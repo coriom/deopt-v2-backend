@@ -2,8 +2,7 @@ use super::matching::prices_cross;
 use super::price_level::PriceLevel;
 use crate::error::{BackendError, Result};
 use crate::types::{
-    now_ms, MarketId, Order, OrderId, OrderStatus, Price1e8, Side, Size1e8, TimeInForce,
-    TradeMatch,
+    now_ms, MarketId, Order, OrderId, OrderStatus, Price1e8, Side, Size1e8, TimeInForce, TradeMatch,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
@@ -87,8 +86,7 @@ impl OrderBook {
         let mut maker_order_updates = Vec::new();
 
         while taker.remaining_size_1e8 > 0 {
-            let Some(maker_order_id) = self.best_match_order_id(taker.side, taker.price_1e8)
-            else {
+            let Some(maker_order_id) = self.best_match_order_id(taker.side, taker.price_1e8) else {
                 break;
             };
 
@@ -202,11 +200,7 @@ impl OrderBook {
         }
     }
 
-    fn snapshot_level(
-        &self,
-        price_1e8: Price1e8,
-        level: &PriceLevel,
-    ) -> Option<BookSideSnapshot> {
+    fn snapshot_level(&self, price_1e8: Price1e8, level: &PriceLevel) -> Option<BookSideSnapshot> {
         let total_size_1e8 = level.total_size_1e8(|order_id| {
             self.orders
                 .get(&order_id)
@@ -273,11 +267,7 @@ impl OrderBook {
             } else {
                 OrderStatus::PartiallyFilled
             };
-            (
-                maker.side,
-                maker.price_1e8,
-                maker.remaining_size_1e8 == 0,
-            )
+            (maker.side, maker.price_1e8, maker.remaining_size_1e8 == 0)
         };
 
         if filled {

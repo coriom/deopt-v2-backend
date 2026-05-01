@@ -38,12 +38,36 @@ fn new_order(
 #[test]
 fn bid_sorting_high_to_low() {
     let mut book = OrderBook::new(MARKET);
-    book.submit(new_order(1, "a", Side::Buy, 100, 10, TimeInForce::Gtc, false))
-        .unwrap();
-    book.submit(new_order(2, "b", Side::Buy, 110, 20, TimeInForce::Gtc, false))
-        .unwrap();
-    book.submit(new_order(3, "c", Side::Buy, 90, 30, TimeInForce::Gtc, false))
-        .unwrap();
+    book.submit(new_order(
+        1,
+        "a",
+        Side::Buy,
+        100,
+        10,
+        TimeInForce::Gtc,
+        false,
+    ))
+    .unwrap();
+    book.submit(new_order(
+        2,
+        "b",
+        Side::Buy,
+        110,
+        20,
+        TimeInForce::Gtc,
+        false,
+    ))
+    .unwrap();
+    book.submit(new_order(
+        3,
+        "c",
+        Side::Buy,
+        90,
+        30,
+        TimeInForce::Gtc,
+        false,
+    ))
+    .unwrap();
 
     let prices: Vec<_> = book
         .snapshot()
@@ -57,12 +81,36 @@ fn bid_sorting_high_to_low() {
 #[test]
 fn ask_sorting_low_to_high() {
     let mut book = OrderBook::new(MARKET);
-    book.submit(new_order(1, "a", Side::Sell, 100, 10, TimeInForce::Gtc, false))
-        .unwrap();
-    book.submit(new_order(2, "b", Side::Sell, 90, 20, TimeInForce::Gtc, false))
-        .unwrap();
-    book.submit(new_order(3, "c", Side::Sell, 110, 30, TimeInForce::Gtc, false))
-        .unwrap();
+    book.submit(new_order(
+        1,
+        "a",
+        Side::Sell,
+        100,
+        10,
+        TimeInForce::Gtc,
+        false,
+    ))
+    .unwrap();
+    book.submit(new_order(
+        2,
+        "b",
+        Side::Sell,
+        90,
+        20,
+        TimeInForce::Gtc,
+        false,
+    ))
+    .unwrap();
+    book.submit(new_order(
+        3,
+        "c",
+        Side::Sell,
+        110,
+        30,
+        TimeInForce::Gtc,
+        false,
+    ))
+    .unwrap();
 
     let prices: Vec<_> = book
         .snapshot()
@@ -76,13 +124,37 @@ fn ask_sorting_low_to_high() {
 #[test]
 fn fifo_at_same_price() {
     let mut book = OrderBook::new(MARKET);
-    book.submit(new_order(1, "maker-a", Side::Sell, 100, 10, TimeInForce::Gtc, false))
-        .unwrap();
-    book.submit(new_order(2, "maker-b", Side::Sell, 100, 10, TimeInForce::Gtc, false))
-        .unwrap();
+    book.submit(new_order(
+        1,
+        "maker-a",
+        Side::Sell,
+        100,
+        10,
+        TimeInForce::Gtc,
+        false,
+    ))
+    .unwrap();
+    book.submit(new_order(
+        2,
+        "maker-b",
+        Side::Sell,
+        100,
+        10,
+        TimeInForce::Gtc,
+        false,
+    ))
+    .unwrap();
 
     let result = book
-        .submit(new_order(3, "taker", Side::Buy, 100, 15, TimeInForce::Ioc, false))
+        .submit(new_order(
+            3,
+            "taker",
+            Side::Buy,
+            100,
+            15,
+            TimeInForce::Ioc,
+            false,
+        ))
         .unwrap();
 
     assert_eq!(result.trades[0].maker_order_id, order_id(1));
@@ -94,10 +166,26 @@ fn fifo_at_same_price() {
 #[test]
 fn full_fill_removes_orders() {
     let mut book = OrderBook::new(MARKET);
-    book.submit(new_order(1, "maker", Side::Sell, 100, 10, TimeInForce::Gtc, false))
-        .unwrap();
+    book.submit(new_order(
+        1,
+        "maker",
+        Side::Sell,
+        100,
+        10,
+        TimeInForce::Gtc,
+        false,
+    ))
+    .unwrap();
     let result = book
-        .submit(new_order(2, "taker", Side::Buy, 100, 10, TimeInForce::Gtc, false))
+        .submit(new_order(
+            2,
+            "taker",
+            Side::Buy,
+            100,
+            10,
+            TimeInForce::Gtc,
+            false,
+        ))
         .unwrap();
 
     assert_eq!(result.order.status, OrderStatus::Filled);
@@ -108,10 +196,26 @@ fn full_fill_removes_orders() {
 #[test]
 fn partial_fill_updates_maker_remainder() {
     let mut book = OrderBook::new(MARKET);
-    book.submit(new_order(1, "maker", Side::Sell, 100, 25, TimeInForce::Gtc, false))
-        .unwrap();
+    book.submit(new_order(
+        1,
+        "maker",
+        Side::Sell,
+        100,
+        25,
+        TimeInForce::Gtc,
+        false,
+    ))
+    .unwrap();
     let result = book
-        .submit(new_order(2, "taker", Side::Buy, 100, 10, TimeInForce::Ioc, false))
+        .submit(new_order(
+            2,
+            "taker",
+            Side::Buy,
+            100,
+            10,
+            TimeInForce::Ioc,
+            false,
+        ))
         .unwrap();
 
     assert_eq!(result.trades.len(), 1);
@@ -125,10 +229,26 @@ fn partial_fill_updates_maker_remainder() {
 #[test]
 fn resting_gtc_remainder() {
     let mut book = OrderBook::new(MARKET);
-    book.submit(new_order(1, "maker", Side::Sell, 100, 10, TimeInForce::Gtc, false))
-        .unwrap();
+    book.submit(new_order(
+        1,
+        "maker",
+        Side::Sell,
+        100,
+        10,
+        TimeInForce::Gtc,
+        false,
+    ))
+    .unwrap();
     let result = book
-        .submit(new_order(2, "taker", Side::Buy, 100, 25, TimeInForce::Gtc, false))
+        .submit(new_order(
+            2,
+            "taker",
+            Side::Buy,
+            100,
+            25,
+            TimeInForce::Gtc,
+            false,
+        ))
         .unwrap();
 
     assert_eq!(result.order.status, OrderStatus::PartiallyFilled);
@@ -139,10 +259,26 @@ fn resting_gtc_remainder() {
 #[test]
 fn ioc_cancels_unfilled_remainder() {
     let mut book = OrderBook::new(MARKET);
-    book.submit(new_order(1, "maker", Side::Sell, 100, 10, TimeInForce::Gtc, false))
-        .unwrap();
+    book.submit(new_order(
+        1,
+        "maker",
+        Side::Sell,
+        100,
+        10,
+        TimeInForce::Gtc,
+        false,
+    ))
+    .unwrap();
     let result = book
-        .submit(new_order(2, "taker", Side::Buy, 100, 25, TimeInForce::Ioc, false))
+        .submit(new_order(
+            2,
+            "taker",
+            Side::Buy,
+            100,
+            25,
+            TimeInForce::Ioc,
+            false,
+        ))
         .unwrap();
 
     assert_eq!(result.order.status, OrderStatus::PartiallyFilled);
@@ -153,10 +289,26 @@ fn ioc_cancels_unfilled_remainder() {
 #[test]
 fn post_only_rejected_if_immediately_matchable() {
     let mut book = OrderBook::new(MARKET);
-    book.submit(new_order(1, "maker", Side::Sell, 100, 10, TimeInForce::Gtc, false))
-        .unwrap();
+    book.submit(new_order(
+        1,
+        "maker",
+        Side::Sell,
+        100,
+        10,
+        TimeInForce::Gtc,
+        false,
+    ))
+    .unwrap();
     let error = book
-        .submit(new_order(2, "taker", Side::Buy, 100, 10, TimeInForce::Gtc, true))
+        .submit(new_order(
+            2,
+            "taker",
+            Side::Buy,
+            100,
+            10,
+            TimeInForce::Gtc,
+            true,
+        ))
         .unwrap_err();
 
     assert!(matches!(error, BackendError::PostOnlyWouldMatch));
@@ -165,8 +317,16 @@ fn post_only_rejected_if_immediately_matchable() {
 #[test]
 fn cancel_open_order() {
     let mut book = OrderBook::new(MARKET);
-    book.submit(new_order(1, "maker", Side::Sell, 100, 10, TimeInForce::Gtc, false))
-        .unwrap();
+    book.submit(new_order(
+        1,
+        "maker",
+        Side::Sell,
+        100,
+        10,
+        TimeInForce::Gtc,
+        false,
+    ))
+    .unwrap();
     let cancelled = book.cancel(order_id(1)).unwrap();
 
     assert_eq!(cancelled.status, OrderStatus::Cancelled);
@@ -186,7 +346,15 @@ fn reject_zero_price() {
 fn reject_zero_size() {
     let mut book = OrderBook::new(MARKET);
     let error = book
-        .submit(new_order(1, "a", Side::Buy, 100, 0, TimeInForce::Gtc, false))
+        .submit(new_order(
+            1,
+            "a",
+            Side::Buy,
+            100,
+            0,
+            TimeInForce::Gtc,
+            false,
+        ))
         .unwrap_err();
     assert!(matches!(error, BackendError::ZeroSize));
 }
@@ -194,10 +362,26 @@ fn reject_zero_size() {
 #[test]
 fn reject_self_trade_without_partial_side_effects() {
     let mut book = OrderBook::new(MARKET);
-    book.submit(new_order(1, "same", Side::Sell, 100, 10, TimeInForce::Gtc, false))
-        .unwrap();
+    book.submit(new_order(
+        1,
+        "same",
+        Side::Sell,
+        100,
+        10,
+        TimeInForce::Gtc,
+        false,
+    ))
+    .unwrap();
     let error = book
-        .submit(new_order(2, "same", Side::Buy, 100, 10, TimeInForce::Gtc, false))
+        .submit(new_order(
+            2,
+            "same",
+            Side::Buy,
+            100,
+            10,
+            TimeInForce::Gtc,
+            false,
+        ))
         .unwrap_err();
 
     assert!(matches!(error, BackendError::SelfTrade));
@@ -206,7 +390,11 @@ fn reject_self_trade_without_partial_side_effects() {
 
 #[test]
 fn no_float_types_used_in_domain_model() {
-    let files = ["src/types.rs", "src/orderbook/book.rs", "src/execution/intent.rs"];
+    let files = [
+        "src/types.rs",
+        "src/orderbook/book.rs",
+        "src/execution/intent.rs",
+    ];
     for file in files {
         let source = fs::read_to_string(file).unwrap();
         assert!(!source.contains("f32"));
