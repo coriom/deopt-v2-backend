@@ -23,6 +23,8 @@ pub enum BackendError {
     OrderNotOpen(OrderId),
     #[error("invalid order id")]
     InvalidOrderId,
+    #[error("invalid fixed-point value for {field}: {reason}")]
+    InvalidFixedPoint { field: String, reason: String },
     #[error("configuration error: {0}")]
     Config(String),
 }

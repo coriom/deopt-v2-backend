@@ -1,5 +1,5 @@
 use axum::body::Body;
-use axum::http::{Request, StatusCode};
+use axum::http::{header, Request, StatusCode};
 use deopt_v2_backend::api::{router, AppState};
 use deopt_v2_backend::engine::{EngineEvent, EngineState};
 use deopt_v2_backend::types::{AccountId, NewOrder, OrderId, OrderStatus, Side, TimeInForce};
@@ -169,4 +169,244 @@ async fn fixed_point_fields_are_serialized_as_strings_in_orderbook_api() {
 
     assert_eq!(json["asks"][0]["price1e8"], "300000000000");
     assert_eq!(json["asks"][0]["totalSize1e8"], "100000000");
+}
+
+#[tokio::test]
+async fn post_orders_accepts_string_price_and_size() {
+    let app = router(AppState::new(EngineState::with_default_markets()));
+    let response = app
+        .oneshot(json_post(
+            "/orders",
+            r#"{
+                "market_id": 1,
+                "account": "0xmaker",
+                "side": "sell",
+                "price_1e8": "300000000000",
+                "size_1e8": "100000000",
+                "time_in_force": "gtc",
+                "reduce_only": false,
+                "post_only": false,
+                "client_order_id": "maker-1"
+            }"#,
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = response_json(response).await;
+    assert_eq!(json["status"], "accepted");
+    assert_eq!(json["events"][0]["order"]["price_1e8"], "300000000000");
+    assert_eq!(json["events"][0]["order"]["size_1e8"], "100000000");
+}
+
+#[tokio::test]
+async fn post_orders_rejects_non_numeric_price_string() {
+    let response = router(AppState::new(EngineState::with_default_markets()))
+        .oneshot(json_post(
+            "/orders",
+            r#"{
+                "market_id": 1,
+                "account": "0xmaker",
+                "side": "sell",
+                "price_1e8": "not-a-number",
+                "size_1e8": "100000000",
+                "time_in_force": "gtc",
+                "reduce_only": false,
+                "post_only": false,
+                "client_order_id": "maker-1"
+            }"#,
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn post_orders_rejects_non_numeric_size_string() {
+    let response = router(AppState::new(EngineState::with_default_markets()))
+        .oneshot(json_post(
+            "/orders",
+            r#"{
+                "market_id": 1,
+                "account": "0xmaker",
+                "side": "sell",
+                "price_1e8": "300000000000",
+                "size_1e8": "not-a-number",
+                "time_in_force": "gtc",
+                "reduce_only": false,
+                "post_only": false,
+                "client_order_id": "maker-1"
+            }"#,
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn post_orders_rejects_negative_string_values() {
+    let response = router(AppState::new(EngineState::with_default_markets()))
+        .oneshot(json_post(
+            "/orders",
+            r#"{
+                "market_id": 1,
+                "account": "0xmaker",
+                "side": "sell",
+                "price_1e8": "-300000000000",
+                "size_1e8": "100000000",
+                "time_in_force": "gtc",
+                "reduce_only": false,
+                "post_only": false,
+                "client_order_id": "maker-1"
+            }"#,
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn post_orders_rejects_empty_string_values() {
+    let response = router(AppState::new(EngineState::with_default_markets()))
+        .oneshot(json_post(
+            "/orders",
+            r#"{
+                "market_id": 1,
+                "account": "0xmaker",
+                "side": "sell",
+                "price_1e8": "",
+                "size_1e8": "100000000",
+                "time_in_force": "gtc",
+                "reduce_only": false,
+                "post_only": false,
+                "client_order_id": "maker-1"
+            }"#,
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn matched_order_response_serializes_financial_quantities_as_strings() {
+    let app = router(AppState::new(EngineState::with_default_markets()));
+    let maker_response = app
+        .clone()
+        .oneshot(json_post(
+            "/orders",
+            r#"{
+                "market_id": 1,
+                "account": "0xmaker",
+                "side": "sell",
+                "price_1e8": "300000000000",
+                "size_1e8": "100000000",
+                "time_in_force": "gtc",
+                "reduce_only": false,
+                "post_only": false,
+                "client_order_id": "maker-1"
+            }"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(maker_response.status(), StatusCode::OK);
+
+    let taker_response = app
+        .oneshot(json_post(
+            "/orders",
+            r#"{
+                "market_id": 1,
+                "account": "0xtaker",
+                "side": "buy",
+                "price_1e8": "300000000000",
+                "size_1e8": "50000000",
+                "time_in_force": "gtc",
+                "reduce_only": false,
+                "post_only": false,
+                "client_order_id": "taker-1"
+            }"#,
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(taker_response.status(), StatusCode::OK);
+    let json = response_json(taker_response).await;
+    let trade = json["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["type"] == "trade_matched")
+        .unwrap();
+    assert_eq!(trade["trade"]["price_1e8"], "300000000000");
+    assert_eq!(trade["trade"]["size_1e8"], "50000000");
+
+    let intent = json["execution_intents"]
+        .as_array()
+        .unwrap()
+        .first()
+        .unwrap();
+    assert_eq!(intent["price_1e8"], "300000000000");
+    assert_eq!(intent["size_1e8"], "50000000");
+}
+
+#[tokio::test]
+async fn execution_intents_api_serializes_financial_quantities_as_strings() {
+    let state = AppState::new(EngineState::with_default_markets());
+    {
+        let mut engine = state.engine.lock().unwrap();
+        engine
+            .submit_order(new_order(
+                1,
+                "maker",
+                Side::Sell,
+                300_000_000_000,
+                100_000_000,
+                TimeInForce::Gtc,
+            ))
+            .unwrap();
+        engine
+            .submit_order(new_order(
+                1,
+                "taker",
+                Side::Buy,
+                300_000_000_000,
+                50_000_000,
+                TimeInForce::Gtc,
+            ))
+            .unwrap();
+    }
+
+    let response = router(state)
+        .oneshot(
+            Request::builder()
+                .uri("/execution-intents")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = response_json(response).await;
+    assert_eq!(json[0]["price_1e8"], "300000000000");
+    assert_eq!(json[0]["size_1e8"], "50000000");
+}
+
+fn json_post(uri: &str, body: &'static str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .unwrap()
+}
+
+async fn response_json(response: axum::response::Response) -> serde_json::Value {
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    serde_json::from_slice(&body).unwrap()
 }

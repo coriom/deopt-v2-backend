@@ -1,13 +1,16 @@
 use super::AppState;
+use crate::api::dto::{
+    ApiEngineEvent, ApiExecutionIntent, SubmitOrderRequest, SubmitOrderResponse,
+};
 use crate::engine::{EngineCommand, EngineEvent};
 use crate::error::BackendError;
-use crate::types::{AccountId, MarketId, NewOrder, OrderId, Price1e8, Side, Size1e8, TimeInForce};
+use crate::types::{MarketId, OrderId};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::str::FromStr;
 use tower_http::trace::TraceLayer;
 
@@ -84,49 +87,12 @@ async fn orderbook(
     }))
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
-pub struct SubmitOrderRequest {
-    pub market_id: MarketId,
-    pub account: AccountId,
-    pub side: Side,
-    pub price_1e8: Price1e8,
-    pub size_1e8: Size1e8,
-    pub time_in_force: TimeInForce,
-    pub reduce_only: bool,
-    pub post_only: bool,
-    pub client_order_id: Option<String>,
-}
-
-impl From<SubmitOrderRequest> for NewOrder {
-    fn from(value: SubmitOrderRequest) -> Self {
-        Self {
-            market_id: value.market_id,
-            account: value.account,
-            side: value.side,
-            price_1e8: value.price_1e8,
-            size_1e8: value.size_1e8,
-            time_in_force: value.time_in_force,
-            reduce_only: value.reduce_only,
-            post_only: value.post_only,
-            client_order_id: value.client_order_id,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct SubmitOrderResponse {
-    pub status: String,
-    pub order_id: Option<OrderId>,
-    pub events: Vec<EngineEvent>,
-    pub execution_intents: Vec<crate::execution::ExecutionIntent>,
-}
-
 async fn submit_order(
     State(state): State<AppState>,
     Json(request): Json<SubmitOrderRequest>,
 ) -> Result<Json<SubmitOrderResponse>, ApiError> {
     let mut engine = state.engine.lock().map_err(|_| ApiError::internal())?;
-    let events = engine.process(EngineCommand::SubmitOrder(request.into()))?;
+    let events = engine.process(EngineCommand::SubmitOrder(request.into_new_order()?))?;
     let status = if events
         .iter()
         .any(|event| matches!(event, EngineEvent::OrderRejected { .. }))
@@ -139,10 +105,13 @@ async fn submit_order(
     let execution_intents = events
         .iter()
         .filter_map(|event| match event {
-            EngineEvent::ExecutionIntentCreated { intent } => Some(intent.clone()),
+            EngineEvent::ExecutionIntentCreated { intent } => {
+                Some(ApiExecutionIntent::from(intent.clone()))
+            }
             _ => None,
         })
         .collect();
+    let events = events.into_iter().map(ApiEngineEvent::from).collect();
 
     Ok(Json(SubmitOrderResponse {
         status: status.to_string(),
@@ -155,7 +124,7 @@ async fn submit_order(
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 struct CancelOrderResponse {
     status: String,
-    event: EngineEvent,
+    event: ApiEngineEvent,
 }
 
 async fn cancel_order(
@@ -170,15 +139,21 @@ async fn cancel_order(
     };
     Ok(Json(CancelOrderResponse {
         status: "cancelled".to_string(),
-        event,
+        event: event.into(),
     }))
 }
 
 async fn execution_intents(
     State(state): State<AppState>,
-) -> Result<Json<Vec<crate::execution::ExecutionIntent>>, ApiError> {
+) -> Result<Json<Vec<ApiExecutionIntent>>, ApiError> {
     let engine = state.engine.lock().map_err(|_| ApiError::internal())?;
-    Ok(Json(engine.execution_intents()))
+    Ok(Json(
+        engine
+            .execution_intents()
+            .into_iter()
+            .map(ApiExecutionIntent::from)
+            .collect(),
+    ))
 }
 
 fn first_order_id(events: &[EngineEvent]) -> Option<OrderId> {
@@ -212,6 +187,7 @@ impl From<BackendError> for ApiError {
         let status = match value {
             BackendError::InvalidOrderId => StatusCode::BAD_REQUEST,
             BackendError::OrderNotFound(_) | BackendError::OrderNotOpen(_) => StatusCode::NOT_FOUND,
+            BackendError::InvalidFixedPoint { .. } => StatusCode::BAD_REQUEST,
             BackendError::ZeroPrice
             | BackendError::ZeroSize
             | BackendError::PostOnlyWouldMatch

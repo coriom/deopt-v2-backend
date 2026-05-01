@@ -63,6 +63,7 @@ The long-term backend needs low-latency deterministic matching, RFQ, market-make
 - Trade price is the resting maker order price.
 - Fill size is `min(taker_remaining, maker_remaining)`.
 - Financial fields use integer fixed-point only: `price_1e8`, `size_1e8`, `remaining_size_1e8`.
+- Public API DTOs accept and return financial fixed-point quantities as strings; internal engine types remain integers.
 
 ## RFQ Future Design
 

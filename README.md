@@ -42,7 +42,7 @@ curl http://127.0.0.1:8080/orderbook/1
 curl http://127.0.0.1:8080/execution-intents
 ```
 
-Submit a limit order:
+Submit a limit order. Financial fixed-point values are strings at the HTTP boundary:
 
 ```sh
 curl -X POST http://127.0.0.1:8080/orders \
@@ -51,8 +51,8 @@ curl -X POST http://127.0.0.1:8080/orders \
     "market_id": 1,
     "account": "0xmaker",
     "side": "sell",
-    "price_1e8": 300000000000,
-    "size_1e8": 100000000,
+    "price_1e8": "300000000000",
+    "size_1e8": "100000000",
     "time_in_force": "gtc",
     "reduce_only": false,
     "post_only": false,
@@ -70,6 +70,7 @@ curl -X DELETE http://127.0.0.1:8080/orders/<order_id>
 
 - In-memory only; restarting clears orders and execution intents.
 - Perp limit orders only.
+- Public API financial quantities are string-encoded fixed-point integers.
 - FOK is rejected cleanly.
 - RFQ and market-maker gateway are type scaffolds only.
 - Execution intents are provisional off-chain records, not settlement.
