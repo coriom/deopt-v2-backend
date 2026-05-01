@@ -12,7 +12,10 @@ async fn main() -> deopt_v2_backend::Result<()> {
         .init();
 
     let addr = config.socket_addr()?;
-    let state = AppState::new(EngineState::with_default_markets());
+    let state = AppState::with_signature_mode(
+        EngineState::with_default_markets(),
+        config.signature_verification_mode,
+    );
     let app = router(state);
 
     info!(
@@ -21,6 +24,7 @@ async fn main() -> deopt_v2_backend::Result<()> {
         chain_id = config.chain_id,
         network = %config.network_name,
         execution_enabled = config.execution_enabled,
+        signature_verification_mode = ?config.signature_verification_mode,
         "starting http server"
     );
 

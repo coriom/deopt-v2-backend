@@ -16,6 +16,7 @@ The long-term backend needs low-latency deterministic matching, RFQ, market-make
 - `execution`: Provisional `ExecutionIntent` records plus an in-memory queue. No transaction submission exists.
 - `rfq`: RFQ type scaffold only.
 - `mm`: market-maker session, heartbeat, bulk quote, and bulk cancel type scaffold only.
+- `signing`: signed-order schema, deterministic EIP-712 payload boundary, signature mode, deadline validation, and in-memory nonce tracking.
 - `config`: environment loading for host, port, log level, network name, chain id, and disabled execution flag.
 
 ## Current v1 Scope
@@ -29,10 +30,11 @@ The long-term backend needs low-latency deterministic matching, RFQ, market-make
 - Order cancellation by `order_id`.
 - Execution-intent creation for every matched trade.
 - HTTP endpoints for health, markets, orderbook, orders, cancellation, and execution intents.
+- Signed-order HTTP boundary with nonce/deadline validation and disabled/strict signature verification modes.
 
 ## Future v2/v3 Scope
 
-- EIP-712 order validation.
+- Full EIP-712 signature recovery.
 - On-chain executor service.
 - Indexer with reorg handling.
 - WebSocket market data and trading.
@@ -45,13 +47,15 @@ The long-term backend needs low-latency deterministic matching, RFQ, market-make
 ## Order Lifecycle
 
 1. Client submits an order to `POST /orders`.
-2. API converts JSON into a typed `NewOrder`.
-3. Engine creates an `OrderId` and timestamp.
-4. Market orderbook validates non-zero price/size and supported time-in-force.
-5. Post-only and self-trade checks run before any fill side effects.
-6. Matching consumes eligible maker liquidity at maker prices.
-7. GTC rests any remainder; IOC cancels any remainder; FOK is rejected.
-8. Engine returns events and creates execution intents for matched trades.
+2. API parses the signed-order DTO with string fixed-point values.
+3. API validates deadline, signature shape/mode, known market, and per-account nonce.
+4. API converts the signed order into a typed `NewOrder`.
+5. Engine creates an `OrderId` and timestamp.
+6. Market orderbook validates non-zero price/size and supported time-in-force.
+7. Post-only and self-trade checks run before any fill side effects.
+8. Matching consumes eligible maker liquidity at maker prices.
+9. GTC rests any remainder; IOC cancels any remainder; FOK is rejected.
+10. Engine returns events and creates execution intents for matched trades.
 
 ## Matching Rules
 
@@ -92,10 +96,11 @@ Matching decisions are deterministic for a given ordered command stream, market 
 - Zero price and zero size are rejected.
 - Self-trade is rejected before fills.
 - Large financial values are represented as integers, not floating point.
+- Disabled signature mode is for local development only; strict mode rejects until real EIP-712 signer recovery is implemented.
 
 ## Out of Scope
 
-No database, Redis, private key loading, transaction signing, ABI encoding, blockchain RPC, EIP-712 verification, production authentication, frontend code, TypeScript, Python service code, C++, or Solidity changes.
+No database, Redis, private key loading, transaction signing, ABI encoding, blockchain RPC, full EIP-712 signature recovery, production authentication, frontend code, TypeScript, Python service code, C++, or Solidity changes.
 
 ## Acceptance Criteria
 

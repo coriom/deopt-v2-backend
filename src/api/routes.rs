@@ -4,7 +4,8 @@ use crate::api::dto::{
 };
 use crate::engine::{EngineCommand, EngineEvent};
 use crate::error::BackendError;
-use crate::types::{MarketId, OrderId};
+use crate::signing::SignatureVerifier;
+use crate::types::{now_ms, MarketId, NewOrder, OrderId};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -91,8 +92,24 @@ async fn submit_order(
     State(state): State<AppState>,
     Json(request): Json<SubmitOrderRequest>,
 ) -> Result<Json<SubmitOrderResponse>, ApiError> {
+    let signed_order = request.into_signed_order()?;
+    validate_deadline(signed_order.deadline_ms)?;
+    SignatureVerifier::verify(&signed_order, state.signature_verification_mode)?;
+
+    {
+        let engine = state.engine.lock().map_err(|_| ApiError::internal())?;
+        if !engine.has_market(signed_order.market_id) {
+            return Err(BackendError::UnknownMarket(signed_order.market_id).into());
+        }
+    }
+
+    {
+        let mut nonces = state.nonces.lock().map_err(|_| ApiError::internal())?;
+        nonces.reserve(&signed_order.account, signed_order.nonce)?;
+    }
+
     let mut engine = state.engine.lock().map_err(|_| ApiError::internal())?;
-    let events = engine.process(EngineCommand::SubmitOrder(request.into_new_order()?))?;
+    let events = engine.process(EngineCommand::SubmitOrder(NewOrder::from(signed_order)))?;
     let status = if events
         .iter()
         .any(|event| matches!(event, EngineEvent::OrderRejected { .. }))
@@ -167,6 +184,13 @@ fn first_order_id(events: &[EngineEvent]) -> Option<OrderId> {
     })
 }
 
+fn validate_deadline(deadline_ms: i64) -> Result<(), BackendError> {
+    if deadline_ms <= now_ms() {
+        return Err(BackendError::DeadlineExpired);
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 pub struct ApiError {
     status: StatusCode,
@@ -188,6 +212,12 @@ impl From<BackendError> for ApiError {
             BackendError::InvalidOrderId => StatusCode::BAD_REQUEST,
             BackendError::OrderNotFound(_) | BackendError::OrderNotOpen(_) => StatusCode::NOT_FOUND,
             BackendError::InvalidFixedPoint { .. } => StatusCode::BAD_REQUEST,
+            BackendError::DeadlineExpired
+            | BackendError::InvalidNonce
+            | BackendError::NonceAlreadyUsed
+            | BackendError::MalformedSignature
+            | BackendError::StrictSignatureVerificationUnavailable
+            | BackendError::UnknownMarket(_) => StatusCode::BAD_REQUEST,
             BackendError::ZeroPrice
             | BackendError::ZeroSize
             | BackendError::PostOnlyWouldMatch

@@ -49,6 +49,10 @@ impl EngineState {
         &self.markets
     }
 
+    pub fn has_market(&self, market_id: MarketId) -> bool {
+        self.orderbooks.contains_key(&market_id)
+    }
+
     pub fn execution_intents(&self) -> Vec<ExecutionIntent> {
         self.execution_queue.all()
     }

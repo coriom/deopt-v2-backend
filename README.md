@@ -20,6 +20,7 @@ RUST_LOG=info
 CHAIN_ID=84532
 NETWORK_NAME=base-sepolia
 EXECUTION_ENABLED=false
+SIGNATURE_VERIFICATION_MODE=disabled
 ```
 
 `EXECUTION_ENABLED=false` is intentional for this phase.
@@ -56,7 +57,10 @@ curl -X POST http://127.0.0.1:8080/orders \
     "time_in_force": "gtc",
     "reduce_only": false,
     "post_only": false,
-    "client_order_id": "maker-1"
+    "client_order_id": "maker-1",
+    "nonce": 1,
+    "deadline_ms": 4102444800000,
+    "signature": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
   }'
 ```
 
@@ -71,7 +75,10 @@ curl -X DELETE http://127.0.0.1:8080/orders/<order_id>
 - In-memory only; restarting clears orders and execution intents.
 - Perp limit orders only.
 - Public API financial quantities are string-encoded fixed-point integers.
+- `POST /orders` uses a signed-order payload with nonce, deadline, and signature fields.
+- `SIGNATURE_VERIFICATION_MODE=disabled` validates nonce, deadline, and signature shape while skipping cryptographic recovery.
+- `SIGNATURE_VERIFICATION_MODE=strict` rejects orders explicitly until real EIP-712 recovery is implemented.
 - FOK is rejected cleanly.
 - RFQ and market-maker gateway are type scaffolds only.
 - Execution intents are provisional off-chain records, not settlement.
-- No blockchain RPC, ABI encoding, signing, EIP-712 validation, database, production auth, WebSocket API, or options matching.
+- No blockchain RPC, ABI encoding, transaction signing, full EIP-712 signature recovery, database, production auth, WebSocket API, or options matching.

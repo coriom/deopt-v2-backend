@@ -25,6 +25,18 @@ pub enum BackendError {
     InvalidOrderId,
     #[error("invalid fixed-point value for {field}: {reason}")]
     InvalidFixedPoint { field: String, reason: String },
+    #[error("deadline has expired")]
+    DeadlineExpired,
+    #[error("nonce must be nonzero")]
+    InvalidNonce,
+    #[error("nonce has already been used for account")]
+    NonceAlreadyUsed,
+    #[error("malformed signature")]
+    MalformedSignature,
+    #[error("strict signature verification is not implemented in this phase")]
+    StrictSignatureVerificationUnavailable,
+    #[error("unknown market: {0}")]
+    UnknownMarket(crate::types::MarketId),
     #[error("configuration error: {0}")]
     Config(String),
 }

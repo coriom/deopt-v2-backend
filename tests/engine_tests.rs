@@ -2,8 +2,12 @@ use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use deopt_v2_backend::api::{router, AppState};
 use deopt_v2_backend::engine::{EngineEvent, EngineState};
+use deopt_v2_backend::signing::SignatureVerificationMode;
+use deopt_v2_backend::types::now_ms;
 use deopt_v2_backend::types::{AccountId, NewOrder, OrderId, OrderStatus, Side, TimeInForce};
 use tower::ServiceExt;
+
+const VALID_SIGNATURE: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
 fn new_order(
     market_id: u64,
@@ -177,17 +181,7 @@ async fn post_orders_accepts_string_price_and_size() {
     let response = app
         .oneshot(json_post(
             "/orders",
-            r#"{
-                "market_id": 1,
-                "account": "0xmaker",
-                "side": "sell",
-                "price_1e8": "300000000000",
-                "size_1e8": "100000000",
-                "time_in_force": "gtc",
-                "reduce_only": false,
-                "post_only": false,
-                "client_order_id": "maker-1"
-            }"#,
+            signed_order_body("0xmaker", "sell", "300000000000", "100000000", 1),
         ))
         .await
         .unwrap();
@@ -204,17 +198,7 @@ async fn post_orders_rejects_non_numeric_price_string() {
     let response = router(AppState::new(EngineState::with_default_markets()))
         .oneshot(json_post(
             "/orders",
-            r#"{
-                "market_id": 1,
-                "account": "0xmaker",
-                "side": "sell",
-                "price_1e8": "not-a-number",
-                "size_1e8": "100000000",
-                "time_in_force": "gtc",
-                "reduce_only": false,
-                "post_only": false,
-                "client_order_id": "maker-1"
-            }"#,
+            signed_order_body("0xmaker", "sell", "not-a-number", "100000000", 1),
         ))
         .await
         .unwrap();
@@ -227,17 +211,7 @@ async fn post_orders_rejects_non_numeric_size_string() {
     let response = router(AppState::new(EngineState::with_default_markets()))
         .oneshot(json_post(
             "/orders",
-            r#"{
-                "market_id": 1,
-                "account": "0xmaker",
-                "side": "sell",
-                "price_1e8": "300000000000",
-                "size_1e8": "not-a-number",
-                "time_in_force": "gtc",
-                "reduce_only": false,
-                "post_only": false,
-                "client_order_id": "maker-1"
-            }"#,
+            signed_order_body("0xmaker", "sell", "300000000000", "not-a-number", 1),
         ))
         .await
         .unwrap();
@@ -250,17 +224,7 @@ async fn post_orders_rejects_negative_string_values() {
     let response = router(AppState::new(EngineState::with_default_markets()))
         .oneshot(json_post(
             "/orders",
-            r#"{
-                "market_id": 1,
-                "account": "0xmaker",
-                "side": "sell",
-                "price_1e8": "-300000000000",
-                "size_1e8": "100000000",
-                "time_in_force": "gtc",
-                "reduce_only": false,
-                "post_only": false,
-                "client_order_id": "maker-1"
-            }"#,
+            signed_order_body("0xmaker", "sell", "-300000000000", "100000000", 1),
         ))
         .await
         .unwrap();
@@ -273,17 +237,7 @@ async fn post_orders_rejects_empty_string_values() {
     let response = router(AppState::new(EngineState::with_default_markets()))
         .oneshot(json_post(
             "/orders",
-            r#"{
-                "market_id": 1,
-                "account": "0xmaker",
-                "side": "sell",
-                "price_1e8": "",
-                "size_1e8": "100000000",
-                "time_in_force": "gtc",
-                "reduce_only": false,
-                "post_only": false,
-                "client_order_id": "maker-1"
-            }"#,
+            signed_order_body("0xmaker", "sell", "", "100000000", 1),
         ))
         .await
         .unwrap();
@@ -298,17 +252,7 @@ async fn matched_order_response_serializes_financial_quantities_as_strings() {
         .clone()
         .oneshot(json_post(
             "/orders",
-            r#"{
-                "market_id": 1,
-                "account": "0xmaker",
-                "side": "sell",
-                "price_1e8": "300000000000",
-                "size_1e8": "100000000",
-                "time_in_force": "gtc",
-                "reduce_only": false,
-                "post_only": false,
-                "client_order_id": "maker-1"
-            }"#,
+            signed_order_body("0xmaker", "sell", "300000000000", "100000000", 1),
         ))
         .await
         .unwrap();
@@ -317,17 +261,7 @@ async fn matched_order_response_serializes_financial_quantities_as_strings() {
     let taker_response = app
         .oneshot(json_post(
             "/orders",
-            r#"{
-                "market_id": 1,
-                "account": "0xtaker",
-                "side": "buy",
-                "price_1e8": "300000000000",
-                "size_1e8": "50000000",
-                "time_in_force": "gtc",
-                "reduce_only": false,
-                "post_only": false,
-                "client_order_id": "taker-1"
-            }"#,
+            signed_order_body("0xtaker", "buy", "300000000000", "50000000", 1),
         ))
         .await
         .unwrap();
@@ -395,7 +329,128 @@ async fn execution_intents_api_serializes_financial_quantities_as_strings() {
     assert_eq!(json[0]["size_1e8"], "50000000");
 }
 
-fn json_post(uri: &str, body: &'static str) -> Request<Body> {
+#[tokio::test]
+async fn post_orders_rejects_expired_deadline() {
+    let response = router(AppState::new(EngineState::with_default_markets()))
+        .oneshot(json_post(
+            "/orders",
+            signed_order_body_with_deadline(
+                "0xmaker",
+                "sell",
+                "300000000000",
+                "100000000",
+                1,
+                now_ms() - 1,
+                VALID_SIGNATURE,
+            ),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn post_orders_rejects_reused_nonce_for_same_account() {
+    let app = router(AppState::new(EngineState::with_default_markets()));
+    let first = app
+        .clone()
+        .oneshot(json_post(
+            "/orders",
+            signed_order_body("0xmaker", "sell", "300000000000", "100000000", 7),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+
+    let second = app
+        .oneshot(json_post(
+            "/orders",
+            signed_order_body("0xmaker", "sell", "300100000000", "100000000", 7),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(second.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn post_orders_rejects_zero_nonce() {
+    let response = router(AppState::new(EngineState::with_default_markets()))
+        .oneshot(json_post(
+            "/orders",
+            signed_order_body("0xmaker", "sell", "300000000000", "100000000", 0),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn post_orders_allows_same_nonce_for_different_accounts() {
+    let app = router(AppState::new(EngineState::with_default_markets()));
+    let first = app
+        .clone()
+        .oneshot(json_post(
+            "/orders",
+            signed_order_body("0xmaker-a", "sell", "300000000000", "100000000", 11),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+
+    let second = app
+        .oneshot(json_post(
+            "/orders",
+            signed_order_body("0xmaker-b", "sell", "300100000000", "100000000", 11),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(second.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn post_orders_rejects_malformed_signature() {
+    let response = router(AppState::new(EngineState::with_default_markets()))
+        .oneshot(json_post(
+            "/orders",
+            signed_order_body_with_deadline(
+                "0xmaker",
+                "sell",
+                "300000000000",
+                "100000000",
+                1,
+                future_deadline(),
+                "not-a-signature",
+            ),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn strict_signature_mode_rejects_without_faking_verification() {
+    let app = router(AppState::with_signature_mode(
+        EngineState::with_default_markets(),
+        SignatureVerificationMode::Strict,
+    ));
+
+    let response = app
+        .oneshot(json_post(
+            "/orders",
+            signed_order_body("0xmaker", "sell", "300000000000", "100000000", 1),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+fn json_post(uri: &str, body: String) -> Request<Body> {
     Request::builder()
         .method("POST")
         .uri(uri)
@@ -409,4 +464,53 @@ async fn response_json(response: axum::response::Response) -> serde_json::Value 
         .await
         .unwrap();
     serde_json::from_slice(&body).unwrap()
+}
+
+fn signed_order_body(
+    account: &str,
+    side: &str,
+    price_1e8: &str,
+    size_1e8: &str,
+    nonce: u64,
+) -> String {
+    signed_order_body_with_deadline(
+        account,
+        side,
+        price_1e8,
+        size_1e8,
+        nonce,
+        future_deadline(),
+        VALID_SIGNATURE,
+    )
+}
+
+fn signed_order_body_with_deadline(
+    account: &str,
+    side: &str,
+    price_1e8: &str,
+    size_1e8: &str,
+    nonce: u64,
+    deadline_ms: i64,
+    signature: &str,
+) -> String {
+    format!(
+        r#"{{
+            "market_id": 1,
+            "account": "{account}",
+            "side": "{side}",
+            "price_1e8": "{price_1e8}",
+            "size_1e8": "{size_1e8}",
+            "time_in_force": "gtc",
+            "reduce_only": false,
+            "post_only": false,
+            "client_order_id": "client-{nonce}",
+            "nonce": {nonce},
+            "deadline_ms": {deadline_ms},
+            "signature": "{signature}"
+        }}"#
+    )
+}
+
+fn future_deadline() -> i64 {
+    now_ms() + 60_000
 }

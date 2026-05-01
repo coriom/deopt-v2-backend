@@ -1,6 +1,7 @@
 use crate::engine::EngineEvent;
 use crate::error::{BackendError, Result};
 use crate::execution::ExecutionIntent;
+use crate::signing::SignedOrder;
 use crate::types::{
     AccountId, MarketId, NewOrder, Order, OrderId, OrderStatus, OrderType, Side, TimeInForce,
     TimestampMs, TradeMatch,
@@ -19,13 +20,16 @@ pub struct SubmitOrderRequest {
     pub reduce_only: bool,
     pub post_only: bool,
     pub client_order_id: Option<String>,
+    pub nonce: u64,
+    pub deadline_ms: TimestampMs,
+    pub signature: String,
 }
 
 impl SubmitOrderRequest {
-    pub fn into_new_order(self) -> Result<NewOrder> {
-        Ok(NewOrder {
-            market_id: self.market_id,
+    pub fn into_signed_order(self) -> Result<SignedOrder> {
+        Ok(SignedOrder {
             account: self.account,
+            market_id: self.market_id,
             side: self.side,
             price_1e8: parse_fixed_u128("price_1e8", &self.price_1e8)?,
             size_1e8: parse_fixed_u128("size_1e8", &self.size_1e8)?,
@@ -33,7 +37,26 @@ impl SubmitOrderRequest {
             reduce_only: self.reduce_only,
             post_only: self.post_only,
             client_order_id: self.client_order_id,
+            nonce: self.nonce,
+            deadline_ms: self.deadline_ms,
+            signature: self.signature,
         })
+    }
+}
+
+impl From<SignedOrder> for NewOrder {
+    fn from(order: SignedOrder) -> Self {
+        Self {
+            market_id: order.market_id,
+            account: order.account,
+            side: order.side,
+            price_1e8: order.price_1e8,
+            size_1e8: order.size_1e8,
+            time_in_force: order.time_in_force,
+            reduce_only: order.reduce_only,
+            post_only: order.post_only,
+            client_order_id: order.client_order_id,
+        }
     }
 }
 

@@ -1,4 +1,5 @@
 use crate::error::{BackendError, Result};
+use crate::signing::signature::SignatureVerificationMode;
 use std::env;
 use std::net::SocketAddr;
 
@@ -10,6 +11,7 @@ pub struct AppConfig {
     pub chain_id: u64,
     pub network_name: String,
     pub execution_enabled: bool,
+    pub signature_verification_mode: SignatureVerificationMode,
 }
 
 impl AppConfig {
@@ -22,6 +24,7 @@ impl AppConfig {
         let chain_id = parse_env("CHAIN_ID", "84532")?;
         let network_name = env::var("NETWORK_NAME").unwrap_or_else(|_| "base-sepolia".to_string());
         let execution_enabled = parse_env("EXECUTION_ENABLED", "false")?;
+        let signature_verification_mode = parse_env("SIGNATURE_VERIFICATION_MODE", "disabled")?;
 
         Ok(Self {
             host,
@@ -30,6 +33,7 @@ impl AppConfig {
             chain_id,
             network_name,
             execution_enabled,
+            signature_verification_mode,
         })
     }
 

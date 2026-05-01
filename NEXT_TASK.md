@@ -1,114 +1,158 @@
-# NEXT_TASK.md — API Numeric Serialization Hardening
+# NEXT_TASK.md — EIP-712 Order Model and Signature Verification
 
 ## Context
 
 The Rust trading backend scaffold is implemented and validated.
 
 Current status:
-- cargo fmt: OK
-- cargo clippy --all-targets --all-features -- -D warnings: OK
-- cargo test: OK
-- cargo build: OK
-- HTTP server runs
-- /health works
-- /markets works
-- POST /orders works with numeric JSON values
+- deterministic in-memory orderbook works
 - matching works
 - execution intents are created
-- /orderbook/:market_id works
-- /execution-intents works
-
-Observed issue:
-- API currently expects `price_1e8` and `size_1e8` as JSON numbers.
-- For frontend and external clients, financial fixed-point integers must be accepted as strings to avoid JavaScript precision issues.
-- API responses currently emit large integer fields as numbers in some places.
+- API accepts financial fixed-point values as strings
+- API returns financial fixed-point values as strings
+- cargo fmt: OK
+- cargo clippy: OK
+- cargo test: OK
+- cargo build: OK
 
 ## Goal
 
-Harden external API serialization without changing core matching semantics.
+Add the first security layer for off-chain orders:
 
-The internal engine must continue using integer fixed-point types.
+- signed order model
+- EIP-712-compatible order schema
+- signature verification scaffold/implementation
+- nonce validation
+- deadline validation
 
-The HTTP boundary should support string-based integer JSON for financial quantities.
+This phase must not execute transactions on-chain.
 
 ## Scope
 
-Implement API-safe numeric serialization/deserialization for fixed-point fields.
+Add signed order support at the API boundary.
 
-Required external JSON behavior:
+The engine should only accept orders after:
+- payload is well-formed
+- fixed-point strings are valid
+- deadline has not expired
+- nonce has not already been used
+- signature is valid, if signature verification is implemented
 
-1. `POST /orders` must accept:
-   - `price_1e8` as string
-   - `size_1e8` as string
+If complete EIP-712 verification is too large for one pass, implement:
+- exact typed order data model
+- deterministic hash/signature module boundary
+- strict TODO with tests for the non-cryptographic validation paths
 
-Example:
+But prefer implementing actual signature recovery if feasible in Rust.
 
-```json
-{
-  "market_id": 1,
-  "account": "0xmaker",
-  "side": "sell",
-  "price_1e8": "300000000000",
-  "size_1e8": "100000000",
-  "time_in_force": "gtc",
-  "reduce_only": false,
-  "post_only": false,
-  "client_order_id": "maker-1"
-}
-API responses must serialize financial fixed-point quantities as strings:
-price_1e8
-size_1e8
-remaining_size_1e8
-orderbook price1e8
-orderbook totalSize1e8
-trade price_1e8
-trade size_1e8
-execution intent price_1e8
-execution intent size_1e8
-Internal domain models may keep integer types.
-Do not introduce floating point.
-Do not change matching behavior.
-Do not add blockchain RPC.
-Do not add DB.
-Do not add TypeScript/Python/Node.
-Implementation Guidance
+## Required Order Fields
 
-Prefer a small explicit API DTO layer instead of polluting core engine types.
+Extend external order input to include:
 
-Suggested pattern:
+- `account`
+- `market_id`
+- `side`
+- `price_1e8`
+- `size_1e8`
+- `time_in_force`
+- `reduce_only`
+- `post_only`
+- `client_order_id`
+- `nonce`
+- `deadline_ms`
+- `signature`
 
-Keep internal domain structs in src/types.rs using integer fields.
-Add API request/response structs in src/api/routes.rs or a new src/api/dto.rs.
-Convert API DTOs into internal commands.
-Convert internal events/orders/trades/intents into API response DTOs.
+Keep `price_1e8` and `size_1e8` as strings in external JSON.
 
-String parsing rules:
+## Domain Requirements
 
-reject empty strings
-reject negative values
-reject non-numeric strings
-reject zero price
-reject zero size
-preserve existing engine validation errors where possible
+Add a signed-order model separate from internal engine order.
 
-Do not silently truncate values.
+Suggested modules:
 
-Required Tests
+```text
+src/signing/mod.rs
+src/signing/eip712.rs
+src/signing/signature.rs
+src/signing/nonce.rs
+Validation Rules
 
-Add or update tests to cover:
+Reject:
 
-POST /orders accepts string price_1e8 and size_1e8.
-POST /orders rejects non-numeric price_1e8.
-POST /orders rejects non-numeric size_1e8.
-POST /orders rejects negative string values.
-POST /orders rejects empty string values.
-Matched order response serializes financial quantities as strings.
-/orderbook/:market_id serializes financial quantities as strings.
-/execution-intents serializes financial quantities as strings.
-Existing orderbook and engine tests still pass.
+expired deadline
+zero nonce if you decide nonce must be nonzero
+reused nonce for same account
+malformed signature
+invalid signer/account mismatch
+invalid fixed-point values
+unknown market
+
+Nonce scope:
+
+nonce uniqueness should be per account.
+
+In-memory nonce store is acceptable for this phase.
+
+API Requirements
+
+POST /orders should support signed order input.
+
+For local development/testing, allow a config flag:
+
+SIGNATURE_VERIFICATION_MODE=disabled
+
+Accepted values:
+
+disabled
+strict
+
+Behavior:
+
+disabled: still validate nonce/deadline, but skip cryptographic signature recovery
+strict: enforce signature verification
+
+Default should be disabled for this phase unless actual signature verification is fully implemented.
+
+Do not fake strict verification.
+
+Tests Required
+
+Add tests for:
+
+accepts valid order in disabled signature mode
+rejects expired deadline
+rejects reused nonce for same account
+allows same nonce for different accounts
+rejects malformed signature in strict mode if strict is implemented
+rejects signer/account mismatch if strict is implemented
+existing matching tests still pass
+existing API numeric string tests still pass
+Constraints
+
+Do not add:
+
+blockchain RPC
+transaction sending
+private key loading
+database
+frontend
+TypeScript
+Python
+Node.js
+Solidity changes
+
+Do not modify:
+
+~/DEOPT/deoptv2
+
+Do not introduce:
+
+floating point financial math
+fake on-chain execution
+fake finality
 Validation
 
-Before finishing, run:
+Run:
 
 cargo fmt
 cargo clippy --all-targets --all-features -- -D warnings
@@ -118,10 +162,11 @@ Acceptance Criteria
 
 The task is complete only if:
 
-string numeric inputs work for POST /orders
-unsafe JSON number dependency is removed from public API inputs
-financial quantities in public API responses are strings
+signed order API model exists
+nonce/deadline validation exists
+signature mode config exists
+disabled mode works for local testing
+strict mode is either correctly implemented or clearly rejected/not enabled
 all tests pass
-no blockchain/database/frontend scope is added
-no Solidity repo is modified
+no blockchain execution is added
 EOF
