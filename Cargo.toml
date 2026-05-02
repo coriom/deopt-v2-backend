@@ -8,8 +8,11 @@ rust-version = "1.75"
 axum = "0.7"
 chrono = { version = "0.4", features = ["serde", "clock"] }
 dotenvy = "0.15"
+k256 = { version = "0.13", features = ["ecdsa"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha3 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "migrate"] }
 thiserror = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal"] }
 tower-http = { version = "0.5", features = ["trace"] }

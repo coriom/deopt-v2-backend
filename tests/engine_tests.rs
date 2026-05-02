@@ -2,12 +2,16 @@ use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use deopt_v2_backend::api::{router, AppState};
 use deopt_v2_backend::engine::{EngineEvent, EngineState};
-use deopt_v2_backend::signing::SignatureVerificationMode;
+use deopt_v2_backend::signing::{Eip712Domain, SignatureVerificationMode, SignedOrder};
 use deopt_v2_backend::types::now_ms;
 use deopt_v2_backend::types::{AccountId, NewOrder, OrderId, OrderStatus, Side, TimeInForce};
+use k256::ecdsa::SigningKey;
+use sha3::{Digest, Keccak256};
 use tower::ServiceExt;
 
 const VALID_SIGNATURE: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const TEST_ONLY_PRIVATE_KEY_HEX: &str =
+    "4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318";
 
 fn new_order(
     market_id: u64,
@@ -433,16 +437,118 @@ async fn post_orders_rejects_malformed_signature() {
 }
 
 #[tokio::test]
-async fn strict_signature_mode_rejects_without_faking_verification() {
+async fn strict_signature_mode_accepts_valid_signed_order() {
     let app = router(AppState::with_signature_mode(
         EngineState::with_default_markets(),
         SignatureVerificationMode::Strict,
     ));
+    let fields = valid_strict_fields(1);
+
+    let response = app
+        .oneshot(json_post("/orders", strict_signed_order_body(&fields)))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = response_json(response).await;
+    assert_eq!(json["status"], "accepted");
+}
+
+#[tokio::test]
+async fn strict_signature_mode_rejects_signer_account_mismatch() {
+    let app = router(AppState::with_signature_mode(
+        EngineState::with_default_markets(),
+        SignatureVerificationMode::Strict,
+    ));
+    let mut fields = valid_strict_fields(2);
+    let signature = strict_signature(&fields);
+    fields.account = "0x0000000000000000000000000000000000000001".to_string();
 
     let response = app
         .oneshot(json_post(
             "/orders",
-            signed_order_body("0xmaker", "sell", "300000000000", "100000000", 1),
+            strict_signed_order_body_with_signature(&fields, &signature),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn strict_signature_mode_rejects_malformed_account_address() {
+    let app = router(AppState::with_signature_mode(
+        EngineState::with_default_markets(),
+        SignatureVerificationMode::Strict,
+    ));
+    let mut fields = valid_strict_fields(3);
+    fields.account = "0xmaker".to_string();
+
+    let response = app
+        .oneshot(json_post(
+            "/orders",
+            strict_signed_order_body_with_signature(&fields, VALID_SIGNATURE),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn strict_signature_mode_rejects_malformed_signature() {
+    let app = router(AppState::with_signature_mode(
+        EngineState::with_default_markets(),
+        SignatureVerificationMode::Strict,
+    ));
+    let fields = valid_strict_fields(4);
+
+    let response = app
+        .oneshot(json_post(
+            "/orders",
+            strict_signed_order_body_with_signature(&fields, "not-a-signature"),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn strict_signature_mode_rejects_tampered_price_after_signing() {
+    let app = router(AppState::with_signature_mode(
+        EngineState::with_default_markets(),
+        SignatureVerificationMode::Strict,
+    ));
+    let mut fields = valid_strict_fields(5);
+    let signature = strict_signature(&fields);
+    fields.price_1e8 = "300100000000".to_string();
+
+    let response = app
+        .oneshot(json_post(
+            "/orders",
+            strict_signed_order_body_with_signature(&fields, &signature),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn strict_signature_mode_rejects_tampered_nonce_after_signing() {
+    let app = router(AppState::with_signature_mode(
+        EngineState::with_default_markets(),
+        SignatureVerificationMode::Strict,
+    ));
+    let mut fields = valid_strict_fields(6);
+    let signature = strict_signature(&fields);
+    fields.nonce = 7;
+
+    let response = app
+        .oneshot(json_post(
+            "/orders",
+            strict_signed_order_body_with_signature(&fields, &signature),
         ))
         .await
         .unwrap();
@@ -513,4 +619,135 @@ fn signed_order_body_with_deadline(
 
 fn future_deadline() -> i64 {
     now_ms() + 60_000
+}
+
+#[derive(Clone, Debug)]
+struct StrictOrderFields {
+    account: String,
+    side: &'static str,
+    price_1e8: String,
+    size_1e8: String,
+    nonce: u64,
+    deadline_ms: i64,
+    client_order_id: String,
+}
+
+fn valid_strict_fields(nonce: u64) -> StrictOrderFields {
+    StrictOrderFields {
+        account: test_account(),
+        side: "sell",
+        price_1e8: "300000000000".to_string(),
+        size_1e8: "100000000".to_string(),
+        nonce,
+        deadline_ms: future_deadline(),
+        client_order_id: format!("strict-client-{nonce}"),
+    }
+}
+
+fn strict_signed_order_body(fields: &StrictOrderFields) -> String {
+    let signature = strict_signature(fields);
+    strict_signed_order_body_with_signature(fields, &signature)
+}
+
+fn strict_signed_order_body_with_signature(fields: &StrictOrderFields, signature: &str) -> String {
+    let StrictOrderFields {
+        account,
+        side,
+        price_1e8,
+        size_1e8,
+        nonce,
+        deadline_ms,
+        client_order_id,
+    } = fields;
+    format!(
+        r#"{{
+            "market_id": 1,
+            "account": "{account}",
+            "side": "{side}",
+            "price_1e8": "{price_1e8}",
+            "size_1e8": "{size_1e8}",
+            "time_in_force": "gtc",
+            "reduce_only": false,
+            "post_only": false,
+            "client_order_id": "{client_order_id}",
+            "nonce": {nonce},
+            "deadline_ms": {deadline_ms},
+            "signature": "{signature}"
+        }}"#
+    )
+}
+
+fn strict_signature(fields: &StrictOrderFields) -> String {
+    let order = SignedOrder {
+        account: AccountId::new(fields.account.clone()),
+        market_id: 1,
+        side: match fields.side {
+            "buy" => Side::Buy,
+            "sell" => Side::Sell,
+            other => panic!("unsupported test side: {other}"),
+        },
+        price_1e8: fields.price_1e8.parse().unwrap(),
+        size_1e8: fields.size_1e8.parse().unwrap(),
+        time_in_force: TimeInForce::Gtc,
+        reduce_only: false,
+        post_only: false,
+        client_order_id: Some(fields.client_order_id.clone()),
+        nonce: fields.nonce,
+        deadline_ms: fields.deadline_ms,
+        signature: String::new(),
+    };
+    let signing_key = test_signing_key();
+    let digest = order.eip712_digest(&Eip712Domain::default()).unwrap();
+    let (signature, recovery_id) = signing_key.sign_prehash_recoverable(&digest).unwrap();
+
+    let mut bytes = Vec::with_capacity(65);
+    let signature_bytes = signature.to_bytes();
+    bytes.extend_from_slice(&signature_bytes);
+    bytes.push(recovery_id.to_byte() + 27);
+    format!("0x{}", hex_encode(&bytes))
+}
+
+fn test_account() -> String {
+    let verifying_key = test_signing_key().verifying_key().to_encoded_point(false);
+    let hash = Keccak256::digest(&verifying_key.as_bytes()[1..]);
+    format!("0x{}", hex_encode(&hash[12..]))
+}
+
+fn test_signing_key() -> SigningKey {
+    let mut bytes = [0u8; 32];
+    decode_hex_to_slice(TEST_ONLY_PRIVATE_KEY_HEX, &mut bytes).unwrap();
+    SigningKey::from_slice(&bytes).unwrap()
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+fn decode_hex_to_slice(hex: &str, out: &mut [u8]) -> std::result::Result<(), ()> {
+    if hex.len() != out.len() * 2 {
+        return Err(());
+    }
+
+    for (index, byte) in out.iter_mut().enumerate() {
+        let high = decode_hex_nibble(hex.as_bytes()[index * 2])?;
+        let low = decode_hex_nibble(hex.as_bytes()[index * 2 + 1])?;
+        *byte = (high << 4) | low;
+    }
+
+    Ok(())
+}
+
+fn decode_hex_nibble(byte: u8) -> std::result::Result<u8, ()> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(()),
+    }
 }

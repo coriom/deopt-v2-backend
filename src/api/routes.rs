@@ -2,9 +2,10 @@ use super::AppState;
 use crate::api::dto::{
     ApiEngineEvent, ApiExecutionIntent, SubmitOrderRequest, SubmitOrderResponse,
 };
+use crate::db::PgRepository;
 use crate::engine::{EngineCommand, EngineEvent};
-use crate::error::BackendError;
-use crate::signing::SignatureVerifier;
+use crate::error::{BackendError, Result as BackendResult};
+use crate::signing::{SignatureVerifier, SignedOrder};
 use crate::types::{now_ms, MarketId, NewOrder, OrderId};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -94,13 +95,21 @@ async fn submit_order(
 ) -> Result<Json<SubmitOrderResponse>, ApiError> {
     let signed_order = request.into_signed_order()?;
     validate_deadline(signed_order.deadline_ms)?;
-    SignatureVerifier::verify(&signed_order, state.signature_verification_mode)?;
+    SignatureVerifier::verify(
+        &signed_order,
+        state.signature_verification_mode,
+        &state.eip712_domain,
+    )?;
 
     {
         let engine = state.engine.lock().map_err(|_| ApiError::internal())?;
         if !engine.has_market(signed_order.market_id) {
             return Err(BackendError::UnknownMarket(signed_order.market_id).into());
         }
+    }
+
+    if let Some(repository) = state.repository.clone() {
+        return submit_order_persistent(state, repository, signed_order).await;
     }
 
     {
@@ -138,6 +147,33 @@ async fn submit_order(
     }))
 }
 
+async fn submit_order_persistent(
+    state: AppState,
+    repository: PgRepository,
+    signed_order: SignedOrder,
+) -> Result<Json<SubmitOrderResponse>, ApiError> {
+    let mut tx = repository.begin().await?;
+    repository
+        .insert_nonce_tx(&mut tx, &signed_order.account, signed_order.nonce, now_ms())
+        .await?;
+
+    let events = {
+        let mut engine = state.engine.lock().map_err(|_| ApiError::internal())?;
+        engine.process(EngineCommand::SubmitOrder(NewOrder::from(
+            signed_order.clone(),
+        )))?
+    };
+
+    repository
+        .persist_submission_tx(&mut tx, &signed_order, &events)
+        .await?;
+    tx.commit()
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+
+    Ok(Json(response_from_events(events)))
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 struct CancelOrderResponse {
     status: String,
@@ -149,8 +185,13 @@ async fn cancel_order(
     Path(order_id): Path<String>,
 ) -> Result<Json<CancelOrderResponse>, ApiError> {
     let order_id = OrderId::from_str(&order_id).map_err(|_| BackendError::InvalidOrderId)?;
-    let mut engine = state.engine.lock().map_err(|_| ApiError::internal())?;
-    let events = engine.process(EngineCommand::CancelOrder { order_id })?;
+    let events = {
+        let mut engine = state.engine.lock().map_err(|_| ApiError::internal())?;
+        engine.process(EngineCommand::CancelOrder { order_id })?
+    };
+    if let Some(repository) = state.repository.clone() {
+        repository.persist_engine_events(&events).await?;
+    }
     let Some(event) = events.into_iter().next() else {
         return Err(ApiError::internal());
     };
@@ -163,6 +204,17 @@ async fn cancel_order(
 async fn execution_intents(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<ApiExecutionIntent>>, ApiError> {
+    if let Some(repository) = state.repository.clone() {
+        return Ok(Json(
+            repository
+                .list_execution_intents()
+                .await?
+                .into_iter()
+                .map(ApiExecutionIntent::from)
+                .collect(),
+        ));
+    }
+
     let engine = state.engine.lock().map_err(|_| ApiError::internal())?;
     Ok(Json(
         engine
@@ -171,6 +223,35 @@ async fn execution_intents(
             .map(ApiExecutionIntent::from)
             .collect(),
     ))
+}
+
+fn response_from_events(events: Vec<EngineEvent>) -> SubmitOrderResponse {
+    let status = if events
+        .iter()
+        .any(|event| matches!(event, EngineEvent::OrderRejected { .. }))
+    {
+        "rejected"
+    } else {
+        "accepted"
+    };
+    let order_id = first_order_id(&events);
+    let execution_intents = events
+        .iter()
+        .filter_map(|event| match event {
+            EngineEvent::ExecutionIntentCreated { intent } => {
+                Some(ApiExecutionIntent::from(intent.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    let events = events.into_iter().map(ApiEngineEvent::from).collect();
+
+    SubmitOrderResponse {
+        status: status.to_string(),
+        order_id,
+        events,
+        execution_intents,
+    }
 }
 
 fn first_order_id(events: &[EngineEvent]) -> Option<OrderId> {
@@ -184,7 +265,7 @@ fn first_order_id(events: &[EngineEvent]) -> Option<OrderId> {
     })
 }
 
-fn validate_deadline(deadline_ms: i64) -> Result<(), BackendError> {
+fn validate_deadline(deadline_ms: i64) -> BackendResult<()> {
     if deadline_ms <= now_ms() {
         return Err(BackendError::DeadlineExpired);
     }
@@ -216,6 +297,10 @@ impl From<BackendError> for ApiError {
             | BackendError::InvalidNonce
             | BackendError::NonceAlreadyUsed
             | BackendError::MalformedSignature
+            | BackendError::MalformedAccountAddress
+            | BackendError::UnsupportedSignatureV
+            | BackendError::SignatureRecoveryFailed
+            | BackendError::SignatureSignerMismatch
             | BackendError::StrictSignatureVerificationUnavailable
             | BackendError::UnknownMarket(_) => StatusCode::BAD_REQUEST,
             BackendError::ZeroPrice
@@ -225,6 +310,7 @@ impl From<BackendError> for ApiError {
             | BackendError::UnsupportedTimeInForce(_)
             | BackendError::UnsupportedCommand(_)
             | BackendError::Config(_) => StatusCode::BAD_REQUEST,
+            BackendError::Persistence(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         Self {
             status,

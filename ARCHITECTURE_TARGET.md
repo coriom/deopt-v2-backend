@@ -125,19 +125,20 @@ Responsibilities:
 11. options orderbook
 12. structured products backend
 
-## Current Task Boundary
+## Current Implemented Boundary
 
-Implement only Phase 1 foundations:
+Implemented Phase 1 foundations:
 - deterministic orderbook
 - perp matching
 - HTTP API
 - execution-intent queue
 - RFQ scaffold
 - MM gateway scaffold
+- EIP-712 order signature validation
+- PostgreSQL persistence V1 for nonces, orders, trades, execution intents, and event audit records
 
 Do not implement:
 - blockchain RPC
-- DB
-- EIP-712
+- on-chain execution database/indexer views
 - real WebSocket MM gateway
 - on-chain execution

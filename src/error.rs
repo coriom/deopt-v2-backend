@@ -33,10 +33,20 @@ pub enum BackendError {
     NonceAlreadyUsed,
     #[error("malformed signature")]
     MalformedSignature,
+    #[error("malformed account address")]
+    MalformedAccountAddress,
+    #[error("unsupported signature v value")]
+    UnsupportedSignatureV,
+    #[error("signature recovery failed")]
+    SignatureRecoveryFailed,
+    #[error("signature signer does not match order account")]
+    SignatureSignerMismatch,
     #[error("strict signature verification is not implemented in this phase")]
     StrictSignatureVerificationUnavailable,
     #[error("unknown market: {0}")]
     UnknownMarket(crate::types::MarketId),
     #[error("configuration error: {0}")]
     Config(String),
+    #[error("persistence error: {0}")]
+    Persistence(String),
 }

@@ -21,9 +21,36 @@ CHAIN_ID=84532
 NETWORK_NAME=base-sepolia
 EXECUTION_ENABLED=false
 SIGNATURE_VERIFICATION_MODE=disabled
+PERSISTENCE_ENABLED=false
+DATABASE_URL=postgres://deopt:deopt@127.0.0.1:5432/deopt_v2_backend
+EIP712_NAME=DeOptV2
+EIP712_VERSION=1
+EIP712_CHAIN_ID=84532
+EIP712_VERIFYING_CONTRACT=0x0000000000000000000000000000000000000000
 ```
 
 `EXECUTION_ENABLED=false` is intentional for this phase.
+`PERSISTENCE_ENABLED=false` keeps the default local in-memory behavior and does not require Postgres.
+
+## Persistence
+
+PostgreSQL persistence is opt-in:
+
+```text
+PERSISTENCE_ENABLED=true
+DATABASE_URL=postgres://deopt:deopt@127.0.0.1:5432/deopt_v2_backend
+```
+
+When enabled, the service connects to Postgres at startup and runs migrations from `migrations/`. The first migration creates `used_nonces`, `orders`, `trades`, `execution_intents`, and `engine_events`.
+
+One local setup option:
+
+```sh
+createdb deopt_v2_backend
+cargo run
+```
+
+If your local Postgres uses a different user, password, host, or database name, set `DATABASE_URL` accordingly. Persistence is required before production executor usage so used nonces and pending execution intents survive restarts, but this repository still does not submit transactions.
 
 ## Test
 
@@ -72,13 +99,13 @@ curl -X DELETE http://127.0.0.1:8080/orders/<order_id>
 
 ## Current Limitations
 
-- In-memory only; restarting clears orders and execution intents.
+- Default mode is in-memory; restarting clears orders and execution intents unless `PERSISTENCE_ENABLED=true`.
 - Perp limit orders only.
 - Public API financial quantities are string-encoded fixed-point integers.
 - `POST /orders` uses a signed-order payload with nonce, deadline, and signature fields.
 - `SIGNATURE_VERIFICATION_MODE=disabled` validates nonce, deadline, and signature shape while skipping cryptographic recovery.
-- `SIGNATURE_VERIFICATION_MODE=strict` rejects orders explicitly until real EIP-712 recovery is implemented.
+- `SIGNATURE_VERIFICATION_MODE=strict` verifies the EIP-712 order digest and recovered secp256k1 signer against `account`.
 - FOK is rejected cleanly.
 - RFQ and market-maker gateway are type scaffolds only.
 - Execution intents are provisional off-chain records, not settlement.
-- No blockchain RPC, ABI encoding, transaction signing, full EIP-712 signature recovery, database, production auth, WebSocket API, or options matching.
+- No blockchain RPC, ABI encoding, transaction signing, production auth, WebSocket API, or options matching.

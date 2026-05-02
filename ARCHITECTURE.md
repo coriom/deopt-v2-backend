@@ -14,10 +14,11 @@ The long-term backend needs low-latency deterministic matching, RFQ, market-make
 - `engine`: Command/event boundary. It owns market orderbooks and the execution-intent queue.
 - `orderbook`: Pure synchronous matching logic with `BTreeMap` price levels and FIFO `VecDeque` ordering.
 - `execution`: Provisional `ExecutionIntent` records plus an in-memory queue. No transaction submission exists.
+- `db`: Optional PostgreSQL persistence for used nonces, submitted orders, matched trades, execution intents, and engine event audit records.
 - `rfq`: RFQ type scaffold only.
 - `mm`: market-maker session, heartbeat, bulk quote, and bulk cancel type scaffold only.
-- `signing`: signed-order schema, deterministic EIP-712 payload boundary, signature mode, deadline validation, and in-memory nonce tracking.
-- `config`: environment loading for host, port, log level, network name, chain id, and disabled execution flag.
+- `signing`: signed-order schema, EIP-712 order hashing, strict secp256k1 signer recovery, signature mode, deadline validation, and in-memory nonce tracking.
+- `config`: environment loading for host, port, log level, network name, chain id, disabled execution flag, signature mode, and opt-in persistence.
 
 ## Current v1 Scope
 
@@ -30,25 +31,25 @@ The long-term backend needs low-latency deterministic matching, RFQ, market-make
 - Order cancellation by `order_id`.
 - Execution-intent creation for every matched trade.
 - HTTP endpoints for health, markets, orderbook, orders, cancellation, and execution intents.
-- Signed-order HTTP boundary with nonce/deadline validation and disabled/strict signature verification modes.
+- Signed-order HTTP boundary with nonce/deadline validation, disabled signature shape checks, and strict EIP-712 signer recovery.
+- Optional PostgreSQL persistence V1 guarded by `PERSISTENCE_ENABLED=false` by default.
 
 ## Future v2/v3 Scope
 
-- Full EIP-712 signature recovery.
 - On-chain executor service.
 - Indexer with reorg handling.
 - WebSocket market data and trading.
 - Real market-maker gateway.
 - RFQ auction/quote lifecycle.
 - Options orderbooks.
-- Persistence and replay storage.
+- Full replay storage and recovery from persisted orderbooks.
 - Risk pre-checks based on indexed protocol state.
 
 ## Order Lifecycle
 
 1. Client submits an order to `POST /orders`.
 2. API parses the signed-order DTO with string fixed-point values.
-3. API validates deadline, signature shape/mode, known market, and per-account nonce.
+3. API validates deadline, signature shape/mode, known market, and per-account nonce. Persistent mode reserves the nonce in Postgres so replay protection survives restart.
 4. API converts the signed order into a typed `NewOrder`.
 5. Engine creates an `OrderId` and timestamp.
 6. Market orderbook validates non-zero price/size and supported time-in-force.
@@ -81,13 +82,21 @@ The current MM module defines session, heartbeat, bulk quote update, and bulk ca
 
 Every matched trade creates an `ExecutionIntent` with buyer, seller, order IDs, market, price, size, timestamp, and `Pending` status. Intents are stored in memory and exposed through `GET /execution-intents`.
 
+## Persistence V1
+
+Persistence is disabled by default. With `PERSISTENCE_ENABLED=false`, the service does not connect to Postgres and retains the original in-memory nonce, orderbook, and execution-intent behavior.
+
+With `PERSISTENCE_ENABLED=true`, startup requires `DATABASE_URL`, connects to Postgres, and runs migrations. The repository persists used nonces, accepted orders, matched trades, execution intents, cancellation/status updates, and a basic `engine_events` audit stream. Persisted nonce uniqueness is scoped to `(account, nonce)`, which prevents replay after restart while still allowing different accounts to use the same nonce.
+
+The in-memory engine remains the live matching state in this V1 patch. Database writes for an order submission use a SQL transaction for nonce insertion and event persistence, but full engine-state rollback/replay around database failure is deferred.
+
 ## Blockchain Execution Boundary
 
 This repository does not execute on-chain transactions in phase 1. It does not call RPC endpoints, encode ABI payloads, sign transactions, load private keys, or mark trades as finally settled. A future executor service can consume intents, simulate calls, submit transactions, and reconcile confirmations with an indexer.
 
 ## Deterministic Replay Assumptions
 
-Matching decisions are deterministic for a given ordered command stream, market set, generated IDs, and timestamps. The pure orderbook uses ordered maps for price priority and FIFO queues for time priority. Durable replay storage is not implemented yet.
+Matching decisions are deterministic for a given ordered command stream, market set, generated IDs, and timestamps. The pure orderbook uses ordered maps for price priority and FIFO queues for time priority. Durable replay from persisted orders is not implemented yet.
 
 ## Safety Assumptions
 
@@ -96,11 +105,11 @@ Matching decisions are deterministic for a given ordered command stream, market 
 - Zero price and zero size are rejected.
 - Self-trade is rejected before fills.
 - Large financial values are represented as integers, not floating point.
-- Disabled signature mode is for local development only; strict mode rejects until real EIP-712 signer recovery is implemented.
+- Disabled signature mode is for local development only; strict mode requires recovered EIP-712 signer equality with `order.account`.
 
 ## Out of Scope
 
-No database, Redis, private key loading, transaction signing, ABI encoding, blockchain RPC, full EIP-712 signature recovery, production authentication, frontend code, TypeScript, Python service code, C++, or Solidity changes.
+No Redis, private key loading, transaction signing, ABI encoding, blockchain RPC, production authentication, frontend code, TypeScript, Python service code, C++, or Solidity changes.
 
 ## Acceptance Criteria
 

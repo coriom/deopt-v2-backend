@@ -1,5 +1,6 @@
 use deopt_v2_backend::api::{router, AppState};
 use deopt_v2_backend::config::AppConfig;
+use deopt_v2_backend::db::PgRepository;
 use deopt_v2_backend::engine::EngineState;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -12,9 +13,23 @@ async fn main() -> deopt_v2_backend::Result<()> {
         .init();
 
     let addr = config.socket_addr()?;
-    let state = AppState::with_signature_mode(
+    let repository = if config.persistence_enabled {
+        let database_url = config.database_url.as_deref().ok_or_else(|| {
+            deopt_v2_backend::error::BackendError::Config(
+                "DATABASE_URL is required when PERSISTENCE_ENABLED=true".to_string(),
+            )
+        })?;
+        let repository = PgRepository::connect(database_url).await?;
+        repository.run_migrations().await?;
+        Some(repository)
+    } else {
+        None
+    };
+    let state = AppState::with_signature_mode_domain_and_repository(
         EngineState::with_default_markets(),
         config.signature_verification_mode,
+        config.eip712_domain.clone(),
+        repository,
     );
     let app = router(state);
 
@@ -25,6 +40,7 @@ async fn main() -> deopt_v2_backend::Result<()> {
         network = %config.network_name,
         execution_enabled = config.execution_enabled,
         signature_verification_mode = ?config.signature_verification_mode,
+        persistence_enabled = config.persistence_enabled,
         "starting http server"
     );
 
