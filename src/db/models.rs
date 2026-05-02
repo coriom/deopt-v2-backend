@@ -186,6 +186,7 @@ pub fn order_status_to_str(status: OrderStatus) -> &'static str {
 pub fn execution_status_to_str(status: ExecutionIntentStatus) -> &'static str {
     match status {
         ExecutionIntentStatus::Pending => "pending",
+        ExecutionIntentStatus::DryRun => "dry_run",
         ExecutionIntentStatus::Submitted => "submitted",
         ExecutionIntentStatus::Confirmed => "confirmed",
         ExecutionIntentStatus::Failed => "failed",
@@ -195,6 +196,7 @@ pub fn execution_status_to_str(status: ExecutionIntentStatus) -> &'static str {
 fn execution_status_from_str(value: &str) -> Result<ExecutionIntentStatus> {
     match value {
         "pending" => Ok(ExecutionIntentStatus::Pending),
+        "dry_run" => Ok(ExecutionIntentStatus::DryRun),
         "submitted" => Ok(ExecutionIntentStatus::Submitted),
         "confirmed" => Ok(ExecutionIntentStatus::Confirmed),
         "failed" => Ok(ExecutionIntentStatus::Failed),

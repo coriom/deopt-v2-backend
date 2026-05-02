@@ -2,12 +2,16 @@ use deopt_v2_backend::api::{router, AppState};
 use deopt_v2_backend::config::AppConfig;
 use deopt_v2_backend::db::PgRepository;
 use deopt_v2_backend::engine::EngineState;
+use deopt_v2_backend::execution::{spawn_executor, Executor};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> deopt_v2_backend::Result<()> {
     let config = AppConfig::from_env()?;
+    config
+        .execution
+        .validate_startup(config.persistence_enabled)?;
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::new(config.rust_log.clone()))
         .init();
@@ -25,20 +29,31 @@ async fn main() -> deopt_v2_backend::Result<()> {
     } else {
         None
     };
-    let state = AppState::with_signature_mode_domain_and_repository(
+    let state = AppState::with_signature_mode_domain_repository_and_execution_config(
         EngineState::with_default_markets(),
         config.signature_verification_mode,
         config.eip712_domain.clone(),
-        repository,
+        repository.clone(),
+        config.execution.clone(),
     );
     let app = router(state);
+
+    if config.execution.execution_enabled {
+        if let Some(repository) = repository.clone() {
+            spawn_executor(
+                Executor::new(config.execution.clone(), repository),
+                config.execution.poll_interval_ms,
+            );
+        }
+    }
 
     info!(
         service = "deopt-v2-backend",
         %addr,
         chain_id = config.chain_id,
         network = %config.network_name,
-        execution_enabled = config.execution_enabled,
+        execution_enabled = config.execution.execution_enabled,
+        executor_dry_run = config.execution.dry_run,
         signature_verification_mode = ?config.signature_verification_mode,
         persistence_enabled = config.persistence_enabled,
         "starting http server"

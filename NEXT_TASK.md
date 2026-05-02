@@ -1,4 +1,4 @@
-# NEXT_TASK.md — Persistence V1 for Orders, Nonces, Trades, and Execution Intents
+# NEXT_TASK.md — On-Chain Executor Scaffold V1
 
 ## Context
 
@@ -9,312 +9,271 @@ Current status:
 - execution intents are created
 - public API uses string fixed-point quantities
 - signed order boundary exists
-- nonce validation exists
-- deadline validation exists
 - strict EIP-712 signature verification works
-- disabled signature mode still works for local development
+- PostgreSQL persistence exists
+- used nonces, orders, trades, and execution intents persist correctly
+- persistence was validated at runtime
+- nonce replay after restart is rejected
 - cargo fmt: OK
 - cargo clippy --all-targets --all-features -- -D warnings: OK
 - cargo test: OK
 - cargo build: OK
 
 Current limitation:
-- orders, used nonces, trades, and execution intents are still in-memory
-- restart loses nonce state
-- restart loses pending execution intents
-- this is not acceptable before on-chain executor integration
+- execution intents are created and persisted but are not yet consumed by an executor
+- no on-chain transaction is built, simulated, or submitted
+- execution intent lifecycle remains stuck at `pending`
 
 ## Goal
 
-Add persistence V1 using PostgreSQL.
+Add an on-chain executor scaffold V1.
 
-This task must persist:
-- submitted orders
-- used nonces
-- matched trades
-- execution intents
-- basic engine events if reasonable
+This task must prepare the executor architecture without creating unsafe production execution.
 
-This task must not implement blockchain execution.
+The executor should:
+- load execution configuration
+- read pending execution intents
+- expose executor status
+- provide a dry-run execution path
+- scaffold transaction construction boundaries
+- update execution intent status safely only in dry-run / scaffold mode
+- never send real transactions unless explicitly enabled in a future task
+
+## Critical Safety Rule
+
+Do not send real blockchain transactions in this task.
+
+This is an executor scaffold, not production execution.
+
+No private key loading yet.
+No transaction signing yet.
+No broadcast yet.
 
 ## Stack
 
-Use Rust async PostgreSQL with:
+Use Rust.
 
-- `sqlx`
-- `postgres`
-- `runtime-tokio-rustls`
-- migrations
+Allowed crates if needed:
+- `alloy-primitives`
+- `alloy-json-rpc`
+- `alloy-provider`
+- `alloy-rpc-types`
+- `alloy-transport-http`
+- `alloy-contract`
+- `url`
 
-Do not use:
-- Diesel
-- Prisma
-- Node.js
+Use the minimal dependency set.
+
+Do not add:
+- ethers-rs unless strongly justified
 - TypeScript
 - Python
+- Node.js
+- frontend code
 
-## Database Configuration
+## Config
 
-Add `.env.example` fields:
+Add or extend `.env.example`:
 
 ```env
-DATABASE_URL=postgres://deopt:deopt@127.0.0.1:5432/deopt_v2_backend
-PERSISTENCE_ENABLED=false
+EXECUTION_ENABLED=false
+EXECUTOR_DRY_RUN=true
+EXECUTOR_POLL_INTERVAL_MS=1000
+EXECUTOR_MAX_BATCH_SIZE=10
+
+RPC_URL=
+PERP_MATCHING_ENGINE_ADDRESS=0x0000000000000000000000000000000000000000
+PERP_ENGINE_ADDRESS=0x0000000000000000000000000000000000000000
 
 Rules:
 
-PERSISTENCE_ENABLED=false should keep current in-memory behavior.
-PERSISTENCE_ENABLED=true should require a valid DATABASE_URL.
-Tests should not require a running Postgres unless explicitly marked/isolated.
-Existing tests must continue passing without Postgres.
-Required Files / Modules
+EXECUTION_ENABLED=false means executor does nothing.
+EXECUTION_ENABLED=true with EXECUTOR_DRY_RUN=true means executor may process pending intents in dry-run mode only.
+EXECUTOR_DRY_RUN=false must be rejected for now with a clear error because real transaction sending is not implemented in this task.
+No private key env vars in this task.
+Required Modules
 
-Add modules such as:
+Add or extend modules such as:
 
-src/db/mod.rs
-src/db/pool.rs
-src/db/models.rs
-src/db/repository.rs
-src/db/migrations.rs optional
+src/execution/config.rs
+src/execution/executor.rs
+src/execution/status.rs
+src/execution/runner.rs
+src/execution/tx_builder.rs
 
-migrations/
-  0001_init.sql
+Adapt names if cleaner.
 
-Adapt naming if a cleaner structure already exists.
+Execution Intent Status Lifecycle
 
-Database Schema Requirements
+Current status:
 
-Create SQL migration with tables:
+pending
 
-used_nonces
+Add or support statuses:
 
-Purpose:
+pending
+dry_run
+submitted
+confirmed
+failed
 
-prevent replay after restart
+In this task:
 
-Fields:
+executor may move pending -> dry_run
+executor must not move to submitted
+executor must not move to confirmed
+failed may be used only for local dry-run/scaffold errors
+Repository Requirements
 
-account TEXT NOT NULL
-nonce BIGINT NOT NULL
-created_at_ms BIGINT NOT NULL
-primary key (account, nonce)
-orders
+Extend persistence repository with methods:
 
-Purpose:
+fetch pending execution intents with limit
+update execution intent status
+optionally append engine/executor event
 
-store submitted orders and their current status
+Example methods:
 
-Fields:
+list_pending_execution_intents(limit: u32)
+update_execution_intent_status(intent_id, status, updated_at_ms)
 
-order_id TEXT PRIMARY KEY
-market_id BIGINT NOT NULL
-account TEXT NOT NULL
-side TEXT NOT NULL
-order_type TEXT NOT NULL
-time_in_force TEXT NOT NULL
-price_1e8 TEXT NOT NULL
-size_1e8 TEXT NOT NULL
-remaining_size_1e8 TEXT NOT NULL
-reduce_only BOOLEAN NOT NULL
-post_only BOOLEAN NOT NULL
-client_order_id TEXT NOT NULL
-nonce BIGINT NOT NULL
-deadline_ms BIGINT NOT NULL
-signature TEXT NOT NULL
-status TEXT NOT NULL
-created_at_ms BIGINT NOT NULL
-updated_at_ms BIGINT NOT NULL
+Keep existing behavior unchanged when persistence is disabled.
 
-Indexes:
+Executor Behavior
 
-(account)
-(market_id)
-(status)
-unique (account, nonce)
-trades
+When EXECUTION_ENABLED=false:
 
-Purpose:
+executor does not start
+API and matching continue working normally
 
-store off-chain matched trades before on-chain confirmation
+When EXECUTION_ENABLED=true and EXECUTOR_DRY_RUN=true:
 
-Fields:
+executor can start a background loop
+it fetches pending intents from DB if persistence is enabled
+it logs what would be executed
+it may update intent status to dry_run
+it does not call contracts
+it does not sign
+it does not broadcast
 
-trade_id TEXT PRIMARY KEY
-market_id BIGINT NOT NULL
-maker_order_id TEXT NOT NULL
-taker_order_id TEXT NOT NULL
-maker_account TEXT NOT NULL
-taker_account TEXT NOT NULL
-price_1e8 TEXT NOT NULL
-size_1e8 TEXT NOT NULL
-buyer TEXT NOT NULL
-seller TEXT NOT NULL
-created_at_ms BIGINT NOT NULL
+When EXECUTION_ENABLED=true and EXECUTOR_DRY_RUN=false:
 
-Indexes:
+startup must fail with a clear error:
+real on-chain execution is not implemented yet
 
-(market_id)
-(maker_account)
-(taker_account)
-(buyer)
-(seller)
-execution_intents
+If persistence is disabled and execution is enabled:
 
-Purpose:
+either reject startup or run a no-op dry-run executor
+prefer rejecting startup with a clear error:
+executor requires persistence enabled
+HTTP API Requirements
 
-store pending on-chain execution work
+Add executor/status endpoint:
 
-Fields:
+GET /executor/status
 
-intent_id TEXT PRIMARY KEY
-market_id BIGINT NOT NULL
-buyer TEXT NOT NULL
-seller TEXT NOT NULL
-price_1e8 TEXT NOT NULL
-size_1e8 TEXT NOT NULL
-buy_order_id TEXT NOT NULL
-sell_order_id TEXT NOT NULL
-status TEXT NOT NULL
-created_at_ms BIGINT NOT NULL
-updated_at_ms BIGINT NOT NULL
+Return:
 
-Indexes:
+{
+  "executionEnabled": false,
+  "dryRun": true,
+  "realBroadcastEnabled": false,
+  "persistenceRequired": true
+}
 
-(status)
-(market_id)
-(buyer)
-(seller)
-engine_events optional
+Add endpoint if simple:
+
+POST /executor/tick
 
 Purpose:
 
-audit trail / replay foundation
+manually process one executor dry-run tick
+useful for tests/local dev
+only allowed in dry-run mode
+no real tx
 
-Fields:
+If this adds too much scope, implement only /executor/status.
 
-event_id TEXT PRIMARY KEY
-event_type TEXT NOT NULL
-payload_json TEXT NOT NULL
-created_at_ms BIGINT NOT NULL
+Transaction Builder Scaffold
 
-If adding this table creates too much scope, scaffold it but do not fully wire it.
+Create a boundary that will later build PerpMatchingEngine calldata.
 
-Persistence Semantics
+For now, it should expose a function like:
 
-When PERSISTENCE_ENABLED=false:
+build_perp_execution_call(intent: &ExecutionIntent) -> Result<PreparedExecutionCall>
 
-current in-memory behavior remains
-no DB connection required
-all existing tests pass
+PreparedExecutionCall should contain:
 
-When PERSISTENCE_ENABLED=true:
+target contract address
+intent id
+market id
+buyer
+seller
+price_1e8
+size_1e8
+placeholder calldata bytes or empty bytes
+clear flag is_placeholder: true
 
-connect to Postgres at startup
-run migrations or clearly document migration command
-persist accepted orders
-persist used nonce atomically with order acceptance
-persist matched trades
-persist execution intents
-update order statuses after fills/cancellations
-Atomicity Requirement
+Do not fake ABI encoding.
 
-For order submission with persistence enabled:
+The function must clearly document that calldata is placeholder until contract ABI integration.
 
-The following must be atomic or clearly protected against partial failure:
+Tests Required
 
-nonce insertion
-order insertion
-matching result persistence
-order status updates
-execution intent insertion
+Normal cargo test must not require RPC or Postgres.
 
-Use a SQL transaction where practical.
+Add tests for:
 
-If full atomic persistence around the engine is too large for this pass:
-
-implement repository methods
-wire only safe persistence points
-document deferred atomic transaction boundary clearly
-
-Do not silently create inconsistent DB state.
-
-Nonce Persistence
-
-Nonce behavior:
-
-reused nonce for same account must be rejected even after restart when persistence is enabled
-same nonce for different accounts is allowed
-nonce uniqueness is per account
-nonce must remain nonzero
-
-Important:
-
-In-memory nonce validation must still work when persistence is disabled.
-Persistent nonce validation must be used when persistence is enabled.
-API Requirements
-
-No route shape changes required.
-
-Keep existing endpoints:
-
-GET /health
-GET /markets
-GET /orderbook/:market_id
-POST /orders
-DELETE /orders/:order_id
-GET /execution-intents
-
-If persistence is enabled:
-
-GET /execution-intents may return persisted intents, in-memory intents, or a merged view.
-Prefer the simplest correct implementation.
-Do not break existing behavior.
-Testing Requirements
-
-Existing tests must continue passing without Postgres.
-
-Add unit tests for:
-
-repository model conversion if possible without DB
 config parsing:
-persistence disabled does not require DATABASE_URL
-persistence enabled requires DATABASE_URL
-nonce behavior remains unchanged in in-memory mode
+execution disabled
+dry-run enabled
+real execution disabled/rejected
+executor status response
+tx builder scaffold produces placeholder call
+dry-run tick with mocked/in-memory repository if feasible
+execution enabled without persistence rejected if implemented
+existing matching/API/persistence config tests still pass
 
-Add optional/integration tests only if they can be safely ignored unless DATABASE_URL is set.
+Do not make normal tests depend on:
 
-Do not make normal cargo test depend on a running database.
-
+Base Sepolia RPC
+Postgres
+private keys
 Documentation Requirements
 
 Update README.md:
 
-explain persistence mode
+explain executor scaffold
+explain dry-run mode
+explain that real broadcast is not implemented
 explain required env vars
-explain migration command
-explain local Postgres setup briefly
-explain that persistence is required before production executor usage
+explain why persistence is required before execution
 
 Update ARCHITECTURE.md:
 
-describe persistence V1
-explain in-memory vs persistent mode
-explain why nonce persistence matters
-state that on-chain execution is still deferred
+describe execution intent lifecycle
+describe executor V1 boundary
+describe future production executor responsibilities:
+contract ABI integration
+simulation
+nonce manager
+gas manager
+signing
+broadcast
+tx/event reconciliation
 Constraints
 
 Do not add:
 
-blockchain RPC
-transaction sending
+real transaction sending
 private key loading
+production executor
+fake ABI encoding
+fake transaction confirmation
 frontend
 TypeScript
 Python
 Node.js
 Solidity changes
-fake on-chain settlement
-fake finality
 
 Do not modify:
 
@@ -324,7 +283,8 @@ Do not introduce:
 
 floating point financial math
 matching semantic changes
-fake transaction confirmation
+fake on-chain settlement
+fake finality
 Validation
 
 Run:
@@ -333,20 +293,21 @@ cargo fmt
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test
 cargo build
-
-If DB integration tests are added, they must be opt-in and documented.
-
 Acceptance Criteria
 
 The task is complete only if:
 
-persistence config exists
-SQL migration exists
-repository layer exists
-used nonces can be persisted when enabled
-orders/trades/execution intents can be persisted when enabled
-existing in-memory mode remains default and passes all tests
-no normal test requires Postgres
+executor config exists
+/executor/status works
+real broadcast remains impossible
+dry-run scaffold exists
+pending execution intents can be fetched for executor processing when persistence is enabled
+intent status can be updated to dry_run
+tx builder boundary exists but does not fake ABI encoding
+normal tests do not require RPC/Postgres
 all validation commands pass
-no blockchain execution is added
+no blockchain transaction execution is added
 EOF
+
+
+after all, run thelegram.py (say nothing, just run and that all)

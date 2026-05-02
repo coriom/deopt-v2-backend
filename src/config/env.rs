@@ -1,4 +1,5 @@
 use crate::error::{BackendError, Result};
+use crate::execution::ExecutionConfig;
 use crate::signing::signature::SignatureVerificationMode;
 use crate::signing::Eip712Domain;
 use crate::types::AccountId;
@@ -12,7 +13,7 @@ pub struct AppConfig {
     pub rust_log: String,
     pub chain_id: u64,
     pub network_name: String,
-    pub execution_enabled: bool,
+    pub execution: ExecutionConfig,
     pub signature_verification_mode: SignatureVerificationMode,
     pub eip712_domain: Eip712Domain,
     pub persistence_enabled: bool,
@@ -31,7 +32,23 @@ impl AppConfig {
         let rust_log = get_env(&mut lookup, "RUST_LOG", "info");
         let chain_id = parse_env(&mut lookup, "CHAIN_ID", "84532")?;
         let network_name = get_env(&mut lookup, "NETWORK_NAME", "base-sepolia");
-        let execution_enabled = parse_env(&mut lookup, "EXECUTION_ENABLED", "false")?;
+        let execution = ExecutionConfig {
+            execution_enabled: parse_env(&mut lookup, "EXECUTION_ENABLED", "false")?,
+            dry_run: parse_env(&mut lookup, "EXECUTOR_DRY_RUN", "true")?,
+            poll_interval_ms: parse_env(&mut lookup, "EXECUTOR_POLL_INTERVAL_MS", "1000")?,
+            max_batch_size: parse_env(&mut lookup, "EXECUTOR_MAX_BATCH_SIZE", "10")?,
+            rpc_url: lookup("RPC_URL").filter(|value| !value.is_empty()),
+            perp_matching_engine_address: AccountId::new(get_env(
+                &mut lookup,
+                "PERP_MATCHING_ENGINE_ADDRESS",
+                "0x0000000000000000000000000000000000000000",
+            )),
+            perp_engine_address: AccountId::new(get_env(
+                &mut lookup,
+                "PERP_ENGINE_ADDRESS",
+                "0x0000000000000000000000000000000000000000",
+            )),
+        };
         let signature_verification_mode =
             parse_env(&mut lookup, "SIGNATURE_VERIFICATION_MODE", "disabled")?;
         let eip712_domain = Eip712Domain {
@@ -52,6 +69,7 @@ impl AppConfig {
                 "DATABASE_URL is required when PERSISTENCE_ENABLED=true".to_string(),
             ));
         }
+        execution.validate_startup(persistence_enabled)?;
 
         Ok(Self {
             host,
@@ -59,7 +77,7 @@ impl AppConfig {
             rust_log,
             chain_id,
             network_name,
-            execution_enabled,
+            execution,
             signature_verification_mode,
             eip712_domain,
             persistence_enabled,
@@ -130,6 +148,79 @@ mod tests {
         assert_eq!(
             config.database_url.as_deref(),
             Some("postgres://deopt:deopt@127.0.0.1:5432/deopt_v2_backend")
+        );
+    }
+
+    #[test]
+    fn execution_disabled_uses_dry_run_defaults() {
+        let config = config_from_pairs([("EXECUTION_ENABLED", "false")]).unwrap();
+
+        assert!(!config.execution.execution_enabled);
+        assert!(config.execution.dry_run);
+        assert_eq!(config.execution.poll_interval_ms, 1_000);
+        assert_eq!(config.execution.max_batch_size, 10);
+        assert_eq!(config.execution.rpc_url, None);
+    }
+
+    #[test]
+    fn dry_run_execution_requires_persistence() {
+        let error = config_from_pairs([
+            ("EXECUTION_ENABLED", "true"),
+            ("EXECUTOR_DRY_RUN", "true"),
+            ("PERSISTENCE_ENABLED", "false"),
+        ])
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("executor requires persistence enabled"));
+    }
+
+    #[test]
+    fn real_execution_is_rejected() {
+        let error = config_from_pairs([
+            ("EXECUTION_ENABLED", "true"),
+            ("EXECUTOR_DRY_RUN", "false"),
+            ("PERSISTENCE_ENABLED", "true"),
+            (
+                "DATABASE_URL",
+                "postgres://deopt:deopt@127.0.0.1:5432/deopt_v2_backend",
+            ),
+        ])
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("real on-chain execution is not implemented yet"));
+    }
+
+    #[test]
+    fn dry_run_execution_with_persistence_is_accepted() {
+        let config = config_from_pairs([
+            ("EXECUTION_ENABLED", "true"),
+            ("EXECUTOR_DRY_RUN", "true"),
+            ("EXECUTOR_POLL_INTERVAL_MS", "250"),
+            ("EXECUTOR_MAX_BATCH_SIZE", "3"),
+            ("RPC_URL", "https://example.invalid"),
+            (
+                "PERP_MATCHING_ENGINE_ADDRESS",
+                "0x0000000000000000000000000000000000000009",
+            ),
+            ("PERSISTENCE_ENABLED", "true"),
+            (
+                "DATABASE_URL",
+                "postgres://deopt:deopt@127.0.0.1:5432/deopt_v2_backend",
+            ),
+        ])
+        .unwrap();
+
+        assert!(config.execution.execution_enabled);
+        assert!(config.execution.dry_run);
+        assert_eq!(config.execution.poll_interval_ms, 250);
+        assert_eq!(config.execution.max_batch_size, 3);
+        assert_eq!(
+            config.execution.rpc_url.as_deref(),
+            Some("https://example.invalid")
         );
     }
 

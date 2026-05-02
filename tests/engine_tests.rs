@@ -556,6 +556,26 @@ async fn strict_signature_mode_rejects_tampered_nonce_after_signing() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
+#[tokio::test]
+async fn executor_status_api_reports_scaffold_flags() {
+    let response = router(AppState::new(EngineState::with_default_markets()))
+        .oneshot(
+            Request::builder()
+                .uri("/executor/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = response_json(response).await;
+    assert_eq!(json["executionEnabled"], false);
+    assert_eq!(json["dryRun"], true);
+    assert_eq!(json["realBroadcastEnabled"], false);
+    assert_eq!(json["persistenceRequired"], true);
+}
+
 fn json_post(uri: &str, body: String) -> Request<Body> {
     Request::builder()
         .method("POST")

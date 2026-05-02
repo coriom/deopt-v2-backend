@@ -1,5 +1,6 @@
 use crate::db::PgRepository;
 use crate::engine::EngineState;
+use crate::execution::ExecutionConfig;
 use crate::signing::{Eip712Domain, NonceStore, SignatureVerificationMode};
 use std::sync::{Arc, Mutex};
 
@@ -10,6 +11,7 @@ pub struct AppState {
     pub signature_verification_mode: SignatureVerificationMode,
     pub eip712_domain: Eip712Domain,
     pub repository: Option<PgRepository>,
+    pub execution_config: ExecutionConfig,
 }
 
 impl AppState {
@@ -47,12 +49,29 @@ impl AppState {
         eip712_domain: Eip712Domain,
         repository: Option<PgRepository>,
     ) -> Self {
+        Self::with_signature_mode_domain_repository_and_execution_config(
+            engine,
+            signature_verification_mode,
+            eip712_domain,
+            repository,
+            ExecutionConfig::disabled(),
+        )
+    }
+
+    pub fn with_signature_mode_domain_repository_and_execution_config(
+        engine: EngineState,
+        signature_verification_mode: SignatureVerificationMode,
+        eip712_domain: Eip712Domain,
+        repository: Option<PgRepository>,
+        execution_config: ExecutionConfig,
+    ) -> Self {
         Self {
             engine: Arc::new(Mutex::new(engine)),
             nonces: Arc::new(Mutex::new(NonceStore::new())),
             signature_verification_mode,
             eip712_domain,
             repository,
+            execution_config,
         }
     }
 }

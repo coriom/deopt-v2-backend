@@ -5,6 +5,7 @@ use crate::api::dto::{
 use crate::db::PgRepository;
 use crate::engine::{EngineCommand, EngineEvent};
 use crate::error::{BackendError, Result as BackendResult};
+use crate::execution::Executor;
 use crate::signing::{SignatureVerifier, SignedOrder};
 use crate::types::{now_ms, MarketId, NewOrder, OrderId};
 use axum::extract::{Path, State};
@@ -24,6 +25,8 @@ pub fn router(state: AppState) -> Router {
         .route("/orders", post(submit_order))
         .route("/orders/:order_id", delete(cancel_order))
         .route("/execution-intents", get(execution_intents))
+        .route("/executor/status", get(executor_status))
+        .route("/executor/tick", post(executor_tick))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -223,6 +226,48 @@ async fn execution_intents(
             .map(ApiExecutionIntent::from)
             .collect(),
     ))
+}
+
+async fn executor_status(State(state): State<AppState>) -> Json<crate::execution::ExecutionStatus> {
+    Json(state.execution_config.status())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct ExecutorTickResponse {
+    #[serde(rename = "pendingSeen")]
+    pending_seen: usize,
+    #[serde(rename = "dryRunUpdated")]
+    dry_run_updated: usize,
+    #[serde(rename = "placeholderCallsPrepared")]
+    placeholder_calls_prepared: usize,
+}
+
+async fn executor_tick(
+    State(state): State<AppState>,
+) -> Result<Json<ExecutorTickResponse>, ApiError> {
+    if !state.execution_config.execution_enabled {
+        return Err(BackendError::Config("execution is disabled".to_string()).into());
+    }
+    if !state.execution_config.dry_run {
+        return Err(BackendError::Config(
+            "real on-chain execution is not implemented yet; set EXECUTOR_DRY_RUN=true".to_string(),
+        )
+        .into());
+    }
+
+    let repository = state
+        .repository
+        .clone()
+        .ok_or_else(|| BackendError::Config("executor requires persistence enabled".to_string()))?;
+    let result = Executor::new(state.execution_config, repository)
+        .tick()
+        .await?;
+
+    Ok(Json(ExecutorTickResponse {
+        pending_seen: result.pending_seen,
+        dry_run_updated: result.dry_run_updated,
+        placeholder_calls_prepared: result.prepared_calls.len(),
+    }))
 }
 
 fn response_from_events(events: Vec<EngineEvent>) -> SubmitOrderResponse {

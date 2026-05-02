@@ -1,12 +1,13 @@
 use super::models::{
-    order_status_to_str, timestamp_to_i64, u64_to_i64, DbExecutionIntent, DbOrder, DbTrade,
+    execution_status_to_str, order_status_to_str, timestamp_to_i64, u64_to_i64, DbExecutionIntent,
+    DbOrder, DbTrade,
 };
 use super::pool;
 use crate::engine::EngineEvent;
 use crate::error::{BackendError, Result};
-use crate::execution::ExecutionIntent;
+use crate::execution::{ExecutionIntent, ExecutionIntentRepository, ExecutionIntentStatus};
 use crate::signing::SignedOrder;
-use crate::types::{now_ms, AccountId, OrderStatus};
+use crate::types::{now_ms, AccountId, OrderStatus, TimestampMs};
 use sqlx::postgres::{PgPool, PgRow};
 use sqlx::{Postgres, Row, Transaction};
 use uuid::Uuid;
@@ -140,6 +141,67 @@ impl PgRepository {
             .map(db_execution_intent_from_row)
             .map(|result| result.and_then(ExecutionIntent::try_from))
             .collect()
+    }
+
+    pub async fn list_pending_execution_intents(&self, limit: u32) -> Result<Vec<ExecutionIntent>> {
+        let rows = sqlx::query(
+            "SELECT intent_id, market_id, buyer, seller, price_1e8, size_1e8, \
+             buy_order_id, sell_order_id, status, created_at_ms, updated_at_ms \
+             FROM execution_intents \
+             WHERE status = 'pending' \
+             ORDER BY created_at_ms ASC, intent_id ASC \
+             LIMIT $1",
+        )
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+
+        rows.into_iter()
+            .map(db_execution_intent_from_row)
+            .map(|result| result.and_then(ExecutionIntent::try_from))
+            .collect()
+    }
+
+    pub async fn update_execution_intent_status(
+        &self,
+        intent_id: Uuid,
+        status: ExecutionIntentStatus,
+        updated_at_ms: TimestampMs,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE execution_intents
+             SET status = $2, updated_at_ms = $3
+             WHERE intent_id = $1",
+        )
+        .bind(intent_id.to_string())
+        .bind(execution_status_to_str(status))
+        .bind(timestamp_to_i64(updated_at_ms))
+        .execute(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        Ok(())
+    }
+}
+
+impl ExecutionIntentRepository for PgRepository {
+    fn list_pending_execution_intents(
+        &self,
+        limit: u32,
+    ) -> crate::execution::RepositoryFuture<'_, Vec<ExecutionIntent>> {
+        Box::pin(async move { PgRepository::list_pending_execution_intents(self, limit).await })
+    }
+
+    fn update_execution_intent_status(
+        &self,
+        intent_id: Uuid,
+        status: ExecutionIntentStatus,
+        updated_at_ms: TimestampMs,
+    ) -> crate::execution::RepositoryFuture<'_, ()> {
+        Box::pin(async move {
+            PgRepository::update_execution_intent_status(self, intent_id, status, updated_at_ms)
+                .await
+        })
     }
 }
 
