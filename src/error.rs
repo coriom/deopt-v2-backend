@@ -23,6 +23,8 @@ pub enum BackendError {
     OrderNotOpen(OrderId),
     #[error("invalid order id")]
     InvalidOrderId,
+    #[error("invalid execution intent id")]
+    InvalidExecutionIntentId,
     #[error("invalid fixed-point value for {field}: {reason}")]
     InvalidFixedPoint { field: String, reason: String },
     #[error("deadline has expired")]
@@ -35,6 +37,8 @@ pub enum BackendError {
     MalformedSignature,
     #[error("trade signatures are required to build executable PerpMatchingEngine calldata")]
     MissingTradeSignatures,
+    #[error("execution intent is missing PerpTrade metadata: {0}")]
+    MissingExecutionMetadata(String),
     #[error("malformed account address")]
     MalformedAccountAddress,
     #[error("unsupported signature v value")]

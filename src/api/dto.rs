@@ -56,6 +56,8 @@ impl From<SignedOrder> for NewOrder {
             reduce_only: order.reduce_only,
             post_only: order.post_only,
             client_order_id: order.client_order_id,
+            signed_nonce: Some(order.nonce),
+            signed_deadline_ms: Some(order.deadline_ms),
         }
     }
 }
@@ -82,6 +84,8 @@ pub struct ApiOrder {
     pub reduce_only: bool,
     pub post_only: bool,
     pub client_order_id: Option<String>,
+    pub signed_nonce: Option<u64>,
+    pub signed_deadline_ms: Option<TimestampMs>,
     pub created_at_ms: TimestampMs,
     pub status: OrderStatus,
 }
@@ -101,6 +105,8 @@ impl From<Order> for ApiOrder {
             reduce_only: order.reduce_only,
             post_only: order.post_only,
             client_order_id: order.client_order_id,
+            signed_nonce: order.signed_nonce,
+            signed_deadline_ms: order.signed_deadline_ms,
             created_at_ms: order.created_at_ms,
             status: order.status,
         }
@@ -114,6 +120,10 @@ pub struct ApiTradeMatch {
     pub taker_order_id: OrderId,
     pub maker_account: AccountId,
     pub taker_account: AccountId,
+    pub maker_nonce: Option<u64>,
+    pub taker_nonce: Option<u64>,
+    pub maker_deadline_ms: Option<TimestampMs>,
+    pub taker_deadline_ms: Option<TimestampMs>,
     pub price_1e8: String,
     pub size_1e8: String,
     pub buyer: AccountId,
@@ -129,6 +139,10 @@ impl From<TradeMatch> for ApiTradeMatch {
             taker_order_id: trade.taker_order_id,
             maker_account: trade.maker_account,
             taker_account: trade.taker_account,
+            maker_nonce: trade.maker_nonce,
+            taker_nonce: trade.taker_nonce,
+            maker_deadline_ms: trade.maker_deadline_ms,
+            taker_deadline_ms: trade.taker_deadline_ms,
             price_1e8: trade.price_1e8.to_string(),
             size_1e8: trade.size_1e8.to_string(),
             buyer: trade.buyer,
@@ -150,6 +164,10 @@ pub struct ApiExecutionIntent {
     pub sell_order_id: OrderId,
     pub created_at_ms: TimestampMs,
     pub status: crate::execution::ExecutionIntentStatus,
+    pub buyer_is_maker: Option<bool>,
+    pub buyer_nonce: Option<u64>,
+    pub seller_nonce: Option<u64>,
+    pub deadline_ms: Option<TimestampMs>,
 }
 
 impl From<ExecutionIntent> for ApiExecutionIntent {
@@ -165,6 +183,10 @@ impl From<ExecutionIntent> for ApiExecutionIntent {
             sell_order_id: intent.sell_order_id,
             created_at_ms: intent.created_at_ms,
             status: intent.status,
+            buyer_is_maker: intent.buyer_is_maker,
+            buyer_nonce: intent.buyer_nonce,
+            seller_nonce: intent.seller_nonce,
+            deadline_ms: intent.deadline_ms,
         }
     }
 }

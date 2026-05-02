@@ -102,6 +102,8 @@ pub struct Order {
     pub reduce_only: bool,
     pub post_only: bool,
     pub client_order_id: Option<String>,
+    pub signed_nonce: Option<u64>,
+    pub signed_deadline_ms: Option<TimestampMs>,
     pub created_at_ms: TimestampMs,
     pub status: OrderStatus,
 }
@@ -117,6 +119,8 @@ pub struct NewOrder {
     pub reduce_only: bool,
     pub post_only: bool,
     pub client_order_id: Option<String>,
+    pub signed_nonce: Option<u64>,
+    pub signed_deadline_ms: Option<TimestampMs>,
 }
 
 impl NewOrder {
@@ -134,6 +138,8 @@ impl NewOrder {
             reduce_only: self.reduce_only,
             post_only: self.post_only,
             client_order_id: self.client_order_id,
+            signed_nonce: self.signed_nonce,
+            signed_deadline_ms: self.signed_deadline_ms,
             created_at_ms,
             status: OrderStatus::New,
         }
@@ -147,6 +153,10 @@ pub struct TradeMatch {
     pub taker_order_id: OrderId,
     pub maker_account: AccountId,
     pub taker_account: AccountId,
+    pub maker_nonce: Option<u64>,
+    pub taker_nonce: Option<u64>,
+    pub maker_deadline_ms: Option<TimestampMs>,
+    pub taker_deadline_ms: Option<TimestampMs>,
     pub price_1e8: Price1e8,
     pub size_1e8: Size1e8,
     pub buyer: AccountId,

@@ -99,6 +99,10 @@ pub struct DbExecutionIntent {
     pub size_1e8: String,
     pub buy_order_id: String,
     pub sell_order_id: String,
+    pub buyer_is_maker: Option<bool>,
+    pub buyer_nonce: Option<i64>,
+    pub seller_nonce: Option<i64>,
+    pub deadline_ms: Option<i64>,
     pub status: String,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
@@ -117,6 +121,16 @@ impl TryFrom<&ExecutionIntent> for DbExecutionIntent {
             size_1e8: intent.size_1e8.to_string(),
             buy_order_id: intent.buy_order_id.to_string(),
             sell_order_id: intent.sell_order_id.to_string(),
+            buyer_is_maker: intent.buyer_is_maker,
+            buyer_nonce: intent
+                .buyer_nonce
+                .map(|value| u64_to_i64("buyer_nonce", value))
+                .transpose()?,
+            seller_nonce: intent
+                .seller_nonce
+                .map(|value| u64_to_i64("seller_nonce", value))
+                .transpose()?,
+            deadline_ms: intent.deadline_ms,
             status: execution_status_to_str(intent.status).to_string(),
             created_at_ms: intent.created_at_ms,
             updated_at_ms: intent.created_at_ms,
@@ -145,6 +159,16 @@ impl TryFrom<DbExecutionIntent> for ExecutionIntent {
                 .map_err(|error| BackendError::Persistence(error.to_string()))?,
             sell_order_id: OrderId::from_str(&value.sell_order_id)
                 .map_err(|error| BackendError::Persistence(error.to_string()))?,
+            buyer_is_maker: value.buyer_is_maker,
+            buyer_nonce: value
+                .buyer_nonce
+                .map(|nonce| i64_to_u64("buyer_nonce", nonce))
+                .transpose()?,
+            seller_nonce: value
+                .seller_nonce
+                .map(|nonce| i64_to_u64("seller_nonce", nonce))
+                .transpose()?,
+            deadline_ms: value.deadline_ms,
             created_at_ms: value.created_at_ms,
             status: execution_status_from_str(&value.status)?,
         })
@@ -239,6 +263,8 @@ mod tests {
             reduce_only: false,
             post_only: true,
             client_order_id: Some("client-1".to_string()),
+            signed_nonce: Some(7),
+            signed_deadline_ms: Some(456),
             created_at_ms: 123,
             status: OrderStatus::PartiallyFilled,
         }

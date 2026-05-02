@@ -31,6 +31,8 @@ fn new_order(
         reduce_only: false,
         post_only: false,
         client_order_id: None,
+        signed_nonce: None,
+        signed_deadline_ms: None,
     }
 }
 
@@ -576,6 +578,191 @@ async fn executor_status_api_reports_scaffold_flags() {
     assert_eq!(json["persistenceRequired"], true);
 }
 
+#[tokio::test]
+async fn signing_payload_endpoint_returns_perp_trade_fields() {
+    let app = router(AppState::new(EngineState::with_default_markets()));
+    let maker = app
+        .clone()
+        .oneshot(json_post(
+            "/orders",
+            signed_order_body(
+                "0x0000000000000000000000000000000000000001",
+                "sell",
+                "300000000000",
+                "100000000",
+                21,
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(maker.status(), StatusCode::OK);
+    let taker = app
+        .clone()
+        .oneshot(json_post(
+            "/orders",
+            signed_order_body(
+                "0x0000000000000000000000000000000000000002",
+                "buy",
+                "300000000000",
+                "50000000",
+                22,
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(taker.status(), StatusCode::OK);
+    let taker_json = response_json(taker).await;
+    let intent_id = taker_json["execution_intents"][0]["intent_id"]
+        .as_str()
+        .unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/execution-intents/{intent_id}/signing-payload"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = response_json(response).await;
+    assert_eq!(json["primary_type"], "PerpTrade");
+    assert_eq!(json["domain"]["name"], "DeOptV2-PerpMatchingEngine");
+    assert_eq!(json["domain"]["version"], "1");
+    assert_eq!(
+        json["message"]["buyer"],
+        "0x0000000000000000000000000000000000000002"
+    );
+    assert_eq!(
+        json["message"]["seller"],
+        "0x0000000000000000000000000000000000000001"
+    );
+    assert_eq!(json["message"]["marketId"], "1");
+    assert_eq!(json["message"]["sizeDelta1e8"], "50000000");
+    assert_eq!(json["message"]["executionPrice1e8"], "300000000000");
+    assert_eq!(json["message"]["buyerIsMaker"], false);
+    assert_eq!(json["message"]["buyerNonce"], "22");
+    assert_eq!(json["message"]["sellerNonce"], "21");
+    assert!(json["digest"].as_str().unwrap().starts_with("0x"));
+}
+
+#[tokio::test]
+async fn signing_payload_missing_nonce_metadata_returns_clear_error() {
+    let state = AppState::new(EngineState::with_default_markets());
+    let intent_id = {
+        let mut engine = state.engine.lock().unwrap();
+        engine
+            .submit_order(new_order(
+                1,
+                "0x0000000000000000000000000000000000000001",
+                Side::Sell,
+                100,
+                10,
+                TimeInForce::Gtc,
+            ))
+            .unwrap();
+        engine
+            .submit_order(new_order(
+                1,
+                "0x0000000000000000000000000000000000000002",
+                Side::Buy,
+                100,
+                10,
+                TimeInForce::Gtc,
+            ))
+            .unwrap();
+        engine.execution_intents()[0].intent_id
+    };
+
+    let response = router(state)
+        .oneshot(
+            Request::builder()
+                .uri(format!("/execution-intents/{intent_id}/signing-payload"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let json = response_json(response).await;
+    assert!(json["error"]
+        .as_str()
+        .unwrap()
+        .contains("missing PerpTrade metadata"));
+}
+
+#[tokio::test]
+async fn signature_endpoint_rejects_malformed_buyer_sig() {
+    let (app, intent_id) = app_with_signed_match().await;
+
+    let response = app
+        .oneshot(json_post(
+            &format!("/execution-intents/{intent_id}/signatures"),
+            format!(
+                r#"{{
+                    "buyer_sig": "0x1234",
+                    "seller_sig": "{}"
+                }}"#,
+                trade_signature(0xbb)
+            ),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn signature_endpoint_rejects_malformed_seller_sig() {
+    let (app, intent_id) = app_with_signed_match().await;
+
+    let response = app
+        .oneshot(json_post(
+            &format!("/execution-intents/{intent_id}/signatures"),
+            format!(
+                r#"{{
+                    "buyer_sig": "{}",
+                    "seller_sig": "not-a-signature"
+                }}"#,
+                trade_signature(0xaa)
+            ),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn submitting_both_trade_signatures_marks_calldata_ready() {
+    let (app, intent_id) = app_with_signed_match().await;
+
+    let response = app
+        .oneshot(json_post(
+            &format!("/execution-intents/{intent_id}/signatures"),
+            format!(
+                r#"{{
+                    "buyer_sig": "{}",
+                    "seller_sig": "{}"
+                }}"#,
+                trade_signature(0xaa),
+                trade_signature(0xbb)
+            ),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = response_json(response).await;
+    assert_eq!(json["buyer_signature_present"], true);
+    assert_eq!(json["seller_signature_present"], true);
+    assert_eq!(json["calldata_ready"], true);
+    assert_eq!(json["missing_signatures"], false);
+}
+
 fn json_post(uri: &str, body: String) -> Request<Body> {
     Request::builder()
         .method("POST")
@@ -583,6 +770,54 @@ fn json_post(uri: &str, body: String) -> Request<Body> {
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(body))
         .unwrap()
+}
+
+async fn app_with_signed_match() -> (axum::Router, String) {
+    let app = router(AppState::new(EngineState::with_default_markets()));
+    let maker = app
+        .clone()
+        .oneshot(json_post(
+            "/orders",
+            signed_order_body(
+                "0x0000000000000000000000000000000000000001",
+                "sell",
+                "300000000000",
+                "100000000",
+                31,
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(maker.status(), StatusCode::OK);
+    let taker = app
+        .clone()
+        .oneshot(json_post(
+            "/orders",
+            signed_order_body(
+                "0x0000000000000000000000000000000000000002",
+                "buy",
+                "300000000000",
+                "50000000",
+                32,
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(taker.status(), StatusCode::OK);
+    let json = response_json(taker).await;
+    let intent_id = json["execution_intents"][0]["intent_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    (app, intent_id)
+}
+
+fn trade_signature(byte: u8) -> String {
+    let mut signature = String::from("0x");
+    for _ in 0..65 {
+        signature.push_str(&format!("{byte:02x}"));
+    }
+    signature
 }
 
 async fn response_json(response: axum::response::Response) -> serde_json::Value {

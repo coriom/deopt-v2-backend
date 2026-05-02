@@ -1,8 +1,10 @@
 use crate::db::PgRepository;
 use crate::engine::EngineState;
-use crate::execution::ExecutionConfig;
+use crate::execution::{ExecutionConfig, StoredTradeSignatures};
 use crate::signing::{Eip712Domain, NonceStore, SignatureVerificationMode};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -10,8 +12,10 @@ pub struct AppState {
     pub nonces: Arc<Mutex<NonceStore>>,
     pub signature_verification_mode: SignatureVerificationMode,
     pub eip712_domain: Eip712Domain,
+    pub chain_id: u64,
     pub repository: Option<PgRepository>,
     pub execution_config: ExecutionConfig,
+    pub trade_signatures: Arc<Mutex<HashMap<Uuid, StoredTradeSignatures>>>,
 }
 
 impl AppState {
@@ -55,6 +59,7 @@ impl AppState {
             eip712_domain,
             repository,
             ExecutionConfig::disabled(),
+            84532,
         )
     }
 
@@ -64,14 +69,17 @@ impl AppState {
         eip712_domain: Eip712Domain,
         repository: Option<PgRepository>,
         execution_config: ExecutionConfig,
+        chain_id: u64,
     ) -> Self {
         Self {
             engine: Arc::new(Mutex::new(engine)),
             nonces: Arc::new(Mutex::new(NonceStore::new())),
             signature_verification_mode,
             eip712_domain,
+            chain_id,
             repository,
             execution_config,
+            trade_signatures: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }

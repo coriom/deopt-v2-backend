@@ -35,6 +35,7 @@ async fn main() -> deopt_v2_backend::Result<()> {
         config.eip712_domain.clone(),
         repository.clone(),
         config.execution.clone(),
+        config.chain_id,
     );
     let app = router(state);
 

@@ -31,6 +31,8 @@ fn new_order(
         reduce_only: false,
         post_only,
         client_order_id: Some(format!("client-{id}")),
+        signed_nonce: None,
+        signed_deadline_ms: None,
     }
     .into_order(order_id(id), id as i64)
 }

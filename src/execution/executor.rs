@@ -1,5 +1,9 @@
 use super::config::ExecutionConfig;
-use super::tx_builder::{preview_perp_execution_call_from_intent, PreparedExecutionCall};
+use super::tx_builder::{
+    build_perp_execution_call_from_intent, preview_perp_execution_call_from_intent,
+    PreparedExecutionCall,
+};
+use super::StoredTradeSignatures;
 use super::{ExecutionIntent, ExecutionIntentStatus};
 use crate::error::{BackendError, Result};
 use crate::types::{now_ms, TimestampMs};
@@ -22,6 +26,11 @@ pub trait ExecutionIntentRepository: Clone + Send + Sync {
         status: ExecutionIntentStatus,
         updated_at_ms: TimestampMs,
     ) -> RepositoryFuture<'_, ()>;
+
+    fn get_execution_intent_signatures(
+        &self,
+        intent_id: Uuid,
+    ) -> RepositoryFuture<'_, StoredTradeSignatures>;
 }
 
 #[derive(Clone)]
@@ -56,10 +65,22 @@ where
         let mut prepared_calls = Vec::with_capacity(intents.len());
 
         for intent in &intents {
-            let prepared_call = preview_perp_execution_call_from_intent(
-                intent,
-                &self.config.perp_matching_engine_address,
-            )?;
+            let signatures = self
+                .repository
+                .get_execution_intent_signatures(intent.intent_id)
+                .await?;
+            let prepared_call = (if signatures.calldata_ready() {
+                build_perp_execution_call_from_intent(
+                    intent,
+                    &self.config.perp_matching_engine_address,
+                    &signatures,
+                )
+            } else {
+                preview_perp_execution_call_from_intent(
+                    intent,
+                    &self.config.perp_matching_engine_address,
+                )
+            })?;
             info!(
                 intent_id = %intent.intent_id,
                 market_id = intent.market_id,
@@ -169,6 +190,13 @@ mod tests {
             };
             Box::pin(async move { result })
         }
+
+        fn get_execution_intent_signatures(
+            &self,
+            _intent_id: Uuid,
+        ) -> RepositoryFuture<'_, StoredTradeSignatures> {
+            Box::pin(async { Ok(StoredTradeSignatures::default()) })
+        }
     }
 
     #[tokio::test]
@@ -182,6 +210,10 @@ mod tests {
             size_1e8: 10,
             buy_order_id: OrderId(Uuid::from_u128(2)),
             sell_order_id: OrderId(Uuid::from_u128(3)),
+            buyer_is_maker: Some(false),
+            buyer_nonce: Some(11),
+            seller_nonce: Some(12),
+            deadline_ms: Some(123_456),
             created_at_ms: 123,
             status: ExecutionIntentStatus::Pending,
         };

@@ -1,6 +1,8 @@
 use crate::error::Result;
 use crate::execution::abi::encode_execute_trade_calldata;
-use crate::execution::{ExecutionIntent, PerpTradePayload, PerpTradeSignatureBundle};
+use crate::execution::{
+    ExecutionIntent, PerpTradePayload, PerpTradeSignatureBundle, StoredTradeSignatures,
+};
 use crate::signing::eip712::parse_evm_address;
 use crate::types::AccountId;
 use uuid::Uuid;
@@ -71,11 +73,23 @@ pub fn preview_perp_execution_call_from_intent(
     })
 }
 
+pub fn build_perp_execution_call_from_intent(
+    intent: &ExecutionIntent,
+    target: &AccountId,
+    signatures: &StoredTradeSignatures,
+) -> Result<PreparedExecutionCall> {
+    let Some(bundle) = signatures.bundle()? else {
+        return preview_perp_execution_call_from_intent(intent, target);
+    };
+    let payload = intent.perp_trade_payload()?;
+    build_perp_execution_call(target, intent.intent_id, &payload, Some(&bundle))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::execution::abi::execute_trade_selector;
-    use crate::execution::ExecutionIntentStatus;
+    use crate::execution::{ExecutionIntentStatus, StoredTradeSignatures};
     use crate::types::OrderId;
 
     #[test]
@@ -119,6 +133,10 @@ mod tests {
             size_1e8: 100_000_000,
             buy_order_id: OrderId(Uuid::from_u128(2)),
             sell_order_id: OrderId(Uuid::from_u128(3)),
+            buyer_is_maker: Some(false),
+            buyer_nonce: Some(11),
+            seller_nonce: Some(12),
+            deadline_ms: Some(4_102_444_800),
             created_at_ms: 123,
             status: ExecutionIntentStatus::Pending,
         };
@@ -132,6 +150,42 @@ mod tests {
         assert!(call.missing_signatures);
         assert!(call.calldata.is_empty());
         assert!(!call.is_broadcastable);
+    }
+
+    #[test]
+    fn tx_builder_builds_calldata_only_when_both_signatures_exist() {
+        let intent = intent();
+        let mut signatures = StoredTradeSignatures::default();
+        signatures.upsert(Some(signature_hex(0xaa)), None).unwrap();
+        let preview =
+            build_perp_execution_call_from_intent(&intent, &target(), &signatures).unwrap();
+        assert!(preview.missing_signatures);
+        assert!(preview.calldata.is_empty());
+
+        signatures.upsert(None, Some(signature_hex(0xbb))).unwrap();
+        let call = build_perp_execution_call_from_intent(&intent, &target(), &signatures).unwrap();
+        assert!(!call.missing_signatures);
+        assert!(!call.calldata.is_empty());
+        assert!(!call.is_broadcastable);
+    }
+
+    fn intent() -> ExecutionIntent {
+        ExecutionIntent {
+            intent_id: Uuid::from_u128(1),
+            market_id: 7,
+            buyer: AccountId::new("0x0000000000000000000000000000000000000001"),
+            seller: AccountId::new("0x0000000000000000000000000000000000000002"),
+            price_1e8: 300_000_000_000,
+            size_1e8: 100_000_000,
+            buy_order_id: OrderId(Uuid::from_u128(2)),
+            sell_order_id: OrderId(Uuid::from_u128(3)),
+            buyer_is_maker: Some(false),
+            buyer_nonce: Some(11),
+            seller_nonce: Some(12),
+            deadline_ms: Some(4_102_444_800),
+            created_at_ms: 123,
+            status: ExecutionIntentStatus::Pending,
+        }
     }
 
     fn payload() -> PerpTradePayload {

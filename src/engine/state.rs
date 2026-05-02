@@ -144,6 +144,16 @@ fn intent_from_trade(trade: &TradeMatch) -> ExecutionIntent {
     } else {
         (trade.maker_order_id, trade.taker_order_id)
     };
+    let buyer_is_maker = trade.buyer == trade.maker_account;
+    let (buyer_nonce, seller_nonce) = if buyer_is_maker {
+        (trade.maker_nonce, trade.taker_nonce)
+    } else {
+        (trade.taker_nonce, trade.maker_nonce)
+    };
+    let deadline_ms = match (trade.maker_deadline_ms, trade.taker_deadline_ms) {
+        (Some(maker_deadline), Some(taker_deadline)) => Some(maker_deadline.min(taker_deadline)),
+        _ => None,
+    };
 
     ExecutionIntent {
         intent_id: Uuid::new_v4(),
@@ -154,6 +164,10 @@ fn intent_from_trade(trade: &TradeMatch) -> ExecutionIntent {
         size_1e8: trade.size_1e8,
         buy_order_id,
         sell_order_id,
+        buyer_is_maker: Some(buyer_is_maker),
+        buyer_nonce,
+        seller_nonce,
+        deadline_ms,
         created_at_ms: trade.created_at_ms,
         status: ExecutionIntentStatus::Pending,
     }

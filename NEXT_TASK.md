@@ -1,261 +1,226 @@
 # NEXT_TASK.md — PerpMatchingEngine Calldata Builder V1
+# NEXT_TASK.md — Matched PerpTrade Signature Flow V1
 
 ## Context
 
-The Rust backend now has:
+The backend now has:
 - deterministic matching
-- execution intents
 - strict EIP-712 order verification
 - PostgreSQL persistence
 - dry-run executor scaffold
+- real ABI calldata builder for PerpMatchingEngine.executeTrade
 
-The Solidity target for perp execution is:
+Important Solidity constraint:
+- PerpMatchingEngine does not verify order signatures.
+- It verifies buyerSig and sellerSig over the final matched PerpTrade.
+- Therefore, existing signed order signatures are not sufficient for execution.
 
-- Contract: `PerpMatchingEngine`
-- Function: `executeTrade(PerpTrade calldata t, bytes calldata buyerSig, bytes calldata sellerSig)`
-- EIP-712 domain:
-  - name: `DeOptV2-PerpMatchingEngine`
-  - version: `1`
+## Goal
 
-Solidity struct:
+Add a signature collection flow for matched PerpTrade execution.
 
-```solidity
-struct PerpTrade {
-    address buyer;
-    address seller;
-    uint256 marketId;
-    uint128 sizeDelta1e8;
-    uint128 executionPrice1e8;
-    bool buyerIsMaker;
-    uint256 buyerNonce;
-    uint256 sellerNonce;
-    uint256 deadline;
-}
+The backend must:
+- expose the final PerpTrade payload that buyer and seller must sign
+- accept buyer/seller trade signatures
+- validate signature shape
+- persist signatures
+- mark an execution intent as calldata-ready when both signatures are present
+- build real calldata only when both signatures are present
+- still not broadcast transactions
 
-Typehash:
-
-PerpTrade(address buyer,address seller,uint256 marketId,uint128 sizeDelta1e8,uint128 executionPrice1e8,bool buyerIsMaker,uint256 buyerNonce,uint256 sellerNonce,uint256 deadline)
-
-The contract:
-
-requires caller to be an authorized executor
-verifies buyerSig and sellerSig over the exact same PerpTrade digest
-consumes on-chain nonces
-calls perpEngine.applyTrade(...)
-Goal
-
-Implement a real calldata builder boundary for PerpMatchingEngine.executeTrade.
-
-This task must:
-
-define the Rust representation of PerpTrade
-map backend ExecutionIntent into a PerpTrade candidate
-encode calldata for executeTrade
-keep broadcast impossible
-keep private key loading impossible
-keep transaction submission impossible
-Critical Design Note
-
-The backend currently verifies signed off-chain orders.
-
-The Solidity contract expects signatures over the final matched PerpTrade.
-
-Therefore, this task must not pretend that existing order signatures are valid PerpTrade signatures.
-
-For now:
-
-buyerSig and sellerSig must be explicit fields supplied to the builder or placeholder-empty with signatures_missing=true
-calldata may be built only when both trade signatures are present
-otherwise the builder should return a clear MissingTradeSignatures error or produce a non-executable preview object
-
-Do not fake buyerSig/sellerSig.
-
-Scope
+## Scope
 
 Implement:
-
-PerpTradePayload
-PerpTradeSignatureBundle
-PreparedExecutionCall
-ABI calldata encoding for executeTrade
-deterministic tests for encoding shape
-executor dry-run should report whether intent is calldata-ready or missing signatures
+- signing payload endpoint
+- signature submission endpoint
+- persistence for trade signatures
+- calldata-ready status/metadata
+- dry-run executor awareness of missing/present signatures
 
 Do not implement:
+- RPC simulation
+- transaction signing
+- transaction broadcast
+- private key loading
+- indexer
+- Solidity changes
 
-RPC simulation
-eth_call
-signing
-private key loading
-broadcast
-transaction status transitions to submitted/confirmed
-indexer
-Solidity changes
-Suggested Modules
+## Required API
 
-Add or extend:
+Add:
 
-src/execution/perp_trade.rs
-src/execution/abi.rs
-src/execution/tx_builder.rs
+```text
+GET /execution-intents/:intent_id/signing-payload
+POST /execution-intents/:intent_id/signatures
+GET /execution-intents/:intent_id/signing-payload
 
-Keep names clean if existing structure differs.
+Returns the PerpTrade payload to sign.
 
-Required Data Model
-PerpTradePayload
+Response should include:
 
-Fields:
-
-buyer
-seller
-market_id
-size_delta_1e8
-execution_price_1e8
-buyer_is_maker
-buyer_nonce
-seller_nonce
-deadline
-
-Types:
-
-addresses must be valid EVM addresses
-market_id: u128 or U256-compatible
-size_delta_1e8: u128
-execution_price_1e8: u128
-buyer_nonce: u128/U256-compatible
-seller_nonce: u128/U256-compatible
-deadline: u128/U256-compatible
-PerpTradeSignatureBundle
-
-Fields:
-
-buyer_sig
-seller_sig
-
-Rules:
-
-each signature must be 0x + 65-byte hex
-no fake signatures
-PreparedExecutionCall
-
-Fields:
-
-target
-function_name
 intent_id
-market_id
+eip712 domain:
+name: DeOptV2-PerpMatchingEngine
+version: 1
+chainId
+verifyingContract
+type name: PerpTrade
+type fields
+message:
 buyer
 seller
-value
-calldata
-is_broadcastable
-missing_signatures
+marketId
+sizeDelta1e8
+executionPrice1e8
+buyerIsMaker
+buyerNonce
+sellerNonce
+deadline
+digest if available from backend implementation
 
-Rules:
+Important:
 
-target = PERP_MATCHING_ENGINE_ADDRESS
-function_name = executeTrade
-value = 0
-is_broadcastable=false for this task
-missing_signatures=true if signatures are not provided
-ABI Encoding
-
-Use an idiomatic Rust ABI encoding crate.
+Do not invent buyerNonce/sellerNonce silently.
+If the backend does not yet know buyerNonce/sellerNonce/deadline, return a clear error or require them to be stored with the intent.
 
 Preferred:
 
-alloy-primitives
-alloy-sol-types
+extend execution intent metadata to include:
+buyer_nonce
+seller_nonce
+deadline
+buyer_is_maker
 
-Define the Solidity call equivalent to:
+If current ExecutionIntent lacks these fields, add a minimal backwards-compatible execution metadata table or nullable columns.
 
-function executeTrade(
-    PerpTrade calldata t,
-    bytes calldata buyerSig,
-    bytes calldata sellerSig
-)
+POST /execution-intents/:intent_id/signatures
 
-Where PerpTrade is:
+Request:
 
-(address,address,uint256,uint128,uint128,bool,uint256,uint256,uint256)
+{
+  "buyer_sig": "0x...",
+  "seller_sig": "0x..."
+}
 
-Do not hand-roll ABI encoding if alloy can do it cleanly.
+Rules:
 
-Config
+allow submitting both at once
+optionally allow one side at a time if simple
+validate 0x + 65-byte hex
+persist signatures
+do not fake cryptographic verification unless implemented
+after both signatures exist, builder can produce calldata
 
-Ensure .env.example includes:
+Response:
 
-PERP_MATCHING_ENGINE_ADDRESS=0x0000000000000000000000000000000000000000
+intent_id
+buyer_signature_present
+seller_signature_present
+calldata_ready
+missing_signatures
+Persistence Requirements
 
-If already present, keep it.
+Add table or columns for trade signatures.
 
-ExecutionIntent Mapping
+Preferred table:
 
-From current ExecutionIntent:
+CREATE TABLE execution_intent_signatures (
+    intent_id TEXT PRIMARY KEY REFERENCES execution_intents(intent_id) ON DELETE CASCADE,
+    buyer_sig TEXT,
+    seller_sig TEXT,
+    updated_at_ms BIGINT NOT NULL
+);
 
-buyer = intent.buyer
-seller = intent.seller
-marketId = intent.market_id
-sizeDelta1e8 = intent.size_1e8
-executionPrice1e8 = intent.price_1e8
+If adding columns to execution_intents is cleaner, acceptable.
 
-For now, buyerIsMaker, buyerNonce, sellerNonce, and deadline may not be present in current ExecutionIntent.
+Need migration:
 
-Handle this explicitly:
+migrations/0002_execution_intent_signatures.sql
 
-do not silently invent values
-add fields if necessary to the intent model only if clean and backwards-compatible
-otherwise make the builder require an explicit PerpTradePayload
+Normal tests must not require Postgres.
 
-Preferred for this task:
+PerpTrade Payload Requirements
 
-create builder from explicit PerpTradePayload
-create a separate preview mapper from ExecutionIntent that marks missing fields
+A PerpTrade requires:
+
+buyer
+seller
+marketId
+sizeDelta1e8
+executionPrice1e8
+buyerIsMaker
+buyerNonce
+sellerNonce
+deadline
+
+ExecutionIntent currently has:
+
+buyer
+seller
+market_id
+price_1e8
+size_1e8
+buy_order_id
+sell_order_id
+
+Missing:
+
+buyerIsMaker
+buyerNonce
+sellerNonce
+deadline
+
+For this phase:
+
+derive buyerIsMaker from maker/taker if available, or store it explicitly when intent is created
+derive buyerNonce/sellerNonce from original signed orders if available, or store them explicitly when intent is created
+set deadline from a clear execution deadline policy or original order deadlines if available
+
+Do not silently use zero deadline/nonces unless documented and tested.
+
+Builder Integration
+
+Update the tx builder:
+
+if signatures missing: return preview with missing_signatures=true
+if signatures present: build real calldata
+still is_broadcastable=false
 Tests Required
 
 Add tests for:
 
-PerpTradePayload validates addresses
-invalid buyer address rejected
-invalid seller address rejected
-missing signatures are detected
-malformed signatures rejected
-calldata builder creates non-empty calldata with valid signatures
-calldata selector matches executeTrade((address,address,uint256,uint128,uint128,bool,uint256,uint256,uint256),bytes,bytes)
-prepared call target equals configured PerpMatchingEngine address
-prepared call remains is_broadcastable=false
-existing executor/status tests still pass
-existing matching tests still pass
+signing payload endpoint returns expected PerpTrade fields
+missing nonce/deadline metadata returns clear error if not implemented
+signature endpoint rejects malformed buyer_sig
+signature endpoint rejects malformed seller_sig
+submitting both signatures marks calldata_ready
+tx builder builds calldata only when both signatures exist
+missing signatures produce non-executable preview
+existing tests still pass
 
-No tests may require:
+No normal test may require:
 
-RPC
 Postgres
+RPC
 private keys
 Base Sepolia
 Documentation
 
 Update README.md and ARCHITECTURE.md:
 
-explain calldata builder V1
-explain that PerpMatchingEngine requires signatures over matched PerpTrade
-explain that order signatures are not the same as trade signatures
-explain that broadcast remains disabled
-explain next steps:
-obtain trade signatures
-RPC simulation
-broadcast
-indexer reconciliation
+order signatures vs PerpTrade signatures
+why second signature flow exists
+endpoint usage
+no broadcast yet
+next phase is RPC simulation
 Constraints
 
 Do not add:
 
-real transaction sending
+transaction broadcast
 private key loading
 RPC simulation
-fake signatures
-fake ABI encoding
-fake confirmation
+indexer
 frontend
 TypeScript
 Python
@@ -266,11 +231,12 @@ Do not modify:
 
 ~/DEOPT/deoptv2
 
-Do not change:
+Do not fake:
 
-matching semantics
-financial numeric rules
-EIP-712 order verification behavior
+signatures
+calldata readiness
+on-chain confirmation
+broadcast
 Validation
 
 Run:
@@ -281,14 +247,15 @@ cargo test
 cargo build
 Acceptance Criteria
 
-The task is complete only if:
+Complete only if:
 
-real ABI calldata can be built for PerpMatchingEngine.executeTrade
-builder requires explicit buyerSig and sellerSig for executable calldata
-missing trade signatures are not faked
-broadcast remains impossible
+signing payload endpoint exists
+signature submission endpoint exists
+signatures can be persisted or tracked
+calldata readiness depends on both signatures
+no broadcast exists
 all tests pass
-no RPC/Postgres/private keys are required for normal tests
 EOF
 
-after all, run thelegram.py (say nothing, just run and that all)
+after all, 
+## run thelegram.py (say nothing, just run and that all)

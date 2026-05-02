@@ -1,6 +1,7 @@
 use crate::error::{BackendError, Result};
-use crate::signing::eip712::parse_evm_address;
+use crate::signing::eip712::{keccak256, parse_evm_address, EIP712_DOMAIN_TYPE};
 use crate::types::AccountId;
+use serde::Serialize;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PerpTradePayload {
@@ -71,6 +72,106 @@ impl PerpTradeSignatureBundle {
     }
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct StoredTradeSignatures {
+    pub buyer_sig: Option<String>,
+    pub seller_sig: Option<String>,
+}
+
+impl StoredTradeSignatures {
+    pub fn upsert(&mut self, buyer_sig: Option<String>, seller_sig: Option<String>) -> Result<()> {
+        if let Some(signature) = buyer_sig {
+            validate_signature_hex(&signature)?;
+            self.buyer_sig = Some(signature);
+        }
+        if let Some(signature) = seller_sig {
+            validate_signature_hex(&signature)?;
+            self.seller_sig = Some(signature);
+        }
+        Ok(())
+    }
+
+    pub fn buyer_signature_present(&self) -> bool {
+        self.buyer_sig.is_some()
+    }
+
+    pub fn seller_signature_present(&self) -> bool {
+        self.seller_sig.is_some()
+    }
+
+    pub fn calldata_ready(&self) -> bool {
+        self.buyer_signature_present() && self.seller_signature_present()
+    }
+
+    pub fn missing_signatures(&self) -> bool {
+        !self.calldata_ready()
+    }
+
+    pub fn bundle(&self) -> Result<Option<PerpTradeSignatureBundle>> {
+        let Some(buyer_sig) = self.buyer_sig.as_deref() else {
+            return Ok(None);
+        };
+        let Some(seller_sig) = self.seller_sig.as_deref() else {
+            return Ok(None);
+        };
+        Ok(Some(PerpTradeSignatureBundle::new(buyer_sig, seller_sig)?))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct TradeSignatureStatus {
+    pub buyer_signature_present: bool,
+    pub seller_signature_present: bool,
+    pub calldata_ready: bool,
+    pub missing_signatures: bool,
+}
+
+impl From<&StoredTradeSignatures> for TradeSignatureStatus {
+    fn from(value: &StoredTradeSignatures) -> Self {
+        Self {
+            buyer_signature_present: value.buyer_signature_present(),
+            seller_signature_present: value.seller_signature_present(),
+            calldata_ready: value.calldata_ready(),
+            missing_signatures: value.missing_signatures(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PerpTradeDomain {
+    pub name: String,
+    pub version: String,
+    pub chain_id: u64,
+    pub verifying_contract: AccountId,
+}
+
+impl PerpTradeDomain {
+    pub fn new(chain_id: u64, verifying_contract: AccountId) -> Self {
+        Self {
+            name: "DeOptV2-PerpMatchingEngine".to_string(),
+            version: "1".to_string(),
+            chain_id,
+            verifying_contract,
+        }
+    }
+}
+
+pub const PERP_TRADE_TYPE: &str = "PerpTrade(address buyer,address seller,uint256 marketId,uint128 sizeDelta1e8,uint128 executionPrice1e8,bool buyerIsMaker,uint256 buyerNonce,uint256 sellerNonce,uint256 deadline)";
+
+pub fn perp_trade_digest(payload: &PerpTradePayload, domain: &PerpTradeDomain) -> Result<String> {
+    let domain_separator = domain_separator(domain)?;
+    let trade_hash = perp_trade_hash(payload)?;
+    let mut encoded = Vec::with_capacity(66);
+    encoded.extend_from_slice(b"\x19\x01");
+    encoded.extend_from_slice(&domain_separator);
+    encoded.extend_from_slice(&trade_hash);
+    Ok(hex_0x(&keccak256(&encoded)))
+}
+
+fn validate_signature_hex(signature: &str) -> Result<()> {
+    decode_signature(signature).map(|_| ())
+}
+
 fn decode_signature(signature: &str) -> Result<Vec<u8>> {
     let Some(hex) = signature.strip_prefix("0x") else {
         return Err(BackendError::MalformedSignature);
@@ -82,6 +183,75 @@ fn decode_signature(signature: &str) -> Result<Vec<u8>> {
     let mut bytes = vec![0u8; 65];
     decode_hex_to_slice(hex, &mut bytes).map_err(|_| BackendError::MalformedSignature)?;
     Ok(bytes)
+}
+
+fn domain_separator(domain: &PerpTradeDomain) -> Result<[u8; 32]> {
+    let verifying_contract = parse_evm_address(&domain.verifying_contract)?;
+    let mut encoded = Vec::with_capacity(160);
+    encoded.extend_from_slice(&keccak256(EIP712_DOMAIN_TYPE.as_bytes()));
+    encoded.extend_from_slice(&keccak256(domain.name.as_bytes()));
+    encoded.extend_from_slice(&keccak256(domain.version.as_bytes()));
+    encoded.extend_from_slice(&encode_u64(domain.chain_id));
+    encoded.extend_from_slice(&encode_address(&verifying_contract));
+    Ok(keccak256(&encoded))
+}
+
+fn perp_trade_hash(payload: &PerpTradePayload) -> Result<[u8; 32]> {
+    payload.validate()?;
+    let buyer = parse_evm_address(&payload.buyer)?;
+    let seller = parse_evm_address(&payload.seller)?;
+
+    let mut encoded = Vec::with_capacity(320);
+    encoded.extend_from_slice(&keccak256(PERP_TRADE_TYPE.as_bytes()));
+    encoded.extend_from_slice(&encode_address(&buyer));
+    encoded.extend_from_slice(&encode_address(&seller));
+    encoded.extend_from_slice(&encode_u128(payload.market_id));
+    encoded.extend_from_slice(&encode_u128(payload.size_delta_1e8));
+    encoded.extend_from_slice(&encode_u128(payload.execution_price_1e8));
+    encoded.extend_from_slice(&encode_bool(payload.buyer_is_maker));
+    encoded.extend_from_slice(&encode_u128(payload.buyer_nonce));
+    encoded.extend_from_slice(&encode_u128(payload.seller_nonce));
+    encoded.extend_from_slice(&encode_u128(payload.deadline));
+    Ok(keccak256(&encoded))
+}
+
+fn encode_address(address: &[u8; 20]) -> [u8; 32] {
+    let mut word = [0u8; 32];
+    word[12..].copy_from_slice(address);
+    word
+}
+
+fn encode_bool(value: bool) -> [u8; 32] {
+    encode_u8(u8::from(value))
+}
+
+fn encode_u8(value: u8) -> [u8; 32] {
+    let mut word = [0u8; 32];
+    word[31] = value;
+    word
+}
+
+fn encode_u64(value: u64) -> [u8; 32] {
+    let mut word = [0u8; 32];
+    word[24..].copy_from_slice(&value.to_be_bytes());
+    word
+}
+
+fn encode_u128(value: u128) -> [u8; 32] {
+    let mut word = [0u8; 32];
+    word[16..].copy_from_slice(&value.to_be_bytes());
+    word
+}
+
+fn hex_0x(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(2 + bytes.len() * 2);
+    encoded.push_str("0x");
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
 }
 
 fn decode_hex_to_slice(hex: &str, out: &mut [u8]) -> std::result::Result<(), ()> {
@@ -159,6 +329,34 @@ mod tests {
         let error = PerpTradeSignatureBundle::new("0x1234", &signature_hex(0xbb)).unwrap_err();
 
         assert!(matches!(error, BackendError::MalformedSignature));
+    }
+
+    #[test]
+    fn stored_signatures_report_calldata_readiness() {
+        let mut signatures = StoredTradeSignatures::default();
+        signatures.upsert(Some(signature_hex(0xaa)), None).unwrap();
+        assert!(signatures.buyer_signature_present());
+        assert!(!signatures.seller_signature_present());
+        assert!(!signatures.calldata_ready());
+
+        signatures.upsert(None, Some(signature_hex(0xbb))).unwrap();
+        assert!(signatures.calldata_ready());
+        assert!(signatures.bundle().unwrap().is_some());
+    }
+
+    #[test]
+    fn perp_trade_digest_is_eip712_shape() {
+        let digest = perp_trade_digest(
+            &valid_payload(),
+            &PerpTradeDomain::new(
+                84532,
+                AccountId::new("0x0000000000000000000000000000000000000009"),
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(digest.len(), 66);
+        assert!(digest.starts_with("0x"));
     }
 
     fn valid_payload() -> PerpTradePayload {

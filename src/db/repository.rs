@@ -5,7 +5,9 @@ use super::models::{
 use super::pool;
 use crate::engine::EngineEvent;
 use crate::error::{BackendError, Result};
-use crate::execution::{ExecutionIntent, ExecutionIntentRepository, ExecutionIntentStatus};
+use crate::execution::{
+    ExecutionIntent, ExecutionIntentRepository, ExecutionIntentStatus, StoredTradeSignatures,
+};
 use crate::signing::SignedOrder;
 use crate::types::{now_ms, AccountId, OrderStatus, TimestampMs};
 use sqlx::postgres::{PgPool, PgRow};
@@ -130,7 +132,8 @@ impl PgRepository {
     pub async fn list_execution_intents(&self) -> Result<Vec<ExecutionIntent>> {
         let rows = sqlx::query(
             "SELECT intent_id, market_id, buyer, seller, price_1e8, size_1e8, \
-             buy_order_id, sell_order_id, status, created_at_ms, updated_at_ms \
+             buy_order_id, sell_order_id, buyer_is_maker, buyer_nonce, seller_nonce, deadline_ms, \
+             status, created_at_ms, updated_at_ms \
              FROM execution_intents ORDER BY created_at_ms ASC, intent_id ASC",
         )
         .fetch_all(&self.pool)
@@ -146,7 +149,8 @@ impl PgRepository {
     pub async fn list_pending_execution_intents(&self, limit: u32) -> Result<Vec<ExecutionIntent>> {
         let rows = sqlx::query(
             "SELECT intent_id, market_id, buyer, seller, price_1e8, size_1e8, \
-             buy_order_id, sell_order_id, status, created_at_ms, updated_at_ms \
+             buy_order_id, sell_order_id, buyer_is_maker, buyer_nonce, seller_nonce, deadline_ms, \
+             status, created_at_ms, updated_at_ms \
              FROM execution_intents \
              WHERE status = 'pending' \
              ORDER BY created_at_ms ASC, intent_id ASC \
@@ -182,6 +186,75 @@ impl PgRepository {
         .map_err(|error| BackendError::Persistence(error.to_string()))?;
         Ok(())
     }
+
+    pub async fn get_execution_intent(&self, intent_id: Uuid) -> Result<Option<ExecutionIntent>> {
+        let row = sqlx::query(
+            "SELECT intent_id, market_id, buyer, seller, price_1e8, size_1e8, \
+             buy_order_id, sell_order_id, buyer_is_maker, buyer_nonce, seller_nonce, deadline_ms, \
+             status, created_at_ms, updated_at_ms \
+             FROM execution_intents WHERE intent_id = $1",
+        )
+        .bind(intent_id.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+
+        row.map(db_execution_intent_from_row)
+            .transpose()?
+            .map(ExecutionIntent::try_from)
+            .transpose()
+    }
+
+    pub async fn get_execution_intent_signatures(
+        &self,
+        intent_id: Uuid,
+    ) -> Result<StoredTradeSignatures> {
+        let row = sqlx::query(
+            "SELECT buyer_sig, seller_sig FROM execution_intent_signatures WHERE intent_id = $1",
+        )
+        .bind(intent_id.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+
+        let Some(row) = row else {
+            return Ok(StoredTradeSignatures::default());
+        };
+        Ok(StoredTradeSignatures {
+            buyer_sig: row_get(&row, "buyer_sig")?,
+            seller_sig: row_get(&row, "seller_sig")?,
+        })
+    }
+
+    pub async fn upsert_execution_intent_signatures(
+        &self,
+        intent_id: Uuid,
+        buyer_sig: Option<String>,
+        seller_sig: Option<String>,
+        updated_at_ms: TimestampMs,
+    ) -> Result<StoredTradeSignatures> {
+        let mut signatures = self.get_execution_intent_signatures(intent_id).await?;
+        signatures.upsert(buyer_sig, seller_sig)?;
+
+        sqlx::query(
+            "INSERT INTO execution_intent_signatures
+                (intent_id, buyer_sig, seller_sig, updated_at_ms)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (intent_id) DO UPDATE
+             SET buyer_sig = EXCLUDED.buyer_sig,
+                 seller_sig = EXCLUDED.seller_sig,
+                 updated_at_ms = EXCLUDED.updated_at_ms",
+        )
+        .bind(intent_id.to_string())
+        .bind(&signatures.buyer_sig)
+        .bind(&signatures.seller_sig)
+        .bind(timestamp_to_i64(updated_at_ms))
+        .execute(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+
+        Ok(signatures)
+    }
 }
 
 impl ExecutionIntentRepository for PgRepository {
@@ -202,6 +275,15 @@ impl ExecutionIntentRepository for PgRepository {
             PgRepository::update_execution_intent_status(self, intent_id, status, updated_at_ms)
                 .await
         })
+    }
+
+    fn get_execution_intent_signatures(
+        &self,
+        intent_id: Uuid,
+    ) -> crate::execution::RepositoryFuture<'_, StoredTradeSignatures> {
+        Box::pin(
+            async move { PgRepository::get_execution_intent_signatures(self, intent_id).await },
+        )
     }
 }
 
@@ -298,8 +380,9 @@ async fn insert_execution_intent(
     sqlx::query(
         "INSERT INTO execution_intents (
             intent_id, market_id, buyer, seller, price_1e8, size_1e8,
-            buy_order_id, sell_order_id, status, created_at_ms, updated_at_ms
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+            buy_order_id, sell_order_id, buyer_is_maker, buyer_nonce, seller_nonce, deadline_ms,
+            status, created_at_ms, updated_at_ms
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
     )
     .bind(&intent.intent_id)
     .bind(intent.market_id)
@@ -309,6 +392,10 @@ async fn insert_execution_intent(
     .bind(&intent.size_1e8)
     .bind(&intent.buy_order_id)
     .bind(&intent.sell_order_id)
+    .bind(intent.buyer_is_maker)
+    .bind(intent.buyer_nonce)
+    .bind(intent.seller_nonce)
+    .bind(intent.deadline_ms)
     .bind(&intent.status)
     .bind(intent.created_at_ms)
     .bind(intent.updated_at_ms)
@@ -360,6 +447,10 @@ fn db_execution_intent_from_row(row: PgRow) -> Result<DbExecutionIntent> {
         size_1e8: row_get(&row, "size_1e8")?,
         buy_order_id: row_get(&row, "buy_order_id")?,
         sell_order_id: row_get(&row, "sell_order_id")?,
+        buyer_is_maker: row_get(&row, "buyer_is_maker")?,
+        buyer_nonce: row_get(&row, "buyer_nonce")?,
+        seller_nonce: row_get(&row, "seller_nonce")?,
+        deadline_ms: row_get(&row, "deadline_ms")?,
         status: row_get(&row, "status")?,
         created_at_ms: row_get(&row, "created_at_ms")?,
         updated_at_ms: row_get(&row, "updated_at_ms")?,

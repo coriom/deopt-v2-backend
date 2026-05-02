@@ -45,6 +45,27 @@ The execution module can ABI encode `PerpMatchingEngine.executeTrade((address,ad
 
 The order signatures accepted by `POST /orders` are not PerpTrade signatures. The Solidity `PerpMatchingEngine` verifies signatures over the final matched `PerpTrade`, so the builder never reuses order signatures as trade signatures and never fabricates buyer or seller signatures. If signatures are missing, the builder produces a non-executable preview with empty calldata and `missing_signatures=true`.
 
+After a match, clients can fetch the exact EIP-712 trade payload:
+
+```sh
+curl http://127.0.0.1:8080/execution-intents/<intent_id>/signing-payload
+```
+
+The response includes the `DeOptV2-PerpMatchingEngine` domain, `PerpTrade` type fields, message fields, and digest. The trade message uses the matched buyer/seller, market, size, execution price, buyer maker flag, buyer/seller order nonces, and the minimum original order deadline. If an old or direct in-memory intent lacks nonce/deadline metadata, the endpoint returns a clear error instead of inventing values.
+
+Clients submit matched-trade signatures separately:
+
+```sh
+curl -X POST http://127.0.0.1:8080/execution-intents/<intent_id>/signatures \
+  -H 'content-type: application/json' \
+  -d '{
+    "buyer_sig": "0x...",
+    "seller_sig": "0x..."
+  }'
+```
+
+Signatures are accepted only as `0x` plus 65-byte hex strings. They are stored in memory by default and in `execution_intent_signatures` when persistence is enabled. `calldata_ready=true` only when both buyer and seller trade signatures are present and the corresponding intent has complete PerpTrade metadata.
+
 Broadcast remains disabled. The prepared call always has `is_broadcastable=false` and `value=0`; no RPC simulation, signing, private key loading, transaction submission, or confirmation tracking exists in this phase.
 
 ## Persistence
@@ -123,12 +144,11 @@ curl -X DELETE http://127.0.0.1:8080/orders/<order_id>
 - FOK is rejected cleanly.
 - RFQ and market-maker gateway are type scaffolds only.
 - Execution intents are provisional off-chain records, not settlement.
-- PerpMatchingEngine calldata can be encoded only from explicit trade payloads and explicit trade signatures.
+- PerpMatchingEngine calldata can be encoded only from complete matched trade payloads and explicit buyer/seller PerpTrade signatures.
 - No blockchain RPC, transaction signing, production auth, WebSocket API, or options matching.
 
 ## Deferred Execution Work
 
-- Obtain buyer and seller signatures over the matched `PerpTrade` payload.
 - Add RPC simulation with `eth_call`.
 - Add transaction signing and broadcast behind explicit production safety controls.
 - Reconcile submitted transactions through an indexer before marking execution confirmed.
