@@ -1,5 +1,5 @@
 use super::config::ExecutionConfig;
-use super::tx_builder::{build_perp_execution_call, PreparedExecutionCall};
+use super::tx_builder::{preview_perp_execution_call_from_intent, PreparedExecutionCall};
 use super::{ExecutionIntent, ExecutionIntentStatus};
 use crate::error::{BackendError, Result};
 use crate::types::{now_ms, TimestampMs};
@@ -56,8 +56,10 @@ where
         let mut prepared_calls = Vec::with_capacity(intents.len());
 
         for intent in &intents {
-            let prepared_call =
-                build_perp_execution_call(intent, &self.config.perp_matching_engine_address)?;
+            let prepared_call = preview_perp_execution_call_from_intent(
+                intent,
+                &self.config.perp_matching_engine_address,
+            )?;
             info!(
                 intent_id = %intent.intent_id,
                 market_id = intent.market_id,
@@ -65,7 +67,9 @@ where
                 seller = %intent.seller.0,
                 price_1e8 = %intent.price_1e8,
                 size_1e8 = %intent.size_1e8,
-                "executor dry-run prepared placeholder call"
+                calldata_ready = !prepared_call.calldata.is_empty(),
+                missing_signatures = prepared_call.missing_signatures,
+                "executor dry-run prepared PerpMatchingEngine calldata preview"
             );
             self.repository
                 .update_execution_intent_status(
@@ -80,6 +84,14 @@ where
         Ok(ExecutionTickResult {
             pending_seen: intents.len(),
             dry_run_updated: prepared_calls.len(),
+            calldata_ready: prepared_calls
+                .iter()
+                .filter(|call| !call.calldata.is_empty())
+                .count(),
+            missing_signatures: prepared_calls
+                .iter()
+                .filter(|call| call.missing_signatures)
+                .count(),
             prepared_calls,
         })
     }
@@ -89,6 +101,8 @@ where
 pub struct ExecutionTickResult {
     pub pending_seen: usize,
     pub dry_run_updated: usize,
+    pub calldata_ready: usize,
+    pub missing_signatures: usize,
     pub prepared_calls: Vec<PreparedExecutionCall>,
 }
 
@@ -191,7 +205,10 @@ mod tests {
 
         assert_eq!(result.pending_seen, 1);
         assert_eq!(result.dry_run_updated, 1);
+        assert_eq!(result.calldata_ready, 0);
+        assert_eq!(result.missing_signatures, 1);
         assert_eq!(result.prepared_calls.len(), 1);
+        assert!(result.prepared_calls[0].missing_signatures);
         assert_eq!(repository.all()[0].status, ExecutionIntentStatus::DryRun);
     }
 }

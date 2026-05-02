@@ -1,6 +1,6 @@
 # DeOpt v2 Rust Trading Backend
 
-Phase 1 Rust backend for DeOpt v2 trading infrastructure. This service provides an in-memory perp orderbook, deterministic matching, a thin HTTP API, RFQ/MM scaffolds, and an execution-intent queue.
+Phase 1 Rust backend for DeOpt v2 trading infrastructure. This service provides an in-memory perp orderbook, deterministic matching, a thin HTTP API, RFQ/MM scaffolds, an execution-intent queue, and a dry-run PerpMatchingEngine calldata builder boundary.
 
 Smart contracts remain the final source of truth. This backend does not submit transactions, sign payloads, load private keys, call RPC endpoints, or claim final settlement.
 
@@ -20,6 +20,12 @@ RUST_LOG=info
 CHAIN_ID=84532
 NETWORK_NAME=base-sepolia
 EXECUTION_ENABLED=false
+EXECUTOR_DRY_RUN=true
+EXECUTOR_POLL_INTERVAL_MS=1000
+EXECUTOR_MAX_BATCH_SIZE=10
+RPC_URL=
+PERP_MATCHING_ENGINE_ADDRESS=0x0000000000000000000000000000000000000000
+PERP_ENGINE_ADDRESS=0x0000000000000000000000000000000000000000
 SIGNATURE_VERIFICATION_MODE=disabled
 PERSISTENCE_ENABLED=false
 DATABASE_URL=postgres://deopt:deopt@127.0.0.1:5432/deopt_v2_backend
@@ -30,7 +36,16 @@ EIP712_VERIFYING_CONTRACT=0x0000000000000000000000000000000000000000
 ```
 
 `EXECUTION_ENABLED=false` is intentional for this phase.
+`EXECUTOR_DRY_RUN=false` is rejected because real on-chain execution is not implemented.
 `PERSISTENCE_ENABLED=false` keeps the default local in-memory behavior and does not require Postgres.
+
+## PerpMatchingEngine Calldata
+
+The execution module can ABI encode `PerpMatchingEngine.executeTrade((address,address,uint256,uint128,uint128,bool,uint256,uint256,uint256),bytes,bytes)` with `alloy-sol-types` when given an explicit `PerpTradePayload` and explicit buyer/seller trade signatures.
+
+The order signatures accepted by `POST /orders` are not PerpTrade signatures. The Solidity `PerpMatchingEngine` verifies signatures over the final matched `PerpTrade`, so the builder never reuses order signatures as trade signatures and never fabricates buyer or seller signatures. If signatures are missing, the builder produces a non-executable preview with empty calldata and `missing_signatures=true`.
+
+Broadcast remains disabled. The prepared call always has `is_broadcastable=false` and `value=0`; no RPC simulation, signing, private key loading, transaction submission, or confirmation tracking exists in this phase.
 
 ## Persistence
 
@@ -108,4 +123,12 @@ curl -X DELETE http://127.0.0.1:8080/orders/<order_id>
 - FOK is rejected cleanly.
 - RFQ and market-maker gateway are type scaffolds only.
 - Execution intents are provisional off-chain records, not settlement.
-- No blockchain RPC, ABI encoding, transaction signing, production auth, WebSocket API, or options matching.
+- PerpMatchingEngine calldata can be encoded only from explicit trade payloads and explicit trade signatures.
+- No blockchain RPC, transaction signing, production auth, WebSocket API, or options matching.
+
+## Deferred Execution Work
+
+- Obtain buyer and seller signatures over the matched `PerpTrade` payload.
+- Add RPC simulation with `eth_call`.
+- Add transaction signing and broadcast behind explicit production safety controls.
+- Reconcile submitted transactions through an indexer before marking execution confirmed.

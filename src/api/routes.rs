@@ -238,8 +238,12 @@ struct ExecutorTickResponse {
     pending_seen: usize,
     #[serde(rename = "dryRunUpdated")]
     dry_run_updated: usize,
-    #[serde(rename = "placeholderCallsPrepared")]
-    placeholder_calls_prepared: usize,
+    #[serde(rename = "calldataReady")]
+    calldata_ready: usize,
+    #[serde(rename = "missingSignatures")]
+    missing_signatures: usize,
+    #[serde(rename = "callsPrepared")]
+    calls_prepared: usize,
 }
 
 async fn executor_tick(
@@ -266,7 +270,9 @@ async fn executor_tick(
     Ok(Json(ExecutorTickResponse {
         pending_seen: result.pending_seen,
         dry_run_updated: result.dry_run_updated,
-        placeholder_calls_prepared: result.prepared_calls.len(),
+        calldata_ready: result.calldata_ready,
+        missing_signatures: result.missing_signatures,
+        calls_prepared: result.prepared_calls.len(),
     }))
 }
 
@@ -342,6 +348,7 @@ impl From<BackendError> for ApiError {
             | BackendError::InvalidNonce
             | BackendError::NonceAlreadyUsed
             | BackendError::MalformedSignature
+            | BackendError::MissingTradeSignatures
             | BackendError::MalformedAccountAddress
             | BackendError::UnsupportedSignatureV
             | BackendError::SignatureRecoveryFailed

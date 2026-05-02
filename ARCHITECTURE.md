@@ -13,7 +13,7 @@ The long-term backend needs low-latency deterministic matching, RFQ, market-make
 - `api`: Axum HTTP routes. The API parses requests, calls the engine, and returns events/state.
 - `engine`: Command/event boundary. It owns market orderbooks and the execution-intent queue.
 - `orderbook`: Pure synchronous matching logic with `BTreeMap` price levels and FIFO `VecDeque` ordering.
-- `execution`: Provisional `ExecutionIntent` records plus an in-memory queue. No transaction submission exists.
+- `execution`: Provisional `ExecutionIntent` records, an in-memory queue, a dry-run executor scaffold, and a PerpMatchingEngine calldata builder. No transaction submission exists.
 - `db`: Optional PostgreSQL persistence for used nonces, submitted orders, matched trades, execution intents, and engine event audit records.
 - `rfq`: RFQ type scaffold only.
 - `mm`: market-maker session, heartbeat, bulk quote, and bulk cancel type scaffold only.
@@ -30,6 +30,7 @@ The long-term backend needs low-latency deterministic matching, RFQ, market-make
 - Self-trade rejection before matching.
 - Order cancellation by `order_id`.
 - Execution-intent creation for every matched trade.
+- PerpMatchingEngine `executeTrade` calldata builder V1 for explicit matched-trade payloads and explicit trade signatures.
 - HTTP endpoints for health, markets, orderbook, orders, cancellation, and execution intents.
 - Signed-order HTTP boundary with nonce/deadline validation, disabled signature shape checks, and strict EIP-712 signer recovery.
 - Optional PostgreSQL persistence V1 guarded by `PERSISTENCE_ENABLED=false` by default.
@@ -92,7 +93,11 @@ The in-memory engine remains the live matching state in this V1 patch. Database 
 
 ## Blockchain Execution Boundary
 
-This repository does not execute on-chain transactions in phase 1. It does not call RPC endpoints, encode ABI payloads, sign transactions, load private keys, or mark trades as finally settled. A future executor service can consume intents, simulate calls, submit transactions, and reconcile confirmations with an indexer.
+This repository does not execute on-chain transactions in phase 1. It does not call RPC endpoints, sign transactions, load private keys, broadcast transactions, or mark trades as finally settled. A future executor service can consume intents, simulate calls, submit transactions, and reconcile confirmations with an indexer.
+
+The current calldata builder V1 can encode `PerpMatchingEngine.executeTrade(PerpTrade,bytes,bytes)` using an explicit `PerpTradePayload` and explicit buyer/seller trade signatures. `PerpTrade` signatures are distinct from the off-chain order signatures verified by the order API: the Solidity contract verifies signatures over the final matched trade payload, not the original order payloads. The builder therefore does not reuse order signatures and does not fabricate missing signatures. Intent-derived executor dry-runs are non-executable previews when maker/nonce/deadline or trade signatures are unavailable.
+
+Prepared execution calls remain non-broadcastable in this phase. `is_broadcastable=false`, transaction `value=0`, and no submitted or confirmed lifecycle state is produced by the calldata builder.
 
 ## Deterministic Replay Assumptions
 
@@ -102,6 +107,7 @@ Matching decisions are deterministic for a given ordered command stream, market 
 
 - Smart contracts are canonical for final balances, fills, and risk.
 - Off-chain matches are provisional until confirmed on-chain in a later phase.
+- PerpMatchingEngine requires signatures over the exact matched `PerpTrade`; order signatures are not valid substitutes.
 - Zero price and zero size are rejected.
 - Self-trade is rejected before fills.
 - Large financial values are represented as integers, not floating point.
@@ -109,7 +115,7 @@ Matching decisions are deterministic for a given ordered command stream, market 
 
 ## Out of Scope
 
-No Redis, private key loading, transaction signing, ABI encoding, blockchain RPC, production authentication, frontend code, TypeScript, Python service code, C++, or Solidity changes.
+No Redis, private key loading, transaction signing, blockchain RPC, production authentication, frontend code, TypeScript, Python service code, C++, or Solidity changes. ABI encoding is limited to the non-broadcastable PerpMatchingEngine calldata builder boundary.
 
 ## Acceptance Criteria
 

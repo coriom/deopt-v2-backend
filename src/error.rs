@@ -33,6 +33,8 @@ pub enum BackendError {
     NonceAlreadyUsed,
     #[error("malformed signature")]
     MalformedSignature,
+    #[error("trade signatures are required to build executable PerpMatchingEngine calldata")]
+    MissingTradeSignatures,
     #[error("malformed account address")]
     MalformedAccountAddress,
     #[error("unsupported signature v value")]

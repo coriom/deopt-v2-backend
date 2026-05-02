@@ -1,50 +1,115 @@
 use crate::error::Result;
-use crate::execution::ExecutionIntent;
-use crate::types::{AccountId, MarketId, Price1e8, Size1e8};
+use crate::execution::abi::encode_execute_trade_calldata;
+use crate::execution::{ExecutionIntent, PerpTradePayload, PerpTradeSignatureBundle};
+use crate::signing::eip712::parse_evm_address;
+use crate::types::AccountId;
 use uuid::Uuid;
+
+pub const EXECUTE_TRADE_FUNCTION_NAME: &str = "executeTrade";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PreparedExecutionCall {
-    pub target_contract: AccountId,
+    pub target: AccountId,
+    pub function_name: &'static str,
     pub intent_id: Uuid,
-    pub market_id: MarketId,
+    pub market_id: u128,
     pub buyer: AccountId,
     pub seller: AccountId,
-    pub price_1e8: Price1e8,
-    pub size_1e8: Size1e8,
+    pub value: u128,
     pub calldata: Vec<u8>,
-    pub is_placeholder: bool,
+    pub is_broadcastable: bool,
+    pub missing_signatures: bool,
 }
 
-/// Builds the execution-call boundary for a future PerpMatchingEngine call.
-///
-/// This scaffold intentionally does not ABI encode calldata. Contract ABI
-/// integration will replace the empty placeholder bytes in a later task.
 pub fn build_perp_execution_call(
-    intent: &ExecutionIntent,
-    target_contract: &AccountId,
+    target: &AccountId,
+    intent_id: Uuid,
+    payload: &PerpTradePayload,
+    signatures: Option<&PerpTradeSignatureBundle>,
 ) -> Result<PreparedExecutionCall> {
+    parse_evm_address(target)?;
+    payload.validate()?;
+
+    let (calldata, missing_signatures) = match signatures {
+        Some(signatures) => (encode_execute_trade_calldata(payload, signatures)?, false),
+        None => (Vec::new(), true),
+    };
+
     Ok(PreparedExecutionCall {
-        target_contract: target_contract.clone(),
+        target: target.clone(),
+        function_name: EXECUTE_TRADE_FUNCTION_NAME,
+        intent_id,
+        market_id: payload.market_id,
+        buyer: payload.buyer.clone(),
+        seller: payload.seller.clone(),
+        value: 0,
+        calldata,
+        is_broadcastable: false,
+        missing_signatures,
+    })
+}
+
+pub fn preview_perp_execution_call_from_intent(
+    intent: &ExecutionIntent,
+    target: &AccountId,
+) -> Result<PreparedExecutionCall> {
+    parse_evm_address(target)?;
+    parse_evm_address(&intent.buyer)?;
+    parse_evm_address(&intent.seller)?;
+
+    Ok(PreparedExecutionCall {
+        target: target.clone(),
+        function_name: EXECUTE_TRADE_FUNCTION_NAME,
         intent_id: intent.intent_id,
-        market_id: intent.market_id,
+        market_id: u128::from(intent.market_id),
         buyer: intent.buyer.clone(),
         seller: intent.seller.clone(),
-        price_1e8: intent.price_1e8,
-        size_1e8: intent.size_1e8,
+        value: 0,
         calldata: Vec::new(),
-        is_placeholder: true,
+        is_broadcastable: false,
+        missing_signatures: true,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::execution::abi::execute_trade_selector;
     use crate::execution::ExecutionIntentStatus;
     use crate::types::OrderId;
 
     #[test]
-    fn tx_builder_produces_placeholder_call() {
+    fn missing_signatures_create_non_executable_preview() {
+        let call =
+            build_perp_execution_call(&target(), Uuid::from_u128(1), &payload(), None).unwrap();
+
+        assert_eq!(call.target, target());
+        assert_eq!(call.function_name, "executeTrade");
+        assert_eq!(call.value, 0);
+        assert!(call.calldata.is_empty());
+        assert!(call.missing_signatures);
+        assert!(!call.is_broadcastable);
+    }
+
+    #[test]
+    fn prepared_call_target_equals_configured_matching_engine_address() {
+        let call = build_perp_execution_call(
+            &target(),
+            Uuid::from_u128(1),
+            &payload(),
+            Some(&signature_bundle()),
+        )
+        .unwrap();
+
+        assert_eq!(call.target, target());
+        assert!(!call.calldata.is_empty());
+        assert_eq!(&call.calldata[..4], execute_trade_selector().as_slice());
+        assert!(!call.missing_signatures);
+        assert!(!call.is_broadcastable);
+    }
+
+    #[test]
+    fn intent_preview_marks_missing_trade_payload_fields_and_signatures() {
         let intent = ExecutionIntent {
             intent_id: Uuid::from_u128(1),
             market_id: 7,
@@ -57,18 +122,46 @@ mod tests {
             created_at_ms: 123,
             status: ExecutionIntentStatus::Pending,
         };
-        let target = AccountId::new("0x0000000000000000000000000000000000000009");
 
-        let call = build_perp_execution_call(&intent, &target).unwrap();
+        let call = preview_perp_execution_call_from_intent(&intent, &target()).unwrap();
 
-        assert_eq!(call.target_contract, target);
         assert_eq!(call.intent_id, intent.intent_id);
         assert_eq!(call.market_id, 7);
         assert_eq!(call.buyer, intent.buyer);
         assert_eq!(call.seller, intent.seller);
-        assert_eq!(call.price_1e8, "300000000000".parse::<u128>().unwrap());
-        assert_eq!(call.size_1e8, "100000000".parse::<u128>().unwrap());
+        assert!(call.missing_signatures);
         assert!(call.calldata.is_empty());
-        assert!(call.is_placeholder);
+        assert!(!call.is_broadcastable);
+    }
+
+    fn payload() -> PerpTradePayload {
+        PerpTradePayload::new(
+            AccountId::new("0x0000000000000000000000000000000000000001"),
+            AccountId::new("0x0000000000000000000000000000000000000002"),
+            1,
+            100_000_000,
+            300_000_000_000,
+            true,
+            11,
+            12,
+            4_102_444_800,
+        )
+        .unwrap()
+    }
+
+    fn target() -> AccountId {
+        AccountId::new("0x0000000000000000000000000000000000000009")
+    }
+
+    fn signature_bundle() -> PerpTradeSignatureBundle {
+        PerpTradeSignatureBundle::new(&signature_hex(0xaa), &signature_hex(0xbb)).unwrap()
+    }
+
+    fn signature_hex(byte: u8) -> String {
+        let mut signature = String::from("0x");
+        for _ in 0..65 {
+            signature.push_str(&format!("{byte:02x}"));
+        }
+        signature
     }
 }

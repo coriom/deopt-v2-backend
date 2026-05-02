@@ -1,274 +1,261 @@
-# NEXT_TASK.md — On-Chain Executor Scaffold V1
+# NEXT_TASK.md — PerpMatchingEngine Calldata Builder V1
 
 ## Context
 
-The Rust trading backend is implemented and validated.
+The Rust backend now has:
+- deterministic matching
+- execution intents
+- strict EIP-712 order verification
+- PostgreSQL persistence
+- dry-run executor scaffold
 
-Current status:
-- deterministic in-memory matching works
-- execution intents are created
-- public API uses string fixed-point quantities
-- signed order boundary exists
-- strict EIP-712 signature verification works
-- PostgreSQL persistence exists
-- used nonces, orders, trades, and execution intents persist correctly
-- persistence was validated at runtime
-- nonce replay after restart is rejected
-- cargo fmt: OK
-- cargo clippy --all-targets --all-features -- -D warnings: OK
-- cargo test: OK
-- cargo build: OK
+The Solidity target for perp execution is:
 
-Current limitation:
-- execution intents are created and persisted but are not yet consumed by an executor
-- no on-chain transaction is built, simulated, or submitted
-- execution intent lifecycle remains stuck at `pending`
+- Contract: `PerpMatchingEngine`
+- Function: `executeTrade(PerpTrade calldata t, bytes calldata buyerSig, bytes calldata sellerSig)`
+- EIP-712 domain:
+  - name: `DeOptV2-PerpMatchingEngine`
+  - version: `1`
 
-## Goal
+Solidity struct:
 
-Add an on-chain executor scaffold V1.
+```solidity
+struct PerpTrade {
+    address buyer;
+    address seller;
+    uint256 marketId;
+    uint128 sizeDelta1e8;
+    uint128 executionPrice1e8;
+    bool buyerIsMaker;
+    uint256 buyerNonce;
+    uint256 sellerNonce;
+    uint256 deadline;
+}
 
-This task must prepare the executor architecture without creating unsafe production execution.
+Typehash:
 
-The executor should:
-- load execution configuration
-- read pending execution intents
-- expose executor status
-- provide a dry-run execution path
-- scaffold transaction construction boundaries
-- update execution intent status safely only in dry-run / scaffold mode
-- never send real transactions unless explicitly enabled in a future task
+PerpTrade(address buyer,address seller,uint256 marketId,uint128 sizeDelta1e8,uint128 executionPrice1e8,bool buyerIsMaker,uint256 buyerNonce,uint256 sellerNonce,uint256 deadline)
 
-## Critical Safety Rule
+The contract:
 
-Do not send real blockchain transactions in this task.
+requires caller to be an authorized executor
+verifies buyerSig and sellerSig over the exact same PerpTrade digest
+consumes on-chain nonces
+calls perpEngine.applyTrade(...)
+Goal
 
-This is an executor scaffold, not production execution.
+Implement a real calldata builder boundary for PerpMatchingEngine.executeTrade.
 
-No private key loading yet.
-No transaction signing yet.
-No broadcast yet.
+This task must:
 
-## Stack
+define the Rust representation of PerpTrade
+map backend ExecutionIntent into a PerpTrade candidate
+encode calldata for executeTrade
+keep broadcast impossible
+keep private key loading impossible
+keep transaction submission impossible
+Critical Design Note
 
-Use Rust.
+The backend currently verifies signed off-chain orders.
 
-Allowed crates if needed:
-- `alloy-primitives`
-- `alloy-json-rpc`
-- `alloy-provider`
-- `alloy-rpc-types`
-- `alloy-transport-http`
-- `alloy-contract`
-- `url`
+The Solidity contract expects signatures over the final matched PerpTrade.
 
-Use the minimal dependency set.
+Therefore, this task must not pretend that existing order signatures are valid PerpTrade signatures.
 
-Do not add:
-- ethers-rs unless strongly justified
-- TypeScript
-- Python
-- Node.js
-- frontend code
+For now:
 
-## Config
+buyerSig and sellerSig must be explicit fields supplied to the builder or placeholder-empty with signatures_missing=true
+calldata may be built only when both trade signatures are present
+otherwise the builder should return a clear MissingTradeSignatures error or produce a non-executable preview object
 
-Add or extend `.env.example`:
+Do not fake buyerSig/sellerSig.
 
-```env
-EXECUTION_ENABLED=false
-EXECUTOR_DRY_RUN=true
-EXECUTOR_POLL_INTERVAL_MS=1000
-EXECUTOR_MAX_BATCH_SIZE=10
+Scope
 
-RPC_URL=
-PERP_MATCHING_ENGINE_ADDRESS=0x0000000000000000000000000000000000000000
-PERP_ENGINE_ADDRESS=0x0000000000000000000000000000000000000000
+Implement:
+
+PerpTradePayload
+PerpTradeSignatureBundle
+PreparedExecutionCall
+ABI calldata encoding for executeTrade
+deterministic tests for encoding shape
+executor dry-run should report whether intent is calldata-ready or missing signatures
+
+Do not implement:
+
+RPC simulation
+eth_call
+signing
+private key loading
+broadcast
+transaction status transitions to submitted/confirmed
+indexer
+Solidity changes
+Suggested Modules
+
+Add or extend:
+
+src/execution/perp_trade.rs
+src/execution/abi.rs
+src/execution/tx_builder.rs
+
+Keep names clean if existing structure differs.
+
+Required Data Model
+PerpTradePayload
+
+Fields:
+
+buyer
+seller
+market_id
+size_delta_1e8
+execution_price_1e8
+buyer_is_maker
+buyer_nonce
+seller_nonce
+deadline
+
+Types:
+
+addresses must be valid EVM addresses
+market_id: u128 or U256-compatible
+size_delta_1e8: u128
+execution_price_1e8: u128
+buyer_nonce: u128/U256-compatible
+seller_nonce: u128/U256-compatible
+deadline: u128/U256-compatible
+PerpTradeSignatureBundle
+
+Fields:
+
+buyer_sig
+seller_sig
 
 Rules:
 
-EXECUTION_ENABLED=false means executor does nothing.
-EXECUTION_ENABLED=true with EXECUTOR_DRY_RUN=true means executor may process pending intents in dry-run mode only.
-EXECUTOR_DRY_RUN=false must be rejected for now with a clear error because real transaction sending is not implemented in this task.
-No private key env vars in this task.
-Required Modules
+each signature must be 0x + 65-byte hex
+no fake signatures
+PreparedExecutionCall
 
-Add or extend modules such as:
+Fields:
 
-src/execution/config.rs
-src/execution/executor.rs
-src/execution/status.rs
-src/execution/runner.rs
-src/execution/tx_builder.rs
-
-Adapt names if cleaner.
-
-Execution Intent Status Lifecycle
-
-Current status:
-
-pending
-
-Add or support statuses:
-
-pending
-dry_run
-submitted
-confirmed
-failed
-
-In this task:
-
-executor may move pending -> dry_run
-executor must not move to submitted
-executor must not move to confirmed
-failed may be used only for local dry-run/scaffold errors
-Repository Requirements
-
-Extend persistence repository with methods:
-
-fetch pending execution intents with limit
-update execution intent status
-optionally append engine/executor event
-
-Example methods:
-
-list_pending_execution_intents(limit: u32)
-update_execution_intent_status(intent_id, status, updated_at_ms)
-
-Keep existing behavior unchanged when persistence is disabled.
-
-Executor Behavior
-
-When EXECUTION_ENABLED=false:
-
-executor does not start
-API and matching continue working normally
-
-When EXECUTION_ENABLED=true and EXECUTOR_DRY_RUN=true:
-
-executor can start a background loop
-it fetches pending intents from DB if persistence is enabled
-it logs what would be executed
-it may update intent status to dry_run
-it does not call contracts
-it does not sign
-it does not broadcast
-
-When EXECUTION_ENABLED=true and EXECUTOR_DRY_RUN=false:
-
-startup must fail with a clear error:
-real on-chain execution is not implemented yet
-
-If persistence is disabled and execution is enabled:
-
-either reject startup or run a no-op dry-run executor
-prefer rejecting startup with a clear error:
-executor requires persistence enabled
-HTTP API Requirements
-
-Add executor/status endpoint:
-
-GET /executor/status
-
-Return:
-
-{
-  "executionEnabled": false,
-  "dryRun": true,
-  "realBroadcastEnabled": false,
-  "persistenceRequired": true
-}
-
-Add endpoint if simple:
-
-POST /executor/tick
-
-Purpose:
-
-manually process one executor dry-run tick
-useful for tests/local dev
-only allowed in dry-run mode
-no real tx
-
-If this adds too much scope, implement only /executor/status.
-
-Transaction Builder Scaffold
-
-Create a boundary that will later build PerpMatchingEngine calldata.
-
-For now, it should expose a function like:
-
-build_perp_execution_call(intent: &ExecutionIntent) -> Result<PreparedExecutionCall>
-
-PreparedExecutionCall should contain:
-
-target contract address
-intent id
-market id
+target
+function_name
+intent_id
+market_id
 buyer
 seller
-price_1e8
-size_1e8
-placeholder calldata bytes or empty bytes
-clear flag is_placeholder: true
+value
+calldata
+is_broadcastable
+missing_signatures
 
-Do not fake ABI encoding.
+Rules:
 
-The function must clearly document that calldata is placeholder until contract ABI integration.
+target = PERP_MATCHING_ENGINE_ADDRESS
+function_name = executeTrade
+value = 0
+is_broadcastable=false for this task
+missing_signatures=true if signatures are not provided
+ABI Encoding
 
+Use an idiomatic Rust ABI encoding crate.
+
+Preferred:
+
+alloy-primitives
+alloy-sol-types
+
+Define the Solidity call equivalent to:
+
+function executeTrade(
+    PerpTrade calldata t,
+    bytes calldata buyerSig,
+    bytes calldata sellerSig
+)
+
+Where PerpTrade is:
+
+(address,address,uint256,uint128,uint128,bool,uint256,uint256,uint256)
+
+Do not hand-roll ABI encoding if alloy can do it cleanly.
+
+Config
+
+Ensure .env.example includes:
+
+PERP_MATCHING_ENGINE_ADDRESS=0x0000000000000000000000000000000000000000
+
+If already present, keep it.
+
+ExecutionIntent Mapping
+
+From current ExecutionIntent:
+
+buyer = intent.buyer
+seller = intent.seller
+marketId = intent.market_id
+sizeDelta1e8 = intent.size_1e8
+executionPrice1e8 = intent.price_1e8
+
+For now, buyerIsMaker, buyerNonce, sellerNonce, and deadline may not be present in current ExecutionIntent.
+
+Handle this explicitly:
+
+do not silently invent values
+add fields if necessary to the intent model only if clean and backwards-compatible
+otherwise make the builder require an explicit PerpTradePayload
+
+Preferred for this task:
+
+create builder from explicit PerpTradePayload
+create a separate preview mapper from ExecutionIntent that marks missing fields
 Tests Required
-
-Normal cargo test must not require RPC or Postgres.
 
 Add tests for:
 
-config parsing:
-execution disabled
-dry-run enabled
-real execution disabled/rejected
-executor status response
-tx builder scaffold produces placeholder call
-dry-run tick with mocked/in-memory repository if feasible
-execution enabled without persistence rejected if implemented
-existing matching/API/persistence config tests still pass
+PerpTradePayload validates addresses
+invalid buyer address rejected
+invalid seller address rejected
+missing signatures are detected
+malformed signatures rejected
+calldata builder creates non-empty calldata with valid signatures
+calldata selector matches executeTrade((address,address,uint256,uint128,uint128,bool,uint256,uint256,uint256),bytes,bytes)
+prepared call target equals configured PerpMatchingEngine address
+prepared call remains is_broadcastable=false
+existing executor/status tests still pass
+existing matching tests still pass
 
-Do not make normal tests depend on:
+No tests may require:
 
-Base Sepolia RPC
+RPC
 Postgres
 private keys
-Documentation Requirements
+Base Sepolia
+Documentation
 
-Update README.md:
+Update README.md and ARCHITECTURE.md:
 
-explain executor scaffold
-explain dry-run mode
-explain that real broadcast is not implemented
-explain required env vars
-explain why persistence is required before execution
-
-Update ARCHITECTURE.md:
-
-describe execution intent lifecycle
-describe executor V1 boundary
-describe future production executor responsibilities:
-contract ABI integration
-simulation
-nonce manager
-gas manager
-signing
+explain calldata builder V1
+explain that PerpMatchingEngine requires signatures over matched PerpTrade
+explain that order signatures are not the same as trade signatures
+explain that broadcast remains disabled
+explain next steps:
+obtain trade signatures
+RPC simulation
 broadcast
-tx/event reconciliation
+indexer reconciliation
 Constraints
 
 Do not add:
 
 real transaction sending
 private key loading
-production executor
+RPC simulation
+fake signatures
 fake ABI encoding
-fake transaction confirmation
+fake confirmation
 frontend
 TypeScript
 Python
@@ -279,12 +266,11 @@ Do not modify:
 
 ~/DEOPT/deoptv2
 
-Do not introduce:
+Do not change:
 
-floating point financial math
-matching semantic changes
-fake on-chain settlement
-fake finality
+matching semantics
+financial numeric rules
+EIP-712 order verification behavior
 Validation
 
 Run:
@@ -297,17 +283,12 @@ Acceptance Criteria
 
 The task is complete only if:
 
-executor config exists
-/executor/status works
-real broadcast remains impossible
-dry-run scaffold exists
-pending execution intents can be fetched for executor processing when persistence is enabled
-intent status can be updated to dry_run
-tx builder boundary exists but does not fake ABI encoding
-normal tests do not require RPC/Postgres
-all validation commands pass
-no blockchain transaction execution is added
+real ABI calldata can be built for PerpMatchingEngine.executeTrade
+builder requires explicit buyerSig and sellerSig for executable calldata
+missing trade signatures are not faked
+broadcast remains impossible
+all tests pass
+no RPC/Postgres/private keys are required for normal tests
 EOF
-
 
 after all, run thelegram.py (say nothing, just run and that all)

@@ -6,6 +6,8 @@ rust-version = "1.75"
 
 [dependencies]
 axum = "0.7"
+alloy-primitives = "0.7"
+alloy-sol-types = "0.7"
 chrono = { version = "0.4", features = ["serde", "clock"] }
 dotenvy = "0.15"
 k256 = { version = "0.13", features = ["ecdsa"] }
