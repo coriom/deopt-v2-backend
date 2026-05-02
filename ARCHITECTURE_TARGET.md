@@ -137,9 +137,11 @@ Implemented Phase 1 foundations:
 - EIP-712 order signature validation
 - PostgreSQL persistence V1 for nonces, orders, trades, execution intents, and event audit records
 - Manual `eth_call` simulation V1 for calldata-ready execution intents
+- Indexer V1 for persisted `PerpMatchingEngine.TradeExecuted` events and block cursor tracking
 
 Do not implement:
 - transaction-sending RPC
-- on-chain execution database/indexer views
+- confirmed execution lifecycle from indexed events without a deterministic intent link
+- full reorg-safe indexer views
 - real WebSocket MM gateway
 - on-chain execution

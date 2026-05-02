@@ -3,6 +3,7 @@ use axum::http::{header, Request, StatusCode};
 use deopt_v2_backend::api::{router, AppState};
 use deopt_v2_backend::engine::{EngineEvent, EngineState};
 use deopt_v2_backend::execution::ExecutionConfig;
+use deopt_v2_backend::indexer::IndexerConfig;
 use deopt_v2_backend::signing::{Eip712Domain, SignatureVerificationMode, SignedOrder};
 use deopt_v2_backend::types::now_ms;
 use deopt_v2_backend::types::{AccountId, NewOrder, OrderId, OrderStatus, Side, TimeInForce};
@@ -581,6 +582,38 @@ async fn executor_status_api_reports_scaffold_flags() {
     assert_eq!(json["simulationRequiresPersistence"], true);
     assert_eq!(json["rpcConfigured"], false);
     assert_eq!(json["broadcastEnabled"], false);
+}
+
+#[tokio::test]
+async fn indexer_status_api_reports_v1_flags() {
+    let response = router(AppState::new(EngineState::with_default_markets()))
+        .oneshot(
+            Request::builder()
+                .uri("/indexer/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = response_json(response).await;
+    assert_eq!(json["indexerEnabled"], false);
+    assert_eq!(json["rpcConfigured"], false);
+    assert_eq!(json["persistenceRequired"], true);
+    assert_eq!(json["lastIndexedBlock"], 0);
+    assert_eq!(
+        json["targetContract"],
+        "0x0000000000000000000000000000000000000000"
+    );
+}
+
+#[test]
+fn indexer_default_does_not_claim_confirmation_lifecycle() {
+    let status = IndexerConfig::disabled().status(0);
+
+    assert!(!status.indexer_enabled);
+    assert_eq!(status.last_indexed_block, 0);
 }
 
 #[tokio::test]

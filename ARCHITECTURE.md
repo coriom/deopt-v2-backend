@@ -14,6 +14,7 @@ The long-term backend needs low-latency deterministic matching, RFQ, market-make
 - `engine`: Command/event boundary. It owns market orderbooks and the execution-intent queue.
 - `orderbook`: Pure synchronous matching logic with `BTreeMap` price levels and FIFO `VecDeque` ordering.
 - `execution`: Provisional `ExecutionIntent` records, an in-memory queue, a dry-run executor scaffold, a PerpMatchingEngine calldata builder, and manual `eth_call` simulation. No transaction submission exists.
+- `indexer`: Opt-in Indexer V1 that reads `PerpMatchingEngine.TradeExecuted` logs with `eth_getLogs`, persists decoded events, and advances a block cursor after persistence succeeds.
 - `db`: Optional PostgreSQL persistence for used nonces, submitted orders, matched trades, execution intents, and engine event audit records.
 - `rfq`: RFQ type scaffold only.
 - `mm`: market-maker session, heartbeat, bulk quote, and bulk cancel type scaffold only.
@@ -36,11 +37,25 @@ The long-term backend needs low-latency deterministic matching, RFQ, market-make
 - HTTP endpoints for health, markets, orderbook, orders, cancellation, and execution intents.
 - Signed-order HTTP boundary with nonce/deadline validation, disabled signature shape checks, and strict EIP-712 signer recovery.
 - Optional PostgreSQL persistence V1 guarded by `PERSISTENCE_ENABLED=false` by default.
+- Optional Indexer V1 guarded by `INDEXER_ENABLED=false` by default.
+
+## Indexer V1
+
+Indexer V1 reads Base Sepolia logs from `RPC_URL` for `PERP_MATCHING_ENGINE_ADDRESS` and topic0 `TradeExecuted(address,address,uint256,uint128,uint128,bool,uint256,uint256)`. Each tick reads the latest block, calculates a bounded range from the stored `perp_matching_engine` cursor, fetches logs with `eth_getLogs`, decodes the indexed buyer/seller/market topics and ABI data fields, inserts rows into `indexed_perp_trades`, and updates `indexer_cursors` only after those writes succeed.
+
+The indexer is read-only. It does not sign, send, or broadcast transactions. It also does not mark `ExecutionIntent` records submitted or confirmed because the event does not include a deterministic backend intent id. Indexed events are preparation for later explicit reconciliation.
+
+V1 stores `block_hash` when the RPC log includes it, but does not implement deep reorg rollback or replay correction. Smart contracts remain the final source of truth.
+
+HTTP endpoints:
+- `GET /indexer/status`
+- `POST /indexer/tick`
+- `GET /indexed/perp-trades`
 
 ## Future v2/v3 Scope
 
 - On-chain executor service.
-- Indexer with reorg handling.
+- Indexer with full reorg handling and deterministic intent reconciliation.
 - WebSocket market data and trading.
 - Real market-maker gateway.
 - RFQ auction/quote lifecycle.
@@ -119,6 +134,8 @@ Matching decisions are deterministic for a given ordered command stream, market 
 - Off-chain matches are provisional until confirmed on-chain in a later phase.
 - PerpMatchingEngine requires signatures over the exact matched `PerpTrade`; order signatures are not valid substitutes.
 - `simulation_ok` only means an `eth_call` did not revert at the queried block.
+- Indexed `TradeExecuted` events prove on-chain execution occurred, but do not identify a backend intent without an explicit deterministic link.
+- Indexer V1 is not fully reorg safe.
 - Zero price and zero size are rejected.
 - Self-trade is rejected before fills.
 - Large financial values are represented as integers, not floating point.
@@ -126,7 +143,7 @@ Matching decisions are deterministic for a given ordered command stream, market 
 
 ## Out of Scope
 
-No Redis, private key loading, transaction signing, transaction broadcast, production authentication, frontend code, TypeScript, Python service code, C++, or Solidity changes. Blockchain RPC is limited to manual `eth_call` simulation. ABI encoding is limited to the non-broadcastable PerpMatchingEngine calldata builder boundary.
+No Redis, private key loading, transaction signing, transaction broadcast, production authentication, frontend code, TypeScript, Python service code, C++, or Solidity changes. Blockchain RPC is limited to manual `eth_call` simulation and opt-in `eth_getLogs` indexing. ABI encoding is limited to the non-broadcastable PerpMatchingEngine calldata builder boundary.
 
 ## Acceptance Criteria
 

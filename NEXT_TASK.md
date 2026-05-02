@@ -1,4 +1,4 @@
-# NEXT_TASK.md — Executor RPC Simulation V1
+# NEXT_TASK.md — Indexer V1 for PerpMatchingEngine Events
 
 ## Context
 
@@ -6,248 +6,271 @@ The Rust backend now has:
 - deterministic in-memory matching
 - strict EIP-712 order verification
 - PostgreSQL persistence
-- dry-run executor scaffold
+- execution intents
+- matched PerpTrade signature collection
 - real PerpMatchingEngine calldata builder
-- matched PerpTrade signature collection flow
-- calldata readiness only when buyerSig and sellerSig are both present
+- RPC simulation via eth_call
+- simulation result persistence
+
+Current status:
+- no real transaction broadcast exists
+- no private key loading exists
+- no submitted/confirmed lifecycle exists
+- no indexer exists yet
 
 Current limitation:
-- calldata can be built, but it is not simulated against Base Sepolia
-- execution intents cannot yet be marked simulation_ok or simulation_failed
-- no on-chain safety check exists before future broadcast
+- the backend cannot read on-chain events
+- the backend cannot reconcile contract state/events with backend state
+- future broadcast would have no safe confirmation path
 
 ## Goal
 
-Add RPC simulation V1 for execution intents.
+Add Indexer V1.
 
-The executor must be able to:
-- take a calldata-ready execution intent
-- build the PerpMatchingEngine.executeTrade calldata
-- run an eth_call simulation against the configured RPC
-- persist simulation result
-- expose a manual simulation endpoint
+The indexer must:
+- read Base Sepolia logs from RPC
+- decode `PerpMatchingEngine.TradeExecuted`
+- persist indexed events
+- persist block cursor
+- expose indexer status
+- expose manual indexer tick
+- not mark backend intents confirmed yet unless there is a safe deterministic link
 
-This task must not broadcast transactions.
+This task must not add transaction broadcast.
 
 ## Critical Safety Rule
 
-Do not send real transactions.
+Do not fake confirmation.
 
-This task is simulation only:
-- no private key loading
-- no signing
-- no sendTransaction
-- no broadcast
-- no submitted status
-- no confirmed status
+An indexed `TradeExecuted` event proves that a trade was executed on-chain, but mapping it to a backend `ExecutionIntent` must be explicit and reliable.
 
-`simulation_ok` means only:
-- eth_call did not revert at the current block
+If there is no deterministic intent id in the event, do not mark an intent as confirmed.
 
-`simulation_ok` does not mean:
-- submitted
-- confirmed
-- final
-- executed
+For this task:
+- index the event
+- persist it
+- expose it
+- prepare reconciliation
+- do not fake confirmed lifecycle
 
-## Config
+## Target Solidity Event
 
-Add or extend `.env.example`:
+From `PerpMatchingEngine`:
 
-```env
-SIMULATION_ENABLED=false
-SIMULATION_REQUIRE_PERSISTENCE=true
-RPC_URL=
-PERP_MATCHING_ENGINE_ADDRESS=0x0000000000000000000000000000000000000000
+```solidity
+event TradeExecuted(
+    address indexed buyer,
+    address indexed seller,
+    uint256 indexed marketId,
+    uint128 sizeDelta1e8,
+    uint128 executionPrice1e8,
+    bool buyerIsMaker,
+    uint256 buyerNonce,
+    uint256 sellerNonce
+);
+
+Contract:
+
+PerpMatchingEngine
+Address from env:
+PERP_MATCHING_ENGINE_ADDRESS
+Config
+
+Add or extend .env.example:
+
+INDEXER_ENABLED=false
+INDEXER_START_BLOCK=0
+INDEXER_POLL_INTERVAL_MS=3000
+INDEXER_MAX_BLOCK_RANGE=500
+INDEXER_REQUIRE_PERSISTENCE=true
 
 Rules:
 
-SIMULATION_ENABLED=false: simulation endpoints may return disabled or no-op.
-SIMULATION_ENABLED=true: requires valid RPC_URL.
-If SIMULATION_REQUIRE_PERSISTENCE=true, simulation requires PERSISTENCE_ENABLED=true.
-No private key env vars.
+INDEXER_ENABLED=false: indexer does not start.
+INDEXER_ENABLED=true: requires RPC_URL.
+if INDEXER_REQUIRE_PERSISTENCE=true, requires PERSISTENCE_ENABLED=true.
+no private key required.
+no transaction sending.
 Required Modules
 
-Add or extend:
+Add modules such as:
 
-src/execution/simulator.rs
-src/execution/rpc.rs
-src/execution/status.rs
-src/execution/executor.rs
-src/execution/tx_builder.rs
-src/db/repository.rs
-src/db/models.rs
+src/indexer/mod.rs
+src/indexer/config.rs
+src/indexer/events.rs
+src/indexer/decoder.rs
+src/indexer/runner.rs
+src/indexer/status.rs
 
-Names can differ if cleaner.
+Adapt names if cleaner.
 
-Execution Intent Statuses
+Database Requirements
 
-Support statuses:
+Add migration:
 
-pending
-dry_run
-calldata_ready
-simulation_ok
-simulation_failed
-submitted
-confirmed
-failed
+migrations/0004_indexer.sql
 
-In this task:
+Tables:
 
-allowed transition: calldata_ready -> simulation_ok
-allowed transition: calldata_ready -> simulation_failed
-allowed transition: dry_run -> simulation_ok only if calldata exists and signatures exist
-do not transition to submitted
-do not transition to confirmed
-Persistence Requirements
-
-Add persistence for simulation result.
-
-Preferred migration:
-
-CREATE TABLE execution_simulations (
-    simulation_id TEXT PRIMARY KEY,
-    intent_id TEXT NOT NULL REFERENCES execution_intents(intent_id) ON DELETE CASCADE,
-    status TEXT NOT NULL,
-    block_number BIGINT,
-    error TEXT,
-    created_at_ms BIGINT NOT NULL
+indexer_cursors
+CREATE TABLE indexer_cursors (
+    name TEXT PRIMARY KEY,
+    last_indexed_block BIGINT NOT NULL,
+    updated_at_ms BIGINT NOT NULL
+);
+indexed_perp_trades
+CREATE TABLE indexed_perp_trades (
+    event_id TEXT PRIMARY KEY,
+    tx_hash TEXT NOT NULL,
+    log_index BIGINT NOT NULL,
+    block_number BIGINT NOT NULL,
+    block_hash TEXT,
+    buyer TEXT NOT NULL,
+    seller TEXT NOT NULL,
+    market_id TEXT NOT NULL,
+    size_delta_1e8 TEXT NOT NULL,
+    execution_price_1e8 TEXT NOT NULL,
+    buyer_is_maker BOOLEAN NOT NULL,
+    buyer_nonce TEXT NOT NULL,
+    seller_nonce TEXT NOT NULL,
+    created_at_ms BIGINT NOT NULL,
+    UNIQUE(tx_hash, log_index)
 );
 
-CREATE INDEX idx_execution_simulations_intent_id ON execution_simulations(intent_id);
-CREATE INDEX idx_execution_simulations_status ON execution_simulations(status);
+Indexes:
 
-Alternative acceptable:
+block_number
+buyer
+seller
+market_id
+tx_hash
 
-add simulation columns to execution_intents
-but separate table is preferred for audit trail
+Optional generic table:
 
-Repository methods:
+indexed_events
+CREATE TABLE indexed_events (
+    event_id TEXT PRIMARY KEY,
+    contract_address TEXT NOT NULL,
+    event_name TEXT NOT NULL,
+    tx_hash TEXT NOT NULL,
+    log_index BIGINT NOT NULL,
+    block_number BIGINT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at_ms BIGINT NOT NULL,
+    UNIQUE(tx_hash, log_index)
+);
 
-get execution intent by id
-get stored trade signatures for intent
-insert simulation result
-update intent status to simulation_ok / simulation_failed
-append engine/executor event if existing audit path exists
-RPC Simulation Behavior
+If too much scope, implement indexed_perp_trades only.
 
-Given an intent id:
+RPC Behavior
 
-Load execution intent.
-Load trade signatures.
-Validate both signatures exist.
-Build PerpTradePayload.
-Build executeTrade calldata.
-Perform eth_call:
-from: optional zero address or configured executor address
-to: PERP_MATCHING_ENGINE_ADDRESS
-data: calldata
-value: 0
-If eth_call succeeds:
-persist simulation_ok
-update intent status to simulation_ok
-If eth_call reverts/fails:
-persist simulation_failed with error message
-update intent status to simulation_failed
+Implement log fetching using eth_getLogs.
 
-Important:
+For each tick:
 
-If caller authorization matters, eth_call should use a configured executor address if available.
-Add optional env:
-EXECUTOR_FROM_ADDRESS=0x0000000000000000000000000000000000000000
-Do not use a private key.
-Do not sign.
-Do not broadcast.
+Read current chain block number.
+Read cursor for perp_matching_engine.
+Determine range:
+from = last_indexed_block + 1
+to = min(current_block, from + INDEXER_MAX_BLOCK_RANGE - 1)
+Fetch logs for:
+address = PERP_MATCHING_ENGINE_ADDRESS
+topic0 = keccak256 of TradeExecuted(address,address,uint256,uint128,uint128,bool,uint256,uint256)
+Decode logs.
+Persist decoded trades.
+Advance cursor only after successful persistence.
+
+If no cursor exists:
+
+initialize from INDEXER_START_BLOCK.
+Reorg Handling
+
+Minimal V1:
+
+store block_hash if available
+do not implement deep reorg rollback yet
+document limitation
+
+Do not pretend full reorg safety.
+
 HTTP API
 
 Add:
 
-POST /executor/simulate/:intent_id
+GET /indexer/status
+POST /indexer/tick
+GET /indexed/perp-trades
+GET /indexer/status
 
-Behavior:
-
-requires simulation enabled
-requires persistence enabled if configured
-loads intent from DB or in-memory if cleanly supported
-simulates exactly one intent
-returns simulation status
-
-Response example:
+Return:
 
 {
-  "intent_id": "abc",
-  "simulation_status": "simulation_ok",
-  "block_number": 123456,
-  "submitted": false,
-  "confirmed": false
+  "indexerEnabled": false,
+  "rpcConfigured": true,
+  "persistenceRequired": true,
+  "lastIndexedBlock": 0,
+  "targetContract": "0x..."
 }
+POST /indexer/tick
 
-On revert:
+Runs one manual indexing tick.
 
-{
-  "intent_id": "abc",
-  "simulation_status": "simulation_failed",
-  "error": "execution reverted: ..."
-}
+Return:
 
-Update:
+from_block
+to_block
+logs_found
+events_indexed
+cursor_updated
+GET /indexed/perp-trades
 
-GET /executor/status
+Return recent indexed TradeExecuted events.
 
-Add fields:
+Limit can default to 50.
 
-simulationEnabled
-simulationRequiresPersistence
-rpcConfigured
-broadcastEnabled=false
-Dry-Run Executor Integration
-
-If simple:
-
-dry-run executor may skip simulation unless explicitly requested.
-Do not auto-simulate in background unless clean and safe.
-
-Preferred for this task:
-
-manual simulation endpoint only.
-background auto-simulation can be deferred.
 Tests Required
 
 Normal cargo test must not require RPC or Postgres.
 
 Add tests for:
 
-simulation config disabled
-simulation enabled requires RPC_URL
-simulation requiring persistence rejects persistence disabled
-/executor/status includes simulation fields
-simulate endpoint rejects when simulation disabled
-simulate endpoint rejects missing signatures before RPC
-simulator maps success to simulation_ok using mocked provider if feasible
-simulator maps failure to simulation_failed using mocked provider if feasible
-no broadcast is possible
+indexer config disabled
+indexer enabled requires RPC_URL
+indexer requiring persistence rejects persistence disabled
+TradeExecuted topic0 is correct
+decoder decodes a known synthetic log
+cursor range calculation
+indexer status endpoint returns fields
+no confirmation status is written
 existing tests still pass
 
-If mocking provider is too large:
+If full log decoding test is too heavy:
 
-isolate pure simulation result mapping tests
-keep real RPC tests out of default test suite
+test topic0 and pure decode helpers
+do not require live RPC
 Documentation
 
 Update README.md:
 
-explain simulation mode
+explain indexer role
 explain env vars
-explain that simulation is eth_call only
-explain simulation_ok is not confirmation
-explain no private key / no broadcast
+explain manual tick
+explain indexed_perp_trades
+explain no fake confirmation
 
 Update ARCHITECTURE.md:
 
-add simulation stage to execution lifecycle
-pending/calldata_ready -> simulation_ok/simulation_failed
-future submitted/confirmed only after broadcast and indexer reconciliation
+add indexer stage
+explain backend lifecycle:
+order accepted
+matched
+intent created
+signed
+simulated
+later submitted
+indexed
+reconciled
+explain that confirmation requires deterministic reconciliation
 Constraints
 
 Do not add:
@@ -256,7 +279,6 @@ transaction broadcast
 private key loading
 sendTransaction
 production executor
-indexer
 frontend
 TypeScript
 Python
@@ -269,18 +291,19 @@ Do not modify:
 
 Do not fake:
 
-successful simulation
-submitted status
 confirmed status
+submitted status
 on-chain execution
 transaction hash
+reorg safety
 
 Do not change:
 
 matching semantics
 financial numeric rules
-EIP-712 order verification behavior
-PerpTrade signature collection behavior
+EIP-712 order verification
+PerpTrade signature flow
+RPC simulation behavior
 Validation
 
 Run:
@@ -289,19 +312,26 @@ cargo fmt
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test
 cargo build
+
+Normal tests must not require:
+
+RPC
+Postgres
+private keys
+Base Sepolia
 Acceptance Criteria
 
 The task is complete only if:
 
-simulation config exists
-simulation endpoint exists
-eth_call simulation boundary exists
-simulation result persistence exists
-intent status can become simulation_ok or simulation_failed
-no broadcast/private key/signing exists
-default tests require no RPC/Postgres
-all validation commands pass
+indexer config exists
+DB migration exists
+TradeExecuted topic/decoder exists
+indexer cursor exists
+manual tick endpoint exists
+indexed perp trades can be persisted
+no fake confirmed status is introduced
+all tests pass
 EOF
 
 after all, 
-## run thelegram.py (say nothing, just run and that all)
+## run telegram.py (say nothing, just run and that all)

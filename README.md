@@ -1,6 +1,6 @@
 # DeOpt v2 Rust Trading Backend
 
-Phase 1 Rust backend for DeOpt v2 trading infrastructure. This service provides an in-memory perp orderbook, deterministic matching, a thin HTTP API, RFQ/MM scaffolds, an execution-intent queue, a dry-run PerpMatchingEngine calldata builder boundary, and manual RPC simulation for calldata-ready intents.
+Phase 1 Rust backend for DeOpt v2 trading infrastructure. This service provides an in-memory perp orderbook, deterministic matching, a thin HTTP API, RFQ/MM scaffolds, an execution-intent queue, a dry-run PerpMatchingEngine calldata builder boundary, manual RPC simulation for calldata-ready intents, and an opt-in Indexer V1 for PerpMatchingEngine events.
 
 Smart contracts remain the final source of truth. This backend does not submit transactions, sign payloads, load private keys, or claim final settlement. Optional simulation uses `eth_call` only and never broadcasts.
 
@@ -29,6 +29,11 @@ RPC_URL=
 EXECUTOR_FROM_ADDRESS=0x0000000000000000000000000000000000000000
 PERP_MATCHING_ENGINE_ADDRESS=0x0000000000000000000000000000000000000000
 PERP_ENGINE_ADDRESS=0x0000000000000000000000000000000000000000
+INDEXER_ENABLED=false
+INDEXER_START_BLOCK=0
+INDEXER_POLL_INTERVAL_MS=3000
+INDEXER_MAX_BLOCK_RANGE=500
+INDEXER_REQUIRE_PERSISTENCE=true
 SIGNATURE_VERIFICATION_MODE=disabled
 PERSISTENCE_ENABLED=false
 DATABASE_URL=postgres://deopt:deopt@127.0.0.1:5432/deopt_v2_backend
@@ -42,6 +47,7 @@ EIP712_VERIFYING_CONTRACT=0x0000000000000000000000000000000000000000
 `EXECUTOR_DRY_RUN=false` is rejected because real on-chain execution is not implemented.
 `PERSISTENCE_ENABLED=false` keeps the default local in-memory behavior and does not require Postgres.
 `SIMULATION_ENABLED=true` requires `RPC_URL`; when `SIMULATION_REQUIRE_PERSISTENCE=true`, it also requires `PERSISTENCE_ENABLED=true`.
+`INDEXER_ENABLED=true` requires `RPC_URL`; when `INDEXER_REQUIRE_PERSISTENCE=true`, it also requires `PERSISTENCE_ENABLED=true`.
 
 ## PerpMatchingEngine Calldata
 
@@ -89,6 +95,31 @@ PERSISTENCE_ENABLED=true
 
 The endpoint returns `submitted=false` and `confirmed=false` for every response. Real broadcast remains impossible in this backend phase, and `GET /executor/status` reports `broadcastEnabled=false`.
 
+## Indexer V1
+
+Indexer V1 is opt-in and read-only:
+
+```text
+INDEXER_ENABLED=true
+INDEXER_START_BLOCK=0
+INDEXER_POLL_INTERVAL_MS=3000
+INDEXER_MAX_BLOCK_RANGE=500
+INDEXER_REQUIRE_PERSISTENCE=true
+RPC_URL=https://...
+PERP_MATCHING_ENGINE_ADDRESS=0x...
+PERSISTENCE_ENABLED=true
+```
+
+It reads `eth_getLogs` for `PerpMatchingEngine.TradeExecuted`, decodes the event, stores rows in `indexed_perp_trades`, and advances the `perp_matching_engine` cursor only after persistence succeeds. Manual control and reads are exposed through:
+
+```sh
+curl http://127.0.0.1:8080/indexer/status
+curl -X POST http://127.0.0.1:8080/indexer/tick
+curl http://127.0.0.1:8080/indexed/perp-trades
+```
+
+Indexed events do not mark execution intents submitted or confirmed. The Solidity event does not include a deterministic backend intent id, so reconciliation is intentionally deferred. V1 stores `block_hash` when the RPC provides it, but does not implement deep reorg rollback.
+
 ## Persistence
 
 PostgreSQL persistence is opt-in:
@@ -98,7 +129,7 @@ PERSISTENCE_ENABLED=true
 DATABASE_URL=postgres://deopt:deopt@127.0.0.1:5432/deopt_v2_backend
 ```
 
-When enabled, the service connects to Postgres at startup and runs migrations from `migrations/`. Migrations create `used_nonces`, `orders`, `trades`, `execution_intents`, `execution_intent_signatures`, `execution_simulations`, and `engine_events`.
+When enabled, the service connects to Postgres at startup and runs migrations from `migrations/`. Migrations create `used_nonces`, `orders`, `trades`, `execution_intents`, `execution_intent_signatures`, `execution_simulations`, `engine_events`, `indexer_cursors`, and `indexed_perp_trades`.
 
 One local setup option:
 
@@ -165,6 +196,8 @@ curl -X DELETE http://127.0.0.1:8080/orders/<order_id>
 - FOK is rejected cleanly.
 - RFQ and market-maker gateway are type scaffolds only.
 - Execution intents are provisional off-chain records, not settlement.
+- Indexed `TradeExecuted` events are stored for reconciliation only; they do not confirm backend intents.
+- Indexer V1 stores block hashes when available but does not implement deep reorg rollback.
 - PerpMatchingEngine calldata can be encoded only from complete matched trade payloads and explicit buyer/seller PerpTrade signatures.
 - Optional blockchain RPC is limited to manual `eth_call` simulation. No transaction signing, production auth, WebSocket API, or options matching.
 

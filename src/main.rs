@@ -3,6 +3,7 @@ use deopt_v2_backend::config::AppConfig;
 use deopt_v2_backend::db::PgRepository;
 use deopt_v2_backend::engine::EngineState;
 use deopt_v2_backend::execution::{spawn_executor, Executor};
+use deopt_v2_backend::indexer::{spawn_indexer, Indexer};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -11,6 +12,9 @@ async fn main() -> deopt_v2_backend::Result<()> {
     let config = AppConfig::from_env()?;
     config
         .execution
+        .validate_startup(config.persistence_enabled)?;
+    config
+        .indexer
         .validate_startup(config.persistence_enabled)?;
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::new(config.rust_log.clone()))
@@ -29,12 +33,13 @@ async fn main() -> deopt_v2_backend::Result<()> {
     } else {
         None
     };
-    let state = AppState::with_signature_mode_domain_repository_and_execution_config(
+    let state = AppState::with_signature_mode_domain_repository_execution_and_indexer_config(
         EngineState::with_default_markets(),
         config.signature_verification_mode,
         config.eip712_domain.clone(),
         repository.clone(),
         config.execution.clone(),
+        config.indexer.clone(),
         config.chain_id,
     );
     let app = router(state);
@@ -47,6 +52,12 @@ async fn main() -> deopt_v2_backend::Result<()> {
             );
         }
     }
+    if config.indexer.enabled {
+        if let Some(repository) = repository.clone() {
+            let indexer = Indexer::from_config_and_repository(config.indexer.clone(), repository)?;
+            spawn_indexer(indexer, config.indexer.poll_interval_ms);
+        }
+    }
 
     info!(
         service = "deopt-v2-backend",
@@ -54,6 +65,7 @@ async fn main() -> deopt_v2_backend::Result<()> {
         chain_id = config.chain_id,
         network = %config.network_name,
         execution_enabled = config.execution.execution_enabled,
+        indexer_enabled = config.indexer.enabled,
         executor_dry_run = config.execution.dry_run,
         signature_verification_mode = ?config.signature_verification_mode,
         persistence_enabled = config.persistence_enabled,

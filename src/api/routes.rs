@@ -10,9 +10,10 @@ use crate::execution::{
     HttpJsonRpcProvider, PerpTradeDomain, PerpTradePayload, SimulationResult,
     StoredTradeSignatures, TradeSignatureStatus, PERP_TRADE_TYPE,
 };
+use crate::indexer::{Indexer, IndexerStatus, IndexerTickResult};
 use crate::signing::{SignatureVerifier, SignedOrder};
 use crate::types::{now_ms, MarketId, NewOrder, OrderId};
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -44,6 +45,9 @@ pub fn router(state: AppState) -> Router {
             "/executor/simulate/:intent_id",
             post(simulate_executor_intent),
         )
+        .route("/indexer/status", get(indexer_status))
+        .route("/indexer/tick", post(indexer_tick))
+        .route("/indexed/perp-trades", get(indexed_perp_trades))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -463,6 +467,53 @@ async fn simulate_executor_intent(
     }))
 }
 
+async fn indexer_status(State(state): State<AppState>) -> Result<Json<IndexerStatus>, ApiError> {
+    let last_indexed_block = if let Some(repository) = state.repository.clone() {
+        repository
+            .get_indexer_cursor(crate::indexer::runner::PERP_MATCHING_ENGINE_CURSOR)
+            .await?
+            .unwrap_or(state.indexer_config.start_block)
+    } else {
+        state.indexer_config.start_block
+    };
+
+    Ok(Json(IndexerStatus {
+        indexer_enabled: state.indexer_config.enabled,
+        rpc_configured: state.indexer_config.rpc_url.is_some(),
+        persistence_required: state.indexer_config.require_persistence,
+        last_indexed_block,
+        target_contract: state.indexer_config.perp_matching_engine_address.0.clone(),
+    }))
+}
+
+async fn indexer_tick(State(state): State<AppState>) -> Result<Json<IndexerTickResult>, ApiError> {
+    if !state.indexer_config.enabled {
+        return Err(BackendError::Config("indexer is disabled".to_string()).into());
+    }
+    let repository = state
+        .repository
+        .clone()
+        .ok_or_else(|| BackendError::Config("indexer requires persistence enabled".to_string()))?;
+    let indexer = Indexer::from_config_and_repository(state.indexer_config, repository)?;
+    Ok(Json(indexer.tick().await?))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+struct IndexedPerpTradesQuery {
+    limit: Option<u32>,
+}
+
+async fn indexed_perp_trades(
+    State(state): State<AppState>,
+    Query(query): Query<IndexedPerpTradesQuery>,
+) -> Result<Json<Vec<crate::indexer::IndexedPerpTrade>>, ApiError> {
+    let Some(repository) = state.repository.clone() else {
+        return Ok(Json(Vec::new()));
+    };
+    let limit = query.limit.unwrap_or(50).clamp(1, 500);
+    Ok(Json(repository.list_indexed_perp_trades(limit).await?))
+}
+
 fn response_from_events(events: Vec<EngineEvent>) -> SubmitOrderResponse {
     let status = if events
         .iter()
@@ -717,6 +768,7 @@ impl From<BackendError> for ApiError {
             | BackendError::UnsupportedTimeInForce(_)
             | BackendError::UnsupportedCommand(_)
             | BackendError::Simulation(_)
+            | BackendError::Indexer(_)
             | BackendError::Config(_) => StatusCode::BAD_REQUEST,
             BackendError::Persistence(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };

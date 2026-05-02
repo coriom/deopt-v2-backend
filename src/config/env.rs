@@ -1,5 +1,6 @@
 use crate::error::{BackendError, Result};
 use crate::execution::ExecutionConfig;
+use crate::indexer::IndexerConfig;
 use crate::signing::signature::SignatureVerificationMode;
 use crate::signing::Eip712Domain;
 use crate::types::AccountId;
@@ -14,6 +15,7 @@ pub struct AppConfig {
     pub chain_id: u64,
     pub network_name: String,
     pub execution: ExecutionConfig,
+    pub indexer: IndexerConfig,
     pub signature_verification_mode: SignatureVerificationMode,
     pub eip712_domain: Eip712Domain,
     pub persistence_enabled: bool,
@@ -60,6 +62,15 @@ impl AppConfig {
                 "0x0000000000000000000000000000000000000000",
             )),
         };
+        let indexer = IndexerConfig {
+            enabled: parse_env(&mut lookup, "INDEXER_ENABLED", "false")?,
+            start_block: parse_env(&mut lookup, "INDEXER_START_BLOCK", "0")?,
+            poll_interval_ms: parse_env(&mut lookup, "INDEXER_POLL_INTERVAL_MS", "3000")?,
+            max_block_range: parse_env(&mut lookup, "INDEXER_MAX_BLOCK_RANGE", "500")?,
+            require_persistence: parse_env(&mut lookup, "INDEXER_REQUIRE_PERSISTENCE", "true")?,
+            rpc_url: execution.rpc_url.clone(),
+            perp_matching_engine_address: execution.perp_matching_engine_address.clone(),
+        };
         let signature_verification_mode =
             parse_env(&mut lookup, "SIGNATURE_VERIFICATION_MODE", "disabled")?;
         let eip712_domain = Eip712Domain {
@@ -81,6 +92,7 @@ impl AppConfig {
             ));
         }
         execution.validate_startup(persistence_enabled)?;
+        indexer.validate_startup(persistence_enabled)?;
 
         Ok(Self {
             host,
@@ -89,6 +101,7 @@ impl AppConfig {
             chain_id,
             network_name,
             execution,
+            indexer,
             signature_verification_mode,
             eip712_domain,
             persistence_enabled,
@@ -263,6 +276,50 @@ mod tests {
         assert!(error
             .to_string()
             .contains("simulation requires persistence enabled"));
+    }
+
+    #[test]
+    fn indexer_disabled_does_not_require_rpc_or_persistence() {
+        let config = config_from_pairs([
+            ("INDEXER_ENABLED", "false"),
+            ("PERSISTENCE_ENABLED", "false"),
+        ])
+        .unwrap();
+
+        assert!(!config.indexer.enabled);
+        assert_eq!(config.indexer.rpc_url, None);
+        assert_eq!(config.indexer.start_block, 0);
+        assert_eq!(config.indexer.poll_interval_ms, 3_000);
+        assert_eq!(config.indexer.max_block_range, 500);
+        assert!(config.indexer.require_persistence);
+    }
+
+    #[test]
+    fn indexer_enabled_requires_rpc_url() {
+        let error = config_from_pairs([
+            ("INDEXER_ENABLED", "true"),
+            ("INDEXER_REQUIRE_PERSISTENCE", "false"),
+        ])
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("RPC_URL is required when INDEXER_ENABLED=true"));
+    }
+
+    #[test]
+    fn indexer_requiring_persistence_rejects_persistence_disabled() {
+        let error = config_from_pairs([
+            ("INDEXER_ENABLED", "true"),
+            ("INDEXER_REQUIRE_PERSISTENCE", "true"),
+            ("RPC_URL", "https://example.invalid"),
+            ("PERSISTENCE_ENABLED", "false"),
+        ])
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("indexer requires persistence enabled"));
     }
 
     fn config_from_pairs<const N: usize>(pairs: [(&str, &str); N]) -> Result<AppConfig> {

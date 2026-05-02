@@ -4,6 +4,7 @@ pub mod db;
 pub mod engine;
 pub mod error;
 pub mod execution;
+pub mod indexer;
 pub mod mm;
 pub mod orderbook;
 pub mod rfq;

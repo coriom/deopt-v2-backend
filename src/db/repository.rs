@@ -9,6 +9,7 @@ use crate::execution::{
     ExecutionIntent, ExecutionIntentRepository, ExecutionIntentStatus, SimulationResult,
     StoredTradeSignatures,
 };
+use crate::indexer::IndexedPerpTrade;
 use crate::signing::SignedOrder;
 use crate::types::{now_ms, AccountId, OrderStatus, TimestampMs};
 use sqlx::postgres::{PgPool, PgRow};
@@ -272,6 +273,55 @@ impl PgRepository {
             .await
             .map_err(|error| BackendError::Persistence(error.to_string()))
     }
+
+    pub async fn get_indexer_cursor(&self, name: &str) -> Result<Option<u64>> {
+        let row = sqlx::query("SELECT last_indexed_block FROM indexer_cursors WHERE name = $1")
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|error| BackendError::Persistence(error.to_string()))?;
+
+        row.map(|row| {
+            let value: i64 = row_get(&row, "last_indexed_block")?;
+            i64_to_u64_persistence("last_indexed_block", value)
+        })
+        .transpose()
+    }
+
+    pub async fn persist_indexed_perp_trades_and_cursor(
+        &self,
+        cursor_name: &str,
+        trades: &[IndexedPerpTrade],
+        last_indexed_block: u64,
+    ) -> Result<u64> {
+        let mut tx = self.begin().await?;
+        let mut inserted = 0u64;
+        for trade in trades {
+            inserted += insert_indexed_perp_trade(&mut tx, trade).await?;
+        }
+        upsert_indexer_cursor(&mut tx, cursor_name, last_indexed_block, now_ms()).await?;
+        tx.commit()
+            .await
+            .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        Ok(inserted)
+    }
+
+    pub async fn list_indexed_perp_trades(&self, limit: u32) -> Result<Vec<IndexedPerpTrade>> {
+        let rows = sqlx::query(
+            "SELECT event_id, tx_hash, log_index, block_number, block_hash, buyer, seller,
+                    market_id, size_delta_1e8, execution_price_1e8, buyer_is_maker,
+                    buyer_nonce, seller_nonce, created_at_ms
+             FROM indexed_perp_trades
+             ORDER BY block_number DESC, log_index DESC
+             LIMIT $1",
+        )
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+
+        rows.into_iter().map(indexed_perp_trade_from_row).collect()
+    }
 }
 
 impl ExecutionIntentRepository for PgRepository {
@@ -407,6 +457,60 @@ async fn insert_execution_simulation(
     Ok(())
 }
 
+async fn insert_indexed_perp_trade(
+    tx: &mut Transaction<'_, Postgres>,
+    trade: &IndexedPerpTrade,
+) -> Result<u64> {
+    let result = sqlx::query(
+        "INSERT INTO indexed_perp_trades (
+            event_id, tx_hash, log_index, block_number, block_hash, buyer, seller,
+            market_id, size_delta_1e8, execution_price_1e8, buyer_is_maker,
+            buyer_nonce, seller_nonce, created_at_ms
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+        ON CONFLICT (tx_hash, log_index) DO NOTHING",
+    )
+    .bind(&trade.event_id)
+    .bind(&trade.tx_hash)
+    .bind(u64_to_i64("log_index", trade.log_index)?)
+    .bind(u64_to_i64("block_number", trade.block_number)?)
+    .bind(&trade.block_hash)
+    .bind(&trade.buyer)
+    .bind(&trade.seller)
+    .bind(&trade.market_id)
+    .bind(&trade.size_delta_1e8)
+    .bind(&trade.execution_price_1e8)
+    .bind(trade.buyer_is_maker)
+    .bind(&trade.buyer_nonce)
+    .bind(&trade.seller_nonce)
+    .bind(timestamp_to_i64(trade.created_at_ms))
+    .execute(&mut **tx)
+    .await
+    .map_err(|error| BackendError::Persistence(error.to_string()))?;
+    Ok(result.rows_affected())
+}
+
+async fn upsert_indexer_cursor(
+    tx: &mut Transaction<'_, Postgres>,
+    name: &str,
+    last_indexed_block: u64,
+    updated_at_ms: i64,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO indexer_cursors (name, last_indexed_block, updated_at_ms)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (name) DO UPDATE
+         SET last_indexed_block = EXCLUDED.last_indexed_block,
+             updated_at_ms = EXCLUDED.updated_at_ms",
+    )
+    .bind(name)
+    .bind(u64_to_i64("last_indexed_block", last_indexed_block)?)
+    .bind(timestamp_to_i64(updated_at_ms))
+    .execute(&mut **tx)
+    .await
+    .map_err(|error| BackendError::Persistence(error.to_string()))?;
+    Ok(())
+}
+
 async fn insert_trade(tx: &mut Transaction<'_, Postgres>, trade: &DbTrade) -> Result<()> {
     sqlx::query(
         "INSERT INTO trades (
@@ -515,6 +619,27 @@ fn db_execution_intent_from_row(row: PgRow) -> Result<DbExecutionIntent> {
     })
 }
 
+fn indexed_perp_trade_from_row(row: PgRow) -> Result<IndexedPerpTrade> {
+    let log_index: i64 = row_get(&row, "log_index")?;
+    let block_number: i64 = row_get(&row, "block_number")?;
+    Ok(IndexedPerpTrade {
+        event_id: row_get(&row, "event_id")?,
+        tx_hash: row_get(&row, "tx_hash")?,
+        log_index: i64_to_u64_persistence("log_index", log_index)?,
+        block_number: i64_to_u64_persistence("block_number", block_number)?,
+        block_hash: row_get(&row, "block_hash")?,
+        buyer: row_get(&row, "buyer")?,
+        seller: row_get(&row, "seller")?,
+        market_id: row_get(&row, "market_id")?,
+        size_delta_1e8: row_get(&row, "size_delta_1e8")?,
+        execution_price_1e8: row_get(&row, "execution_price_1e8")?,
+        buyer_is_maker: row_get(&row, "buyer_is_maker")?,
+        buyer_nonce: row_get(&row, "buyer_nonce")?,
+        seller_nonce: row_get(&row, "seller_nonce")?,
+        created_at_ms: row_get(&row, "created_at_ms")?,
+    })
+}
+
 fn row_get<T>(row: &PgRow, column: &str) -> Result<T>
 where
     for<'r> T: sqlx::Decode<'r, Postgres> + sqlx::Type<Postgres>,
@@ -529,4 +654,9 @@ fn is_unique_violation(error: &sqlx::Error) -> bool {
         .and_then(|database_error| database_error.code())
         .as_deref()
         == Some("23505")
+}
+
+fn i64_to_u64_persistence(field: &str, value: i64) -> Result<u64> {
+    u64::try_from(value)
+        .map_err(|_| BackendError::Persistence(format!("{field} cannot be negative")))
 }

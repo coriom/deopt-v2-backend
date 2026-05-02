@@ -41,6 +41,8 @@ pub enum BackendError {
     MissingExecutionMetadata(String),
     #[error("simulation failed: {0}")]
     Simulation(String),
+    #[error("indexer failed: {0}")]
+    Indexer(String),
     #[error("malformed account address")]
     MalformedAccountAddress,
     #[error("unsupported signature v value")]
