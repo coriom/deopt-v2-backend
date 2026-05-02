@@ -1,5 +1,5 @@
 use crate::error::{BackendError, Result};
-use crate::execution::{ExecutionIntent, ExecutionIntentStatus};
+use crate::execution::{ExecutionIntent, ExecutionIntentStatus, SimulationResult};
 use crate::signing::SignedOrder;
 use crate::types::{
     AccountId, Order, OrderId, OrderStatus, OrderType, Side, TimeInForce, TimestampMs, TradeMatch,
@@ -108,6 +108,34 @@ pub struct DbExecutionIntent {
     pub updated_at_ms: i64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DbExecutionSimulation {
+    pub simulation_id: String,
+    pub intent_id: String,
+    pub status: String,
+    pub block_number: Option<i64>,
+    pub error: Option<String>,
+    pub created_at_ms: i64,
+}
+
+impl TryFrom<&SimulationResult> for DbExecutionSimulation {
+    type Error = BackendError;
+
+    fn try_from(result: &SimulationResult) -> Result<Self> {
+        Ok(Self {
+            simulation_id: result.simulation_id.to_string(),
+            intent_id: result.intent_id.to_string(),
+            status: execution_status_to_str(result.status).to_string(),
+            block_number: result
+                .block_number
+                .map(|value| u64_to_i64("block_number", value))
+                .transpose()?,
+            error: result.error.clone(),
+            created_at_ms: result.created_at_ms,
+        })
+    }
+}
+
 impl TryFrom<&ExecutionIntent> for DbExecutionIntent {
     type Error = BackendError;
 
@@ -211,6 +239,9 @@ pub fn execution_status_to_str(status: ExecutionIntentStatus) -> &'static str {
     match status {
         ExecutionIntentStatus::Pending => "pending",
         ExecutionIntentStatus::DryRun => "dry_run",
+        ExecutionIntentStatus::CalldataReady => "calldata_ready",
+        ExecutionIntentStatus::SimulationOk => "simulation_ok",
+        ExecutionIntentStatus::SimulationFailed => "simulation_failed",
         ExecutionIntentStatus::Submitted => "submitted",
         ExecutionIntentStatus::Confirmed => "confirmed",
         ExecutionIntentStatus::Failed => "failed",
@@ -221,6 +252,9 @@ fn execution_status_from_str(value: &str) -> Result<ExecutionIntentStatus> {
     match value {
         "pending" => Ok(ExecutionIntentStatus::Pending),
         "dry_run" => Ok(ExecutionIntentStatus::DryRun),
+        "calldata_ready" => Ok(ExecutionIntentStatus::CalldataReady),
+        "simulation_ok" => Ok(ExecutionIntentStatus::SimulationOk),
+        "simulation_failed" => Ok(ExecutionIntentStatus::SimulationFailed),
         "submitted" => Ok(ExecutionIntentStatus::Submitted),
         "confirmed" => Ok(ExecutionIntentStatus::Confirmed),
         "failed" => Ok(ExecutionIntentStatus::Failed),

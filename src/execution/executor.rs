@@ -223,7 +223,10 @@ mod tests {
             dry_run: true,
             poll_interval_ms: 1_000,
             max_batch_size: 10,
+            simulation_enabled: false,
+            simulation_requires_persistence: true,
             rpc_url: None,
+            executor_from_address: AccountId::new("0x0000000000000000000000000000000000000000"),
             perp_matching_engine_address: AccountId::new(
                 "0x0000000000000000000000000000000000000009",
             ),

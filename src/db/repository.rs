@@ -1,12 +1,13 @@
 use super::models::{
     execution_status_to_str, order_status_to_str, timestamp_to_i64, u64_to_i64, DbExecutionIntent,
-    DbOrder, DbTrade,
+    DbExecutionSimulation, DbOrder, DbTrade,
 };
 use super::pool;
 use crate::engine::EngineEvent;
 use crate::error::{BackendError, Result};
 use crate::execution::{
-    ExecutionIntent, ExecutionIntentRepository, ExecutionIntentStatus, StoredTradeSignatures,
+    ExecutionIntent, ExecutionIntentRepository, ExecutionIntentStatus, SimulationResult,
+    StoredTradeSignatures,
 };
 use crate::signing::SignedOrder;
 use crate::types::{now_ms, AccountId, OrderStatus, TimestampMs};
@@ -255,6 +256,22 @@ impl PgRepository {
 
         Ok(signatures)
     }
+
+    pub async fn persist_simulation_result(&self, result: &SimulationResult) -> Result<()> {
+        let db_simulation = DbExecutionSimulation::try_from(result)?;
+        let mut tx = self.begin().await?;
+        insert_execution_simulation(&mut tx, &db_simulation).await?;
+        update_execution_intent_status_tx(
+            &mut tx,
+            &result.intent_id.to_string(),
+            result.status,
+            result.created_at_ms,
+        )
+        .await?;
+        tx.commit()
+            .await
+            .map_err(|error| BackendError::Persistence(error.to_string()))
+    }
 }
 
 impl ExecutionIntentRepository for PgRepository {
@@ -343,6 +360,47 @@ async fn update_order_status(
     .bind(order_status_to_str(status))
     .bind(remaining_size_1e8)
     .bind(timestamp_to_i64(updated_at_ms))
+    .execute(&mut **tx)
+    .await
+    .map_err(|error| BackendError::Persistence(error.to_string()))?;
+    Ok(())
+}
+
+async fn update_execution_intent_status_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    intent_id: &str,
+    status: ExecutionIntentStatus,
+    updated_at_ms: i64,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE execution_intents
+         SET status = $2, updated_at_ms = $3
+         WHERE intent_id = $1",
+    )
+    .bind(intent_id)
+    .bind(execution_status_to_str(status))
+    .bind(timestamp_to_i64(updated_at_ms))
+    .execute(&mut **tx)
+    .await
+    .map_err(|error| BackendError::Persistence(error.to_string()))?;
+    Ok(())
+}
+
+async fn insert_execution_simulation(
+    tx: &mut Transaction<'_, Postgres>,
+    simulation: &DbExecutionSimulation,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO execution_simulations (
+            simulation_id, intent_id, status, block_number, error, created_at_ms
+        ) VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(&simulation.simulation_id)
+    .bind(&simulation.intent_id)
+    .bind(&simulation.status)
+    .bind(simulation.block_number)
+    .bind(&simulation.error)
+    .bind(simulation.created_at_ms)
     .execute(&mut **tx)
     .await
     .map_err(|error| BackendError::Persistence(error.to_string()))?;

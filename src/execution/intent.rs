@@ -9,6 +9,9 @@ use uuid::Uuid;
 pub enum ExecutionIntentStatus {
     Pending,
     DryRun,
+    CalldataReady,
+    SimulationOk,
+    SimulationFailed,
     Submitted,
     Confirmed,
     Failed,

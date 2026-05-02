@@ -1,4 +1,5 @@
-use super::ExecutionIntent;
+use super::{ExecutionIntent, ExecutionIntentStatus};
+use uuid::Uuid;
 
 #[derive(Clone, Debug, Default)]
 pub struct ExecutionQueue {
@@ -16,5 +17,17 @@ impl ExecutionQueue {
 
     pub fn all(&self) -> Vec<ExecutionIntent> {
         self.intents.clone()
+    }
+
+    pub fn update_status(&mut self, intent_id: Uuid, status: ExecutionIntentStatus) -> bool {
+        let Some(intent) = self
+            .intents
+            .iter_mut()
+            .find(|intent| intent.intent_id == intent_id)
+        else {
+            return false;
+        };
+        intent.status = status;
+        true
     }
 }

@@ -2,6 +2,7 @@ use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use deopt_v2_backend::api::{router, AppState};
 use deopt_v2_backend::engine::{EngineEvent, EngineState};
+use deopt_v2_backend::execution::ExecutionConfig;
 use deopt_v2_backend::signing::{Eip712Domain, SignatureVerificationMode, SignedOrder};
 use deopt_v2_backend::types::now_ms;
 use deopt_v2_backend::types::{AccountId, NewOrder, OrderId, OrderStatus, Side, TimeInForce};
@@ -576,6 +577,95 @@ async fn executor_status_api_reports_scaffold_flags() {
     assert_eq!(json["dryRun"], true);
     assert_eq!(json["realBroadcastEnabled"], false);
     assert_eq!(json["persistenceRequired"], true);
+    assert_eq!(json["simulationEnabled"], false);
+    assert_eq!(json["simulationRequiresPersistence"], true);
+    assert_eq!(json["rpcConfigured"], false);
+    assert_eq!(json["broadcastEnabled"], false);
+}
+
+#[tokio::test]
+async fn simulate_endpoint_rejects_when_simulation_disabled() {
+    let response = router(AppState::new(EngineState::with_default_markets()))
+        .oneshot(json_post(
+            "/executor/simulate/00000000-0000-0000-0000-000000000001",
+            "{}".to_string(),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let json = response_json(response).await;
+    assert!(json["error"]
+        .as_str()
+        .unwrap()
+        .contains("simulation is disabled"));
+}
+
+#[tokio::test]
+async fn simulate_endpoint_rejects_missing_signatures_before_rpc() {
+    let app = router(
+        AppState::with_signature_mode_domain_repository_and_execution_config(
+            EngineState::with_default_markets(),
+            SignatureVerificationMode::Disabled,
+            Eip712Domain::default(),
+            None,
+            simulation_config_without_persistence_requirement(),
+            84532,
+        ),
+    );
+    let maker = app
+        .clone()
+        .oneshot(json_post(
+            "/orders",
+            signed_order_body(
+                "0x0000000000000000000000000000000000000001",
+                "sell",
+                "300000000000",
+                "100000000",
+                41,
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(maker.status(), StatusCode::OK);
+    let taker = app
+        .clone()
+        .oneshot(json_post(
+            "/orders",
+            signed_order_body(
+                "0x0000000000000000000000000000000000000002",
+                "buy",
+                "300000000000",
+                "50000000",
+                42,
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(taker.status(), StatusCode::OK);
+    let json = response_json(taker).await;
+    let intent_id = json["execution_intents"][0]["intent_id"].as_str().unwrap();
+
+    let response = app
+        .oneshot(json_post(
+            &format!("/executor/simulate/{intent_id}"),
+            "{}".to_string(),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let json = response_json(response).await;
+    assert!(json["error"]
+        .as_str()
+        .unwrap()
+        .contains("trade signatures are required"));
+}
+
+#[test]
+fn executor_status_cannot_report_broadcast_enabled() {
+    assert!(!ExecutionConfig::disabled().status().broadcast_enabled);
+    assert!(!ExecutionConfig::disabled().status().real_broadcast_enabled);
 }
 
 #[tokio::test]
@@ -818,6 +908,21 @@ fn trade_signature(byte: u8) -> String {
         signature.push_str(&format!("{byte:02x}"));
     }
     signature
+}
+
+fn simulation_config_without_persistence_requirement() -> ExecutionConfig {
+    ExecutionConfig {
+        execution_enabled: false,
+        dry_run: true,
+        poll_interval_ms: 1_000,
+        max_batch_size: 10,
+        simulation_enabled: true,
+        simulation_requires_persistence: false,
+        rpc_url: Some("https://example.invalid".to_string()),
+        executor_from_address: AccountId::new("0x0000000000000000000000000000000000000000"),
+        perp_matching_engine_address: AccountId::new("0x0000000000000000000000000000000000000009"),
+        perp_engine_address: AccountId::new("0x0000000000000000000000000000000000000000"),
+    }
 }
 
 async fn response_json(response: axum::response::Response) -> serde_json::Value {

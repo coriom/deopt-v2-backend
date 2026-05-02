@@ -39,6 +39,8 @@ pub enum BackendError {
     MissingTradeSignatures,
     #[error("execution intent is missing PerpTrade metadata: {0}")]
     MissingExecutionMetadata(String),
+    #[error("simulation failed: {0}")]
+    Simulation(String),
     #[error("malformed account address")]
     MalformedAccountAddress,
     #[error("unsupported signature v value")]

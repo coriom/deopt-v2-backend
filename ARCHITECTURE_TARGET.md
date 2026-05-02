@@ -136,9 +136,10 @@ Implemented Phase 1 foundations:
 - MM gateway scaffold
 - EIP-712 order signature validation
 - PostgreSQL persistence V1 for nonces, orders, trades, execution intents, and event audit records
+- Manual `eth_call` simulation V1 for calldata-ready execution intents
 
 Do not implement:
-- blockchain RPC
+- transaction-sending RPC
 - on-chain execution database/indexer views
 - real WebSocket MM gateway
 - on-chain execution

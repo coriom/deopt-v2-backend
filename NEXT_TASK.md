@@ -1,225 +1,261 @@
-# NEXT_TASK.md — PerpMatchingEngine Calldata Builder V1
-# NEXT_TASK.md — Matched PerpTrade Signature Flow V1
+# NEXT_TASK.md — Executor RPC Simulation V1
 
 ## Context
 
-The backend now has:
-- deterministic matching
+The Rust backend now has:
+- deterministic in-memory matching
 - strict EIP-712 order verification
 - PostgreSQL persistence
 - dry-run executor scaffold
-- real ABI calldata builder for PerpMatchingEngine.executeTrade
+- real PerpMatchingEngine calldata builder
+- matched PerpTrade signature collection flow
+- calldata readiness only when buyerSig and sellerSig are both present
 
-Important Solidity constraint:
-- PerpMatchingEngine does not verify order signatures.
-- It verifies buyerSig and sellerSig over the final matched PerpTrade.
-- Therefore, existing signed order signatures are not sufficient for execution.
+Current limitation:
+- calldata can be built, but it is not simulated against Base Sepolia
+- execution intents cannot yet be marked simulation_ok or simulation_failed
+- no on-chain safety check exists before future broadcast
 
 ## Goal
 
-Add a signature collection flow for matched PerpTrade execution.
+Add RPC simulation V1 for execution intents.
 
-The backend must:
-- expose the final PerpTrade payload that buyer and seller must sign
-- accept buyer/seller trade signatures
-- validate signature shape
-- persist signatures
-- mark an execution intent as calldata-ready when both signatures are present
-- build real calldata only when both signatures are present
-- still not broadcast transactions
+The executor must be able to:
+- take a calldata-ready execution intent
+- build the PerpMatchingEngine.executeTrade calldata
+- run an eth_call simulation against the configured RPC
+- persist simulation result
+- expose a manual simulation endpoint
 
-## Scope
+This task must not broadcast transactions.
 
-Implement:
-- signing payload endpoint
-- signature submission endpoint
-- persistence for trade signatures
-- calldata-ready status/metadata
-- dry-run executor awareness of missing/present signatures
+## Critical Safety Rule
 
-Do not implement:
-- RPC simulation
-- transaction signing
-- transaction broadcast
-- private key loading
-- indexer
-- Solidity changes
+Do not send real transactions.
 
-## Required API
+This task is simulation only:
+- no private key loading
+- no signing
+- no sendTransaction
+- no broadcast
+- no submitted status
+- no confirmed status
 
-Add:
+`simulation_ok` means only:
+- eth_call did not revert at the current block
 
-```text
-GET /execution-intents/:intent_id/signing-payload
-POST /execution-intents/:intent_id/signatures
-GET /execution-intents/:intent_id/signing-payload
+`simulation_ok` does not mean:
+- submitted
+- confirmed
+- final
+- executed
 
-Returns the PerpTrade payload to sign.
+## Config
 
-Response should include:
+Add or extend `.env.example`:
 
-intent_id
-eip712 domain:
-name: DeOptV2-PerpMatchingEngine
-version: 1
-chainId
-verifyingContract
-type name: PerpTrade
-type fields
-message:
-buyer
-seller
-marketId
-sizeDelta1e8
-executionPrice1e8
-buyerIsMaker
-buyerNonce
-sellerNonce
-deadline
-digest if available from backend implementation
-
-Important:
-
-Do not invent buyerNonce/sellerNonce silently.
-If the backend does not yet know buyerNonce/sellerNonce/deadline, return a clear error or require them to be stored with the intent.
-
-Preferred:
-
-extend execution intent metadata to include:
-buyer_nonce
-seller_nonce
-deadline
-buyer_is_maker
-
-If current ExecutionIntent lacks these fields, add a minimal backwards-compatible execution metadata table or nullable columns.
-
-POST /execution-intents/:intent_id/signatures
-
-Request:
-
-{
-  "buyer_sig": "0x...",
-  "seller_sig": "0x..."
-}
+```env
+SIMULATION_ENABLED=false
+SIMULATION_REQUIRE_PERSISTENCE=true
+RPC_URL=
+PERP_MATCHING_ENGINE_ADDRESS=0x0000000000000000000000000000000000000000
 
 Rules:
 
-allow submitting both at once
-optionally allow one side at a time if simple
-validate 0x + 65-byte hex
-persist signatures
-do not fake cryptographic verification unless implemented
-after both signatures exist, builder can produce calldata
+SIMULATION_ENABLED=false: simulation endpoints may return disabled or no-op.
+SIMULATION_ENABLED=true: requires valid RPC_URL.
+If SIMULATION_REQUIRE_PERSISTENCE=true, simulation requires PERSISTENCE_ENABLED=true.
+No private key env vars.
+Required Modules
 
-Response:
+Add or extend:
 
-intent_id
-buyer_signature_present
-seller_signature_present
+src/execution/simulator.rs
+src/execution/rpc.rs
+src/execution/status.rs
+src/execution/executor.rs
+src/execution/tx_builder.rs
+src/db/repository.rs
+src/db/models.rs
+
+Names can differ if cleaner.
+
+Execution Intent Statuses
+
+Support statuses:
+
+pending
+dry_run
 calldata_ready
-missing_signatures
+simulation_ok
+simulation_failed
+submitted
+confirmed
+failed
+
+In this task:
+
+allowed transition: calldata_ready -> simulation_ok
+allowed transition: calldata_ready -> simulation_failed
+allowed transition: dry_run -> simulation_ok only if calldata exists and signatures exist
+do not transition to submitted
+do not transition to confirmed
 Persistence Requirements
 
-Add table or columns for trade signatures.
+Add persistence for simulation result.
 
-Preferred table:
+Preferred migration:
 
-CREATE TABLE execution_intent_signatures (
-    intent_id TEXT PRIMARY KEY REFERENCES execution_intents(intent_id) ON DELETE CASCADE,
-    buyer_sig TEXT,
-    seller_sig TEXT,
-    updated_at_ms BIGINT NOT NULL
+CREATE TABLE execution_simulations (
+    simulation_id TEXT PRIMARY KEY,
+    intent_id TEXT NOT NULL REFERENCES execution_intents(intent_id) ON DELETE CASCADE,
+    status TEXT NOT NULL,
+    block_number BIGINT,
+    error TEXT,
+    created_at_ms BIGINT NOT NULL
 );
 
-If adding columns to execution_intents is cleaner, acceptable.
+CREATE INDEX idx_execution_simulations_intent_id ON execution_simulations(intent_id);
+CREATE INDEX idx_execution_simulations_status ON execution_simulations(status);
 
-Need migration:
+Alternative acceptable:
 
-migrations/0002_execution_intent_signatures.sql
+add simulation columns to execution_intents
+but separate table is preferred for audit trail
 
-Normal tests must not require Postgres.
+Repository methods:
 
-PerpTrade Payload Requirements
+get execution intent by id
+get stored trade signatures for intent
+insert simulation result
+update intent status to simulation_ok / simulation_failed
+append engine/executor event if existing audit path exists
+RPC Simulation Behavior
 
-A PerpTrade requires:
+Given an intent id:
 
-buyer
-seller
-marketId
-sizeDelta1e8
-executionPrice1e8
-buyerIsMaker
-buyerNonce
-sellerNonce
-deadline
+Load execution intent.
+Load trade signatures.
+Validate both signatures exist.
+Build PerpTradePayload.
+Build executeTrade calldata.
+Perform eth_call:
+from: optional zero address or configured executor address
+to: PERP_MATCHING_ENGINE_ADDRESS
+data: calldata
+value: 0
+If eth_call succeeds:
+persist simulation_ok
+update intent status to simulation_ok
+If eth_call reverts/fails:
+persist simulation_failed with error message
+update intent status to simulation_failed
 
-ExecutionIntent currently has:
+Important:
 
-buyer
-seller
-market_id
-price_1e8
-size_1e8
-buy_order_id
-sell_order_id
+If caller authorization matters, eth_call should use a configured executor address if available.
+Add optional env:
+EXECUTOR_FROM_ADDRESS=0x0000000000000000000000000000000000000000
+Do not use a private key.
+Do not sign.
+Do not broadcast.
+HTTP API
 
-Missing:
+Add:
 
-buyerIsMaker
-buyerNonce
-sellerNonce
-deadline
+POST /executor/simulate/:intent_id
 
-For this phase:
+Behavior:
 
-derive buyerIsMaker from maker/taker if available, or store it explicitly when intent is created
-derive buyerNonce/sellerNonce from original signed orders if available, or store them explicitly when intent is created
-set deadline from a clear execution deadline policy or original order deadlines if available
+requires simulation enabled
+requires persistence enabled if configured
+loads intent from DB or in-memory if cleanly supported
+simulates exactly one intent
+returns simulation status
 
-Do not silently use zero deadline/nonces unless documented and tested.
+Response example:
 
-Builder Integration
+{
+  "intent_id": "abc",
+  "simulation_status": "simulation_ok",
+  "block_number": 123456,
+  "submitted": false,
+  "confirmed": false
+}
 
-Update the tx builder:
+On revert:
 
-if signatures missing: return preview with missing_signatures=true
-if signatures present: build real calldata
-still is_broadcastable=false
+{
+  "intent_id": "abc",
+  "simulation_status": "simulation_failed",
+  "error": "execution reverted: ..."
+}
+
+Update:
+
+GET /executor/status
+
+Add fields:
+
+simulationEnabled
+simulationRequiresPersistence
+rpcConfigured
+broadcastEnabled=false
+Dry-Run Executor Integration
+
+If simple:
+
+dry-run executor may skip simulation unless explicitly requested.
+Do not auto-simulate in background unless clean and safe.
+
+Preferred for this task:
+
+manual simulation endpoint only.
+background auto-simulation can be deferred.
 Tests Required
+
+Normal cargo test must not require RPC or Postgres.
 
 Add tests for:
 
-signing payload endpoint returns expected PerpTrade fields
-missing nonce/deadline metadata returns clear error if not implemented
-signature endpoint rejects malformed buyer_sig
-signature endpoint rejects malformed seller_sig
-submitting both signatures marks calldata_ready
-tx builder builds calldata only when both signatures exist
-missing signatures produce non-executable preview
+simulation config disabled
+simulation enabled requires RPC_URL
+simulation requiring persistence rejects persistence disabled
+/executor/status includes simulation fields
+simulate endpoint rejects when simulation disabled
+simulate endpoint rejects missing signatures before RPC
+simulator maps success to simulation_ok using mocked provider if feasible
+simulator maps failure to simulation_failed using mocked provider if feasible
+no broadcast is possible
 existing tests still pass
 
-No normal test may require:
+If mocking provider is too large:
 
-Postgres
-RPC
-private keys
-Base Sepolia
+isolate pure simulation result mapping tests
+keep real RPC tests out of default test suite
 Documentation
 
-Update README.md and ARCHITECTURE.md:
+Update README.md:
 
-order signatures vs PerpTrade signatures
-why second signature flow exists
-endpoint usage
-no broadcast yet
-next phase is RPC simulation
+explain simulation mode
+explain env vars
+explain that simulation is eth_call only
+explain simulation_ok is not confirmation
+explain no private key / no broadcast
+
+Update ARCHITECTURE.md:
+
+add simulation stage to execution lifecycle
+pending/calldata_ready -> simulation_ok/simulation_failed
+future submitted/confirmed only after broadcast and indexer reconciliation
 Constraints
 
 Do not add:
 
 transaction broadcast
 private key loading
-RPC simulation
+sendTransaction
+production executor
 indexer
 frontend
 TypeScript
@@ -233,10 +269,18 @@ Do not modify:
 
 Do not fake:
 
-signatures
-calldata readiness
-on-chain confirmation
-broadcast
+successful simulation
+submitted status
+confirmed status
+on-chain execution
+transaction hash
+
+Do not change:
+
+matching semantics
+financial numeric rules
+EIP-712 order verification behavior
+PerpTrade signature collection behavior
 Validation
 
 Run:
@@ -247,14 +291,16 @@ cargo test
 cargo build
 Acceptance Criteria
 
-Complete only if:
+The task is complete only if:
 
-signing payload endpoint exists
-signature submission endpoint exists
-signatures can be persisted or tracked
-calldata readiness depends on both signatures
-no broadcast exists
-all tests pass
+simulation config exists
+simulation endpoint exists
+eth_call simulation boundary exists
+simulation result persistence exists
+intent status can become simulation_ok or simulation_failed
+no broadcast/private key/signing exists
+default tests require no RPC/Postgres
+all validation commands pass
 EOF
 
 after all, 

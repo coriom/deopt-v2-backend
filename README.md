@@ -1,8 +1,8 @@
 # DeOpt v2 Rust Trading Backend
 
-Phase 1 Rust backend for DeOpt v2 trading infrastructure. This service provides an in-memory perp orderbook, deterministic matching, a thin HTTP API, RFQ/MM scaffolds, an execution-intent queue, and a dry-run PerpMatchingEngine calldata builder boundary.
+Phase 1 Rust backend for DeOpt v2 trading infrastructure. This service provides an in-memory perp orderbook, deterministic matching, a thin HTTP API, RFQ/MM scaffolds, an execution-intent queue, a dry-run PerpMatchingEngine calldata builder boundary, and manual RPC simulation for calldata-ready intents.
 
-Smart contracts remain the final source of truth. This backend does not submit transactions, sign payloads, load private keys, call RPC endpoints, or claim final settlement.
+Smart contracts remain the final source of truth. This backend does not submit transactions, sign payloads, load private keys, or claim final settlement. Optional simulation uses `eth_call` only and never broadcasts.
 
 ## Run
 
@@ -23,7 +23,10 @@ EXECUTION_ENABLED=false
 EXECUTOR_DRY_RUN=true
 EXECUTOR_POLL_INTERVAL_MS=1000
 EXECUTOR_MAX_BATCH_SIZE=10
+SIMULATION_ENABLED=false
+SIMULATION_REQUIRE_PERSISTENCE=true
 RPC_URL=
+EXECUTOR_FROM_ADDRESS=0x0000000000000000000000000000000000000000
 PERP_MATCHING_ENGINE_ADDRESS=0x0000000000000000000000000000000000000000
 PERP_ENGINE_ADDRESS=0x0000000000000000000000000000000000000000
 SIGNATURE_VERIFICATION_MODE=disabled
@@ -38,6 +41,7 @@ EIP712_VERIFYING_CONTRACT=0x0000000000000000000000000000000000000000
 `EXECUTION_ENABLED=false` is intentional for this phase.
 `EXECUTOR_DRY_RUN=false` is rejected because real on-chain execution is not implemented.
 `PERSISTENCE_ENABLED=false` keeps the default local in-memory behavior and does not require Postgres.
+`SIMULATION_ENABLED=true` requires `RPC_URL`; when `SIMULATION_REQUIRE_PERSISTENCE=true`, it also requires `PERSISTENCE_ENABLED=true`.
 
 ## PerpMatchingEngine Calldata
 
@@ -66,7 +70,24 @@ curl -X POST http://127.0.0.1:8080/execution-intents/<intent_id>/signatures \
 
 Signatures are accepted only as `0x` plus 65-byte hex strings. They are stored in memory by default and in `execution_intent_signatures` when persistence is enabled. `calldata_ready=true` only when both buyer and seller trade signatures are present and the corresponding intent has complete PerpTrade metadata.
 
-Broadcast remains disabled. The prepared call always has `is_broadcastable=false` and `value=0`; no RPC simulation, signing, private key loading, transaction submission, or confirmation tracking exists in this phase.
+Broadcast remains disabled. The prepared call always has `is_broadcastable=false` and `value=0`; no signing, private key loading, transaction submission, or confirmation tracking exists in this phase.
+
+## RPC Simulation
+
+Manual simulation is opt-in:
+
+```text
+SIMULATION_ENABLED=true
+SIMULATION_REQUIRE_PERSISTENCE=true
+RPC_URL=https://...
+EXECUTOR_FROM_ADDRESS=0x0000000000000000000000000000000000000000
+PERP_MATCHING_ENGINE_ADDRESS=0x...
+PERSISTENCE_ENABLED=true
+```
+
+`POST /executor/simulate/<intent_id>` loads one execution intent, requires both stored PerpTrade signatures, rebuilds the real `executeTrade` calldata, and performs an `eth_call` to `PERP_MATCHING_ENGINE_ADDRESS` with `value=0`. On success, the intent is marked `simulation_ok`; on revert or RPC failure, it is marked `simulation_failed` with the error text. These statuses only describe the result of the call simulation at the queried block. They do not mean submitted, confirmed, final, or executed.
+
+The endpoint returns `submitted=false` and `confirmed=false` for every response. Real broadcast remains impossible in this backend phase, and `GET /executor/status` reports `broadcastEnabled=false`.
 
 ## Persistence
 
@@ -77,7 +98,7 @@ PERSISTENCE_ENABLED=true
 DATABASE_URL=postgres://deopt:deopt@127.0.0.1:5432/deopt_v2_backend
 ```
 
-When enabled, the service connects to Postgres at startup and runs migrations from `migrations/`. The first migration creates `used_nonces`, `orders`, `trades`, `execution_intents`, and `engine_events`.
+When enabled, the service connects to Postgres at startup and runs migrations from `migrations/`. Migrations create `used_nonces`, `orders`, `trades`, `execution_intents`, `execution_intent_signatures`, `execution_simulations`, and `engine_events`.
 
 One local setup option:
 
@@ -145,10 +166,9 @@ curl -X DELETE http://127.0.0.1:8080/orders/<order_id>
 - RFQ and market-maker gateway are type scaffolds only.
 - Execution intents are provisional off-chain records, not settlement.
 - PerpMatchingEngine calldata can be encoded only from complete matched trade payloads and explicit buyer/seller PerpTrade signatures.
-- No blockchain RPC, transaction signing, production auth, WebSocket API, or options matching.
+- Optional blockchain RPC is limited to manual `eth_call` simulation. No transaction signing, production auth, WebSocket API, or options matching.
 
 ## Deferred Execution Work
 
-- Add RPC simulation with `eth_call`.
 - Add transaction signing and broadcast behind explicit production safety controls.
 - Reconcile submitted transactions through an indexer before marking execution confirmed.

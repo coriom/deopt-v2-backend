@@ -6,8 +6,9 @@ use crate::db::PgRepository;
 use crate::engine::{EngineCommand, EngineEvent};
 use crate::error::{BackendError, Result as BackendResult};
 use crate::execution::{
-    perp_trade_digest, Executor, PerpTradeDomain, PerpTradePayload, StoredTradeSignatures,
-    TradeSignatureStatus, PERP_TRADE_TYPE,
+    perp_trade_digest, simulate_execution_intent, ExecutionIntentStatus, Executor,
+    HttpJsonRpcProvider, PerpTradeDomain, PerpTradePayload, SimulationResult,
+    StoredTradeSignatures, TradeSignatureStatus, PERP_TRADE_TYPE,
 };
 use crate::signing::{SignatureVerifier, SignedOrder};
 use crate::types::{now_ms, MarketId, NewOrder, OrderId};
@@ -39,6 +40,10 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/executor/status", get(executor_status))
         .route("/executor/tick", post(executor_tick))
+        .route(
+            "/executor/simulate/:intent_id",
+            post(simulate_executor_intent),
+        )
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -348,6 +353,8 @@ async fn submit_execution_intent_signatures(
             &payload,
             Some(&bundle),
         )?;
+        update_execution_intent_status(&state, intent_id, ExecutionIntentStatus::CalldataReady)
+            .await?;
     }
 
     Ok(Json(SubmitTradeSignaturesResponse {
@@ -404,6 +411,55 @@ async fn executor_tick(
         calldata_ready: result.calldata_ready,
         missing_signatures: result.missing_signatures,
         calls_prepared: result.prepared_calls.len(),
+    }))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct SimulationResponse {
+    intent_id: Uuid,
+    simulation_status: ExecutionIntentStatus,
+    block_number: Option<u64>,
+    error: Option<String>,
+    submitted: bool,
+    confirmed: bool,
+}
+
+async fn simulate_executor_intent(
+    State(state): State<AppState>,
+    Path(intent_id): Path<String>,
+) -> Result<Json<SimulationResponse>, ApiError> {
+    if !state.execution_config.simulation_enabled {
+        return Err(BackendError::Config("simulation is disabled".to_string()).into());
+    }
+    if state.execution_config.simulation_requires_persistence && state.repository.is_none() {
+        return Err(
+            BackendError::Config("simulation requires persistence enabled".to_string()).into(),
+        );
+    }
+
+    let intent_id = parse_uuid(&intent_id)?;
+    let intent = get_execution_intent(&state, intent_id).await?;
+    let signatures = get_trade_signatures(&state, intent_id).await?;
+    if !signatures.calldata_ready() {
+        return Err(BackendError::MissingTradeSignatures.into());
+    }
+
+    let rpc_url =
+        state.execution_config.rpc_url.clone().ok_or_else(|| {
+            BackendError::Config("RPC_URL is required for simulation".to_string())
+        })?;
+    let provider = HttpJsonRpcProvider::new(rpc_url);
+    let result =
+        simulate_execution_intent(&provider, &state.execution_config, &intent, &signatures).await?;
+    persist_simulation_result(&state, &result).await?;
+
+    Ok(Json(SimulationResponse {
+        intent_id,
+        simulation_status: result.status,
+        block_number: result.block_number,
+        error: result.error,
+        submitted: false,
+        confirmed: false,
     }))
 }
 
@@ -495,6 +551,62 @@ async fn upsert_trade_signatures(
     let entry = signatures.entry(intent_id).or_default();
     entry.upsert(buyer_sig, seller_sig)?;
     Ok(entry.clone())
+}
+
+async fn get_trade_signatures(
+    state: &AppState,
+    intent_id: Uuid,
+) -> BackendResult<StoredTradeSignatures> {
+    if let Some(repository) = state.repository.clone() {
+        return repository.get_execution_intent_signatures(intent_id).await;
+    }
+
+    let signatures = state
+        .trade_signatures
+        .lock()
+        .map_err(|_| BackendError::Config("signature store lock poisoned".to_string()))?;
+    Ok(signatures.get(&intent_id).cloned().unwrap_or_default())
+}
+
+async fn update_execution_intent_status(
+    state: &AppState,
+    intent_id: Uuid,
+    status: ExecutionIntentStatus,
+) -> BackendResult<()> {
+    if let Some(repository) = state.repository.clone() {
+        return repository
+            .update_execution_intent_status(intent_id, status, now_ms())
+            .await;
+    }
+
+    let mut engine = state
+        .engine
+        .lock()
+        .map_err(|_| BackendError::Config("engine lock poisoned".to_string()))?;
+    if engine.update_execution_intent_status(intent_id, status) {
+        Ok(())
+    } else {
+        Err(BackendError::InvalidExecutionIntentId)
+    }
+}
+
+async fn persist_simulation_result(
+    state: &AppState,
+    result: &SimulationResult,
+) -> BackendResult<()> {
+    if let Some(repository) = state.repository.clone() {
+        return repository.persist_simulation_result(result).await;
+    }
+
+    let mut engine = state
+        .engine
+        .lock()
+        .map_err(|_| BackendError::Config("engine lock poisoned".to_string()))?;
+    if engine.update_execution_intent_status(result.intent_id, result.status) {
+        Ok(())
+    } else {
+        Err(BackendError::InvalidExecutionIntentId)
+    }
 }
 
 fn parse_uuid(value: &str) -> BackendResult<Uuid> {
@@ -604,6 +716,7 @@ impl From<BackendError> for ApiError {
             | BackendError::SelfTrade
             | BackendError::UnsupportedTimeInForce(_)
             | BackendError::UnsupportedCommand(_)
+            | BackendError::Simulation(_)
             | BackendError::Config(_) => StatusCode::BAD_REQUEST,
             BackendError::Persistence(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };

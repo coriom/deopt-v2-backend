@@ -37,7 +37,18 @@ impl AppConfig {
             dry_run: parse_env(&mut lookup, "EXECUTOR_DRY_RUN", "true")?,
             poll_interval_ms: parse_env(&mut lookup, "EXECUTOR_POLL_INTERVAL_MS", "1000")?,
             max_batch_size: parse_env(&mut lookup, "EXECUTOR_MAX_BATCH_SIZE", "10")?,
+            simulation_enabled: parse_env(&mut lookup, "SIMULATION_ENABLED", "false")?,
+            simulation_requires_persistence: parse_env(
+                &mut lookup,
+                "SIMULATION_REQUIRE_PERSISTENCE",
+                "true",
+            )?,
             rpc_url: lookup("RPC_URL").filter(|value| !value.is_empty()),
+            executor_from_address: AccountId::new(get_env(
+                &mut lookup,
+                "EXECUTOR_FROM_ADDRESS",
+                "0x0000000000000000000000000000000000000000",
+            )),
             perp_matching_engine_address: AccountId::new(get_env(
                 &mut lookup,
                 "PERP_MATCHING_ENGINE_ADDRESS",
@@ -160,6 +171,8 @@ mod tests {
         assert_eq!(config.execution.poll_interval_ms, 1_000);
         assert_eq!(config.execution.max_batch_size, 10);
         assert_eq!(config.execution.rpc_url, None);
+        assert!(!config.execution.simulation_enabled);
+        assert!(config.execution.simulation_requires_persistence);
     }
 
     #[test]
@@ -222,6 +235,34 @@ mod tests {
             config.execution.rpc_url.as_deref(),
             Some("https://example.invalid")
         );
+    }
+
+    #[test]
+    fn simulation_enabled_requires_rpc_url() {
+        let error = config_from_pairs([
+            ("SIMULATION_ENABLED", "true"),
+            ("SIMULATION_REQUIRE_PERSISTENCE", "false"),
+        ])
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("RPC_URL is required when SIMULATION_ENABLED=true"));
+    }
+
+    #[test]
+    fn simulation_requiring_persistence_rejects_persistence_disabled() {
+        let error = config_from_pairs([
+            ("SIMULATION_ENABLED", "true"),
+            ("SIMULATION_REQUIRE_PERSISTENCE", "true"),
+            ("RPC_URL", "https://example.invalid"),
+            ("PERSISTENCE_ENABLED", "false"),
+        ])
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("simulation requires persistence enabled"));
     }
 
     fn config_from_pairs<const N: usize>(pairs: [(&str, &str); N]) -> Result<AppConfig> {

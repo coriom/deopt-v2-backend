@@ -57,6 +57,14 @@ impl EngineState {
         self.execution_queue.all()
     }
 
+    pub fn update_execution_intent_status(
+        &mut self,
+        intent_id: Uuid,
+        status: ExecutionIntentStatus,
+    ) -> bool {
+        self.execution_queue.update_status(intent_id, status)
+    }
+
     pub fn orderbook_snapshot(&self, market_id: MarketId) -> OrderBookSnapshot {
         self.orderbooks
             .get(&market_id)
