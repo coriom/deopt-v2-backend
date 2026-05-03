@@ -1,4 +1,4 @@
-# NEXT_TASK.md — Real Broadcast V1, Guarded Transaction Submission
+# NEXT_TASK.md — Dev EIP-712 PerpTrade Signing CLI
 
 ## Context
 
@@ -7,348 +7,268 @@ The backend now has:
 - signed order verification
 - PostgreSQL persistence
 - execution intents with deterministic `onchain_intent_id`
-- PerpTrade signing payload with `intentId`
+- PerpTrade signing payload endpoint
 - buyer/seller PerpTrade signature collection
 - real `PerpMatchingEngine.executeTrade` calldata builder
 - RPC simulation via `eth_call`
-- Indexer V1 decoding `TradeExecuted(intentId, buyer, seller, ...)`
+- Indexer V1
 - Reconciliation V1 by `onchain_intent_id`
-- guarded broadcast scaffold:
-  - `POST /executor/broadcast/:intent_id`
-  - `GET /executor/transactions`
-  - transaction table
-  - no fake tx hash
-  - no submitted/confirmed status
-  - real broadcast disabled by default
+- guarded real broadcast V1:
+  - disabled by default
+  - real tx signing/sending only behind explicit config
+  - no confirmed status yet
 
 Current limitation:
-- the backend cannot send a real transaction
-- no tx hash is persisted
-- no `submitted` status exists in practice
-- no receipt/finality confirmation exists yet
+- tests currently use fake `aaaa...` / `bbbb...` PerpTrade signatures
+- fake signatures correctly produce `simulation_failed`
+- real broadcast is blocked by `EXECUTOR_REQUIRE_SIMULATION_OK=true`
+- we need a dev-only way to generate valid PerpTrade EIP-712 signatures for Base Sepolia testing
 
 ## Goal
 
-Implement Real Broadcast V1.
+Add a development-only CLI tool that signs PerpTrade EIP-712 payloads using local private keys.
 
-The backend must be able to:
-- sign a real transaction when explicitly enabled
-- send raw transaction via RPC
-- persist the real tx hash
-- mark the execution transaction as `submitted`
-- mark the execution intent as `submitted`
-- never mark `confirmed`
-- refuse unsafe broadcast attempts
+The tool must allow local testnet flow:
 
-This task must implement real broadcast only behind explicit config gates.
+```text
+GET /execution-intents/:intent_id/signing-payload
+-> sign with buyer private key
+-> sign with seller private key
+-> POST /execution-intents/:intent_id/signatures
+-> simulate
+-> later broadcast if simulation_ok
 
-## Critical Safety Rules
+This task must not change server safety.
 
-Default behavior must remain safe.
-
-Real broadcast must happen only if all are true:
-- `EXECUTOR_REAL_BROADCAST_ENABLED=true`
-- `EXECUTOR_PRIVATE_KEY` is present and valid
-- `EXECUTOR_REQUIRE_SIMULATION_OK=true` implies intent status is `simulation_ok`
-- buyer/seller PerpTrade signatures are present
-- calldata can be built
-- `RPC_URL` is configured
-- `PERP_MATCHING_ENGINE_ADDRESS` is configured
-- chain id matches `EXECUTOR_CHAIN_ID`
+Critical Safety Rules
 
 Do not:
-- fake tx hash
-- fake submitted status
-- mark confirmed
-- fake confirmation
-- fake tx ownership
-- modify Solidity
-- change matching semantics
-- introduce floating point arithmetic
-- log or expose private key
 
-If real broadcast cannot be implemented fully, fail explicitly with `RealBroadcastUnavailable`.
-Do not pretend to submit.
+add private keys to committed files
+log private keys
+expose private keys through API
+add server-side automatic signing
+add custodial signing
+add broadcast changes
+mark intents submitted
+mark intents confirmed
+modify Solidity
+change matching semantics
+introduce floating point arithmetic
 
-## Config
+This CLI is dev/testnet only.
 
-Current config exists:
+It must be explicit in README:
 
-```env
-EXECUTOR_REAL_BROADCAST_ENABLED=false
-EXECUTOR_PRIVATE_KEY=
-EXECUTOR_CHAIN_ID=84532
-EXECUTOR_MAX_GAS_LIMIT=1000000
-EXECUTOR_MAX_FEE_PER_GAS_WEI=
-EXECUTOR_MAX_PRIORITY_FEE_PER_GAS_WEI=
-EXECUTOR_REQUIRE_SIMULATION_OK=true
-
-Extend if needed:
-
-EXECUTOR_GAS_ESTIMATION_ENABLED=false
-EXECUTOR_TX_TYPE=eip1559
-
-Rules:
-
-broadcast disabled by default
-private key required only when real broadcast enabled
-private key must never be logged
-private key must not be retained in public/debug structs
-invalid private key must fail startup or broadcast cleanly
-chain mismatch must fail cleanly
-Dependencies
-
-Use idiomatic Rust Ethereum tooling.
+never use with production keys
+do not commit .env
+use throwaway test wallets only
+CLI Location
 
 Preferred:
 
-alloy stack if already partially present
-otherwise ethers is acceptable
+src/bin/sign_perp_trade.rs
 
-Requirements:
+Alternative if project layout prefers:
 
-sign EIP-1559 transaction or legacy transaction cleanly
-produce real raw signed transaction
-call eth_sendRawTransaction
-parse returned tx hash
-persist tx hash
+examples/sign_perp_trade.rs
 
-Do not use shell commands or external CLIs for signing/broadcast.
+Use src/bin/sign_perp_trade.rs if possible so it runs with:
 
-Transaction Requirements
+cargo run --bin sign_perp_trade -- ...
+CLI Inputs
 
-Build transaction from prepared execution call:
+Support one of these clean modes.
 
-to = PERP_MATCHING_ENGINE_ADDRESS
-data = executeTrade(...) calldata
-value = 0
-chainId = EXECUTOR_CHAIN_ID
-gas limit = configured EXECUTOR_MAX_GAS_LIMIT unless gas estimation is implemented
-maxFeePerGas / maxPriorityFeePerGas:
-use configured values if provided
-if not provided, fetch reasonable values from RPC if implemented
-if fee discovery is not implemented, require explicit values when broadcast enabled
+Preferred mode A — payload JSON file
 
-Preferred V1:
+The user saves the backend signing payload to a file:
 
-use configured EXECUTOR_MAX_FEE_PER_GAS_WEI
-use configured EXECUTOR_MAX_PRIORITY_FEE_PER_GAS_WEI
-if missing and real broadcast enabled, fail with clear config error
+curl http://127.0.0.1:8080/execution-intents/$INTENT_ID/signing-payload \
+  > /tmp/perp_trade_payload.json
 
-No automatic gas policy overbuild.
+Then signs:
 
-RPC Requirements
+BUYER_PRIVATE_KEY=0x... \
+cargo run --bin sign_perp_trade -- \
+  --payload /tmp/perp_trade_payload.json \
+  --role buyer
 
-Add RPC methods if missing:
+and:
 
-eth_chainId
-eth_getTransactionCount
-eth_sendRawTransaction
-optionally eth_gasPrice or fee history if implemented
+SELLER_PRIVATE_KEY=0x... \
+cargo run --bin sign_perp_trade -- \
+  --payload /tmp/perp_trade_payload.json \
+  --role seller
+Required args
+--payload <path>
+--role buyer|seller
+Env private key
 
-Nonce:
+Role determines env var:
 
-fetch nonce for executor signer address via eth_getTransactionCount(address, "pending")
-do not maintain local nonce manager in this task
+buyer  -> BUYER_PRIVATE_KEY
+seller -> SELLER_PRIVATE_KEY
 
-Chain id:
+Also allow fallback:
 
-check eth_chainId == EXECUTOR_CHAIN_ID before signing/sending
-Signer Requirements
+SIGNER_PRIVATE_KEY
 
-Add signer module if clean:
+but role-specific env var should take precedence.
 
-src/execution/signer.rs
+CLI Output
 
-Responsibilities:
-
-parse private key
-derive executor address
-sign transaction
-expose only address, never private key
-
-API/debug output may include:
-
-executor address
-
-API/debug output must not include:
-
-private key
-raw signed tx unless strictly necessary; prefer not exposing it
-Broadcast Flow
-
-For POST /executor/broadcast/:intent_id:
-
-Load execution intent.
-Reject if already submitted.
-If EXECUTOR_REQUIRE_SIMULATION_OK=true, require intent status simulation_ok.
-Load signatures.
-Build PerpTradePayload.
-Build calldata.
-Build transaction request.
-If broadcast disabled:
-return refused response:
-submitted=false
-confirmed=false
-tx_hash=null
-reason="broadcast disabled"
-do not create fake tx hash
-do not mutate intent status
-If broadcast enabled:
-validate private key/signer
-check RPC chain id
-fetch pending nonce
-sign transaction
-send raw transaction
-persist transaction with:
-status = submitted
-tx_hash = real RPC result
-update intent status to submitted
-return tx_hash
-confirmed=false
-
-No confirmed transition in this task.
-
-Database Behavior
-
-Existing execution_transactions table exists.
-
-Use it.
-
-Repository additions if needed:
-
-update intent status to submitted
-insert submitted transaction atomically if possible
-detect already submitted tx for intent
-list transaction records
-
-Idempotency:
-
-if intent already has a submitted transaction, return existing tx hash or reject with clear already submitted
-do not send duplicate tx
-
-Atomicity:
-
-after RPC returns tx_hash, persist tx record and intent submitted.
-if DB persistence fails after RPC send, return explicit critical error. Document this limitation.
-ideal: record prepared attempt before send, update after send. Implement if clean.
-API Response
-
-POST /executor/broadcast/:intent_id response:
+Output JSON only:
 
 {
-  "intent_id": "...",
-  "onchain_intent_id": "0x...",
-  "broadcast_enabled": true,
-  "submitted": true,
-  "confirmed": false,
-  "tx_hash": "0x...",
-  "reason": null
+  "role": "buyer",
+  "signer_address": "0x...",
+  "signature": "0x..."
 }
 
-Disabled response remains:
+Rules:
 
-{
-  "intent_id": "...",
-  "onchain_intent_id": "0x...",
-  "broadcast_enabled": false,
-  "submitted": false,
-  "confirmed": false,
-  "tx_hash": null,
-  "reason": "broadcast disabled"
-}
-Execution Intent Status
+signature must be 65-byte recoverable ECDSA signature
+0x + 130 hex chars
+use Ethereum-compatible recovery id format accepted by backend/contract
+do not print private key
+do not print raw digest unless --verbose is explicitly passed
+default output should be easy to pipe/copy
 
-Allowed mutation:
+Optional --verbose can print:
 
-simulation_ok -> submitted
+digest
+domain
+message intentId
+signer address
+EIP-712 Requirements
 
-Forbidden mutation:
+The CLI must sign exactly the digest returned by backend payload if the payload contains a digest.
 
-anything -> confirmed
+Preferred:
 
-If broadcast disabled:
+parse digest from backend payload
+sign that digest directly
+this avoids duplicating EIP-712 hashing logic incorrectly
 
-no status mutation
+Also validate payload shape:
 
-If RPC send fails:
+primary_type == PerpTrade
+types first field is intentId bytes32
+domain.chainId == 84532 unless overridden by optional flag
+message.buyer/seller exists
+message.intentId exists
 
-transaction status failed or rejected attempt if recorded
-intent status should remain simulation_ok unless a clean failure state is already modeled
-do not mark submitted without tx hash
+Signer/address check:
+
+if role=buyer, derived signer address must equal message.buyer
+if role=seller, derived signer address must equal message.seller
+if mismatch, fail clearly unless optional --allow-address-mismatch is provided
+default must reject mismatch
+
+This prevents signing a buyer payload with the seller key by mistake.
+
+Signature Format
+
+Ensure output format is compatible with current Solidity contract and backend.
+
+The backend/contract supports ECDSA v values:
+
+27/28 preferred
+0/1 accepted if already supported
+
+Use 27/28 if straightforward.
+
+Tests should validate:
+
+signature length
+signature recovers to expected address if recovery helper exists
+malformed key rejected
+Dependencies
+
+Use existing crypto dependencies if already present:
+
+k256
+sha3
+hex
+serde_json
+
+Do not add unnecessary large dependencies if current stack can sign.
+
+If signing recoverable ECDSA is difficult with current dependencies:
+
+implement carefully with current k256 recovery APIs
+otherwise add a focused dependency with justification
 Tests Required
 
-Normal cargo test must not require RPC, Postgres, private keys, or Base Sepolia.
+Normal cargo test must not require private keys, RPC, Postgres, or Base Sepolia.
 
-Add pure/unit tests for:
+Add tests for pure helpers:
 
-broadcast disabled by default
-broadcast enabled requires private key
-broadcast enabled requires fee config if fee discovery not implemented
-broadcast enabled requires RPC URL
-private key is not exposed in debug/API structs
-broadcast rejects non-simulation_ok when EXECUTOR_REQUIRE_SIMULATION_OK=true
-broadcast rejects missing signatures
-broadcast disabled returns submitted=false, confirmed=false, tx_hash=null
-submitted response always has confirmed=false
-already submitted intent is not broadcast twice
-transaction request uses:
-target = PerpMatchingEngine
-value = 0
-chain_id = EXECUTOR_CHAIN_ID
-no confirmed mutation exists
+parse payload digest
+reject missing digest
+reject non-PerpTrade payload
+reject payload missing intentId
+reject invalid role
+private key redaction/debug safety if applicable
+derived signer address from deterministic test key
+role/address mismatch rejection
+signature length is 65 bytes / 130 hex chars if feasible without live network
 
-If signer tests are added:
+If CLI integration tests are too heavy:
 
-use deterministic test private key
-test derived address
-do not require network
+test internal signer helper functions
+keep actual CLI invocation manual
+README Update
 
-If RPC broadcast tests are added:
+Add section:
 
-use mocked RPC only
-no live network in default tests
-Documentation
+Development PerpTrade signing
 
-Update README.md:
+Include exact commands:
 
-explain Real Broadcast V1
-explain disabled by default
-explain required env vars
-explain simulation_ok requirement
-explain submitted != confirmed
-explain receipt/indexer/reconciliation confirmation is next phase
-explain private key safety assumptions
+Create intent.
+Fetch signing payload.
+Sign buyer:
+BUYER_PRIVATE_KEY=0x... cargo run --bin sign_perp_trade -- --payload /tmp/perp_trade_payload.json --role buyer
+Sign seller:
+SELLER_PRIVATE_KEY=0x... cargo run --bin sign_perp_trade -- --payload /tmp/perp_trade_payload.json --role seller
+Submit signatures:
+curl -X POST http://127.0.0.1:8080/execution-intents/$INTENT_ID/signatures \
+  -H "Content-Type: application/json" \
+  -d '{"buyer_sig":"0x...","seller_sig":"0x..."}'
+Simulate:
+curl -X POST http://127.0.0.1:8080/executor/simulate/$INTENT_ID
+
+Warnings:
+
+testnet only
+throwaway keys only
+never commit keys
+no production custody model
+Architecture Update
 
 Update ARCHITECTURE.md:
 
-add submitted stage
-lifecycle:
-order accepted
-matched
-intent created
-trade signatures collected
-simulation_ok
-submitted with tx_hash
-indexed event
-reconciled by onchain_intent_id
-confirmed later after receipt/finality/reorg checks
-explicitly state confirmation is not part of this task
+add dev signing CLI as a local testing tool
+explicitly state production signing must happen in user/MM wallets or external signer
+server must not become a custodial signer for users
+CLI is not part of production request path
 Constraints
 
 Do not add:
 
+server-side automatic signing
+private key storage
+key database
+production custody
+broadcast changes
 confirmed lifecycle
-fake tx hash
-fake broadcast
-fake tx ownership
 frontend
 TypeScript
 Python
 Node.js
 Solidity changes
-local nonce manager
-background auto-broadcast
 
 Do not modify:
 
@@ -359,9 +279,10 @@ Do not change:
 matching semantics
 financial numeric rules
 signed order verification
-PerpTrade signing payload
+PerpTrade payload shape
 indexer behavior
-reconciliation confirmed=0 rule
+reconciliation behavior
+broadcast safety behavior
 Validation
 
 Run:
@@ -381,15 +302,16 @@ Acceptance Criteria
 
 Complete only if:
 
-real broadcast is available only behind explicit config
-disabled path remains safe
-real broadcast either works fully or fails explicitly
-no fake tx hash exists
-submitted status is written only after real tx hash
-confirmed is never written
-tx hash persistence exists
+CLI exists
+CLI signs backend-provided digest
+CLI validates role/address by default
+CLI outputs JSON with signer_address and signature
+private keys are never logged
+README has exact usage flow
+server safety unchanged
 all validation commands pass
 EOF
+
 
 after all, 
 ## run telegram.py (say nothing, just run and that all)

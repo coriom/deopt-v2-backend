@@ -82,6 +82,62 @@ Signatures are accepted only as `0x` plus 65-byte hex strings. They are stored i
 
 Broadcast remains disabled by default. The prepared call always has `is_broadcastable=false` and `value=0`; no signing, private key retention, transaction submission, or confirmation tracking exists in the default path.
 
+## Development PerpTrade Signing
+
+The `sign_perp_trade` binary is a local development helper for Base Sepolia and throwaway test wallets only. Never use it with production keys, never commit `.env` files or private keys, and do not treat it as a production custody model. The backend server does not automatically sign user trades.
+
+Fetch the backend-provided EIP-712 payload:
+
+```sh
+export INTENT_ID=<intent_id>
+curl http://127.0.0.1:8080/execution-intents/$INTENT_ID/signing-payload \
+  > /tmp/perp_trade_payload.json
+```
+
+Sign as the buyer. `BUYER_PRIVATE_KEY` takes precedence over `SIGNER_PRIVATE_KEY`:
+
+```sh
+BUYER_PRIVATE_KEY=0x... \
+cargo run --bin sign_perp_trade -- \
+  --payload /tmp/perp_trade_payload.json \
+  --role buyer
+```
+
+Sign as the seller. `SELLER_PRIVATE_KEY` takes precedence over `SIGNER_PRIVATE_KEY`:
+
+```sh
+SELLER_PRIVATE_KEY=0x... \
+cargo run --bin sign_perp_trade -- \
+  --payload /tmp/perp_trade_payload.json \
+  --role seller
+```
+
+The CLI signs the `digest` returned by the backend payload and outputs JSON only by default:
+
+```json
+{
+  "role": "buyer",
+  "signer_address": "0x...",
+  "signature": "0x..."
+}
+```
+
+By default it rejects a buyer key that does not derive to `message.buyer` and a seller key that does not derive to `message.seller`. `--allow-address-mismatch` exists only for explicit debugging. `--verbose` keeps stdout as JSON and adds the digest, domain, and message intent id.
+
+Submit both signatures:
+
+```sh
+curl -X POST http://127.0.0.1:8080/execution-intents/$INTENT_ID/signatures \
+  -H "Content-Type: application/json" \
+  -d '{"buyer_sig":"0x...","seller_sig":"0x..."}'
+```
+
+Then simulate:
+
+```sh
+curl -X POST http://127.0.0.1:8080/executor/simulate/$INTENT_ID
+```
+
 ## RPC Simulation
 
 Manual simulation is opt-in:

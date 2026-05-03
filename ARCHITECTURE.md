@@ -34,6 +34,7 @@ The long-term backend needs low-latency deterministic matching, RFQ, market-make
 - Execution-intent creation for every matched trade.
 - PerpMatchingEngine `executeTrade` calldata builder V1 for explicit matched-trade payloads and explicit trade signatures.
 - Matched PerpTrade signing-payload and trade-signature collection endpoints.
+- Dev-only local PerpTrade signing CLI for testnet payloads returned by the backend.
 - Manual RPC simulation V1 for calldata-ready intents using `eth_call` only.
 - Real Broadcast V1 with transaction request construction, transaction records, disabled-by-default behavior, EIP-1559 signing, pending nonce lookup, chain id checks, and `eth_sendRawTransaction` behind explicit config gates.
 - HTTP endpoints for health, markets, orderbook, orders, cancellation, and execution intents.
@@ -136,6 +137,8 @@ This repository does not execute on-chain transactions in phase 1 by default. Wi
 The current calldata builder V1 can encode `PerpMatchingEngine.executeTrade(PerpTrade,bytes,bytes)` using an explicit `PerpTradePayload` and explicit buyer/seller trade signatures. The Solidity `PerpTrade.intentId` is `keccak256(bytes(execution_intents.intent_id))`, returned as `0x` plus 64 hex chars and used consistently in EIP-712 signing, calldata, and indexed-event reconciliation. `PerpTrade` signatures are distinct from the off-chain order signatures verified by the order API: the Solidity contract verifies signatures over the final matched trade payload, not the original order payloads. The builder therefore does not reuse order signatures and does not fabricate missing signatures.
 
 Clients fetch the final EIP-712 `PerpTrade` payload from `GET /execution-intents/:intent_id/signing-payload`, sign it externally, and submit the two signatures to `POST /execution-intents/:intent_id/signatures`. Signatures are shape-validated and stored in memory or in `execution_intent_signatures` when persistence is enabled. Calldata readiness is true only when both signatures are present and the intent has complete PerpTrade metadata.
+
+For local testnet development, `src/bin/sign_perp_trade.rs` can sign the backend-provided payload digest with a throwaway buyer or seller private key supplied through the process environment. It validates that the derived signer address matches `message.buyer` or `message.seller` by default and emits JSON for manual submission. This CLI is not part of the production request path, does not store keys, and does not make the backend a custodial signer. Production signing must happen in user wallets, market-maker wallets, or external signing systems controlled outside this server.
 
 Intent-derived executor dry-runs produce non-executable previews when trade signatures are unavailable. When both signatures are stored, the dry-run builder can construct real calldata while still marking the prepared call non-broadcastable.
 
