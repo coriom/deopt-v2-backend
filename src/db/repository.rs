@@ -6,8 +6,8 @@ use super::pool;
 use crate::engine::EngineEvent;
 use crate::error::{BackendError, Result};
 use crate::execution::{
-    ExecutionIntent, ExecutionIntentRepository, ExecutionIntentStatus, SimulationResult,
-    StoredTradeSignatures,
+    ExecutionIntent, ExecutionIntentRepository, ExecutionIntentStatus, ExecutionTransaction,
+    ExecutionTransactionStatus, SimulationResult, StoredTradeSignatures,
 };
 use crate::indexer::IndexedPerpTrade;
 use crate::reconciliation::{
@@ -474,6 +474,99 @@ impl PgRepository {
         }
         Ok(counts)
     }
+
+    pub async fn insert_execution_transaction(
+        &self,
+        transaction: &ExecutionTransaction,
+    ) -> Result<u64> {
+        insert_execution_transaction(&self.pool, transaction).await
+    }
+
+    pub async fn update_execution_transaction_status(
+        &self,
+        transaction_id: &str,
+        status: ExecutionTransactionStatus,
+        tx_hash: Option<String>,
+        error: Option<String>,
+        updated_at_ms: TimestampMs,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE execution_transactions
+             SET status = $2, tx_hash = $3, error = $4, updated_at_ms = $5
+             WHERE transaction_id = $1",
+        )
+        .bind(transaction_id)
+        .bind(status.as_str())
+        .bind(tx_hash)
+        .bind(error)
+        .bind(timestamp_to_i64(updated_at_ms))
+        .execute(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        Ok(())
+    }
+
+    pub async fn get_transactions_for_intent(
+        &self,
+        intent_id: Uuid,
+    ) -> Result<Vec<ExecutionTransaction>> {
+        let rows = sqlx::query(
+            "SELECT transaction_id, intent_id, onchain_intent_id, target, calldata, value_wei,
+                    tx_hash, status, error, created_at_ms, updated_at_ms
+             FROM execution_transactions
+             WHERE intent_id = $1
+             ORDER BY created_at_ms DESC, transaction_id DESC",
+        )
+        .bind(intent_id.to_string())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+
+        rows.into_iter()
+            .map(execution_transaction_from_row)
+            .collect()
+    }
+
+    pub async fn list_recent_execution_transactions(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<ExecutionTransaction>> {
+        let rows = sqlx::query(
+            "SELECT transaction_id, intent_id, onchain_intent_id, target, calldata, value_wei,
+                    tx_hash, status, error, created_at_ms, updated_at_ms
+             FROM execution_transactions
+             ORDER BY created_at_ms DESC, transaction_id DESC
+             LIMIT $1",
+        )
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+
+        rows.into_iter()
+            .map(execution_transaction_from_row)
+            .collect()
+    }
+
+    pub async fn find_submitted_transaction_by_intent(
+        &self,
+        intent_id: Uuid,
+    ) -> Result<Option<ExecutionTransaction>> {
+        let row = sqlx::query(
+            "SELECT transaction_id, intent_id, onchain_intent_id, target, calldata, value_wei,
+                    tx_hash, status, error, created_at_ms, updated_at_ms
+             FROM execution_transactions
+             WHERE intent_id = $1 AND status = 'submitted'
+             ORDER BY created_at_ms DESC, transaction_id DESC
+             LIMIT 1",
+        )
+        .bind(intent_id.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+
+        row.map(execution_transaction_from_row).transpose()
+    }
 }
 
 impl ExecutionIntentRepository for PgRepository {
@@ -751,6 +844,33 @@ async fn insert_execution_reconciliation(
     Ok(result.rows_affected())
 }
 
+async fn insert_execution_transaction(
+    pool: &PgPool,
+    transaction: &ExecutionTransaction,
+) -> Result<u64> {
+    let result = sqlx::query(
+        "INSERT INTO execution_transactions (
+            transaction_id, intent_id, onchain_intent_id, target, calldata, value_wei,
+            tx_hash, status, error, created_at_ms, updated_at_ms
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+    )
+    .bind(&transaction.transaction_id)
+    .bind(transaction.intent_id.to_string())
+    .bind(&transaction.onchain_intent_id)
+    .bind(&transaction.target.0)
+    .bind(&transaction.calldata)
+    .bind(&transaction.value_wei)
+    .bind(&transaction.tx_hash)
+    .bind(transaction.status.as_str())
+    .bind(&transaction.error)
+    .bind(timestamp_to_i64(transaction.created_at_ms))
+    .bind(timestamp_to_i64(transaction.updated_at_ms))
+    .execute(pool)
+    .await
+    .map_err(|error| BackendError::Persistence(error.to_string()))?;
+    Ok(result.rows_affected())
+}
+
 async fn insert_engine_event(
     tx: &mut Transaction<'_, Postgres>,
     event: &EngineEvent,
@@ -843,6 +963,25 @@ fn execution_reconciliation_from_row(row: PgRow) -> Result<ExecutionReconciliati
         log_index: i64_to_u64_persistence("log_index", log_index)?,
         status: ReconciliationStatus::parse(&status)?,
         created_at_ms: row_get(&row, "created_at_ms")?,
+    })
+}
+
+fn execution_transaction_from_row(row: PgRow) -> Result<ExecutionTransaction> {
+    let intent_id: String = row_get(&row, "intent_id")?;
+    let status: String = row_get(&row, "status")?;
+    Ok(ExecutionTransaction {
+        transaction_id: row_get(&row, "transaction_id")?,
+        intent_id: Uuid::parse_str(&intent_id)
+            .map_err(|error| BackendError::Persistence(error.to_string()))?,
+        onchain_intent_id: row_get(&row, "onchain_intent_id")?,
+        target: AccountId::new(row_get::<String>(&row, "target")?),
+        calldata: row_get(&row, "calldata")?,
+        value_wei: row_get(&row, "value_wei")?,
+        tx_hash: row_get(&row, "tx_hash")?,
+        status: ExecutionTransactionStatus::parse(&status)?,
+        error: row_get(&row, "error")?,
+        created_at_ms: row_get(&row, "created_at_ms")?,
+        updated_at_ms: row_get(&row, "updated_at_ms")?,
     })
 }
 

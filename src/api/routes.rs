@@ -6,9 +6,11 @@ use crate::db::PgRepository;
 use crate::engine::{EngineCommand, EngineEvent};
 use crate::error::{BackendError, Result as BackendResult};
 use crate::execution::{
-    b256_to_hex_bytes32, perp_trade_digest, simulate_execution_intent, ExecutionIntentStatus,
-    Executor, HttpJsonRpcProvider, PerpTradeDomain, PerpTradePayload, SimulationResult,
-    StoredTradeSignatures, TradeSignatureStatus, PERP_TRADE_TYPE,
+    b256_to_hex_bytes32, build_execution_transaction_request, ensure_no_submitted_transaction,
+    perp_trade_digest, simulate_execution_intent, ExecutionIntentStatus, ExecutionTransaction,
+    ExecutionTransactionStatus, Executor, ExecutorSigner, HttpJsonRpcProvider, PerpTradeDomain,
+    PerpTradePayload, SimulationResult, StoredTradeSignatures, TradeSignatureStatus,
+    TransactionBroadcastProvider, PERP_TRADE_TYPE,
 };
 use crate::indexer::{Indexer, IndexerStatus, IndexerTickResult};
 use crate::reconciliation::{
@@ -48,6 +50,15 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/executor/simulate/:intent_id",
             post(simulate_executor_intent),
+        )
+        .route(
+            "/executor/broadcast/:intent_id",
+            post(broadcast_executor_intent),
+        )
+        .route("/executor/transactions", get(executor_transactions))
+        .route(
+            "/executor/transactions/:intent_id",
+            get(executor_transactions_for_intent),
         )
         .route("/indexer/status", get(indexer_status))
         .route("/indexer/tick", post(indexer_tick))
@@ -478,6 +489,187 @@ async fn simulate_executor_intent(
         submitted: false,
         confirmed: false,
     }))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct BroadcastResponse {
+    intent_id: Uuid,
+    onchain_intent_id: String,
+    broadcast_enabled: bool,
+    submitted: bool,
+    confirmed: bool,
+    tx_hash: Option<String>,
+    reason: Option<String>,
+}
+
+async fn broadcast_executor_intent(
+    State(state): State<AppState>,
+    Path(intent_id): Path<String>,
+) -> Result<Json<BroadcastResponse>, ApiError> {
+    let intent_id = parse_uuid(&intent_id)?;
+    let onchain_intent_id = crate::execution::intent_id_to_hex_bytes32(&intent_id.to_string())?;
+
+    if !state.execution_config.real_broadcast_enabled {
+        return Ok(Json(BroadcastResponse {
+            intent_id,
+            onchain_intent_id,
+            broadcast_enabled: false,
+            submitted: false,
+            confirmed: false,
+            tx_hash: None,
+            reason: Some("broadcast disabled".to_string()),
+        }));
+    }
+
+    let Some(repository) = state.repository.clone() else {
+        return Err(
+            BackendError::Config("broadcast requires persistence enabled".to_string()).into(),
+        );
+    };
+    ensure_no_submitted_transaction(
+        repository
+            .find_submitted_transaction_by_intent(intent_id)
+            .await?
+            .is_some(),
+    )?;
+
+    let intent = get_execution_intent(&state, intent_id).await?;
+    let signatures = get_trade_signatures(&state, intent_id).await?;
+    let request =
+        build_execution_transaction_request(&state.execution_config, &intent, &signatures)?;
+    let now = now_ms();
+    let calldata = request.calldata_hex();
+    let Some(private_key) = state.execution_config.executor_private_key.as_ref() else {
+        return Err(BackendError::Config(
+            "EXECUTOR_PRIVATE_KEY is required when EXECUTOR_REAL_BROADCAST_ENABLED=true"
+                .to_string(),
+        )
+        .into());
+    };
+    let Some(rpc_url) = state.execution_config.rpc_url.clone() else {
+        return Err(BackendError::Config(
+            "RPC_URL is required when EXECUTOR_REAL_BROADCAST_ENABLED=true".to_string(),
+        )
+        .into());
+    };
+    let signer = ExecutorSigner::from_private_key(private_key)?;
+    let provider = HttpJsonRpcProvider::new(rpc_url);
+    let rpc_chain_id = provider.chain_id().await?;
+    if rpc_chain_id != request.chain_id {
+        let transaction = execution_transaction_from_request(
+            &request,
+            calldata,
+            ExecutionTransactionStatus::Rejected,
+            None,
+            Some(format!(
+                "RPC chain id {rpc_chain_id} does not match EXECUTOR_CHAIN_ID {}",
+                request.chain_id
+            )),
+            now,
+        );
+        repository
+            .insert_execution_transaction(&transaction)
+            .await?;
+        return Err(BackendError::BroadcastRejected(
+            "RPC chain id does not match EXECUTOR_CHAIN_ID".to_string(),
+        )
+        .into());
+    }
+    let nonce = provider.transaction_count(signer.address().clone()).await?;
+    let raw_transaction = crate::execution::sign_eip1559_transaction(&request, nonce, &signer)?;
+    let tx_hash = match provider.send_raw_transaction(raw_transaction).await {
+        Ok(tx_hash) => tx_hash,
+        Err(error) => {
+            let transaction = execution_transaction_from_request(
+                &request,
+                calldata,
+                ExecutionTransactionStatus::Failed,
+                None,
+                Some(error.to_string()),
+                now,
+            );
+            repository
+                .insert_execution_transaction(&transaction)
+                .await?;
+            return Err(error.into());
+        }
+    };
+    let transaction = execution_transaction_from_request(
+        &request,
+        calldata,
+        ExecutionTransactionStatus::Submitted,
+        Some(tx_hash.clone()),
+        None,
+        now,
+    );
+    repository
+        .insert_execution_transaction(&transaction)
+        .await?;
+    update_execution_intent_status(&state, intent_id, ExecutionIntentStatus::Submitted).await?;
+
+    Ok(Json(BroadcastResponse {
+        intent_id,
+        onchain_intent_id: request.onchain_intent_id,
+        broadcast_enabled: true,
+        submitted: true,
+        confirmed: false,
+        tx_hash: Some(tx_hash),
+        reason: None,
+    }))
+}
+
+fn execution_transaction_from_request(
+    request: &crate::execution::ExecutionTransactionRequest,
+    calldata: String,
+    status: ExecutionTransactionStatus,
+    tx_hash: Option<String>,
+    error: Option<String>,
+    now: i64,
+) -> ExecutionTransaction {
+    ExecutionTransaction {
+        transaction_id: Uuid::new_v4().to_string(),
+        intent_id: request.intent_id,
+        onchain_intent_id: Some(request.onchain_intent_id.clone()),
+        target: request.to.clone(),
+        calldata,
+        value_wei: request.value_wei.to_string(),
+        tx_hash,
+        status,
+        error,
+        created_at_ms: now,
+        updated_at_ms: now,
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+struct ExecutorTransactionsQuery {
+    limit: Option<u32>,
+}
+
+async fn executor_transactions(
+    State(state): State<AppState>,
+    Query(query): Query<ExecutorTransactionsQuery>,
+) -> Result<Json<Vec<ExecutionTransaction>>, ApiError> {
+    let Some(repository) = state.repository.clone() else {
+        return Ok(Json(Vec::new()));
+    };
+    let limit = query.limit.unwrap_or(50).clamp(1, 500);
+    Ok(Json(
+        repository.list_recent_execution_transactions(limit).await?,
+    ))
+}
+
+async fn executor_transactions_for_intent(
+    State(state): State<AppState>,
+    Path(intent_id): Path<String>,
+) -> Result<Json<Vec<ExecutionTransaction>>, ApiError> {
+    let Some(repository) = state.repository.clone() else {
+        return Ok(Json(Vec::new()));
+    };
+    let intent_id = parse_uuid(&intent_id)?;
+    Ok(Json(
+        repository.get_transactions_for_intent(intent_id).await?,
+    ))
 }
 
 async fn indexer_status(State(state): State<AppState>) -> Result<Json<IndexerStatus>, ApiError> {
@@ -921,6 +1113,7 @@ impl From<BackendError> for ApiError {
             | BackendError::NonceAlreadyUsed
             | BackendError::MalformedSignature
             | BackendError::MissingTradeSignatures
+            | BackendError::BroadcastRejected(_)
             | BackendError::MissingExecutionMetadata(_)
             | BackendError::InvalidPerpTradeIntentId
             | BackendError::MalformedAccountAddress

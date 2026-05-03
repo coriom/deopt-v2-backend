@@ -39,6 +39,8 @@ pub enum BackendError {
     MalformedSignature,
     #[error("trade signatures are required to build executable PerpMatchingEngine calldata")]
     MissingTradeSignatures,
+    #[error("broadcast rejected: {0}")]
+    BroadcastRejected(String),
     #[error("execution intent is missing PerpTrade metadata: {0}")]
     MissingExecutionMetadata(String),
     #[error("simulation failed: {0}")]

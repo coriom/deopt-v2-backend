@@ -1,8 +1,8 @@
 # DeOpt v2 Rust Trading Backend
 
-Phase 1 Rust backend for DeOpt v2 trading infrastructure. This service provides an in-memory perp orderbook, deterministic matching, a thin HTTP API, RFQ/MM scaffolds, an execution-intent queue, a dry-run PerpMatchingEngine calldata builder boundary, manual RPC simulation for calldata-ready intents, and an opt-in Indexer V1 for PerpMatchingEngine events.
+Phase 1 Rust backend for DeOpt v2 trading infrastructure. This service provides an in-memory perp orderbook, deterministic matching, a thin HTTP API, RFQ/MM scaffolds, an execution-intent queue, a dry-run PerpMatchingEngine calldata builder boundary, manual RPC simulation for calldata-ready intents, an explicitly gated real broadcast path, and an opt-in Indexer V1 for PerpMatchingEngine events.
 
-Smart contracts remain the final source of truth. This backend does not submit transactions, sign payloads, load private keys, or claim final settlement. Optional simulation uses `eth_call` only and never broadcasts.
+Smart contracts remain the final source of truth. By default this backend does not submit transactions, sign transaction payloads, load private keys, or claim final settlement. Optional simulation uses `eth_call` only and never broadcasts. Real transaction signing and `eth_sendRawTransaction` are available only when `EXECUTOR_REAL_BROADCAST_ENABLED=true` and all required signer, fee, RPC, persistence, signature, and simulation gates pass.
 
 ## Run
 
@@ -46,6 +46,8 @@ EIP712_VERIFYING_CONTRACT=0x0000000000000000000000000000000000000000
 `EXECUTION_ENABLED=false` is intentional for this phase.
 `EXECUTOR_DRY_RUN=false` is rejected because real on-chain execution is not implemented.
 `PERSISTENCE_ENABLED=false` keeps the default local in-memory behavior and does not require Postgres.
+`EXECUTOR_REAL_BROADCAST_ENABLED=false` is the safe default.
+`EXECUTOR_REAL_BROADCAST_ENABLED=true` requires `PERSISTENCE_ENABLED=true`, `EXECUTOR_PRIVATE_KEY`, `RPC_URL`, `EXECUTOR_MAX_FEE_PER_GAS_WEI`, `EXECUTOR_MAX_PRIORITY_FEE_PER_GAS_WEI`, a nonzero `EXECUTOR_CHAIN_ID`, and a nonzero `EXECUTOR_MAX_GAS_LIMIT`.
 `SIMULATION_ENABLED=true` requires `RPC_URL`; when `SIMULATION_REQUIRE_PERSISTENCE=true`, it also requires `PERSISTENCE_ENABLED=true`.
 `INDEXER_ENABLED=true` requires `RPC_URL`; when `INDEXER_REQUIRE_PERSISTENCE=true`, it also requires `PERSISTENCE_ENABLED=true`.
 
@@ -78,7 +80,7 @@ curl -X POST http://127.0.0.1:8080/execution-intents/<intent_id>/signatures \
 
 Signatures are accepted only as `0x` plus 65-byte hex strings. They are stored in memory by default and in `execution_intent_signatures` when persistence is enabled. `calldata_ready=true` only when both buyer and seller trade signatures are present and the corresponding intent has complete PerpTrade metadata.
 
-Broadcast remains disabled. The prepared call always has `is_broadcastable=false` and `value=0`; no signing, private key loading, transaction submission, or confirmation tracking exists in this phase.
+Broadcast remains disabled by default. The prepared call always has `is_broadcastable=false` and `value=0`; no signing, private key retention, transaction submission, or confirmation tracking exists in the default path.
 
 ## RPC Simulation
 
@@ -95,7 +97,36 @@ PERSISTENCE_ENABLED=true
 
 `POST /executor/simulate/<intent_id>` loads one execution intent, requires both stored PerpTrade signatures, rebuilds the real `executeTrade` calldata, and performs an `eth_call` to `PERP_MATCHING_ENGINE_ADDRESS` with `value=0`. On success, the intent is marked `simulation_ok`; on revert or RPC failure, it is marked `simulation_failed` with the error text. These statuses only describe the result of the call simulation at the queried block. They do not mean submitted, confirmed, final, or executed.
 
-The endpoint returns `submitted=false` and `confirmed=false` for every response. Real broadcast remains impossible in this backend phase, and `GET /executor/status` reports `broadcastEnabled=false`.
+The endpoint returns `submitted=false` and `confirmed=false` for every response. Simulation does not call `eth_sendRawTransaction` and `GET /executor/status` reports `broadcastEnabled=false` until real broadcast is explicitly enabled.
+
+## Real Broadcast V1
+
+Broadcast V1 is disabled by default and only submits when explicitly enabled:
+
+```text
+EXECUTOR_REAL_BROADCAST_ENABLED=false
+EXECUTOR_PRIVATE_KEY=
+EXECUTOR_CHAIN_ID=84532
+EXECUTOR_MAX_GAS_LIMIT=1000000
+EXECUTOR_MAX_FEE_PER_GAS_WEI=
+EXECUTOR_MAX_PRIORITY_FEE_PER_GAS_WEI=
+EXECUTOR_REQUIRE_SIMULATION_OK=true
+```
+
+`POST /executor/broadcast/<intent_id>` returns a clear disabled response while `EXECUTOR_REAL_BROADCAST_ENABLED=false`. It does not sign, call `eth_sendRawTransaction`, fabricate a tx hash, or mark the intent submitted. Transaction request construction requires a complete matched trade, both PerpTrade signatures, non-empty `executeTrade` calldata, a configured `PERP_MATCHING_ENGINE_ADDRESS`, and `simulation_ok` when `EXECUTOR_REQUIRE_SIMULATION_OK=true`.
+
+When `EXECUTOR_REAL_BROADCAST_ENABLED=true`, startup validates the private key shape, RPC URL, static EIP-1559 fee fields, chain id, and gas limit. Broadcast fetches `eth_chainId`, rejects mismatches before signing, fetches the executor pending nonce with `eth_getTransactionCount`, signs a type `0x02` EIP-1559 transaction in-process, and submits only with `eth_sendRawTransaction`. The API records `submitted` only after the RPC returns a real tx hash, then marks the execution intent `submitted`. It never returns `confirmed=true` and never marks an intent confirmed.
+
+Private keys are held only in the execution config secret wrapper and signer object; their `Debug` output is redacted. The API never returns raw transactions or private keys.
+
+When persistence is enabled, transaction records can be read with:
+
+```sh
+curl http://127.0.0.1:8080/executor/transactions
+curl http://127.0.0.1:8080/executor/transactions/<intent_id>
+```
+
+The database stores transaction attempts with statuses `prepared`, `rejected`, `submitted`, and `failed`; it does not include `confirmed`. `submitted` means only that `eth_sendRawTransaction` returned a syntactically valid transaction hash. It does not prove inclusion, execution success, backend ownership, finality, or absence of reorgs. Confirmation requires later indexer, reconciliation, ownership, and finality checks. If the RPC send succeeds but persistence fails immediately afterward, the chain may still have received the transaction; this V1 does not provide atomic RPC-plus-database semantics.
 
 ## Indexer V1
 
@@ -160,7 +191,7 @@ PERSISTENCE_ENABLED=true
 DATABASE_URL=postgres://deopt:deopt@127.0.0.1:5432/deopt_v2_backend
 ```
 
-When enabled, the service connects to Postgres at startup and runs migrations from `migrations/`. Migrations create `used_nonces`, `orders`, `trades`, `execution_intents`, `execution_intent_signatures`, `execution_simulations`, `engine_events`, `indexer_cursors`, `indexed_perp_trades`, and `execution_reconciliations`.
+When enabled, the service connects to Postgres at startup and runs migrations from `migrations/`. Migrations create `used_nonces`, `orders`, `trades`, `execution_intents`, `execution_intent_signatures`, `execution_simulations`, `engine_events`, `indexer_cursors`, `indexed_perp_trades`, `execution_reconciliations`, and `execution_transactions`.
 
 One local setup option:
 
@@ -169,7 +200,7 @@ createdb deopt_v2_backend
 cargo run
 ```
 
-If your local Postgres uses a different user, password, host, or database name, set `DATABASE_URL` accordingly. Persistence is required before production executor usage so used nonces and pending execution intents survive restarts, but this repository still does not submit transactions.
+If your local Postgres uses a different user, password, host, or database name, set `DATABASE_URL` accordingly. Persistence is required before real broadcast usage so transaction records and submitted intent status survive restarts.
 
 ## Test
 
@@ -229,11 +260,12 @@ curl -X DELETE http://127.0.0.1:8080/orders/<order_id>
 - Execution intents are provisional off-chain records, not settlement.
 - Indexed `TradeExecuted` events store `onchain_intent_id` for direct reconciliation only; they do not confirm backend intents.
 - Reconciliation rows link indexed events to intents, but still do not prove transaction ownership, finality, or reorg safety.
+- Real broadcast is disabled by default; when enabled it submits only with a real signed raw transaction and never returns fake tx hashes.
 - Indexer V1 stores block hashes when available but does not implement deep reorg rollback.
 - PerpMatchingEngine calldata can be encoded only from complete matched trade payloads and explicit buyer/seller PerpTrade signatures.
-- Optional blockchain RPC is limited to manual `eth_call` simulation. No transaction signing, production auth, WebSocket API, or options matching.
+- Optional blockchain RPC includes manual `eth_call` simulation, opt-in indexing, and explicitly gated `eth_sendRawTransaction` broadcast. No production auth, WebSocket API, or options matching.
 
 ## Deferred Execution Work
 
-- Add transaction signing and broadcast behind explicit production safety controls.
 - Reconcile submitted transactions through an indexer before marking execution confirmed.
+- Add receipt polling, transaction ownership proofs, gas estimation, fee discovery, retries, nonce reservation, and reorg-aware confirmation.

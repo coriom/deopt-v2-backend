@@ -13,7 +13,7 @@ The long-term backend needs low-latency deterministic matching, RFQ, market-make
 - `api`: Axum HTTP routes. The API parses requests, calls the engine, and returns events/state.
 - `engine`: Command/event boundary. It owns market orderbooks and the execution-intent queue.
 - `orderbook`: Pure synchronous matching logic with `BTreeMap` price levels and FIFO `VecDeque` ordering.
-- `execution`: Provisional `ExecutionIntent` records, an in-memory queue, a dry-run executor scaffold, a PerpMatchingEngine calldata builder, and manual `eth_call` simulation. No transaction submission exists.
+- `execution`: Provisional `ExecutionIntent` records, an in-memory queue, a dry-run executor scaffold, a PerpMatchingEngine calldata builder, manual `eth_call` simulation, and an explicitly gated real broadcast path. No transaction submission exists in the default build.
 - `indexer`: Opt-in Indexer V1 that reads `PerpMatchingEngine.TradeExecuted` logs with `eth_getLogs`, persists decoded events, and advances a block cursor after persistence succeeds.
 - `reconciliation`: Opt-in Reconciliation V1 that links indexed events to execution intents by direct `onchain_intent_id` equality without marking finality.
 - `db`: Optional PostgreSQL persistence for used nonces, submitted orders, matched trades, execution intents, and engine event audit records.
@@ -35,6 +35,7 @@ The long-term backend needs low-latency deterministic matching, RFQ, market-make
 - PerpMatchingEngine `executeTrade` calldata builder V1 for explicit matched-trade payloads and explicit trade signatures.
 - Matched PerpTrade signing-payload and trade-signature collection endpoints.
 - Manual RPC simulation V1 for calldata-ready intents using `eth_call` only.
+- Real Broadcast V1 with transaction request construction, transaction records, disabled-by-default behavior, EIP-1559 signing, pending nonce lookup, chain id checks, and `eth_sendRawTransaction` behind explicit config gates.
 - HTTP endpoints for health, markets, orderbook, orders, cancellation, and execution intents.
 - Signed-order HTTP boundary with nonce/deadline validation, disabled signature shape checks, and strict EIP-712 signer recovery.
 - Optional PostgreSQL persistence V1 guarded by `PERSISTENCE_ENABLED=false` by default.
@@ -118,7 +119,7 @@ Every matched trade creates an `ExecutionIntent` with buyer, seller, order IDs, 
 
 The execution deadline is the minimum of the two original signed-order deadlines. Direct in-memory orders that do not carry nonce/deadline metadata can still match, but their signing-payload endpoint fails clearly instead of inventing missing PerpTrade fields.
 
-The intended lifecycle is: order accepted, matched, execution intent created, PerpTrade signatures collected, optionally simulated, later broadcast by a future executor, indexed by the indexer, reconciled as matched by direct intent id, and only later confirmed after transaction ownership and finality checks. Reconciliation V1 stops at the matched reconciliation row.
+The intended lifecycle is: order accepted, matched, execution intent created, PerpTrade signatures collected, calldata ready, simulation ok, prepared transaction, submitted by the explicitly gated executor, indexed by the indexer, reconciled as matched by direct intent id, and only later confirmed after transaction ownership and finality checks. Real Broadcast V1 stops at submitted after a real RPC tx hash; Reconciliation V1 stops at the matched reconciliation row.
 
 ## Persistence V1
 
@@ -130,7 +131,7 @@ The in-memory engine remains the live matching state in this V1 patch. Database 
 
 ## Blockchain Execution Boundary
 
-This repository does not execute on-chain transactions in phase 1. It does not sign transactions, load private keys, broadcast transactions, or mark trades as finally settled. Manual simulation can call an RPC endpoint with `eth_call` only. A future executor service can consume intents, manage production simulation policy, submit transactions, and reconcile confirmations with an indexer.
+This repository does not execute on-chain transactions in phase 1 by default. With default configuration it does not sign transactions, retain private keys, broadcast transactions, or mark trades as finally settled. Manual simulation can call an RPC endpoint with `eth_call` only. Real Broadcast V1 can submit a transaction only when `EXECUTOR_REAL_BROADCAST_ENABLED=true` and the required private key, RPC URL, static fee configuration, persistence, signatures, calldata, and simulation gates are present.
 
 The current calldata builder V1 can encode `PerpMatchingEngine.executeTrade(PerpTrade,bytes,bytes)` using an explicit `PerpTradePayload` and explicit buyer/seller trade signatures. The Solidity `PerpTrade.intentId` is `keccak256(bytes(execution_intents.intent_id))`, returned as `0x` plus 64 hex chars and used consistently in EIP-712 signing, calldata, and indexed-event reconciliation. `PerpTrade` signatures are distinct from the off-chain order signatures verified by the order API: the Solidity contract verifies signatures over the final matched trade payload, not the original order payloads. The builder therefore does not reuse order signatures and does not fabricate missing signatures.
 
@@ -142,6 +143,12 @@ Prepared execution calls remain non-broadcastable in this phase. `is_broadcastab
 
 Simulation V1 is a manual safety check exposed by `POST /executor/simulate/:intent_id`. It loads the intent and stored PerpTrade signatures, rebuilds the same `executeTrade` calldata, and performs `eth_call` from `EXECUTOR_FROM_ADDRESS` or the zero address to `PERP_MATCHING_ENGINE_ADDRESS`. A successful call marks the intent `simulation_ok`; a revert or RPC failure marks it `simulation_failed` with the error text. These statuses are not submission, confirmation, settlement, or finality.
 
+Real Broadcast V1 is exposed through `POST /executor/broadcast/:intent_id`, `GET /executor/transactions`, and `GET /executor/transactions/:intent_id`. With `EXECUTOR_REAL_BROADCAST_ENABLED=false`, the broadcast endpoint returns a disabled refusal with `submitted=false`, `confirmed=false`, and no tx hash. The transaction request builder requires both PerpTrade signatures, non-empty `executeTrade` calldata, a configured matching-engine target, static EIP-1559 fee values, and `simulation_ok` when required.
+
+When real broadcast is enabled, the executor parses `EXECUTOR_PRIVATE_KEY` into an in-process secp256k1 signer, derives the executor address, checks `eth_chainId == EXECUTOR_CHAIN_ID`, fetches the pending nonce with `eth_getTransactionCount`, signs a type `0x02` EIP-1559 raw transaction, and calls `eth_sendRawTransaction`. The repository stores a `submitted` transaction only after the RPC returns a syntactically valid tx hash and then marks the execution intent `submitted`. It never marks intents confirmed. Rejected chain-id mismatches and failed RPC sends can be persisted as `rejected` or `failed` transaction records without fabricating tx hashes.
+
+Private keys are modeled with a redacted secret wrapper and are not included in API responses. The signer exposes only the derived address. If a transaction is accepted by RPC and the subsequent database write fails, this V1 cannot make the RPC send and database record atomic; operators must reconcile externally with the returned or observed chain transaction data.
+
 ## Deterministic Replay Assumptions
 
 Matching decisions are deterministic for a given ordered command stream, market set, generated IDs, and timestamps. The pure orderbook uses ordered maps for price priority and FIFO queues for time priority. Durable replay from persisted orders is not implemented yet.
@@ -152,6 +159,7 @@ Matching decisions are deterministic for a given ordered command stream, market 
 - Off-chain matches are provisional until confirmed on-chain in a later phase.
 - PerpMatchingEngine requires signatures over the exact matched `PerpTrade`; order signatures are not valid substitutes.
 - `simulation_ok` only means an `eth_call` did not revert at the queried block.
+- `submitted` is valid only after `eth_sendRawTransaction` returns a real tx hash; it does not mean confirmed.
 - Indexed `TradeExecuted` events prove on-chain execution occurred and include `intentId` for direct matching, but this backend still does not mark intents confirmed in phase 1.
 - Indexer V1 is not fully reorg safe.
 - Zero price and zero size are rejected.
@@ -161,7 +169,7 @@ Matching decisions are deterministic for a given ordered command stream, market 
 
 ## Out of Scope
 
-No Redis, private key loading, transaction signing, transaction broadcast, production authentication, frontend code, TypeScript, Python service code, C++, or Solidity changes. Blockchain RPC is limited to manual `eth_call` simulation and opt-in `eth_getLogs` indexing. ABI encoding is limited to the non-broadcastable PerpMatchingEngine calldata builder boundary.
+No Redis, production authentication, frontend code, TypeScript, Python service code, C++, or Solidity changes. Blockchain RPC is limited to manual `eth_call` simulation, opt-in `eth_getLogs` indexing, and explicitly gated `eth_sendRawTransaction` broadcast. ABI encoding is limited to the PerpMatchingEngine calldata builder and guarded transaction request boundary.
 
 ## Acceptance Criteria
 

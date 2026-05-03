@@ -1,329 +1,367 @@
-# NEXT_TASK.md — Reconciliation V1 Direct by onchain_intent_id
+# NEXT_TASK.md — Real Broadcast V1, Guarded Transaction Submission
 
 ## Context
 
-The backend has been adapted to the updated Solidity PerpMatchingEngine.
-
-Current backend features:
+The backend now has:
 - deterministic matching
-- PostgreSQL persistence
 - signed order verification
-- execution intents
-- deterministic onchain_intent_id generated as keccak256(bytes(execution_intents.intent_id))
-- PerpTrade signing payload includes bytes32 intentId
-- PerpTrade calldata includes bytes32 intentId
-- RPC simulation exists
-- Indexer V1 decodes TradeExecuted with:
-  - topic1 = intentId
-  - topic2 = buyer
-  - topic3 = seller
-- indexed_perp_trades can store onchain_intent_id
+- PostgreSQL persistence
+- execution intents with deterministic `onchain_intent_id`
+- PerpTrade signing payload with `intentId`
+- buyer/seller PerpTrade signature collection
+- real `PerpMatchingEngine.executeTrade` calldata builder
+- RPC simulation via `eth_call`
+- Indexer V1 decoding `TradeExecuted(intentId, buyer, seller, ...)`
+- Reconciliation V1 by `onchain_intent_id`
+- guarded broadcast scaffold:
+  - `POST /executor/broadcast/:intent_id`
+  - `GET /executor/transactions`
+  - transaction table
+  - no fake tx hash
+  - no submitted/confirmed status
+  - real broadcast disabled by default
 
 Current limitation:
-- indexed on-chain trades are not yet linked back to backend execution_intents
-- there is no reconciliation table
-- there is no reconciliation endpoint
-- intents must not yet be marked confirmed
+- the backend cannot send a real transaction
+- no tx hash is persisted
+- no `submitted` status exists in practice
+- no receipt/finality confirmation exists yet
 
 ## Goal
 
-Add Reconciliation V1 using direct `onchain_intent_id` matching.
+Implement Real Broadcast V1.
 
-The backend must:
-- match `execution_intents.onchain_intent_id` with `indexed_perp_trades.onchain_intent_id`
-- create persistent reconciliation rows
-- expose reconciliation status
-- expose manual reconciliation tick
-- expose reconciliation rows
-- not mark execution intents as confirmed
-- not mark execution intents as submitted
-- not fake transaction ownership
+The backend must be able to:
+- sign a real transaction when explicitly enabled
+- send raw transaction via RPC
+- persist the real tx hash
+- mark the execution transaction as `submitted`
+- mark the execution intent as `submitted`
+- never mark `confirmed`
+- refuse unsafe broadcast attempts
+
+This task must implement real broadcast only behind explicit config gates.
 
 ## Critical Safety Rules
 
+Default behavior must remain safe.
+
+Real broadcast must happen only if all are true:
+- `EXECUTOR_REAL_BROADCAST_ENABLED=true`
+- `EXECUTOR_PRIVATE_KEY` is present and valid
+- `EXECUTOR_REQUIRE_SIMULATION_OK=true` implies intent status is `simulation_ok`
+- buyer/seller PerpTrade signatures are present
+- calldata can be built
+- `RPC_URL` is configured
+- `PERP_MATCHING_ENGINE_ADDRESS` is configured
+- chain id matches `EXECUTOR_CHAIN_ID`
+
 Do not:
-- add transaction broadcast
-- add private key loading
-- mark intents submitted
-- mark intents confirmed
+- fake tx hash
+- fake submitted status
+- mark confirmed
 - fake confirmation
 - fake tx ownership
-- modify Solidity repository
+- modify Solidity
 - change matching semantics
 - introduce floating point arithmetic
+- log or expose private key
 
-A matched reconciliation means only:
+If real broadcast cannot be implemented fully, fail explicitly with `RealBroadcastUnavailable`.
+Do not pretend to submit.
 
-```text
-An indexed TradeExecuted event has the same onchain_intent_id as a backend execution_intent.
+## Config
 
-It does not mean:
+Current config exists:
 
-backend submitted the transaction
-transaction is final
-intent is confirmed
-reorg safety is complete
-Direct Match Rule
+```env
+EXECUTOR_REAL_BROADCAST_ENABLED=false
+EXECUTOR_PRIVATE_KEY=
+EXECUTOR_CHAIN_ID=84532
+EXECUTOR_MAX_GAS_LIMIT=1000000
+EXECUTOR_MAX_FEE_PER_GAS_WEI=
+EXECUTOR_MAX_PRIORITY_FEE_PER_GAS_WEI=
+EXECUTOR_REQUIRE_SIMULATION_OK=true
 
-Primary reconciliation rule:
+Extend if needed:
 
-execution_intents.onchain_intent_id == indexed_perp_trades.onchain_intent_id
-
-Requirements:
-
-both values must be non-null
-both values must be normalized lowercase hex
-exact unique match => reconciliation status matched
-no matching intent => unmatched or no row, whichever is cleaner
-multiple matching intents for same onchain_intent_id => ambiguous
-duplicate indexed events for same intentId => ambiguous unless same tx/log duplicate already de-duplicated
-Database Migration
-
-Add next migration after existing migrations.
-
-Create table:
-
-CREATE TABLE execution_reconciliations (
-    reconciliation_id TEXT PRIMARY KEY,
-    onchain_intent_id TEXT NOT NULL,
-    intent_id TEXT NOT NULL REFERENCES execution_intents(intent_id) ON DELETE CASCADE,
-    indexed_event_id TEXT NOT NULL REFERENCES indexed_perp_trades(event_id) ON DELETE CASCADE,
-    tx_hash TEXT NOT NULL,
-    block_number BIGINT NOT NULL,
-    log_index BIGINT NOT NULL,
-    status TEXT NOT NULL,
-    created_at_ms BIGINT NOT NULL,
-    UNIQUE(intent_id, indexed_event_id)
-);
-
-CREATE INDEX idx_execution_reconciliations_onchain_intent_id
-    ON execution_reconciliations(onchain_intent_id);
-
-CREATE INDEX idx_execution_reconciliations_intent_id
-    ON execution_reconciliations(intent_id);
-
-CREATE INDEX idx_execution_reconciliations_status
-    ON execution_reconciliations(status);
-
-CREATE INDEX idx_execution_reconciliations_tx_hash
-    ON execution_reconciliations(tx_hash);
-
-Allowed statuses:
-
-matched
-ambiguous
-unmatched
-ignored
-
-Do not add confirmed.
-
-Repository Requirements
-
-Add repository methods:
-
-list_unreconciled_indexed_perp_trades(limit)
-find_execution_intents_by_onchain_intent_id(onchain_intent_id)
-find_indexed_trades_by_onchain_intent_id(onchain_intent_id)
-insert_execution_reconciliation(...)
-list_recent_reconciliations(limit)
-get_reconciliations_for_intent(intent_id)
-count_reconciliations_by_status()
-
-If some methods can be consolidated cleanly, do so.
-
-Ensure duplicate insertion is idempotent:
-
-repeated reconciliation tick should not create duplicate rows
-handle UNIQUE(intent_id, indexed_event_id)
-Reconciliation Algorithm V1
-
-Manual tick:
-
-Load unreconciled indexed_perp_trades with non-null onchain_intent_id.
-For each indexed trade:
-find execution_intents with same onchain_intent_id.
-If exactly one intent:
-create reconciliation row:
-status = matched
-intent_id
-indexed_event_id
-tx_hash
-block_number
-log_index
-onchain_intent_id
-do not mutate execution_intents.status to confirmed
-If zero intents:
-either skip or create unmatched, depending on cleanest implementation.
-If more than one intent:
-create ambiguous if possible
-do not confirm.
-Return counters:
-indexed_trades_checked
-matched
-ambiguous
-unmatched
-confirmed = 0
-
-No confirmed status allowed.
-
-Config
-
-Add or extend .env.example:
-
-RECONCILIATION_ENABLED=false
-RECONCILIATION_REQUIRE_PERSISTENCE=true
-RECONCILIATION_MAX_BATCH_SIZE=100
+EXECUTOR_GAS_ESTIMATION_ENABLED=false
+EXECUTOR_TX_TYPE=eip1559
 
 Rules:
 
-reconciliation requires persistence
-reconciliation does not require RPC directly
-reconciliation works from indexed DB data
-if disabled, write endpoints can return disabled
-HTTP API
+broadcast disabled by default
+private key required only when real broadcast enabled
+private key must never be logged
+private key must not be retained in public/debug structs
+invalid private key must fail startup or broadcast cleanly
+chain mismatch must fail cleanly
+Dependencies
 
-Add:
+Use idiomatic Rust Ethereum tooling.
 
-GET /reconciliation/status
-POST /reconciliation/tick
-GET /reconciliation/intents/:intent_id
-GET /reconciliations
-GET /reconciliation/status
+Preferred:
 
-Return:
+alloy stack if already partially present
+otherwise ethers is acceptable
+
+Requirements:
+
+sign EIP-1559 transaction or legacy transaction cleanly
+produce real raw signed transaction
+call eth_sendRawTransaction
+parse returned tx hash
+persist tx hash
+
+Do not use shell commands or external CLIs for signing/broadcast.
+
+Transaction Requirements
+
+Build transaction from prepared execution call:
+
+to = PERP_MATCHING_ENGINE_ADDRESS
+data = executeTrade(...) calldata
+value = 0
+chainId = EXECUTOR_CHAIN_ID
+gas limit = configured EXECUTOR_MAX_GAS_LIMIT unless gas estimation is implemented
+maxFeePerGas / maxPriorityFeePerGas:
+use configured values if provided
+if not provided, fetch reasonable values from RPC if implemented
+if fee discovery is not implemented, require explicit values when broadcast enabled
+
+Preferred V1:
+
+use configured EXECUTOR_MAX_FEE_PER_GAS_WEI
+use configured EXECUTOR_MAX_PRIORITY_FEE_PER_GAS_WEI
+if missing and real broadcast enabled, fail with clear config error
+
+No automatic gas policy overbuild.
+
+RPC Requirements
+
+Add RPC methods if missing:
+
+eth_chainId
+eth_getTransactionCount
+eth_sendRawTransaction
+optionally eth_gasPrice or fee history if implemented
+
+Nonce:
+
+fetch nonce for executor signer address via eth_getTransactionCount(address, "pending")
+do not maintain local nonce manager in this task
+
+Chain id:
+
+check eth_chainId == EXECUTOR_CHAIN_ID before signing/sending
+Signer Requirements
+
+Add signer module if clean:
+
+src/execution/signer.rs
+
+Responsibilities:
+
+parse private key
+derive executor address
+sign transaction
+expose only address, never private key
+
+API/debug output may include:
+
+executor address
+
+API/debug output must not include:
+
+private key
+raw signed tx unless strictly necessary; prefer not exposing it
+Broadcast Flow
+
+For POST /executor/broadcast/:intent_id:
+
+Load execution intent.
+Reject if already submitted.
+If EXECUTOR_REQUIRE_SIMULATION_OK=true, require intent status simulation_ok.
+Load signatures.
+Build PerpTradePayload.
+Build calldata.
+Build transaction request.
+If broadcast disabled:
+return refused response:
+submitted=false
+confirmed=false
+tx_hash=null
+reason="broadcast disabled"
+do not create fake tx hash
+do not mutate intent status
+If broadcast enabled:
+validate private key/signer
+check RPC chain id
+fetch pending nonce
+sign transaction
+send raw transaction
+persist transaction with:
+status = submitted
+tx_hash = real RPC result
+update intent status to submitted
+return tx_hash
+confirmed=false
+
+No confirmed transition in this task.
+
+Database Behavior
+
+Existing execution_transactions table exists.
+
+Use it.
+
+Repository additions if needed:
+
+update intent status to submitted
+insert submitted transaction atomically if possible
+detect already submitted tx for intent
+list transaction records
+
+Idempotency:
+
+if intent already has a submitted transaction, return existing tx hash or reject with clear already submitted
+do not send duplicate tx
+
+Atomicity:
+
+after RPC returns tx_hash, persist tx record and intent submitted.
+if DB persistence fails after RPC send, return explicit critical error. Document this limitation.
+ideal: record prepared attempt before send, update after send. Implement if clean.
+API Response
+
+POST /executor/broadcast/:intent_id response:
 
 {
-  "reconciliationEnabled": false,
-  "persistenceRequired": true,
-  "matchedReconciliations": 0,
-  "ambiguousReconciliations": 0,
-  "unmatchedReconciliations": 0,
-  "confirmed": 0
+  "intent_id": "...",
+  "onchain_intent_id": "0x...",
+  "broadcast_enabled": true,
+  "submitted": true,
+  "confirmed": false,
+  "tx_hash": "0x...",
+  "reason": null
 }
 
-confirmed must always be 0 in this task.
-
-POST /reconciliation/tick
-
-Return:
+Disabled response remains:
 
 {
-  "indexed_trades_checked": 0,
-  "matched": 0,
-  "ambiguous": 0,
-  "unmatched": 0,
-  "confirmed": 0
+  "intent_id": "...",
+  "onchain_intent_id": "0x...",
+  "broadcast_enabled": false,
+  "submitted": false,
+  "confirmed": false,
+  "tx_hash": null,
+  "reason": "broadcast disabled"
 }
-GET /reconciliation/intents/:intent_id
+Execution Intent Status
 
-Return reconciliation rows for the given intent.
+Allowed mutation:
 
-GET /reconciliations
+simulation_ok -> submitted
 
-Return recent reconciliation rows.
+Forbidden mutation:
 
-Default limit: 50.
+anything -> confirmed
 
-API/DTO Requirements
+If broadcast disabled:
 
-Return fields:
+no status mutation
 
-reconciliation_id
-onchain_intent_id
-intent_id
-indexed_event_id
-tx_hash
-block_number
-log_index
-status
-created_at_ms
+If RPC send fails:
 
-All large numeric values must serialize safely:
-
-block_number can be number if existing API uses number
-price/size are not required in reconciliation row
-if included from joined tables, keep fixed-point strings
+transaction status failed or rejected attempt if recorded
+intent status should remain simulation_ok unless a clean failure state is already modeled
+do not mark submitted without tx hash
 Tests Required
 
-Normal cargo test must not require RPC or Postgres.
+Normal cargo test must not require RPC, Postgres, private keys, or Base Sepolia.
 
-Add tests for:
+Add pure/unit tests for:
 
-reconciliation config disabled by default
-reconciliation requiring persistence rejects persistence disabled
-exact onchain_intent_id match returns matched decision
-unmatched event returns unmatched decision or skipped according to implementation
-duplicate tick is idempotent at decision layer if repository is not tested
-ambiguous matching does not confirm
-reconciliation tick response always has confirmed = 0
-reconciliation status response always has confirmed = 0
-no execution intent status becomes confirmed
-existing tests still pass
+broadcast disabled by default
+broadcast enabled requires private key
+broadcast enabled requires fee config if fee discovery not implemented
+broadcast enabled requires RPC URL
+private key is not exposed in debug/API structs
+broadcast rejects non-simulation_ok when EXECUTOR_REQUIRE_SIMULATION_OK=true
+broadcast rejects missing signatures
+broadcast disabled returns submitted=false, confirmed=false, tx_hash=null
+submitted response always has confirmed=false
+already submitted intent is not broadcast twice
+transaction request uses:
+target = PerpMatchingEngine
+value = 0
+chain_id = EXECUTOR_CHAIN_ID
+no confirmed mutation exists
 
-If DB-backed tests are too heavy:
+If signer tests are added:
 
-isolate pure reconciliation decision logic in src/reconciliation/*
-test pure decision logic with in-memory structs
-keep repository tests out of default suite
+use deterministic test private key
+test derived address
+do not require network
+
+If RPC broadcast tests are added:
+
+use mocked RPC only
+no live network in default tests
 Documentation
 
 Update README.md:
 
-explain direct reconciliation
-explain onchain_intent_id
-explain indexed event linking
-explain why confirmed is not set yet
-explain endpoints
+explain Real Broadcast V1
+explain disabled by default
+explain required env vars
+explain simulation_ok requirement
+explain submitted != confirmed
+explain receipt/indexer/reconciliation confirmation is next phase
+explain private key safety assumptions
 
 Update ARCHITECTURE.md:
 
-add reconciliation stage after indexer
+add submitted stage
 lifecycle:
 order accepted
 matched
-execution intent created
+intent created
 trade signatures collected
-simulated
-later broadcast
-indexed
-reconciled matched
-later confirmed after tx ownership/finality checks
-explain that direct intentId replaces economic-field matching as primary reconciliation path
+simulation_ok
+submitted with tx_hash
+indexed event
+reconciled by onchain_intent_id
+confirmed later after receipt/finality/reorg checks
+explicitly state confirmation is not part of this task
 Constraints
 
 Do not add:
 
-transaction broadcast
-private key loading
-sendTransaction
-production executor
+confirmed lifecycle
+fake tx hash
+fake broadcast
+fake tx ownership
 frontend
 TypeScript
 Python
 Node.js
 Solidity changes
+local nonce manager
+background auto-broadcast
 
 Do not modify:
 
 ~/DEOPT/deopt-v2-sol
 
-Do not fake:
-
-confirmed status
-submitted status
-on-chain execution
-transaction hash
-tx ownership
-reorg safety
-
 Do not change:
 
 matching semantics
 financial numeric rules
-signed order verification behavior
-PerpTrade signature behavior
-RPC simulation behavior
-indexer log fetching behavior
+signed order verification
+PerpTrade signing payload
+indexer behavior
+reconciliation confirmed=0 rule
 Validation
 
 Run:
@@ -343,18 +381,15 @@ Acceptance Criteria
 
 Complete only if:
 
-reconciliation config exists
-reconciliation migration exists
-reconciliation repository methods exist
-direct onchain_intent_id matching exists
-manual reconciliation tick exists
-reconciliation endpoints exist
-duplicate ticks are safe/idempotent
-no intent is marked submitted or confirmed
-status/tick responses report confirmed=0
+real broadcast is available only behind explicit config
+disabled path remains safe
+real broadcast either works fully or fails explicitly
+no fake tx hash exists
+submitted status is written only after real tx hash
+confirmed is never written
+tx hash persistence exists
 all validation commands pass
 EOF
-
 
 after all, 
 ## run telegram.py (say nothing, just run and that all)

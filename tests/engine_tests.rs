@@ -740,6 +740,56 @@ fn executor_status_cannot_report_broadcast_enabled() {
 }
 
 #[tokio::test]
+async fn broadcast_endpoint_rejects_when_disabled_without_fake_hash() {
+    let intent_id = "00000000-0000-0000-0000-000000000001";
+    let response = router(AppState::new(EngineState::with_default_markets()))
+        .oneshot(json_post(
+            &format!("/executor/broadcast/{intent_id}"),
+            "{}".to_string(),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = response_json(response).await;
+    assert_eq!(json["intent_id"], intent_id);
+    assert_eq!(json["broadcast_enabled"], false);
+    assert_eq!(json["submitted"], false);
+    assert_eq!(json["confirmed"], false);
+    assert_eq!(json["tx_hash"], serde_json::Value::Null);
+    assert_eq!(json["reason"], "broadcast disabled");
+}
+
+#[tokio::test]
+async fn executor_transactions_return_empty_without_persistence() {
+    let app = router(AppState::new(EngineState::with_default_markets()));
+    let list = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/executor/transactions")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let by_intent = app
+        .oneshot(
+            Request::builder()
+                .uri("/executor/transactions/00000000-0000-0000-0000-000000000001")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(list.status(), StatusCode::OK);
+    assert_eq!(response_json(list).await, serde_json::json!([]));
+    assert_eq!(by_intent.status(), StatusCode::OK);
+    assert_eq!(response_json(by_intent).await, serde_json::json!([]));
+}
+
+#[tokio::test]
 async fn signing_payload_endpoint_returns_perp_trade_fields() {
     let app = router(AppState::new(EngineState::with_default_markets()));
     let maker = app
@@ -993,6 +1043,13 @@ fn simulation_config_without_persistence_requirement() -> ExecutionConfig {
         dry_run: true,
         poll_interval_ms: 1_000,
         max_batch_size: 10,
+        real_broadcast_enabled: false,
+        executor_private_key: None,
+        executor_chain_id: 84532,
+        max_gas_limit: 1_000_000,
+        max_fee_per_gas_wei: None,
+        max_priority_fee_per_gas_wei: None,
+        require_simulation_ok: true,
         simulation_enabled: true,
         simulation_requires_persistence: false,
         rpc_url: Some("https://example.invalid".to_string()),

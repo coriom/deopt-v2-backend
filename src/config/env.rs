@@ -1,5 +1,5 @@
 use crate::error::{BackendError, Result};
-use crate::execution::ExecutionConfig;
+use crate::execution::{ExecutionConfig, PrivateKeySecret};
 use crate::indexer::IndexerConfig;
 use crate::reconciliation::ReconciliationConfig;
 use crate::signing::signature::SignatureVerificationMode;
@@ -41,6 +41,25 @@ impl AppConfig {
             dry_run: parse_env(&mut lookup, "EXECUTOR_DRY_RUN", "true")?,
             poll_interval_ms: parse_env(&mut lookup, "EXECUTOR_POLL_INTERVAL_MS", "1000")?,
             max_batch_size: parse_env(&mut lookup, "EXECUTOR_MAX_BATCH_SIZE", "10")?,
+            real_broadcast_enabled: parse_env(
+                &mut lookup,
+                "EXECUTOR_REAL_BROADCAST_ENABLED",
+                "false",
+            )?,
+            executor_private_key: lookup("EXECUTOR_PRIVATE_KEY")
+                .filter(|value| !value.is_empty())
+                .map(PrivateKeySecret::new),
+            executor_chain_id: parse_env(&mut lookup, "EXECUTOR_CHAIN_ID", "84532")?,
+            max_gas_limit: parse_env(&mut lookup, "EXECUTOR_MAX_GAS_LIMIT", "1000000")?,
+            max_fee_per_gas_wei: lookup("EXECUTOR_MAX_FEE_PER_GAS_WEI")
+                .filter(|value| !value.is_empty()),
+            max_priority_fee_per_gas_wei: lookup("EXECUTOR_MAX_PRIORITY_FEE_PER_GAS_WEI")
+                .filter(|value| !value.is_empty()),
+            require_simulation_ok: parse_env(
+                &mut lookup,
+                "EXECUTOR_REQUIRE_SIMULATION_OK",
+                "true",
+            )?,
             simulation_enabled: parse_env(&mut lookup, "SIMULATION_ENABLED", "false")?,
             simulation_requires_persistence: parse_env(
                 &mut lookup,
@@ -196,9 +215,150 @@ mod tests {
         assert!(config.execution.dry_run);
         assert_eq!(config.execution.poll_interval_ms, 1_000);
         assert_eq!(config.execution.max_batch_size, 10);
+        assert!(!config.execution.real_broadcast_enabled);
+        assert!(config.execution.executor_private_key.is_none());
+        assert_eq!(config.execution.executor_chain_id, 84532);
+        assert_eq!(config.execution.max_gas_limit, 1_000_000);
+        assert_eq!(config.execution.max_fee_per_gas_wei, None);
+        assert_eq!(config.execution.max_priority_fee_per_gas_wei, None);
+        assert!(config.execution.require_simulation_ok);
         assert_eq!(config.execution.rpc_url, None);
         assert!(!config.execution.simulation_enabled);
         assert!(config.execution.simulation_requires_persistence);
+    }
+
+    #[test]
+    fn real_broadcast_enabled_requires_private_key() {
+        let error = config_from_pairs([
+            ("EXECUTOR_REAL_BROADCAST_ENABLED", "true"),
+            ("PERSISTENCE_ENABLED", "true"),
+            (
+                "DATABASE_URL",
+                "postgres://deopt:deopt@127.0.0.1:5432/deopt_v2_backend",
+            ),
+        ])
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("EXECUTOR_PRIVATE_KEY is required"));
+    }
+
+    #[test]
+    fn real_broadcast_enabled_requires_persistence() {
+        let error = config_from_pairs([("EXECUTOR_REAL_BROADCAST_ENABLED", "true")]).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("real broadcast requires persistence enabled"));
+    }
+
+    #[test]
+    fn real_broadcast_enabled_requires_rpc_url() {
+        let error = config_from_pairs([
+            ("EXECUTOR_REAL_BROADCAST_ENABLED", "true"),
+            ("PERSISTENCE_ENABLED", "true"),
+            (
+                "DATABASE_URL",
+                "postgres://deopt:deopt@127.0.0.1:5432/deopt_v2_backend",
+            ),
+            (
+                "EXECUTOR_PRIVATE_KEY",
+                "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318",
+            ),
+        ])
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("RPC_URL is required when EXECUTOR_REAL_BROADCAST_ENABLED=true"));
+    }
+
+    #[test]
+    fn real_broadcast_enabled_requires_fee_config() {
+        let error = config_from_pairs([
+            ("EXECUTOR_REAL_BROADCAST_ENABLED", "true"),
+            ("PERSISTENCE_ENABLED", "true"),
+            (
+                "DATABASE_URL",
+                "postgres://deopt:deopt@127.0.0.1:5432/deopt_v2_backend",
+            ),
+            (
+                "EXECUTOR_PRIVATE_KEY",
+                "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318",
+            ),
+            ("RPC_URL", "https://example.invalid"),
+        ])
+        .unwrap_err();
+
+        assert!(error.to_string().contains("EXECUTOR_MAX_FEE_PER_GAS_WEI"));
+    }
+
+    #[test]
+    fn real_broadcast_enabled_rejects_invalid_private_key() {
+        let error = config_from_pairs([
+            ("EXECUTOR_REAL_BROADCAST_ENABLED", "true"),
+            ("PERSISTENCE_ENABLED", "true"),
+            (
+                "DATABASE_URL",
+                "postgres://deopt:deopt@127.0.0.1:5432/deopt_v2_backend",
+            ),
+            ("EXECUTOR_PRIVATE_KEY", "0xabc"),
+            ("RPC_URL", "https://example.invalid"),
+            ("EXECUTOR_MAX_FEE_PER_GAS_WEI", "1000000000"),
+            ("EXECUTOR_MAX_PRIORITY_FEE_PER_GAS_WEI", "100000000"),
+        ])
+        .unwrap_err();
+
+        assert!(error.to_string().contains("invalid EXECUTOR_PRIVATE_KEY"));
+    }
+
+    #[test]
+    fn real_broadcast_enabled_accepts_complete_static_config() {
+        let config = config_from_pairs([
+            ("EXECUTOR_REAL_BROADCAST_ENABLED", "true"),
+            ("PERSISTENCE_ENABLED", "true"),
+            (
+                "DATABASE_URL",
+                "postgres://deopt:deopt@127.0.0.1:5432/deopt_v2_backend",
+            ),
+            (
+                "EXECUTOR_PRIVATE_KEY",
+                "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318",
+            ),
+            ("RPC_URL", "https://example.invalid"),
+            ("EXECUTOR_MAX_FEE_PER_GAS_WEI", "1000000000"),
+            ("EXECUTOR_MAX_PRIORITY_FEE_PER_GAS_WEI", "100000000"),
+        ])
+        .unwrap();
+
+        assert!(config.execution.real_broadcast_enabled);
+        assert!(config.execution.executor_private_key.is_some());
+    }
+
+    #[test]
+    fn private_key_is_redacted_from_execution_config_debug() {
+        let config = config_from_pairs([
+            ("EXECUTOR_REAL_BROADCAST_ENABLED", "true"),
+            ("PERSISTENCE_ENABLED", "true"),
+            (
+                "DATABASE_URL",
+                "postgres://deopt:deopt@127.0.0.1:5432/deopt_v2_backend",
+            ),
+            (
+                "EXECUTOR_PRIVATE_KEY",
+                "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318",
+            ),
+            ("RPC_URL", "https://example.invalid"),
+            ("EXECUTOR_MAX_FEE_PER_GAS_WEI", "1000000000"),
+            ("EXECUTOR_MAX_PRIORITY_FEE_PER_GAS_WEI", "100000000"),
+        ])
+        .unwrap();
+
+        let debug = format!("{:?}", config.execution);
+
+        assert!(!debug.contains("4c0883"));
+        assert!(debug.contains("<redacted>"));
     }
 
     #[test]

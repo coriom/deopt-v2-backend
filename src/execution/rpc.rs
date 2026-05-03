@@ -24,6 +24,12 @@ pub trait EthCallProvider: Clone + Send + Sync {
     fn eth_call(&self, request: EthCallRequest) -> RpcFuture<'_, EthCallSuccess>;
 }
 
+pub trait TransactionBroadcastProvider: Clone + Send + Sync {
+    fn chain_id(&self) -> RpcFuture<'_, u64>;
+    fn transaction_count(&self, address: AccountId) -> RpcFuture<'_, u64>;
+    fn send_raw_transaction(&self, raw_transaction: String) -> RpcFuture<'_, String>;
+}
+
 #[derive(Clone)]
 pub struct HttpJsonRpcProvider {
     rpc_url: String,
@@ -36,6 +42,90 @@ impl HttpJsonRpcProvider {
             rpc_url: rpc_url.into(),
             client: reqwest::Client::new(),
         }
+    }
+}
+
+impl TransactionBroadcastProvider for HttpJsonRpcProvider {
+    fn chain_id(&self) -> RpcFuture<'_, u64> {
+        Box::pin(async move {
+            let response: JsonRpcResponse<String> = self
+                .client
+                .post(&self.rpc_url)
+                .json(&JsonRpcRequest {
+                    jsonrpc: "2.0",
+                    id: 1,
+                    method: "eth_chainId",
+                    params: Vec::<serde_json::Value>::new(),
+                })
+                .send()
+                .await
+                .map_err(|error| BackendError::Simulation(error.to_string()))?
+                .json()
+                .await
+                .map_err(|error| BackendError::Simulation(error.to_string()))?;
+            if let Some(error) = response.error {
+                return Err(BackendError::Simulation(error.message));
+            }
+            let result = response.result.ok_or_else(|| {
+                BackendError::Simulation("eth_chainId returned no result".to_string())
+            })?;
+            parse_hex_quantity_u64(&result)
+        })
+    }
+
+    fn transaction_count(&self, address: AccountId) -> RpcFuture<'_, u64> {
+        Box::pin(async move {
+            let response: JsonRpcResponse<String> = self
+                .client
+                .post(&self.rpc_url)
+                .json(&JsonRpcRequest {
+                    jsonrpc: "2.0",
+                    id: 1,
+                    method: "eth_getTransactionCount",
+                    params: (address.0, "pending"),
+                })
+                .send()
+                .await
+                .map_err(|error| BackendError::Simulation(error.to_string()))?
+                .json()
+                .await
+                .map_err(|error| BackendError::Simulation(error.to_string()))?;
+            if let Some(error) = response.error {
+                return Err(BackendError::Simulation(error.message));
+            }
+            let result = response.result.ok_or_else(|| {
+                BackendError::Simulation("eth_getTransactionCount returned no result".to_string())
+            })?;
+            parse_hex_quantity_u64(&result)
+        })
+    }
+
+    fn send_raw_transaction(&self, raw_transaction: String) -> RpcFuture<'_, String> {
+        Box::pin(async move {
+            let response: JsonRpcResponse<String> = self
+                .client
+                .post(&self.rpc_url)
+                .json(&JsonRpcRequest {
+                    jsonrpc: "2.0",
+                    id: 1,
+                    method: "eth_sendRawTransaction",
+                    params: [raw_transaction],
+                })
+                .send()
+                .await
+                .map_err(|error| BackendError::Simulation(error.to_string()))?
+                .json()
+                .await
+                .map_err(|error| BackendError::Simulation(error.to_string()))?;
+            if let Some(error) = response.error {
+                return Err(BackendError::Simulation(error.message));
+            }
+            let tx_hash = response.result.ok_or_else(|| {
+                BackendError::Simulation("eth_sendRawTransaction returned no result".to_string())
+            })?;
+            validate_tx_hash(&tx_hash)?;
+            Ok(tx_hash.to_ascii_lowercase())
+        })
     }
 }
 
@@ -175,4 +265,18 @@ fn decode_hex_bytes(value: &str) -> Result<Vec<u8>> {
         bytes.push(byte);
     }
     Ok(bytes)
+}
+
+fn validate_tx_hash(value: &str) -> Result<()> {
+    let Some(hex) = value.strip_prefix("0x") else {
+        return Err(BackendError::Simulation(
+            "invalid transaction hash".to_string(),
+        ));
+    };
+    if hex.len() != 64 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(BackendError::Simulation(
+            "invalid transaction hash".to_string(),
+        ));
+    }
+    Ok(())
 }
