@@ -309,8 +309,8 @@ impl PgRepository {
     pub async fn list_indexed_perp_trades(&self, limit: u32) -> Result<Vec<IndexedPerpTrade>> {
         let rows = sqlx::query(
             "SELECT event_id, tx_hash, log_index, block_number, block_hash, buyer, seller,
-                    market_id, size_delta_1e8, execution_price_1e8, buyer_is_maker,
-                    buyer_nonce, seller_nonce, created_at_ms
+                    onchain_intent_id, market_id, size_delta_1e8, execution_price_1e8,
+                    buyer_is_maker, buyer_nonce, seller_nonce, created_at_ms
              FROM indexed_perp_trades
              ORDER BY block_number DESC, log_index DESC
              LIMIT $1",
@@ -464,9 +464,9 @@ async fn insert_indexed_perp_trade(
     let result = sqlx::query(
         "INSERT INTO indexed_perp_trades (
             event_id, tx_hash, log_index, block_number, block_hash, buyer, seller,
-            market_id, size_delta_1e8, execution_price_1e8, buyer_is_maker,
+            onchain_intent_id, market_id, size_delta_1e8, execution_price_1e8, buyer_is_maker,
             buyer_nonce, seller_nonce, created_at_ms
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
         ON CONFLICT (tx_hash, log_index) DO NOTHING",
     )
     .bind(&trade.event_id)
@@ -476,6 +476,7 @@ async fn insert_indexed_perp_trade(
     .bind(&trade.block_hash)
     .bind(&trade.buyer)
     .bind(&trade.seller)
+    .bind(&trade.onchain_intent_id)
     .bind(&trade.market_id)
     .bind(&trade.size_delta_1e8)
     .bind(&trade.execution_price_1e8)
@@ -628,6 +629,7 @@ fn indexed_perp_trade_from_row(row: PgRow) -> Result<IndexedPerpTrade> {
         log_index: i64_to_u64_persistence("log_index", log_index)?,
         block_number: i64_to_u64_persistence("block_number", block_number)?,
         block_hash: row_get(&row, "block_hash")?,
+        onchain_intent_id: row_get(&row, "onchain_intent_id")?,
         buyer: row_get(&row, "buyer")?,
         seller: row_get(&row, "seller")?,
         market_id: row_get(&row, "market_id")?,

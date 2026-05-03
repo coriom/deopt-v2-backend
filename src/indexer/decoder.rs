@@ -5,7 +5,7 @@ use crate::types::now_ms;
 use alloy_primitives::U256;
 
 pub const TRADE_EXECUTED_SIGNATURE: &str =
-    "TradeExecuted(address,address,uint256,uint128,uint128,bool,uint256,uint256)";
+    "TradeExecuted(bytes32,address,address,uint256,uint128,uint128,bool,uint256,uint256)";
 
 pub fn trade_executed_topic0() -> String {
     hex_0x(&keccak256(TRADE_EXECUTED_SIGNATURE.as_bytes()))
@@ -28,9 +28,9 @@ pub fn decode_trade_executed_log(log: &EthLog) -> Result<IndexedPerpTrade> {
     let block_number =
         parse_hex_quantity(required_field(log.block_number.as_ref(), "blockNumber")?)?;
     let data = decode_hex_bytes(&log.data)?;
-    if data.len() != 32 * 5 {
+    if data.len() != 32 * 6 {
         return Err(BackendError::Indexer(
-            "TradeExecuted data must contain five ABI words".to_string(),
+            "TradeExecuted data must contain six ABI words".to_string(),
         ));
     }
 
@@ -41,14 +41,15 @@ pub fn decode_trade_executed_log(log: &EthLog) -> Result<IndexedPerpTrade> {
         log_index,
         block_number,
         block_hash: log.block_hash.clone(),
-        buyer: decode_topic_address(&log.topics[1])?,
-        seller: decode_topic_address(&log.topics[2])?,
-        market_id: decode_topic_u256(&log.topics[3])?,
-        size_delta_1e8: decode_data_u256(&data, 0)?.to_string(),
-        execution_price_1e8: decode_data_u256(&data, 1)?.to_string(),
-        buyer_is_maker: decode_bool(&data, 2)?,
-        buyer_nonce: decode_data_u256(&data, 3)?.to_string(),
-        seller_nonce: decode_data_u256(&data, 4)?.to_string(),
+        onchain_intent_id: Some(decode_topic_bytes32(&log.topics[1])?),
+        buyer: decode_topic_address(&log.topics[2])?,
+        seller: decode_topic_address(&log.topics[3])?,
+        market_id: decode_data_u256(&data, 0)?.to_string(),
+        size_delta_1e8: decode_data_u256(&data, 1)?.to_string(),
+        execution_price_1e8: decode_data_u256(&data, 2)?.to_string(),
+        buyer_is_maker: decode_bool(&data, 3)?,
+        buyer_nonce: decode_data_u256(&data, 4)?.to_string(),
+        seller_nonce: decode_data_u256(&data, 5)?.to_string(),
         created_at_ms: now_ms(),
     })
 }
@@ -62,8 +63,8 @@ fn decode_topic_address(topic: &str) -> Result<String> {
     Ok(format!("0x{}", hex_lower(&bytes[12..])))
 }
 
-fn decode_topic_u256(topic: &str) -> Result<String> {
-    Ok(U256::from_be_slice(&decode_fixed_hex(topic, 32)?).to_string())
+fn decode_topic_bytes32(topic: &str) -> Result<String> {
+    Ok(hex_0x(&decode_fixed_hex(topic, 32)?))
 }
 
 fn decode_data_u256(data: &[u8], word_index: usize) -> Result<U256> {
@@ -153,7 +154,7 @@ mod tests {
     fn trade_executed_topic0_matches_signature_hash() {
         assert_eq!(
             trade_executed_topic0(),
-            "0x31b62761eb5ce23f9d5b27a89b2357c69d9d904b7284365382f4cd9a7ae98a25"
+            "0x5018a0a73d56c00e01815636cf5e029fd7ed9440d42b3eea0e75404dfedb3f80"
         );
     }
 
@@ -163,12 +164,13 @@ mod tests {
             address: "0x0000000000000000000000000000000000000009".to_string(),
             topics: vec![
                 trade_executed_topic0(),
+                word(99),
                 topic_address("0000000000000000000000000000000000000001"),
                 topic_address("0000000000000000000000000000000000000002"),
-                word(7),
             ],
             data: format!(
-                "0x{}{}{}{}{}",
+                "0x{}{}{}{}{}{}",
+                word_no_prefix(7),
                 word_no_prefix(100_000_000),
                 word_no_prefix(300_000_000_000),
                 word_no_prefix(1),
@@ -188,6 +190,10 @@ mod tests {
         assert_eq!(trade.log_index, 2);
         assert_eq!(trade.block_number, 123);
         assert_eq!(trade.block_hash.as_deref(), Some("0xblock"));
+        assert_eq!(
+            trade.onchain_intent_id.as_deref(),
+            Some("0x0000000000000000000000000000000000000000000000000000000000000063")
+        );
         assert_eq!(trade.buyer, "0x0000000000000000000000000000000000000001");
         assert_eq!(trade.seller, "0x0000000000000000000000000000000000000002");
         assert_eq!(trade.market_id, "7");

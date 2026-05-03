@@ -14,8 +14,9 @@ pub use config::{ExecutionConfig, ExecutionStatus};
 pub use executor::{ExecutionIntentRepository, ExecutionTickResult, Executor, RepositoryFuture};
 pub use intent::{ExecutionIntent, ExecutionIntentStatus};
 pub use perp_trade::{
-    perp_trade_digest, PerpTradeDomain, PerpTradePayload, PerpTradeSignatureBundle,
-    StoredTradeSignatures, TradeSignatureStatus, PERP_TRADE_TYPE,
+    b256_to_hex_bytes32, intent_id_to_b256, intent_id_to_hex_bytes32, perp_trade_digest,
+    PerpTradeDomain, PerpTradePayload, PerpTradeSignatureBundle, StoredTradeSignatures,
+    TradeSignatureStatus, PERP_TRADE_TYPE,
 };
 pub use queue::ExecutionQueue;
 pub use rpc::{EthCallProvider, EthCallRequest, EthCallSuccess, HttpJsonRpcProvider};

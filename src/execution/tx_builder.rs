@@ -89,7 +89,7 @@ pub fn build_perp_execution_call_from_intent(
 mod tests {
     use super::*;
     use crate::execution::abi::execute_trade_selector;
-    use crate::execution::{ExecutionIntentStatus, StoredTradeSignatures};
+    use crate::execution::{intent_id_to_b256, ExecutionIntentStatus, StoredTradeSignatures};
     use crate::types::OrderId;
 
     #[test]
@@ -190,6 +190,7 @@ mod tests {
 
     fn payload() -> PerpTradePayload {
         PerpTradePayload::new(
+            intent_id_to_b256("00000000-0000-0000-0000-000000000001").unwrap(),
             AccountId::new("0x0000000000000000000000000000000000000001"),
             AccountId::new("0x0000000000000000000000000000000000000002"),
             1,

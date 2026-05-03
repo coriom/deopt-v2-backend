@@ -25,6 +25,8 @@ pub enum BackendError {
     InvalidOrderId,
     #[error("invalid execution intent id")]
     InvalidExecutionIntentId,
+    #[error("invalid PerpTrade intentId")]
+    InvalidPerpTradeIntentId,
     #[error("invalid fixed-point value for {field}: {reason}")]
     InvalidFixedPoint { field: String, reason: String },
     #[error("deadline has expired")]

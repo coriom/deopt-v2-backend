@@ -1,5 +1,5 @@
 use crate::error::{BackendError, Result};
-use crate::execution::PerpTradePayload;
+use crate::execution::{intent_id_to_b256, PerpTradePayload};
 use crate::types::{AccountId, MarketId, OrderId, Price1e8, Size1e8, TimestampMs};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -53,6 +53,7 @@ impl ExecutionIntent {
             .map_err(|_| BackendError::MissingExecutionMetadata("deadline".to_string()))?;
 
         PerpTradePayload::new(
+            intent_id_to_b256(&self.intent_id.to_string())?,
             self.buyer.clone(),
             self.seller.clone(),
             u128::from(self.market_id),

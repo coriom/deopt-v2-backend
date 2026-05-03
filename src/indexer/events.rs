@@ -24,6 +24,8 @@ pub struct IndexedPerpTrade {
     pub block_number: u64,
     #[serde(rename = "blockHash")]
     pub block_hash: Option<String>,
+    #[serde(rename = "onchainIntentId")]
+    pub onchain_intent_id: Option<String>,
     pub buyer: String,
     pub seller: String,
     #[serde(rename = "marketId")]

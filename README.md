@@ -51,7 +51,9 @@ EIP712_VERIFYING_CONTRACT=0x0000000000000000000000000000000000000000
 
 ## PerpMatchingEngine Calldata
 
-The execution module can ABI encode `PerpMatchingEngine.executeTrade((address,address,uint256,uint128,uint128,bool,uint256,uint256,uint256),bytes,bytes)` with `alloy-sol-types` when given an explicit `PerpTradePayload` and explicit buyer/seller trade signatures.
+The execution module can ABI encode `PerpMatchingEngine.executeTrade((bytes32,address,address,uint256,uint128,uint128,bool,uint256,uint256,uint256),bytes,bytes)` with `alloy-sol-types` when given an explicit `PerpTradePayload` and explicit buyer/seller trade signatures.
+
+The Solidity `PerpTrade.intentId` is derived from the backend UUID string as `keccak256(bytes(execution_intents.intent_id))` and exposed as `0x` plus 64 lowercase hex chars. This mapping is deterministic, non-random, and reused by the signing payload, calldata builder, and indexed-event reconciliation.
 
 The order signatures accepted by `POST /orders` are not PerpTrade signatures. The Solidity `PerpMatchingEngine` verifies signatures over the final matched `PerpTrade`, so the builder never reuses order signatures as trade signatures and never fabricates buyer or seller signatures. If signatures are missing, the builder produces a non-executable preview with empty calldata and `missing_signatures=true`.
 
@@ -61,7 +63,7 @@ After a match, clients can fetch the exact EIP-712 trade payload:
 curl http://127.0.0.1:8080/execution-intents/<intent_id>/signing-payload
 ```
 
-The response includes the `DeOptV2-PerpMatchingEngine` domain, `PerpTrade` type fields, message fields, and digest. The trade message uses the matched buyer/seller, market, size, execution price, buyer maker flag, buyer/seller order nonces, and the minimum original order deadline. If an old or direct in-memory intent lacks nonce/deadline metadata, the endpoint returns a clear error instead of inventing values.
+The response includes the `DeOptV2-PerpMatchingEngine` domain, `PerpTrade` type fields, message fields, and digest. The trade message uses `intentId` first, then the matched buyer/seller, market, size, execution price, buyer maker flag, buyer/seller order nonces, and the minimum original order deadline. If an old or direct in-memory intent lacks nonce/deadline metadata, the endpoint returns a clear error instead of inventing values.
 
 Clients submit matched-trade signatures separately:
 
@@ -110,7 +112,7 @@ PERP_MATCHING_ENGINE_ADDRESS=0x...
 PERSISTENCE_ENABLED=true
 ```
 
-It reads `eth_getLogs` for `PerpMatchingEngine.TradeExecuted`, decodes the event, stores rows in `indexed_perp_trades`, and advances the `perp_matching_engine` cursor only after persistence succeeds. Manual control and reads are exposed through:
+It reads `eth_getLogs` for `PerpMatchingEngine.TradeExecuted`, decodes the event, stores rows in `indexed_perp_trades`, and advances the `perp_matching_engine` cursor only after persistence succeeds. The Solidity event now emits indexed `intentId`, which the backend stores as `indexed_perp_trades.onchain_intent_id`. Manual control and reads are exposed through:
 
 ```sh
 curl http://127.0.0.1:8080/indexer/status
@@ -118,7 +120,7 @@ curl -X POST http://127.0.0.1:8080/indexer/tick
 curl http://127.0.0.1:8080/indexed/perp-trades
 ```
 
-Indexed events do not mark execution intents submitted or confirmed. The Solidity event does not include a deterministic backend intent id, so reconciliation is intentionally deferred. V1 stores `block_hash` when the RPC provides it, but does not implement deep reorg rollback.
+Indexed events do not mark execution intents submitted or confirmed. Direct reconciliation can compare `keccak256(bytes(execution_intents.intent_id))` with `indexed_perp_trades.onchain_intent_id`; economic match keys are only a fallback for historical data without an intent id. V1 stores `block_hash` when the RPC provides it, but does not implement deep reorg rollback.
 
 ## Persistence
 
@@ -196,7 +198,7 @@ curl -X DELETE http://127.0.0.1:8080/orders/<order_id>
 - FOK is rejected cleanly.
 - RFQ and market-maker gateway are type scaffolds only.
 - Execution intents are provisional off-chain records, not settlement.
-- Indexed `TradeExecuted` events are stored for reconciliation only; they do not confirm backend intents.
+- Indexed `TradeExecuted` events store `onchain_intent_id` for direct reconciliation only; they do not confirm backend intents.
 - Indexer V1 stores block hashes when available but does not implement deep reorg rollback.
 - PerpMatchingEngine calldata can be encoded only from complete matched trade payloads and explicit buyer/seller PerpTrade signatures.
 - Optional blockchain RPC is limited to manual `eth_call` simulation. No transaction signing, production auth, WebSocket API, or options matching.

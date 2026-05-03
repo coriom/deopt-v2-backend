@@ -1,10 +1,12 @@
 use crate::error::{BackendError, Result};
 use crate::signing::eip712::{keccak256, parse_evm_address, EIP712_DOMAIN_TYPE};
 use crate::types::AccountId;
+use alloy_primitives::B256;
 use serde::Serialize;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PerpTradePayload {
+    pub intent_id: B256,
     pub buyer: AccountId,
     pub seller: AccountId,
     pub market_id: u128,
@@ -19,6 +21,7 @@ pub struct PerpTradePayload {
 impl PerpTradePayload {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
+        intent_id: B256,
         buyer: AccountId,
         seller: AccountId,
         market_id: u128,
@@ -30,6 +33,7 @@ impl PerpTradePayload {
         deadline: u128,
     ) -> Result<Self> {
         let payload = Self {
+            intent_id,
             buyer,
             seller,
             market_id,
@@ -45,6 +49,9 @@ impl PerpTradePayload {
     }
 
     pub fn validate(&self) -> Result<()> {
+        if self.intent_id == B256::ZERO {
+            return Err(BackendError::InvalidPerpTradeIntentId);
+        }
         parse_evm_address(&self.buyer)?;
         parse_evm_address(&self.seller)?;
         if self.size_delta_1e8 == 0 {
@@ -55,6 +62,22 @@ impl PerpTradePayload {
         }
         Ok(())
     }
+}
+
+pub fn intent_id_to_b256(intent_id: &str) -> Result<B256> {
+    let mapped = B256::from(keccak256(intent_id.as_bytes()));
+    if mapped == B256::ZERO {
+        return Err(BackendError::InvalidPerpTradeIntentId);
+    }
+    Ok(mapped)
+}
+
+pub fn intent_id_to_hex_bytes32(intent_id: &str) -> Result<String> {
+    Ok(b256_to_hex_bytes32(&intent_id_to_b256(intent_id)?))
+}
+
+pub fn b256_to_hex_bytes32(intent_id: &B256) -> String {
+    hex_0x(intent_id.as_slice())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -156,7 +179,7 @@ impl PerpTradeDomain {
     }
 }
 
-pub const PERP_TRADE_TYPE: &str = "PerpTrade(address buyer,address seller,uint256 marketId,uint128 sizeDelta1e8,uint128 executionPrice1e8,bool buyerIsMaker,uint256 buyerNonce,uint256 sellerNonce,uint256 deadline)";
+pub const PERP_TRADE_TYPE: &str = "PerpTrade(bytes32 intentId,address buyer,address seller,uint256 marketId,uint128 sizeDelta1e8,uint128 executionPrice1e8,bool buyerIsMaker,uint256 buyerNonce,uint256 sellerNonce,uint256 deadline)";
 
 pub fn perp_trade_digest(payload: &PerpTradePayload, domain: &PerpTradeDomain) -> Result<String> {
     let domain_separator = domain_separator(domain)?;
@@ -201,8 +224,9 @@ fn perp_trade_hash(payload: &PerpTradePayload) -> Result<[u8; 32]> {
     let buyer = parse_evm_address(&payload.buyer)?;
     let seller = parse_evm_address(&payload.seller)?;
 
-    let mut encoded = Vec::with_capacity(320);
+    let mut encoded = Vec::with_capacity(352);
     encoded.extend_from_slice(&keccak256(PERP_TRADE_TYPE.as_bytes()));
+    encoded.extend_from_slice(payload.intent_id.as_slice());
     encoded.extend_from_slice(&encode_address(&buyer));
     encoded.extend_from_slice(&encode_address(&seller));
     encoded.extend_from_slice(&encode_u128(payload.market_id));
@@ -286,11 +310,57 @@ mod tests {
         let payload = valid_payload();
 
         assert_eq!(payload.market_id, 1);
+        assert_eq!(
+            intent_id_to_hex_bytes32("00000000-0000-0000-0000-000000000001").unwrap(),
+            hex_0x(payload.intent_id.as_slice())
+        );
+    }
+
+    #[test]
+    fn backend_intent_id_maps_deterministically_to_bytes32() {
+        let intent_id = "550e8400-e29b-41d4-a716-446655440000";
+
+        let first = intent_id_to_b256(intent_id).unwrap();
+        let second = intent_id_to_b256(intent_id).unwrap();
+        let hex = intent_id_to_hex_bytes32(intent_id).unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(hex.len(), 66);
+        assert!(hex.starts_with("0x"));
+        assert_ne!(first, B256::ZERO);
+    }
+
+    #[test]
+    fn different_backend_intent_ids_map_to_different_bytes32_values() {
+        let first = intent_id_to_b256("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        let second = intent_id_to_b256("550e8400-e29b-41d4-a716-446655440001").unwrap();
+
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn zero_perp_trade_intent_id_is_rejected() {
+        let error = PerpTradePayload::new(
+            B256::ZERO,
+            AccountId::new("0x0000000000000000000000000000000000000001"),
+            AccountId::new("0x0000000000000000000000000000000000000002"),
+            1,
+            10,
+            100,
+            true,
+            11,
+            12,
+            123,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, BackendError::InvalidPerpTradeIntentId));
     }
 
     #[test]
     fn invalid_buyer_address_is_rejected() {
         let error = PerpTradePayload::new(
+            intent_id_to_b256("00000000-0000-0000-0000-000000000001").unwrap(),
             AccountId::new("buyer"),
             AccountId::new("0x0000000000000000000000000000000000000002"),
             1,
@@ -309,6 +379,7 @@ mod tests {
     #[test]
     fn invalid_seller_address_is_rejected() {
         let error = PerpTradePayload::new(
+            intent_id_to_b256("00000000-0000-0000-0000-000000000001").unwrap(),
             AccountId::new("0x0000000000000000000000000000000000000001"),
             AccountId::new("seller"),
             1,
@@ -359,8 +430,50 @@ mod tests {
         assert!(digest.starts_with("0x"));
     }
 
+    #[test]
+    fn perp_trade_digest_changes_when_intent_id_changes() {
+        let domain = PerpTradeDomain::new(
+            84532,
+            AccountId::new("0x0000000000000000000000000000000000000009"),
+        );
+        let first = perp_trade_digest(&valid_payload(), &domain).unwrap();
+        let second = perp_trade_digest(
+            &PerpTradePayload::new(
+                intent_id_to_b256("00000000-0000-0000-0000-000000000002").unwrap(),
+                AccountId::new("0x0000000000000000000000000000000000000001"),
+                AccountId::new("0x0000000000000000000000000000000000000002"),
+                1,
+                10,
+                100,
+                true,
+                11,
+                12,
+                123,
+            )
+            .unwrap(),
+            &domain,
+        )
+        .unwrap();
+
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn perp_trade_digest_is_deterministic() {
+        let domain = PerpTradeDomain::new(
+            84532,
+            AccountId::new("0x0000000000000000000000000000000000000009"),
+        );
+
+        assert_eq!(
+            perp_trade_digest(&valid_payload(), &domain).unwrap(),
+            perp_trade_digest(&valid_payload(), &domain).unwrap()
+        );
+    }
+
     fn valid_payload() -> PerpTradePayload {
         PerpTradePayload::new(
+            intent_id_to_b256("00000000-0000-0000-0000-000000000001").unwrap(),
             AccountId::new("0x0000000000000000000000000000000000000001"),
             AccountId::new("0x0000000000000000000000000000000000000002"),
             1,

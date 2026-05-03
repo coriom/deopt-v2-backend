@@ -6,8 +6,8 @@ use crate::db::PgRepository;
 use crate::engine::{EngineCommand, EngineEvent};
 use crate::error::{BackendError, Result as BackendResult};
 use crate::execution::{
-    perp_trade_digest, simulate_execution_intent, ExecutionIntentStatus, Executor,
-    HttpJsonRpcProvider, PerpTradeDomain, PerpTradePayload, SimulationResult,
+    b256_to_hex_bytes32, perp_trade_digest, simulate_execution_intent, ExecutionIntentStatus,
+    Executor, HttpJsonRpcProvider, PerpTradeDomain, PerpTradePayload, SimulationResult,
     StoredTradeSignatures, TradeSignatureStatus, PERP_TRADE_TYPE,
 };
 use crate::indexer::{Indexer, IndexerStatus, IndexerTickResult};
@@ -278,6 +278,8 @@ struct SigningPayloadTypeField {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 struct SigningPayloadMessage {
+    #[serde(rename = "intentId")]
+    intent_id: String,
     buyer: String,
     seller: String,
     #[serde(rename = "marketId")]
@@ -673,6 +675,7 @@ fn perp_trade_domain(state: &AppState) -> PerpTradeDomain {
 
 fn signing_payload_message(payload: PerpTradePayload) -> SigningPayloadMessage {
     SigningPayloadMessage {
+        intent_id: b256_to_hex_bytes32(&payload.intent_id),
         buyer: payload.buyer.0,
         seller: payload.seller.0,
         market_id: payload.market_id.to_string(),
@@ -688,6 +691,10 @@ fn signing_payload_message(payload: PerpTradePayload) -> SigningPayloadMessage {
 fn perp_trade_type_fields() -> Vec<SigningPayloadTypeField> {
     let _ = PERP_TRADE_TYPE;
     vec![
+        SigningPayloadTypeField {
+            name: "intentId",
+            type_name: "bytes32",
+        },
         SigningPayloadTypeField {
             name: "buyer",
             type_name: "address",
@@ -755,6 +762,7 @@ impl From<BackendError> for ApiError {
             | BackendError::MalformedSignature
             | BackendError::MissingTradeSignatures
             | BackendError::MissingExecutionMetadata(_)
+            | BackendError::InvalidPerpTradeIntentId
             | BackendError::MalformedAccountAddress
             | BackendError::UnsupportedSignatureV
             | BackendError::SignatureRecoveryFailed

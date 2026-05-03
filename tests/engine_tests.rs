@@ -2,7 +2,7 @@ use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use deopt_v2_backend::api::{router, AppState};
 use deopt_v2_backend::engine::{EngineEvent, EngineState};
-use deopt_v2_backend::execution::ExecutionConfig;
+use deopt_v2_backend::execution::{intent_id_to_hex_bytes32, ExecutionConfig};
 use deopt_v2_backend::indexer::IndexerConfig;
 use deopt_v2_backend::signing::{Eip712Domain, SignatureVerificationMode, SignedOrder};
 use deopt_v2_backend::types::now_ms;
@@ -754,6 +754,12 @@ async fn signing_payload_endpoint_returns_perp_trade_fields() {
     assert_eq!(json["primary_type"], "PerpTrade");
     assert_eq!(json["domain"]["name"], "DeOptV2-PerpMatchingEngine");
     assert_eq!(json["domain"]["version"], "1");
+    assert_eq!(json["types"][0]["name"], "intentId");
+    assert_eq!(json["types"][0]["type"], "bytes32");
+    assert_eq!(
+        json["message"]["intentId"],
+        intent_id_to_hex_bytes32(intent_id).unwrap()
+    );
     assert_eq!(
         json["message"]["buyer"],
         "0x0000000000000000000000000000000000000002"

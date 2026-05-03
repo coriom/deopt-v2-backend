@@ -11,4 +11,5 @@ Thumbs.db
 .idea/
 .vscode/
 
-thelegram.py
+ARCHITECTURE_TARGET.md
+telegram.py

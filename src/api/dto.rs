@@ -1,6 +1,6 @@
 use crate::engine::EngineEvent;
 use crate::error::{BackendError, Result};
-use crate::execution::ExecutionIntent;
+use crate::execution::{intent_id_to_hex_bytes32, ExecutionIntent};
 use crate::signing::SignedOrder;
 use crate::types::{
     AccountId, MarketId, NewOrder, Order, OrderId, OrderStatus, OrderType, Side, TimeInForce,
@@ -155,6 +155,7 @@ impl From<TradeMatch> for ApiTradeMatch {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ApiExecutionIntent {
     pub intent_id: Uuid,
+    pub onchain_intent_id: String,
     pub market_id: MarketId,
     pub buyer: AccountId,
     pub seller: AccountId,
@@ -172,8 +173,11 @@ pub struct ApiExecutionIntent {
 
 impl From<ExecutionIntent> for ApiExecutionIntent {
     fn from(intent: ExecutionIntent) -> Self {
+        let onchain_intent_id = intent_id_to_hex_bytes32(&intent.intent_id.to_string())
+            .expect("UUID string always maps to nonzero bytes32");
         Self {
             intent_id: intent.intent_id,
+            onchain_intent_id,
             market_id: intent.market_id,
             buyer: intent.buyer,
             seller: intent.seller,

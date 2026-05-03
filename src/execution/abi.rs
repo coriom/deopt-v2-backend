@@ -6,6 +6,7 @@ use alloy_sol_types::{sol, SolCall};
 
 sol! {
     struct PerpTrade {
+        bytes32 intentId;
         address buyer;
         address seller;
         uint256 marketId;
@@ -21,7 +22,7 @@ sol! {
 }
 
 pub const EXECUTE_TRADE_SIGNATURE: &str =
-    "executeTrade((address,address,uint256,uint128,uint128,bool,uint256,uint256,uint256),bytes,bytes)";
+    "executeTrade((bytes32,address,address,uint256,uint128,uint128,bool,uint256,uint256,uint256),bytes,bytes)";
 
 pub fn execute_trade_selector() -> [u8; 4] {
     executeTradeCall::SELECTOR
@@ -34,6 +35,7 @@ pub fn encode_execute_trade_calldata(
     payload.validate()?;
     let call = executeTradeCall {
         t: PerpTrade {
+            intentId: payload.intent_id,
             buyer: Address::from(parse_evm_address(&payload.buyer)?),
             seller: Address::from(parse_evm_address(&payload.seller)?),
             marketId: U256::from(payload.market_id),
@@ -58,7 +60,7 @@ pub fn expected_execute_trade_selector() -> [u8; 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::execution::{PerpTradePayload, PerpTradeSignatureBundle};
+    use crate::execution::{intent_id_to_b256, PerpTradePayload, PerpTradeSignatureBundle};
     use crate::types::AccountId;
 
     #[test]
@@ -76,6 +78,7 @@ mod tests {
 
     fn payload() -> PerpTradePayload {
         PerpTradePayload::new(
+            intent_id_to_b256("00000000-0000-0000-0000-000000000001").unwrap(),
             AccountId::new("0x0000000000000000000000000000000000000001"),
             AccountId::new("0x0000000000000000000000000000000000000002"),
             1,

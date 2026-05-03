@@ -41,9 +41,9 @@ The long-term backend needs low-latency deterministic matching, RFQ, market-make
 
 ## Indexer V1
 
-Indexer V1 reads Base Sepolia logs from `RPC_URL` for `PERP_MATCHING_ENGINE_ADDRESS` and topic0 `TradeExecuted(address,address,uint256,uint128,uint128,bool,uint256,uint256)`. Each tick reads the latest block, calculates a bounded range from the stored `perp_matching_engine` cursor, fetches logs with `eth_getLogs`, decodes the indexed buyer/seller/market topics and ABI data fields, inserts rows into `indexed_perp_trades`, and updates `indexer_cursors` only after those writes succeed.
+Indexer V1 reads Base Sepolia logs from `RPC_URL` for `PERP_MATCHING_ENGINE_ADDRESS` and topic0 `TradeExecuted(bytes32,address,address,uint256,uint128,uint128,bool,uint256,uint256)`. Each tick reads the latest block, calculates a bounded range from the stored `perp_matching_engine` cursor, fetches logs with `eth_getLogs`, decodes indexed `intentId`/buyer/seller topics and ABI data fields, inserts rows into `indexed_perp_trades`, and updates `indexer_cursors` only after those writes succeed.
 
-The indexer is read-only. It does not sign, send, or broadcast transactions. It also does not mark `ExecutionIntent` records submitted or confirmed because the event does not include a deterministic backend intent id. Indexed events are preparation for later explicit reconciliation.
+The indexer is read-only. It does not sign, send, or broadcast transactions. It also does not mark `ExecutionIntent` records submitted or confirmed. Indexed `onchain_intent_id` values allow direct reconciliation by comparing them to `keccak256(bytes(execution_intents.intent_id))`; economic match keys are a fallback only for data that lacks the event intent id.
 
 V1 stores `block_hash` when the RPC log includes it, but does not implement deep reorg rollback or replay correction. Smart contracts remain the final source of truth.
 
@@ -114,7 +114,7 @@ The in-memory engine remains the live matching state in this V1 patch. Database 
 
 This repository does not execute on-chain transactions in phase 1. It does not sign transactions, load private keys, broadcast transactions, or mark trades as finally settled. Manual simulation can call an RPC endpoint with `eth_call` only. A future executor service can consume intents, manage production simulation policy, submit transactions, and reconcile confirmations with an indexer.
 
-The current calldata builder V1 can encode `PerpMatchingEngine.executeTrade(PerpTrade,bytes,bytes)` using an explicit `PerpTradePayload` and explicit buyer/seller trade signatures. `PerpTrade` signatures are distinct from the off-chain order signatures verified by the order API: the Solidity contract verifies signatures over the final matched trade payload, not the original order payloads. The builder therefore does not reuse order signatures and does not fabricate missing signatures.
+The current calldata builder V1 can encode `PerpMatchingEngine.executeTrade(PerpTrade,bytes,bytes)` using an explicit `PerpTradePayload` and explicit buyer/seller trade signatures. The Solidity `PerpTrade.intentId` is `keccak256(bytes(execution_intents.intent_id))`, returned as `0x` plus 64 hex chars and used consistently in EIP-712 signing, calldata, and indexed-event reconciliation. `PerpTrade` signatures are distinct from the off-chain order signatures verified by the order API: the Solidity contract verifies signatures over the final matched trade payload, not the original order payloads. The builder therefore does not reuse order signatures and does not fabricate missing signatures.
 
 Clients fetch the final EIP-712 `PerpTrade` payload from `GET /execution-intents/:intent_id/signing-payload`, sign it externally, and submit the two signatures to `POST /execution-intents/:intent_id/signatures`. Signatures are shape-validated and stored in memory or in `execution_intent_signatures` when persistence is enabled. Calldata readiness is true only when both signatures are present and the intent has complete PerpTrade metadata.
 
@@ -134,7 +134,7 @@ Matching decisions are deterministic for a given ordered command stream, market 
 - Off-chain matches are provisional until confirmed on-chain in a later phase.
 - PerpMatchingEngine requires signatures over the exact matched `PerpTrade`; order signatures are not valid substitutes.
 - `simulation_ok` only means an `eth_call` did not revert at the queried block.
-- Indexed `TradeExecuted` events prove on-chain execution occurred, but do not identify a backend intent without an explicit deterministic link.
+- Indexed `TradeExecuted` events prove on-chain execution occurred and include `intentId` for direct matching, but this backend still does not mark intents confirmed in phase 1.
 - Indexer V1 is not fully reorg safe.
 - Zero price and zero size are rejected.
 - Self-trade is rejected before fills.

@@ -1,67 +1,40 @@
-# NEXT_TASK.md — Indexer V1 for PerpMatchingEngine Events
+# NEXT_TASK.md — Backend Adaptation to PerpTrade intentId
 
 ## Context
 
-The Rust backend now has:
-- deterministic in-memory matching
-- strict EIP-712 order verification
-- PostgreSQL persistence
-- execution intents
-- matched PerpTrade signature collection
-- real PerpMatchingEngine calldata builder
-- RPC simulation via eth_call
-- simulation result persistence
+The Solidity PerpMatchingEngine has been updated and verified on Base Sepolia.
 
-Current status:
-- no real transaction broadcast exists
-- no private key loading exists
-- no submitted/confirmed lifecycle exists
-- no indexer exists yet
+Solidity changes:
+- `PerpTrade` now includes `bytes32 intentId` as the first field.
+- `TRADE_TYPEHASH` now includes `intentId`.
+- `TradeExecuted` now emits `bytes32 indexed intentId`.
+- `marketId` is no longer indexed in the event.
+- `IPerpEngineTrade.Trade` is unchanged.
+- `VerifyDeployment` passes on Base Sepolia.
 
-Current limitation:
-- the backend cannot read on-chain events
-- the backend cannot reconcile contract state/events with backend state
-- future broadcast would have no safe confirmation path
-
-## Goal
-
-Add Indexer V1.
-
-The indexer must:
-- read Base Sepolia logs from RPC
-- decode `PerpMatchingEngine.TradeExecuted`
-- persist indexed events
-- persist block cursor
-- expose indexer status
-- expose manual indexer tick
-- not mark backend intents confirmed yet unless there is a safe deterministic link
-
-This task must not add transaction broadcast.
-
-## Critical Safety Rule
-
-Do not fake confirmation.
-
-An indexed `TradeExecuted` event proves that a trade was executed on-chain, but mapping it to a backend `ExecutionIntent` must be explicit and reliable.
-
-If there is no deterministic intent id in the event, do not mark an intent as confirmed.
-
-For this task:
-- index the event
-- persist it
-- expose it
-- prepare reconciliation
-- do not fake confirmed lifecycle
-
-## Target Solidity Event
-
-From `PerpMatchingEngine`:
+Updated Solidity struct:
 
 ```solidity
+struct PerpTrade {
+    bytes32 intentId;
+    address buyer;
+    address seller;
+    uint256 marketId;
+    uint128 sizeDelta1e8;
+    uint128 executionPrice1e8;
+    bool buyerIsMaker;
+    uint256 buyerNonce;
+    uint256 sellerNonce;
+    uint256 deadline;
+}
+
+Updated Solidity event:
+
 event TradeExecuted(
+    bytes32 indexed intentId,
     address indexed buyer,
     address indexed seller,
-    uint256 indexed marketId,
+    uint256 marketId,
     uint128 sizeDelta1e8,
     uint128 executionPrice1e8,
     bool buyerIsMaker,
@@ -69,208 +42,287 @@ event TradeExecuted(
     uint256 sellerNonce
 );
 
-Contract:
+Updated EIP-712 type:
 
-PerpMatchingEngine
-Address from env:
-PERP_MATCHING_ENGINE_ADDRESS
-Config
+PerpTrade(bytes32 intentId,address buyer,address seller,uint256 marketId,uint128 sizeDelta1e8,uint128 executionPrice1e8,bool buyerIsMaker,uint256 buyerNonce,uint256 sellerNonce,uint256 deadline)
 
-Add or extend .env.example:
+Current backend status:
 
-INDEXER_ENABLED=false
-INDEXER_START_BLOCK=0
-INDEXER_POLL_INTERVAL_MS=3000
-INDEXER_MAX_BLOCK_RANGE=500
-INDEXER_REQUIRE_PERSISTENCE=true
+matching works
+persistence works
+signed order verification works
+PerpTrade signature flow works for the old struct
+calldata builder works for the old struct
+indexer works for the old TradeExecuted event
+reconciliation work was being designed around economic match keys, but direct intentId is now available
+Goal
+
+Adapt the Rust backend to the new Solidity PerpTrade ABI/event with bytes32 intentId.
+
+The backend must:
+
+include intentId in PerpTrade signing payload
+include intentId in PerpTrade EIP-712 digest
+include intentId in calldata encoding
+decode TradeExecuted with intentId as topic1
+persist on-chain intent id
+prefer direct reconciliation through intentId
+
+This task must not add real transaction broadcast.
+
+Critical Safety Rules
+
+Do not:
+
+add private key loading
+add transaction broadcast
+mark intents submitted
+mark intents confirmed
+fake confirmation
+modify the Solidity repository
+change matching semantics
+introduce floating point arithmetic
+
+Normal tests must not require:
+
+RPC
+Postgres
+private keys
+Base Sepolia
+Intent ID Mapping
+
+Backend execution_intents.intent_id is currently a UUID string.
+
+Map this backend UUID string to Solidity bytes32 intentId deterministically.
+
+Preferred mapping:
+
+intentId = keccak256(bytes(execution_intents.intent_id))
 
 Rules:
 
-INDEXER_ENABLED=false: indexer does not start.
-INDEXER_ENABLED=true: requires RPC_URL.
-if INDEXER_REQUIRE_PERSISTENCE=true, requires PERSISTENCE_ENABLED=true.
-no private key required.
-no transaction sending.
-Required Modules
+output as 0x + 64 hex chars
+never zero
+deterministic
+documented
+reusable by signing payload, calldata builder, indexer/reconciliation
 
-Add modules such as:
+Add a helper, e.g.:
 
-src/indexer/mod.rs
-src/indexer/config.rs
-src/indexer/events.rs
-src/indexer/decoder.rs
-src/indexer/runner.rs
-src/indexer/status.rs
+intent_id_to_b256(intent_id: &str) -> Result<B256>
+intent_id_to_hex_bytes32(intent_id: &str) -> Result<String>
 
-Adapt names if cleaner.
+Do not use random bytes.
+Do not use the raw UUID bytes unless already documented and tested.
+Use keccak256 because this is EVM-centric.
 
-Database Requirements
+PerpTradePayload Changes
 
-Add migration:
+Update PerpTradePayload to include:
 
-migrations/0004_indexer.sql
+intent_id: bytes32 / B256 / [u8;32]
 
-Tables:
+Field order must match Solidity exactly:
 
-indexer_cursors
-CREATE TABLE indexer_cursors (
-    name TEXT PRIMARY KEY,
-    last_indexed_block BIGINT NOT NULL,
-    updated_at_ms BIGINT NOT NULL
-);
-indexed_perp_trades
-CREATE TABLE indexed_perp_trades (
-    event_id TEXT PRIMARY KEY,
-    tx_hash TEXT NOT NULL,
-    log_index BIGINT NOT NULL,
-    block_number BIGINT NOT NULL,
-    block_hash TEXT,
-    buyer TEXT NOT NULL,
-    seller TEXT NOT NULL,
-    market_id TEXT NOT NULL,
-    size_delta_1e8 TEXT NOT NULL,
-    execution_price_1e8 TEXT NOT NULL,
-    buyer_is_maker BOOLEAN NOT NULL,
-    buyer_nonce TEXT NOT NULL,
-    seller_nonce TEXT NOT NULL,
-    created_at_ms BIGINT NOT NULL,
-    UNIQUE(tx_hash, log_index)
-);
-
-Indexes:
-
-block_number
+intentId
 buyer
 seller
-market_id
-tx_hash
+marketId
+sizeDelta1e8
+executionPrice1e8
+buyerIsMaker
+buyerNonce
+sellerNonce
+deadline
 
-Optional generic table:
+Validation:
 
-indexed_events
-CREATE TABLE indexed_events (
-    event_id TEXT PRIMARY KEY,
-    contract_address TEXT NOT NULL,
-    event_name TEXT NOT NULL,
-    tx_hash TEXT NOT NULL,
-    log_index BIGINT NOT NULL,
-    block_number BIGINT NOT NULL,
-    payload_json TEXT NOT NULL,
-    created_at_ms BIGINT NOT NULL,
-    UNIQUE(tx_hash, log_index)
-);
+reject zero intentId
+buyer/seller valid EVM addresses
+price/size nonzero
+nonce/deadline existing validation remains
+Signing Payload Endpoint
 
-If too much scope, implement indexed_perp_trades only.
+Update:
 
-RPC Behavior
+GET /execution-intents/:intent_id/signing-payload
 
-Implement log fetching using eth_getLogs.
-
-For each tick:
-
-Read current chain block number.
-Read cursor for perp_matching_engine.
-Determine range:
-from = last_indexed_block + 1
-to = min(current_block, from + INDEXER_MAX_BLOCK_RANGE - 1)
-Fetch logs for:
-address = PERP_MATCHING_ENGINE_ADDRESS
-topic0 = keccak256 of TradeExecuted(address,address,uint256,uint128,uint128,bool,uint256,uint256)
-Decode logs.
-Persist decoded trades.
-Advance cursor only after successful persistence.
-
-If no cursor exists:
-
-initialize from INDEXER_START_BLOCK.
-Reorg Handling
-
-Minimal V1:
-
-store block_hash if available
-do not implement deep reorg rollback yet
-document limitation
-
-Do not pretend full reorg safety.
-
-HTTP API
-
-Add:
-
-GET /indexer/status
-POST /indexer/tick
-GET /indexed/perp-trades
-GET /indexer/status
-
-Return:
+Response must include intentId inside the EIP-712 message:
 
 {
-  "indexerEnabled": false,
-  "rpcConfigured": true,
-  "persistenceRequired": true,
-  "lastIndexedBlock": 0,
-  "targetContract": "0x..."
+  "message": {
+    "intentId": "0x..."
+  }
 }
-POST /indexer/tick
 
-Runs one manual indexing tick.
+Type fields must include first:
 
-Return:
+{"name":"intentId","type":"bytes32"}
 
-from_block
-to_block
-logs_found
-events_indexed
-cursor_updated
-GET /indexed/perp-trades
+The returned digest must be recomputed with the new typehash and field order.
 
-Return recent indexed TradeExecuted events.
+PerpTrade EIP-712 Digest
 
-Limit can default to 50.
+Update typehash to:
+
+PerpTrade(bytes32 intentId,address buyer,address seller,uint256 marketId,uint128 sizeDelta1e8,uint128 executionPrice1e8,bool buyerIsMaker,uint256 buyerNonce,uint256 sellerNonce,uint256 deadline)
+
+Hash order must exactly match Solidity.
+
+Tests must confirm:
+
+digest changes when intentId changes
+digest is deterministic
+signing payload digest matches PerpTradePayload digest
+ABI Calldata Encoding
+
+Update executeTrade calldata encoding.
+
+New function signature:
+
+executeTrade((bytes32,address,address,uint256,uint128,uint128,bool,uint256,uint256,uint256),bytes,bytes)
+
+Old function signature was:
+
+executeTrade((address,address,uint256,uint128,uint128,bool,uint256,uint256,uint256),bytes,bytes)
+
+Update:
+
+ABI struct
+calldata builder
+selector test
+prepared call tests
+
+PreparedExecutionCall must still have:
+
+is_broadcastable=false
+no send transaction
+no private key
+Indexer Decoder Update
+
+Update TradeExecuted event decoder.
+
+New event layout:
+
+topic0 = keccak256 TradeExecuted(bytes32,address,address,uint256,uint128,uint128,bool,uint256,uint256)
+topic1 = indexed intentId
+topic2 = indexed buyer
+topic3 = indexed seller
+data:
+marketId
+sizeDelta1e8
+executionPrice1e8
+buyerIsMaker
+buyerNonce
+sellerNonce
+
+Old layout had:
+
+topic1 buyer
+topic2 seller
+topic3 marketId
+
+Update:
+
+topic0 constant
+decode logic
+tests with synthetic log
+API response if needed
+Database Migration
+
+Add next migration after existing migrations.
+
+Add to indexed_perp_trades:
+
+ALTER TABLE indexed_perp_trades ADD COLUMN onchain_intent_id TEXT;
+CREATE INDEX idx_indexed_perp_trades_onchain_intent_id ON indexed_perp_trades(onchain_intent_id);
+
+Do not delete old migrations.
+Do not rewrite historical migrations.
+
+If there is an existing reconciliation migration already added locally, adapt it instead of duplicating concepts.
+
+Reconciliation Update
+
+If reconciliation module already exists:
+
+update it to prefer onchain_intent_id
+
+If reconciliation module does not yet exist:
+
+implement minimal direct reconciliation scaffold only if clean.
+
+Primary matching rule:
+
+keccak256(bytes(execution_intents.intent_id)) == indexed_perp_trades.onchain_intent_id
+
+Do not mark confirmed.
+
+Allowed result:
+
+matched
+unmatched
+ambiguous if duplicate data exists
+
+But this task may stop at:
+
+storing onchain_intent_id
+exposing it
+adding pure helper/tests
+
+Do not overbuild.
+
+API Updates
+
+Update existing responses if relevant:
+
+signing payload includes intentId
+indexed perp trades include onchain_intent_id
+reconciliation endpoints, if present, use direct intent id matching
+
+No route breaking changes.
 
 Tests Required
 
-Normal cargo test must not require RPC or Postgres.
+Add/update tests for:
 
-Add tests for:
+Intent ID mapping
+UUID string maps deterministically to bytes32
+same UUID gives same bytes32
+different UUID gives different bytes32
+output is 0x + 64 hex chars
+zero intentId rejected if manually constructed
+Signing payload
+includes intentId as first EIP-712 field
+message includes intentId
+digest changes when intent id changes
+ABI
+selector matches:
+executeTrade((bytes32,address,address,uint256,uint128,uint128,bool,uint256,uint256,uint256),bytes,bytes)
+calldata is non-empty with signatures
+prepared call remains non-broadcastable
+Indexer
+TradeExecuted topic0 updated
+decoder reads topic1 as intentId
+decoder reads buyer from topic2
+decoder reads seller from topic3
+decoder reads marketId from data
+Reconciliation
+direct onchain_intent_id match works if module exists
+no intent is marked confirmed
 
-indexer config disabled
-indexer enabled requires RPC_URL
-indexer requiring persistence rejects persistence disabled
-TradeExecuted topic0 is correct
-decoder decodes a known synthetic log
-cursor range calculation
-indexer status endpoint returns fields
-no confirmation status is written
-existing tests still pass
+Existing tests must still pass.
 
-If full log decoding test is too heavy:
-
-test topic0 and pure decode helpers
-do not require live RPC
 Documentation
 
-Update README.md:
+Update README.md and ARCHITECTURE.md:
 
-explain indexer role
-explain env vars
-explain manual tick
-explain indexed_perp_trades
-explain no fake confirmation
-
-Update ARCHITECTURE.md:
-
-add indexer stage
-explain backend lifecycle:
-order accepted
-matched
-intent created
-signed
-simulated
-later submitted
-indexed
-reconciled
-explain that confirmation requires deterministic reconciliation
+explain intentId = keccak256(intent_id UUID string)
+explain Solidity now emits intentId
+explain reconciliation is direct through on-chain intent id
+explain economic match key is fallback only if still present
+explain no confirmed status yet
+explain no broadcast yet
 Constraints
 
 Do not add:
@@ -287,7 +339,7 @@ Solidity changes
 
 Do not modify:
 
-~/DEOPT/deoptv2
+~/DEOPT/deopt-v2-sol
 
 Do not fake:
 
@@ -295,15 +347,15 @@ confirmed status
 submitted status
 on-chain execution
 transaction hash
-reorg safety
+tx ownership
 
 Do not change:
 
 matching semantics
 financial numeric rules
-EIP-712 order verification
-PerpTrade signature flow
-RPC simulation behavior
+signed order verification behavior
+persistence default behavior
+simulation safety behavior
 Validation
 
 Run:
@@ -321,16 +373,16 @@ private keys
 Base Sepolia
 Acceptance Criteria
 
-The task is complete only if:
+Complete only if:
 
-indexer config exists
-DB migration exists
-TradeExecuted topic/decoder exists
-indexer cursor exists
-manual tick endpoint exists
-indexed perp trades can be persisted
-no fake confirmed status is introduced
-all tests pass
+backend PerpTrade payload includes intentId
+signing payload includes intentId
+EIP-712 digest uses new Solidity typehash
+calldata encoding uses new tuple shape
+indexer decodes new TradeExecuted layout
+DB stores onchain_intent_id
+no broadcast/confirmation is added
+all validation commands pass
 EOF
 
 after all, 
