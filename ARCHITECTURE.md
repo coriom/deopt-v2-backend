@@ -15,11 +15,12 @@ The long-term backend needs low-latency deterministic matching, RFQ, market-make
 - `orderbook`: Pure synchronous matching logic with `BTreeMap` price levels and FIFO `VecDeque` ordering.
 - `execution`: Provisional `ExecutionIntent` records, an in-memory queue, a dry-run executor scaffold, a PerpMatchingEngine calldata builder, and manual `eth_call` simulation. No transaction submission exists.
 - `indexer`: Opt-in Indexer V1 that reads `PerpMatchingEngine.TradeExecuted` logs with `eth_getLogs`, persists decoded events, and advances a block cursor after persistence succeeds.
+- `reconciliation`: Opt-in Reconciliation V1 that links indexed events to execution intents by direct `onchain_intent_id` equality without marking finality.
 - `db`: Optional PostgreSQL persistence for used nonces, submitted orders, matched trades, execution intents, and engine event audit records.
 - `rfq`: RFQ type scaffold only.
 - `mm`: market-maker session, heartbeat, bulk quote, and bulk cancel type scaffold only.
 - `signing`: signed-order schema, EIP-712 order hashing, strict secp256k1 signer recovery, signature mode, deadline validation, and in-memory nonce tracking.
-- `config`: environment loading for host, port, log level, network name, chain id, disabled execution flag, simulation flags, signature mode, and opt-in persistence.
+- `config`: environment loading for host, port, log level, network name, chain id, disabled execution flag, simulation flags, indexer flags, reconciliation flags, signature mode, and opt-in persistence.
 
 ## Current v1 Scope
 
@@ -38,6 +39,7 @@ The long-term backend needs low-latency deterministic matching, RFQ, market-make
 - Signed-order HTTP boundary with nonce/deadline validation, disabled signature shape checks, and strict EIP-712 signer recovery.
 - Optional PostgreSQL persistence V1 guarded by `PERSISTENCE_ENABLED=false` by default.
 - Optional Indexer V1 guarded by `INDEXER_ENABLED=false` by default.
+- Optional Reconciliation V1 guarded by `RECONCILIATION_ENABLED=false` by default.
 
 ## Indexer V1
 
@@ -51,6 +53,20 @@ HTTP endpoints:
 - `GET /indexer/status`
 - `POST /indexer/tick`
 - `GET /indexed/perp-trades`
+
+## Reconciliation V1
+
+Reconciliation V1 runs after indexing and uses direct `onchain_intent_id` identity as its primary matching path. New persisted execution intents store `execution_intents.onchain_intent_id = keccak256(bytes(execution_intents.intent_id))`, and indexed `TradeExecuted` rows store the Solidity event `intentId` as `indexed_perp_trades.onchain_intent_id`.
+
+A manual reconciliation tick reads unreconciled indexed trades with non-null on-chain intent ids. If exactly one backend execution intent and exactly one indexed event share that id, it inserts an `execution_reconciliations` row with `status=matched`. If multiple intents or duplicate indexed events share the id, it records an ambiguous result where possible. If no backend intent exists, the event is counted as unmatched and no tx ownership is fabricated.
+
+Reconciliation is not finality. It does not mutate `execution_intents.status`, does not set `submitted`, and does not set `confirmed`. API status and tick responses report `confirmed=0` in this phase. Future confirmation requires transaction ownership checks and reorg-aware finality handling.
+
+HTTP endpoints:
+- `GET /reconciliation/status`
+- `POST /reconciliation/tick`
+- `GET /reconciliations`
+- `GET /reconciliation/intents/:intent_id`
 
 ## Future v2/v3 Scope
 
@@ -101,6 +117,8 @@ The current MM module defines session, heartbeat, bulk quote update, and bulk ca
 Every matched trade creates an `ExecutionIntent` with buyer, seller, order IDs, market, price, size, buyer maker flag, buyer/seller order nonces, execution deadline, timestamp, and `Pending` status. Intents are stored in memory and exposed through `GET /execution-intents`.
 
 The execution deadline is the minimum of the two original signed-order deadlines. Direct in-memory orders that do not carry nonce/deadline metadata can still match, but their signing-payload endpoint fails clearly instead of inventing missing PerpTrade fields.
+
+The intended lifecycle is: order accepted, matched, execution intent created, PerpTrade signatures collected, optionally simulated, later broadcast by a future executor, indexed by the indexer, reconciled as matched by direct intent id, and only later confirmed after transaction ownership and finality checks. Reconciliation V1 stops at the matched reconciliation row.
 
 ## Persistence V1
 

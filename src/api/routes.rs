@@ -11,6 +11,10 @@ use crate::execution::{
     StoredTradeSignatures, TradeSignatureStatus, PERP_TRADE_TYPE,
 };
 use crate::indexer::{Indexer, IndexerStatus, IndexerTickResult};
+use crate::reconciliation::{
+    decide_direct_reconciliation, DirectReconciliationInput, ExecutionReconciliation,
+    ReconciliationCounts, ReconciliationStatus, ReconciliationTickResult,
+};
 use crate::signing::{SignatureVerifier, SignedOrder};
 use crate::types::{now_ms, MarketId, NewOrder, OrderId};
 use axum::extract::{Path, Query, State};
@@ -48,6 +52,13 @@ pub fn router(state: AppState) -> Router {
         .route("/indexer/status", get(indexer_status))
         .route("/indexer/tick", post(indexer_tick))
         .route("/indexed/perp-trades", get(indexed_perp_trades))
+        .route("/reconciliation/status", get(reconciliation_status))
+        .route("/reconciliation/tick", post(reconciliation_tick))
+        .route(
+            "/reconciliation/intents/:intent_id",
+            get(reconciliations_for_intent),
+        )
+        .route("/reconciliations", get(reconciliations))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -514,6 +525,155 @@ async fn indexed_perp_trades(
     };
     let limit = query.limit.unwrap_or(50).clamp(1, 500);
     Ok(Json(repository.list_indexed_perp_trades(limit).await?))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct ReconciliationStatusResponse {
+    #[serde(rename = "reconciliationEnabled")]
+    reconciliation_enabled: bool,
+    #[serde(rename = "persistenceRequired")]
+    persistence_required: bool,
+    #[serde(rename = "matchedReconciliations")]
+    matched_reconciliations: u64,
+    #[serde(rename = "ambiguousReconciliations")]
+    ambiguous_reconciliations: u64,
+    #[serde(rename = "unmatchedReconciliations")]
+    unmatched_reconciliations: u64,
+    confirmed: u64,
+}
+
+async fn reconciliation_status(
+    State(state): State<AppState>,
+) -> Result<Json<ReconciliationStatusResponse>, ApiError> {
+    let counts = if let Some(repository) = state.repository.clone() {
+        repository.count_reconciliations_by_status().await?
+    } else {
+        ReconciliationCounts::default()
+    };
+
+    Ok(Json(ReconciliationStatusResponse {
+        reconciliation_enabled: state.reconciliation_config.enabled,
+        persistence_required: state.reconciliation_config.require_persistence,
+        matched_reconciliations: counts.matched,
+        ambiguous_reconciliations: counts.ambiguous,
+        unmatched_reconciliations: counts.unmatched,
+        confirmed: counts.confirmed(),
+    }))
+}
+
+async fn reconciliation_tick(
+    State(state): State<AppState>,
+) -> Result<Json<ReconciliationTickResult>, ApiError> {
+    if !state.reconciliation_config.enabled {
+        return Err(BackendError::Config("reconciliation is disabled".to_string()).into());
+    }
+    let repository = state.repository.clone().ok_or_else(|| {
+        BackendError::Config("reconciliation requires persistence enabled".to_string())
+    })?;
+
+    let indexed_trades = repository
+        .list_unreconciled_indexed_perp_trades(state.reconciliation_config.max_batch_size)
+        .await?;
+    let mut result = ReconciliationTickResult::default();
+    for indexed_trade in indexed_trades {
+        result.indexed_trades_checked += 1;
+        let Some(onchain_intent_id) = indexed_trade.onchain_intent_id.as_deref() else {
+            continue;
+        };
+        let matching_intents = repository
+            .find_execution_intents_by_onchain_intent_id(onchain_intent_id)
+            .await?;
+        let matching_indexed_trades = repository
+            .find_indexed_trades_by_onchain_intent_id(onchain_intent_id)
+            .await?;
+        let decision = decide_direct_reconciliation(&DirectReconciliationInput {
+            onchain_intent_id: Some(onchain_intent_id.to_string()),
+            matching_intent_count: matching_intents.len(),
+            matching_indexed_event_count: matching_indexed_trades.len(),
+        });
+
+        match decision {
+            ReconciliationStatus::Matched => {
+                if let Some(intent) = matching_intents.first() {
+                    let row = reconciliation_row(
+                        onchain_intent_id,
+                        &intent.intent_id.to_string(),
+                        &indexed_trade,
+                        ReconciliationStatus::Matched,
+                    );
+                    repository.insert_execution_reconciliation(&row).await?;
+                }
+                result.matched += 1;
+            }
+            ReconciliationStatus::Ambiguous => {
+                for intent in &matching_intents {
+                    let row = reconciliation_row(
+                        onchain_intent_id,
+                        &intent.intent_id.to_string(),
+                        &indexed_trade,
+                        ReconciliationStatus::Ambiguous,
+                    );
+                    repository.insert_execution_reconciliation(&row).await?;
+                }
+                result.ambiguous += 1;
+            }
+            ReconciliationStatus::Unmatched => {
+                result.unmatched += 1;
+            }
+            ReconciliationStatus::Ignored => {}
+        }
+    }
+    result.confirmed = 0;
+
+    Ok(Json(result))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+struct ReconciliationsQuery {
+    limit: Option<u32>,
+}
+
+async fn reconciliations(
+    State(state): State<AppState>,
+    Query(query): Query<ReconciliationsQuery>,
+) -> Result<Json<Vec<ExecutionReconciliation>>, ApiError> {
+    let Some(repository) = state.repository.clone() else {
+        return Ok(Json(Vec::new()));
+    };
+    let limit = query.limit.unwrap_or(50).clamp(1, 500);
+    Ok(Json(repository.list_recent_reconciliations(limit).await?))
+}
+
+async fn reconciliations_for_intent(
+    State(state): State<AppState>,
+    Path(intent_id): Path<String>,
+) -> Result<Json<Vec<ExecutionReconciliation>>, ApiError> {
+    let Some(repository) = state.repository.clone() else {
+        return Ok(Json(Vec::new()));
+    };
+    let intent_id = parse_uuid(&intent_id)?;
+    Ok(Json(
+        repository.get_reconciliations_for_intent(intent_id).await?,
+    ))
+}
+
+fn reconciliation_row(
+    onchain_intent_id: &str,
+    intent_id: &str,
+    indexed_trade: &crate::indexer::IndexedPerpTrade,
+    status: ReconciliationStatus,
+) -> ExecutionReconciliation {
+    ExecutionReconciliation {
+        reconciliation_id: Uuid::new_v4().to_string(),
+        onchain_intent_id: onchain_intent_id.to_string(),
+        intent_id: intent_id.to_string(),
+        indexed_event_id: indexed_trade.event_id.clone(),
+        tx_hash: indexed_trade.tx_hash.clone(),
+        block_number: indexed_trade.block_number,
+        log_index: indexed_trade.log_index,
+        status,
+        created_at_ms: now_ms(),
+    }
 }
 
 fn response_from_events(events: Vec<EngineEvent>) -> SubmitOrderResponse {

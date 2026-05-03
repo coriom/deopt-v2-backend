@@ -16,6 +16,9 @@ async fn main() -> deopt_v2_backend::Result<()> {
     config
         .indexer
         .validate_startup(config.persistence_enabled)?;
+    config
+        .reconciliation
+        .validate_startup(config.persistence_enabled)?;
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::new(config.rust_log.clone()))
         .init();
@@ -33,15 +36,17 @@ async fn main() -> deopt_v2_backend::Result<()> {
     } else {
         None
     };
-    let state = AppState::with_signature_mode_domain_repository_execution_and_indexer_config(
-        EngineState::with_default_markets(),
-        config.signature_verification_mode,
-        config.eip712_domain.clone(),
-        repository.clone(),
-        config.execution.clone(),
-        config.indexer.clone(),
-        config.chain_id,
-    );
+    let state =
+        AppState::with_signature_mode_domain_repository_execution_indexer_and_reconciliation_config(
+            EngineState::with_default_markets(),
+            config.signature_verification_mode,
+            config.eip712_domain.clone(),
+            repository.clone(),
+            config.execution.clone(),
+            config.indexer.clone(),
+            config.reconciliation.clone(),
+            config.chain_id,
+        );
     let app = router(state);
 
     if config.execution.execution_enabled {
@@ -66,6 +71,7 @@ async fn main() -> deopt_v2_backend::Result<()> {
         network = %config.network_name,
         execution_enabled = config.execution.execution_enabled,
         indexer_enabled = config.indexer.enabled,
+        reconciliation_enabled = config.reconciliation.enabled,
         executor_dry_run = config.execution.dry_run,
         signature_verification_mode = ?config.signature_verification_mode,
         persistence_enabled = config.persistence_enabled,

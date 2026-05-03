@@ -1,328 +1,294 @@
-# NEXT_TASK.md — Backend Adaptation to PerpTrade intentId
+# NEXT_TASK.md — Reconciliation V1 Direct by onchain_intent_id
 
 ## Context
 
-The Solidity PerpMatchingEngine has been updated and verified on Base Sepolia.
+The backend has been adapted to the updated Solidity PerpMatchingEngine.
 
-Solidity changes:
-- `PerpTrade` now includes `bytes32 intentId` as the first field.
-- `TRADE_TYPEHASH` now includes `intentId`.
-- `TradeExecuted` now emits `bytes32 indexed intentId`.
-- `marketId` is no longer indexed in the event.
-- `IPerpEngineTrade.Trade` is unchanged.
-- `VerifyDeployment` passes on Base Sepolia.
+Current backend features:
+- deterministic matching
+- PostgreSQL persistence
+- signed order verification
+- execution intents
+- deterministic onchain_intent_id generated as keccak256(bytes(execution_intents.intent_id))
+- PerpTrade signing payload includes bytes32 intentId
+- PerpTrade calldata includes bytes32 intentId
+- RPC simulation exists
+- Indexer V1 decodes TradeExecuted with:
+  - topic1 = intentId
+  - topic2 = buyer
+  - topic3 = seller
+- indexed_perp_trades can store onchain_intent_id
 
-Updated Solidity struct:
+Current limitation:
+- indexed on-chain trades are not yet linked back to backend execution_intents
+- there is no reconciliation table
+- there is no reconciliation endpoint
+- intents must not yet be marked confirmed
 
-```solidity
-struct PerpTrade {
-    bytes32 intentId;
-    address buyer;
-    address seller;
-    uint256 marketId;
-    uint128 sizeDelta1e8;
-    uint128 executionPrice1e8;
-    bool buyerIsMaker;
-    uint256 buyerNonce;
-    uint256 sellerNonce;
-    uint256 deadline;
-}
+## Goal
 
-Updated Solidity event:
-
-event TradeExecuted(
-    bytes32 indexed intentId,
-    address indexed buyer,
-    address indexed seller,
-    uint256 marketId,
-    uint128 sizeDelta1e8,
-    uint128 executionPrice1e8,
-    bool buyerIsMaker,
-    uint256 buyerNonce,
-    uint256 sellerNonce
-);
-
-Updated EIP-712 type:
-
-PerpTrade(bytes32 intentId,address buyer,address seller,uint256 marketId,uint128 sizeDelta1e8,uint128 executionPrice1e8,bool buyerIsMaker,uint256 buyerNonce,uint256 sellerNonce,uint256 deadline)
-
-Current backend status:
-
-matching works
-persistence works
-signed order verification works
-PerpTrade signature flow works for the old struct
-calldata builder works for the old struct
-indexer works for the old TradeExecuted event
-reconciliation work was being designed around economic match keys, but direct intentId is now available
-Goal
-
-Adapt the Rust backend to the new Solidity PerpTrade ABI/event with bytes32 intentId.
+Add Reconciliation V1 using direct `onchain_intent_id` matching.
 
 The backend must:
+- match `execution_intents.onchain_intent_id` with `indexed_perp_trades.onchain_intent_id`
+- create persistent reconciliation rows
+- expose reconciliation status
+- expose manual reconciliation tick
+- expose reconciliation rows
+- not mark execution intents as confirmed
+- not mark execution intents as submitted
+- not fake transaction ownership
 
-include intentId in PerpTrade signing payload
-include intentId in PerpTrade EIP-712 digest
-include intentId in calldata encoding
-decode TradeExecuted with intentId as topic1
-persist on-chain intent id
-prefer direct reconciliation through intentId
-
-This task must not add real transaction broadcast.
-
-Critical Safety Rules
+## Critical Safety Rules
 
 Do not:
+- add transaction broadcast
+- add private key loading
+- mark intents submitted
+- mark intents confirmed
+- fake confirmation
+- fake tx ownership
+- modify Solidity repository
+- change matching semantics
+- introduce floating point arithmetic
 
-add private key loading
-add transaction broadcast
-mark intents submitted
-mark intents confirmed
-fake confirmation
-modify the Solidity repository
-change matching semantics
-introduce floating point arithmetic
+A matched reconciliation means only:
 
-Normal tests must not require:
+```text
+An indexed TradeExecuted event has the same onchain_intent_id as a backend execution_intent.
 
-RPC
-Postgres
-private keys
-Base Sepolia
-Intent ID Mapping
+It does not mean:
 
-Backend execution_intents.intent_id is currently a UUID string.
+backend submitted the transaction
+transaction is final
+intent is confirmed
+reorg safety is complete
+Direct Match Rule
 
-Map this backend UUID string to Solidity bytes32 intentId deterministically.
+Primary reconciliation rule:
 
-Preferred mapping:
+execution_intents.onchain_intent_id == indexed_perp_trades.onchain_intent_id
 
-intentId = keccak256(bytes(execution_intents.intent_id))
+Requirements:
 
-Rules:
-
-output as 0x + 64 hex chars
-never zero
-deterministic
-documented
-reusable by signing payload, calldata builder, indexer/reconciliation
-
-Add a helper, e.g.:
-
-intent_id_to_b256(intent_id: &str) -> Result<B256>
-intent_id_to_hex_bytes32(intent_id: &str) -> Result<String>
-
-Do not use random bytes.
-Do not use the raw UUID bytes unless already documented and tested.
-Use keccak256 because this is EVM-centric.
-
-PerpTradePayload Changes
-
-Update PerpTradePayload to include:
-
-intent_id: bytes32 / B256 / [u8;32]
-
-Field order must match Solidity exactly:
-
-intentId
-buyer
-seller
-marketId
-sizeDelta1e8
-executionPrice1e8
-buyerIsMaker
-buyerNonce
-sellerNonce
-deadline
-
-Validation:
-
-reject zero intentId
-buyer/seller valid EVM addresses
-price/size nonzero
-nonce/deadline existing validation remains
-Signing Payload Endpoint
-
-Update:
-
-GET /execution-intents/:intent_id/signing-payload
-
-Response must include intentId inside the EIP-712 message:
-
-{
-  "message": {
-    "intentId": "0x..."
-  }
-}
-
-Type fields must include first:
-
-{"name":"intentId","type":"bytes32"}
-
-The returned digest must be recomputed with the new typehash and field order.
-
-PerpTrade EIP-712 Digest
-
-Update typehash to:
-
-PerpTrade(bytes32 intentId,address buyer,address seller,uint256 marketId,uint128 sizeDelta1e8,uint128 executionPrice1e8,bool buyerIsMaker,uint256 buyerNonce,uint256 sellerNonce,uint256 deadline)
-
-Hash order must exactly match Solidity.
-
-Tests must confirm:
-
-digest changes when intentId changes
-digest is deterministic
-signing payload digest matches PerpTradePayload digest
-ABI Calldata Encoding
-
-Update executeTrade calldata encoding.
-
-New function signature:
-
-executeTrade((bytes32,address,address,uint256,uint128,uint128,bool,uint256,uint256,uint256),bytes,bytes)
-
-Old function signature was:
-
-executeTrade((address,address,uint256,uint128,uint128,bool,uint256,uint256,uint256),bytes,bytes)
-
-Update:
-
-ABI struct
-calldata builder
-selector test
-prepared call tests
-
-PreparedExecutionCall must still have:
-
-is_broadcastable=false
-no send transaction
-no private key
-Indexer Decoder Update
-
-Update TradeExecuted event decoder.
-
-New event layout:
-
-topic0 = keccak256 TradeExecuted(bytes32,address,address,uint256,uint128,uint128,bool,uint256,uint256)
-topic1 = indexed intentId
-topic2 = indexed buyer
-topic3 = indexed seller
-data:
-marketId
-sizeDelta1e8
-executionPrice1e8
-buyerIsMaker
-buyerNonce
-sellerNonce
-
-Old layout had:
-
-topic1 buyer
-topic2 seller
-topic3 marketId
-
-Update:
-
-topic0 constant
-decode logic
-tests with synthetic log
-API response if needed
+both values must be non-null
+both values must be normalized lowercase hex
+exact unique match => reconciliation status matched
+no matching intent => unmatched or no row, whichever is cleaner
+multiple matching intents for same onchain_intent_id => ambiguous
+duplicate indexed events for same intentId => ambiguous unless same tx/log duplicate already de-duplicated
 Database Migration
 
 Add next migration after existing migrations.
 
-Add to indexed_perp_trades:
+Create table:
 
-ALTER TABLE indexed_perp_trades ADD COLUMN onchain_intent_id TEXT;
-CREATE INDEX idx_indexed_perp_trades_onchain_intent_id ON indexed_perp_trades(onchain_intent_id);
+CREATE TABLE execution_reconciliations (
+    reconciliation_id TEXT PRIMARY KEY,
+    onchain_intent_id TEXT NOT NULL,
+    intent_id TEXT NOT NULL REFERENCES execution_intents(intent_id) ON DELETE CASCADE,
+    indexed_event_id TEXT NOT NULL REFERENCES indexed_perp_trades(event_id) ON DELETE CASCADE,
+    tx_hash TEXT NOT NULL,
+    block_number BIGINT NOT NULL,
+    log_index BIGINT NOT NULL,
+    status TEXT NOT NULL,
+    created_at_ms BIGINT NOT NULL,
+    UNIQUE(intent_id, indexed_event_id)
+);
 
-Do not delete old migrations.
-Do not rewrite historical migrations.
+CREATE INDEX idx_execution_reconciliations_onchain_intent_id
+    ON execution_reconciliations(onchain_intent_id);
 
-If there is an existing reconciliation migration already added locally, adapt it instead of duplicating concepts.
+CREATE INDEX idx_execution_reconciliations_intent_id
+    ON execution_reconciliations(intent_id);
 
-Reconciliation Update
+CREATE INDEX idx_execution_reconciliations_status
+    ON execution_reconciliations(status);
 
-If reconciliation module already exists:
+CREATE INDEX idx_execution_reconciliations_tx_hash
+    ON execution_reconciliations(tx_hash);
 
-update it to prefer onchain_intent_id
-
-If reconciliation module does not yet exist:
-
-implement minimal direct reconciliation scaffold only if clean.
-
-Primary matching rule:
-
-keccak256(bytes(execution_intents.intent_id)) == indexed_perp_trades.onchain_intent_id
-
-Do not mark confirmed.
-
-Allowed result:
+Allowed statuses:
 
 matched
+ambiguous
 unmatched
-ambiguous if duplicate data exists
+ignored
 
-But this task may stop at:
+Do not add confirmed.
 
-storing onchain_intent_id
-exposing it
-adding pure helper/tests
+Repository Requirements
 
-Do not overbuild.
+Add repository methods:
 
-API Updates
+list_unreconciled_indexed_perp_trades(limit)
+find_execution_intents_by_onchain_intent_id(onchain_intent_id)
+find_indexed_trades_by_onchain_intent_id(onchain_intent_id)
+insert_execution_reconciliation(...)
+list_recent_reconciliations(limit)
+get_reconciliations_for_intent(intent_id)
+count_reconciliations_by_status()
 
-Update existing responses if relevant:
+If some methods can be consolidated cleanly, do so.
 
-signing payload includes intentId
-indexed perp trades include onchain_intent_id
-reconciliation endpoints, if present, use direct intent id matching
+Ensure duplicate insertion is idempotent:
 
-No route breaking changes.
+repeated reconciliation tick should not create duplicate rows
+handle UNIQUE(intent_id, indexed_event_id)
+Reconciliation Algorithm V1
 
+Manual tick:
+
+Load unreconciled indexed_perp_trades with non-null onchain_intent_id.
+For each indexed trade:
+find execution_intents with same onchain_intent_id.
+If exactly one intent:
+create reconciliation row:
+status = matched
+intent_id
+indexed_event_id
+tx_hash
+block_number
+log_index
+onchain_intent_id
+do not mutate execution_intents.status to confirmed
+If zero intents:
+either skip or create unmatched, depending on cleanest implementation.
+If more than one intent:
+create ambiguous if possible
+do not confirm.
+Return counters:
+indexed_trades_checked
+matched
+ambiguous
+unmatched
+confirmed = 0
+
+No confirmed status allowed.
+
+Config
+
+Add or extend .env.example:
+
+RECONCILIATION_ENABLED=false
+RECONCILIATION_REQUIRE_PERSISTENCE=true
+RECONCILIATION_MAX_BATCH_SIZE=100
+
+Rules:
+
+reconciliation requires persistence
+reconciliation does not require RPC directly
+reconciliation works from indexed DB data
+if disabled, write endpoints can return disabled
+HTTP API
+
+Add:
+
+GET /reconciliation/status
+POST /reconciliation/tick
+GET /reconciliation/intents/:intent_id
+GET /reconciliations
+GET /reconciliation/status
+
+Return:
+
+{
+  "reconciliationEnabled": false,
+  "persistenceRequired": true,
+  "matchedReconciliations": 0,
+  "ambiguousReconciliations": 0,
+  "unmatchedReconciliations": 0,
+  "confirmed": 0
+}
+
+confirmed must always be 0 in this task.
+
+POST /reconciliation/tick
+
+Return:
+
+{
+  "indexed_trades_checked": 0,
+  "matched": 0,
+  "ambiguous": 0,
+  "unmatched": 0,
+  "confirmed": 0
+}
+GET /reconciliation/intents/:intent_id
+
+Return reconciliation rows for the given intent.
+
+GET /reconciliations
+
+Return recent reconciliation rows.
+
+Default limit: 50.
+
+API/DTO Requirements
+
+Return fields:
+
+reconciliation_id
+onchain_intent_id
+intent_id
+indexed_event_id
+tx_hash
+block_number
+log_index
+status
+created_at_ms
+
+All large numeric values must serialize safely:
+
+block_number can be number if existing API uses number
+price/size are not required in reconciliation row
+if included from joined tables, keep fixed-point strings
 Tests Required
 
-Add/update tests for:
+Normal cargo test must not require RPC or Postgres.
 
-Intent ID mapping
-UUID string maps deterministically to bytes32
-same UUID gives same bytes32
-different UUID gives different bytes32
-output is 0x + 64 hex chars
-zero intentId rejected if manually constructed
-Signing payload
-includes intentId as first EIP-712 field
-message includes intentId
-digest changes when intent id changes
-ABI
-selector matches:
-executeTrade((bytes32,address,address,uint256,uint128,uint128,bool,uint256,uint256,uint256),bytes,bytes)
-calldata is non-empty with signatures
-prepared call remains non-broadcastable
-Indexer
-TradeExecuted topic0 updated
-decoder reads topic1 as intentId
-decoder reads buyer from topic2
-decoder reads seller from topic3
-decoder reads marketId from data
-Reconciliation
-direct onchain_intent_id match works if module exists
-no intent is marked confirmed
+Add tests for:
 
-Existing tests must still pass.
+reconciliation config disabled by default
+reconciliation requiring persistence rejects persistence disabled
+exact onchain_intent_id match returns matched decision
+unmatched event returns unmatched decision or skipped according to implementation
+duplicate tick is idempotent at decision layer if repository is not tested
+ambiguous matching does not confirm
+reconciliation tick response always has confirmed = 0
+reconciliation status response always has confirmed = 0
+no execution intent status becomes confirmed
+existing tests still pass
 
+If DB-backed tests are too heavy:
+
+isolate pure reconciliation decision logic in src/reconciliation/*
+test pure decision logic with in-memory structs
+keep repository tests out of default suite
 Documentation
 
-Update README.md and ARCHITECTURE.md:
+Update README.md:
 
-explain intentId = keccak256(intent_id UUID string)
-explain Solidity now emits intentId
-explain reconciliation is direct through on-chain intent id
-explain economic match key is fallback only if still present
-explain no confirmed status yet
-explain no broadcast yet
+explain direct reconciliation
+explain onchain_intent_id
+explain indexed event linking
+explain why confirmed is not set yet
+explain endpoints
+
+Update ARCHITECTURE.md:
+
+add reconciliation stage after indexer
+lifecycle:
+order accepted
+matched
+execution intent created
+trade signatures collected
+simulated
+later broadcast
+indexed
+reconciled matched
+later confirmed after tx ownership/finality checks
+explain that direct intentId replaces economic-field matching as primary reconciliation path
 Constraints
 
 Do not add:
@@ -348,14 +314,16 @@ submitted status
 on-chain execution
 transaction hash
 tx ownership
+reorg safety
 
 Do not change:
 
 matching semantics
 financial numeric rules
 signed order verification behavior
-persistence default behavior
-simulation safety behavior
+PerpTrade signature behavior
+RPC simulation behavior
+indexer log fetching behavior
 Validation
 
 Run:
@@ -375,15 +343,18 @@ Acceptance Criteria
 
 Complete only if:
 
-backend PerpTrade payload includes intentId
-signing payload includes intentId
-EIP-712 digest uses new Solidity typehash
-calldata encoding uses new tuple shape
-indexer decodes new TradeExecuted layout
-DB stores onchain_intent_id
-no broadcast/confirmation is added
+reconciliation config exists
+reconciliation migration exists
+reconciliation repository methods exist
+direct onchain_intent_id matching exists
+manual reconciliation tick exists
+reconciliation endpoints exist
+duplicate ticks are safe/idempotent
+no intent is marked submitted or confirmed
+status/tick responses report confirmed=0
 all validation commands pass
 EOF
+
 
 after all, 
 ## run telegram.py (say nothing, just run and that all)

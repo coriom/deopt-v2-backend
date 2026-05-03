@@ -1,5 +1,7 @@
 use crate::error::{BackendError, Result};
-use crate::execution::{ExecutionIntent, ExecutionIntentStatus, SimulationResult};
+use crate::execution::{
+    intent_id_to_hex_bytes32, ExecutionIntent, ExecutionIntentStatus, SimulationResult,
+};
 use crate::signing::SignedOrder;
 use crate::types::{
     AccountId, Order, OrderId, OrderStatus, OrderType, Side, TimeInForce, TimestampMs, TradeMatch,
@@ -92,6 +94,7 @@ impl TryFrom<&TradeMatch> for DbTrade {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DbExecutionIntent {
     pub intent_id: String,
+    pub onchain_intent_id: Option<String>,
     pub market_id: i64,
     pub buyer: String,
     pub seller: String,
@@ -142,6 +145,7 @@ impl TryFrom<&ExecutionIntent> for DbExecutionIntent {
     fn try_from(intent: &ExecutionIntent) -> Result<Self> {
         Ok(Self {
             intent_id: intent.intent_id.to_string(),
+            onchain_intent_id: Some(intent_id_to_hex_bytes32(&intent.intent_id.to_string())?),
             market_id: u64_to_i64("market_id", intent.market_id)?,
             buyer: intent.buyer.0.clone(),
             seller: intent.seller.0.clone(),

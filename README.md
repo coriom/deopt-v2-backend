@@ -122,6 +122,35 @@ curl http://127.0.0.1:8080/indexed/perp-trades
 
 Indexed events do not mark execution intents submitted or confirmed. Direct reconciliation can compare `keccak256(bytes(execution_intents.intent_id))` with `indexed_perp_trades.onchain_intent_id`; economic match keys are only a fallback for historical data without an intent id. V1 stores `block_hash` when the RPC provides it, but does not implement deep reorg rollback.
 
+## Reconciliation V1
+
+Reconciliation V1 is opt-in, persistence-backed, and read-only with respect to execution intent lifecycle:
+
+```text
+RECONCILIATION_ENABLED=false
+RECONCILIATION_REQUIRE_PERSISTENCE=true
+RECONCILIATION_MAX_BATCH_SIZE=100
+```
+
+It links indexed `TradeExecuted` events to backend intents by direct bytes32 identity:
+
+```text
+execution_intents.onchain_intent_id == indexed_perp_trades.onchain_intent_id
+```
+
+An exact unique match writes an `execution_reconciliations` row with `status=matched`. Missing backend intents are counted as unmatched without inventing ownership. Multiple backend intents or duplicate indexed events for the same on-chain intent id are treated as ambiguous. Reconciliation rows include the indexed event id, tx hash, block number, and log index, but they do not prove this backend submitted the transaction.
+
+Manual control and reads:
+
+```sh
+curl http://127.0.0.1:8080/reconciliation/status
+curl -X POST http://127.0.0.1:8080/reconciliation/tick
+curl http://127.0.0.1:8080/reconciliations
+curl http://127.0.0.1:8080/reconciliation/intents/<intent_id>
+```
+
+Reconciliation does not mark intents submitted or confirmed. Status and tick responses always return `confirmed=0`; final confirmation is deferred until a future executor can prove tx ownership and finality with reorg-aware indexing.
+
 ## Persistence
 
 PostgreSQL persistence is opt-in:
@@ -131,7 +160,7 @@ PERSISTENCE_ENABLED=true
 DATABASE_URL=postgres://deopt:deopt@127.0.0.1:5432/deopt_v2_backend
 ```
 
-When enabled, the service connects to Postgres at startup and runs migrations from `migrations/`. Migrations create `used_nonces`, `orders`, `trades`, `execution_intents`, `execution_intent_signatures`, `execution_simulations`, `engine_events`, `indexer_cursors`, and `indexed_perp_trades`.
+When enabled, the service connects to Postgres at startup and runs migrations from `migrations/`. Migrations create `used_nonces`, `orders`, `trades`, `execution_intents`, `execution_intent_signatures`, `execution_simulations`, `engine_events`, `indexer_cursors`, `indexed_perp_trades`, and `execution_reconciliations`.
 
 One local setup option:
 
@@ -199,6 +228,7 @@ curl -X DELETE http://127.0.0.1:8080/orders/<order_id>
 - RFQ and market-maker gateway are type scaffolds only.
 - Execution intents are provisional off-chain records, not settlement.
 - Indexed `TradeExecuted` events store `onchain_intent_id` for direct reconciliation only; they do not confirm backend intents.
+- Reconciliation rows link indexed events to intents, but still do not prove transaction ownership, finality, or reorg safety.
 - Indexer V1 stores block hashes when available but does not implement deep reorg rollback.
 - PerpMatchingEngine calldata can be encoded only from complete matched trade payloads and explicit buyer/seller PerpTrade signatures.
 - Optional blockchain RPC is limited to manual `eth_call` simulation. No transaction signing, production auth, WebSocket API, or options matching.

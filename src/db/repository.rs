@@ -10,6 +10,10 @@ use crate::execution::{
     StoredTradeSignatures,
 };
 use crate::indexer::IndexedPerpTrade;
+use crate::reconciliation::{
+    normalize_onchain_intent_id, ExecutionReconciliation, ReconciliationCounts,
+    ReconciliationStatus,
+};
 use crate::signing::SignedOrder;
 use crate::types::{now_ms, AccountId, OrderStatus, TimestampMs};
 use sqlx::postgres::{PgPool, PgRow};
@@ -133,7 +137,7 @@ impl PgRepository {
 
     pub async fn list_execution_intents(&self) -> Result<Vec<ExecutionIntent>> {
         let rows = sqlx::query(
-            "SELECT intent_id, market_id, buyer, seller, price_1e8, size_1e8, \
+            "SELECT intent_id, onchain_intent_id, market_id, buyer, seller, price_1e8, size_1e8, \
              buy_order_id, sell_order_id, buyer_is_maker, buyer_nonce, seller_nonce, deadline_ms, \
              status, created_at_ms, updated_at_ms \
              FROM execution_intents ORDER BY created_at_ms ASC, intent_id ASC",
@@ -150,7 +154,7 @@ impl PgRepository {
 
     pub async fn list_pending_execution_intents(&self, limit: u32) -> Result<Vec<ExecutionIntent>> {
         let rows = sqlx::query(
-            "SELECT intent_id, market_id, buyer, seller, price_1e8, size_1e8, \
+            "SELECT intent_id, onchain_intent_id, market_id, buyer, seller, price_1e8, size_1e8, \
              buy_order_id, sell_order_id, buyer_is_maker, buyer_nonce, seller_nonce, deadline_ms, \
              status, created_at_ms, updated_at_ms \
              FROM execution_intents \
@@ -191,7 +195,7 @@ impl PgRepository {
 
     pub async fn get_execution_intent(&self, intent_id: Uuid) -> Result<Option<ExecutionIntent>> {
         let row = sqlx::query(
-            "SELECT intent_id, market_id, buyer, seller, price_1e8, size_1e8, \
+            "SELECT intent_id, onchain_intent_id, market_id, buyer, seller, price_1e8, size_1e8, \
              buy_order_id, sell_order_id, buyer_is_maker, buyer_nonce, seller_nonce, deadline_ms, \
              status, created_at_ms, updated_at_ms \
              FROM execution_intents WHERE intent_id = $1",
@@ -321,6 +325,154 @@ impl PgRepository {
         .map_err(|error| BackendError::Persistence(error.to_string()))?;
 
         rows.into_iter().map(indexed_perp_trade_from_row).collect()
+    }
+
+    pub async fn list_unreconciled_indexed_perp_trades(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<IndexedPerpTrade>> {
+        let rows = sqlx::query(
+            "SELECT event_id, tx_hash, log_index, block_number, block_hash, buyer, seller,
+                    onchain_intent_id, market_id, size_delta_1e8, execution_price_1e8,
+                    buyer_is_maker, buyer_nonce, seller_nonce, created_at_ms
+             FROM indexed_perp_trades indexed
+             WHERE indexed.onchain_intent_id IS NOT NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM execution_reconciliations reconciled
+                   WHERE reconciled.indexed_event_id = indexed.event_id
+               )
+             ORDER BY block_number ASC, log_index ASC
+             LIMIT $1",
+        )
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+
+        rows.into_iter().map(indexed_perp_trade_from_row).collect()
+    }
+
+    pub async fn find_execution_intents_by_onchain_intent_id(
+        &self,
+        onchain_intent_id: &str,
+    ) -> Result<Vec<ExecutionIntent>> {
+        let Some(onchain_intent_id) = normalize_onchain_intent_id(onchain_intent_id) else {
+            return Ok(Vec::new());
+        };
+        let rows = sqlx::query(
+            "SELECT intent_id, onchain_intent_id, market_id, buyer, seller, price_1e8, size_1e8,
+                    buy_order_id, sell_order_id, buyer_is_maker, buyer_nonce, seller_nonce,
+                    deadline_ms, status, created_at_ms, updated_at_ms
+             FROM execution_intents
+             WHERE onchain_intent_id = $1
+             ORDER BY created_at_ms ASC, intent_id ASC",
+        )
+        .bind(onchain_intent_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+
+        rows.into_iter()
+            .map(db_execution_intent_from_row)
+            .map(|result| result.and_then(ExecutionIntent::try_from))
+            .collect()
+    }
+
+    pub async fn find_indexed_trades_by_onchain_intent_id(
+        &self,
+        onchain_intent_id: &str,
+    ) -> Result<Vec<IndexedPerpTrade>> {
+        let Some(onchain_intent_id) = normalize_onchain_intent_id(onchain_intent_id) else {
+            return Ok(Vec::new());
+        };
+        let rows = sqlx::query(
+            "SELECT event_id, tx_hash, log_index, block_number, block_hash, buyer, seller,
+                    onchain_intent_id, market_id, size_delta_1e8, execution_price_1e8,
+                    buyer_is_maker, buyer_nonce, seller_nonce, created_at_ms
+             FROM indexed_perp_trades
+             WHERE onchain_intent_id = $1
+             ORDER BY block_number ASC, log_index ASC",
+        )
+        .bind(onchain_intent_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+
+        rows.into_iter().map(indexed_perp_trade_from_row).collect()
+    }
+
+    pub async fn insert_execution_reconciliation(
+        &self,
+        reconciliation: &ExecutionReconciliation,
+    ) -> Result<u64> {
+        insert_execution_reconciliation(&self.pool, reconciliation).await
+    }
+
+    pub async fn list_recent_reconciliations(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<ExecutionReconciliation>> {
+        let rows = sqlx::query(
+            "SELECT reconciliation_id, onchain_intent_id, intent_id, indexed_event_id, tx_hash,
+                    block_number, log_index, status, created_at_ms
+             FROM execution_reconciliations
+             ORDER BY created_at_ms DESC, reconciliation_id DESC
+             LIMIT $1",
+        )
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+
+        rows.into_iter()
+            .map(execution_reconciliation_from_row)
+            .collect()
+    }
+
+    pub async fn get_reconciliations_for_intent(
+        &self,
+        intent_id: Uuid,
+    ) -> Result<Vec<ExecutionReconciliation>> {
+        let rows = sqlx::query(
+            "SELECT reconciliation_id, onchain_intent_id, intent_id, indexed_event_id, tx_hash,
+                    block_number, log_index, status, created_at_ms
+             FROM execution_reconciliations
+             WHERE intent_id = $1
+             ORDER BY created_at_ms DESC, reconciliation_id DESC",
+        )
+        .bind(intent_id.to_string())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+
+        rows.into_iter()
+            .map(execution_reconciliation_from_row)
+            .collect()
+    }
+
+    pub async fn count_reconciliations_by_status(&self) -> Result<ReconciliationCounts> {
+        let rows = sqlx::query(
+            "SELECT status, COUNT(*) AS count
+             FROM execution_reconciliations
+             GROUP BY status",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+
+        let mut counts = ReconciliationCounts::default();
+        for row in rows {
+            let status: String = row_get(&row, "status")?;
+            let count: i64 = row_get(&row, "count")?;
+            let count = i64_to_u64_persistence("count", count)?;
+            match ReconciliationStatus::parse(&status)? {
+                ReconciliationStatus::Matched => counts.matched = count,
+                ReconciliationStatus::Ambiguous => counts.ambiguous = count,
+                ReconciliationStatus::Unmatched => counts.unmatched = count,
+                ReconciliationStatus::Ignored => counts.ignored = count,
+            }
+        }
+        Ok(counts)
     }
 }
 
@@ -461,6 +613,10 @@ async fn insert_indexed_perp_trade(
     tx: &mut Transaction<'_, Postgres>,
     trade: &IndexedPerpTrade,
 ) -> Result<u64> {
+    let onchain_intent_id = trade
+        .onchain_intent_id
+        .as_deref()
+        .and_then(normalize_onchain_intent_id);
     let result = sqlx::query(
         "INSERT INTO indexed_perp_trades (
             event_id, tx_hash, log_index, block_number, block_hash, buyer, seller,
@@ -476,7 +632,7 @@ async fn insert_indexed_perp_trade(
     .bind(&trade.block_hash)
     .bind(&trade.buyer)
     .bind(&trade.seller)
-    .bind(&trade.onchain_intent_id)
+    .bind(&onchain_intent_id)
     .bind(&trade.market_id)
     .bind(&trade.size_delta_1e8)
     .bind(&trade.execution_price_1e8)
@@ -542,12 +698,13 @@ async fn insert_execution_intent(
 ) -> Result<()> {
     sqlx::query(
         "INSERT INTO execution_intents (
-            intent_id, market_id, buyer, seller, price_1e8, size_1e8,
+            intent_id, onchain_intent_id, market_id, buyer, seller, price_1e8, size_1e8,
             buy_order_id, sell_order_id, buyer_is_maker, buyer_nonce, seller_nonce, deadline_ms,
             status, created_at_ms, updated_at_ms
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
     )
     .bind(&intent.intent_id)
+    .bind(&intent.onchain_intent_id)
     .bind(intent.market_id)
     .bind(&intent.buyer)
     .bind(&intent.seller)
@@ -566,6 +723,32 @@ async fn insert_execution_intent(
     .await
     .map_err(|error| BackendError::Persistence(error.to_string()))?;
     Ok(())
+}
+
+async fn insert_execution_reconciliation(
+    pool: &PgPool,
+    reconciliation: &ExecutionReconciliation,
+) -> Result<u64> {
+    let result = sqlx::query(
+        "INSERT INTO execution_reconciliations (
+            reconciliation_id, onchain_intent_id, intent_id, indexed_event_id, tx_hash,
+            block_number, log_index, status, created_at_ms
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        ON CONFLICT (intent_id, indexed_event_id) DO NOTHING",
+    )
+    .bind(&reconciliation.reconciliation_id)
+    .bind(&reconciliation.onchain_intent_id)
+    .bind(&reconciliation.intent_id)
+    .bind(&reconciliation.indexed_event_id)
+    .bind(&reconciliation.tx_hash)
+    .bind(u64_to_i64("block_number", reconciliation.block_number)?)
+    .bind(u64_to_i64("log_index", reconciliation.log_index)?)
+    .bind(reconciliation.status.as_str())
+    .bind(timestamp_to_i64(reconciliation.created_at_ms))
+    .execute(pool)
+    .await
+    .map_err(|error| BackendError::Persistence(error.to_string()))?;
+    Ok(result.rows_affected())
 }
 
 async fn insert_engine_event(
@@ -603,6 +786,7 @@ fn engine_event_type(event: &EngineEvent) -> &'static str {
 fn db_execution_intent_from_row(row: PgRow) -> Result<DbExecutionIntent> {
     Ok(DbExecutionIntent {
         intent_id: row_get(&row, "intent_id")?,
+        onchain_intent_id: row_get(&row, "onchain_intent_id")?,
         market_id: row_get(&row, "market_id")?,
         buyer: row_get(&row, "buyer")?,
         seller: row_get(&row, "seller")?,
@@ -623,13 +807,16 @@ fn db_execution_intent_from_row(row: PgRow) -> Result<DbExecutionIntent> {
 fn indexed_perp_trade_from_row(row: PgRow) -> Result<IndexedPerpTrade> {
     let log_index: i64 = row_get(&row, "log_index")?;
     let block_number: i64 = row_get(&row, "block_number")?;
+    let onchain_intent_id: Option<String> = row_get(&row, "onchain_intent_id")?;
     Ok(IndexedPerpTrade {
         event_id: row_get(&row, "event_id")?,
         tx_hash: row_get(&row, "tx_hash")?,
         log_index: i64_to_u64_persistence("log_index", log_index)?,
         block_number: i64_to_u64_persistence("block_number", block_number)?,
         block_hash: row_get(&row, "block_hash")?,
-        onchain_intent_id: row_get(&row, "onchain_intent_id")?,
+        onchain_intent_id: onchain_intent_id
+            .as_deref()
+            .and_then(normalize_onchain_intent_id),
         buyer: row_get(&row, "buyer")?,
         seller: row_get(&row, "seller")?,
         market_id: row_get(&row, "market_id")?,
@@ -638,6 +825,23 @@ fn indexed_perp_trade_from_row(row: PgRow) -> Result<IndexedPerpTrade> {
         buyer_is_maker: row_get(&row, "buyer_is_maker")?,
         buyer_nonce: row_get(&row, "buyer_nonce")?,
         seller_nonce: row_get(&row, "seller_nonce")?,
+        created_at_ms: row_get(&row, "created_at_ms")?,
+    })
+}
+
+fn execution_reconciliation_from_row(row: PgRow) -> Result<ExecutionReconciliation> {
+    let block_number: i64 = row_get(&row, "block_number")?;
+    let log_index: i64 = row_get(&row, "log_index")?;
+    let status: String = row_get(&row, "status")?;
+    Ok(ExecutionReconciliation {
+        reconciliation_id: row_get(&row, "reconciliation_id")?,
+        onchain_intent_id: row_get(&row, "onchain_intent_id")?,
+        intent_id: row_get(&row, "intent_id")?,
+        indexed_event_id: row_get(&row, "indexed_event_id")?,
+        tx_hash: row_get(&row, "tx_hash")?,
+        block_number: i64_to_u64_persistence("block_number", block_number)?,
+        log_index: i64_to_u64_persistence("log_index", log_index)?,
+        status: ReconciliationStatus::parse(&status)?,
         created_at_ms: row_get(&row, "created_at_ms")?,
     })
 }

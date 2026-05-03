@@ -608,6 +608,44 @@ async fn indexer_status_api_reports_v1_flags() {
     );
 }
 
+#[tokio::test]
+async fn reconciliation_status_api_reports_confirmed_zero() {
+    let response = router(AppState::new(EngineState::with_default_markets()))
+        .oneshot(
+            Request::builder()
+                .uri("/reconciliation/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = response_json(response).await;
+    assert_eq!(json["reconciliationEnabled"], false);
+    assert_eq!(json["persistenceRequired"], true);
+    assert_eq!(json["matchedReconciliations"], 0);
+    assert_eq!(json["ambiguousReconciliations"], 0);
+    assert_eq!(json["unmatchedReconciliations"], 0);
+    assert_eq!(json["confirmed"], 0);
+}
+
+#[tokio::test]
+async fn reconciliation_tick_rejects_when_disabled() {
+    let response = router(AppState::new(EngineState::with_default_markets()))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/reconciliation/tick")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
 #[test]
 fn indexer_default_does_not_claim_confirmation_lifecycle() {
     let status = IndexerConfig::disabled().status(0);

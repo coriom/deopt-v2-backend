@@ -2,6 +2,7 @@ use crate::db::PgRepository;
 use crate::engine::EngineState;
 use crate::execution::{ExecutionConfig, StoredTradeSignatures};
 use crate::indexer::IndexerConfig;
+use crate::reconciliation::ReconciliationConfig;
 use crate::signing::{Eip712Domain, NonceStore, SignatureVerificationMode};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -17,6 +18,7 @@ pub struct AppState {
     pub repository: Option<PgRepository>,
     pub execution_config: ExecutionConfig,
     pub indexer_config: IndexerConfig,
+    pub reconciliation_config: ReconciliationConfig,
     pub trade_signatures: Arc<Mutex<HashMap<Uuid, StoredTradeSignatures>>>,
 }
 
@@ -73,13 +75,14 @@ impl AppState {
         execution_config: ExecutionConfig,
         chain_id: u64,
     ) -> Self {
-        Self::with_signature_mode_domain_repository_execution_and_indexer_config(
+        Self::with_signature_mode_domain_repository_execution_indexer_and_reconciliation_config(
             engine,
             signature_verification_mode,
             eip712_domain,
             repository,
             execution_config,
             IndexerConfig::disabled(),
+            ReconciliationConfig::disabled(),
             chain_id,
         )
     }
@@ -93,6 +96,29 @@ impl AppState {
         indexer_config: IndexerConfig,
         chain_id: u64,
     ) -> Self {
+        Self::with_signature_mode_domain_repository_execution_indexer_and_reconciliation_config(
+            engine,
+            signature_verification_mode,
+            eip712_domain,
+            repository,
+            execution_config,
+            indexer_config,
+            ReconciliationConfig::disabled(),
+            chain_id,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_signature_mode_domain_repository_execution_indexer_and_reconciliation_config(
+        engine: EngineState,
+        signature_verification_mode: SignatureVerificationMode,
+        eip712_domain: Eip712Domain,
+        repository: Option<PgRepository>,
+        execution_config: ExecutionConfig,
+        indexer_config: IndexerConfig,
+        reconciliation_config: ReconciliationConfig,
+        chain_id: u64,
+    ) -> Self {
         Self {
             engine: Arc::new(Mutex::new(engine)),
             nonces: Arc::new(Mutex::new(NonceStore::new())),
@@ -102,6 +128,7 @@ impl AppState {
             repository,
             execution_config,
             indexer_config,
+            reconciliation_config,
             trade_signatures: Arc::new(Mutex::new(HashMap::new())),
         }
     }

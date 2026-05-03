@@ -1,6 +1,7 @@
 use crate::error::{BackendError, Result};
 use crate::execution::ExecutionConfig;
 use crate::indexer::IndexerConfig;
+use crate::reconciliation::ReconciliationConfig;
 use crate::signing::signature::SignatureVerificationMode;
 use crate::signing::Eip712Domain;
 use crate::types::AccountId;
@@ -16,6 +17,7 @@ pub struct AppConfig {
     pub network_name: String,
     pub execution: ExecutionConfig,
     pub indexer: IndexerConfig,
+    pub reconciliation: ReconciliationConfig,
     pub signature_verification_mode: SignatureVerificationMode,
     pub eip712_domain: Eip712Domain,
     pub persistence_enabled: bool,
@@ -71,6 +73,15 @@ impl AppConfig {
             rpc_url: execution.rpc_url.clone(),
             perp_matching_engine_address: execution.perp_matching_engine_address.clone(),
         };
+        let reconciliation = ReconciliationConfig {
+            enabled: parse_env(&mut lookup, "RECONCILIATION_ENABLED", "false")?,
+            require_persistence: parse_env(
+                &mut lookup,
+                "RECONCILIATION_REQUIRE_PERSISTENCE",
+                "true",
+            )?,
+            max_batch_size: parse_env(&mut lookup, "RECONCILIATION_MAX_BATCH_SIZE", "100")?,
+        };
         let signature_verification_mode =
             parse_env(&mut lookup, "SIGNATURE_VERIFICATION_MODE", "disabled")?;
         let eip712_domain = Eip712Domain {
@@ -93,6 +104,7 @@ impl AppConfig {
         }
         execution.validate_startup(persistence_enabled)?;
         indexer.validate_startup(persistence_enabled)?;
+        reconciliation.validate_startup(persistence_enabled)?;
 
         Ok(Self {
             host,
@@ -102,6 +114,7 @@ impl AppConfig {
             network_name,
             execution,
             indexer,
+            reconciliation,
             signature_verification_mode,
             eip712_domain,
             persistence_enabled,
@@ -292,6 +305,29 @@ mod tests {
         assert_eq!(config.indexer.poll_interval_ms, 3_000);
         assert_eq!(config.indexer.max_block_range, 500);
         assert!(config.indexer.require_persistence);
+    }
+
+    #[test]
+    fn reconciliation_config_disabled_by_default() {
+        let config = config_from_pairs([("PERSISTENCE_ENABLED", "false")]).unwrap();
+
+        assert!(!config.reconciliation.enabled);
+        assert!(config.reconciliation.require_persistence);
+        assert_eq!(config.reconciliation.max_batch_size, 100);
+    }
+
+    #[test]
+    fn reconciliation_requiring_persistence_rejects_persistence_disabled() {
+        let error = config_from_pairs([
+            ("RECONCILIATION_ENABLED", "true"),
+            ("RECONCILIATION_REQUIRE_PERSISTENCE", "true"),
+            ("PERSISTENCE_ENABLED", "false"),
+        ])
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("reconciliation requires persistence enabled"));
     }
 
     #[test]
