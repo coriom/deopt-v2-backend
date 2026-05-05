@@ -151,7 +151,28 @@ PERP_MATCHING_ENGINE_ADDRESS=0x...
 PERSISTENCE_ENABLED=true
 ```
 
-`POST /executor/simulate/<intent_id>` loads one execution intent, requires both stored PerpTrade signatures, rebuilds the real `executeTrade` calldata, and performs an `eth_call` to `PERP_MATCHING_ENGINE_ADDRESS` with `value=0`. On success, the intent is marked `simulation_ok`; on revert or RPC failure, it is marked `simulation_failed` with the error text. These statuses only describe the result of the call simulation at the queried block. They do not mean submitted, confirmed, final, or executed.
+`POST /executor/simulate/<intent_id>` loads one execution intent, requires both stored PerpTrade signatures, rebuilds the real `executeTrade` calldata, and performs an `eth_call` to `PERP_MATCHING_ENGINE_ADDRESS` with `value=0`. On success, the intent is marked `simulation_ok`; on revert or RPC failure, it is marked `simulation_failed` with the error text and any decoded revert diagnostics. These statuses only describe the result of the call simulation at the queried block. They do not mean submitted, confirmed, final, or executed.
+
+Simulation failure responses include diagnostic fields when the RPC returns revert data:
+
+```json
+{
+  "simulation_status": "simulation_failed",
+  "error": "simulation failed: execution reverted",
+  "revert_data": "0x...",
+  "revert_selector": "0x...",
+  "decoded_error": {
+    "kind": "custom_error",
+    "name": "InvalidSignature",
+    "selector": "0x...",
+    "args": []
+  },
+  "submitted": false,
+  "confirmed": false
+}
+```
+
+The decoder supports Solidity `Error(string)`, `Panic(uint256)`, unknown custom-error selectors, and a table of common protocol errors such as `InvalidSignature`, `NotAuthorized`, `InsufficientMargin`, `MarketCloseOnly`, `OracleStale`, `OraclePriceUnavailable`, `InvalidPrice`, and `InvalidSize`. If an RPC provider returns only a message, `decoded_error.kind` is `missing_revert_data` and the raw message is preserved. These diagnostics are persisted in `execution_simulations` as `revert_data`, `revert_selector`, and `decoded_error`.
 
 The endpoint returns `submitted=false` and `confirmed=false` for every response. Simulation does not call `eth_sendRawTransaction` and `GET /executor/status` reports `broadcastEnabled=false` until real broadcast is explicitly enabled.
 

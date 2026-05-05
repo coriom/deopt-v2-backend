@@ -35,7 +35,7 @@ The long-term backend needs low-latency deterministic matching, RFQ, market-make
 - PerpMatchingEngine `executeTrade` calldata builder V1 for explicit matched-trade payloads and explicit trade signatures.
 - Matched PerpTrade signing-payload and trade-signature collection endpoints.
 - Dev-only local PerpTrade signing CLI for testnet payloads returned by the backend.
-- Manual RPC simulation V1 for calldata-ready intents using `eth_call` only.
+- Manual RPC simulation V1 for calldata-ready intents using `eth_call` only, with revert-data diagnostics on failure.
 - Real Broadcast V1 with transaction request construction, transaction records, disabled-by-default behavior, EIP-1559 signing, pending nonce lookup, chain id checks, and `eth_sendRawTransaction` behind explicit config gates.
 - HTTP endpoints for health, markets, orderbook, orders, cancellation, and execution intents.
 - Signed-order HTTP boundary with nonce/deadline validation, disabled signature shape checks, and strict EIP-712 signer recovery.
@@ -120,7 +120,7 @@ Every matched trade creates an `ExecutionIntent` with buyer, seller, order IDs, 
 
 The execution deadline is the minimum of the two original signed-order deadlines. Direct in-memory orders that do not carry nonce/deadline metadata can still match, but their signing-payload endpoint fails clearly instead of inventing missing PerpTrade fields.
 
-The intended lifecycle is: order accepted, matched, execution intent created, PerpTrade signatures collected, calldata ready, simulation ok, prepared transaction, submitted by the explicitly gated executor, indexed by the indexer, reconciled as matched by direct intent id, and only later confirmed after transaction ownership and finality checks. Real Broadcast V1 stops at submitted after a real RPC tx hash; Reconciliation V1 stops at the matched reconciliation row.
+The intended lifecycle is: order accepted, matched, execution intent created, PerpTrade signatures collected, calldata ready, simulation with revert diagnostics when needed, simulation ok, prepared transaction, submitted by the explicitly gated executor, indexed by the indexer, reconciled as matched by direct intent id, and only later confirmed after transaction ownership and finality checks. Real Broadcast V1 stops at submitted after a real RPC tx hash; Reconciliation V1 stops at the matched reconciliation row.
 
 ## Persistence V1
 
@@ -144,7 +144,7 @@ Intent-derived executor dry-runs produce non-executable previews when trade sign
 
 Prepared execution calls remain non-broadcastable in this phase. `is_broadcastable=false`, transaction `value=0`, and no submitted or confirmed lifecycle state is produced by the calldata builder.
 
-Simulation V1 is a manual safety check exposed by `POST /executor/simulate/:intent_id`. It loads the intent and stored PerpTrade signatures, rebuilds the same `executeTrade` calldata, and performs `eth_call` from `EXECUTOR_FROM_ADDRESS` or the zero address to `PERP_MATCHING_ENGINE_ADDRESS`. A successful call marks the intent `simulation_ok`; a revert or RPC failure marks it `simulation_failed` with the error text. These statuses are not submission, confirmation, settlement, or finality.
+Simulation V1 is a manual safety check exposed by `POST /executor/simulate/:intent_id`. It loads the intent and stored PerpTrade signatures, rebuilds the same `executeTrade` calldata, and performs `eth_call` from `EXECUTOR_FROM_ADDRESS` or the zero address to `PERP_MATCHING_ENGINE_ADDRESS`. A successful call marks the intent `simulation_ok`; a revert or RPC failure marks it `simulation_failed` with the error text. Revert Diagnostics V1 extracts revert data from common JSON-RPC error shapes, decodes Solidity `Error(string)` and `Panic(uint256)`, maps known custom-error selectors such as `InvalidSignature`, `NotAuthorized`, `InsufficientMargin`, and `OracleStale`, and persists the raw data, selector, and decoded JSON on the simulation row. These statuses and diagnostics are a safety gate before real broadcast; they are not submission, confirmation, settlement, or finality.
 
 Real Broadcast V1 is exposed through `POST /executor/broadcast/:intent_id`, `GET /executor/transactions`, and `GET /executor/transactions/:intent_id`. With `EXECUTOR_REAL_BROADCAST_ENABLED=false`, the broadcast endpoint returns a disabled refusal with `submitted=false`, `confirmed=false`, and no tx hash. The transaction request builder requires both PerpTrade signatures, non-empty `executeTrade` calldata, a configured matching-engine target, static EIP-1559 fee values, and `simulation_ok` when required.
 

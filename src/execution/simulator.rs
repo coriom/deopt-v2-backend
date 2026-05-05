@@ -1,4 +1,5 @@
 use crate::error::Result;
+use crate::execution::revert::{DecodedRevertError, RevertDiagnostics};
 use crate::execution::rpc::{EthCallProvider, EthCallRequest};
 use crate::execution::{
     build_perp_execution_call_from_intent, ExecutionConfig, ExecutionIntent, ExecutionIntentStatus,
@@ -15,6 +16,9 @@ pub struct SimulationResult {
     pub status: ExecutionIntentStatus,
     pub block_number: Option<u64>,
     pub error: Option<String>,
+    pub revert_data: Option<String>,
+    pub revert_selector: Option<String>,
+    pub decoded_error: Option<DecodedRevertError>,
     pub created_at_ms: TimestampMs,
 }
 
@@ -67,16 +71,32 @@ where
             status: ExecutionIntentStatus::SimulationOk,
             block_number: success.block_number,
             error: None,
+            revert_data: None,
+            revert_selector: None,
+            decoded_error: None,
             created_at_ms,
         }),
-        Err(error) => Ok(SimulationResult {
-            simulation_id: Uuid::new_v4(),
-            intent_id: call.intent_id,
-            status: ExecutionIntentStatus::SimulationFailed,
-            block_number: None,
-            error: Some(error.to_string()),
-            created_at_ms,
-        }),
+        Err(error) => {
+            let diagnostics = diagnostics_from_backend_error(&error);
+            Ok(SimulationResult {
+                simulation_id: Uuid::new_v4(),
+                intent_id: call.intent_id,
+                status: ExecutionIntentStatus::SimulationFailed,
+                block_number: None,
+                error: Some(error.to_string()),
+                revert_data: diagnostics.revert_data,
+                revert_selector: diagnostics.revert_selector,
+                decoded_error: Some(diagnostics.decoded_error),
+                created_at_ms,
+            })
+        }
+    }
+}
+
+fn diagnostics_from_backend_error(error: &crate::error::BackendError) -> RevertDiagnostics {
+    match error {
+        crate::error::BackendError::SimulationReverted(diagnostics) => diagnostics.as_ref().clone(),
+        other => RevertDiagnostics::missing(other.to_string()),
     }
 }
 
@@ -92,6 +112,7 @@ mod tests {
     enum MockOutcome {
         Success,
         Failure(&'static str),
+        Revert(RevertDiagnostics),
     }
 
     #[derive(Clone)]
@@ -110,6 +131,9 @@ mod tests {
                     }),
                     MockOutcome::Failure(message) => {
                         Err(BackendError::Simulation(message.to_string()))
+                    }
+                    MockOutcome::Revert(diagnostics) => {
+                        Err(BackendError::SimulationReverted(Box::new(diagnostics)))
                     }
                 }
             })
@@ -132,6 +156,9 @@ mod tests {
         assert_eq!(result.status, ExecutionIntentStatus::SimulationOk);
         assert_eq!(result.block_number, Some(123));
         assert_eq!(result.error, None);
+        assert_eq!(result.revert_data, None);
+        assert_eq!(result.revert_selector, None);
+        assert_eq!(result.decoded_error, None);
     }
 
     #[tokio::test]
@@ -149,6 +176,43 @@ mod tests {
 
         assert_eq!(result.status, ExecutionIntentStatus::SimulationFailed);
         assert!(result.error.unwrap().contains("execution reverted"));
+        assert_eq!(
+            result.decoded_error.unwrap().kind,
+            "missing_revert_data".to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn simulator_maps_revert_diagnostics_to_simulation_failed() {
+        let result = simulate_execution_intent(
+            &MockProvider {
+                outcome: MockOutcome::Revert(RevertDiagnostics {
+                    raw_error: "execution reverted".to_string(),
+                    revert_data: Some("0x12345678".to_string()),
+                    revert_selector: Some("0x12345678".to_string()),
+                    decoded_error: crate::execution::revert::DecodedRevertError {
+                        kind: "unknown_custom_error".to_string(),
+                        name: None,
+                        selector: Some("0x12345678".to_string()),
+                        args: None,
+                        decoded: None,
+                    },
+                }),
+            },
+            &config(),
+            &intent(),
+            &signatures(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.status, ExecutionIntentStatus::SimulationFailed);
+        assert_eq!(result.revert_data.as_deref(), Some("0x12345678"));
+        assert_eq!(result.revert_selector.as_deref(), Some("0x12345678"));
+        assert_eq!(
+            result.decoded_error.unwrap().kind,
+            "unknown_custom_error".to_string()
+        );
     }
 
     #[tokio::test]

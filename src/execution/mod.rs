@@ -4,6 +4,7 @@ pub mod executor;
 pub mod intent;
 pub mod perp_trade;
 pub mod queue;
+pub mod revert;
 pub mod rpc;
 pub mod runner;
 pub mod signer;
@@ -21,6 +22,7 @@ pub use perp_trade::{
     TradeSignatureStatus, PERP_TRADE_TYPE,
 };
 pub use queue::ExecutionQueue;
+pub use revert::{DecodedRevertError, RevertDiagnostics};
 pub use rpc::{
     EthCallProvider, EthCallRequest, EthCallSuccess, HttpJsonRpcProvider,
     TransactionBroadcastProvider,

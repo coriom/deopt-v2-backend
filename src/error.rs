@@ -45,6 +45,8 @@ pub enum BackendError {
     MissingExecutionMetadata(String),
     #[error("simulation failed: {0}")]
     Simulation(String),
+    #[error("simulation failed: {0}")]
+    SimulationReverted(Box<crate::execution::RevertDiagnostics>),
     #[error("indexer failed: {0}")]
     Indexer(String),
     #[error("malformed account address")]

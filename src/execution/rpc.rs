@@ -1,4 +1,5 @@
 use crate::error::{BackendError, Result};
+use crate::execution::revert::diagnostics_from_rpc_error;
 use crate::types::AccountId;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
@@ -158,7 +159,9 @@ impl EthCallProvider for HttpJsonRpcProvider {
                 .map_err(|error| BackendError::Simulation(error.to_string()))?;
 
             if let Some(error) = response.error {
-                return Err(BackendError::Simulation(error.message));
+                return Err(BackendError::SimulationReverted(Box::new(
+                    diagnostics_from_rpc_error(&error.message, error.data.as_ref()),
+                )));
             }
             let result = response.result.ok_or_else(|| {
                 BackendError::Simulation("eth_call returned no result".to_string())
@@ -225,6 +228,7 @@ struct JsonRpcResponse<T> {
 #[derive(Clone, Debug, Deserialize)]
 struct JsonRpcError {
     message: String,
+    data: Option<serde_json::Value>,
 }
 
 fn hex_0x(bytes: &[u8]) -> String {

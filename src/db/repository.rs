@@ -687,14 +687,18 @@ async fn insert_execution_simulation(
 ) -> Result<()> {
     sqlx::query(
         "INSERT INTO execution_simulations (
-            simulation_id, intent_id, status, block_number, error, created_at_ms
-        ) VALUES ($1, $2, $3, $4, $5, $6)",
+            simulation_id, intent_id, status, block_number, error,
+            revert_data, revert_selector, decoded_error, created_at_ms
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
     )
     .bind(&simulation.simulation_id)
     .bind(&simulation.intent_id)
     .bind(&simulation.status)
     .bind(simulation.block_number)
     .bind(&simulation.error)
+    .bind(&simulation.revert_data)
+    .bind(&simulation.revert_selector)
+    .bind(&simulation.decoded_error)
     .bind(simulation.created_at_ms)
     .execute(&mut **tx)
     .await

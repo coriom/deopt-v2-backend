@@ -7,10 +7,10 @@ use crate::engine::{EngineCommand, EngineEvent};
 use crate::error::{BackendError, Result as BackendResult};
 use crate::execution::{
     b256_to_hex_bytes32, build_execution_transaction_request, ensure_no_submitted_transaction,
-    perp_trade_digest, simulate_execution_intent, ExecutionIntentStatus, ExecutionTransaction,
-    ExecutionTransactionStatus, Executor, ExecutorSigner, HttpJsonRpcProvider, PerpTradeDomain,
-    PerpTradePayload, SimulationResult, StoredTradeSignatures, TradeSignatureStatus,
-    TransactionBroadcastProvider, PERP_TRADE_TYPE,
+    perp_trade_digest, simulate_execution_intent, DecodedRevertError, ExecutionIntentStatus,
+    ExecutionTransaction, ExecutionTransactionStatus, Executor, ExecutorSigner,
+    HttpJsonRpcProvider, PerpTradeDomain, PerpTradePayload, SimulationResult,
+    StoredTradeSignatures, TradeSignatureStatus, TransactionBroadcastProvider, PERP_TRADE_TYPE,
 };
 use crate::indexer::{Indexer, IndexerStatus, IndexerTickResult};
 use crate::reconciliation::{
@@ -448,8 +448,27 @@ struct SimulationResponse {
     simulation_status: ExecutionIntentStatus,
     block_number: Option<u64>,
     error: Option<String>,
+    revert_data: Option<String>,
+    revert_selector: Option<String>,
+    decoded_error: Option<DecodedRevertError>,
     submitted: bool,
     confirmed: bool,
+}
+
+impl From<SimulationResult> for SimulationResponse {
+    fn from(result: SimulationResult) -> Self {
+        Self {
+            intent_id: result.intent_id,
+            simulation_status: result.status,
+            block_number: result.block_number,
+            error: result.error,
+            revert_data: result.revert_data,
+            revert_selector: result.revert_selector,
+            decoded_error: result.decoded_error,
+            submitted: false,
+            confirmed: false,
+        }
+    }
 }
 
 async fn simulate_executor_intent(
@@ -481,14 +500,7 @@ async fn simulate_executor_intent(
         simulate_execution_intent(&provider, &state.execution_config, &intent, &signatures).await?;
     persist_simulation_result(&state, &result).await?;
 
-    Ok(Json(SimulationResponse {
-        intent_id,
-        simulation_status: result.status,
-        block_number: result.block_number,
-        error: result.error,
-        submitted: false,
-        confirmed: false,
-    }))
+    Ok(Json(SimulationResponse::from(result)))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -1040,6 +1052,43 @@ fn signing_payload_message(payload: PerpTradePayload) -> SigningPayloadMessage {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::execution::DecodedRevertError;
+
+    #[test]
+    fn simulation_response_keeps_submitted_and_confirmed_false() {
+        let result = SimulationResult {
+            simulation_id: Uuid::from_u128(1),
+            intent_id: Uuid::from_u128(2),
+            status: ExecutionIntentStatus::SimulationFailed,
+            block_number: None,
+            error: Some("simulation failed: execution reverted".to_string()),
+            revert_data: Some("0x12345678".to_string()),
+            revert_selector: Some("0x12345678".to_string()),
+            decoded_error: Some(DecodedRevertError {
+                kind: "unknown_custom_error".to_string(),
+                name: None,
+                selector: Some("0x12345678".to_string()),
+                args: None,
+                decoded: None,
+            }),
+            created_at_ms: 123,
+        };
+
+        let response = SimulationResponse::from(result);
+
+        assert!(!response.submitted);
+        assert!(!response.confirmed);
+        assert_eq!(response.revert_data.as_deref(), Some("0x12345678"));
+        assert_eq!(
+            response.decoded_error.unwrap().kind,
+            "unknown_custom_error".to_string()
+        );
+    }
+}
+
 fn perp_trade_type_fields() -> Vec<SigningPayloadTypeField> {
     let _ = PERP_TRADE_TYPE;
     vec![
@@ -1129,6 +1178,7 @@ impl From<BackendError> for ApiError {
             | BackendError::UnsupportedTimeInForce(_)
             | BackendError::UnsupportedCommand(_)
             | BackendError::Simulation(_)
+            | BackendError::SimulationReverted(_)
             | BackendError::Indexer(_)
             | BackendError::Config(_) => StatusCode::BAD_REQUEST,
             BackendError::Persistence(_) => StatusCode::INTERNAL_SERVER_ERROR,

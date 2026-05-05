@@ -118,6 +118,9 @@ pub struct DbExecutionSimulation {
     pub status: String,
     pub block_number: Option<i64>,
     pub error: Option<String>,
+    pub revert_data: Option<String>,
+    pub revert_selector: Option<String>,
+    pub decoded_error: Option<String>,
     pub created_at_ms: i64,
 }
 
@@ -134,6 +137,14 @@ impl TryFrom<&SimulationResult> for DbExecutionSimulation {
                 .map(|value| u64_to_i64("block_number", value))
                 .transpose()?,
             error: result.error.clone(),
+            revert_data: result.revert_data.clone(),
+            revert_selector: result.revert_selector.clone(),
+            decoded_error: result
+                .decoded_error
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|error| BackendError::Persistence(error.to_string()))?,
             created_at_ms: result.created_at_ms,
         })
     }
