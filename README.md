@@ -29,6 +29,9 @@ RPC_URL=
 EXECUTOR_FROM_ADDRESS=0x0000000000000000000000000000000000000000
 PERP_MATCHING_ENGINE_ADDRESS=0x0000000000000000000000000000000000000000
 PERP_ENGINE_ADDRESS=0x0000000000000000000000000000000000000000
+PERP_NONCE_SYNC_ENABLED=false
+PERP_NONCE_SYNC_REQUIRE_RPC=true
+PERP_NONCE_SYNC_STRICT=true
 INDEXER_ENABLED=false
 INDEXER_START_BLOCK=0
 INDEXER_POLL_INTERVAL_MS=3000
@@ -54,6 +57,7 @@ EIP712_VERIFYING_CONTRACT=0x0000000000000000000000000000000000000000
 `EXECUTOR_REAL_BROADCAST_ENABLED=false` is the safe default.
 `EXECUTOR_REAL_BROADCAST_ENABLED=true` requires `PERSISTENCE_ENABLED=true`, `EXECUTOR_PRIVATE_KEY`, `RPC_URL`, `EXECUTOR_MAX_FEE_PER_GAS_WEI`, `EXECUTOR_MAX_PRIORITY_FEE_PER_GAS_WEI`, a nonzero `EXECUTOR_CHAIN_ID`, and a nonzero `EXECUTOR_MAX_GAS_LIMIT`.
 `SIMULATION_ENABLED=true` requires `RPC_URL`; when `SIMULATION_REQUIRE_PERSISTENCE=true`, it also requires `PERSISTENCE_ENABLED=true`.
+`PERP_NONCE_SYNC_ENABLED=false` keeps existing local nonce behavior unchanged. When set to `true`, `PERP_NONCE_SYNC_REQUIRE_RPC=true` requires `RPC_URL` and a nonzero `PERP_MATCHING_ENGINE_ADDRESS` at startup. `PERP_NONCE_SYNC_STRICT=true` rejects an order when its nonce does not equal `PerpMatchingEngine.nonces(order.account)`.
 `INDEXER_ENABLED=true` requires `RPC_URL`; when `INDEXER_REQUIRE_PERSISTENCE=true`, it also requires `PERSISTENCE_ENABLED=true`.
 `CONFIRMATION_ENABLED=true` requires `RPC_URL`; when `CONFIRMATION_REQUIRE_PERSISTENCE=true`, it also requires `PERSISTENCE_ENABLED=true`. Confirmation is disabled by default, never broadcasts, and rejects startup if `CONFIRMATION_REQUIRE_RECONCILIATION=false`.
 
@@ -143,6 +147,49 @@ Then simulate:
 ```sh
 curl -X POST http://127.0.0.1:8080/executor/simulate/$INTENT_ID
 ```
+
+## Perp On-chain Nonce Sync V1
+
+Perp nonce sync is opt-in:
+
+```text
+PERP_NONCE_SYNC_ENABLED=false
+PERP_NONCE_SYNC_REQUIRE_RPC=true
+PERP_NONCE_SYNC_STRICT=true
+RPC_URL=https://...
+PERP_MATCHING_ENGINE_ADDRESS=0x774d96E5739bffadEE91508b4D3D74F5BE29F165
+```
+
+Local `used_nonces` protects the backend from accepting the same signed order twice, including across restarts when persistence is enabled. It is not enough for on-chain execution because `PerpMatchingEngine` is canonical and requires `nonces[account] == tradeNonce`. A stale backend-local nonce can therefore pass local replay checks but still revert when the final `PerpTrade` is submitted.
+
+When nonce sync and strict mode are enabled, `POST /orders` reads `PerpMatchingEngine.nonces(order.account)` with `eth_call` and rejects the order before local nonce reservation if `order.nonce` differs from the on-chain value:
+
+```json
+{
+  "error": "perp nonce mismatch: expected on-chain nonce 1, got 0"
+}
+```
+
+Existing local nonce protection remains in place after the on-chain check. With `PERP_NONCE_SYNC_ENABLED=false`, order intake behaves as before and normal tests do not require RPC.
+
+Operators can query the on-chain nonce directly:
+
+```sh
+curl http://127.0.0.1:8080/accounts/0x0000000000000000000000000000000000000001/perp-nonce
+```
+
+Example response:
+
+```json
+{
+  "account": "0x0000000000000000000000000000000000000001",
+  "perp_matching_engine": "0x774d96e5739bffadee91508b4d3d74f5be29f165",
+  "nonce": 1,
+  "source": "onchain"
+}
+```
+
+This prepares the market-maker gateway path by making the backend reject stale taker or maker order nonces before it creates matches and execution intents.
 
 ## RPC Simulation
 
@@ -333,6 +380,7 @@ cargo build
 curl http://127.0.0.1:8080/health
 curl http://127.0.0.1:8080/markets
 curl http://127.0.0.1:8080/orderbook/1
+curl http://127.0.0.1:8080/accounts/0x0000000000000000000000000000000000000001/perp-nonce
 curl http://127.0.0.1:8080/execution-intents
 ```
 
@@ -369,6 +417,7 @@ curl -X DELETE http://127.0.0.1:8080/orders/<order_id>
 - Perp limit orders only.
 - Public API financial quantities are string-encoded fixed-point integers.
 - `POST /orders` uses a signed-order payload with nonce, deadline, and signature fields.
+- Perp on-chain nonce sync is disabled by default; strict sync requires RPC and compares order nonces with `PerpMatchingEngine.nonces(account)` before local nonce reservation.
 - `SIGNATURE_VERIFICATION_MODE=disabled` validates nonce, deadline, and signature shape while skipping cryptographic recovery.
 - `SIGNATURE_VERIFICATION_MODE=strict` verifies the EIP-712 order digest and recovered secp256k1 signer against `account`.
 - FOK is rejected cleanly.

@@ -14,6 +14,7 @@ The long-term backend needs low-latency deterministic matching, RFQ, market-make
 - `engine`: Command/event boundary. It owns market orderbooks and the execution-intent queue.
 - `orderbook`: Pure synchronous matching logic with `BTreeMap` price levels and FIFO `VecDeque` ordering.
 - `execution`: Provisional `ExecutionIntent` records, an in-memory queue, a dry-run executor scaffold, a PerpMatchingEngine calldata builder, manual `eth_call` simulation, and an explicitly gated real broadcast path. No transaction submission exists in the default build.
+- `nonce_sync`: Opt-in Perp on-chain nonce reads from `PerpMatchingEngine.nonces(account)` and strict order-intake validation before backend-local nonce reservation.
 - `indexer`: Opt-in Indexer V1 that reads `PerpMatchingEngine.TradeExecuted` logs with `eth_getLogs`, persists decoded events, and advances a block cursor after persistence succeeds.
 - `reconciliation`: Opt-in Reconciliation V1 that links indexed events to execution intents by direct `onchain_intent_id` equality without marking finality.
 - `confirmation`: Opt-in Confirmation / Finality V1 that reads transaction receipts and block height, then marks submitted execution transactions and intents confirmed only after receipt success, enough blocks, indexed event identity, and matched reconciliation.
@@ -38,12 +39,37 @@ The long-term backend needs low-latency deterministic matching, RFQ, market-make
 - Dev-only local PerpTrade signing CLI for testnet payloads returned by the backend.
 - Manual RPC simulation V1 for calldata-ready intents using `eth_call` only, with revert-data diagnostics on failure.
 - Real Broadcast V1 with transaction request construction, transaction records, disabled-by-default behavior, EIP-1559 signing, pending nonce lookup, chain id checks, and `eth_sendRawTransaction` behind explicit config gates.
+- Perp On-chain Nonce Sync V1 with a disabled-by-default read endpoint and optional strict `POST /orders` nonce equality check against `PerpMatchingEngine.nonces(order.account)`.
 - HTTP endpoints for health, markets, orderbook, orders, cancellation, and execution intents.
 - Signed-order HTTP boundary with nonce/deadline validation, disabled signature shape checks, and strict EIP-712 signer recovery.
 - Optional PostgreSQL persistence V1 guarded by `PERSISTENCE_ENABLED=false` by default.
 - Optional Indexer V1 guarded by `INDEXER_ENABLED=false` by default.
 - Optional Reconciliation V1 guarded by `RECONCILIATION_ENABLED=false` by default.
 - Optional Confirmation / Finality V1 guarded by `CONFIRMATION_ENABLED=false` by default.
+
+## Perp On-chain Nonce Sync V1
+
+Perp On-chain Nonce Sync V1 is disabled by default:
+
+```text
+PERP_NONCE_SYNC_ENABLED=false
+PERP_NONCE_SYNC_REQUIRE_RPC=true
+PERP_NONCE_SYNC_STRICT=true
+```
+
+Local nonce state remains replay protection for the backend, but it is not the canonical nonce source for settlement. The deployed `PerpMatchingEngine` checks `nonces[account] == tradeNonce` when executing the final `PerpTrade`. If backend-local nonce state is stale after testnet resets, restarts, manual executions, or another submitter advancing the on-chain nonce, local `used_nonces` can diverge from `PerpMatchingEngine.nonces(account)`.
+
+When `PERP_NONCE_SYNC_ENABLED=true`, the backend can query:
+
+```text
+PerpMatchingEngine.nonces(address)(uint256)
+```
+
+using `RPC_URL` and `PERP_MATCHING_ENGINE_ADDRESS`. `GET /accounts/:address/perp-nonce` returns the account, matching-engine address, on-chain nonce, and `source=onchain`; when the feature is disabled it returns `perp nonce sync is disabled`. If nonce sync is enabled and `PERP_NONCE_SYNC_REQUIRE_RPC=true`, startup fails unless RPC and a valid nonzero matching-engine address are configured. If startup validation is deferred with `PERP_NONCE_SYNC_REQUIRE_RPC=false`, the endpoint and strict order validation return explicit configuration errors until RPC and contract address are present.
+
+When `PERP_NONCE_SYNC_STRICT=true`, `POST /orders` reads the on-chain nonce before consuming the in-memory or persisted local nonce. The order is accepted into the existing local nonce path only when `order.nonce == PerpMatchingEngine.nonces(order.account)`. Lower and higher nonces are rejected with `perp nonce mismatch: expected on-chain nonce N, got M`. This keeps local replay protection in place while preventing known-stale orders from reaching matching, execution intent creation, simulation, or broadcast preparation.
+
+This is a prerequisite for the market-maker gateway because gateway order flow will depend on continuously correct maker and taker nonces before matched trades are signed and submitted.
 
 ## Indexer V1
 
@@ -115,7 +141,7 @@ HTTP endpoints:
 
 1. Client submits an order to `POST /orders`.
 2. API parses the signed-order DTO with string fixed-point values.
-3. API validates deadline, signature shape/mode, known market, and per-account nonce. Persistent mode reserves the nonce in Postgres so replay protection survives restart.
+3. API validates deadline, signature shape/mode, known market, optional on-chain perp nonce equality, and per-account local nonce. Persistent mode reserves the local nonce in Postgres so replay protection survives restart.
 4. API converts the signed order into a typed `NewOrder`.
 5. Engine creates an `OrderId` and timestamp.
 6. Market orderbook validates non-zero price/size and supported time-in-force.
@@ -191,6 +217,7 @@ Matching decisions are deterministic for a given ordered command stream, market 
 ## Safety Assumptions
 
 - Smart contracts are canonical for final balances, fills, and risk.
+- `PerpMatchingEngine.nonces(account)` is canonical for PerpTrade nonce equality; backend-local `used_nonces` is replay protection only.
 - Off-chain matches are provisional until confirmed on-chain in a later phase.
 - PerpMatchingEngine requires signatures over the exact matched `PerpTrade`; order signatures are not valid substitutes.
 - `simulation_ok` only means an `eth_call` did not revert at the queried block.

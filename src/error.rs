@@ -35,6 +35,10 @@ pub enum BackendError {
     InvalidNonce,
     #[error("nonce has already been used for account")]
     NonceAlreadyUsed,
+    #[error("perp nonce sync is disabled")]
+    PerpNonceSyncDisabled,
+    #[error("perp nonce mismatch: expected on-chain nonce {expected}, got {got}")]
+    PerpNonceMismatch { expected: u64, got: u64 },
     #[error("malformed signature")]
     MalformedSignature,
     #[error("trade signatures are required to build executable PerpMatchingEngine calldata")]

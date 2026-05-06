@@ -17,6 +17,7 @@ use crate::execution::{
     TransactionReceiptProvider, PERP_TRADE_TYPE,
 };
 use crate::indexer::{Indexer, IndexerStatus, IndexerTickResult};
+use crate::nonce_sync::{read_perp_nonce, validate_order_perp_nonce, PerpNonceResponse};
 use crate::reconciliation::{
     decide_direct_reconciliation, DirectReconciliationInput, ExecutionReconciliation,
     ReconciliationCounts, ReconciliationStatus, ReconciliationTickResult,
@@ -38,6 +39,7 @@ pub fn router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/markets", get(markets))
         .route("/orderbook/:market_id", get(orderbook))
+        .route("/accounts/:address/perp-nonce", get(account_perp_nonce))
         .route("/orders", post(submit_order))
         .route("/orders/:order_id", delete(cancel_order))
         .route("/execution-intents", get(execution_intents))
@@ -172,6 +174,8 @@ async fn submit_order(
         return submit_order_persistent(state, repository, signed_order).await;
     }
 
+    validate_perp_nonce_before_local_reserve(&state, &signed_order).await?;
+
     {
         let mut nonces = state.nonces.lock().map_err(|_| ApiError::internal())?;
         nonces.reserve(&signed_order.account, signed_order.nonce)?;
@@ -212,6 +216,8 @@ async fn submit_order_persistent(
     repository: PgRepository,
     signed_order: SignedOrder,
 ) -> Result<Json<SubmitOrderResponse>, ApiError> {
+    validate_perp_nonce_before_local_reserve(&state, &signed_order).await?;
+
     let mut tx = repository.begin().await?;
     repository
         .insert_nonce_tx(&mut tx, &signed_order.account, signed_order.nonce, now_ms())
@@ -232,6 +238,27 @@ async fn submit_order_persistent(
         .map_err(|error| BackendError::Persistence(error.to_string()))?;
 
     Ok(Json(response_from_events(events)))
+}
+
+async fn account_perp_nonce(
+    State(state): State<AppState>,
+    Path(address): Path<String>,
+) -> Result<Json<PerpNonceResponse>, ApiError> {
+    if !state.perp_nonce_sync_config.enabled {
+        return Err(BackendError::PerpNonceSyncDisabled.into());
+    }
+    let rpc_url = state
+        .perp_nonce_sync_config
+        .rpc_url
+        .clone()
+        .ok_or_else(|| {
+            BackendError::Config("RPC_URL is required for perp nonce sync".to_string())
+        })?;
+    let provider = HttpJsonRpcProvider::new(rpc_url);
+    let account = crate::types::AccountId::new(address);
+    Ok(Json(
+        read_perp_nonce(&state.perp_nonce_sync_config, &provider, &account).await?,
+    ))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -995,6 +1022,30 @@ fn confirmation_provider(state: &AppState) -> BackendResult<HttpJsonRpcProvider>
     Ok(HttpJsonRpcProvider::new(rpc_url))
 }
 
+async fn validate_perp_nonce_before_local_reserve(
+    state: &AppState,
+    signed_order: &SignedOrder,
+) -> BackendResult<()> {
+    if !state.perp_nonce_sync_config.enabled || !state.perp_nonce_sync_config.strict {
+        return Ok(());
+    }
+    let rpc_url = state
+        .perp_nonce_sync_config
+        .rpc_url
+        .clone()
+        .ok_or_else(|| {
+            BackendError::Config("RPC_URL is required for perp nonce sync".to_string())
+        })?;
+    let provider = HttpJsonRpcProvider::new(rpc_url);
+    validate_order_perp_nonce(
+        &state.perp_nonce_sync_config,
+        &provider,
+        &signed_order.account,
+        signed_order.nonce,
+    )
+    .await
+}
+
 fn missing_submitted_transaction_decision(state: &AppState) -> ConfirmationDecision {
     ConfirmationDecision {
         confirmation_status: ConfirmationStatus::Failed,
@@ -1485,6 +1536,8 @@ impl From<BackendError> for ApiError {
             BackendError::DeadlineExpired
             | BackendError::InvalidNonce
             | BackendError::NonceAlreadyUsed
+            | BackendError::PerpNonceSyncDisabled
+            | BackendError::PerpNonceMismatch { .. }
             | BackendError::MalformedSignature
             | BackendError::MissingTradeSignatures
             | BackendError::BroadcastRejected(_)

@@ -184,6 +184,23 @@ async fn fixed_point_fields_are_serialized_as_strings_in_orderbook_api() {
 }
 
 #[tokio::test]
+async fn perp_nonce_endpoint_rejects_when_disabled() {
+    let response = router(AppState::new(EngineState::with_default_markets()))
+        .oneshot(
+            Request::builder()
+                .uri("/accounts/0x0000000000000000000000000000000000000001/perp-nonce")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let json = response_json(response).await;
+    assert_eq!(json["error"], "perp nonce sync is disabled");
+}
+
+#[tokio::test]
 async fn post_orders_accepts_string_price_and_size() {
     let app = router(AppState::new(EngineState::with_default_markets()));
     let response = app

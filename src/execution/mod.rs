@@ -24,7 +24,7 @@ pub use perp_trade::{
 pub use queue::ExecutionQueue;
 pub use revert::{DecodedRevertError, RevertDiagnostics};
 pub use rpc::{
-    EthCallProvider, EthCallRequest, EthCallSuccess, HttpJsonRpcProvider,
+    EthCallProvider, EthCallRequest, EthCallSuccess, HttpJsonRpcProvider, RpcFuture,
     TransactionBroadcastProvider, TransactionReceiptProvider,
 };
 pub use runner::spawn_executor;

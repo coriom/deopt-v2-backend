@@ -2,6 +2,7 @@ use crate::confirmation::ConfirmationConfig;
 use crate::error::{BackendError, Result};
 use crate::execution::{ExecutionConfig, PrivateKeySecret};
 use crate::indexer::IndexerConfig;
+use crate::nonce_sync::PerpNonceSyncConfig;
 use crate::reconciliation::ReconciliationConfig;
 use crate::signing::signature::SignatureVerificationMode;
 use crate::signing::Eip712Domain;
@@ -17,6 +18,7 @@ pub struct AppConfig {
     pub chain_id: u64,
     pub network_name: String,
     pub execution: ExecutionConfig,
+    pub perp_nonce_sync: PerpNonceSyncConfig,
     pub confirmation: ConfirmationConfig,
     pub indexer: IndexerConfig,
     pub reconciliation: ReconciliationConfig,
@@ -119,6 +121,13 @@ impl AppConfig {
             )?,
             rpc_url: execution.rpc_url.clone(),
         };
+        let perp_nonce_sync = PerpNonceSyncConfig {
+            enabled: parse_env(&mut lookup, "PERP_NONCE_SYNC_ENABLED", "false")?,
+            require_rpc: parse_env(&mut lookup, "PERP_NONCE_SYNC_REQUIRE_RPC", "true")?,
+            strict: parse_env(&mut lookup, "PERP_NONCE_SYNC_STRICT", "true")?,
+            rpc_url: execution.rpc_url.clone(),
+            perp_matching_engine_address: execution.perp_matching_engine_address.clone(),
+        };
         let signature_verification_mode =
             parse_env(&mut lookup, "SIGNATURE_VERIFICATION_MODE", "disabled")?;
         let eip712_domain = Eip712Domain {
@@ -140,6 +149,7 @@ impl AppConfig {
             ));
         }
         execution.validate_startup(persistence_enabled)?;
+        perp_nonce_sync.validate_startup()?;
         indexer.validate_startup(persistence_enabled)?;
         reconciliation.validate_startup(persistence_enabled)?;
         confirmation.validate_startup(persistence_enabled)?;
@@ -151,6 +161,7 @@ impl AppConfig {
             chain_id,
             network_name,
             execution,
+            perp_nonce_sync,
             confirmation,
             indexer,
             reconciliation,
@@ -245,6 +256,58 @@ mod tests {
         assert_eq!(config.execution.rpc_url, None);
         assert!(!config.execution.simulation_enabled);
         assert!(config.execution.simulation_requires_persistence);
+    }
+
+    #[test]
+    fn perp_nonce_sync_uses_safe_defaults() {
+        let config = config_from_pairs([("PERP_NONCE_SYNC_ENABLED", "false")]).unwrap();
+
+        assert!(!config.perp_nonce_sync.enabled);
+        assert!(config.perp_nonce_sync.require_rpc);
+        assert!(config.perp_nonce_sync.strict);
+    }
+
+    #[test]
+    fn perp_nonce_sync_enabled_requires_rpc_when_required() {
+        let error = config_from_pairs([
+            ("PERP_NONCE_SYNC_ENABLED", "true"),
+            ("PERP_NONCE_SYNC_REQUIRE_RPC", "true"),
+            (
+                "PERP_MATCHING_ENGINE_ADDRESS",
+                "0x774d96E5739bffadEE91508b4D3D74F5BE29F165",
+            ),
+        ])
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("RPC_URL is required for perp nonce sync"));
+    }
+
+    #[test]
+    fn perp_nonce_sync_enabled_requires_matching_engine_when_required() {
+        let error = config_from_pairs([
+            ("PERP_NONCE_SYNC_ENABLED", "true"),
+            ("PERP_NONCE_SYNC_REQUIRE_RPC", "true"),
+            ("RPC_URL", "https://example.invalid"),
+        ])
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("PERP_MATCHING_ENGINE_ADDRESS is required for perp nonce sync"));
+    }
+
+    #[test]
+    fn perp_nonce_sync_enabled_can_defer_rpc_validation() {
+        let config = config_from_pairs([
+            ("PERP_NONCE_SYNC_ENABLED", "true"),
+            ("PERP_NONCE_SYNC_REQUIRE_RPC", "false"),
+        ])
+        .unwrap();
+
+        assert!(config.perp_nonce_sync.enabled);
+        assert!(!config.perp_nonce_sync.require_rpc);
     }
 
     #[test]

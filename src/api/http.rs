@@ -3,6 +3,7 @@ use crate::db::PgRepository;
 use crate::engine::EngineState;
 use crate::execution::{ExecutionConfig, StoredTradeSignatures};
 use crate::indexer::IndexerConfig;
+use crate::nonce_sync::PerpNonceSyncConfig;
 use crate::reconciliation::ReconciliationConfig;
 use crate::signing::{Eip712Domain, NonceStore, SignatureVerificationMode};
 use std::collections::HashMap;
@@ -18,6 +19,7 @@ pub struct AppState {
     pub chain_id: u64,
     pub repository: Option<PgRepository>,
     pub execution_config: ExecutionConfig,
+    pub perp_nonce_sync_config: PerpNonceSyncConfig,
     pub confirmation_config: ConfirmationConfig,
     pub indexer_config: IndexerConfig,
     pub reconciliation_config: ReconciliationConfig,
@@ -127,6 +129,7 @@ impl AppState {
             eip712_domain,
             repository,
             execution_config,
+            PerpNonceSyncConfig::disabled(),
             ConfirmationConfig::disabled(),
             indexer_config,
             reconciliation_config,
@@ -141,6 +144,7 @@ impl AppState {
         eip712_domain: Eip712Domain,
         repository: Option<PgRepository>,
         execution_config: ExecutionConfig,
+        perp_nonce_sync_config: PerpNonceSyncConfig,
         confirmation_config: ConfirmationConfig,
         indexer_config: IndexerConfig,
         reconciliation_config: ReconciliationConfig,
@@ -154,6 +158,7 @@ impl AppState {
             chain_id,
             repository,
             execution_config,
+            perp_nonce_sync_config,
             confirmation_config,
             indexer_config,
             reconciliation_config,
