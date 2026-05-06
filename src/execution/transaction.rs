@@ -1,3 +1,4 @@
+use crate::confirmation::ConfirmationStatus;
 use crate::error::{BackendError, Result};
 use crate::execution::{
     build_perp_execution_call_from_intent, intent_id_to_hex_bytes32, ExecutionConfig,
@@ -52,6 +53,10 @@ pub struct ExecutionTransaction {
     pub tx_hash: Option<String>,
     pub status: ExecutionTransactionStatus,
     pub error: Option<String>,
+    pub confirmed_at_ms: Option<TimestampMs>,
+    pub confirmed_block_number: Option<u64>,
+    pub confirmation_status: Option<ConfirmationStatus>,
+    pub confirmation_error: Option<String>,
     pub created_at_ms: TimestampMs,
     pub updated_at_ms: TimestampMs,
 }
@@ -403,6 +408,10 @@ mod tests {
             tx_hash: None,
             status: ExecutionTransactionStatus::Rejected,
             error: Some("broadcast disabled".to_string()),
+            confirmed_at_ms: None,
+            confirmed_block_number: None,
+            confirmation_status: None,
+            confirmation_error: None,
             created_at_ms: 123,
             updated_at_ms: 123,
         };

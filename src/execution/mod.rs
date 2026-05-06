@@ -25,7 +25,7 @@ pub use queue::ExecutionQueue;
 pub use revert::{DecodedRevertError, RevertDiagnostics};
 pub use rpc::{
     EthCallProvider, EthCallRequest, EthCallSuccess, HttpJsonRpcProvider,
-    TransactionBroadcastProvider,
+    TransactionBroadcastProvider, TransactionReceiptProvider,
 };
 pub use runner::spawn_executor;
 pub use signer::ExecutorSigner;

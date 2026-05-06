@@ -1,3 +1,4 @@
+use crate::confirmation::ConfirmationConfig;
 use crate::error::{BackendError, Result};
 use crate::execution::{ExecutionConfig, PrivateKeySecret};
 use crate::indexer::IndexerConfig;
@@ -16,6 +17,7 @@ pub struct AppConfig {
     pub chain_id: u64,
     pub network_name: String,
     pub execution: ExecutionConfig,
+    pub confirmation: ConfirmationConfig,
     pub indexer: IndexerConfig,
     pub reconciliation: ReconciliationConfig,
     pub signature_verification_mode: SignatureVerificationMode,
@@ -101,6 +103,22 @@ impl AppConfig {
             )?,
             max_batch_size: parse_env(&mut lookup, "RECONCILIATION_MAX_BATCH_SIZE", "100")?,
         };
+        let confirmation = ConfirmationConfig {
+            enabled: parse_env(&mut lookup, "CONFIRMATION_ENABLED", "false")?,
+            require_persistence: parse_env(
+                &mut lookup,
+                "CONFIRMATION_REQUIRE_PERSISTENCE",
+                "true",
+            )?,
+            required_blocks: parse_env(&mut lookup, "CONFIRMATION_REQUIRED_BLOCKS", "2")?,
+            max_batch_size: parse_env(&mut lookup, "CONFIRMATION_MAX_BATCH_SIZE", "50")?,
+            require_reconciliation: parse_env(
+                &mut lookup,
+                "CONFIRMATION_REQUIRE_RECONCILIATION",
+                "true",
+            )?,
+            rpc_url: execution.rpc_url.clone(),
+        };
         let signature_verification_mode =
             parse_env(&mut lookup, "SIGNATURE_VERIFICATION_MODE", "disabled")?;
         let eip712_domain = Eip712Domain {
@@ -124,6 +142,7 @@ impl AppConfig {
         execution.validate_startup(persistence_enabled)?;
         indexer.validate_startup(persistence_enabled)?;
         reconciliation.validate_startup(persistence_enabled)?;
+        confirmation.validate_startup(persistence_enabled)?;
 
         Ok(Self {
             host,
@@ -132,6 +151,7 @@ impl AppConfig {
             chain_id,
             network_name,
             execution,
+            confirmation,
             indexer,
             reconciliation,
             signature_verification_mode,
@@ -474,6 +494,61 @@ mod tests {
         assert!(!config.reconciliation.enabled);
         assert!(config.reconciliation.require_persistence);
         assert_eq!(config.reconciliation.max_batch_size, 100);
+    }
+
+    #[test]
+    fn confirmation_config_uses_safe_defaults() {
+        let config = config_from_pairs([("PERSISTENCE_ENABLED", "false")]).unwrap();
+
+        assert!(!config.confirmation.enabled);
+        assert!(config.confirmation.require_persistence);
+        assert_eq!(config.confirmation.required_blocks, 2);
+        assert_eq!(config.confirmation.max_batch_size, 50);
+        assert!(config.confirmation.require_reconciliation);
+        assert_eq!(config.confirmation.rpc_url, None);
+    }
+
+    #[test]
+    fn confirmation_enabled_requires_rpc_url() {
+        let error = config_from_pairs([
+            ("CONFIRMATION_ENABLED", "true"),
+            ("CONFIRMATION_REQUIRE_PERSISTENCE", "false"),
+        ])
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("RPC_URL is required when CONFIRMATION_ENABLED=true"));
+    }
+
+    #[test]
+    fn confirmation_requiring_persistence_rejects_persistence_disabled() {
+        let error = config_from_pairs([
+            ("CONFIRMATION_ENABLED", "true"),
+            ("CONFIRMATION_REQUIRE_PERSISTENCE", "true"),
+            ("RPC_URL", "https://example.invalid"),
+            ("PERSISTENCE_ENABLED", "false"),
+        ])
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("confirmation requires persistence enabled"));
+    }
+
+    #[test]
+    fn confirmation_enabled_rejects_reconciliation_disabled() {
+        let error = config_from_pairs([
+            ("CONFIRMATION_ENABLED", "true"),
+            ("CONFIRMATION_REQUIRE_PERSISTENCE", "false"),
+            ("CONFIRMATION_REQUIRE_RECONCILIATION", "false"),
+            ("RPC_URL", "https://example.invalid"),
+        ])
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("CONFIRMATION_REQUIRE_RECONCILIATION must be true"));
     }
 
     #[test]

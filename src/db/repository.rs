@@ -3,6 +3,7 @@ use super::models::{
     DbExecutionSimulation, DbOrder, DbTrade,
 };
 use super::pool;
+use crate::confirmation::{ConfirmationDecision, ConfirmationStatus};
 use crate::engine::EngineEvent;
 use crate::error::{BackendError, Result};
 use crate::execution::{
@@ -512,7 +513,8 @@ impl PgRepository {
     ) -> Result<Vec<ExecutionTransaction>> {
         let rows = sqlx::query(
             "SELECT transaction_id, intent_id, onchain_intent_id, target, calldata, value_wei,
-                    tx_hash, status, error, created_at_ms, updated_at_ms
+                    tx_hash, status, error, confirmed_at_ms, confirmed_block_number,
+                    confirmation_status, confirmation_error, created_at_ms, updated_at_ms
              FROM execution_transactions
              WHERE intent_id = $1
              ORDER BY created_at_ms DESC, transaction_id DESC",
@@ -533,7 +535,8 @@ impl PgRepository {
     ) -> Result<Vec<ExecutionTransaction>> {
         let rows = sqlx::query(
             "SELECT transaction_id, intent_id, onchain_intent_id, target, calldata, value_wei,
-                    tx_hash, status, error, created_at_ms, updated_at_ms
+                    tx_hash, status, error, confirmed_at_ms, confirmed_block_number,
+                    confirmation_status, confirmation_error, created_at_ms, updated_at_ms
              FROM execution_transactions
              ORDER BY created_at_ms DESC, transaction_id DESC
              LIMIT $1",
@@ -554,7 +557,8 @@ impl PgRepository {
     ) -> Result<Option<ExecutionTransaction>> {
         let row = sqlx::query(
             "SELECT transaction_id, intent_id, onchain_intent_id, target, calldata, value_wei,
-                    tx_hash, status, error, created_at_ms, updated_at_ms
+                    tx_hash, status, error, confirmed_at_ms, confirmed_block_number,
+                    confirmation_status, confirmation_error, created_at_ms, updated_at_ms
              FROM execution_transactions
              WHERE intent_id = $1 AND status = 'submitted'
              ORDER BY created_at_ms DESC, transaction_id DESC
@@ -566,6 +570,133 @@ impl PgRepository {
         .map_err(|error| BackendError::Persistence(error.to_string()))?;
 
         row.map(execution_transaction_from_row).transpose()
+    }
+
+    pub async fn list_submitted_unconfirmed_execution_transactions(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<ExecutionTransaction>> {
+        let rows = sqlx::query(
+            "SELECT transaction_id, intent_id, onchain_intent_id, target, calldata, value_wei,
+                    tx_hash, status, error, confirmed_at_ms, confirmed_block_number,
+                    confirmation_status, confirmation_error, created_at_ms, updated_at_ms
+             FROM execution_transactions
+             WHERE status = 'submitted'
+               AND tx_hash IS NOT NULL
+               AND COALESCE(confirmation_status, 'pending') <> 'confirmed'
+             ORDER BY created_at_ms ASC, transaction_id ASC
+             LIMIT $1",
+        )
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+
+        rows.into_iter()
+            .map(execution_transaction_from_row)
+            .collect()
+    }
+
+    pub async fn has_indexed_trade_for_confirmation(
+        &self,
+        tx_hash: &str,
+        onchain_intent_id: &str,
+    ) -> Result<bool> {
+        let row = sqlx::query(
+            "SELECT 1
+             FROM indexed_perp_trades
+             WHERE lower(tx_hash) = lower($1) AND lower(onchain_intent_id) = lower($2)
+             LIMIT 1",
+        )
+        .bind(tx_hash.to_ascii_lowercase())
+        .bind(onchain_intent_id.to_ascii_lowercase())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        Ok(row.is_some())
+    }
+
+    pub async fn has_matched_reconciliation_for_confirmation(
+        &self,
+        intent_id: Uuid,
+        onchain_intent_id: &str,
+        tx_hash: &str,
+    ) -> Result<bool> {
+        let row = sqlx::query(
+            "SELECT 1
+             FROM execution_reconciliations
+             WHERE intent_id = $1
+               AND lower(onchain_intent_id) = lower($2)
+               AND lower(tx_hash) = lower($3)
+               AND status = 'matched'
+             LIMIT 1",
+        )
+        .bind(intent_id.to_string())
+        .bind(onchain_intent_id.to_ascii_lowercase())
+        .bind(tx_hash.to_ascii_lowercase())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        Ok(row.is_some())
+    }
+
+    pub async fn apply_confirmation_decision(
+        &self,
+        transaction_id: &str,
+        intent_id: Uuid,
+        decision: &ConfirmationDecision,
+        now_ms: TimestampMs,
+    ) -> Result<()> {
+        let mut tx = self.begin().await?;
+        sqlx::query(
+            "UPDATE execution_transactions
+             SET confirmation_status = $2,
+                 confirmation_error = $3,
+                 confirmed_at_ms = CASE WHEN $2 = 'confirmed' THEN COALESCE(confirmed_at_ms, $4) ELSE confirmed_at_ms END,
+                 confirmed_block_number = CASE WHEN $2 = 'confirmed' THEN $5 ELSE confirmed_block_number END,
+                 updated_at_ms = $4
+             WHERE transaction_id = $1",
+        )
+        .bind(transaction_id)
+        .bind(decision.confirmation_status.as_str())
+        .bind(&decision.reason)
+        .bind(timestamp_to_i64(now_ms))
+        .bind(
+            decision
+                .receipt_block_number
+                .map(|value| u64_to_i64("confirmed_block_number", value))
+                .transpose()?,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+
+        if decision.confirmed {
+            update_execution_intent_status_tx(
+                &mut tx,
+                &intent_id.to_string(),
+                ExecutionIntentStatus::Confirmed,
+                now_ms,
+            )
+            .await?;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|error| BackendError::Persistence(error.to_string()))
+    }
+
+    pub async fn count_confirmed_execution_transactions(&self) -> Result<u64> {
+        let row = sqlx::query(
+            "SELECT COUNT(*) AS count
+             FROM execution_transactions
+             WHERE confirmation_status = 'confirmed'",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        let count: i64 = row_get(&row, "count")?;
+        i64_to_u64_persistence("count", count)
     }
 }
 
@@ -855,8 +986,9 @@ async fn insert_execution_transaction(
     let result = sqlx::query(
         "INSERT INTO execution_transactions (
             transaction_id, intent_id, onchain_intent_id, target, calldata, value_wei,
-            tx_hash, status, error, created_at_ms, updated_at_ms
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+            tx_hash, status, error, confirmed_at_ms, confirmed_block_number,
+            confirmation_status, confirmation_error, created_at_ms, updated_at_ms
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
     )
     .bind(&transaction.transaction_id)
     .bind(transaction.intent_id.to_string())
@@ -867,6 +999,19 @@ async fn insert_execution_transaction(
     .bind(&transaction.tx_hash)
     .bind(transaction.status.as_str())
     .bind(&transaction.error)
+    .bind(transaction.confirmed_at_ms.map(timestamp_to_i64))
+    .bind(
+        transaction
+            .confirmed_block_number
+            .map(|value| u64_to_i64("confirmed_block_number", value))
+            .transpose()?,
+    )
+    .bind(
+        transaction
+            .confirmation_status
+            .map(ConfirmationStatus::as_str),
+    )
+    .bind(&transaction.confirmation_error)
     .bind(timestamp_to_i64(transaction.created_at_ms))
     .bind(timestamp_to_i64(transaction.updated_at_ms))
     .execute(pool)
@@ -973,6 +1118,8 @@ fn execution_reconciliation_from_row(row: PgRow) -> Result<ExecutionReconciliati
 fn execution_transaction_from_row(row: PgRow) -> Result<ExecutionTransaction> {
     let intent_id: String = row_get(&row, "intent_id")?;
     let status: String = row_get(&row, "status")?;
+    let confirmed_block_number: Option<i64> = row_get(&row, "confirmed_block_number")?;
+    let confirmation_status: Option<String> = row_get(&row, "confirmation_status")?;
     Ok(ExecutionTransaction {
         transaction_id: row_get(&row, "transaction_id")?,
         intent_id: Uuid::parse_str(&intent_id)
@@ -984,6 +1131,15 @@ fn execution_transaction_from_row(row: PgRow) -> Result<ExecutionTransaction> {
         tx_hash: row_get(&row, "tx_hash")?,
         status: ExecutionTransactionStatus::parse(&status)?,
         error: row_get(&row, "error")?,
+        confirmed_at_ms: row_get(&row, "confirmed_at_ms")?,
+        confirmed_block_number: confirmed_block_number
+            .map(|value| i64_to_u64_persistence("confirmed_block_number", value))
+            .transpose()?,
+        confirmation_status: confirmation_status
+            .as_deref()
+            .map(ConfirmationStatus::parse)
+            .transpose()?,
+        confirmation_error: row_get(&row, "confirmation_error")?,
         created_at_ms: row_get(&row, "created_at_ms")?,
         updated_at_ms: row_get(&row, "updated_at_ms")?,
     })

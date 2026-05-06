@@ -1,3 +1,4 @@
+use crate::confirmation::ConfirmationConfig;
 use crate::db::PgRepository;
 use crate::engine::EngineState;
 use crate::execution::{ExecutionConfig, StoredTradeSignatures};
@@ -17,6 +18,7 @@ pub struct AppState {
     pub chain_id: u64,
     pub repository: Option<PgRepository>,
     pub execution_config: ExecutionConfig,
+    pub confirmation_config: ConfirmationConfig,
     pub indexer_config: IndexerConfig,
     pub reconciliation_config: ReconciliationConfig,
     pub trade_signatures: Arc<Mutex<HashMap<Uuid, StoredTradeSignatures>>>,
@@ -119,6 +121,31 @@ impl AppState {
         reconciliation_config: ReconciliationConfig,
         chain_id: u64,
     ) -> Self {
+        Self::with_all_config(
+            engine,
+            signature_verification_mode,
+            eip712_domain,
+            repository,
+            execution_config,
+            ConfirmationConfig::disabled(),
+            indexer_config,
+            reconciliation_config,
+            chain_id,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_all_config(
+        engine: EngineState,
+        signature_verification_mode: SignatureVerificationMode,
+        eip712_domain: Eip712Domain,
+        repository: Option<PgRepository>,
+        execution_config: ExecutionConfig,
+        confirmation_config: ConfirmationConfig,
+        indexer_config: IndexerConfig,
+        reconciliation_config: ReconciliationConfig,
+        chain_id: u64,
+    ) -> Self {
         Self {
             engine: Arc::new(Mutex::new(engine)),
             nonces: Arc::new(Mutex::new(NonceStore::new())),
@@ -127,6 +154,7 @@ impl AppState {
             chain_id,
             repository,
             execution_config,
+            confirmation_config,
             indexer_config,
             reconciliation_config,
             trade_signatures: Arc::new(Mutex::new(HashMap::new())),

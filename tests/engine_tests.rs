@@ -646,6 +646,50 @@ async fn reconciliation_tick_rejects_when_disabled() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
+#[tokio::test]
+async fn confirmation_status_api_reports_safe_defaults() {
+    let response = router(AppState::new(EngineState::with_default_markets()))
+        .oneshot(
+            Request::builder()
+                .uri("/executor/confirmations/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = response_json(response).await;
+    assert_eq!(json["confirmationEnabled"], false);
+    assert_eq!(json["persistenceRequired"], true);
+    assert_eq!(json["rpcConfigured"], false);
+    assert_eq!(json["requiredConfirmations"], 2);
+    assert_eq!(json["maxBatchSize"], 50);
+    assert_eq!(json["requireReconciliation"], true);
+    assert_eq!(json["confirmed"], 0);
+}
+
+#[tokio::test]
+async fn confirmation_manual_endpoint_rejects_when_disabled() {
+    let response = router(AppState::new(EngineState::with_default_markets()))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/executor/confirm/00000000-0000-0000-0000-000000000001")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let json = response_json(response).await;
+    assert!(json["error"]
+        .as_str()
+        .unwrap()
+        .contains("confirmation is disabled"));
+}
+
 #[test]
 fn indexer_default_does_not_claim_confirmation_lifecycle() {
     let status = IndexerConfig::disabled().status(0);

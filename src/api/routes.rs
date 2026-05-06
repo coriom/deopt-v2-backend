@@ -2,6 +2,9 @@ use super::AppState;
 use crate::api::dto::{
     ApiEngineEvent, ApiExecutionIntent, SubmitOrderRequest, SubmitOrderResponse,
 };
+use crate::confirmation::{
+    decide_confirmation, ConfirmationDecision, ConfirmationDecisionInput, ConfirmationStatus,
+};
 use crate::db::PgRepository;
 use crate::engine::{EngineCommand, EngineEvent};
 use crate::error::{BackendError, Result as BackendResult};
@@ -10,7 +13,8 @@ use crate::execution::{
     perp_trade_digest, simulate_execution_intent, DecodedRevertError, ExecutionIntentStatus,
     ExecutionTransaction, ExecutionTransactionStatus, Executor, ExecutorSigner,
     HttpJsonRpcProvider, PerpTradeDomain, PerpTradePayload, SimulationResult,
-    StoredTradeSignatures, TradeSignatureStatus, TransactionBroadcastProvider, PERP_TRADE_TYPE,
+    StoredTradeSignatures, TradeSignatureStatus, TransactionBroadcastProvider,
+    TransactionReceiptProvider, PERP_TRADE_TYPE,
 };
 use crate::indexer::{Indexer, IndexerStatus, IndexerTickResult};
 use crate::reconciliation::{
@@ -59,6 +63,16 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/executor/transactions/:intent_id",
             get(executor_transactions_for_intent),
+        )
+        .route("/executor/confirmations/status", get(confirmation_status))
+        .route(
+            "/executor/confirm/:intent_id",
+            post(confirm_executor_intent),
+        )
+        .route("/executor/confirmations/tick", post(confirmation_tick))
+        .route(
+            "/executor/confirmations/:intent_id",
+            get(confirmation_for_intent),
         )
         .route("/indexer/status", get(indexer_status))
         .route("/indexer/tick", post(indexer_tick))
@@ -648,6 +662,10 @@ fn execution_transaction_from_request(
         tx_hash,
         status,
         error,
+        confirmed_at_ms: None,
+        confirmed_block_number: None,
+        confirmation_status: None,
+        confirmation_error: None,
         created_at_ms: now,
         updated_at_ms: now,
     }
@@ -682,6 +700,313 @@ async fn executor_transactions_for_intent(
     Ok(Json(
         repository.get_transactions_for_intent(intent_id).await?,
     ))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct ConfirmationStatusResponse {
+    #[serde(rename = "confirmationEnabled")]
+    confirmation_enabled: bool,
+    #[serde(rename = "persistenceRequired")]
+    persistence_required: bool,
+    #[serde(rename = "rpcConfigured")]
+    rpc_configured: bool,
+    #[serde(rename = "requiredConfirmations")]
+    required_confirmations: u64,
+    #[serde(rename = "maxBatchSize")]
+    max_batch_size: u32,
+    #[serde(rename = "requireReconciliation")]
+    require_reconciliation: bool,
+    confirmed: u64,
+}
+
+async fn confirmation_status(
+    State(state): State<AppState>,
+) -> Result<Json<ConfirmationStatusResponse>, ApiError> {
+    let confirmed = if let Some(repository) = state.repository.clone() {
+        repository.count_confirmed_execution_transactions().await?
+    } else {
+        0
+    };
+
+    Ok(Json(ConfirmationStatusResponse {
+        confirmation_enabled: state.confirmation_config.enabled,
+        persistence_required: state.confirmation_config.require_persistence,
+        rpc_configured: state.confirmation_config.rpc_url.is_some(),
+        required_confirmations: state.confirmation_config.required_blocks,
+        max_batch_size: state.confirmation_config.max_batch_size,
+        require_reconciliation: state.confirmation_config.require_reconciliation,
+        confirmed,
+    }))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct ConfirmationResponse {
+    intent_id: Uuid,
+    tx_hash: Option<String>,
+    confirmation_status: ConfirmationStatus,
+    confirmed: bool,
+    receipt_status: Option<u64>,
+    receipt_block_number: Option<u64>,
+    current_block_number: Option<u64>,
+    required_confirmations: u64,
+    indexed_event_found: bool,
+    reconciliation_matched: bool,
+    reason: Option<String>,
+}
+
+impl ConfirmationResponse {
+    fn from_decision(
+        intent_id: Uuid,
+        tx_hash: Option<String>,
+        decision: ConfirmationDecision,
+    ) -> Self {
+        Self {
+            intent_id,
+            tx_hash,
+            confirmation_status: decision.confirmation_status,
+            confirmed: decision.confirmed,
+            receipt_status: decision.receipt_status,
+            receipt_block_number: decision.receipt_block_number,
+            current_block_number: decision.current_block_number,
+            required_confirmations: decision.required_confirmations,
+            indexed_event_found: decision.indexed_event_found,
+            reconciliation_matched: decision.reconciliation_matched,
+            reason: decision.reason,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct ConfirmationTickResponse {
+    processed: usize,
+    confirmed: usize,
+    pending: usize,
+    failed: usize,
+    results: Vec<ConfirmationResponse>,
+}
+
+async fn confirm_executor_intent(
+    State(state): State<AppState>,
+    Path(intent_id): Path<String>,
+) -> Result<Json<ConfirmationResponse>, ApiError> {
+    ensure_confirmation_enabled(&state)?;
+    let repository = confirmation_repository(&state)?;
+    let provider = confirmation_provider(&state)?;
+    let intent_id = parse_uuid(&intent_id)?;
+    let Some(transaction) = repository
+        .find_submitted_transaction_by_intent(intent_id)
+        .await?
+    else {
+        return Ok(Json(ConfirmationResponse::from_decision(
+            intent_id,
+            None,
+            missing_submitted_transaction_decision(&state),
+        )));
+    };
+
+    Ok(Json(
+        confirm_transaction(&state, &repository, &provider, transaction).await?,
+    ))
+}
+
+async fn confirmation_tick(
+    State(state): State<AppState>,
+) -> Result<Json<ConfirmationTickResponse>, ApiError> {
+    ensure_confirmation_enabled(&state)?;
+    let repository = confirmation_repository(&state)?;
+    let provider = confirmation_provider(&state)?;
+    let transactions = repository
+        .list_submitted_unconfirmed_execution_transactions(state.confirmation_config.max_batch_size)
+        .await?;
+    let mut results = Vec::with_capacity(transactions.len());
+    for transaction in transactions {
+        results.push(confirm_transaction(&state, &repository, &provider, transaction).await?);
+    }
+    let confirmed = results.iter().filter(|result| result.confirmed).count();
+    let failed = results
+        .iter()
+        .filter(|result| result.confirmation_status == ConfirmationStatus::Failed)
+        .count();
+    let pending = results.len().saturating_sub(confirmed + failed);
+
+    Ok(Json(ConfirmationTickResponse {
+        processed: results.len(),
+        confirmed,
+        pending,
+        failed,
+        results,
+    }))
+}
+
+async fn confirmation_for_intent(
+    State(state): State<AppState>,
+    Path(intent_id): Path<String>,
+) -> Result<Json<ConfirmationResponse>, ApiError> {
+    let repository = confirmation_repository(&state)?;
+    let intent_id = parse_uuid(&intent_id)?;
+    let Some(transaction) = repository
+        .find_submitted_transaction_by_intent(intent_id)
+        .await?
+    else {
+        return Ok(Json(ConfirmationResponse::from_decision(
+            intent_id,
+            None,
+            missing_submitted_transaction_decision(&state),
+        )));
+    };
+
+    Ok(Json(ConfirmationResponse {
+        intent_id,
+        tx_hash: transaction.tx_hash,
+        confirmation_status: transaction
+            .confirmation_status
+            .unwrap_or(ConfirmationStatus::Pending),
+        confirmed: transaction.confirmation_status == Some(ConfirmationStatus::Confirmed),
+        receipt_status: None,
+        receipt_block_number: transaction.confirmed_block_number,
+        current_block_number: None,
+        required_confirmations: state.confirmation_config.required_blocks,
+        indexed_event_found: false,
+        reconciliation_matched: false,
+        reason: transaction.confirmation_error,
+    }))
+}
+
+async fn confirm_transaction(
+    state: &AppState,
+    repository: &PgRepository,
+    provider: &HttpJsonRpcProvider,
+    transaction: ExecutionTransaction,
+) -> BackendResult<ConfirmationResponse> {
+    let tx_hash = transaction.tx_hash.clone();
+    let Some(tx_hash_value) = tx_hash.clone() else {
+        let decision = ConfirmationDecision {
+            confirmation_status: ConfirmationStatus::Failed,
+            confirmed: false,
+            receipt_status: None,
+            receipt_block_number: None,
+            current_block_number: None,
+            required_confirmations: state.confirmation_config.required_blocks,
+            indexed_event_found: false,
+            reconciliation_matched: false,
+            reason: Some("submitted transaction hash not found".to_string()),
+        };
+        repository
+            .apply_confirmation_decision(
+                &transaction.transaction_id,
+                transaction.intent_id,
+                &decision,
+                now_ms(),
+            )
+            .await?;
+        return Ok(ConfirmationResponse::from_decision(
+            transaction.intent_id,
+            tx_hash,
+            decision,
+        ));
+    };
+    let Some(onchain_intent_id) = transaction.onchain_intent_id.as_deref() else {
+        let decision = ConfirmationDecision {
+            confirmation_status: ConfirmationStatus::Failed,
+            confirmed: false,
+            receipt_status: None,
+            receipt_block_number: None,
+            current_block_number: None,
+            required_confirmations: state.confirmation_config.required_blocks,
+            indexed_event_found: false,
+            reconciliation_matched: false,
+            reason: Some("onchain intent id not found for submitted transaction".to_string()),
+        };
+        repository
+            .apply_confirmation_decision(
+                &transaction.transaction_id,
+                transaction.intent_id,
+                &decision,
+                now_ms(),
+            )
+            .await?;
+        return Ok(ConfirmationResponse::from_decision(
+            transaction.intent_id,
+            tx_hash,
+            decision,
+        ));
+    };
+
+    let receipt = provider.transaction_receipt(tx_hash_value.clone()).await?;
+    let current_block_number = if receipt.is_some() {
+        Some(provider.block_number().await?)
+    } else {
+        None
+    };
+    let indexed_event_found = repository
+        .has_indexed_trade_for_confirmation(&tx_hash_value, onchain_intent_id)
+        .await?;
+    let reconciliation_matched = repository
+        .has_matched_reconciliation_for_confirmation(
+            transaction.intent_id,
+            onchain_intent_id,
+            &tx_hash_value,
+        )
+        .await?;
+    let decision = decide_confirmation(&ConfirmationDecisionInput {
+        tx_hash: tx_hash.clone(),
+        receipt,
+        current_block_number,
+        required_confirmations: state.confirmation_config.required_blocks,
+        indexed_event_found,
+        reconciliation_matched,
+        require_reconciliation: state.confirmation_config.require_reconciliation,
+    });
+    repository
+        .apply_confirmation_decision(
+            &transaction.transaction_id,
+            transaction.intent_id,
+            &decision,
+            now_ms(),
+        )
+        .await?;
+
+    Ok(ConfirmationResponse::from_decision(
+        transaction.intent_id,
+        tx_hash,
+        decision,
+    ))
+}
+
+fn ensure_confirmation_enabled(state: &AppState) -> BackendResult<()> {
+    if state.confirmation_config.enabled {
+        Ok(())
+    } else {
+        Err(BackendError::Config("confirmation is disabled".to_string()))
+    }
+}
+
+fn confirmation_repository(state: &AppState) -> BackendResult<PgRepository> {
+    state.repository.clone().ok_or_else(|| {
+        BackendError::Config("confirmation requires persistence enabled".to_string())
+    })
+}
+
+fn confirmation_provider(state: &AppState) -> BackendResult<HttpJsonRpcProvider> {
+    let rpc_url =
+        state.confirmation_config.rpc_url.clone().ok_or_else(|| {
+            BackendError::Config("RPC_URL is required for confirmation".to_string())
+        })?;
+    Ok(HttpJsonRpcProvider::new(rpc_url))
+}
+
+fn missing_submitted_transaction_decision(state: &AppState) -> ConfirmationDecision {
+    ConfirmationDecision {
+        confirmation_status: ConfirmationStatus::Failed,
+        confirmed: false,
+        receipt_status: None,
+        receipt_block_number: None,
+        current_block_number: None,
+        required_confirmations: state.confirmation_config.required_blocks,
+        indexed_event_found: false,
+        reconciliation_matched: false,
+        reason: Some("submitted execution transaction not found".to_string()),
+    }
 }
 
 async fn indexer_status(State(state): State<AppState>) -> Result<Json<IndexerStatus>, ApiError> {

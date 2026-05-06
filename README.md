@@ -34,6 +34,11 @@ INDEXER_START_BLOCK=0
 INDEXER_POLL_INTERVAL_MS=3000
 INDEXER_MAX_BLOCK_RANGE=500
 INDEXER_REQUIRE_PERSISTENCE=true
+CONFIRMATION_ENABLED=false
+CONFIRMATION_REQUIRE_PERSISTENCE=true
+CONFIRMATION_REQUIRED_BLOCKS=2
+CONFIRMATION_MAX_BATCH_SIZE=50
+CONFIRMATION_REQUIRE_RECONCILIATION=true
 SIGNATURE_VERIFICATION_MODE=disabled
 PERSISTENCE_ENABLED=false
 DATABASE_URL=postgres://deopt:deopt@127.0.0.1:5432/deopt_v2_backend
@@ -50,6 +55,7 @@ EIP712_VERIFYING_CONTRACT=0x0000000000000000000000000000000000000000
 `EXECUTOR_REAL_BROADCAST_ENABLED=true` requires `PERSISTENCE_ENABLED=true`, `EXECUTOR_PRIVATE_KEY`, `RPC_URL`, `EXECUTOR_MAX_FEE_PER_GAS_WEI`, `EXECUTOR_MAX_PRIORITY_FEE_PER_GAS_WEI`, a nonzero `EXECUTOR_CHAIN_ID`, and a nonzero `EXECUTOR_MAX_GAS_LIMIT`.
 `SIMULATION_ENABLED=true` requires `RPC_URL`; when `SIMULATION_REQUIRE_PERSISTENCE=true`, it also requires `PERSISTENCE_ENABLED=true`.
 `INDEXER_ENABLED=true` requires `RPC_URL`; when `INDEXER_REQUIRE_PERSISTENCE=true`, it also requires `PERSISTENCE_ENABLED=true`.
+`CONFIRMATION_ENABLED=true` requires `RPC_URL`; when `CONFIRMATION_REQUIRE_PERSISTENCE=true`, it also requires `PERSISTENCE_ENABLED=true`. Confirmation is disabled by default, never broadcasts, and rejects startup if `CONFIRMATION_REQUIRE_RECONCILIATION=false`.
 
 ## PerpMatchingEngine Calldata
 
@@ -203,7 +209,7 @@ curl http://127.0.0.1:8080/executor/transactions
 curl http://127.0.0.1:8080/executor/transactions/<intent_id>
 ```
 
-The database stores transaction attempts with statuses `prepared`, `rejected`, `submitted`, and `failed`; it does not include `confirmed`. `submitted` means only that `eth_sendRawTransaction` returned a syntactically valid transaction hash. It does not prove inclusion, execution success, backend ownership, finality, or absence of reorgs. Confirmation requires later indexer, reconciliation, ownership, and finality checks. If the RPC send succeeds but persistence fails immediately afterward, the chain may still have received the transaction; this V1 does not provide atomic RPC-plus-database semantics.
+The database stores transaction attempts with statuses `prepared`, `rejected`, `submitted`, and `failed`. `submitted` means only that `eth_sendRawTransaction` returned a syntactically valid transaction hash. It does not prove inclusion, execution success, backend ownership, finality, or absence of reorgs. If the RPC send succeeds but persistence fails immediately afterward, the chain may still have received the transaction; this V1 does not provide atomic RPC-plus-database semantics.
 
 ## Indexer V1
 
@@ -257,7 +263,40 @@ curl http://127.0.0.1:8080/reconciliations
 curl http://127.0.0.1:8080/reconciliation/intents/<intent_id>
 ```
 
-Reconciliation does not mark intents submitted or confirmed. Status and tick responses always return `confirmed=0`; final confirmation is deferred until a future executor can prove tx ownership and finality with reorg-aware indexing.
+Reconciliation does not mark intents submitted or confirmed. A matched reconciliation is one required input to confirmation, not finality by itself.
+
+## Execution Confirmation / Finality V1
+
+Confirmation V1 is opt-in and persistence-backed:
+
+```text
+CONFIRMATION_ENABLED=false
+CONFIRMATION_REQUIRE_PERSISTENCE=true
+CONFIRMATION_REQUIRED_BLOCKS=2
+CONFIRMATION_MAX_BATCH_SIZE=50
+CONFIRMATION_REQUIRE_RECONCILIATION=true
+RPC_URL=https://...
+PERSISTENCE_ENABLED=true
+```
+
+The lifecycle is:
+
+```text
+broadcast submitted tx hash -> receipt success -> enough blocks -> indexed TradeExecuted -> matched reconciliation -> confirmed
+```
+
+Receipt status alone is insufficient. A successful receipt proves only that the transaction executed successfully in a block returned by the RPC provider. The backend also requires a stored `TradeExecuted` event for the same `tx_hash` and `onchain_intent_id`, plus a `matched` reconciliation row for the same intent, on-chain intent id, and transaction hash. The required block count guards against shallow reorgs by requiring `current_block >= receipt_block + CONFIRMATION_REQUIRED_BLOCKS`.
+
+Manual control and reads:
+
+```sh
+curl http://127.0.0.1:8080/executor/confirmations/status
+curl -X POST http://127.0.0.1:8080/executor/confirm/<intent_id>
+curl -X POST http://127.0.0.1:8080/executor/confirmations/tick
+curl http://127.0.0.1:8080/executor/confirmations/<intent_id>
+```
+
+`POST /executor/confirmations/tick` scans submitted, unconfirmed transaction rows up to `CONFIRMATION_MAX_BATCH_SIZE` and applies the same checks idempotently. It updates `execution_transactions.confirmation_status` and only sets `execution_intents.status=confirmed` when all confirmation conditions pass. Pending/failure statuses include `missing_receipt`, `receipt_failed`, `not_finalized`, `missing_indexed_event`, `missing_reconciliation`, `failed`, and `confirmed`.
 
 ## Persistence
 
@@ -268,7 +307,7 @@ PERSISTENCE_ENABLED=true
 DATABASE_URL=postgres://deopt:deopt@127.0.0.1:5432/deopt_v2_backend
 ```
 
-When enabled, the service connects to Postgres at startup and runs migrations from `migrations/`. Migrations create `used_nonces`, `orders`, `trades`, `execution_intents`, `execution_intent_signatures`, `execution_simulations`, `engine_events`, `indexer_cursors`, `indexed_perp_trades`, `execution_reconciliations`, and `execution_transactions`.
+When enabled, the service connects to Postgres at startup and runs migrations from `migrations/`. Migrations create `used_nonces`, `orders`, `trades`, `execution_intents`, `execution_intent_signatures`, `execution_simulations`, `engine_events`, `indexer_cursors`, `indexed_perp_trades`, `execution_reconciliations`, and `execution_transactions`. Confirmation adds nullable `confirmed_at_ms`, `confirmed_block_number`, `confirmation_status`, and `confirmation_error` fields to `execution_transactions`.
 
 One local setup option:
 
@@ -337,6 +376,7 @@ curl -X DELETE http://127.0.0.1:8080/orders/<order_id>
 - Execution intents are provisional off-chain records, not settlement.
 - Indexed `TradeExecuted` events store `onchain_intent_id` for direct reconciliation only; they do not confirm backend intents.
 - Reconciliation rows link indexed events to intents, but still do not prove transaction ownership, finality, or reorg safety.
+- Confirmation requires receipt success, enough blocks, a matching indexed event, and matched reconciliation before marking an intent confirmed.
 - Real broadcast is disabled by default; when enabled it submits only with a real signed raw transaction and never returns fake tx hashes.
 - Indexer V1 stores block hashes when available but does not implement deep reorg rollback.
 - PerpMatchingEngine calldata can be encoded only from complete matched trade payloads and explicit buyer/seller PerpTrade signatures.
@@ -344,5 +384,4 @@ curl -X DELETE http://127.0.0.1:8080/orders/<order_id>
 
 ## Deferred Execution Work
 
-- Reconcile submitted transactions through an indexer before marking execution confirmed.
-- Add receipt polling, transaction ownership proofs, gas estimation, fee discovery, retries, nonce reservation, and reorg-aware confirmation.
+- Add background confirmation polling, transaction ownership proofs beyond persisted broadcast rows, gas estimation, fee discovery, retries, nonce reservation, and deep reorg rollback.

@@ -1,3 +1,4 @@
+use crate::confirmation::ConfirmationReceipt;
 use crate::error::{BackendError, Result};
 use crate::execution::revert::diagnostics_from_rpc_error;
 use crate::types::AccountId;
@@ -29,6 +30,11 @@ pub trait TransactionBroadcastProvider: Clone + Send + Sync {
     fn chain_id(&self) -> RpcFuture<'_, u64>;
     fn transaction_count(&self, address: AccountId) -> RpcFuture<'_, u64>;
     fn send_raw_transaction(&self, raw_transaction: String) -> RpcFuture<'_, String>;
+}
+
+pub trait TransactionReceiptProvider: Clone + Send + Sync {
+    fn block_number(&self) -> RpcFuture<'_, u64>;
+    fn transaction_receipt(&self, tx_hash: String) -> RpcFuture<'_, Option<ConfirmationReceipt>>;
 }
 
 #[derive(Clone)]
@@ -133,7 +139,7 @@ impl TransactionBroadcastProvider for HttpJsonRpcProvider {
 impl EthCallProvider for HttpJsonRpcProvider {
     fn eth_call(&self, request: EthCallRequest) -> RpcFuture<'_, EthCallSuccess> {
         Box::pin(async move {
-            let block_number = self.block_number().await.ok();
+            let block_number = TransactionReceiptProvider::block_number(self).await.ok();
             let response: JsonRpcResponse<String> = self
                 .client
                 .post(&self.rpc_url)
@@ -175,30 +181,61 @@ impl EthCallProvider for HttpJsonRpcProvider {
     }
 }
 
-impl HttpJsonRpcProvider {
-    async fn block_number(&self) -> Result<u64> {
-        let response: JsonRpcResponse<String> = self
-            .client
-            .post(&self.rpc_url)
-            .json(&JsonRpcRequest {
-                jsonrpc: "2.0",
-                id: 1,
-                method: "eth_blockNumber",
-                params: Vec::<serde_json::Value>::new(),
-            })
-            .send()
-            .await
-            .map_err(|error| BackendError::Simulation(error.to_string()))?
-            .json()
-            .await
-            .map_err(|error| BackendError::Simulation(error.to_string()))?;
-        if let Some(error) = response.error {
-            return Err(BackendError::Simulation(error.message));
-        }
-        let result = response.result.ok_or_else(|| {
-            BackendError::Simulation("eth_blockNumber returned no result".to_string())
-        })?;
-        parse_hex_quantity_u64(&result)
+impl TransactionReceiptProvider for HttpJsonRpcProvider {
+    fn block_number(&self) -> RpcFuture<'_, u64> {
+        Box::pin(async move {
+            let response: JsonRpcResponse<String> = self
+                .client
+                .post(&self.rpc_url)
+                .json(&JsonRpcRequest {
+                    jsonrpc: "2.0",
+                    id: 1,
+                    method: "eth_blockNumber",
+                    params: Vec::<serde_json::Value>::new(),
+                })
+                .send()
+                .await
+                .map_err(|error| BackendError::Simulation(error.to_string()))?
+                .json()
+                .await
+                .map_err(|error| BackendError::Simulation(error.to_string()))?;
+            if let Some(error) = response.error {
+                return Err(BackendError::Simulation(error.message));
+            }
+            let result = response.result.ok_or_else(|| {
+                BackendError::Simulation("eth_blockNumber returned no result".to_string())
+            })?;
+            parse_hex_quantity_u64(&result)
+        })
+    }
+
+    fn transaction_receipt(&self, tx_hash: String) -> RpcFuture<'_, Option<ConfirmationReceipt>> {
+        Box::pin(async move {
+            validate_tx_hash(&tx_hash)?;
+            let response: JsonRpcResponse<Option<EthTransactionReceipt>> = self
+                .client
+                .post(&self.rpc_url)
+                .json(&JsonRpcRequest {
+                    jsonrpc: "2.0",
+                    id: 1,
+                    method: "eth_getTransactionReceipt",
+                    params: [tx_hash],
+                })
+                .send()
+                .await
+                .map_err(|error| BackendError::Simulation(error.to_string()))?
+                .json()
+                .await
+                .map_err(|error| BackendError::Simulation(error.to_string()))?;
+            if let Some(error) = response.error {
+                return Err(BackendError::Simulation(error.message));
+            }
+            response
+                .result
+                .flatten()
+                .map(ConfirmationReceipt::try_from)
+                .transpose()
+        })
     }
 }
 
@@ -229,6 +266,35 @@ struct JsonRpcResponse<T> {
 struct JsonRpcError {
     message: String,
     data: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EthTransactionReceipt {
+    transaction_hash: String,
+    block_number: Option<String>,
+    status: Option<String>,
+}
+
+impl TryFrom<EthTransactionReceipt> for ConfirmationReceipt {
+    type Error = BackendError;
+
+    fn try_from(value: EthTransactionReceipt) -> Result<Self> {
+        validate_tx_hash(&value.transaction_hash)?;
+        Ok(Self {
+            tx_hash: value.transaction_hash.to_ascii_lowercase(),
+            status: value
+                .status
+                .as_deref()
+                .map(parse_hex_quantity_u64)
+                .transpose()?,
+            block_number: value
+                .block_number
+                .as_deref()
+                .map(parse_hex_quantity_u64)
+                .transpose()?,
+        })
+    }
 }
 
 fn hex_0x(bytes: &[u8]) -> String {

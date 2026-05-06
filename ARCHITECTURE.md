@@ -16,11 +16,12 @@ The long-term backend needs low-latency deterministic matching, RFQ, market-make
 - `execution`: Provisional `ExecutionIntent` records, an in-memory queue, a dry-run executor scaffold, a PerpMatchingEngine calldata builder, manual `eth_call` simulation, and an explicitly gated real broadcast path. No transaction submission exists in the default build.
 - `indexer`: Opt-in Indexer V1 that reads `PerpMatchingEngine.TradeExecuted` logs with `eth_getLogs`, persists decoded events, and advances a block cursor after persistence succeeds.
 - `reconciliation`: Opt-in Reconciliation V1 that links indexed events to execution intents by direct `onchain_intent_id` equality without marking finality.
+- `confirmation`: Opt-in Confirmation / Finality V1 that reads transaction receipts and block height, then marks submitted execution transactions and intents confirmed only after receipt success, enough blocks, indexed event identity, and matched reconciliation.
 - `db`: Optional PostgreSQL persistence for used nonces, submitted orders, matched trades, execution intents, and engine event audit records.
 - `rfq`: RFQ type scaffold only.
 - `mm`: market-maker session, heartbeat, bulk quote, and bulk cancel type scaffold only.
 - `signing`: signed-order schema, EIP-712 order hashing, strict secp256k1 signer recovery, signature mode, deadline validation, and in-memory nonce tracking.
-- `config`: environment loading for host, port, log level, network name, chain id, disabled execution flag, simulation flags, indexer flags, reconciliation flags, signature mode, and opt-in persistence.
+- `config`: environment loading for host, port, log level, network name, chain id, disabled execution flag, simulation flags, indexer flags, reconciliation flags, confirmation flags, signature mode, and opt-in persistence.
 
 ## Current v1 Scope
 
@@ -42,6 +43,7 @@ The long-term backend needs low-latency deterministic matching, RFQ, market-make
 - Optional PostgreSQL persistence V1 guarded by `PERSISTENCE_ENABLED=false` by default.
 - Optional Indexer V1 guarded by `INDEXER_ENABLED=false` by default.
 - Optional Reconciliation V1 guarded by `RECONCILIATION_ENABLED=false` by default.
+- Optional Confirmation / Finality V1 guarded by `CONFIRMATION_ENABLED=false` by default.
 
 ## Indexer V1
 
@@ -62,13 +64,41 @@ Reconciliation V1 runs after indexing and uses direct `onchain_intent_id` identi
 
 A manual reconciliation tick reads unreconciled indexed trades with non-null on-chain intent ids. If exactly one backend execution intent and exactly one indexed event share that id, it inserts an `execution_reconciliations` row with `status=matched`. If multiple intents or duplicate indexed events share the id, it records an ambiguous result where possible. If no backend intent exists, the event is counted as unmatched and no tx ownership is fabricated.
 
-Reconciliation is not finality. It does not mutate `execution_intents.status`, does not set `submitted`, and does not set `confirmed`. API status and tick responses report `confirmed=0` in this phase. Future confirmation requires transaction ownership checks and reorg-aware finality handling.
+Reconciliation is not finality. It does not mutate `execution_intents.status`, does not set `submitted`, and does not set `confirmed`. Confirmation V1 consumes matched reconciliation rows as one required input.
 
 HTTP endpoints:
 - `GET /reconciliation/status`
 - `POST /reconciliation/tick`
 - `GET /reconciliations`
 - `GET /reconciliation/intents/:intent_id`
+
+## Confirmation / Finality V1
+
+Confirmation V1 runs after real broadcast, indexing, and reconciliation. It is disabled by default:
+
+```text
+CONFIRMATION_ENABLED=false
+CONFIRMATION_REQUIRE_PERSISTENCE=true
+CONFIRMATION_REQUIRED_BLOCKS=2
+CONFIRMATION_MAX_BATCH_SIZE=50
+CONFIRMATION_REQUIRE_RECONCILIATION=true
+```
+
+The confirmation sequence is:
+
+```text
+broadcast -> receipt -> indexer -> reconciliation -> confirmation
+```
+
+A transaction receipt with `status=1` is not enough to confirm a backend intent. The backend also requires `receipt.block_number`, `current_block >= receipt.block_number + CONFIRMATION_REQUIRED_BLOCKS`, an indexed `TradeExecuted` row with the same `tx_hash` and `onchain_intent_id`, and a `matched` reconciliation row for the same `intent_id`, `onchain_intent_id`, and `tx_hash`. This keeps receipt inclusion, event decoding, direct intent identity, and reconciliation tied to the same transaction before `execution_intents.status` can become `confirmed`.
+
+Confirmation updates `execution_transactions.confirmation_status` idempotently. It sets `confirmed_at_ms`, `confirmed_block_number`, and `execution_intents.status=confirmed` only for the `confirmed` decision. Pending and failure reasons are persisted as `missing_receipt`, `receipt_failed`, `not_finalized`, `missing_indexed_event`, `missing_reconciliation`, or `failed`.
+
+HTTP endpoints:
+- `GET /executor/confirmations/status`
+- `POST /executor/confirm/:intent_id`
+- `POST /executor/confirmations/tick`
+- `GET /executor/confirmations/:intent_id`
 
 ## Future v2/v3 Scope
 
@@ -120,7 +150,7 @@ Every matched trade creates an `ExecutionIntent` with buyer, seller, order IDs, 
 
 The execution deadline is the minimum of the two original signed-order deadlines. Direct in-memory orders that do not carry nonce/deadline metadata can still match, but their signing-payload endpoint fails clearly instead of inventing missing PerpTrade fields.
 
-The intended lifecycle is: order accepted, matched, execution intent created, PerpTrade signatures collected, calldata ready, simulation with revert diagnostics when needed, simulation ok, prepared transaction, submitted by the explicitly gated executor, indexed by the indexer, reconciled as matched by direct intent id, and only later confirmed after transaction ownership and finality checks. Real Broadcast V1 stops at submitted after a real RPC tx hash; Reconciliation V1 stops at the matched reconciliation row.
+The intended lifecycle is: order accepted, matched, execution intent created, PerpTrade signatures collected, calldata ready, simulation with revert diagnostics when needed, simulation ok, prepared transaction, submitted by the explicitly gated executor, indexed by the indexer, reconciled as matched by direct intent id, and confirmed only after receipt success, enough blocks, indexed event identity, and matched reconciliation. Real Broadcast V1 stops at submitted after a real RPC tx hash; Reconciliation V1 stops at the matched reconciliation row.
 
 ## Persistence V1
 
@@ -148,7 +178,9 @@ Simulation V1 is a manual safety check exposed by `POST /executor/simulate/:inte
 
 Real Broadcast V1 is exposed through `POST /executor/broadcast/:intent_id`, `GET /executor/transactions`, and `GET /executor/transactions/:intent_id`. With `EXECUTOR_REAL_BROADCAST_ENABLED=false`, the broadcast endpoint returns a disabled refusal with `submitted=false`, `confirmed=false`, and no tx hash. The transaction request builder requires both PerpTrade signatures, non-empty `executeTrade` calldata, a configured matching-engine target, static EIP-1559 fee values, and `simulation_ok` when required.
 
-When real broadcast is enabled, the executor parses `EXECUTOR_PRIVATE_KEY` into an in-process secp256k1 signer, derives the executor address, checks `eth_chainId == EXECUTOR_CHAIN_ID`, fetches the pending nonce with `eth_getTransactionCount`, signs a type `0x02` EIP-1559 raw transaction, and calls `eth_sendRawTransaction`. The repository stores a `submitted` transaction only after the RPC returns a syntactically valid tx hash and then marks the execution intent `submitted`. It never marks intents confirmed. Rejected chain-id mismatches and failed RPC sends can be persisted as `rejected` or `failed` transaction records without fabricating tx hashes.
+When real broadcast is enabled, the executor parses `EXECUTOR_PRIVATE_KEY` into an in-process secp256k1 signer, derives the executor address, checks `eth_chainId == EXECUTOR_CHAIN_ID`, fetches the pending nonce with `eth_getTransactionCount`, signs a type `0x02` EIP-1559 raw transaction, and calls `eth_sendRawTransaction`. The repository stores a `submitted` transaction only after the RPC returns a syntactically valid tx hash and then marks the execution intent `submitted`. It never marks intents confirmed during broadcast. Rejected chain-id mismatches and failed RPC sends can be persisted as `rejected` or `failed` transaction records without fabricating tx hashes.
+
+Confirmation V1 is exposed separately through manual endpoints. It reads `eth_getTransactionReceipt` and `eth_blockNumber`, but it does not trust receipt status alone and does not use receipt logs as a substitute for the persisted indexer and reconciliation records.
 
 Private keys are modeled with a redacted secret wrapper and are not included in API responses. The signer exposes only the derived address. If a transaction is accepted by RPC and the subsequent database write fails, this V1 cannot make the RPC send and database record atomic; operators must reconcile externally with the returned or observed chain transaction data.
 
@@ -163,7 +195,8 @@ Matching decisions are deterministic for a given ordered command stream, market 
 - PerpMatchingEngine requires signatures over the exact matched `PerpTrade`; order signatures are not valid substitutes.
 - `simulation_ok` only means an `eth_call` did not revert at the queried block.
 - `submitted` is valid only after `eth_sendRawTransaction` returns a real tx hash; it does not mean confirmed.
-- Indexed `TradeExecuted` events prove on-chain execution occurred and include `intentId` for direct matching, but this backend still does not mark intents confirmed in phase 1.
+- Indexed `TradeExecuted` events prove on-chain execution occurred and include `intentId` for direct matching, but confirmation still also requires receipt success, enough blocks, and matched reconciliation for the same transaction.
+- Receipt status alone is insufficient for confirmation.
 - Indexer V1 is not fully reorg safe.
 - Zero price and zero size are rejected.
 - Self-trade is rejected before fills.
@@ -172,7 +205,7 @@ Matching decisions are deterministic for a given ordered command stream, market 
 
 ## Out of Scope
 
-No Redis, production authentication, frontend code, TypeScript, Python service code, C++, or Solidity changes. Blockchain RPC is limited to manual `eth_call` simulation, opt-in `eth_getLogs` indexing, and explicitly gated `eth_sendRawTransaction` broadcast. ABI encoding is limited to the PerpMatchingEngine calldata builder and guarded transaction request boundary.
+No Redis, production authentication, frontend code, TypeScript, Python service code, C++, or Solidity changes. Blockchain RPC is limited to manual `eth_call` simulation, opt-in `eth_getLogs` indexing, confirmation receipt/block reads, and explicitly gated `eth_sendRawTransaction` broadcast. ABI encoding is limited to the PerpMatchingEngine calldata builder and guarded transaction request boundary.
 
 ## Acceptance Criteria
 
