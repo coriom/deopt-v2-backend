@@ -20,9 +20,9 @@ The long-term backend needs low-latency deterministic matching, RFQ, market-make
 - `confirmation`: Opt-in Confirmation / Finality V1 that reads transaction receipts and block height, then marks submitted execution transactions and intents confirmed only after receipt success, enough blocks, indexed event identity, and matched reconciliation.
 - `db`: Optional PostgreSQL persistence for used nonces, submitted orders, matched trades, execution intents, and engine event audit records.
 - `rfq`: RFQ type scaffold only.
-- `mm`: transport-agnostic Market Maker Gateway V1A protocol, session, heartbeat, rate-limit, cancel-on-disconnect planning, bulk order/cancel, quote-replace models, service boundary, and adapter traits. WebTransport startup is deferred.
+- `mm`: Market Maker Gateway protocol, session, heartbeat, rate-limit, cancel-on-disconnect planning, bulk order/cancel, quote-replace models, service boundary, adapter traits, and disabled-by-default WebTransport V1B adapter. Protocol/session/service/rate-limit logic remains transport-agnostic.
 - `signing`: signed-order schema, EIP-712 order hashing, strict secp256k1 signer recovery, signature mode, deadline validation, and in-memory nonce tracking.
-- `config`: environment loading for host, port, log level, network name, chain id, disabled execution flag, simulation flags, indexer flags, reconciliation flags, confirmation flags, Market Maker Gateway V1A flags, signature mode, and opt-in persistence.
+- `config`: environment loading for host, port, log level, network name, chain id, disabled execution flag, simulation flags, indexer flags, reconciliation flags, confirmation flags, Market Maker Gateway V1B flags, signature mode, and opt-in persistence.
 
 ## Current v1 Scope
 
@@ -46,7 +46,7 @@ The long-term backend needs low-latency deterministic matching, RFQ, market-make
 - Optional Indexer V1 guarded by `INDEXER_ENABLED=false` by default.
 - Optional Reconciliation V1 guarded by `RECONCILIATION_ENABLED=false` by default.
 - Optional Confirmation / Finality V1 guarded by `CONFIRMATION_ENABLED=false` by default.
-- Market Maker Gateway V1A core guarded by `MM_GATEWAY_ENABLED=false` by default. V1A is transport-agnostic and does not start a WebTransport server.
+- Market Maker Gateway V1B guarded by `MM_GATEWAY_ENABLED=false` by default. Enabled mode starts a separate WebTransport UDP listener with required TLS cert/key config.
 
 ## Perp On-chain Nonce Sync V1
 
@@ -182,6 +182,16 @@ Rate-limit decisions are pure and cover max messages per second, max in-flight r
 Bulk submit and bulk cancel support structured partial results. Quote replace accepts optional bid and ask legs plus `cancel_previous`, returns deterministic planned counts, and records planned client order ids in the session. V1A does not call Axum handlers, does not mutate the live orderbook, does not fabricate backend order ids, does not create execution intents, and does not broadcast transactions.
 
 Cancel-on-disconnect is planning-only. It returns the session's currently open client order ids when enabled. It never touches execution intents, submitted transactions, confirmed transactions, or chain state.
+
+## Market Maker Gateway V1B
+
+V1B adds a concrete WebTransport adapter using `wtransport` while keeping WebTransport crate types isolated to `src/mm/transport/webtransport.rs`. The adapter is disabled by default. When `MM_GATEWAY_ENABLED=true`, startup requires `MM_GATEWAY_TRANSPORT=webtransport`, `MM_GATEWAY_CERT_PATH`, and `MM_GATEWAY_KEY_PATH`, loads the TLS identity, binds UDP `MM_GATEWAY_HOST:MM_GATEWAY_PORT`, and spawns the gateway beside the HTTP Axum TCP server.
+
+The WebTransport adapter accepts sessions and reliable bidirectional streams. Critical gateway messages use deterministic length-prefixed JSON frames: `u32` big-endian length followed by JSON bytes, with a 1 MiB maximum. V1B handles one request per bidirectional stream and returns one framed response. Datagrams are intentionally deferred for market data and are not used for trading commands.
+
+Each decoded client message is passed to `MmGatewayService::handle_message`, which updates the transport-neutral session and returns a transport-neutral server message. On disconnect, the adapter invokes the existing cancel-on-disconnect planner and logs the planned client order ids only. It does not mutate the live orderbook, execution intents, submitted transactions, confirmed transactions, or chain state.
+
+V1B does not implement RFQ, options support, pricing logic, production wallet challenge auth, WebSocket fallback, live gateway orderbook mutation, or auto-broadcast. Normal tests cover framing, config validation, and serialization without binding UDP, loading cert files, calling RPC, connecting to Postgres, or using private keys.
 
 ## Execution-Intent Flow
 

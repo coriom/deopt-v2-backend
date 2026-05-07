@@ -2,6 +2,7 @@ use crate::confirmation::ConfirmationConfig;
 use crate::error::{BackendError, Result};
 use crate::execution::{ExecutionConfig, PrivateKeySecret};
 use crate::indexer::IndexerConfig;
+use crate::mm::transport::webtransport::validate_webtransport_startup;
 use crate::mm::MmGatewayConfig;
 use crate::nonce_sync::PerpNonceSyncConfig;
 use crate::reconciliation::ReconciliationConfig;
@@ -189,6 +190,7 @@ impl AppConfig {
         indexer.validate_startup(persistence_enabled)?;
         reconciliation.validate_startup(persistence_enabled)?;
         confirmation.validate_startup(persistence_enabled)?;
+        validate_webtransport_startup(&mm_gateway)?;
 
         Ok(Self {
             host,
@@ -631,6 +633,64 @@ mod tests {
         assert!(config.mm_gateway.cancel_on_disconnect);
         assert_eq!(config.mm_gateway.auth_mode, crate::mm::AuthMode::Disabled);
         assert!(!config.mm_gateway.require_auth);
+    }
+
+    #[test]
+    fn mm_gateway_enabled_requires_cert_path() {
+        let error = config_from_pairs([
+            ("PERSISTENCE_ENABLED", "false"),
+            ("MM_GATEWAY_ENABLED", "true"),
+        ])
+        .unwrap_err();
+
+        assert!(error.to_string().contains("MM_GATEWAY_CERT_PATH"));
+    }
+
+    #[test]
+    fn mm_gateway_enabled_requires_key_path() {
+        let error = config_from_pairs([
+            ("PERSISTENCE_ENABLED", "false"),
+            ("MM_GATEWAY_ENABLED", "true"),
+            ("MM_GATEWAY_CERT_PATH", "/tmp/deopt-mm-gateway/cert.pem"),
+        ])
+        .unwrap_err();
+
+        assert!(error.to_string().contains("MM_GATEWAY_KEY_PATH"));
+    }
+
+    #[test]
+    fn mm_gateway_rejects_unsupported_transport_string() {
+        let error = config_from_pairs([
+            ("PERSISTENCE_ENABLED", "false"),
+            ("MM_GATEWAY_TRANSPORT", "websocket"),
+        ])
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("unsupported MM_GATEWAY_TRANSPORT"));
+    }
+
+    #[test]
+    fn mm_gateway_config_does_not_change_http_socket_config() {
+        let config = config_from_pairs([
+            ("PERSISTENCE_ENABLED", "false"),
+            ("HOST", "127.0.0.1"),
+            ("PORT", "18080"),
+            ("MM_GATEWAY_ENABLED", "true"),
+            ("MM_GATEWAY_HOST", "127.0.0.1"),
+            ("MM_GATEWAY_PORT", "18443"),
+            ("MM_GATEWAY_CERT_PATH", "/tmp/deopt-mm-gateway/cert.pem"),
+            ("MM_GATEWAY_KEY_PATH", "/tmp/deopt-mm-gateway/key.pem"),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            config.socket_addr().unwrap(),
+            "127.0.0.1:18080".parse().unwrap()
+        );
+        assert_eq!(config.mm_gateway.host, "127.0.0.1");
+        assert_eq!(config.mm_gateway.port, 18443);
     }
 
     #[test]

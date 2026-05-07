@@ -49,6 +49,22 @@ EIP712_NAME=DeOptV2
 EIP712_VERSION=1
 EIP712_CHAIN_ID=84532
 EIP712_VERIFYING_CONTRACT=0x0000000000000000000000000000000000000000
+MM_GATEWAY_ENABLED=false
+MM_GATEWAY_TRANSPORT=webtransport
+MM_GATEWAY_HOST=127.0.0.1
+MM_GATEWAY_PORT=8443
+MM_GATEWAY_CERT_PATH=
+MM_GATEWAY_KEY_PATH=
+MM_GATEWAY_MAX_SESSIONS=100
+MM_GATEWAY_MAX_IN_FLIGHT_PER_SESSION=128
+MM_GATEWAY_RATE_LIMIT_PER_SEC=100
+MM_GATEWAY_HEARTBEAT_TIMEOUT_MS=15000
+MM_GATEWAY_MAX_ORDERS_PER_BULK=50
+MM_GATEWAY_MAX_CANCELS_PER_BULK=100
+MM_GATEWAY_MAX_OPEN_ORDERS_PER_ACCOUNT=500
+MM_GATEWAY_CANCEL_ON_DISCONNECT=true
+MM_GATEWAY_AUTH_MODE=disabled
+MM_GATEWAY_REQUIRE_AUTH=false
 ```
 
 `EXECUTION_ENABLED=false` is intentional for this phase.
@@ -60,11 +76,11 @@ EIP712_VERIFYING_CONTRACT=0x0000000000000000000000000000000000000000
 `PERP_NONCE_SYNC_ENABLED=false` keeps existing local nonce behavior unchanged. When set to `true`, `PERP_NONCE_SYNC_REQUIRE_RPC=true` requires `RPC_URL` and a nonzero `PERP_MATCHING_ENGINE_ADDRESS` at startup. `PERP_NONCE_SYNC_STRICT=true` rejects an order when its nonce does not equal `PerpMatchingEngine.nonces(order.account)`.
 `INDEXER_ENABLED=true` requires `RPC_URL`; when `INDEXER_REQUIRE_PERSISTENCE=true`, it also requires `PERSISTENCE_ENABLED=true`.
 `CONFIRMATION_ENABLED=true` requires `RPC_URL`; when `CONFIRMATION_REQUIRE_PERSISTENCE=true`, it also requires `PERSISTENCE_ENABLED=true`. Confirmation is disabled by default, never broadcasts, and rejects startup if `CONFIRMATION_REQUIRE_RECONCILIATION=false`.
-`MM_GATEWAY_ENABLED=false` is the safe default. V1A parses and stores Market Maker Gateway configuration but does not start a WebTransport listener, load certificates, open UDP ports, submit orders to the live orderbook, or broadcast transactions.
+`MM_GATEWAY_ENABLED=false` is the safe default. When `true`, V1B starts a separate WebTransport UDP listener and requires `MM_GATEWAY_CERT_PATH` and `MM_GATEWAY_KEY_PATH`. It does not submit orders to the live orderbook or broadcast transactions.
 
 ## Market Maker Gateway V1A
 
-The Market Maker Gateway is the planned low-latency path for market-maker order flow, quote replacement, heartbeat/session tracking, and later market-data delivery. WebTransport is the strategic transport because it gives HTTP/3 over QUIC, reliable streams, optional datagrams, and connection-oriented session semantics. V1A intentionally keeps the business logic transport-agnostic; the V1B adapter will add `wtransport`, TLS certificate/key loading, UDP listener startup, and JSON framing over reliable streams.
+The Market Maker Gateway is the planned low-latency path for market-maker order flow, quote replacement, heartbeat/session tracking, and later market-data delivery. WebTransport is the strategic transport because it gives HTTP/3 over QUIC, reliable streams, optional datagrams, and connection-oriented session semantics. V1A intentionally keeps the business logic transport-agnostic.
 
 All client messages use the same JSON envelope:
 
@@ -104,6 +120,65 @@ MM_GATEWAY_MAX_OPEN_ORDERS_PER_ACCOUNT=500
 ```
 
 The gateway V1A never enables real broadcast by default, never signs transaction payloads, never bypasses existing order validation, and normal tests do not require WebTransport, certificates, UDP, RPC, Postgres, private keys, or Base Sepolia.
+
+## Market Maker Gateway V1B
+
+V1B adds the concrete WebTransport adapter using `wtransport`. The adapter is isolated under `src/mm/transport/webtransport.rs`; protocol, session, service, and rate-limit modules remain transport-neutral.
+
+Startup behavior:
+
+- `MM_GATEWAY_ENABLED=false`: no WebTransport server is started.
+- `MM_GATEWAY_ENABLED=true`: the process loads `MM_GATEWAY_CERT_PATH` and `MM_GATEWAY_KEY_PATH`, binds UDP `MM_GATEWAY_HOST:MM_GATEWAY_PORT`, and runs beside the existing HTTP Axum server.
+- Missing cert/key paths, unreadable cert/key files, invalid bind addresses, or unsupported transports fail startup with clear config errors.
+- The HTTP API keeps its existing TCP `HOST:PORT` behavior.
+
+Critical order messages use reliable bidirectional streams, not datagrams. V1B framing is:
+
+```text
+u32 big-endian payload length
+JSON payload bytes
+```
+
+The maximum frame size is `1048576` bytes. Oversized frames are rejected. Invalid JSON produces an error response when the request id can be recovered. V1B handles one request per bidirectional stream and writes one framed JSON response. Keeping streams open for multiple requests is deferred.
+
+Local certificate options:
+
+```sh
+mkdir -p /tmp/deopt-mm-gateway
+mkcert -cert-file /tmp/deopt-mm-gateway/cert.pem \
+       -key-file /tmp/deopt-mm-gateway/key.pem \
+       localhost 127.0.0.1 ::1
+```
+
+or:
+
+```sh
+mkdir -p /tmp/deopt-mm-gateway
+openssl req -x509 -newkey rsa:2048 -nodes \
+  -keyout /tmp/deopt-mm-gateway/key.pem \
+  -out /tmp/deopt-mm-gateway/cert.pem \
+  -days 1 \
+  -subj "/CN=localhost"
+```
+
+Then configure:
+
+```text
+MM_GATEWAY_ENABLED=true
+MM_GATEWAY_TRANSPORT=webtransport
+MM_GATEWAY_HOST=127.0.0.1
+MM_GATEWAY_PORT=8443
+MM_GATEWAY_CERT_PATH=/tmp/deopt-mm-gateway/cert.pem
+MM_GATEWAY_KEY_PATH=/tmp/deopt-mm-gateway/key.pem
+```
+
+Runtime notes:
+
+- WebTransport requires UDP reachability on `MM_GATEWAY_PORT` and client support for HTTP/3 over QUIC.
+- Browser clients using self-signed certificates may need local trust setup or WebTransport certificate hash options.
+- V1B logs cancel-on-disconnect plans on session close, but live orderbook cancellation remains deferred.
+- Datagrams are deferred for market data and are not used for critical order messages.
+- The gateway still never auto-broadcasts, never signs transaction payloads, and never changes execution finality.
 
 ## PerpMatchingEngine Calldata
 

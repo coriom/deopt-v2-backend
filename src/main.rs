@@ -4,6 +4,7 @@ use deopt_v2_backend::db::PgRepository;
 use deopt_v2_backend::engine::EngineState;
 use deopt_v2_backend::execution::{spawn_executor, Executor};
 use deopt_v2_backend::indexer::{spawn_indexer, Indexer};
+use deopt_v2_backend::mm::transport::webtransport::spawn_webtransport_gateway;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -68,6 +69,7 @@ async fn main() -> deopt_v2_backend::Result<()> {
             spawn_indexer(indexer, config.indexer.poll_interval_ms);
         }
     }
+    spawn_webtransport_gateway(config.mm_gateway.clone()).await?;
 
     info!(
         service = "deopt-v2-backend",

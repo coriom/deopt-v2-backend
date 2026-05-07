@@ -1,6 +1,8 @@
 use super::protocol::ServerMessage;
 use super::service::MmGatewayService;
 
+pub mod webtransport;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MmTransportError {
     pub message: String,

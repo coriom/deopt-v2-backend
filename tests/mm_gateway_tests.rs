@@ -2,6 +2,10 @@ use deopt_v2_backend::mm::protocol::{ResultEnvelope, ServerMessage};
 use deopt_v2_backend::mm::rate_limit::{
     check_cancels_per_bulk, check_message_rate, check_open_orders, check_orders_per_bulk,
 };
+use deopt_v2_backend::mm::transport::webtransport::{
+    decode_json_frame, encode_frame, encode_json_frame, read_frame, validate_webtransport_startup,
+    write_json_frame, MmFrameError, MmGatewayStartup, MM_GATEWAY_MAX_FRAME_BYTES,
+};
 use deopt_v2_backend::mm::{
     AuthMode, BulkSubmitResultPayload, ClientMessage, ErrorCode, HeartbeatResultPayload,
     MmGatewayConfig, MmGatewayService, MmSession, RateLimitDecision,
@@ -375,6 +379,82 @@ fn require_auth_mode_rejects_trading_message_before_auth() {
     let value = serde_json::to_value(response).unwrap();
     assert_eq!(value["type"], "error");
     assert_eq!(value["error"]["code"], "AUTH_REQUIRED");
+}
+
+#[test]
+fn frame_encode_decode_roundtrip() {
+    let payload = br#"{"type":"heartbeat","request_id":"hb-1","payload":{}}"#;
+
+    let frame = encode_frame(payload, MM_GATEWAY_MAX_FRAME_BYTES).unwrap();
+    let decoded: serde_json::Value = decode_json_frame(&frame, MM_GATEWAY_MAX_FRAME_BYTES).unwrap();
+
+    assert_eq!(decoded["type"], "heartbeat");
+    assert_eq!(decoded["request_id"], "hb-1");
+}
+
+#[test]
+fn oversized_frame_rejected() {
+    let payload = vec![1_u8; 8];
+
+    let error = encode_frame(&payload, 4).unwrap_err();
+
+    assert!(matches!(error, MmFrameError::Oversized { len: 8, max: 4 }));
+}
+
+#[test]
+fn invalid_json_rejected() {
+    let frame = encode_frame(b"{not-json", MM_GATEWAY_MAX_FRAME_BYTES).unwrap();
+
+    let error =
+        decode_json_frame::<serde_json::Value>(&frame, MM_GATEWAY_MAX_FRAME_BYTES).unwrap_err();
+
+    assert!(matches!(error, MmFrameError::Json(_)));
+}
+
+#[test]
+fn disabled_config_does_not_start_gateway() {
+    let config = MmGatewayConfig::default();
+
+    let startup = validate_webtransport_startup(&config).unwrap();
+
+    assert_eq!(startup, MmGatewayStartup::Disabled);
+}
+
+#[test]
+fn service_response_can_be_serialized_into_frame() {
+    let response = ServerMessage::error("bad-1", ErrorCode::BadRequest, "invalid request");
+
+    let frame = encode_json_frame(&response, MM_GATEWAY_MAX_FRAME_BYTES).unwrap();
+    let decoded: serde_json::Value = decode_json_frame(&frame, MM_GATEWAY_MAX_FRAME_BYTES).unwrap();
+
+    assert_eq!(decoded["type"], "error");
+    assert_eq!(decoded["request_id"], "bad-1");
+    assert_eq!(decoded["ok"], false);
+}
+
+#[tokio::test]
+async fn async_frame_read_write_roundtrip() {
+    let (mut client, mut server) = tokio::io::duplex(1024);
+    let response = ServerMessage::HeartbeatResult(ResultEnvelope::new(
+        "heartbeat_result",
+        "hb-1",
+        HeartbeatResultPayload {
+            session_id: "session-1".to_string(),
+            last_heartbeat_at_ms: 20,
+        },
+    ));
+
+    write_json_frame(&mut client, &response, MM_GATEWAY_MAX_FRAME_BYTES)
+        .await
+        .unwrap();
+    let payload = read_frame(&mut server, MM_GATEWAY_MAX_FRAME_BYTES)
+        .await
+        .unwrap()
+        .unwrap();
+    let decoded: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+
+    assert_eq!(decoded["type"], "heartbeat_result");
+    assert_eq!(decoded["request_id"], "hb-1");
 }
 
 fn valid_order(client_order_id: &str) -> serde_json::Value {
