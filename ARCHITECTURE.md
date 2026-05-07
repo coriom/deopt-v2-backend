@@ -20,9 +20,9 @@ The long-term backend needs low-latency deterministic matching, RFQ, market-make
 - `confirmation`: Opt-in Confirmation / Finality V1 that reads transaction receipts and block height, then marks submitted execution transactions and intents confirmed only after receipt success, enough blocks, indexed event identity, and matched reconciliation.
 - `db`: Optional PostgreSQL persistence for used nonces, submitted orders, matched trades, execution intents, and engine event audit records.
 - `rfq`: RFQ type scaffold only.
-- `mm`: market-maker session, heartbeat, bulk quote, and bulk cancel type scaffold only.
+- `mm`: transport-agnostic Market Maker Gateway V1A protocol, session, heartbeat, rate-limit, cancel-on-disconnect planning, bulk order/cancel, quote-replace models, service boundary, and adapter traits. WebTransport startup is deferred.
 - `signing`: signed-order schema, EIP-712 order hashing, strict secp256k1 signer recovery, signature mode, deadline validation, and in-memory nonce tracking.
-- `config`: environment loading for host, port, log level, network name, chain id, disabled execution flag, simulation flags, indexer flags, reconciliation flags, confirmation flags, signature mode, and opt-in persistence.
+- `config`: environment loading for host, port, log level, network name, chain id, disabled execution flag, simulation flags, indexer flags, reconciliation flags, confirmation flags, Market Maker Gateway V1A flags, signature mode, and opt-in persistence.
 
 ## Current v1 Scope
 
@@ -46,6 +46,7 @@ The long-term backend needs low-latency deterministic matching, RFQ, market-make
 - Optional Indexer V1 guarded by `INDEXER_ENABLED=false` by default.
 - Optional Reconciliation V1 guarded by `RECONCILIATION_ENABLED=false` by default.
 - Optional Confirmation / Finality V1 guarded by `CONFIRMATION_ENABLED=false` by default.
+- Market Maker Gateway V1A core guarded by `MM_GATEWAY_ENABLED=false` by default. V1A is transport-agnostic and does not start a WebTransport server.
 
 ## Perp On-chain Nonce Sync V1
 
@@ -166,9 +167,21 @@ HTTP endpoints:
 
 The current RFQ module defines IDs, request/quote structs, and lifecycle states: open, quoted, accepted, expired, executed, and failed. Real quote routing, auctions, expiry handling, and settlement coordination are intentionally deferred.
 
-## MM Gateway Future Design
+## Market Maker Gateway V1A
 
-The current MM module defines session, heartbeat, bulk quote update, and bulk cancel concepts. Real authentication, WebSocket transport, throttling, quote ownership, and market-data distribution are intentionally deferred.
+The Market Maker Gateway is the future low-latency market-maker ingress path for heartbeats, session state, bulk order operations, quote replacement, and later market data. WebTransport is the strategic transport because it provides HTTP/3 over QUIC, reliable streams, connection-level sessions, and optional datagrams. V1A deliberately isolates the protocol and service layer from concrete WebTransport crate types. V1B will add the `wtransport` dependency, TLS certificate/key loading, UDP listener startup, JSON framing over reliable bidirectional streams, and local WebTransport smoke tooling.
+
+V1A client messages are JSON envelopes with `type`, `request_id`, and `payload`. Success responses use `type="<message>_result"`, `request_id`, `ok=true`, and `payload`. Errors use `type="error"`, `request_id`, `ok=false`, and stable error codes. The defined client message set is `auth`, `heartbeat`, `submit_order`, `bulk_submit`, `cancel_order`, `bulk_cancel`, `cancel_all`, `quote_replace`, and `get_session`.
+
+The session model is transport-neutral and serializable. It tracks `session_id`, `connection_id`, optional `account`, `authenticated`, `auth_mode`, connection and heartbeat timestamps, `cancel_on_disconnect`, open client order ids, per-second message-window counters, and in-flight request count. Pure helpers create sessions, bind accounts after auth, update heartbeat timestamps, detect heartbeat timeout, register/unregister open client order ids, produce cancel-on-disconnect plans, update in-flight count, and return public session snapshots.
+
+Auth is shape-only in V1A. The safe default is `MM_GATEWAY_AUTH_MODE=disabled` and `MM_GATEWAY_REQUIRE_AUTH=false`, which allows development sessions to process account-bearing messages without wallet challenge auth. When `MM_GATEWAY_REQUIRE_AUTH=true`, trading messages are rejected before authentication. Production wallet challenge auth is deferred.
+
+Rate-limit decisions are pure and cover max messages per second, max in-flight requests per session, max orders per bulk, max cancels per bulk, and max open client order ids per account/session. These limits are parsed from `MM_GATEWAY_*` configuration with safe defaults and no certificate or UDP validation in V1A.
+
+Bulk submit and bulk cancel support structured partial results. Quote replace accepts optional bid and ask legs plus `cancel_previous`, returns deterministic planned counts, and records planned client order ids in the session. V1A does not call Axum handlers, does not mutate the live orderbook, does not fabricate backend order ids, does not create execution intents, and does not broadcast transactions.
+
+Cancel-on-disconnect is planning-only. It returns the session's currently open client order ids when enabled. It never touches execution intents, submitted transactions, confirmed transactions, or chain state.
 
 ## Execution-Intent Flow
 

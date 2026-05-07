@@ -76,6 +76,7 @@ async fn main() -> deopt_v2_backend::Result<()> {
         network = %config.network_name,
         execution_enabled = config.execution.execution_enabled,
         confirmation_enabled = config.confirmation.enabled,
+        mm_gateway_enabled = config.mm_gateway.enabled,
         indexer_enabled = config.indexer.enabled,
         reconciliation_enabled = config.reconciliation.enabled,
         executor_dry_run = config.execution.dry_run,

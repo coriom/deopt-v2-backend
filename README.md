@@ -60,6 +60,50 @@ EIP712_VERIFYING_CONTRACT=0x0000000000000000000000000000000000000000
 `PERP_NONCE_SYNC_ENABLED=false` keeps existing local nonce behavior unchanged. When set to `true`, `PERP_NONCE_SYNC_REQUIRE_RPC=true` requires `RPC_URL` and a nonzero `PERP_MATCHING_ENGINE_ADDRESS` at startup. `PERP_NONCE_SYNC_STRICT=true` rejects an order when its nonce does not equal `PerpMatchingEngine.nonces(order.account)`.
 `INDEXER_ENABLED=true` requires `RPC_URL`; when `INDEXER_REQUIRE_PERSISTENCE=true`, it also requires `PERSISTENCE_ENABLED=true`.
 `CONFIRMATION_ENABLED=true` requires `RPC_URL`; when `CONFIRMATION_REQUIRE_PERSISTENCE=true`, it also requires `PERSISTENCE_ENABLED=true`. Confirmation is disabled by default, never broadcasts, and rejects startup if `CONFIRMATION_REQUIRE_RECONCILIATION=false`.
+`MM_GATEWAY_ENABLED=false` is the safe default. V1A parses and stores Market Maker Gateway configuration but does not start a WebTransport listener, load certificates, open UDP ports, submit orders to the live orderbook, or broadcast transactions.
+
+## Market Maker Gateway V1A
+
+The Market Maker Gateway is the planned low-latency path for market-maker order flow, quote replacement, heartbeat/session tracking, and later market-data delivery. WebTransport is the strategic transport because it gives HTTP/3 over QUIC, reliable streams, optional datagrams, and connection-oriented session semantics. V1A intentionally keeps the business logic transport-agnostic; the V1B adapter will add `wtransport`, TLS certificate/key loading, UDP listener startup, and JSON framing over reliable streams.
+
+All client messages use the same JSON envelope:
+
+```json
+{
+  "type": "heartbeat",
+  "request_id": "hb-1",
+  "payload": {}
+}
+```
+
+Success responses use `type="<message>_result"`, the same `request_id`, `ok=true`, and a typed `payload`. Errors use `type="error"`, `ok=false`, and stable error codes such as `BAD_REQUEST`, `AUTH_REQUIRED`, `RATE_LIMITED`, `TOO_MANY_ORDERS`, `TOO_MANY_CANCELS`, `ORDER_REJECTED`, `CANCEL_REJECTED`, and `QUOTE_REPLACE_FAILED`.
+
+V1A defines protocol models for `auth`, `heartbeat`, `submit_order`, `bulk_submit`, `cancel_order`, `bulk_cancel`, `cancel_all`, `quote_replace`, and `get_session`. `heartbeat` updates the session timestamp and `get_session` returns a public serializable snapshot containing session id, connection id, optional account, auth mode, heartbeat time, cancel-on-disconnect flag, open client order ids, rate-window counters, and in-flight count.
+
+Gateway auth is shape-only in V1A. The supported default is:
+
+```text
+MM_GATEWAY_AUTH_MODE=disabled
+MM_GATEWAY_REQUIRE_AUTH=false
+```
+
+In disabled mode, development sessions can process messages without wallet challenge auth when account-bearing payloads include the account. Wallet challenge auth is deferred.
+
+Bulk submit and bulk cancel are partial-result capable and return per-item `ok` / `error` entries. `quote_replace` accepts optional `bid` and `ask` legs plus `cancel_previous`; V1A returns deterministic planned counts and tracks planned client order ids in the session. It does not mutate the live orderbook and does not fabricate backend order ids or matched execution intents.
+
+Cancel-on-disconnect is planning-only in V1A. The planner returns the session's currently open client order ids when `MM_GATEWAY_CANCEL_ON_DISCONNECT=true`; it does not touch execution intents, submitted transactions, confirmed transactions, or chain state.
+
+Pure rate-limit helpers enforce max messages per second, max in-flight requests per session, max orders per bulk, max cancels per bulk, and max open client order ids per account/session:
+
+```text
+MM_GATEWAY_MAX_IN_FLIGHT_PER_SESSION=128
+MM_GATEWAY_RATE_LIMIT_PER_SEC=100
+MM_GATEWAY_MAX_ORDERS_PER_BULK=50
+MM_GATEWAY_MAX_CANCELS_PER_BULK=100
+MM_GATEWAY_MAX_OPEN_ORDERS_PER_ACCOUNT=500
+```
+
+The gateway V1A never enables real broadcast by default, never signs transaction payloads, never bypasses existing order validation, and normal tests do not require WebTransport, certificates, UDP, RPC, Postgres, private keys, or Base Sepolia.
 
 ## PerpMatchingEngine Calldata
 

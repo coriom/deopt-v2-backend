@@ -2,6 +2,7 @@ use crate::confirmation::ConfirmationConfig;
 use crate::error::{BackendError, Result};
 use crate::execution::{ExecutionConfig, PrivateKeySecret};
 use crate::indexer::IndexerConfig;
+use crate::mm::MmGatewayConfig;
 use crate::nonce_sync::PerpNonceSyncConfig;
 use crate::reconciliation::ReconciliationConfig;
 use crate::signing::signature::SignatureVerificationMode;
@@ -22,6 +23,7 @@ pub struct AppConfig {
     pub confirmation: ConfirmationConfig,
     pub indexer: IndexerConfig,
     pub reconciliation: ReconciliationConfig,
+    pub mm_gateway: MmGatewayConfig,
     pub signature_verification_mode: SignatureVerificationMode,
     pub eip712_domain: Eip712Domain,
     pub persistence_enabled: bool,
@@ -105,6 +107,40 @@ impl AppConfig {
             )?,
             max_batch_size: parse_env(&mut lookup, "RECONCILIATION_MAX_BATCH_SIZE", "100")?,
         };
+        let mm_gateway = MmGatewayConfig {
+            enabled: parse_env(&mut lookup, "MM_GATEWAY_ENABLED", "false")?,
+            transport: parse_env(&mut lookup, "MM_GATEWAY_TRANSPORT", "webtransport")?,
+            host: get_env(&mut lookup, "MM_GATEWAY_HOST", "127.0.0.1"),
+            port: parse_env(&mut lookup, "MM_GATEWAY_PORT", "8443")?,
+            cert_path: lookup("MM_GATEWAY_CERT_PATH").filter(|value| !value.is_empty()),
+            key_path: lookup("MM_GATEWAY_KEY_PATH").filter(|value| !value.is_empty()),
+            max_sessions: parse_env(&mut lookup, "MM_GATEWAY_MAX_SESSIONS", "100")?,
+            max_in_flight_per_session: parse_env(
+                &mut lookup,
+                "MM_GATEWAY_MAX_IN_FLIGHT_PER_SESSION",
+                "128",
+            )?,
+            rate_limit_per_sec: parse_env(&mut lookup, "MM_GATEWAY_RATE_LIMIT_PER_SEC", "100")?,
+            heartbeat_timeout_ms: parse_env(
+                &mut lookup,
+                "MM_GATEWAY_HEARTBEAT_TIMEOUT_MS",
+                "15000",
+            )?,
+            max_orders_per_bulk: parse_env(&mut lookup, "MM_GATEWAY_MAX_ORDERS_PER_BULK", "50")?,
+            max_cancels_per_bulk: parse_env(&mut lookup, "MM_GATEWAY_MAX_CANCELS_PER_BULK", "100")?,
+            max_open_orders_per_account: parse_env(
+                &mut lookup,
+                "MM_GATEWAY_MAX_OPEN_ORDERS_PER_ACCOUNT",
+                "500",
+            )?,
+            cancel_on_disconnect: parse_env(
+                &mut lookup,
+                "MM_GATEWAY_CANCEL_ON_DISCONNECT",
+                "true",
+            )?,
+            auth_mode: parse_env(&mut lookup, "MM_GATEWAY_AUTH_MODE", "disabled")?,
+            require_auth: parse_env(&mut lookup, "MM_GATEWAY_REQUIRE_AUTH", "false")?,
+        };
         let confirmation = ConfirmationConfig {
             enabled: parse_env(&mut lookup, "CONFIRMATION_ENABLED", "false")?,
             require_persistence: parse_env(
@@ -165,6 +201,7 @@ impl AppConfig {
             confirmation,
             indexer,
             reconciliation,
+            mm_gateway,
             signature_verification_mode,
             eip712_domain,
             persistence_enabled,
@@ -569,6 +606,31 @@ mod tests {
         assert_eq!(config.confirmation.max_batch_size, 50);
         assert!(config.confirmation.require_reconciliation);
         assert_eq!(config.confirmation.rpc_url, None);
+    }
+
+    #[test]
+    fn mm_gateway_uses_safe_v1a_defaults() {
+        let config = config_from_pairs([("PERSISTENCE_ENABLED", "false")]).unwrap();
+
+        assert!(!config.mm_gateway.enabled);
+        assert_eq!(
+            config.mm_gateway.transport,
+            crate::mm::MmGatewayTransport::WebTransport
+        );
+        assert_eq!(config.mm_gateway.host, "127.0.0.1");
+        assert_eq!(config.mm_gateway.port, 8443);
+        assert_eq!(config.mm_gateway.cert_path, None);
+        assert_eq!(config.mm_gateway.key_path, None);
+        assert_eq!(config.mm_gateway.max_sessions, 100);
+        assert_eq!(config.mm_gateway.max_in_flight_per_session, 128);
+        assert_eq!(config.mm_gateway.rate_limit_per_sec, 100);
+        assert_eq!(config.mm_gateway.heartbeat_timeout_ms, 15_000);
+        assert_eq!(config.mm_gateway.max_orders_per_bulk, 50);
+        assert_eq!(config.mm_gateway.max_cancels_per_bulk, 100);
+        assert_eq!(config.mm_gateway.max_open_orders_per_account, 500);
+        assert!(config.mm_gateway.cancel_on_disconnect);
+        assert_eq!(config.mm_gateway.auth_mode, crate::mm::AuthMode::Disabled);
+        assert!(!config.mm_gateway.require_auth);
     }
 
     #[test]

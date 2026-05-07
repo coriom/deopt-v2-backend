@@ -1,221 +1,519 @@
-# NEXT_TASK.md — Execution Confirmation / Finality V1
+
+# NEXT_TASK.md — Market Maker Gateway V1A: Transport-Agnostic Protocol & Service Layer
 
 ## Context
 
-The backend now supports:
+The backend already supports:
 
-- signed order intake
-- in-memory and PostgreSQL persistence
+- HTTP order intake
+- orderbook matching
 - execution intents
 - PerpTrade signing payloads
 - buyer/seller PerpTrade signatures
-- calldata builder for new intentId PerpMatchingEngine ABI
+- calldata builder for the intentId `PerpMatchingEngine`
 - RPC simulation
 - guarded real broadcast
-- indexer for TradeExecuted
-- reconciliation by onchain_intent_id
+- indexer for `TradeExecuted`
+- reconciliation by `onchain_intent_id`
+- confirmation/finality
+- on-chain perp nonce sync
 
-A full Base Sepolia execution has succeeded:
+A full Base Sepolia execution lifecycle has already succeeded:
 
-- simulation_ok
-- broadcast submitted=true
-- real tx_hash returned
-- TradeExecuted indexed
-- reconciliation matched by onchain_intent_id
-- confirmed remains 0 because confirmation lifecycle is not implemented yet
+```text
+orderbook
+→ execution_intent
+→ PerpTrade signatures
+→ simulation_ok
+→ real broadcast
+→ TradeExecuted indexed
+→ reconciliation matched
+→ confirmation confirmed=true
 
-Known successful tx:
+The next major product block is the Market Maker Gateway.
 
-- tx_hash: 0x6b837e4c1be858c0acac95e228893b7be1eb06cdc9223a5c6828ef7aac778105
-- intent_id: 84faf041-fb8b-445c-a549-99c95bcb5a76
-- onchain_intent_id: 0x9f775e79f8ab122b1b4b4d39393e329420f4fee2b5acb10370f76ecc72f02435
+Strategic decision:
 
-## Goal
+Use WebTransport as the primary future MM transport.
+Do not implement WebSocket first.
+However, do not couple market maker business logic to WebTransport crate types.
+First implement a transport-agnostic protocol/session/service layer.
+WebTransport adapter will be implemented in the next task.
+Why This Task Is Split
 
-Implement Execution Confirmation / Finality V1.
+A read-only technical spike recommended wtransport as the WebTransport adapter crate because:
 
-The backend must be able to:
+quinn is QUIC only, not WebTransport.
+h3 / h3-quinn are lower-level HTTP/3 plumbing.
+wtransport is the right abstraction level for WebTransport sessions, reliable streams, unidirectional streams, datagrams, TLS identity/cert handling, and Tokio runtime integration.
 
-1. Read transaction receipts by tx_hash.
-2. Verify receipt status == success.
-3. Verify the transaction is sufficiently finalized by block confirmations.
-4. Require reconciliation matched by onchain_intent_id before marking confirmed.
-5. Mark execution transaction as confirmed.
-6. Mark execution intent as confirmed only when all safety conditions are met.
-7. Expose manual confirmation endpoints.
-8. Preserve current safety rules:
-   - no fake confirmation
-   - no fake tx hash
-   - no confirmation without indexed event
-   - no confirmation without reconciliation
-   - no automatic broadcast changes
+However, WebTransport has extra operational complexity:
 
-## Safety Rules
+UDP port
+HTTP/3 / QUIC server
+TLS certificate/key
+local cert trust
+client tooling
+
+Therefore V1 is split:
+
+V1A: transport-agnostic MM protocol/session/service layer.
+V1B: WebTransport adapter using wtransport.
+
+This task is V1A only.
+
+Goal
+
+Implement the transport-agnostic Market Maker Gateway core.
+
+This means:
+
+protocol message schema
+response/error envelope
+session state
+heartbeat logic
+rate-limit decisions
+cancel-on-disconnect planning
+bulk order request/response models
+quote replace request/response models
+shared service boundary for submit/cancel/quote operations
+no live WebTransport server yet
+Non-Goals
+
+Do not implement in this task:
+
+WebTransport server
+WebSocket server
+RFQ
+options gateway
+strategy engine
+market maker pricing logic
+market-data datagrams
+production wallet challenge auth
+real broadcast from the gateway
+Solidity changes
+execution lifecycle changes
+Absolute Safety Rules
 
 Do not:
 
-- fake transaction confirmation
-- mark confirmed based only on receipt status
-- mark confirmed without indexed TradeExecuted
-- mark confirmed without reconciliation matched
-- change matching semantics
-- change PerpTrade ABI
-- modify Solidity contracts
-- deploy contracts
-- enable real broadcast by default
-- require RPC/Postgres/private keys for normal cargo test
-- use floating point arithmetic
+modify Solidity
+deploy contracts
+change PerpTrade ABI
+change matching semantics
+enable real broadcast by default
+auto-broadcast from MM gateway
+bypass existing order validation
+bypass nonce sync
+bypass signature/deadline validation
+fake orders, matches, txs, reconciliations, or confirmations
+require RPC/Postgres/private keys/certs for normal cargo test
+commit
+push
+expose private keys
 
-## Confirmation Definition
+Normal cargo test must remain offline.
 
-An execution intent is confirmed only if all conditions are true:
+Required Module Structure
 
-1. There is a submitted execution transaction row with real tx_hash.
-2. RPC receipt exists for tx_hash.
-3. Receipt status == 1.
-4. Receipt block number is not null.
-5. Current chain block >= receipt block + CONFIRMATION_REQUIRED_BLOCKS.
-6. Indexer has stored a TradeExecuted event for the same tx_hash and onchain_intent_id.
-7. Reconciliation exists with:
-   - intent_id
-   - onchain_intent_id
-   - status = matched
-8. The matched indexed event corresponds to the transaction hash.
+Add or extend:
 
-If any condition fails, return a clear pending/failure reason.
+src/mm/
+  mod.rs
+  gateway.rs          # keep existing scaffold or delegate/re-export
+  protocol.rs         # message schemas and envelopes
+  session.rs          # session state and heartbeat/disconnect logic
+  rate_limit.rs       # pure rate-limit decisions
+  service.rs          # transport-neutral command service boundary
+  transport/
+    mod.rs            # adapter traits only, no concrete WebTransport yet
 
-## Config
+Do not add webtransport.rs in this task unless it is an empty placeholder with no external dependency. Prefer deferring it to V1B.
 
-Add config:
+Protocol Envelope
 
-```env
-CONFIRMATION_ENABLED=false
-CONFIRMATION_REQUIRE_PERSISTENCE=true
-CONFIRMATION_REQUIRED_BLOCKS=2
-CONFIRMATION_MAX_BATCH_SIZE=50
-CONFIRMATION_REQUIRE_RECONCILIATION=true
-
-Defaults must be safe.
-
-Normal tests must not need RPC/Postgres.
-
-Database
-
-Extend execution_transactions if needed with:
-
-confirmed_at_ms BIGINT NULL
-confirmed_block_number BIGINT NULL
-confirmation_status TEXT NULL
-confirmation_error TEXT NULL
-
-Allowed statuses:
-
-pending
-confirmed
-failed
-not_finalized
-missing_receipt
-missing_reconciliation
-missing_indexed_event
-receipt_failed
-
-Do not delete old migrations.
-Add a new migration.
-
-If execution_intents already has status values, add/use confirmed status carefully.
-
-RPC
-
-Extend RPC provider with:
-
-eth_getTransactionReceipt
-eth_blockNumber
-
-Receipt parser must handle:
-
-transactionHash
-blockNumber
-status
-logs if needed, but prefer indexed_perp_trades + reconciliation for confirmation
-missing/null receipt
-
-Do not rely on logs from receipt alone as final confirmation if indexer/reconciliation is required.
-
-API
-
-Add endpoints:
-
-GET /executor/confirmations/status
-POST /executor/confirm/:intent_id
-POST /executor/confirmations/tick
-GET /executor/confirmations/:intent_id
-
-Expected manual confirmation response:
+All client messages must have this shape:
 
 {
-  "intent_id": "...",
-  "tx_hash": "0x...",
-  "confirmation_status": "confirmed",
-  "confirmed": true,
-  "receipt_status": 1,
-  "receipt_block_number": 41119866,
-  "current_block_number": 41119870,
-  "required_confirmations": 2,
-  "indexed_event_found": true,
-  "reconciliation_matched": true,
-  "reason": null
+  "type": "...",
+  "request_id": "...",
+  "payload": {}
 }
 
-If not finalized:
+All success responses must have this shape:
 
 {
-  "confirmation_status": "not_finalized",
-  "confirmed": false,
-  "reason": "receipt block has fewer than required confirmations"
+  "type": "..._result",
+  "request_id": "...",
+  "ok": true,
+  "payload": {}
 }
 
-If missing reconciliation:
+All error responses must have this shape:
 
 {
-  "confirmation_status": "missing_reconciliation",
-  "confirmed": false,
-  "reason": "matched reconciliation not found"
+  "type": "error",
+  "request_id": "...",
+  "ok": false,
+  "error": {
+    "code": "...",
+    "message": "..."
+  }
 }
-Confirmation Tick
 
-POST /executor/confirmations/tick should:
+Use serde / serde_json.
 
-find submitted but unconfirmed execution transactions
-process at most CONFIRMATION_MAX_BATCH_SIZE
-apply the full confirmation definition
-update statuses idempotently
-never mark confirmed unless all conditions pass
+Client Message Types V1A
+
+Define protocol models for:
+
+auth
+heartbeat
+submit_order
+bulk_submit
+cancel_order
+bulk_cancel
+cancel_all
+quote_replace
+get_session
+
+Even if service handlers are only partially wired in V1A, the message types and response types must exist.
+
+Server Response Types V1A
+
+Define response payloads for:
+
+auth_result
+heartbeat_result
+submit_order_result
+bulk_submit_result
+cancel_order_result
+bulk_cancel_result
+cancel_all_result
+quote_replace_result
+get_session_result
+error
+Error Codes
+
+Define stable string error codes, for example:
+
+BAD_REQUEST
+UNKNOWN_MESSAGE_TYPE
+AUTH_REQUIRED
+AUTH_FAILED
+RATE_LIMITED
+TOO_MANY_ORDERS
+TOO_MANY_CANCELS
+SESSION_CLOSED
+ORDER_REJECTED
+CANCEL_REJECTED
+QUOTE_REPLACE_FAILED
+INTERNAL_ERROR
+
+Avoid leaking internal debug data in user-facing error messages.
+
+Session State
+
+Add a transport-neutral MM session model.
+
+Required fields:
+
+session_id
+connection_id
+account optional
+authenticated bool
+auth_mode
+connected_at_ms
+last_heartbeat_at_ms
+cancel_on_disconnect
+open_client_order_ids
+messages_in_current_window
+window_started_at_ms
+in_flight_requests
+
+Types can be Rust-specific, but must be serializable for get_session.
+
+Session Behavior
+
+Implement pure/session-level helpers:
+
+create new session
+bind account after auth
+update heartbeat timestamp
+detect heartbeat timeout
+register open order id
+unregister open order id
+plan cancel-on-disconnect
+increment/decrement in-flight count
+produce public session snapshot
+
+Do not require network tests.
+
+Auth V1A
+
+Implement protocol shape only.
+
+Supported config/design:
+
+MM_GATEWAY_AUTH_MODE=disabled
+MM_GATEWAY_REQUIRE_AUTH=false
+
+In disabled mode:
+
+session can process messages without account-bound auth if the message payload contains account where required
+get_session should show auth_mode=disabled
+
+Do not implement wallet signature challenge yet unless trivial. Leave TODO for V2.
+
+Rate Limits
+
+Add pure rate-limit decision logic.
+
+Config fields should exist in .env.example and config parsing if appropriate:
+
+MM_GATEWAY_ENABLED=false
+MM_GATEWAY_TRANSPORT=webtransport
+MM_GATEWAY_HOST=127.0.0.1
+MM_GATEWAY_PORT=8443
+MM_GATEWAY_CERT_PATH=
+MM_GATEWAY_KEY_PATH=
+MM_GATEWAY_MAX_SESSIONS=100
+MM_GATEWAY_MAX_IN_FLIGHT_PER_SESSION=128
+MM_GATEWAY_RATE_LIMIT_PER_SEC=100
+MM_GATEWAY_HEARTBEAT_TIMEOUT_MS=15000
+MM_GATEWAY_MAX_ORDERS_PER_BULK=50
+MM_GATEWAY_MAX_CANCELS_PER_BULK=100
+MM_GATEWAY_MAX_OPEN_ORDERS_PER_ACCOUNT=500
+MM_GATEWAY_CANCEL_ON_DISCONNECT=true
+MM_GATEWAY_AUTH_MODE=disabled
+MM_GATEWAY_REQUIRE_AUTH=false
+
+In this V1A task:
+
+config can be parsed and stored
+no server should start yet
+cert/key validation may be deferred to V1B when MM_GATEWAY_ENABLED=true
+
+Rate-limit helpers must cover:
+
+max messages per second
+max in-flight per session
+max orders per bulk
+max cancels per bulk
+max open orders per account
+Service Boundary
+
+Create a transport-neutral service layer that defines the intent of operations.
+
+Preferred shape:
+
+MmGatewayService
+  handle_message(session, message) -> response
+
+or equivalent.
+
+The service should delegate or prepare delegation to existing backend logic, but avoid broad refactors.
+
+For V1A:
+
+heartbeat should fully work.
+get_session should fully work.
+bulk_submit should validate bulk size and produce structured partial result.
+bulk_cancel should validate bulk size and produce structured partial result.
+quote_replace should parse/plan:
+optional cancel previous quote ids
+optional bid
+optional ask
+return deterministic result structure
+If full integration with existing orderbook requires broader refactor, return explicit ORDER_REJECTED / NOT_IMPLEMENTED for specific operations and document V1B/V1C integration.
+
+But prefer extracting small reusable helpers from HTTP order/cancel path if safe and minimal.
+
+Integration Guidance
+
+Existing relevant code paths:
+
+src/api/routes.rs       # HTTP submit/cancel behavior
+src/engine/state.rs     # engine command boundary
+src/db/repository.rs    # persistence
+src/nonce_sync/mod.rs   # on-chain perp nonce sync
+
+Do not call Axum HTTP handlers directly from MM service.
+
+If shared order/cancel behavior is needed:
+
+extract small pure/helper functions
+keep HTTP behavior unchanged
+add tests proving HTTP behavior still works
+Transport Trait
+
+Define a transport abstraction in src/mm/transport/mod.rs.
+
+Example conceptual responsibilities:
+
+MmTransportSession:
+  session_id()
+  send(server_message)
+  close(reason)
+
+MmTransportAdapter:
+  start(service)
+
+Keep the trait simple. It should not mention WebTransport.
+
+Do not use concrete WebTransport types in protocol/session/service modules.
+
+Cancel-on-Disconnect Planning
+
+Implement planning only in V1A.
+
+Function should return which open client order IDs should be cancelled when session disconnects.
+
+Rules:
+
+only open resting off-chain orders belonging to the session/account
+do not touch execution intents
+do not touch submitted txs
+do not touch confirmed txs
+idempotent result
+
+Actual orderbook mutation can be deferred if needed.
+
+Quote Replace Semantics
+
+Define request payload:
+
+{
+  "market_id": 1,
+  "account": "0x...",
+  "cancel_previous": true,
+  "bid": {
+    "price_1e8": "299900000000",
+    "size_1e8": "100000000",
+    "client_order_id": "eth-bid-001",
+    "nonce": 1,
+    "signature": "0x..."
+  },
+  "ask": {
+    "price_1e8": "300100000000",
+    "size_1e8": "100000000",
+    "client_order_id": "eth-ask-001",
+    "nonce": 2,
+    "signature": "0x..."
+  }
+}
+
+Define response payload:
+
+{
+  "market_id": 1,
+  "cancelled": 2,
+  "submitted": 2,
+  "rejected": 0,
+  "matched_intents": []
+}
+
+V1A can return deterministic planned results if full orderbook integration is deferred.
+
+Bulk Behavior
+
+Bulk submit/cancel should be partial-accept capable.
+
+Response should include per-item results:
+
+{
+  "accepted": 2,
+  "rejected": 1,
+  "results": [
+    {
+      "client_order_id": "x",
+      "ok": true,
+      "order_id": "..."
+    },
+    {
+      "client_order_id": "y",
+      "ok": false,
+      "error": {
+        "code": "ORDER_REJECTED",
+        "message": "..."
+      }
+    }
+  ]
+}
 Tests
 
-Add pure/unit tests for confirmation decision logic.
+Add tests under:
 
-Tests must cover:
+tests/mm_gateway_tests.rs
 
-missing receipt => missing_receipt
-receipt status 0 => receipt_failed
-receipt status 1 but insufficient confirmations => not_finalized
-receipt status 1 and enough confirmations but no indexed event => missing_indexed_event
-indexed event exists but no matched reconciliation => missing_reconciliation
-matched reconciliation but wrong tx_hash => missing_indexed_event or mismatch failure
-all conditions true => confirmed
-idempotent confirmation does not duplicate rows or corrupt state
-normal cargo test does not require live RPC/Postgres
+or module-level unit tests.
+
+Required tests:
+
+parse valid heartbeat message
+reject unknown message type
+format success response envelope
+format error response envelope
+heartbeat updates session timestamp
+heartbeat timeout decision
+rate limit allows under threshold
+rate limit rejects over threshold
+max orders per bulk enforced
+max cancels per bulk enforced
+max open orders per account enforced
+cancel-on-disconnect plan returns only open session orders
+cancel-on-disconnect is idempotent
+quote_replace parses bid-only
+quote_replace parses ask-only
+quote_replace parses bid+ask
+bulk submit partial result shape
+get_session returns public session snapshot
+disabled auth mode allows dev session
+require-auth mode rejects trading message before auth
+
+Tests must not require:
+
+live WebTransport
+cert files
+UDP port
+RPC
+Postgres
+private keys
+Base Sepolia
 Documentation
 
-Update README.md and ARCHITECTURE.md:
+Update:
 
-explain confirmation lifecycle
-explain why receipt status alone is insufficient
-explain finality block requirement
-explain relationship:
-broadcast -> receipt -> indexer -> reconciliation -> confirmation
-document endpoints
-document safe defaults
+README.md
+ARCHITECTURE.md
+
+Document:
+
+purpose of Market Maker Gateway
+why WebTransport is the strategic transport
+why V1A is transport-agnostic
+planned V1B WebTransport adapter using wtransport
+MM message envelope
+session model
+heartbeat
+cancel-on-disconnect
+quote_replace
+bulk behavior
+rate limits
+safety boundaries
+no auto-broadcast in gateway V1
+future work:
+WebTransport adapter
+datagrams for market data
+wallet challenge auth
+RFQ
+options support
+Cargo
+
+Do not add wtransport dependency in V1A unless needed.
+
+Dependency addition should happen in V1B.
+
 Validation
 
 Run:
@@ -226,19 +524,33 @@ cargo test
 cargo build
 Acceptance Criteria
 
-Complete only if:
+This task is complete only if:
 
-confirmation config exists
-receipt RPC exists
-confirmation decision logic is tested
-manual confirm endpoint exists
-batch tick endpoint exists
-no normal tests require RPC/Postgres/private keys
-no fake confirmation is possible
-confirmed requires receipt success + enough blocks + indexed event + matched reconciliation
-cargo fmt/clippy/test/build pass
+MM protocol message types exist
+response/error envelope exists
+session state exists
+heartbeat logic exists
+rate-limit logic exists
+cancel-on-disconnect planning exists
+quote_replace request/response models exist
+bulk partial result models exist
+transport trait exists and is WebTransport-agnostic
+config keys exist with safe defaults
+README/ARCHITECTURE document the V1A/V1B split
+normal tests are offline
+cargo fmt passes
+cargo clippy passes with -D warnings
+cargo test passes
+cargo build passes
+Deferred to NEXT_TASK V1B
+Add wtransport dependency
+Start dedicated WebTransport UDP listener
+TLS cert/key loading
+JSON framing over reliable bidirectional streams
+local WebTransport smoke client
+optional datagram support
+runtime cert/UDP documentation
 EOF
-
 
 
 
