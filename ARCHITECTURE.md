@@ -19,7 +19,7 @@ The long-term backend needs low-latency deterministic matching, RFQ, market-make
 - `reconciliation`: Opt-in Reconciliation V1 that links indexed events to execution intents by direct `onchain_intent_id` equality without marking finality.
 - `confirmation`: Opt-in Confirmation / Finality V1 that reads transaction receipts and block height, then marks submitted execution transactions and intents confirmed only after receipt success, enough blocks, indexed event identity, and matched reconciliation.
 - `db`: Optional PostgreSQL persistence for used nonces, submitted orders, matched trades, execution intents, and engine event audit records.
-- `rfq`: RFQ V1A domain types, in-memory store, service validation, quote lifecycle, quote acceptance, and execution-intent creation through the existing lifecycle boundary.
+- `rfq`: RFQ V1B domain types, in-memory store, service validation, quote lifecycle, MM gateway broadcast/notification coordination, quote acceptance, and execution-intent creation through the existing lifecycle boundary.
 - `orders`: Shared order/cancel service used by HTTP and the Market Maker Gateway for signed order validation, nonce handling, matching, persistence writes, ownership-checked cancels, cancel-all, and deterministic resting-order lookup.
 - `mm`: Market Maker Gateway protocol, session, heartbeat, rate-limit, live order/cancel handling, quote-replace models, service boundary, adapter traits, and disabled-by-default WebTransport V1C adapter. Protocol/session/service/rate-limit logic remains transport-agnostic.
 - `signing`: signed-order schema, EIP-712 order hashing, strict secp256k1 signer recovery, signature mode, deadline validation, and in-memory nonce tracking.
@@ -47,12 +47,12 @@ The long-term backend needs low-latency deterministic matching, RFQ, market-make
 - Optional Indexer V1 guarded by `INDEXER_ENABLED=false` by default.
 - Optional Reconciliation V1 guarded by `RECONCILIATION_ENABLED=false` by default.
 - Optional Confirmation / Finality V1 guarded by `CONFIRMATION_ENABLED=false` by default.
-- RFQ V1A guarded by `RFQ_ENABLED=false` by default. Enabled mode exposes HTTP/core RFQ creation, quote submission/listing, cancellation, and acceptance into a pending execution intent without WebTransport RFQ push or auto-broadcast.
+- RFQ V1B guarded by `RFQ_ENABLED=false` by default. Enabled mode exposes HTTP/core RFQ creation, quote submission/listing, cancellation, WebTransport RFQ push/quote intake through connected MM sessions, and acceptance into a pending execution intent without auto-broadcast.
 - Market Maker Gateway V1C guarded by `MM_GATEWAY_ENABLED=false` by default. Enabled mode starts a separate WebTransport UDP listener with required TLS cert/key config and routes MM order flow through the live off-chain perp orderbook without auto-broadcasting.
 
-## RFQ V1A
+## RFQ V1B
 
-RFQ V1A is an HTTP/core service. A taker creates an RFQ, market makers submit quotes through the HTTP/dev endpoint, the taker lists quotes, and accepting one quote creates a normal pending `ExecutionIntent`. The accepted intent then follows the same signing, simulation, guarded broadcast, indexing, reconciliation, and confirmation lifecycle as orderbook-created intents.
+RFQ V1B is an HTTP/core service integrated with the Market Maker Gateway. A taker creates an RFQ through HTTP, the backend broadcasts an `rfq_request` to connected MM sessions when available, market makers submit quotes through either WebTransport `rfq_quote` or the HTTP/dev endpoint, the taker lists quotes through HTTP, and accepting one quote creates a normal pending `ExecutionIntent`. The accepted intent then follows the same signing, simulation, guarded broadcast, indexing, reconciliation, and confirmation lifecycle as orderbook-created intents.
 
 RFQ statuses are `open`, `expired`, `accepted`, `cancelled`, and `failed`. Quote statuses are `active`, `expired`, `accepted`, `rejected`, and `cancelled`. Expiry is enforced at quote submission and acceptance time. Accepting a quote is single-winner: the RFQ becomes `accepted`, the winning quote becomes `accepted`, and all other active quotes for that RFQ become `rejected`.
 
@@ -74,7 +74,14 @@ HTTP endpoints:
 - `POST /rfqs/:rfq_id/accept/:quote_id`
 - `POST /rfqs/:rfq_id/cancel`
 
-RFQ V1B is deferred: WebTransport RFQ push, RFQ over MM sessions, signed RFQ quote messages, market-maker selection/ranking, and accepted/expired quote notifications are not implemented in V1A.
+Market Maker Gateway RFQ protocol messages:
+- `rfq_request`: server-initiated push to active MM sessions with RFQ id, taker, market, side, size, optional limit price, and expiry.
+- `rfq_quote`: MM-submitted quote with RFQ id, MM account, price, size, optional client quote id, and quote TTL.
+- `rfq_quote_result`: gateway response containing the persisted quote id, RFQ id, active status, and expiry.
+- `rfq_quote_accepted`: best-effort notification to the accepted quote session with execution intent id and on-chain intent id.
+- `rfq_quote_rejected`: best-effort notification to active competing quote sessions after another quote wins.
+
+The session registry is transport-neutral and stores active session snapshots plus outbound message channels. WebTransport code only registers/unregisters sessions and writes server-initiated frames; RFQ validation, persistence, and acceptance behavior stay in RFQ/MM service layers. Signed RFQ quote messages, market-maker selection/ranking, options RFQ, multi-leg RFQ, and expiry schedulers remain deferred.
 
 ## Perp On-chain Nonce Sync V1
 
@@ -193,7 +200,7 @@ HTTP endpoints:
 
 ## RFQ Future Design
 
-Future RFQ phases add WebTransport delivery to connected market-maker sessions, production wallet authentication, signed RFQ quote messages, options and multi-leg RFQs, market-maker ranking, auction logic, and richer lifecycle notifications. RFQ V1A intentionally stops at HTTP quote collection and accepted-quote execution-intent creation.
+Future RFQ phases add production wallet authentication, signed RFQ quote messages, options and multi-leg RFQs, market-maker ranking, auction logic, richer lifecycle notifications, and expiry schedulers. RFQ V1B intentionally stops at basic broadcast to active MM sessions, gateway quote persistence, and best-effort acceptance/rejection notifications.
 
 ## Market Maker Gateway V1A
 
@@ -215,11 +222,11 @@ Cancel-on-disconnect is planning-only. It returns the session's currently open c
 
 V1B adds a concrete WebTransport adapter using `wtransport` while keeping WebTransport crate types isolated to `src/mm/transport/webtransport.rs`. The adapter is disabled by default. When `MM_GATEWAY_ENABLED=true`, startup requires `MM_GATEWAY_TRANSPORT=webtransport`, `MM_GATEWAY_CERT_PATH`, and `MM_GATEWAY_KEY_PATH`, loads the TLS identity, binds UDP `MM_GATEWAY_HOST:MM_GATEWAY_PORT`, and spawns the gateway beside the HTTP Axum TCP server.
 
-The WebTransport adapter accepts sessions and reliable bidirectional streams. Critical gateway messages use deterministic length-prefixed JSON frames: `u32` big-endian length followed by JSON bytes, with a 1 MiB maximum. V1B handles one request per bidirectional stream and returns one framed response. Datagrams are intentionally deferred for market data and are not used for trading commands.
+The WebTransport adapter accepts sessions and reliable bidirectional streams. Critical gateway request/response messages use deterministic length-prefixed JSON frames: `u32` big-endian length followed by JSON bytes, with a 1 MiB maximum. V1B handles one client request per bidirectional stream and returns one framed response. Server-initiated RFQ notifications use outbound WebTransport streams from the same transport adapter. Datagrams are intentionally deferred for market data and are not used for trading commands.
 
-Each decoded client message is passed to `MmGatewayService::handle_message`, which updates the transport-neutral session and returns a transport-neutral server message. V1B did not mutate the live orderbook, execution intents, submitted transactions, confirmed transactions, or chain state.
+Each decoded client message is passed to `MmGatewayService::handle_message`, which updates the transport-neutral session and returns a transport-neutral server message. RFQ messages are routed through the RFQ service and store. The adapter registers sessions in a transport-neutral registry and writes outbound server messages, but does not contain RFQ business logic.
 
-V1B does not implement RFQ, options support, pricing logic, production wallet challenge auth, WebSocket fallback, live gateway orderbook mutation, or auto-broadcast. Normal tests cover framing, config validation, and serialization without binding UDP, loading cert files, calling RPC, connecting to Postgres, or using private keys.
+V1B does not implement options support, pricing logic, production wallet challenge auth, WebSocket fallback, live gateway orderbook mutation, or auto-broadcast. Normal tests cover framing, config validation, RFQ protocol serialization, gateway RFQ quote handling, and session notifications without binding UDP, loading cert files, calling RPC, connecting to Postgres, or using private keys.
 
 ## Market Maker Gateway V1C
 

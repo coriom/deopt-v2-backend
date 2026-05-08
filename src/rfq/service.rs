@@ -2,9 +2,14 @@ use super::{QuoteId, RfqConfig, RfqId, RfqQuote, RfqQuoteStatus, RfqRequest, Rfq
 use crate::api::AppState;
 use crate::error::{BackendError, Result};
 use crate::execution::{intent_id_to_hex_bytes32, ExecutionIntent, ExecutionIntentStatus};
+use crate::mm::protocol::{
+    NotificationEnvelope, RfqQuoteAcceptedPayload, RfqQuoteRejectedPayload, RfqRequestPayload,
+    ServerMessage,
+};
 use crate::nonce_sync::read_perp_nonce;
 use crate::signing::eip712::parse_evm_address;
 use crate::types::{now_ms, AccountId, MarketId, OrderId, Price1e8, Side, Size1e8, TimestampMs};
+use tracing::{info, warn};
 use uuid::Uuid;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -35,6 +40,8 @@ pub struct AcceptQuoteOutcome {
     pub status: RfqStatus,
     pub execution_intent_id: Uuid,
     pub onchain_intent_id: String,
+    pub mm_notification_sent: bool,
+    pub mm_notification_warning: Option<String>,
 }
 
 pub async fn create_rfq(state: &AppState, input: CreateRfqInput) -> Result<RfqRequest> {
@@ -81,6 +88,7 @@ pub async fn create_rfq(state: &AppState, input: CreateRfqInput) -> Result<RfqRe
             .map_err(|_| BackendError::Config("RFQ store lock poisoned".to_string()))?
             .insert_rfq(rfq.clone());
     }
+    broadcast_rfq_request(state, &rfq);
     Ok(rfq)
 }
 
@@ -191,6 +199,7 @@ pub async fn accept_quote(
     ensure_enabled(&state.rfq_config)?;
     let rfq = get_rfq(state, rfq_id).await?;
     let quote = get_quote(state, quote_id).await?;
+    let quotes_before_accept = list_quotes(state, rfq_id).await?;
     let now = now_ms();
     validate_acceptance(&rfq, &quote, now)?;
 
@@ -233,12 +242,22 @@ pub async fn accept_quote(
             .push_execution_intent(intent.clone());
     }
 
+    let (mm_notification_sent, mm_notification_warning) = notify_quote_acceptance(
+        state,
+        &quote,
+        &quotes_before_accept,
+        &onchain_intent_id,
+        intent.intent_id,
+    );
+
     Ok(AcceptQuoteOutcome {
         rfq_id,
         quote_id,
         status: RfqStatus::Accepted,
         execution_intent_id: intent.intent_id,
         onchain_intent_id,
+        mm_notification_sent,
+        mm_notification_warning,
     })
 }
 
@@ -335,6 +354,99 @@ pub fn rfq_execution_sides(rfq: &RfqRequest, quote: &RfqQuote) -> (AccountId, Ac
         Side::Buy => (rfq.taker.clone(), quote.mm_account.clone(), false),
         Side::Sell => (quote.mm_account.clone(), rfq.taker.clone(), true),
     }
+}
+
+fn broadcast_rfq_request(state: &AppState, rfq: &RfqRequest) {
+    let message = ServerMessage::RfqRequest(NotificationEnvelope::new(
+        "rfq_request",
+        format!("rfq-push-{}", rfq.rfq_id),
+        RfqRequestPayload {
+            rfq_id: rfq.rfq_id,
+            taker: rfq.taker.clone(),
+            market_id: rfq.market_id,
+            side: rfq.side,
+            size_1e8: rfq.size_1e8.to_string(),
+            limit_price_1e8: rfq.limit_price_1e8.map(|value| value.to_string()),
+            expires_at_ms: rfq.expires_at_ms,
+        },
+    ));
+    match state.mm_sessions.broadcast(message) {
+        Ok(sent) => {
+            info!(rfq_id = %rfq.rfq_id, broadcast_count = sent, "broadcast RFQ request to MM sessions");
+        }
+        Err(error) => {
+            warn!(rfq_id = %rfq.rfq_id, error = %error, "RFQ request broadcast failed");
+        }
+    }
+}
+
+fn notify_quote_acceptance(
+    state: &AppState,
+    accepted_quote: &RfqQuote,
+    quotes_before_accept: &[RfqQuote],
+    onchain_intent_id: &str,
+    execution_intent_id: Uuid,
+) -> (bool, Option<String>) {
+    let mut accepted_sent = false;
+    let mut warning = None;
+
+    if let Some(session_id) = accepted_quote.session_id.as_deref() {
+        let message = ServerMessage::RfqQuoteAccepted(NotificationEnvelope::new(
+            "rfq_quote_accepted",
+            format!("rfq-accepted-{}", accepted_quote.quote_id),
+            RfqQuoteAcceptedPayload {
+                rfq_id: accepted_quote.rfq_id,
+                quote_id: accepted_quote.quote_id,
+                execution_intent_id,
+                onchain_intent_id: onchain_intent_id.to_string(),
+            },
+        ));
+        match state.mm_sessions.send_to_session(session_id, message) {
+            Ok(()) => {
+                accepted_sent = true;
+            }
+            Err(error) => {
+                let message = error.to_string();
+                warn!(
+                    rfq_id = %accepted_quote.rfq_id,
+                    quote_id = %accepted_quote.quote_id,
+                    session_id,
+                    error = %message,
+                    "RFQ quote accepted notification failed"
+                );
+                warning = Some(message);
+            }
+        }
+    }
+
+    for quote in quotes_before_accept {
+        if quote.quote_id == accepted_quote.quote_id || quote.status != RfqQuoteStatus::Active {
+            continue;
+        }
+        let Some(session_id) = quote.session_id.as_deref() else {
+            continue;
+        };
+        let message = ServerMessage::RfqQuoteRejected(NotificationEnvelope::new(
+            "rfq_quote_rejected",
+            format!("rfq-rejected-{}", quote.quote_id),
+            RfqQuoteRejectedPayload {
+                rfq_id: quote.rfq_id,
+                quote_id: quote.quote_id,
+                status: RfqQuoteStatus::Rejected,
+            },
+        ));
+        if let Err(error) = state.mm_sessions.send_to_session(session_id, message) {
+            warn!(
+                rfq_id = %quote.rfq_id,
+                quote_id = %quote.quote_id,
+                session_id,
+                error = %error,
+                "RFQ quote rejected notification failed"
+            );
+        }
+    }
+
+    (accepted_sent, warning)
 }
 
 async fn reserve_trade_nonces(

@@ -86,9 +86,9 @@ MM_GATEWAY_REQUIRE_AUTH=false
 `RFQ_ENABLED=false` is the safe default. When `RFQ_ENABLED=true` and `RFQ_REQUIRE_PERSISTENCE=true`, startup requires `PERSISTENCE_ENABLED=true`. Test and development code can run RFQ in memory with persistence disabled, but production-like RFQ acceptance should use Postgres so RFQ, quote, and execution-intent updates are committed together.
 `MM_GATEWAY_ENABLED=false` is the safe default. When `true`, V1C starts a separate WebTransport UDP listener and requires `MM_GATEWAY_CERT_PATH` and `MM_GATEWAY_KEY_PATH`. It can submit and cancel off-chain perp orders through the live in-memory orderbook, but it does not auto-broadcast, sign, simulate, index, reconcile, or confirm execution intents.
 
-## RFQ V1A
+## RFQ V1B
 
-RFQ V1A is HTTP/core only. It supports taker RFQ creation, HTTP/dev quote submission by market makers, quote listing, taker quote acceptance, RFQ cancellation, and creation of a normal `execution_intent` for the accepted quote. It does not push RFQs over WebTransport, does not process RFQ messages over MM sessions, does not support options or multi-leg RFQs, and does not auto-sign, simulate, or broadcast.
+RFQ V1B supports taker RFQ creation, WebTransport `rfq_request` push to connected Market Maker Gateway sessions, WebTransport `rfq_quote` submission by market makers, HTTP/dev quote submission, quote listing, taker quote acceptance, RFQ cancellation, and creation of a normal `execution_intent` for the accepted quote. It does not support options or multi-leg RFQs, market-maker ranking, signed RFQ quotes, auto-signing, simulation, or broadcast.
 
 HTTP endpoints:
 
@@ -101,6 +101,18 @@ GET /rfqs/:rfq_id/quotes
 POST /rfqs/:rfq_id/accept/:quote_id
 POST /rfqs/:rfq_id/cancel
 ```
+
+Market Maker Gateway RFQ messages use the existing JSON envelope and length-prefixed WebTransport frames:
+
+```text
+server -> MM: rfq_request
+MM -> server: rfq_quote
+server -> MM: rfq_quote_result
+server -> MM: rfq_quote_accepted
+server -> MM: rfq_quote_rejected
+```
+
+`rfq_quote` stores quotes in the same RFQ repository as the HTTP/dev endpoint, including `session_id` and `client_quote_id` when supplied. `rfq_quote_result` returns the stored `quote_id`, `rfq_id`, active status, and quote expiry. RFQ creation still succeeds when no MM sessions are connected.
 
 RFQ statuses are `open`, `expired`, `accepted`, `cancelled`, and `failed`. Quote statuses are `active`, `expired`, `accepted`, `rejected`, and `cancelled`. Expiry is enforced on quote submission and acceptance. Accepting one quote deterministically marks the RFQ `accepted`, marks the winning quote `accepted`, and marks other active quotes for that RFQ `rejected`.
 
@@ -115,7 +127,7 @@ POST /executor/simulate/:intent_id
 POST /executor/broadcast/:intent_id
 ```
 
-Broadcast remains disabled unless the existing explicit broadcast gates are enabled. RFQ acceptance never fabricates signatures, transaction hashes, confirmations, or finality. RFQ V1B is deferred for WebTransport RFQ push, RFQ quote messages over MM sessions, signed RFQ quotes, market-maker ranking, and live RFQ session notifications.
+Broadcast remains disabled unless the existing explicit broadcast gates are enabled. RFQ acceptance never fabricates signatures, transaction hashes, confirmations, or finality. If the accepted quote or rejected competing quotes are associated with active MM sessions, the backend sends best-effort WebTransport notifications; notification failure does not revert acceptance. Signed RFQ quotes, market-maker ranking, options RFQ, multi-leg RFQ, and expiry schedulers remain deferred.
 
 ## Market Maker Gateway V1A
 
@@ -588,7 +600,7 @@ curl -X DELETE http://127.0.0.1:8080/orders/<order_id>
 - `SIGNATURE_VERIFICATION_MODE=disabled` validates nonce, deadline, and signature shape while skipping cryptographic recovery.
 - `SIGNATURE_VERIFICATION_MODE=strict` verifies the EIP-712 order digest and recovered secp256k1 signer against `account`.
 - FOK is rejected cleanly.
-- RFQ is a type scaffold only; the market-maker gateway supports live perp orderbook submit/cancel flow but not RFQ, options, production auth, or market data datagrams.
+- RFQ supports HTTP/dev flow plus basic MM gateway push and quote intake; options RFQ, multi-leg RFQ, signed RFQ quotes, MM ranking, production auth, and market data datagrams remain deferred.
 - Execution intents are provisional off-chain records, not settlement.
 - Indexed `TradeExecuted` events store `onchain_intent_id` for direct reconciliation only; they do not confirm backend intents.
 - Reconciliation rows link indexed events to intents, but still do not prove transaction ownership, finality, or reorg safety.

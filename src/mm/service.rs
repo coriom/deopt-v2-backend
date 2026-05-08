@@ -4,7 +4,8 @@ use super::protocol::{
     CancelAllResultPayload, CancelOrderPayload, CancelOrderResultPayload, ClientMessage, ErrorCode,
     GetSessionResultPayload, HeartbeatResultPayload, ProtocolError, QuoteLegPayload,
     QuoteReplaceLegResult, QuoteReplacePayload, QuoteReplaceResultPayload, ResultEnvelope,
-    ServerMessage, SubmitOrderPayload, SubmitOrderResultPayload,
+    RfqQuotePayload, RfqQuoteResultPayload, ServerMessage, SubmitOrderPayload,
+    SubmitOrderResultPayload,
 };
 use super::rate_limit::{
     check_cancels_per_bulk, check_in_flight, check_message_rate, check_open_orders,
@@ -18,6 +19,7 @@ use crate::orders::service::{
     cancel_order, cancel_resting_orders, submit_signed_order, CancelOrderInput,
     CancelRestingFilter, SubmitOrderOutcome,
 };
+use crate::rfq::service::{submit_quote as submit_rfq_quote, SubmitQuoteInput};
 use crate::signing::SignedOrder;
 use crate::types::{AccountId, MarketId, Side, TimeInForce, TimestampMs};
 use std::collections::BTreeSet;
@@ -115,6 +117,10 @@ impl MmGatewayService {
                 self.handle_quote_replace(session, envelope.request_id, envelope.payload)
                     .await
             }
+            ClientMessage::RfqQuote(envelope) => {
+                self.handle_rfq_quote(session, envelope.request_id, envelope.payload)
+                    .await
+            }
             ClientMessage::GetSession(envelope) => {
                 ServerMessage::GetSessionResult(ResultEnvelope::new(
                     "get_session_result",
@@ -169,6 +175,26 @@ impl MmGatewayService {
                 0
             }
         }
+    }
+
+    pub fn register_session(
+        &self,
+        session: &MmSession,
+        sender: tokio::sync::mpsc::UnboundedSender<ServerMessage>,
+    ) -> crate::error::Result<()> {
+        self.state.mm_sessions.register(session, sender)
+    }
+
+    pub fn update_session(&self, session: &MmSession) -> crate::error::Result<()> {
+        self.state.mm_sessions.update(session)
+    }
+
+    pub fn unregister_session(&self, session_id: &str) -> crate::error::Result<()> {
+        self.state.mm_sessions.unregister(session_id)
+    }
+
+    pub fn active_sessions(&self) -> crate::error::Result<Vec<super::PublicSessionSnapshot>> {
+        self.state.mm_sessions.list_active()
     }
 
     async fn handle_submit_order(
@@ -472,6 +498,61 @@ impl MmGatewayService {
                 matched_intents,
             },
         ))
+    }
+
+    async fn handle_rfq_quote(
+        &self,
+        session: &mut MmSession,
+        request_id: String,
+        payload: RfqQuotePayload,
+    ) -> ServerMessage {
+        let Some(mm_account) = session_account(session, Some(payload.mm_account.clone())) else {
+            return ServerMessage::error(
+                request_id,
+                ErrorCode::RfqQuoteRejected,
+                "rfq_quote account does not match authenticated session",
+            );
+        };
+
+        let price_1e8 = match parse_fixed_u128("price_1e8", &payload.price_1e8) {
+            Ok(value) => value,
+            Err(error) => {
+                return backend_error_response(request_id, ErrorCode::RfqQuoteRejected, error);
+            }
+        };
+        let size_1e8 = match parse_fixed_u128("size_1e8", &payload.size_1e8) {
+            Ok(value) => value,
+            Err(error) => {
+                return backend_error_response(request_id, ErrorCode::RfqQuoteRejected, error);
+            }
+        };
+
+        match submit_rfq_quote(
+            &self.state,
+            SubmitQuoteInput {
+                rfq_id: payload.rfq_id,
+                mm_account,
+                session_id: Some(session.session_id.clone()),
+                client_quote_id: payload.client_quote_id,
+                price_1e8,
+                size_1e8,
+                quote_ttl_ms: payload.quote_ttl_ms,
+            },
+        )
+        .await
+        {
+            Ok(quote) => ServerMessage::RfqQuoteResult(ResultEnvelope::new(
+                "rfq_quote_result",
+                request_id,
+                RfqQuoteResultPayload {
+                    quote_id: quote.quote_id,
+                    rfq_id: quote.rfq_id,
+                    status: quote.status,
+                    expires_at_ms: quote.expires_at_ms,
+                },
+            )),
+            Err(error) => backend_error_response(request_id, ErrorCode::RfqQuoteRejected, error),
+        }
     }
 
     async fn submit_payload(

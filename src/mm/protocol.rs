@@ -1,4 +1,5 @@
 use super::session::PublicSessionSnapshot;
+use crate::rfq::{RfqQuoteStatus, RfqStatus};
 use crate::types::{AccountId, MarketId, OrderId, Side, TimeInForce, TimestampMs};
 use serde::de::{self, DeserializeOwned};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -19,6 +20,7 @@ pub enum ErrorCode {
     OrderRejected,
     CancelRejected,
     QuoteReplaceFailed,
+    RfqQuoteRejected,
     InternalError,
     NotImplemented,
 }
@@ -54,6 +56,7 @@ pub enum ClientMessage {
     BulkCancel(ClientEnvelope<BulkCancelPayload>),
     CancelAll(ClientEnvelope<CancelAllPayload>),
     QuoteReplace(ClientEnvelope<QuoteReplacePayload>),
+    RfqQuote(ClientEnvelope<RfqQuotePayload>),
     GetSession(ClientEnvelope<GetSessionPayload>),
 }
 
@@ -68,6 +71,7 @@ impl ClientMessage {
             Self::BulkCancel(envelope) => &envelope.request_id,
             Self::CancelAll(envelope) => &envelope.request_id,
             Self::QuoteReplace(envelope) => &envelope.request_id,
+            Self::RfqQuote(envelope) => &envelope.request_id,
             Self::GetSession(envelope) => &envelope.request_id,
         }
     }
@@ -82,6 +86,7 @@ impl ClientMessage {
             Self::BulkCancel(_) => "bulk_cancel",
             Self::CancelAll(_) => "cancel_all",
             Self::QuoteReplace(_) => "quote_replace",
+            Self::RfqQuote(_) => "rfq_quote",
             Self::GetSession(_) => "get_session",
         }
     }
@@ -130,6 +135,7 @@ fn parse_raw_client_envelope(raw: RawClientEnvelope) -> Result<ClientMessage, Pr
         "bulk_cancel" => Ok(ClientMessage::BulkCancel(parse_payload(raw)?)),
         "cancel_all" => Ok(ClientMessage::CancelAll(parse_payload(raw)?)),
         "quote_replace" => Ok(ClientMessage::QuoteReplace(parse_payload(raw)?)),
+        "rfq_quote" => Ok(ClientMessage::RfqQuote(parse_payload(raw)?)),
         "get_session" => Ok(ClientMessage::GetSession(parse_payload(raw)?)),
         _ => Err(ProtocolError::new(
             ErrorCode::UnknownMessageType,
@@ -221,6 +227,16 @@ pub struct QuoteLegPayload {
     pub nonce: u64,
     pub deadline_ms: TimestampMs,
     pub signature: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+pub struct RfqQuotePayload {
+    pub rfq_id: uuid::Uuid,
+    pub mm_account: AccountId,
+    pub price_1e8: String,
+    pub size_1e8: String,
+    pub client_quote_id: Option<String>,
+    pub quote_ttl_ms: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Default, Deserialize)]
@@ -315,6 +331,46 @@ pub struct QuoteReplaceLegResult {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RfqRequestPayload {
+    pub rfq_id: uuid::Uuid,
+    pub taker: AccountId,
+    pub market_id: MarketId,
+    pub side: Side,
+    pub size_1e8: String,
+    pub limit_price_1e8: Option<String>,
+    pub expires_at_ms: TimestampMs,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RfqQuoteResultPayload {
+    pub quote_id: uuid::Uuid,
+    pub rfq_id: uuid::Uuid,
+    pub status: RfqQuoteStatus,
+    pub expires_at_ms: TimestampMs,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RfqQuoteAcceptedPayload {
+    pub rfq_id: uuid::Uuid,
+    pub quote_id: uuid::Uuid,
+    pub execution_intent_id: uuid::Uuid,
+    pub onchain_intent_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RfqQuoteRejectedPayload {
+    pub rfq_id: uuid::Uuid,
+    pub quote_id: uuid::Uuid,
+    pub status: RfqQuoteStatus,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RfqExpiredPayload {
+    pub rfq_id: uuid::Uuid,
+    pub status: RfqStatus,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct GetSessionResultPayload {
     pub session: PublicSessionSnapshot,
 }
@@ -329,6 +385,11 @@ pub enum ServerMessage {
     BulkCancelResult(ResultEnvelope<BulkCancelResultPayload>),
     CancelAllResult(ResultEnvelope<CancelAllResultPayload>),
     QuoteReplaceResult(ResultEnvelope<QuoteReplaceResultPayload>),
+    RfqRequest(NotificationEnvelope<RfqRequestPayload>),
+    RfqQuoteResult(ResultEnvelope<RfqQuoteResultPayload>),
+    RfqQuoteAccepted(NotificationEnvelope<RfqQuoteAcceptedPayload>),
+    RfqQuoteRejected(NotificationEnvelope<RfqQuoteRejectedPayload>),
+    RfqExpired(NotificationEnvelope<RfqExpiredPayload>),
     GetSessionResult(ResultEnvelope<GetSessionResultPayload>),
     Error(ErrorEnvelope),
 }
@@ -362,6 +423,11 @@ impl Serialize for ServerMessage {
             Self::BulkCancelResult(envelope) => envelope.serialize(serializer),
             Self::CancelAllResult(envelope) => envelope.serialize(serializer),
             Self::QuoteReplaceResult(envelope) => envelope.serialize(serializer),
+            Self::RfqRequest(envelope) => envelope.serialize(serializer),
+            Self::RfqQuoteResult(envelope) => envelope.serialize(serializer),
+            Self::RfqQuoteAccepted(envelope) => envelope.serialize(serializer),
+            Self::RfqQuoteRejected(envelope) => envelope.serialize(serializer),
+            Self::RfqExpired(envelope) => envelope.serialize(serializer),
             Self::GetSessionResult(envelope) => envelope.serialize(serializer),
             Self::Error(envelope) => envelope.serialize(serializer),
         }
@@ -383,6 +449,24 @@ impl<T> ResultEnvelope<T> {
             message_type: message_type.into(),
             request_id: request_id.into(),
             ok: true,
+            payload,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct NotificationEnvelope<T> {
+    #[serde(rename = "type")]
+    pub message_type: String,
+    pub request_id: String,
+    pub payload: T,
+}
+
+impl<T> NotificationEnvelope<T> {
+    pub fn new(message_type: impl Into<String>, request_id: impl Into<String>, payload: T) -> Self {
+        Self {
+            message_type: message_type.into(),
+            request_id: request_id.into(),
             payload,
         }
     }

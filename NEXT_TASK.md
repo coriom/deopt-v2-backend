@@ -1,486 +1,344 @@
-# NEXT_TASK.md — RFQ V1A: Core RFQ Service + HTTP API
+# NEXT_TASK.md — RFQ V1B Runtime Verification
 
 ## Context
 
-The backend now has a validated execution pipeline:
+RFQ V1B has been implemented.
 
-- HTTP order intake
-- orderbook matching
-- execution intents
-- PerpTrade signing payloads
-- buyer/seller signatures
-- RPC simulation
-- guarded real broadcast
-- indexer
-- reconciliation
-- confirmation/finality
-- on-chain perp nonce sync
+Implemented features:
 
-The Market Maker Gateway V1 is also implemented and runtime-verified:
+- RFQ protocol messages:
+  - `rfq_quote`
+  - `rfq_request`
+  - `rfq_quote_result`
+  - `rfq_quote_accepted`
+  - `rfq_quote_rejected`
+  - `rfq_expired`
+- MM session registry
+- RFQ creation broadcasts `rfq_request` to active MM sessions
+- WebTransport MM can submit `rfq_quote`
+- RFQ quotes are persisted through the RFQ service/repository
+- Accepted quote creates a normal pending execution_intent
+- Accepted quote notifies MM session best-effort
+- Competing active session quotes get best-effort rejection
+- No auto-broadcast
+- No Solidity changes
+- No execution lifecycle changes
 
-- WebTransport server
-- reliable bidirectional streams
-- heartbeat/get_session
-- submit_order
-- bulk_submit
-- cancel_order
-- bulk_cancel
-- cancel_all
-- quote_replace
-- cancel-on-disconnect
-- HTTP orderbook verification
-
-Next product block: RFQ.
-
-Strategic RFQ design:
+Validation already passed:
 
 ```text
-taker creates RFQ
-→ MM quotes respond
-→ taker accepts quote
-→ backend creates execution_intent
-→ existing signing/simulation/broadcast/index/reconcile/confirm lifecycle handles execution
+cargo fmt
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test
+cargo build
 
-RFQ must not bypass the execution lifecycle.
+Now runtime behavior must be verified.
 
 Goal
 
-Implement RFQ V1A core service and HTTP API.
+Runtime-verify the complete RFQ V1B flow over real WebTransport.
 
-This task must build the RFQ domain layer, persistence, quote collection, quote acceptance, and execution-intent creation through existing backend primitives.
+Prove:
 
-Do not implement WebTransport RFQ push yet. That is V1B.
-
+HTTP taker creates RFQ
+→ connected MM receives rfq_request over WebTransport
+→ MM sends rfq_quote over WebTransport
+→ HTTP quote listing shows MM quote
+→ HTTP accept quote creates execution_intent
+→ MM receives rfq_quote_accepted notification
 Non-Goals
 
 Do not implement:
 
-WebTransport RFQ broadcasting
-MM session RFQ push
-RFQ over WebTransport
-RFQ quote messages in MM gateway
+RFQ V1C
+signed RFQ quotes
 options RFQ
 multi-leg RFQ
-auction engine
 MM ranking
-market data datagrams
-automatic broadcast
-automatic signing
-production RFQ quote signatures
-Solidity changes
-Absolute Safety Rules
+production auth
+market-data datagrams
+auto-signing
+auto-simulation
+auto-broadcast
+Safety Rules
 
 Do not:
 
 modify Solidity
 deploy contracts
 change PerpTrade ABI
-change matching semantics
-enable real broadcast by default
-auto-broadcast accepted RFQs
-fake quotes
+change execution lifecycle
+enable real broadcast
+call /executor/broadcast
+expose private keys
+fake RFQ success
+fake quote rows
 fake execution intents
-fake tx hashes
-fake confirmations
-bypass existing validation
-bypass nonce sync when execution_intent is created
-require live RPC/Postgres/private keys/WebTransport/certs/UDP for normal cargo test
+fake notifications
 commit
 push
-expose private keys
-RFQ V1A Model
 
-RFQ V1A is HTTP/core only.
+If a real code bug is found:
 
-It supports:
+apply minimal patch only
+run full validation:
+cargo fmt
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test
+cargo build
+Runtime Setup
 
-taker creates RFQ
-MM quote is submitted via HTTP/dev API
-taker lists quotes
-taker accepts one quote
-backend creates an execution_intent
-RFQ and quote statuses update
+Use local WebTransport certs under:
 
-The actual final PerpTrade signing/simulation/broadcast remains existing flow.
+/tmp/deopt-mm-gateway/cert.pem
+/tmp/deopt-mm-gateway/key.pem
 
-RFQ Lifecycle
+Use ECDSA P-256 cert generation because previous runtime smoke showed RSA cert failed WebTransport client verification.
 
-RFQ statuses:
+Generate if missing:
 
-open
-expired
-accepted
-cancelled
-failed
+mkdir -p /tmp/deopt-mm-gateway
 
-Quote statuses:
+openssl ecparam -name prime256v1 -genkey -noout \
+  -out /tmp/deopt-mm-gateway/key.pem
 
-active
-expired
-accepted
-rejected
-cancelled
+openssl req -new -x509 \
+  -key /tmp/deopt-mm-gateway/key.pem \
+  -out /tmp/deopt-mm-gateway/cert.pem \
+  -days 1 \
+  -subj "/CN=localhost"
 
-Rules:
+Temporarily set .env:
 
-RFQ starts as open.
-RFQ has expires_at_ms.
-Quote has expires_at_ms.
-Expired RFQ cannot receive quotes.
-Expired quote cannot be accepted.
-Accepting one quote sets RFQ status to accepted.
-Accepting one quote sets quote status to accepted.
-Other active quotes for same RFQ become rejected or remain active but non-acceptable; choose one deterministic behavior and document it.
-Only one quote can win.
-Accept quote must be idempotent or reject clearly if already accepted.
-Accepted quote creates exactly one execution_intent.
-No broadcast occurs during RFQ accept.
-RFQ Direction Semantics
+RFQ_ENABLED=true
 
-Define RFQ side from taker perspective:
+MM_GATEWAY_ENABLED=true
+MM_GATEWAY_TRANSPORT=webtransport
+MM_GATEWAY_HOST=127.0.0.1
+MM_GATEWAY_PORT=8443
+MM_GATEWAY_CERT_PATH=/tmp/deopt-mm-gateway/cert.pem
+MM_GATEWAY_KEY_PATH=/tmp/deopt-mm-gateway/key.pem
+MM_GATEWAY_AUTH_MODE=disabled
+MM_GATEWAY_REQUIRE_AUTH=false
 
-side = buy  => taker wants to buy perp exposure, MM is seller
-side = sell => taker wants to sell perp exposure, MM is buyer
+EXECUTION_ENABLED=false
+EXECUTOR_REAL_BROADCAST_ENABLED=false
 
-Execution intent mapping:
+After the test, restore safe state:
 
-If RFQ side is buy:
+MM_GATEWAY_ENABLED=false
+EXECUTOR_REAL_BROADCAST_ENABLED=false
+EXECUTION_ENABLED=false
+Runtime Test Steps
+1. Start backend
 
-buyer = taker
-seller = mm_account
-buyer_is_maker = false
+Ensure no old backend is running:
 
-If RFQ side is sell:
+pkill -f deopt-v2-backend || true
 
-buyer = mm_account
-seller = taker
-buyer_is_maker = true
+Start backend:
 
-Validate this carefully against existing execution intent / matching semantics.
+cargo run --bin deopt-v2-backend
 
-Database
+Verify:
 
-Add migration:
+curl http://127.0.0.1:8080/health
 
-migrations/0010_rfqs.sql
+Expected:
 
-Suggested tables:
+{"ok":true,"service":"deopt-v2-backend"}
+2. Start MM WebTransport smoke client
 
-CREATE TABLE rfqs (
-    rfq_id TEXT PRIMARY KEY,
-    taker TEXT NOT NULL,
-    market_id BIGINT NOT NULL,
-    side TEXT NOT NULL,
-    size_1e8 TEXT NOT NULL,
-    limit_price_1e8 TEXT NULL,
-    status TEXT NOT NULL,
-    created_at_ms BIGINT NOT NULL,
-    expires_at_ms BIGINT NOT NULL,
-    accepted_quote_id TEXT NULL,
-    execution_intent_id TEXT NULL
-);
+Use src/bin/mm_wt_smoke.rs.
 
-CREATE INDEX idx_rfqs_status ON rfqs(status);
-CREATE INDEX idx_rfqs_taker ON rfqs(lower(taker));
-CREATE INDEX idx_rfqs_market_id ON rfqs(market_id);
+Extend it minimally if needed so it can:
 
-CREATE TABLE rfq_quotes (
-    quote_id TEXT PRIMARY KEY,
-    rfq_id TEXT NOT NULL REFERENCES rfqs(rfq_id),
-    mm_account TEXT NOT NULL,
-    session_id TEXT NULL,
-    client_quote_id TEXT NULL,
-    price_1e8 TEXT NOT NULL,
-    size_1e8 TEXT NOT NULL,
-    status TEXT NOT NULL,
-    created_at_ms BIGINT NOT NULL,
-    expires_at_ms BIGINT NOT NULL
-);
+connect
+heartbeat
+get_session
+listen for rfq_request
+send rfq_quote
+listen for rfq_quote_accepted
 
-CREATE INDEX idx_rfq_quotes_rfq_id ON rfq_quotes(rfq_id);
-CREATE INDEX idx_rfq_quotes_mm ON rfq_quotes(lower(mm_account));
-CREATE INDEX idx_rfq_quotes_status ON rfq_quotes(status);
+Do not require private keys.
 
-Use existing project DB style and SQLx patterns.
+Do not broadcast.
 
-If repository uses different conventions, follow existing style.
+Use:
 
-Rust Modules
+MM_WT_URL=https://127.0.0.1:8443/mm \
+MM_WT_CERT_PATH=/tmp/deopt-mm-gateway/cert.pem \
+cargo run --bin mm_wt_smoke -- rfq
 
-Add:
+If the current binary uses different flags, adapt minimally and document final command.
 
-src/rfq/
-  mod.rs
-  types.rs
-  service.rs
+3. Create RFQ through HTTP
 
-Optional:
+Use harmless test accounts.
 
-src/rfq/store.rs
+Example:
 
-if repository style prefers separate store abstraction.
+TAKER=0xc0A76c2A6c6b70C0B065A05E64417886416cc976
 
-API Endpoints
+curl -X POST http://127.0.0.1:8080/rfqs \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"taker\": \"$TAKER\",
+    \"market_id\": 1,
+    \"side\": \"buy\",
+    \"size_1e8\": \"100000000\",
+    \"limit_price_1e8\": \"305000000000\",
+    \"ttl_ms\": 30000
+  }"
 
-Add HTTP endpoints:
+Expected:
 
-POST /rfqs
-GET /rfqs
-GET /rfqs/:rfq_id
-POST /rfqs/:rfq_id/quotes
-GET /rfqs/:rfq_id/quotes
-POST /rfqs/:rfq_id/accept/:quote_id
-POST /rfqs/:rfq_id/cancel
-POST /rfqs
-
-Request:
-
-{
-  "taker": "0x...",
-  "market_id": 1,
-  "side": "buy",
-  "size_1e8": "100000000",
-  "limit_price_1e8": "305000000000",
-  "ttl_ms": 5000
-}
-
-Response:
-
-{
-  "rfq_id": "...",
-  "status": "open",
-  "expires_at_ms": 1770000005000
-}
-
-Validation:
-
-taker address valid
-market exists
-side is buy/sell
-size > 0
-ttl_ms within config bounds
-limit_price optional but if present > 0
-POST /rfqs/:rfq_id/quotes
-
-V1A dev/HTTP quote submission.
-
-Request:
-
-{
-  "mm_account": "0x...",
-  "price_1e8": "300100000000",
-  "size_1e8": "100000000",
-  "client_quote_id": "mm-quote-001",
-  "quote_ttl_ms": 3000
-}
-
-Response:
-
-{
-  "quote_id": "...",
-  "rfq_id": "...",
-  "status": "active",
-  "expires_at_ms": 1770000003000
-}
-
-Validation:
-
-RFQ exists
 RFQ status open
-RFQ not expired
-MM account valid
-price > 0
-size > 0
-quote size <= RFQ size for V1A
-quote_ttl_ms within config bounds
-quote expires no later than RFQ expires_at_ms
-optional client_quote_id idempotence or duplicate rejection
-GET /rfqs/:rfq_id/quotes
+rfq_id returned
+MM smoke client receives rfq_request
+4. MM sends RFQ quote over WebTransport
 
-Return all quotes for RFQ.
-
-POST /rfqs/:rfq_id/accept/:quote_id
-
-Accept quote and create execution intent.
-
-Response:
+Smoke client should send something equivalent to:
 
 {
-  "rfq_id": "...",
-  "quote_id": "...",
-  "status": "accepted",
-  "execution_intent_id": "...",
-  "onchain_intent_id": "0x..."
+  "type": "rfq_quote",
+  "request_id": "smoke-rfq-quote-1",
+  "payload": {
+    "rfq_id": "<RFQ_ID>",
+    "mm_account": "0xbAf0976a00a0DCc84Df5B15d927695c8b014B1c3",
+    "price_1e8": "300100000000",
+    "size_1e8": "100000000",
+    "client_quote_id": "smoke-mm-rfq-quote-1",
+    "quote_ttl_ms": 10000
+  }
 }
 
-Validation:
+Expected response:
 
-RFQ exists
-quote exists and belongs to RFQ
-RFQ status open
-RFQ not expired
+{
+  "type": "rfq_quote_result",
+  "ok": true,
+  "payload": {
+    "quote_id": "...",
+    "status": "active"
+  }
+}
+5. Verify quote via HTTP
+curl http://127.0.0.1:8080/rfqs/$RFQ_ID/quotes
+
+Expected:
+
+quote is listed
+quote has session_id
 quote status active
-quote not expired
-quote size compatible
-price compatible with taker limit
-no previous accepted quote
+mm_account matches smoke MM
+6. Accept quote via HTTP
+curl -X POST http://127.0.0.1:8080/rfqs/$RFQ_ID/accept/$QUOTE_ID
 
-Critical:
-This endpoint must create an execution_intent using existing execution-intent creation path if possible.
+Expected:
 
-Do not duplicate execution-intent logic incorrectly.
+RFQ status accepted
+quote status accepted
+execution_intent_id returned
+onchain_intent_id returned if endpoint exposes it
+no broadcast occurred
+7. Verify execution intent exists
+curl http://127.0.0.1:8080/execution-intents
 
-Config
+or direct endpoint if available.
 
-Add safe defaults:
+Expected:
 
-RFQ_ENABLED=false
-RFQ_REQUIRE_PERSISTENCE=true
-RFQ_DEFAULT_TTL_MS=5000
-RFQ_MAX_TTL_MS=30000
-RFQ_MIN_QUOTE_TTL_MS=500
-RFQ_MAX_QUOTE_TTL_MS=10000
-RFQ_MAX_QUOTES_PER_RFQ=50
+new execution intent exists
+status pending
+buyer/seller mapping correct:
+taker buy => buyer=taker, seller=mm_account, buyer_is_maker=false
+8. Verify MM notification
 
-Startup:
+Smoke client should receive:
 
-If RFQ_ENABLED=true and persistence required but unavailable, fail clearly.
-If disabled, endpoints can return "rfq is disabled" or stay registered but reject.
+{
+  "type": "rfq_quote_accepted",
+  "payload": {
+    "rfq_id": "...",
+    "quote_id": "...",
+    "execution_intent_id": "..."
+  }
+}
 
-Normal tests must not require live Postgres.
+If notification fails but acceptance succeeds, report the warning. Do not fake notification.
 
-Persistence / Atomicity
+9. Verify no forbidden mutation
 
-Accept quote must be safe.
+Confirm:
 
-Acceptance should be atomic at DB level if possible:
+no real broadcast
+no tx_hash created by RFQ accept
+no confirmation created
+no Solidity interaction required
+10. Stop backend and restore .env
 
-verify RFQ still open
-verify quote still active
-create execution_intent
-set RFQ accepted_quote_id
-set RFQ execution_intent_id
-set RFQ status accepted
-set accepted quote status accepted
-reject or mark other active quotes deterministically
+Restore safe state:
 
-If full SQL transaction support already exists, use it.
+MM_GATEWAY_ENABLED=false
+EXECUTOR_REAL_BROADCAST_ENABLED=false
+EXECUTION_ENABLED=false
 
-If not, implement minimal safe ordering and document limitation.
+Stop backend.
 
-Do not fake atomicity.
+If Runtime Fails
 
-Execution Intent Creation
+Diagnose precisely:
 
-Accepted RFQ must create the same kind of execution_intent as orderbook matching.
+RFQ disabled config
+MM gateway disabled config
+cert issue
+UDP/QUIC issue
+smoke client issue
+server-initiated message delivery issue
+session registry issue
+rfq_quote parsing issue
+RFQ service validation issue
+persistence issue
+execution_intent creation issue
+notification issue
 
-Expected fields:
+If a real bug is found, patch minimally and rerun validation.
 
-market_id from RFQ
-buyer/seller derived from side
-price_1e8 from accepted quote
-size_1e8 from accepted quote or RFQ
-buyer_is_maker according to side mapping
-buyer_nonce / seller_nonce should use current configured behavior
-deadline should use RFQ/quote expiry semantics or existing execution deadline defaults
-
-Important:
-RFQ acceptance must not sign PerpTrade.
-RFQ acceptance must not simulate.
-RFQ acceptance must not broadcast.
-It only creates the execution_intent.
-
-Existing endpoints should then work:
-
-GET /execution-intents/:intent_id/signing-payload
-POST /execution-intents/:intent_id/signatures
-POST /executor/simulate/:intent_id
-POST /executor/broadcast/:intent_id
-Tests
-
-Add tests for RFQ logic.
-
-Normal cargo test must be offline.
-
-Required tests:
-
-create RFQ success
-create RFQ rejects invalid taker
-create RFQ rejects invalid side
-create RFQ rejects zero size
-create RFQ caps TTL
-submit quote success
-submit quote rejects expired RFQ
-submit quote rejects wrong/zero price
-submit quote rejects size > RFQ size
-submit quote caps quote TTL to RFQ expiry
-list quotes
-accept quote success
-accept quote rejects expired RFQ
-accept quote rejects expired quote
-accept quote rejects quote from different RFQ
-accept quote rejects price beyond taker limit
-accept quote creates execution_intent with correct buyer/seller for taker buy
-accept quote creates execution_intent with correct buyer/seller for taker sell
-accept quote is single-winner
-cancel RFQ prevents quote acceptance
-
-If full DB tests are complex, add pure service tests and repository tests using existing project patterns.
-
-Documentation
-
-Update:
-
-README.md
-ARCHITECTURE.md
-
-Document:
-
-RFQ V1A scope
-RFQ lifecycle
-quote lifecycle
-HTTP endpoints
-side semantics
-execution_intent creation
-no auto-broadcast
-future RFQ V1B WebTransport integration
-future signed RFQ quotes
-future MM selection/ranking
 Validation
 
-Run:
+If any code was changed, run:
 
 cargo fmt
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test
 cargo build
-Acceptance Criteria
+Final Report Required
 
-Complete only if:
+Return:
 
-RFQ config exists
-RFQ tables migration exists
-RFQ service exists
-HTTP endpoints exist
-quote submission works
-quote acceptance creates execution_intent
-side mapping is tested
-no auto-broadcast
-no WebTransport RFQ push yet
-tests pass offline
-docs updated
-cargo fmt passes
-cargo clippy passes
-cargo test passes
-cargo build passes
-Deferred to RFQ V1B
-broadcast RFQ to connected MM sessions over WebTransport
-receive rfq_quote over WebTransport
-notify MM of accepted/expired quote
-live RFQ runtime smoke over WebTransport
-production wallet auth
-signed RFQ quote messages
-RFQ market maker ranking/selection
+Files changed.
+Whether code patch was needed.
+Cert generation method.
+Backend startup result.
+HTTP health result.
+WebTransport connection result.
+RFQ creation result.
+Whether MM received rfq_request.
+rfq_quote submission result.
+HTTP quote listing result.
+RFQ accept result.
+Execution intent created:
+intent_id
+onchain_intent_id if available
+buyer
+seller
+buyer_is_maker
+Whether MM received rfq_quote_accepted.
+Verification that no broadcast happened.
+Final .env safety state.
+Validation commands run.
+Remaining blocker, if any.
 EOF
 
 

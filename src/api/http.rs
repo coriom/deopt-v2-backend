@@ -3,6 +3,7 @@ use crate::db::PgRepository;
 use crate::engine::EngineState;
 use crate::execution::{ExecutionConfig, StoredTradeSignatures};
 use crate::indexer::IndexerConfig;
+use crate::mm::MmSessionRegistry;
 use crate::nonce_sync::PerpNonceSyncConfig;
 use crate::reconciliation::ReconciliationConfig;
 use crate::rfq::{RfqConfig, RfqStore};
@@ -26,6 +27,7 @@ pub struct AppState {
     pub reconciliation_config: ReconciliationConfig,
     pub rfq_config: RfqConfig,
     pub rfq_store: Arc<Mutex<RfqStore>>,
+    pub mm_sessions: MmSessionRegistry,
     pub trade_signatures: Arc<Mutex<HashMap<Uuid, StoredTradeSignatures>>>,
 }
 
@@ -169,6 +171,7 @@ impl AppState {
             reconciliation_config,
             rfq_config,
             rfq_store: Arc::new(Mutex::new(RfqStore::new())),
+            mm_sessions: MmSessionRegistry::new(),
             trade_signatures: Arc::new(Mutex::new(HashMap::new())),
         }
     }

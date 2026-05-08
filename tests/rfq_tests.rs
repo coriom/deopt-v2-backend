@@ -2,6 +2,7 @@ use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use deopt_v2_backend::api::{router, AppState};
 use deopt_v2_backend::engine::EngineState;
+use deopt_v2_backend::mm::{AuthMode, MmSession, ServerMessage};
 use deopt_v2_backend::rfq::service::{
     accept_quote, cancel_rfq, create_rfq, list_quotes, submit_quote, CreateRfqInput,
     SubmitQuoteInput,
@@ -10,6 +11,7 @@ use deopt_v2_backend::rfq::{RfqConfig, RfqQuoteStatus, RfqStatus};
 use deopt_v2_backend::types::{AccountId, Side};
 use serde_json::json;
 use std::time::Duration;
+use tokio::sync::mpsc;
 use tower::ServiceExt;
 
 fn rfq_config() -> RfqConfig {
@@ -65,6 +67,40 @@ async fn create_rfq_success() {
 
     assert_eq!(rfq.status, RfqStatus::Open);
     assert_eq!(rfq.taker, taker());
+}
+
+#[tokio::test]
+async fn create_rfq_broadcasts_to_connected_mm_sessions() {
+    let state = state();
+    let (sender, mut receiver) = mpsc::unbounded_channel();
+    let session = MmSession::with_ids(
+        "session-rfq-1",
+        "connection-1",
+        10,
+        AuthMode::Disabled,
+        true,
+    );
+    state.mm_sessions.register(&session, sender).unwrap();
+
+    let rfq = create_rfq(&state, create_input(Side::Buy)).await.unwrap();
+    let message = receiver.recv().await.unwrap();
+
+    let ServerMessage::RfqRequest(envelope) = message else {
+        panic!("expected rfq_request");
+    };
+    assert_eq!(envelope.message_type, "rfq_request");
+    assert_eq!(envelope.payload.rfq_id, rfq.rfq_id);
+    assert_eq!(envelope.payload.size_1e8, "100000000");
+}
+
+#[tokio::test]
+async fn create_rfq_succeeds_with_zero_connected_mm_sessions() {
+    let state = state();
+
+    let rfq = create_rfq(&state, create_input(Side::Buy)).await.unwrap();
+
+    assert_eq!(rfq.status, RfqStatus::Open);
+    assert!(state.mm_sessions.list_active().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -202,6 +238,70 @@ async fn accept_quote_success() {
 
     assert_eq!(accepted.status, RfqStatus::Accepted);
     assert!(accepted.onchain_intent_id.starts_with("0x"));
+}
+
+#[tokio::test]
+async fn accept_quote_sends_notification_when_session_connected() {
+    let state = state();
+    let (sender, mut receiver) = mpsc::unbounded_channel();
+    let session = MmSession::with_ids(
+        "session-rfq-1",
+        "connection-1",
+        10,
+        AuthMode::Disabled,
+        true,
+    );
+    state.mm_sessions.register(&session, sender).unwrap();
+    let rfq = create_rfq(&state, create_input(Side::Buy)).await.unwrap();
+    receiver.recv().await.unwrap();
+    let mut quote_input = quote_input(rfq.rfq_id);
+    quote_input.session_id = Some("session-rfq-1".to_string());
+    let quote = submit_quote(&state, quote_input).await.unwrap();
+
+    let accepted = accept_quote(&state, rfq.rfq_id, quote.quote_id)
+        .await
+        .unwrap();
+    let message = receiver.recv().await.unwrap();
+
+    assert!(accepted.mm_notification_sent);
+    assert!(accepted.mm_notification_warning.is_none());
+    let ServerMessage::RfqQuoteAccepted(envelope) = message else {
+        panic!("expected rfq_quote_accepted");
+    };
+    assert_eq!(envelope.payload.rfq_id, rfq.rfq_id);
+    assert_eq!(envelope.payload.quote_id, quote.quote_id);
+    assert_eq!(
+        envelope.payload.execution_intent_id,
+        accepted.execution_intent_id
+    );
+}
+
+#[tokio::test]
+async fn accept_quote_still_succeeds_if_notification_fails() {
+    let state = state();
+    let (sender, receiver) = mpsc::unbounded_channel();
+    let session = MmSession::with_ids(
+        "session-rfq-1",
+        "connection-1",
+        10,
+        AuthMode::Disabled,
+        true,
+    );
+    state.mm_sessions.register(&session, sender).unwrap();
+    drop(receiver);
+    let rfq = create_rfq(&state, create_input(Side::Buy)).await.unwrap();
+    let mut quote_input = quote_input(rfq.rfq_id);
+    quote_input.session_id = Some("session-rfq-1".to_string());
+    let quote = submit_quote(&state, quote_input).await.unwrap();
+
+    let accepted = accept_quote(&state, rfq.rfq_id, quote.quote_id)
+        .await
+        .unwrap();
+
+    assert_eq!(accepted.status, RfqStatus::Accepted);
+    assert!(!accepted.mm_notification_sent);
+    assert!(accepted.mm_notification_warning.is_some());
+    assert_eq!(state.engine.lock().unwrap().execution_intents().len(), 1);
 }
 
 #[tokio::test]

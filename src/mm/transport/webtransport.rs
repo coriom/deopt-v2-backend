@@ -13,10 +13,11 @@ use std::path::PathBuf;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::mpsc;
 use tracing::{info, warn};
 use wtransport::endpoint::IncomingSession;
 use wtransport::stream::{RecvStream, SendStream};
-use wtransport::{Endpoint, Identity, ServerConfig};
+use wtransport::{Connection, Endpoint, Identity, ServerConfig};
 
 pub const MM_GATEWAY_MAX_FRAME_BYTES: usize = 1_048_576;
 
@@ -167,6 +168,10 @@ async fn handle_incoming_session(
         config.auth_mode,
         config.cancel_on_disconnect,
     );
+    let (outbound_sender, mut outbound_receiver) = mpsc::unbounded_channel();
+    service
+        .register_session(&session, outbound_sender)
+        .map_err(|error| error.to_string())?;
 
     loop {
         tokio::select! {
@@ -187,6 +192,18 @@ async fn handle_incoming_session(
                     }
                 }
             }
+            outbound = outbound_receiver.recv() => {
+                let Some(message) = outbound else {
+                    break;
+                };
+                if let Err(error) = send_server_message(&connection, &message).await {
+                    warn!(
+                        session_id = %session.session_id,
+                        error = %error,
+                        "MM WebTransport server-initiated message failed"
+                    );
+                }
+            }
             closed = connection.closed() => {
                 info!(session_id = %session.session_id, error = %closed, "MM WebTransport session closed");
                 break;
@@ -202,6 +219,13 @@ async fn handle_incoming_session(
             "completed MM cancel-on-disconnect"
         );
     }
+    if let Err(error) = service.unregister_session(&session.session_id) {
+        warn!(
+            session_id = %session.session_id,
+            error = %error,
+            "failed to unregister MM session"
+        );
+    }
 
     Ok(())
 }
@@ -214,7 +238,17 @@ async fn handle_bi_stream(
 ) -> std::result::Result<(), String> {
     let response = match read_frame(&mut recv, MM_GATEWAY_MAX_FRAME_BYTES).await {
         Ok(Some(frame)) => match decode_client_message(&frame) {
-            Ok(message) => service.handle_message(session, message, now_ms()).await,
+            Ok(message) => {
+                let response = service.handle_message(session, message, now_ms()).await;
+                if let Err(error) = service.update_session(session) {
+                    warn!(
+                        session_id = %session.session_id,
+                        error = %error,
+                        "failed to update MM session registry"
+                    );
+                }
+                response
+            }
             Err(response) => *response,
         },
         Ok(None) => return Ok(()),
@@ -231,6 +265,22 @@ async fn handle_bi_stream(
         .map_err(|error| error.to_string())?;
     send.finish().await.map_err(|error| error.to_string())?;
     Ok(())
+}
+
+async fn send_server_message(
+    connection: &Connection,
+    message: &ServerMessage,
+) -> std::result::Result<(), String> {
+    let mut send = connection
+        .open_uni()
+        .await
+        .map_err(|error| error.to_string())?
+        .await
+        .map_err(|error| error.to_string())?;
+    write_json_frame(&mut send, message, MM_GATEWAY_MAX_FRAME_BYTES)
+        .await
+        .map_err(|error| error.to_string())?;
+    send.finish().await.map_err(|error| error.to_string())
 }
 
 pub fn encode_frame(

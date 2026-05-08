@@ -398,6 +398,8 @@ struct AcceptQuoteResponse {
     status: RfqStatus,
     execution_intent_id: Uuid,
     onchain_intent_id: String,
+    mm_notification_sent: bool,
+    mm_notification_warning: Option<String>,
 }
 
 impl From<AcceptQuoteOutcome> for AcceptQuoteResponse {
@@ -408,6 +410,8 @@ impl From<AcceptQuoteOutcome> for AcceptQuoteResponse {
             status: outcome.status,
             execution_intent_id: outcome.execution_intent_id,
             onchain_intent_id: outcome.onchain_intent_id,
+            mm_notification_sent: outcome.mm_notification_sent,
+            mm_notification_warning: outcome.mm_notification_warning,
         }
     }
 }
