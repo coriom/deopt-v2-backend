@@ -1,6 +1,6 @@
 use super::AppState;
 use crate::api::dto::{
-    ApiEngineEvent, ApiExecutionIntent, SubmitOrderRequest, SubmitOrderResponse,
+    parse_fixed_u128, ApiEngineEvent, ApiExecutionIntent, SubmitOrderRequest, SubmitOrderResponse,
 };
 use crate::confirmation::{
     decide_confirmation, ConfirmationDecision, ConfirmationDecisionInput, ConfirmationStatus,
@@ -25,7 +25,14 @@ use crate::reconciliation::{
     decide_direct_reconciliation, DirectReconciliationInput, ExecutionReconciliation,
     ReconciliationCounts, ReconciliationStatus, ReconciliationTickResult,
 };
-use crate::types::{now_ms, MarketId, OrderId};
+use crate::rfq::service::{
+    accept_quote as accept_rfq_quote, cancel_rfq as cancel_rfq_service,
+    create_rfq as create_rfq_service, get_rfq as get_rfq_service,
+    list_quotes as list_rfq_quotes_service, list_rfqs as list_rfqs_service,
+    submit_quote as submit_rfq_quote, AcceptQuoteOutcome, CreateRfqInput, SubmitQuoteInput,
+};
+use crate::rfq::{parse_quote_id, parse_rfq_id, RfqQuote, RfqQuoteStatus, RfqRequest, RfqStatus};
+use crate::types::{now_ms, AccountId, MarketId, OrderId, Side};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -44,6 +51,11 @@ pub fn router(state: AppState) -> Router {
         .route("/accounts/:address/perp-nonce", get(account_perp_nonce))
         .route("/orders", post(submit_order))
         .route("/orders/:order_id", delete(cancel_order))
+        .route("/rfqs", post(create_rfq).get(list_rfqs))
+        .route("/rfqs/:rfq_id", get(get_rfq))
+        .route("/rfqs/:rfq_id/quotes", post(submit_quote).get(list_quotes))
+        .route("/rfqs/:rfq_id/accept/:quote_id", post(accept_quote))
+        .route("/rfqs/:rfq_id/cancel", post(cancel_rfq))
         .route("/execution-intents", get(execution_intents))
         .route(
             "/execution-intents/:intent_id/signing-payload",
@@ -211,6 +223,215 @@ async fn cancel_order(
         status: "cancelled".to_string(),
         event: event.into(),
     }))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+struct CreateRfqRequest {
+    taker: AccountId,
+    market_id: MarketId,
+    side: Side,
+    size_1e8: String,
+    limit_price_1e8: Option<String>,
+    ttl_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct RfqResponse {
+    rfq_id: Uuid,
+    taker: AccountId,
+    market_id: MarketId,
+    side: Side,
+    size_1e8: String,
+    limit_price_1e8: Option<String>,
+    status: RfqStatus,
+    created_at_ms: i64,
+    expires_at_ms: i64,
+    accepted_quote_id: Option<Uuid>,
+    execution_intent_id: Option<Uuid>,
+}
+
+impl From<RfqRequest> for RfqResponse {
+    fn from(rfq: RfqRequest) -> Self {
+        let now = now_ms();
+        let status = rfq.effective_status(now);
+        Self {
+            rfq_id: rfq.rfq_id,
+            taker: rfq.taker,
+            market_id: rfq.market_id,
+            side: rfq.side,
+            size_1e8: rfq.size_1e8.to_string(),
+            limit_price_1e8: rfq.limit_price_1e8.map(|value| value.to_string()),
+            status,
+            created_at_ms: rfq.created_at_ms,
+            expires_at_ms: rfq.expires_at_ms,
+            accepted_quote_id: rfq.accepted_quote_id,
+            execution_intent_id: rfq.execution_intent_id,
+        }
+    }
+}
+
+async fn create_rfq(
+    State(state): State<AppState>,
+    Json(request): Json<CreateRfqRequest>,
+) -> Result<Json<RfqResponse>, ApiError> {
+    let limit_price_1e8 = request
+        .limit_price_1e8
+        .as_deref()
+        .map(|value| parse_fixed_u128("limit_price_1e8", value))
+        .transpose()?;
+    let rfq = create_rfq_service(
+        &state,
+        CreateRfqInput {
+            taker: request.taker,
+            market_id: request.market_id,
+            side: request.side,
+            size_1e8: parse_fixed_u128("size_1e8", &request.size_1e8)?,
+            limit_price_1e8,
+            ttl_ms: request.ttl_ms,
+        },
+    )
+    .await?;
+    Ok(Json(rfq.into()))
+}
+
+async fn list_rfqs(State(state): State<AppState>) -> Result<Json<Vec<RfqResponse>>, ApiError> {
+    Ok(Json(
+        list_rfqs_service(&state)
+            .await?
+            .into_iter()
+            .map(RfqResponse::from)
+            .collect(),
+    ))
+}
+
+async fn get_rfq(
+    State(state): State<AppState>,
+    Path(rfq_id): Path<String>,
+) -> Result<Json<RfqResponse>, ApiError> {
+    Ok(Json(
+        get_rfq_service(&state, parse_rfq_id(&rfq_id)?)
+            .await?
+            .into(),
+    ))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+struct SubmitQuoteRequest {
+    mm_account: AccountId,
+    price_1e8: String,
+    size_1e8: String,
+    client_quote_id: Option<String>,
+    quote_ttl_ms: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct RfqQuoteResponse {
+    quote_id: Uuid,
+    rfq_id: Uuid,
+    mm_account: AccountId,
+    session_id: Option<String>,
+    client_quote_id: Option<String>,
+    price_1e8: String,
+    size_1e8: String,
+    status: RfqQuoteStatus,
+    created_at_ms: i64,
+    expires_at_ms: i64,
+}
+
+impl From<RfqQuote> for RfqQuoteResponse {
+    fn from(quote: RfqQuote) -> Self {
+        let now = now_ms();
+        let status = quote.effective_status(now);
+        Self {
+            quote_id: quote.quote_id,
+            rfq_id: quote.rfq_id,
+            mm_account: quote.mm_account,
+            session_id: quote.session_id,
+            client_quote_id: quote.client_quote_id,
+            price_1e8: quote.price_1e8.to_string(),
+            size_1e8: quote.size_1e8.to_string(),
+            status,
+            created_at_ms: quote.created_at_ms,
+            expires_at_ms: quote.expires_at_ms,
+        }
+    }
+}
+
+async fn submit_quote(
+    State(state): State<AppState>,
+    Path(rfq_id): Path<String>,
+    Json(request): Json<SubmitQuoteRequest>,
+) -> Result<Json<RfqQuoteResponse>, ApiError> {
+    let quote = submit_rfq_quote(
+        &state,
+        SubmitQuoteInput {
+            rfq_id: parse_rfq_id(&rfq_id)?,
+            mm_account: request.mm_account,
+            session_id: None,
+            client_quote_id: request.client_quote_id,
+            price_1e8: parse_fixed_u128("price_1e8", &request.price_1e8)?,
+            size_1e8: parse_fixed_u128("size_1e8", &request.size_1e8)?,
+            quote_ttl_ms: request.quote_ttl_ms,
+        },
+    )
+    .await?;
+    Ok(Json(quote.into()))
+}
+
+async fn list_quotes(
+    State(state): State<AppState>,
+    Path(rfq_id): Path<String>,
+) -> Result<Json<Vec<RfqQuoteResponse>>, ApiError> {
+    Ok(Json(
+        list_rfq_quotes_service(&state, parse_rfq_id(&rfq_id)?)
+            .await?
+            .into_iter()
+            .map(RfqQuoteResponse::from)
+            .collect(),
+    ))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct AcceptQuoteResponse {
+    rfq_id: Uuid,
+    quote_id: Uuid,
+    status: RfqStatus,
+    execution_intent_id: Uuid,
+    onchain_intent_id: String,
+}
+
+impl From<AcceptQuoteOutcome> for AcceptQuoteResponse {
+    fn from(outcome: AcceptQuoteOutcome) -> Self {
+        Self {
+            rfq_id: outcome.rfq_id,
+            quote_id: outcome.quote_id,
+            status: outcome.status,
+            execution_intent_id: outcome.execution_intent_id,
+            onchain_intent_id: outcome.onchain_intent_id,
+        }
+    }
+}
+
+async fn accept_quote(
+    State(state): State<AppState>,
+    Path((rfq_id, quote_id)): Path<(String, String)>,
+) -> Result<Json<AcceptQuoteResponse>, ApiError> {
+    Ok(Json(
+        accept_rfq_quote(&state, parse_rfq_id(&rfq_id)?, parse_quote_id(&quote_id)?)
+            .await?
+            .into(),
+    ))
+}
+
+async fn cancel_rfq(
+    State(state): State<AppState>,
+    Path(rfq_id): Path<String>,
+) -> Result<Json<RfqResponse>, ApiError> {
+    Ok(Json(
+        cancel_rfq_service(&state, parse_rfq_id(&rfq_id)?)
+            .await?
+            .into(),
+    ))
 }
 
 async fn execution_intents(
@@ -1385,11 +1606,15 @@ impl From<BackendError> for ApiError {
         let status = match value {
             BackendError::InvalidOrderId => StatusCode::BAD_REQUEST,
             BackendError::InvalidExecutionIntentId => StatusCode::NOT_FOUND,
+            BackendError::InvalidRfqId | BackendError::InvalidRfqQuoteId => StatusCode::NOT_FOUND,
             BackendError::OrderNotFound(_) | BackendError::OrderNotOpen(_) => StatusCode::NOT_FOUND,
             BackendError::InvalidFixedPoint { .. } => StatusCode::BAD_REQUEST,
             BackendError::DeadlineExpired
             | BackendError::InvalidNonce
             | BackendError::NonceAlreadyUsed
+            | BackendError::RfqDisabled
+            | BackendError::InvalidRfqState(_)
+            | BackendError::InvalidRfqQuoteState(_)
             | BackendError::PerpNonceSyncDisabled
             | BackendError::PerpNonceMismatch { .. }
             | BackendError::MalformedSignature

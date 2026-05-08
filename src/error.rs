@@ -25,6 +25,16 @@ pub enum BackendError {
     InvalidOrderId,
     #[error("invalid execution intent id")]
     InvalidExecutionIntentId,
+    #[error("rfq is disabled")]
+    RfqDisabled,
+    #[error("invalid RFQ id")]
+    InvalidRfqId,
+    #[error("invalid RFQ quote id")]
+    InvalidRfqQuoteId,
+    #[error("invalid RFQ state: {0}")]
+    InvalidRfqState(String),
+    #[error("invalid RFQ quote state: {0}")]
+    InvalidRfqQuoteState(String),
     #[error("invalid PerpTrade intentId")]
     InvalidPerpTradeIntentId,
     #[error("invalid fixed-point value for {field}: {reason}")]

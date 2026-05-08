@@ -15,8 +15,9 @@ use crate::reconciliation::{
     normalize_onchain_intent_id, ExecutionReconciliation, ReconciliationCounts,
     ReconciliationStatus,
 };
+use crate::rfq::{QuoteId, RfqId, RfqQuote, RfqQuoteStatus, RfqRequest, RfqStatus};
 use crate::signing::SignedOrder;
-use crate::types::{now_ms, AccountId, OrderStatus, TimestampMs};
+use crate::types::{now_ms, AccountId, OrderStatus, Side, TimestampMs};
 use sqlx::postgres::{PgPool, PgRow};
 use sqlx::{Postgres, Row, Transaction};
 use uuid::Uuid;
@@ -698,6 +699,298 @@ impl PgRepository {
         let count: i64 = row_get(&row, "count")?;
         i64_to_u64_persistence("count", count)
     }
+
+    pub async fn insert_rfq(&self, rfq: &RfqRequest) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO rfqs (
+                rfq_id, taker, market_id, side, size_1e8, limit_price_1e8, status,
+                created_at_ms, expires_at_ms, accepted_quote_id, execution_intent_id
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+        )
+        .bind(rfq.rfq_id.to_string())
+        .bind(&rfq.taker.0)
+        .bind(u64_to_i64("market_id", rfq.market_id)?)
+        .bind(match rfq.side {
+            Side::Buy => "buy",
+            Side::Sell => "sell",
+        })
+        .bind(rfq.size_1e8.to_string())
+        .bind(rfq.limit_price_1e8.map(|value| value.to_string()))
+        .bind(rfq.status.as_str())
+        .bind(timestamp_to_i64(rfq.created_at_ms))
+        .bind(timestamp_to_i64(rfq.expires_at_ms))
+        .bind(rfq.accepted_quote_id.map(|id| id.to_string()))
+        .bind(rfq.execution_intent_id.map(|id| id.to_string()))
+        .execute(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        Ok(())
+    }
+
+    pub async fn list_rfqs(&self) -> Result<Vec<RfqRequest>> {
+        let rows = sqlx::query(
+            "SELECT rfq_id, taker, market_id, side, size_1e8, limit_price_1e8, status,
+                    created_at_ms, expires_at_ms, accepted_quote_id, execution_intent_id
+             FROM rfqs
+             ORDER BY created_at_ms ASC, rfq_id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        rows.into_iter().map(rfq_from_row).collect()
+    }
+
+    pub async fn get_rfq(&self, rfq_id: RfqId) -> Result<Option<RfqRequest>> {
+        let row = sqlx::query(
+            "SELECT rfq_id, taker, market_id, side, size_1e8, limit_price_1e8, status,
+                    created_at_ms, expires_at_ms, accepted_quote_id, execution_intent_id
+             FROM rfqs
+             WHERE rfq_id = $1",
+        )
+        .bind(rfq_id.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        row.map(rfq_from_row).transpose()
+    }
+
+    pub async fn insert_rfq_quote(&self, quote: &RfqQuote) -> Result<()> {
+        let result = sqlx::query(
+            "INSERT INTO rfq_quotes (
+                quote_id, rfq_id, mm_account, session_id, client_quote_id, price_1e8,
+                size_1e8, status, created_at_ms, expires_at_ms
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+        )
+        .bind(quote.quote_id.to_string())
+        .bind(quote.rfq_id.to_string())
+        .bind(&quote.mm_account.0)
+        .bind(&quote.session_id)
+        .bind(&quote.client_quote_id)
+        .bind(quote.price_1e8.to_string())
+        .bind(quote.size_1e8.to_string())
+        .bind(quote.status.as_str())
+        .bind(timestamp_to_i64(quote.created_at_ms))
+        .bind(timestamp_to_i64(quote.expires_at_ms))
+        .execute(&self.pool)
+        .await;
+
+        match result {
+            Ok(_) => Ok(()),
+            Err(error) if is_unique_violation(&error) => Err(BackendError::InvalidRfqQuoteState(
+                "duplicate client_quote_id for RFQ and MM account".to_string(),
+            )),
+            Err(error) => Err(BackendError::Persistence(error.to_string())),
+        }
+    }
+
+    pub async fn list_rfq_quotes(&self, rfq_id: RfqId) -> Result<Vec<RfqQuote>> {
+        let rows = sqlx::query(
+            "SELECT quote_id, rfq_id, mm_account, session_id, client_quote_id, price_1e8,
+                    size_1e8, status, created_at_ms, expires_at_ms
+             FROM rfq_quotes
+             WHERE rfq_id = $1
+             ORDER BY created_at_ms ASC, quote_id ASC",
+        )
+        .bind(rfq_id.to_string())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        rows.into_iter().map(rfq_quote_from_row).collect()
+    }
+
+    pub async fn count_rfq_quotes(&self, rfq_id: RfqId) -> Result<usize> {
+        let row = sqlx::query("SELECT COUNT(*) AS count FROM rfq_quotes WHERE rfq_id = $1")
+            .bind(rfq_id.to_string())
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        let count: i64 = row_get(&row, "count")?;
+        let count = i64_to_u64_persistence("count", count)?;
+        usize::try_from(count)
+            .map_err(|_| BackendError::Persistence("RFQ quote count exceeds usize".to_string()))
+    }
+
+    pub async fn get_rfq_quote(&self, quote_id: QuoteId) -> Result<Option<RfqQuote>> {
+        let row = sqlx::query(
+            "SELECT quote_id, rfq_id, mm_account, session_id, client_quote_id, price_1e8,
+                    size_1e8, status, created_at_ms, expires_at_ms
+             FROM rfq_quotes
+             WHERE quote_id = $1",
+        )
+        .bind(quote_id.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        row.map(rfq_quote_from_row).transpose()
+    }
+
+    pub async fn accept_rfq_quote_and_insert_intent(
+        &self,
+        rfq_id: RfqId,
+        quote_id: QuoteId,
+        intent: &ExecutionIntent,
+        updated_at_ms: TimestampMs,
+    ) -> Result<()> {
+        let mut tx = self.begin().await?;
+        let buyer_nonce = intent
+            .buyer_nonce
+            .ok_or_else(|| BackendError::MissingExecutionMetadata("buyer_nonce".to_string()))?;
+        let seller_nonce = intent
+            .seller_nonce
+            .ok_or_else(|| BackendError::MissingExecutionMetadata("seller_nonce".to_string()))?;
+        self.insert_nonce_tx(&mut tx, &intent.buyer, buyer_nonce, updated_at_ms)
+            .await?;
+        self.insert_nonce_tx(&mut tx, &intent.seller, seller_nonce, updated_at_ms)
+            .await?;
+        let db_intent = DbExecutionIntent::try_from(intent)?;
+        insert_execution_intent(&mut tx, &db_intent).await?;
+
+        let rfq_result = sqlx::query(
+            "UPDATE rfqs
+             SET status = 'accepted', accepted_quote_id = $2, execution_intent_id = $3
+             WHERE rfq_id = $1 AND status = 'open' AND accepted_quote_id IS NULL",
+        )
+        .bind(rfq_id.to_string())
+        .bind(quote_id.to_string())
+        .bind(intent.intent_id.to_string())
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        if rfq_result.rows_affected() != 1 {
+            return Err(BackendError::InvalidRfqState(
+                "RFQ is no longer open".to_string(),
+            ));
+        }
+
+        let quote_result = sqlx::query(
+            "UPDATE rfq_quotes
+             SET status = 'accepted'
+             WHERE quote_id = $1 AND rfq_id = $2 AND status = 'active'",
+        )
+        .bind(quote_id.to_string())
+        .bind(rfq_id.to_string())
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        if quote_result.rows_affected() != 1 {
+            return Err(BackendError::InvalidRfqQuoteState(
+                "quote is no longer active".to_string(),
+            ));
+        }
+
+        sqlx::query(
+            "UPDATE rfq_quotes
+             SET status = 'rejected'
+             WHERE rfq_id = $1 AND quote_id <> $2 AND status = 'active'",
+        )
+        .bind(rfq_id.to_string())
+        .bind(quote_id.to_string())
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+
+        insert_engine_event(
+            &mut tx,
+            &EngineEvent::ExecutionIntentCreated {
+                intent: intent.clone(),
+            },
+        )
+        .await?;
+        let _ = updated_at_ms;
+        tx.commit()
+            .await
+            .map_err(|error| BackendError::Persistence(error.to_string()))
+    }
+
+    pub async fn cancel_rfq(
+        &self,
+        rfq_id: RfqId,
+        _updated_at_ms: TimestampMs,
+    ) -> Result<RfqRequest> {
+        let mut tx = self.begin().await?;
+        let result = sqlx::query(
+            "UPDATE rfqs
+             SET status = 'cancelled'
+             WHERE rfq_id = $1 AND status <> 'accepted'",
+        )
+        .bind(rfq_id.to_string())
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        if result.rows_affected() != 1 {
+            return Err(BackendError::InvalidRfqState(
+                "RFQ cannot be cancelled".to_string(),
+            ));
+        }
+        sqlx::query(
+            "UPDATE rfq_quotes
+             SET status = 'cancelled'
+             WHERE rfq_id = $1 AND status = 'active'",
+        )
+        .bind(rfq_id.to_string())
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        tx.commit()
+            .await
+            .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        self.get_rfq(rfq_id)
+            .await?
+            .ok_or(BackendError::InvalidRfqId)
+    }
+
+    pub async fn reserve_next_trade_nonces(
+        &self,
+        buyer: &AccountId,
+        seller: &AccountId,
+        created_at_ms: TimestampMs,
+    ) -> Result<(u64, u64)> {
+        let mut tx = self.begin().await?;
+        let buyer_nonce = reserve_next_nonce_tx(&mut tx, buyer, created_at_ms).await?;
+        let seller_nonce = reserve_next_nonce_tx(&mut tx, seller, created_at_ms).await?;
+        tx.commit()
+            .await
+            .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        Ok((buyer_nonce, seller_nonce))
+    }
+
+    pub async fn next_trade_nonces(
+        &self,
+        buyer: &AccountId,
+        seller: &AccountId,
+    ) -> Result<(u64, u64)> {
+        let mut tx = self.begin().await?;
+        let buyer_nonce = next_nonce_tx(&mut tx, buyer).await?;
+        let seller_nonce = if buyer == seller {
+            buyer_nonce
+                .checked_add(1)
+                .ok_or(BackendError::InvalidNonce)?
+        } else {
+            next_nonce_tx(&mut tx, seller).await?
+        };
+        tx.commit()
+            .await
+            .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        Ok((buyer_nonce, seller_nonce))
+    }
+
+    pub async fn reserve_trade_nonces(
+        &self,
+        buyer: &AccountId,
+        buyer_nonce: u64,
+        seller: &AccountId,
+        seller_nonce: u64,
+        created_at_ms: TimestampMs,
+    ) -> Result<()> {
+        let mut tx = self.begin().await?;
+        self.insert_nonce_tx(&mut tx, buyer, buyer_nonce, created_at_ms)
+            .await?;
+        self.insert_nonce_tx(&mut tx, seller, seller_nonce, created_at_ms)
+            .await?;
+        tx.commit()
+            .await
+            .map_err(|error| BackendError::Persistence(error.to_string()))
+    }
 }
 
 impl ExecutionIntentRepository for PgRepository {
@@ -1143,6 +1436,114 @@ fn execution_transaction_from_row(row: PgRow) -> Result<ExecutionTransaction> {
         created_at_ms: row_get(&row, "created_at_ms")?,
         updated_at_ms: row_get(&row, "updated_at_ms")?,
     })
+}
+
+fn rfq_from_row(row: PgRow) -> Result<RfqRequest> {
+    let rfq_id: String = row_get(&row, "rfq_id")?;
+    let market_id: i64 = row_get(&row, "market_id")?;
+    let side: String = row_get(&row, "side")?;
+    let limit_price_1e8: Option<String> = row_get(&row, "limit_price_1e8")?;
+    let status: String = row_get(&row, "status")?;
+    let accepted_quote_id: Option<String> = row_get(&row, "accepted_quote_id")?;
+    let execution_intent_id: Option<String> = row_get(&row, "execution_intent_id")?;
+    Ok(RfqRequest {
+        rfq_id: Uuid::parse_str(&rfq_id)
+            .map_err(|error| BackendError::Persistence(error.to_string()))?,
+        taker: AccountId::new(row_get::<String>(&row, "taker")?),
+        market_id: i64_to_u64_persistence("market_id", market_id)?,
+        side: match side.as_str() {
+            "buy" => Side::Buy,
+            "sell" => Side::Sell,
+            other => {
+                return Err(BackendError::Persistence(format!(
+                    "invalid RFQ side: {other}"
+                )))
+            }
+        },
+        size_1e8: row_get::<String>(&row, "size_1e8")?
+            .parse()
+            .map_err(|error| BackendError::Persistence(format!("invalid RFQ size: {error}")))?,
+        limit_price_1e8: limit_price_1e8
+            .map(|value| {
+                value.parse().map_err(|error| {
+                    BackendError::Persistence(format!("invalid RFQ limit price: {error}"))
+                })
+            })
+            .transpose()?,
+        status: RfqStatus::parse(&status)?,
+        created_at_ms: row_get(&row, "created_at_ms")?,
+        expires_at_ms: row_get(&row, "expires_at_ms")?,
+        accepted_quote_id: accepted_quote_id
+            .map(|value| {
+                Uuid::parse_str(&value)
+                    .map_err(|error| BackendError::Persistence(error.to_string()))
+            })
+            .transpose()?,
+        execution_intent_id: execution_intent_id
+            .map(|value| {
+                Uuid::parse_str(&value)
+                    .map_err(|error| BackendError::Persistence(error.to_string()))
+            })
+            .transpose()?,
+    })
+}
+
+fn rfq_quote_from_row(row: PgRow) -> Result<RfqQuote> {
+    let quote_id: String = row_get(&row, "quote_id")?;
+    let rfq_id: String = row_get(&row, "rfq_id")?;
+    let status: String = row_get(&row, "status")?;
+    Ok(RfqQuote {
+        quote_id: Uuid::parse_str(&quote_id)
+            .map_err(|error| BackendError::Persistence(error.to_string()))?,
+        rfq_id: Uuid::parse_str(&rfq_id)
+            .map_err(|error| BackendError::Persistence(error.to_string()))?,
+        mm_account: AccountId::new(row_get::<String>(&row, "mm_account")?),
+        session_id: row_get(&row, "session_id")?,
+        client_quote_id: row_get(&row, "client_quote_id")?,
+        price_1e8: row_get::<String>(&row, "price_1e8")?
+            .parse()
+            .map_err(|error| {
+                BackendError::Persistence(format!("invalid RFQ quote price: {error}"))
+            })?,
+        size_1e8: row_get::<String>(&row, "size_1e8")?
+            .parse()
+            .map_err(|error| {
+                BackendError::Persistence(format!("invalid RFQ quote size: {error}"))
+            })?,
+        status: RfqQuoteStatus::parse(&status)?,
+        created_at_ms: row_get(&row, "created_at_ms")?,
+        expires_at_ms: row_get(&row, "expires_at_ms")?,
+    })
+}
+
+async fn reserve_next_nonce_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    account: &AccountId,
+    created_at_ms: TimestampMs,
+) -> Result<u64> {
+    let next_nonce = next_nonce_tx(tx, account).await?;
+    sqlx::query("INSERT INTO used_nonces (account, nonce, created_at_ms) VALUES ($1, $2, $3)")
+        .bind(&account.0)
+        .bind(u64_to_i64("nonce", next_nonce)?)
+        .bind(timestamp_to_i64(created_at_ms))
+        .execute(&mut **tx)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+    Ok(next_nonce)
+}
+
+async fn next_nonce_tx(tx: &mut Transaction<'_, Postgres>, account: &AccountId) -> Result<u64> {
+    let row = sqlx::query(
+        "SELECT COALESCE(MAX(nonce), 0) + 1 AS next_nonce
+         FROM used_nonces
+         WHERE account = $1",
+    )
+    .bind(&account.0)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(|error| BackendError::Persistence(error.to_string()))?;
+    let next_nonce: i64 = row_get(&row, "next_nonce")?;
+    i64_to_u64_persistence("next_nonce", next_nonce)
 }
 
 fn row_get<T>(row: &PgRow, column: &str) -> Result<T>

@@ -1,48 +1,26 @@
-# NEXT_TASK.md — Market Maker Gateway V1C: Live Orderbook Integration
+# NEXT_TASK.md — RFQ V1A: Core RFQ Service + HTTP API
 
 ## Context
 
-Market Maker Gateway V1A and V1B are implemented.
+The backend now has a validated execution pipeline:
 
-V1A added:
+- HTTP order intake
+- orderbook matching
+- execution intents
+- PerpTrade signing payloads
+- buyer/seller signatures
+- RPC simulation
+- guarded real broadcast
+- indexer
+- reconciliation
+- confirmation/finality
+- on-chain perp nonce sync
 
-- transport-neutral protocol
-- session state
-- heartbeat
-- rate limits
-- quote_replace/bulk message models
-- cancel-on-disconnect planning
-- transport abstraction
+The Market Maker Gateway V1 is also implemented and runtime-verified:
 
-V1B added:
-
-- WebTransport adapter using `wtransport`
-- UDP listener
-- TLS cert/key loading
+- WebTransport server
 - reliable bidirectional streams
-- length-prefixed JSON framing
-- smoke client `mm_wt_smoke`
-- heartbeat and get_session verified at runtime
-
-Runtime verification succeeded:
-
-- WebTransport listener started on `127.0.0.1:8443`
-- HTTP server remained active on `127.0.0.1:8080`
-- smoke client connected successfully outside sandbox
-- heartbeat returned valid framed JSON
-- get_session returned valid framed JSON
-- gateway and real broadcast were restored disabled afterward
-
-Current limitation:
-
-The MM gateway service currently returns deterministic planned results. It does not yet mutate the live orderbook.
-
-## Goal
-
-Implement Market Maker Gateway V1C: connect the MM gateway service to the real backend orderbook/order lifecycle.
-
-The gateway should support real off-chain order management through WebTransport:
-
+- heartbeat/get_session
 - submit_order
 - bulk_submit
 - cancel_order
@@ -50,286 +28,404 @@ The gateway should support real off-chain order management through WebTransport:
 - cancel_all
 - quote_replace
 - cancel-on-disconnect
+- HTTP orderbook verification
 
-The gateway must reuse existing backend validation and engine/orderbook logic where possible.
+Next product block: RFQ.
 
-## Non-Goals
+Strategic RFQ design:
+
+```text
+taker creates RFQ
+→ MM quotes respond
+→ taker accepts quote
+→ backend creates execution_intent
+→ existing signing/simulation/broadcast/index/reconcile/confirm lifecycle handles execution
+
+RFQ must not bypass the execution lifecycle.
+
+Goal
+
+Implement RFQ V1A core service and HTTP API.
+
+This task must build the RFQ domain layer, persistence, quote collection, quote acceptance, and execution-intent creation through existing backend primitives.
+
+Do not implement WebTransport RFQ push yet. That is V1B.
+
+Non-Goals
 
 Do not implement:
 
-- RFQ
-- options gateway
-- MM strategy/pricing engine
-- market data datagrams
-- production wallet auth
-- auto-broadcast
-- automatic signing
-- changes to Solidity
-- changes to PerpTrade ABI
-- execution lifecycle redesign
-
-## Absolute Safety Rules
+WebTransport RFQ broadcasting
+MM session RFQ push
+RFQ over WebTransport
+RFQ quote messages in MM gateway
+options RFQ
+multi-leg RFQ
+auction engine
+MM ranking
+market data datagrams
+automatic broadcast
+automatic signing
+production RFQ quote signatures
+Solidity changes
+Absolute Safety Rules
 
 Do not:
 
-- modify Solidity
-- deploy contracts
-- enable real broadcast by default
-- auto-broadcast from MM gateway
-- bypass existing validation
-- bypass on-chain nonce sync if enabled
-- bypass signature/deadline validation
-- fake order IDs
-- fake matches
-- fake execution intents
-- fake tx hashes
-- fake confirmations
-- require live RPC/Postgres/private keys/certs/UDP for normal cargo test
-- commit
-- push
-- expose private keys
+modify Solidity
+deploy contracts
+change PerpTrade ABI
+change matching semantics
+enable real broadcast by default
+auto-broadcast accepted RFQs
+fake quotes
+fake execution intents
+fake tx hashes
+fake confirmations
+bypass existing validation
+bypass nonce sync when execution_intent is created
+require live RPC/Postgres/private keys/WebTransport/certs/UDP for normal cargo test
+commit
+push
+expose private keys
+RFQ V1A Model
 
-## Important Architecture Rule
+RFQ V1A is HTTP/core only.
 
-Do not put orderbook business logic inside `webtransport.rs`.
+It supports:
 
-The flow must remain:
+taker creates RFQ
+MM quote is submitted via HTTP/dev API
+taker lists quotes
+taker accepts one quote
+backend creates an execution_intent
+RFQ and quote statuses update
 
-```text
-WebTransport adapter
-→ framed ClientMessage
-→ MmGatewayService
-→ shared order/cancel service
-→ engine/orderbook/persistence
-→ framed ServerMessage
+The actual final PerpTrade signing/simulation/broadcast remains existing flow.
 
-Only src/mm/transport/webtransport.rs may depend on WebTransport-specific types.
+RFQ Lifecycle
 
-Required Behavior
-1. submit_order
+RFQ statuses:
 
-A submit_order message should create a real backend order using the same behavior as HTTP POST /orders.
+open
+expired
+accepted
+cancelled
+failed
 
-It must return:
+Quote statuses:
+
+active
+expired
+accepted
+rejected
+cancelled
+
+Rules:
+
+RFQ starts as open.
+RFQ has expires_at_ms.
+Quote has expires_at_ms.
+Expired RFQ cannot receive quotes.
+Expired quote cannot be accepted.
+Accepting one quote sets RFQ status to accepted.
+Accepting one quote sets quote status to accepted.
+Other active quotes for same RFQ become rejected or remain active but non-acceptable; choose one deterministic behavior and document it.
+Only one quote can win.
+Accept quote must be idempotent or reject clearly if already accepted.
+Accepted quote creates exactly one execution_intent.
+No broadcast occurs during RFQ accept.
+RFQ Direction Semantics
+
+Define RFQ side from taker perspective:
+
+side = buy  => taker wants to buy perp exposure, MM is seller
+side = sell => taker wants to sell perp exposure, MM is buyer
+
+Execution intent mapping:
+
+If RFQ side is buy:
+
+buyer = taker
+seller = mm_account
+buyer_is_maker = false
+
+If RFQ side is sell:
+
+buyer = mm_account
+seller = taker
+buyer_is_maker = true
+
+Validate this carefully against existing execution intent / matching semantics.
+
+Database
+
+Add migration:
+
+migrations/0010_rfqs.sql
+
+Suggested tables:
+
+CREATE TABLE rfqs (
+    rfq_id TEXT PRIMARY KEY,
+    taker TEXT NOT NULL,
+    market_id BIGINT NOT NULL,
+    side TEXT NOT NULL,
+    size_1e8 TEXT NOT NULL,
+    limit_price_1e8 TEXT NULL,
+    status TEXT NOT NULL,
+    created_at_ms BIGINT NOT NULL,
+    expires_at_ms BIGINT NOT NULL,
+    accepted_quote_id TEXT NULL,
+    execution_intent_id TEXT NULL
+);
+
+CREATE INDEX idx_rfqs_status ON rfqs(status);
+CREATE INDEX idx_rfqs_taker ON rfqs(lower(taker));
+CREATE INDEX idx_rfqs_market_id ON rfqs(market_id);
+
+CREATE TABLE rfq_quotes (
+    quote_id TEXT PRIMARY KEY,
+    rfq_id TEXT NOT NULL REFERENCES rfqs(rfq_id),
+    mm_account TEXT NOT NULL,
+    session_id TEXT NULL,
+    client_quote_id TEXT NULL,
+    price_1e8 TEXT NOT NULL,
+    size_1e8 TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_at_ms BIGINT NOT NULL,
+    expires_at_ms BIGINT NOT NULL
+);
+
+CREATE INDEX idx_rfq_quotes_rfq_id ON rfq_quotes(rfq_id);
+CREATE INDEX idx_rfq_quotes_mm ON rfq_quotes(lower(mm_account));
+CREATE INDEX idx_rfq_quotes_status ON rfq_quotes(status);
+
+Use existing project DB style and SQLx patterns.
+
+If repository uses different conventions, follow existing style.
+
+Rust Modules
+
+Add:
+
+src/rfq/
+  mod.rs
+  types.rs
+  service.rs
+
+Optional:
+
+src/rfq/store.rs
+
+if repository style prefers separate store abstraction.
+
+API Endpoints
+
+Add HTTP endpoints:
+
+POST /rfqs
+GET /rfqs
+GET /rfqs/:rfq_id
+POST /rfqs/:rfq_id/quotes
+GET /rfqs/:rfq_id/quotes
+POST /rfqs/:rfq_id/accept/:quote_id
+POST /rfqs/:rfq_id/cancel
+POST /rfqs
+
+Request:
 
 {
-  "type": "submit_order_result",
-  "request_id": "...",
-  "ok": true,
-  "payload": {
-    "accepted": true,
-    "order_id": "...",
-    "client_order_id": "...",
-    "status": "accepted",
-    "matched_intents": []
-  }
+  "taker": "0x...",
+  "market_id": 1,
+  "side": "buy",
+  "size_1e8": "100000000",
+  "limit_price_1e8": "305000000000",
+  "ttl_ms": 5000
 }
 
-If the order matches immediately and creates execution intents, return their IDs.
-
-Do not sign, simulate, broadcast, index, reconcile, or confirm from the MM gateway.
-
-2. bulk_submit
-
-Process each order independently.
-
-Partial success is allowed.
-
-Response shape:
+Response:
 
 {
-  "accepted": 2,
-  "rejected": 1,
-  "results": [
-    {
-      "client_order_id": "...",
-      "ok": true,
-      "order_id": "...",
-      "matched_intents": []
-    },
-    {
-      "client_order_id": "...",
-      "ok": false,
-      "error": {
-        "code": "ORDER_REJECTED",
-        "message": "..."
-      }
-    }
-  ]
+  "rfq_id": "...",
+  "status": "open",
+  "expires_at_ms": 1770000005000
 }
 
-Enforce:
+Validation:
 
-MM_GATEWAY_MAX_ORDERS_PER_BULK
-per-session rate limits
-max open orders per account
-existing order validation
-3. cancel_order
+taker address valid
+market exists
+side is buy/sell
+size > 0
+ttl_ms within config bounds
+limit_price optional but if present > 0
+POST /rfqs/:rfq_id/quotes
 
-Cancel a real resting off-chain order by:
+V1A dev/HTTP quote submission.
 
-order_id, or
-client_order_id
+Request:
 
-Only allow cancellation for the owning account/session.
+{
+  "mm_account": "0x...",
+  "price_1e8": "300100000000",
+  "size_1e8": "100000000",
+  "client_quote_id": "mm-quote-001",
+  "quote_ttl_ms": 3000
+}
 
-Do not cancel submitted/broadcast/confirmed execution intents.
+Response:
 
-4. bulk_cancel
+{
+  "quote_id": "...",
+  "rfq_id": "...",
+  "status": "active",
+  "expires_at_ms": 1770000003000
+}
 
-Cancel multiple resting orders.
+Validation:
 
-Partial success is allowed.
+RFQ exists
+RFQ status open
+RFQ not expired
+MM account valid
+price > 0
+size > 0
+quote size <= RFQ size for V1A
+quote_ttl_ms within config bounds
+quote expires no later than RFQ expires_at_ms
+optional client_quote_id idempotence or duplicate rejection
+GET /rfqs/:rfq_id/quotes
 
-Enforce:
+Return all quotes for RFQ.
 
-MM_GATEWAY_MAX_CANCELS_PER_BULK
-ownership rules
-idempotent behavior where possible
-5. cancel_all
+POST /rfqs/:rfq_id/accept/:quote_id
 
-Cancel all resting off-chain orders for the session/account.
+Accept quote and create execution intent.
 
-Optional filter:
+Response:
 
-market_id
+{
+  "rfq_id": "...",
+  "quote_id": "...",
+  "status": "accepted",
+  "execution_intent_id": "...",
+  "onchain_intent_id": "0x..."
+}
 
-Do not mutate execution intents that are already matched/submitted/broadcast/confirmed.
+Validation:
 
-6. quote_replace
+RFQ exists
+quote exists and belongs to RFQ
+RFQ status open
+RFQ not expired
+quote status active
+quote not expired
+quote size compatible
+price compatible with taker limit
+no previous accepted quote
 
-Implement real quote replace:
+Critical:
+This endpoint must create an execution_intent using existing execution-intent creation path if possible.
 
-Identify previous open quote orders for the account and market.
-If cancel_previous=true, cancel previous resting quotes.
-Submit new bid and/or ask.
-Return:
-cancelled count
-submitted count
-rejected count
-per-leg result
-matched intent IDs if matching occurred
+Do not duplicate execution-intent logic incorrectly.
 
-The operation should be deterministic.
+Config
 
-If full atomicity is hard, use clear non-atomic semantics and document them:
+Add safe defaults:
 
-cancel previous first, then submit new bid/ask independently
-7. cancel-on-disconnect
+RFQ_ENABLED=false
+RFQ_REQUIRE_PERSISTENCE=true
+RFQ_DEFAULT_TTL_MS=5000
+RFQ_MAX_TTL_MS=30000
+RFQ_MIN_QUOTE_TTL_MS=500
+RFQ_MAX_QUOTE_TTL_MS=10000
+RFQ_MAX_QUOTES_PER_RFQ=50
 
-On WebTransport session disconnect:
+Startup:
 
-cancel real open resting off-chain orders owned by that session/account if enabled
-do not cancel submitted/broadcast/confirmed intents
-idempotent
-log cancellation summary
+If RFQ_ENABLED=true and persistence required but unavailable, fail clearly.
+If disabled, endpoints can return "rfq is disabled" or stay registered but reject.
 
-If order ownership tracking is insufficient, add minimal tracking.
+Normal tests must not require live Postgres.
 
-Shared Service Extraction
+Persistence / Atomicity
 
-Current HTTP route logic likely owns order/cancel behavior.
+Accept quote must be safe.
 
-Extract minimal shared helpers so both HTTP and MM gateway use the same behavior.
+Acceptance should be atomic at DB level if possible:
 
-Target structure can be:
+verify RFQ still open
+verify quote still active
+create execution_intent
+set RFQ accepted_quote_id
+set RFQ execution_intent_id
+set RFQ status accepted
+set accepted quote status accepted
+reject or mark other active quotes deterministically
 
-src/orders/service.rs
+If full SQL transaction support already exists, use it.
 
-or similar.
+If not, implement minimal safe ordering and document limitation.
 
-Avoid broad refactors.
+Do not fake atomicity.
 
-The goal:
+Execution Intent Creation
 
-HTTP POST /orders
-MM submit_order
+Accepted RFQ must create the same kind of execution_intent as orderbook matching.
 
-should call the same core order submission logic.
+Expected fields:
 
-Same for cancel paths.
+market_id from RFQ
+buyer/seller derived from side
+price_1e8 from accepted quote
+size_1e8 from accepted quote or RFQ
+buyer_is_maker according to side mapping
+buyer_nonce / seller_nonce should use current configured behavior
+deadline should use RFQ/quote expiry semantics or existing execution deadline defaults
 
-Session Ownership
+Important:
+RFQ acceptance must not sign PerpTrade.
+RFQ acceptance must not simulate.
+RFQ acceptance must not broadcast.
+It only creates the execution_intent.
 
-The gateway must track which orders were created by each session.
+Existing endpoints should then work:
 
-Session should register:
-
-order_id
-client_order_id
-market_id
-account
-
-This enables:
-
-cancel-on-disconnect
-quote_replace
-get_session
-max open orders enforcement
-Nonce Handling
-
-Do not invent on-chain nonces.
-
-If PERP_NONCE_SYNC_ENABLED=true, gateway order submission must respect the existing nonce sync behavior.
-
-If sync is disabled, existing behavior remains.
-
-Do not consume/store local nonces for rejected orders.
-
-Auth V1C
-
-Auth can remain disabled by default:
-
-MM_GATEWAY_AUTH_MODE=disabled
-MM_GATEWAY_REQUIRE_AUTH=false
-
-If MM_GATEWAY_REQUIRE_AUTH=true, trading messages should be rejected unless session authenticated.
-
-Do not implement full wallet challenge auth unless trivial.
-
+GET /execution-intents/:intent_id/signing-payload
+POST /execution-intents/:intent_id/signatures
+POST /executor/simulate/:intent_id
+POST /executor/broadcast/:intent_id
 Tests
 
-Normal cargo test must remain offline.
+Add tests for RFQ logic.
 
-Add tests for:
+Normal cargo test must be offline.
 
-submit_order calls shared order service
-submit_order returns order_id/client_order_id
-bulk_submit partial accept/reject
-bulk_submit respects max orders
-cancel_order rejects non-owned order
-cancel_order cancels owned resting order
-bulk_cancel partial result
-cancel_all cancels only account/session resting orders
-quote_replace cancels previous quote then submits bid/ask
-quote_replace handles bid-only
-quote_replace handles ask-only
-quote_replace returns matched intent IDs if service returns them
-cancel-on-disconnect plans and applies only open resting orders
-cancel-on-disconnect does not touch execution intents
-rate limits still apply
-nonce sync errors are surfaced as ORDER_REJECTED
-HTTP order behavior remains unchanged after helper extraction
+Required tests:
 
-If full engine tests require complex setup, create pure service tests with mocked order service traits.
+create RFQ success
+create RFQ rejects invalid taker
+create RFQ rejects invalid side
+create RFQ rejects zero size
+create RFQ caps TTL
+submit quote success
+submit quote rejects expired RFQ
+submit quote rejects wrong/zero price
+submit quote rejects size > RFQ size
+submit quote caps quote TTL to RFQ expiry
+list quotes
+accept quote success
+accept quote rejects expired RFQ
+accept quote rejects expired quote
+accept quote rejects quote from different RFQ
+accept quote rejects price beyond taker limit
+accept quote creates execution_intent with correct buyer/seller for taker buy
+accept quote creates execution_intent with correct buyer/seller for taker sell
+accept quote is single-winner
+cancel RFQ prevents quote acceptance
 
-Do not require live WebTransport for normal tests.
-
-Runtime Smoke Test
-
-Extend mm_wt_smoke or add flags so it can optionally send:
-
-heartbeat
-get_session
-submit_order
-quote_replace
-cancel_all
-
-It must not broadcast.
-
-It must not require private keys unless the tested payload requires them.
-
-If signatures are needed and verification mode is disabled in local dev, use shape-valid dummy signatures.
+If full DB tests are complex, add pure service tests and repository tests using existing project patterns.
 
 Documentation
 
@@ -340,15 +436,16 @@ ARCHITECTURE.md
 
 Document:
 
-V1C live orderbook integration
-submit_order over WebTransport
-bulk_submit semantics
-cancel semantics
-quote_replace semantics
-cancel-on-disconnect real behavior
-non-atomic quote_replace caveat if applicable
-safety boundary: no auto-broadcast
-next steps: RFQ and production auth
+RFQ V1A scope
+RFQ lifecycle
+quote lifecycle
+HTTP endpoints
+side semantics
+execution_intent creation
+no auto-broadcast
+future RFQ V1B WebTransport integration
+future signed RFQ quotes
+future MM selection/ranking
 Validation
 
 Run:
@@ -361,29 +458,29 @@ Acceptance Criteria
 
 Complete only if:
 
-MM submit_order mutates live orderbook through shared backend logic
-bulk_submit works with partial results
-cancel_order cancels real resting orders
-bulk_cancel works with partial results
-cancel_all works for account/session
-quote_replace does real cancel + submit
-cancel-on-disconnect applies real off-chain cancellation
-no auto-broadcast path added
-WebTransport adapter remains transport-only
-HTTP routes still work
-normal tests are offline
+RFQ config exists
+RFQ tables migration exists
+RFQ service exists
+HTTP endpoints exist
+quote submission works
+quote acceptance creates execution_intent
+side mapping is tested
+no auto-broadcast
+no WebTransport RFQ push yet
+tests pass offline
 docs updated
 cargo fmt passes
-cargo clippy passes with -D warnings
+cargo clippy passes
 cargo test passes
 cargo build passes
-Deferred
-RFQ
-production wallet challenge auth
-WebTransport datagrams for market data
-options MM gateway
-MM quality metrics
-inventory/risk-aware quote engine
+Deferred to RFQ V1B
+broadcast RFQ to connected MM sessions over WebTransport
+receive rfq_quote over WebTransport
+notify MM of accepted/expired quote
+live RFQ runtime smoke over WebTransport
+production wallet auth
+signed RFQ quote messages
+RFQ market maker ranking/selection
 EOF
 
 

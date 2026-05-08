@@ -5,6 +5,7 @@ use crate::execution::{ExecutionConfig, StoredTradeSignatures};
 use crate::indexer::IndexerConfig;
 use crate::nonce_sync::PerpNonceSyncConfig;
 use crate::reconciliation::ReconciliationConfig;
+use crate::rfq::{RfqConfig, RfqStore};
 use crate::signing::{Eip712Domain, NonceStore, SignatureVerificationMode};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -23,6 +24,8 @@ pub struct AppState {
     pub confirmation_config: ConfirmationConfig,
     pub indexer_config: IndexerConfig,
     pub reconciliation_config: ReconciliationConfig,
+    pub rfq_config: RfqConfig,
+    pub rfq_store: Arc<Mutex<RfqStore>>,
     pub trade_signatures: Arc<Mutex<HashMap<Uuid, StoredTradeSignatures>>>,
 }
 
@@ -133,6 +136,7 @@ impl AppState {
             ConfirmationConfig::disabled(),
             indexer_config,
             reconciliation_config,
+            RfqConfig::disabled(),
             chain_id,
         )
     }
@@ -148,6 +152,7 @@ impl AppState {
         confirmation_config: ConfirmationConfig,
         indexer_config: IndexerConfig,
         reconciliation_config: ReconciliationConfig,
+        rfq_config: RfqConfig,
         chain_id: u64,
     ) -> Self {
         Self {
@@ -162,7 +167,25 @@ impl AppState {
             confirmation_config,
             indexer_config,
             reconciliation_config,
+            rfq_config,
+            rfq_store: Arc::new(Mutex::new(RfqStore::new())),
             trade_signatures: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    pub fn with_rfq_config(engine: EngineState, rfq_config: RfqConfig) -> Self {
+        Self::with_all_config(
+            engine,
+            SignatureVerificationMode::Disabled,
+            Eip712Domain::default(),
+            None,
+            ExecutionConfig::disabled(),
+            PerpNonceSyncConfig::disabled(),
+            ConfirmationConfig::disabled(),
+            IndexerConfig::disabled(),
+            ReconciliationConfig::disabled(),
+            rfq_config,
+            84532,
+        )
     }
 }

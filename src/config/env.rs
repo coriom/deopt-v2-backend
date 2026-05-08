@@ -6,6 +6,7 @@ use crate::mm::transport::webtransport::validate_webtransport_startup;
 use crate::mm::MmGatewayConfig;
 use crate::nonce_sync::PerpNonceSyncConfig;
 use crate::reconciliation::ReconciliationConfig;
+use crate::rfq::RfqConfig;
 use crate::signing::signature::SignatureVerificationMode;
 use crate::signing::Eip712Domain;
 use crate::types::AccountId;
@@ -24,6 +25,7 @@ pub struct AppConfig {
     pub confirmation: ConfirmationConfig,
     pub indexer: IndexerConfig,
     pub reconciliation: ReconciliationConfig,
+    pub rfq: RfqConfig,
     pub mm_gateway: MmGatewayConfig,
     pub signature_verification_mode: SignatureVerificationMode,
     pub eip712_domain: Eip712Domain,
@@ -158,6 +160,15 @@ impl AppConfig {
             )?,
             rpc_url: execution.rpc_url.clone(),
         };
+        let rfq = RfqConfig {
+            enabled: parse_env(&mut lookup, "RFQ_ENABLED", "false")?,
+            require_persistence: parse_env(&mut lookup, "RFQ_REQUIRE_PERSISTENCE", "true")?,
+            default_ttl_ms: parse_env(&mut lookup, "RFQ_DEFAULT_TTL_MS", "5000")?,
+            max_ttl_ms: parse_env(&mut lookup, "RFQ_MAX_TTL_MS", "30000")?,
+            min_quote_ttl_ms: parse_env(&mut lookup, "RFQ_MIN_QUOTE_TTL_MS", "500")?,
+            max_quote_ttl_ms: parse_env(&mut lookup, "RFQ_MAX_QUOTE_TTL_MS", "10000")?,
+            max_quotes_per_rfq: parse_env(&mut lookup, "RFQ_MAX_QUOTES_PER_RFQ", "50")?,
+        };
         let perp_nonce_sync = PerpNonceSyncConfig {
             enabled: parse_env(&mut lookup, "PERP_NONCE_SYNC_ENABLED", "false")?,
             require_rpc: parse_env(&mut lookup, "PERP_NONCE_SYNC_REQUIRE_RPC", "true")?,
@@ -190,6 +201,7 @@ impl AppConfig {
         indexer.validate_startup(persistence_enabled)?;
         reconciliation.validate_startup(persistence_enabled)?;
         confirmation.validate_startup(persistence_enabled)?;
+        rfq.validate_startup(persistence_enabled)?;
         validate_webtransport_startup(&mm_gateway)?;
 
         Ok(Self {
@@ -203,6 +215,7 @@ impl AppConfig {
             confirmation,
             indexer,
             reconciliation,
+            rfq,
             mm_gateway,
             signature_verification_mode,
             eip712_domain,
@@ -748,6 +761,46 @@ mod tests {
         assert!(error
             .to_string()
             .contains("reconciliation requires persistence enabled"));
+    }
+
+    #[test]
+    fn rfq_uses_safe_defaults() {
+        let config = config_from_pairs([("RFQ_ENABLED", "false")]).unwrap();
+
+        assert!(!config.rfq.enabled);
+        assert!(config.rfq.require_persistence);
+        assert_eq!(config.rfq.default_ttl_ms, 5_000);
+        assert_eq!(config.rfq.max_ttl_ms, 30_000);
+        assert_eq!(config.rfq.min_quote_ttl_ms, 500);
+        assert_eq!(config.rfq.max_quote_ttl_ms, 10_000);
+        assert_eq!(config.rfq.max_quotes_per_rfq, 50);
+    }
+
+    #[test]
+    fn rfq_requiring_persistence_rejects_persistence_disabled() {
+        let error = config_from_pairs([
+            ("RFQ_ENABLED", "true"),
+            ("RFQ_REQUIRE_PERSISTENCE", "true"),
+            ("PERSISTENCE_ENABLED", "false"),
+        ])
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("RFQ requires persistence enabled"));
+    }
+
+    #[test]
+    fn rfq_can_run_without_persistence_when_requirement_disabled() {
+        let config = config_from_pairs([
+            ("RFQ_ENABLED", "true"),
+            ("RFQ_REQUIRE_PERSISTENCE", "false"),
+            ("PERSISTENCE_ENABLED", "false"),
+        ])
+        .unwrap();
+
+        assert!(config.rfq.enabled);
+        assert!(!config.rfq.require_persistence);
     }
 
     #[test]

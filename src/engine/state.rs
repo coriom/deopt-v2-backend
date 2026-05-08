@@ -57,6 +57,10 @@ impl EngineState {
         self.execution_queue.all()
     }
 
+    pub fn push_execution_intent(&mut self, intent: ExecutionIntent) {
+        self.execution_queue.push(intent);
+    }
+
     pub fn update_execution_intent_status(
         &mut self,
         intent_id: Uuid,

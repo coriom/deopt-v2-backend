@@ -23,4 +23,14 @@ impl NonceStore {
         }
         Ok(())
     }
+
+    pub fn reserve_next(&mut self, account: &AccountId) -> Result<u64> {
+        let account_nonces = self.used.entry(account.clone()).or_default();
+        let mut nonce = 1u64;
+        while account_nonces.contains(&nonce) {
+            nonce = nonce.checked_add(1).ok_or(BackendError::InvalidNonce)?;
+        }
+        account_nonces.insert(nonce);
+        Ok(nonce)
+    }
 }

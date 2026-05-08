@@ -42,6 +42,13 @@ CONFIRMATION_REQUIRE_PERSISTENCE=true
 CONFIRMATION_REQUIRED_BLOCKS=2
 CONFIRMATION_MAX_BATCH_SIZE=50
 CONFIRMATION_REQUIRE_RECONCILIATION=true
+RFQ_ENABLED=false
+RFQ_REQUIRE_PERSISTENCE=true
+RFQ_DEFAULT_TTL_MS=5000
+RFQ_MAX_TTL_MS=30000
+RFQ_MIN_QUOTE_TTL_MS=500
+RFQ_MAX_QUOTE_TTL_MS=10000
+RFQ_MAX_QUOTES_PER_RFQ=50
 SIGNATURE_VERIFICATION_MODE=disabled
 PERSISTENCE_ENABLED=false
 DATABASE_URL=postgres://deopt:deopt@127.0.0.1:5432/deopt_v2_backend
@@ -76,7 +83,39 @@ MM_GATEWAY_REQUIRE_AUTH=false
 `PERP_NONCE_SYNC_ENABLED=false` keeps existing local nonce behavior unchanged. When set to `true`, `PERP_NONCE_SYNC_REQUIRE_RPC=true` requires `RPC_URL` and a nonzero `PERP_MATCHING_ENGINE_ADDRESS` at startup. `PERP_NONCE_SYNC_STRICT=true` rejects an order when its nonce does not equal `PerpMatchingEngine.nonces(order.account)`.
 `INDEXER_ENABLED=true` requires `RPC_URL`; when `INDEXER_REQUIRE_PERSISTENCE=true`, it also requires `PERSISTENCE_ENABLED=true`.
 `CONFIRMATION_ENABLED=true` requires `RPC_URL`; when `CONFIRMATION_REQUIRE_PERSISTENCE=true`, it also requires `PERSISTENCE_ENABLED=true`. Confirmation is disabled by default, never broadcasts, and rejects startup if `CONFIRMATION_REQUIRE_RECONCILIATION=false`.
+`RFQ_ENABLED=false` is the safe default. When `RFQ_ENABLED=true` and `RFQ_REQUIRE_PERSISTENCE=true`, startup requires `PERSISTENCE_ENABLED=true`. Test and development code can run RFQ in memory with persistence disabled, but production-like RFQ acceptance should use Postgres so RFQ, quote, and execution-intent updates are committed together.
 `MM_GATEWAY_ENABLED=false` is the safe default. When `true`, V1C starts a separate WebTransport UDP listener and requires `MM_GATEWAY_CERT_PATH` and `MM_GATEWAY_KEY_PATH`. It can submit and cancel off-chain perp orders through the live in-memory orderbook, but it does not auto-broadcast, sign, simulate, index, reconcile, or confirm execution intents.
+
+## RFQ V1A
+
+RFQ V1A is HTTP/core only. It supports taker RFQ creation, HTTP/dev quote submission by market makers, quote listing, taker quote acceptance, RFQ cancellation, and creation of a normal `execution_intent` for the accepted quote. It does not push RFQs over WebTransport, does not process RFQ messages over MM sessions, does not support options or multi-leg RFQs, and does not auto-sign, simulate, or broadcast.
+
+HTTP endpoints:
+
+```text
+POST /rfqs
+GET /rfqs
+GET /rfqs/:rfq_id
+POST /rfqs/:rfq_id/quotes
+GET /rfqs/:rfq_id/quotes
+POST /rfqs/:rfq_id/accept/:quote_id
+POST /rfqs/:rfq_id/cancel
+```
+
+RFQ statuses are `open`, `expired`, `accepted`, `cancelled`, and `failed`. Quote statuses are `active`, `expired`, `accepted`, `rejected`, and `cancelled`. Expiry is enforced on quote submission and acceptance. Accepting one quote deterministically marks the RFQ `accepted`, marks the winning quote `accepted`, and marks other active quotes for that RFQ `rejected`.
+
+RFQ `side` is from the taker perspective. `buy` means the taker buys perp exposure, so the execution intent has `buyer=taker`, `seller=mm_account`, and `buyer_is_maker=false`. `sell` means the taker sells perp exposure, so the execution intent has `buyer=mm_account`, `seller=taker`, and `buyer_is_maker=true`.
+
+Accepted RFQs create pending execution intents only. The resulting intent then uses the existing flow:
+
+```text
+GET /execution-intents/:intent_id/signing-payload
+POST /execution-intents/:intent_id/signatures
+POST /executor/simulate/:intent_id
+POST /executor/broadcast/:intent_id
+```
+
+Broadcast remains disabled unless the existing explicit broadcast gates are enabled. RFQ acceptance never fabricates signatures, transaction hashes, confirmations, or finality. RFQ V1B is deferred for WebTransport RFQ push, RFQ quote messages over MM sessions, signed RFQ quotes, market-maker ranking, and live RFQ session notifications.
 
 ## Market Maker Gateway V1A
 
