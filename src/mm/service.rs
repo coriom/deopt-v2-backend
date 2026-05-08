@@ -1,29 +1,40 @@
 use super::protocol::{
     AuthResultPayload, BulkCancelItemResult, BulkCancelPayload, BulkCancelResultPayload,
-    BulkSubmitItemResult, BulkSubmitPayload, BulkSubmitResultPayload, CancelAllResultPayload,
-    CancelOrderPayload, CancelOrderResultPayload, ClientMessage, ErrorCode,
+    BulkSubmitItemResult, BulkSubmitPayload, BulkSubmitResultPayload, CancelAllPayload,
+    CancelAllResultPayload, CancelOrderPayload, CancelOrderResultPayload, ClientMessage, ErrorCode,
     GetSessionResultPayload, HeartbeatResultPayload, ProtocolError, QuoteLegPayload,
-    QuoteReplacePayload, QuoteReplaceResultPayload, ResultEnvelope, ServerMessage,
-    SubmitOrderPayload, SubmitOrderResultPayload,
+    QuoteReplaceLegResult, QuoteReplacePayload, QuoteReplaceResultPayload, ResultEnvelope,
+    ServerMessage, SubmitOrderPayload, SubmitOrderResultPayload,
 };
 use super::rate_limit::{
     check_cancels_per_bulk, check_in_flight, check_message_rate, check_open_orders,
     check_orders_per_bulk, MmGatewayConfig, RateLimitDecision,
 };
 use super::session::MmSession;
-use crate::types::TimestampMs;
+use crate::api::dto::parse_fixed_u128;
+use crate::api::AppState;
+use crate::error::BackendError;
+use crate::orders::service::{
+    cancel_order, cancel_resting_orders, submit_signed_order, CancelOrderInput,
+    CancelRestingFilter, SubmitOrderOutcome,
+};
+use crate::signing::SignedOrder;
+use crate::types::{AccountId, MarketId, Side, TimeInForce, TimestampMs};
+use std::collections::BTreeSet;
+use tracing::info;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone)]
 pub struct MmGatewayService {
     pub config: MmGatewayConfig,
+    state: AppState,
 }
 
 impl MmGatewayService {
-    pub fn new(config: MmGatewayConfig) -> Self {
-        Self { config }
+    pub fn new(config: MmGatewayConfig, state: AppState) -> Self {
+        Self { config, state }
     }
 
-    pub fn handle_message(
+    pub async fn handle_message(
         &self,
         session: &mut MmSession,
         message: ClientMessage,
@@ -81,45 +92,28 @@ impl MmGatewayService {
                 ))
             }
             ClientMessage::SubmitOrder(envelope) => {
-                let payload = submit_order_result(session, envelope.payload).map_err(|error| {
-                    ServerMessage::error(envelope.request_id.clone(), error.code, error.message)
-                });
-                match payload {
-                    Ok(payload) => ServerMessage::SubmitOrderResult(ResultEnvelope::new(
-                        "submit_order_result",
-                        envelope.request_id,
-                        payload,
-                    )),
-                    Err(error) => error,
-                }
+                self.handle_submit_order(session, envelope.request_id, envelope.payload)
+                    .await
             }
             ClientMessage::BulkSubmit(envelope) => {
                 self.handle_bulk_submit(session, envelope.request_id, envelope.payload)
+                    .await
             }
             ClientMessage::CancelOrder(envelope) => {
-                let payload = cancel_order_result(session, envelope.payload);
-                ServerMessage::CancelOrderResult(ResultEnvelope::new(
-                    "cancel_order_result",
-                    envelope.request_id,
-                    payload,
-                ))
+                self.handle_cancel_order(session, envelope.request_id, envelope.payload)
+                    .await
             }
             ClientMessage::BulkCancel(envelope) => {
                 self.handle_bulk_cancel(session, envelope.request_id, envelope.payload)
+                    .await
             }
             ClientMessage::CancelAll(envelope) => {
-                let cancelled = session.clear_open_client_order_ids().len();
-                ServerMessage::CancelAllResult(ResultEnvelope::new(
-                    "cancel_all_result",
-                    envelope.request_id,
-                    CancelAllResultPayload {
-                        cancelled,
-                        planned: true,
-                    },
-                ))
+                self.handle_cancel_all(session, envelope.request_id, envelope.payload)
+                    .await
             }
             ClientMessage::QuoteReplace(envelope) => {
                 self.handle_quote_replace(session, envelope.request_id, envelope.payload)
+                    .await
             }
             ClientMessage::GetSession(envelope) => {
                 ServerMessage::GetSessionResult(ResultEnvelope::new(
@@ -135,7 +129,71 @@ impl MmGatewayService {
         response
     }
 
-    fn handle_bulk_submit(
+    pub async fn cancel_on_disconnect(&self, session: &mut MmSession) -> usize {
+        if !session.cancel_on_disconnect {
+            return 0;
+        }
+        let Some(account) = session.account.clone() else {
+            return 0;
+        };
+        let ids: BTreeSet<String> = session.open_client_order_ids.iter().cloned().collect();
+        if ids.is_empty() {
+            return 0;
+        }
+
+        match cancel_resting_orders(
+            &self.state,
+            CancelRestingFilter {
+                account,
+                market_id: None,
+                client_order_ids: Some(ids),
+            },
+        )
+        .await
+        {
+            Ok(outcome) => {
+                for cancel in &outcome.cancelled {
+                    if let Some(client_order_id) = cancel.client_order_id.as_deref() {
+                        session.unregister_open_client_order_id(client_order_id);
+                        session.unregister_quote_client_order_id(client_order_id);
+                    }
+                }
+                outcome.cancelled.len()
+            }
+            Err(error) => {
+                info!(
+                    session_id = %session.session_id,
+                    error = %error,
+                    "MM cancel-on-disconnect failed"
+                );
+                0
+            }
+        }
+    }
+
+    async fn handle_submit_order(
+        &self,
+        session: &mut MmSession,
+        request_id: String,
+        payload: SubmitOrderPayload,
+    ) -> ServerMessage {
+        let client_order_id = payload.client_order_id.clone();
+        let outcome = self.submit_payload(session, payload).await;
+        match outcome {
+            Ok(outcome) => ServerMessage::SubmitOrderResult(ResultEnvelope::new(
+                "submit_order_result",
+                request_id,
+                submit_result_payload(outcome),
+            )),
+            Err(error) => ServerMessage::error(
+                request_id,
+                error.code,
+                format_client_error(error.message, client_order_id.as_deref()),
+            ),
+        }
+    }
+
+    async fn handle_bulk_submit(
         &self,
         session: &mut MmSession,
         request_id: String,
@@ -162,27 +220,25 @@ impl MmGatewayService {
         let mut rejected = 0;
         let mut results = Vec::with_capacity(payload.orders.len());
         for order in payload.orders {
-            match validate_submit_order(&order) {
-                Ok(()) => {
-                    if let Some(client_order_id) = order.client_order_id.clone() {
-                        session.register_open_client_order_id(client_order_id.clone());
-                    }
+            let client_order_id = order.client_order_id.clone();
+            match self.submit_payload(session, order).await {
+                Ok(outcome) => {
                     accepted += 1;
                     results.push(BulkSubmitItemResult {
-                        client_order_id: order.client_order_id,
+                        client_order_id: outcome.client_order_id,
                         ok: true,
-                        planned: true,
-                        order_id: None,
+                        order_id: outcome.order_id.map(|order_id| order_id.to_string()),
+                        matched_intents: outcome.matched_intents,
                         error: None,
                     });
                 }
                 Err(error) => {
                     rejected += 1;
                     results.push(BulkSubmitItemResult {
-                        client_order_id: order.client_order_id,
+                        client_order_id,
                         ok: false,
-                        planned: false,
                         order_id: None,
+                        matched_intents: Vec::new(),
                         error: Some(error),
                     });
                 }
@@ -200,7 +256,23 @@ impl MmGatewayService {
         ))
     }
 
-    fn handle_bulk_cancel(
+    async fn handle_cancel_order(
+        &self,
+        session: &mut MmSession,
+        request_id: String,
+        payload: CancelOrderPayload,
+    ) -> ServerMessage {
+        match self.cancel_payload(session, payload).await {
+            Ok(payload) => ServerMessage::CancelOrderResult(ResultEnvelope::new(
+                "cancel_order_result",
+                request_id,
+                payload,
+            )),
+            Err(error) => ServerMessage::error(request_id, error.code, error.message),
+        }
+    }
+
+    async fn handle_bulk_cancel(
         &self,
         session: &mut MmSession,
         request_id: String,
@@ -219,31 +291,26 @@ impl MmGatewayService {
         for cancel in payload.cancels {
             let client_order_id = cancel.client_order_id.clone();
             let order_id = cancel.order_id.map(|order_id| order_id.to_string());
-            if let Some(id) = client_order_id.as_deref() {
-                if session.unregister_open_client_order_id(id) {
+            match self.cancel_payload(session, cancel).await {
+                Ok(payload) => {
                     cancelled += 1;
+                    results.push(BulkCancelItemResult {
+                        client_order_id: payload.client_order_id,
+                        order_id: payload.order_id,
+                        ok: true,
+                        error: None,
+                    });
+                }
+                Err(error) => {
+                    rejected += 1;
                     results.push(BulkCancelItemResult {
                         client_order_id,
                         order_id,
-                        ok: true,
-                        planned: true,
-                        error: None,
+                        ok: false,
+                        error: Some(error),
                     });
-                    continue;
                 }
             }
-
-            rejected += 1;
-            results.push(BulkCancelItemResult {
-                client_order_id,
-                order_id,
-                ok: false,
-                planned: false,
-                error: Some(ProtocolError::new(
-                    ErrorCode::CancelRejected,
-                    "client order id is not open for this session",
-                )),
-            });
         }
 
         ServerMessage::BulkCancelResult(ResultEnvelope::new(
@@ -257,26 +324,139 @@ impl MmGatewayService {
         ))
     }
 
-    fn handle_quote_replace(
+    async fn handle_cancel_all(
+        &self,
+        session: &mut MmSession,
+        request_id: String,
+        payload: CancelAllPayload,
+    ) -> ServerMessage {
+        let Some(account) = session_account(session, payload.account) else {
+            return ServerMessage::error(
+                request_id,
+                ErrorCode::CancelRejected,
+                "account is required for cancel_all",
+            );
+        };
+
+        match cancel_resting_orders(
+            &self.state,
+            CancelRestingFilter {
+                account,
+                market_id: payload.market_id,
+                client_order_ids: None,
+            },
+        )
+        .await
+        {
+            Ok(outcome) => {
+                let cancelled = outcome.cancelled.len();
+                for cancel in outcome.cancelled {
+                    if let Some(client_order_id) = cancel.client_order_id.as_deref() {
+                        session.unregister_open_client_order_id(client_order_id);
+                        session.unregister_quote_client_order_id(client_order_id);
+                    }
+                }
+                ServerMessage::CancelAllResult(ResultEnvelope::new(
+                    "cancel_all_result",
+                    request_id,
+                    CancelAllResultPayload { cancelled },
+                ))
+            }
+            Err(error) => backend_error_response(request_id, ErrorCode::CancelRejected, error),
+        }
+    }
+
+    async fn handle_quote_replace(
         &self,
         session: &mut MmSession,
         request_id: String,
         payload: QuoteReplacePayload,
     ) -> ServerMessage {
+        if session_account(session, Some(payload.account.clone())).is_none() {
+            return ServerMessage::error(
+                request_id,
+                ErrorCode::QuoteReplaceFailed,
+                "quote_replace account does not match authenticated session",
+            );
+        }
+
         let mut cancelled = 0;
         if payload.cancel_previous {
-            cancelled = session.clear_open_client_order_ids().len();
+            let ids: BTreeSet<String> = session.quote_client_order_ids.iter().cloned().collect();
+            match cancel_resting_orders(
+                &self.state,
+                CancelRestingFilter {
+                    account: payload.account.clone(),
+                    market_id: Some(payload.market_id),
+                    client_order_ids: Some(ids),
+                },
+            )
+            .await
+            {
+                Ok(outcome) => {
+                    cancelled = outcome.cancelled.len();
+                    for cancel in outcome.cancelled {
+                        if let Some(client_order_id) = cancel.client_order_id.as_deref() {
+                            session.unregister_open_client_order_id(client_order_id);
+                            session.unregister_quote_client_order_id(client_order_id);
+                        }
+                    }
+                }
+                Err(error) => {
+                    return backend_error_response(
+                        request_id,
+                        ErrorCode::QuoteReplaceFailed,
+                        error,
+                    );
+                }
+            }
         }
 
         let mut submitted = 0;
         let mut rejected = 0;
-        for leg in [&payload.bid, &payload.ask].into_iter().flatten() {
-            match validate_quote_leg(leg) {
-                Ok(()) => {
-                    session.register_open_client_order_id(leg.client_order_id.clone());
+        let mut matched_intents = Vec::new();
+        let mut results = Vec::new();
+        for (side, leg) in [(Side::Buy, payload.bid), (Side::Sell, payload.ask)] {
+            let Some(leg) = leg else {
+                continue;
+            };
+            let client_order_id = leg.client_order_id.clone();
+            match self
+                .submit_quote_leg(
+                    session,
+                    payload.market_id,
+                    payload.account.clone(),
+                    side,
+                    leg,
+                )
+                .await
+            {
+                Ok(outcome) => {
                     submitted += 1;
+                    matched_intents.extend(outcome.matched_intents.clone());
+                    if outcome.resting {
+                        session.register_quote_client_order_id(client_order_id.clone());
+                    }
+                    results.push(QuoteReplaceLegResult {
+                        side,
+                        client_order_id,
+                        ok: true,
+                        order_id: outcome.order_id.map(|order_id| order_id.to_string()),
+                        matched_intents: outcome.matched_intents,
+                        error: None,
+                    });
                 }
-                Err(_) => rejected += 1,
+                Err(error) => {
+                    rejected += 1;
+                    results.push(QuoteReplaceLegResult {
+                        side,
+                        client_order_id,
+                        ok: false,
+                        order_id: None,
+                        matched_intents: Vec::new(),
+                        error: Some(error),
+                    });
+                }
             }
         }
 
@@ -288,10 +468,145 @@ impl MmGatewayService {
                 cancelled,
                 submitted,
                 rejected,
-                matched_intents: Vec::new(),
-                planned: true,
+                results,
+                matched_intents,
             },
         ))
+    }
+
+    async fn submit_payload(
+        &self,
+        session: &mut MmSession,
+        payload: SubmitOrderPayload,
+    ) -> Result<SubmitOrderOutcome, ProtocolError> {
+        let account = payload.account.clone();
+        if session_account(session, Some(account.clone())).is_none() {
+            return Err(ProtocolError::new(
+                ErrorCode::OrderRejected,
+                "order account does not match authenticated session",
+            ));
+        }
+        if payload.client_order_id.as_deref().unwrap_or("").is_empty() {
+            return Err(ProtocolError::new(
+                ErrorCode::OrderRejected,
+                "client_order_id is required for MM gateway orders",
+            ));
+        }
+        let open_orders = self
+            .live_open_order_count(&account)
+            .map_err(|error| protocol_error(ErrorCode::OrderRejected, error))?;
+        if let RateLimitDecision::Rejected { code, message } =
+            check_open_orders(open_orders, 1, &self.config)
+        {
+            return Err(ProtocolError::new(code, message));
+        }
+
+        let signed_order = signed_order_from_submit(payload)?;
+        let outcome = submit_signed_order(&self.state, signed_order)
+            .await
+            .map_err(|error| protocol_error(ErrorCode::OrderRejected, error))?;
+        if outcome.status != "accepted" {
+            return Err(ProtocolError::new(
+                ErrorCode::OrderRejected,
+                rejection_reason(&outcome),
+            ));
+        }
+        if outcome.status == "accepted" && outcome.resting {
+            if let Some(client_order_id) = outcome.client_order_id.clone() {
+                session.register_open_client_order_id(client_order_id);
+            }
+        }
+        Ok(outcome)
+    }
+
+    async fn submit_quote_leg(
+        &self,
+        session: &mut MmSession,
+        market_id: MarketId,
+        account: AccountId,
+        side: Side,
+        leg: QuoteLegPayload,
+    ) -> Result<SubmitOrderOutcome, ProtocolError> {
+        if leg.client_order_id.is_empty() {
+            return Err(ProtocolError::new(
+                ErrorCode::QuoteReplaceFailed,
+                "client_order_id is required",
+            ));
+        }
+        self.submit_payload(
+            session,
+            SubmitOrderPayload {
+                market_id,
+                account,
+                side,
+                price_1e8: leg.price_1e8,
+                size_1e8: leg.size_1e8,
+                time_in_force: TimeInForce::Gtc,
+                reduce_only: false,
+                post_only: false,
+                client_order_id: Some(leg.client_order_id),
+                nonce: leg.nonce,
+                deadline_ms: leg.deadline_ms,
+                signature: leg.signature,
+            },
+        )
+        .await
+        .map_err(|error| ProtocolError::new(ErrorCode::QuoteReplaceFailed, error.message))
+    }
+
+    async fn cancel_payload(
+        &self,
+        session: &mut MmSession,
+        payload: CancelOrderPayload,
+    ) -> Result<CancelOrderResultPayload, ProtocolError> {
+        let Some(account) = session_account(session, payload.account.clone()) else {
+            return Err(ProtocolError::new(
+                ErrorCode::CancelRejected,
+                "account is required for cancel",
+            ));
+        };
+        if payload.order_id.is_none() && payload.client_order_id.is_none() {
+            return Err(ProtocolError::new(
+                ErrorCode::CancelRejected,
+                "order_id or client_order_id is required",
+            ));
+        }
+
+        let outcome = cancel_order(
+            &self.state,
+            CancelOrderInput {
+                account: Some(account),
+                market_id: payload.market_id,
+                order_id: payload.order_id,
+                client_order_id: payload.client_order_id,
+            },
+        )
+        .await
+        .map_err(|error| protocol_error(ErrorCode::CancelRejected, error))?;
+
+        if let Some(client_order_id) = outcome.client_order_id.as_deref() {
+            session.unregister_open_client_order_id(client_order_id);
+            session.unregister_quote_client_order_id(client_order_id);
+        }
+
+        Ok(CancelOrderResultPayload {
+            cancelled: true,
+            client_order_id: outcome.client_order_id,
+            order_id: Some(outcome.order_id.to_string()),
+        })
+    }
+
+    fn live_open_order_count(&self, account: &AccountId) -> Result<usize, BackendError> {
+        let engine = self
+            .state
+            .engine
+            .lock()
+            .map_err(|_| BackendError::Config("engine lock poisoned".to_string()))?;
+        Ok(engine
+            .resting_orders()
+            .into_iter()
+            .filter(|order| &order.account == account)
+            .count())
     }
 }
 
@@ -304,111 +619,77 @@ fn decision_to_error(request_id: &str, decision: RateLimitDecision) -> Option<Se
     }
 }
 
-fn submit_order_result(
-    session: &mut MmSession,
-    payload: SubmitOrderPayload,
-) -> Result<SubmitOrderResultPayload, ProtocolError> {
-    validate_submit_order(&payload)?;
-    if let Some(client_order_id) = payload.client_order_id.clone() {
-        session.register_open_client_order_id(client_order_id.clone());
-        Ok(SubmitOrderResultPayload {
-            accepted: true,
-            planned: true,
-            client_order_id: Some(client_order_id),
-            order_id: None,
-            matched_intents: Vec::new(),
-        })
-    } else {
-        Ok(SubmitOrderResultPayload {
-            accepted: true,
-            planned: true,
-            client_order_id: None,
-            order_id: None,
-            matched_intents: Vec::new(),
-        })
-    }
-}
-
-fn cancel_order_result(
-    session: &mut MmSession,
-    payload: CancelOrderPayload,
-) -> CancelOrderResultPayload {
-    let cancelled = payload
-        .client_order_id
-        .as_deref()
-        .is_some_and(|client_order_id| session.unregister_open_client_order_id(client_order_id));
-    CancelOrderResultPayload {
-        cancelled,
+fn signed_order_from_submit(payload: SubmitOrderPayload) -> Result<SignedOrder, ProtocolError> {
+    Ok(SignedOrder {
+        account: payload.account,
+        market_id: payload.market_id,
+        side: payload.side,
+        price_1e8: parse_fixed_u128("price_1e8", &payload.price_1e8)
+            .map_err(|error| protocol_error(ErrorCode::OrderRejected, error))?,
+        size_1e8: parse_fixed_u128("size_1e8", &payload.size_1e8)
+            .map_err(|error| protocol_error(ErrorCode::OrderRejected, error))?,
+        time_in_force: payload.time_in_force,
+        reduce_only: payload.reduce_only,
+        post_only: payload.post_only,
         client_order_id: payload.client_order_id,
-        order_id: payload.order_id.map(|order_id| order_id.to_string()),
-        planned: true,
+        nonce: payload.nonce,
+        deadline_ms: payload.deadline_ms,
+        signature: payload.signature,
+    })
+}
+
+fn submit_result_payload(outcome: SubmitOrderOutcome) -> SubmitOrderResultPayload {
+    SubmitOrderResultPayload {
+        accepted: outcome.status == "accepted",
+        client_order_id: outcome.client_order_id,
+        order_id: outcome.order_id.map(|order_id| order_id.to_string()),
+        status: outcome.status,
+        matched_intents: outcome.matched_intents,
     }
 }
 
-fn validate_submit_order(payload: &SubmitOrderPayload) -> Result<(), ProtocolError> {
-    if payload.client_order_id.as_deref().unwrap_or("").is_empty() {
-        return Err(ProtocolError::new(
-            ErrorCode::OrderRejected,
-            "client_order_id is required for MM gateway V1A planning",
-        ));
+fn session_account(session: &mut MmSession, account: Option<AccountId>) -> Option<AccountId> {
+    match (session.account.clone(), account) {
+        (Some(session_account), Some(payload_account)) if session_account == payload_account => {
+            Some(session_account)
+        }
+        (Some(_), Some(_)) => None,
+        (Some(session_account), None) => Some(session_account),
+        (None, Some(payload_account)) if !session.authenticated => {
+            session.bind_account(payload_account.clone());
+            Some(payload_account)
+        }
+        (None, Some(payload_account)) => Some(payload_account),
+        (None, None) => None,
     }
-    validate_positive_fixed("price_1e8", &payload.price_1e8)?;
-    validate_positive_fixed("size_1e8", &payload.size_1e8)?;
-    if payload.nonce == 0 {
-        return Err(ProtocolError::new(
-            ErrorCode::OrderRejected,
-            "nonce must be nonzero",
-        ));
-    }
-    if payload.signature.is_empty() {
-        return Err(ProtocolError::new(
-            ErrorCode::OrderRejected,
-            "signature is required",
-        ));
-    }
-
-    Ok(())
 }
 
-fn validate_quote_leg(payload: &QuoteLegPayload) -> Result<(), ProtocolError> {
-    if payload.client_order_id.is_empty() {
-        return Err(ProtocolError::new(
-            ErrorCode::QuoteReplaceFailed,
-            "client_order_id is required",
-        ));
-    }
-    validate_positive_fixed("price_1e8", &payload.price_1e8)?;
-    validate_positive_fixed("size_1e8", &payload.size_1e8)?;
-    if payload.nonce == 0 {
-        return Err(ProtocolError::new(
-            ErrorCode::QuoteReplaceFailed,
-            "nonce must be nonzero",
-        ));
-    }
-    if payload.signature.is_empty() {
-        return Err(ProtocolError::new(
-            ErrorCode::QuoteReplaceFailed,
-            "signature is required",
-        ));
-    }
-
-    Ok(())
+fn protocol_error(code: ErrorCode, error: BackendError) -> ProtocolError {
+    ProtocolError::new(code, error.to_string())
 }
 
-fn validate_positive_fixed(field: &str, value: &str) -> Result<(), ProtocolError> {
-    if value.is_empty()
-        || !value.bytes().all(|byte| byte.is_ascii_digit())
-        || value
-            .parse::<u128>()
-            .ok()
-            .filter(|value| *value > 0)
-            .is_none()
-    {
-        return Err(ProtocolError::new(
-            ErrorCode::BadRequest,
-            format!("{field} must be a positive unsigned integer string"),
-        ));
-    }
+fn backend_error_response(
+    request_id: String,
+    code: ErrorCode,
+    error: BackendError,
+) -> ServerMessage {
+    ServerMessage::error(request_id, code, error.to_string())
+}
 
-    Ok(())
+fn format_client_error(message: String, client_order_id: Option<&str>) -> String {
+    match client_order_id {
+        Some(client_order_id) => format!("{client_order_id}: {message}"),
+        None => message,
+    }
+}
+
+fn rejection_reason(outcome: &SubmitOrderOutcome) -> String {
+    outcome
+        .events
+        .iter()
+        .find_map(|event| match event {
+            crate::engine::EngineEvent::OrderRejected { reason, .. } => Some(reason.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| "order rejected".to_string())
 }

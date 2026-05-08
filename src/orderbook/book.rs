@@ -184,6 +184,13 @@ impl OrderBook {
         self.orders.get(&order_id)
     }
 
+    pub fn resting_orders(&self) -> Vec<Order> {
+        self.locations
+            .keys()
+            .filter_map(|order_id| self.orders.get(order_id).cloned())
+            .collect()
+    }
+
     pub fn snapshot(&self) -> OrderBookSnapshot {
         let bids = self
             .bids

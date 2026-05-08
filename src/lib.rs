@@ -9,6 +9,7 @@ pub mod indexer;
 pub mod mm;
 pub mod nonce_sync;
 pub mod orderbook;
+pub mod orders;
 pub mod reconciliation;
 pub mod rfq;
 pub mod signing;

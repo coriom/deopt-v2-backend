@@ -32,6 +32,7 @@ pub struct MmSession {
     pub last_heartbeat_at_ms: TimestampMs,
     pub cancel_on_disconnect: bool,
     pub open_client_order_ids: BTreeSet<String>,
+    pub quote_client_order_ids: BTreeSet<String>,
     pub messages_in_current_window: u32,
     pub window_started_at_ms: TimestampMs,
     pub in_flight_requests: u32,
@@ -70,6 +71,7 @@ impl MmSession {
             last_heartbeat_at_ms: now_ms,
             cancel_on_disconnect,
             open_client_order_ids: BTreeSet::new(),
+            quote_client_order_ids: BTreeSet::new(),
             messages_in_current_window: 0,
             window_started_at_ms: now_ms,
             in_flight_requests: 0,
@@ -101,6 +103,14 @@ impl MmSession {
         let ids = self.open_client_order_ids.iter().cloned().collect();
         self.open_client_order_ids.clear();
         ids
+    }
+
+    pub fn register_quote_client_order_id(&mut self, client_order_id: impl Into<String>) -> bool {
+        self.quote_client_order_ids.insert(client_order_id.into())
+    }
+
+    pub fn unregister_quote_client_order_id(&mut self, client_order_id: &str) -> bool {
+        self.quote_client_order_ids.remove(client_order_id)
     }
 
     pub fn plan_cancel_on_disconnect(&self) -> CancelOnDisconnectPlan {

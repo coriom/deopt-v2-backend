@@ -6,7 +6,6 @@ use crate::confirmation::{
     decide_confirmation, ConfirmationDecision, ConfirmationDecisionInput, ConfirmationStatus,
 };
 use crate::db::PgRepository;
-use crate::engine::{EngineCommand, EngineEvent};
 use crate::error::{BackendError, Result as BackendResult};
 use crate::execution::{
     b256_to_hex_bytes32, build_execution_transaction_request, ensure_no_submitted_transaction,
@@ -17,13 +16,16 @@ use crate::execution::{
     TransactionReceiptProvider, PERP_TRADE_TYPE,
 };
 use crate::indexer::{Indexer, IndexerStatus, IndexerTickResult};
-use crate::nonce_sync::{read_perp_nonce, validate_order_perp_nonce, PerpNonceResponse};
+use crate::nonce_sync::{read_perp_nonce, PerpNonceResponse};
+use crate::orders::service::{
+    cancel_order as cancel_order_shared, submit_response_from_events, submit_signed_order,
+    CancelOrderInput,
+};
 use crate::reconciliation::{
     decide_direct_reconciliation, DirectReconciliationInput, ExecutionReconciliation,
     ReconciliationCounts, ReconciliationStatus, ReconciliationTickResult,
 };
-use crate::signing::{SignatureVerifier, SignedOrder};
-use crate::types::{now_ms, MarketId, NewOrder, OrderId};
+use crate::types::{now_ms, MarketId, OrderId};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -156,88 +158,8 @@ async fn submit_order(
     Json(request): Json<SubmitOrderRequest>,
 ) -> Result<Json<SubmitOrderResponse>, ApiError> {
     let signed_order = request.into_signed_order()?;
-    validate_deadline(signed_order.deadline_ms)?;
-    SignatureVerifier::verify(
-        &signed_order,
-        state.signature_verification_mode,
-        &state.eip712_domain,
-    )?;
-
-    {
-        let engine = state.engine.lock().map_err(|_| ApiError::internal())?;
-        if !engine.has_market(signed_order.market_id) {
-            return Err(BackendError::UnknownMarket(signed_order.market_id).into());
-        }
-    }
-
-    if let Some(repository) = state.repository.clone() {
-        return submit_order_persistent(state, repository, signed_order).await;
-    }
-
-    validate_perp_nonce_before_local_reserve(&state, &signed_order).await?;
-
-    {
-        let mut nonces = state.nonces.lock().map_err(|_| ApiError::internal())?;
-        nonces.reserve(&signed_order.account, signed_order.nonce)?;
-    }
-
-    let mut engine = state.engine.lock().map_err(|_| ApiError::internal())?;
-    let events = engine.process(EngineCommand::SubmitOrder(NewOrder::from(signed_order)))?;
-    let status = if events
-        .iter()
-        .any(|event| matches!(event, EngineEvent::OrderRejected { .. }))
-    {
-        "rejected"
-    } else {
-        "accepted"
-    };
-    let order_id = first_order_id(&events);
-    let execution_intents = events
-        .iter()
-        .filter_map(|event| match event {
-            EngineEvent::ExecutionIntentCreated { intent } => {
-                Some(ApiExecutionIntent::from(intent.clone()))
-            }
-            _ => None,
-        })
-        .collect();
-    let events = events.into_iter().map(ApiEngineEvent::from).collect();
-
-    Ok(Json(SubmitOrderResponse {
-        status: status.to_string(),
-        order_id,
-        events,
-        execution_intents,
-    }))
-}
-
-async fn submit_order_persistent(
-    state: AppState,
-    repository: PgRepository,
-    signed_order: SignedOrder,
-) -> Result<Json<SubmitOrderResponse>, ApiError> {
-    validate_perp_nonce_before_local_reserve(&state, &signed_order).await?;
-
-    let mut tx = repository.begin().await?;
-    repository
-        .insert_nonce_tx(&mut tx, &signed_order.account, signed_order.nonce, now_ms())
-        .await?;
-
-    let events = {
-        let mut engine = state.engine.lock().map_err(|_| ApiError::internal())?;
-        engine.process(EngineCommand::SubmitOrder(NewOrder::from(
-            signed_order.clone(),
-        )))?
-    };
-
-    repository
-        .persist_submission_tx(&mut tx, &signed_order, &events)
-        .await?;
-    tx.commit()
-        .await
-        .map_err(|error| BackendError::Persistence(error.to_string()))?;
-
-    Ok(Json(response_from_events(events)))
+    let outcome = submit_signed_order(&state, signed_order).await?;
+    Ok(Json(submit_response_from_events(outcome.events)))
 }
 
 async fn account_perp_nonce(
@@ -272,14 +194,17 @@ async fn cancel_order(
     Path(order_id): Path<String>,
 ) -> Result<Json<CancelOrderResponse>, ApiError> {
     let order_id = OrderId::from_str(&order_id).map_err(|_| BackendError::InvalidOrderId)?;
-    let events = {
-        let mut engine = state.engine.lock().map_err(|_| ApiError::internal())?;
-        engine.process(EngineCommand::CancelOrder { order_id })?
-    };
-    if let Some(repository) = state.repository.clone() {
-        repository.persist_engine_events(&events).await?;
-    }
-    let Some(event) = events.into_iter().next() else {
+    let outcome = cancel_order_shared(
+        &state,
+        CancelOrderInput {
+            account: None,
+            market_id: None,
+            order_id: Some(order_id),
+            client_order_id: None,
+        },
+    )
+    .await?;
+    let Some(event) = outcome.events.into_iter().next() else {
         return Err(ApiError::internal());
     };
     Ok(Json(CancelOrderResponse {
@@ -1022,30 +947,6 @@ fn confirmation_provider(state: &AppState) -> BackendResult<HttpJsonRpcProvider>
     Ok(HttpJsonRpcProvider::new(rpc_url))
 }
 
-async fn validate_perp_nonce_before_local_reserve(
-    state: &AppState,
-    signed_order: &SignedOrder,
-) -> BackendResult<()> {
-    if !state.perp_nonce_sync_config.enabled || !state.perp_nonce_sync_config.strict {
-        return Ok(());
-    }
-    let rpc_url = state
-        .perp_nonce_sync_config
-        .rpc_url
-        .clone()
-        .ok_or_else(|| {
-            BackendError::Config("RPC_URL is required for perp nonce sync".to_string())
-        })?;
-    let provider = HttpJsonRpcProvider::new(rpc_url);
-    validate_order_perp_nonce(
-        &state.perp_nonce_sync_config,
-        &provider,
-        &signed_order.account,
-        signed_order.nonce,
-    )
-    .await
-}
-
 fn missing_submitted_transaction_decision(state: &AppState) -> ConfirmationDecision {
     ConfirmationDecision {
         confirmation_status: ConfirmationStatus::Failed,
@@ -1254,53 +1155,6 @@ fn reconciliation_row(
         status,
         created_at_ms: now_ms(),
     }
-}
-
-fn response_from_events(events: Vec<EngineEvent>) -> SubmitOrderResponse {
-    let status = if events
-        .iter()
-        .any(|event| matches!(event, EngineEvent::OrderRejected { .. }))
-    {
-        "rejected"
-    } else {
-        "accepted"
-    };
-    let order_id = first_order_id(&events);
-    let execution_intents = events
-        .iter()
-        .filter_map(|event| match event {
-            EngineEvent::ExecutionIntentCreated { intent } => {
-                Some(ApiExecutionIntent::from(intent.clone()))
-            }
-            _ => None,
-        })
-        .collect();
-    let events = events.into_iter().map(ApiEngineEvent::from).collect();
-
-    SubmitOrderResponse {
-        status: status.to_string(),
-        order_id,
-        events,
-        execution_intents,
-    }
-}
-
-fn first_order_id(events: &[EngineEvent]) -> Option<OrderId> {
-    events.iter().find_map(|event| match event {
-        EngineEvent::OrderAccepted { order } => Some(order.order_id),
-        EngineEvent::OrderRejected { order_id, .. } => Some(*order_id),
-        EngineEvent::OrderCancelled { order } => Some(order.order_id),
-        EngineEvent::OrderPartiallyFilled { order } => Some(order.order_id),
-        EngineEvent::OrderFilled { order } => Some(order.order_id),
-        EngineEvent::TradeMatched { .. } | EngineEvent::ExecutionIntentCreated { .. } => None,
-    })
-}
-
-fn validate_deadline(deadline_ms: i64) -> BackendResult<()> {
-    if deadline_ms <= now_ms() {
-        return Err(BackendError::DeadlineExpired);
-    }
-    Ok(())
 }
 
 async fn get_execution_intent(

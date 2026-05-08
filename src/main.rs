@@ -53,7 +53,7 @@ async fn main() -> deopt_v2_backend::Result<()> {
         config.reconciliation.clone(),
         config.chain_id,
     );
-    let app = router(state);
+    let app = router(state.clone());
 
     if config.execution.execution_enabled {
         if let Some(repository) = repository.clone() {
@@ -69,7 +69,7 @@ async fn main() -> deopt_v2_backend::Result<()> {
             spawn_indexer(indexer, config.indexer.poll_interval_ms);
         }
     }
-    spawn_webtransport_gateway(config.mm_gateway.clone()).await?;
+    spawn_webtransport_gateway(config.mm_gateway.clone(), state).await?;
 
     info!(
         service = "deopt-v2-backend",

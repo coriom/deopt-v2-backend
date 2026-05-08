@@ -76,7 +76,7 @@ MM_GATEWAY_REQUIRE_AUTH=false
 `PERP_NONCE_SYNC_ENABLED=false` keeps existing local nonce behavior unchanged. When set to `true`, `PERP_NONCE_SYNC_REQUIRE_RPC=true` requires `RPC_URL` and a nonzero `PERP_MATCHING_ENGINE_ADDRESS` at startup. `PERP_NONCE_SYNC_STRICT=true` rejects an order when its nonce does not equal `PerpMatchingEngine.nonces(order.account)`.
 `INDEXER_ENABLED=true` requires `RPC_URL`; when `INDEXER_REQUIRE_PERSISTENCE=true`, it also requires `PERSISTENCE_ENABLED=true`.
 `CONFIRMATION_ENABLED=true` requires `RPC_URL`; when `CONFIRMATION_REQUIRE_PERSISTENCE=true`, it also requires `PERSISTENCE_ENABLED=true`. Confirmation is disabled by default, never broadcasts, and rejects startup if `CONFIRMATION_REQUIRE_RECONCILIATION=false`.
-`MM_GATEWAY_ENABLED=false` is the safe default. When `true`, V1B starts a separate WebTransport UDP listener and requires `MM_GATEWAY_CERT_PATH` and `MM_GATEWAY_KEY_PATH`. It does not submit orders to the live orderbook or broadcast transactions.
+`MM_GATEWAY_ENABLED=false` is the safe default. When `true`, V1C starts a separate WebTransport UDP listener and requires `MM_GATEWAY_CERT_PATH` and `MM_GATEWAY_KEY_PATH`. It can submit and cancel off-chain perp orders through the live in-memory orderbook, but it does not auto-broadcast, sign, simulate, index, reconcile, or confirm execution intents.
 
 ## Market Maker Gateway V1A
 
@@ -176,9 +176,18 @@ Runtime notes:
 
 - WebTransport requires UDP reachability on `MM_GATEWAY_PORT` and client support for HTTP/3 over QUIC.
 - Browser clients using self-signed certificates may need local trust setup or WebTransport certificate hash options.
-- V1B logs cancel-on-disconnect plans on session close, but live orderbook cancellation remains deferred.
 - Datagrams are deferred for market data and are not used for critical order messages.
 - The gateway still never auto-broadcasts, never signs transaction payloads, and never changes execution finality.
+
+## Market Maker Gateway V1C
+
+V1C connects the transport-neutral gateway service to the same shared order/cancel service used by HTTP `POST /orders` and `DELETE /orders/:order_id`. Gateway order intake preserves deadline checks, signature shape or strict EIP-712 recovery, known-market validation, optional strict Perp nonce sync, backend local nonce reservation, matching, execution-intent creation, and optional persistence event writes.
+
+Supported live order operations are `submit_order`, `bulk_submit`, `cancel_order`, `bulk_cancel`, `cancel_all`, `quote_replace`, and cancel-on-disconnect. Bulk operations are partial-result capable. Cancels are restricted to resting off-chain orders owned by the session account, addressed by `order_id` or `client_order_id`; they do not mutate submitted, broadcast, confirmed, or otherwise non-resting execution intents.
+
+`quote_replace` uses clear non-atomic semantics: if `cancel_previous=true`, previously tracked quote client order ids for the session are cancelled first for the requested account and market, then the new bid and ask legs are submitted independently as GTC orders. The response reports cancelled, submitted, rejected, per-leg results, backend order ids, and matched execution intent ids.
+
+On WebTransport disconnect, if cancel-on-disconnect is enabled and the session has an account, the adapter asks `MmGatewayService` to cancel the session's tracked resting client order ids and logs the live cancellation count. The WebTransport adapter remains transport-only; orderbook business logic stays in the shared service and gateway service layers.
 
 ## PerpMatchingEngine Calldata
 
@@ -540,7 +549,7 @@ curl -X DELETE http://127.0.0.1:8080/orders/<order_id>
 - `SIGNATURE_VERIFICATION_MODE=disabled` validates nonce, deadline, and signature shape while skipping cryptographic recovery.
 - `SIGNATURE_VERIFICATION_MODE=strict` verifies the EIP-712 order digest and recovered secp256k1 signer against `account`.
 - FOK is rejected cleanly.
-- RFQ and market-maker gateway are type scaffolds only.
+- RFQ is a type scaffold only; the market-maker gateway supports live perp orderbook submit/cancel flow but not RFQ, options, production auth, or market data datagrams.
 - Execution intents are provisional off-chain records, not settlement.
 - Indexed `TradeExecuted` events store `onchain_intent_id` for direct reconciliation only; they do not confirm backend intents.
 - Reconciliation rows link indexed events to intents, but still do not prove transaction ownership, finality, or reorg safety.

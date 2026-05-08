@@ -1,3 +1,4 @@
+use crate::api::AppState;
 use crate::error::{BackendError, Result};
 use crate::mm::protocol::{ClientMessage, ErrorCode, ServerMessage};
 use crate::mm::rate_limit::{MmGatewayConfig, MmGatewayTransport};
@@ -77,7 +78,7 @@ pub fn validate_webtransport_startup(config: &MmGatewayConfig) -> Result<MmGatew
     })
 }
 
-pub async fn spawn_webtransport_gateway(config: MmGatewayConfig) -> Result<()> {
+pub async fn spawn_webtransport_gateway(config: MmGatewayConfig, state: AppState) -> Result<()> {
     let MmGatewayStartup::Enabled {
         bind_addr,
         cert_path,
@@ -108,7 +109,7 @@ pub async fn spawn_webtransport_gateway(config: MmGatewayConfig) -> Result<()> {
     let local_addr = endpoint.local_addr().map_err(|error| {
         BackendError::Config(format!("failed to read MM gateway local address: {error}"))
     })?;
-    let service = MmGatewayService::new(config.clone());
+    let service = MmGatewayService::new(config.clone(), state);
 
     tokio::spawn(async move {
         accept_loop(endpoint, service, config).await;
@@ -193,12 +194,12 @@ async fn handle_incoming_session(
         }
     }
 
-    let plan = session.plan_cancel_on_disconnect();
-    if !plan.client_order_ids.is_empty() {
+    let cancelled = service.cancel_on_disconnect(&mut session).await;
+    if cancelled > 0 {
         info!(
-            session_id = %plan.session_id,
-            planned_cancels = plan.client_order_ids.len(),
-            "planned MM cancel-on-disconnect; live mutation deferred"
+            session_id = %session.session_id,
+            cancelled,
+            "completed MM cancel-on-disconnect"
         );
     }
 
@@ -213,7 +214,7 @@ async fn handle_bi_stream(
 ) -> std::result::Result<(), String> {
     let response = match read_frame(&mut recv, MM_GATEWAY_MAX_FRAME_BYTES).await {
         Ok(Some(frame)) => match decode_client_message(&frame) {
-            Ok(message) => service.handle_message(session, message, now_ms()),
+            Ok(message) => service.handle_message(session, message, now_ms()).await,
             Err(response) => *response,
         },
         Ok(None) => return Ok(()),

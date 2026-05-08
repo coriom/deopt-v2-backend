@@ -72,6 +72,26 @@ impl EngineState {
             .unwrap_or_else(|| OrderBook::new(market_id).snapshot())
     }
 
+    pub fn order(&self, order_id: OrderId) -> Option<Order> {
+        self.orderbooks
+            .values()
+            .find_map(|book| book.get_order(order_id).cloned())
+    }
+
+    pub fn resting_orders(&self) -> Vec<Order> {
+        let mut orders: Vec<Order> = self
+            .orderbooks
+            .values()
+            .flat_map(OrderBook::resting_orders)
+            .collect();
+        orders.sort_by(|left, right| {
+            left.created_at_ms
+                .cmp(&right.created_at_ms)
+                .then_with(|| left.order_id.cmp(&right.order_id))
+        });
+        orders
+    }
+
     pub fn process(&mut self, command: EngineCommand) -> Result<Vec<EngineEvent>> {
         match command {
             EngineCommand::SubmitOrder(order) => self.submit_order(order),

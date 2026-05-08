@@ -219,6 +219,7 @@ pub struct QuoteLegPayload {
     pub size_1e8: String,
     pub client_order_id: String,
     pub nonce: u64,
+    pub deadline_ms: TimestampMs,
     pub signature: String,
 }
 
@@ -241,9 +242,9 @@ pub struct HeartbeatResultPayload {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct SubmitOrderResultPayload {
     pub accepted: bool,
-    pub planned: bool,
     pub client_order_id: Option<String>,
     pub order_id: Option<String>,
+    pub status: String,
     pub matched_intents: Vec<String>,
 }
 
@@ -258,8 +259,8 @@ pub struct BulkSubmitResultPayload {
 pub struct BulkSubmitItemResult {
     pub client_order_id: Option<String>,
     pub ok: bool,
-    pub planned: bool,
     pub order_id: Option<String>,
+    pub matched_intents: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<ProtocolError>,
 }
@@ -269,7 +270,6 @@ pub struct CancelOrderResultPayload {
     pub cancelled: bool,
     pub client_order_id: Option<String>,
     pub order_id: Option<String>,
-    pub planned: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -284,7 +284,6 @@ pub struct BulkCancelItemResult {
     pub client_order_id: Option<String>,
     pub order_id: Option<String>,
     pub ok: bool,
-    pub planned: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<ProtocolError>,
 }
@@ -292,7 +291,6 @@ pub struct BulkCancelItemResult {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct CancelAllResultPayload {
     pub cancelled: usize,
-    pub planned: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -301,8 +299,19 @@ pub struct QuoteReplaceResultPayload {
     pub cancelled: usize,
     pub submitted: usize,
     pub rejected: usize,
+    pub results: Vec<QuoteReplaceLegResult>,
     pub matched_intents: Vec<String>,
-    pub planned: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct QuoteReplaceLegResult {
+    pub side: Side,
+    pub client_order_id: String,
+    pub ok: bool,
+    pub order_id: Option<String>,
+    pub matched_intents: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<ProtocolError>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]

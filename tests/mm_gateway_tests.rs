@@ -10,7 +10,10 @@ use deopt_v2_backend::mm::{
     AuthMode, BulkSubmitResultPayload, ClientMessage, ErrorCode, HeartbeatResultPayload,
     MmGatewayConfig, MmGatewayService, MmSession, RateLimitDecision,
 };
+use deopt_v2_backend::{api::AppState, engine::EngineState};
 use serde_json::json;
+
+const VALID_SIGNATURE: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
 #[test]
 fn parse_valid_heartbeat_message() {
@@ -69,9 +72,9 @@ fn format_error_response_envelope() {
     assert_eq!(value["error"]["message"], "invalid request");
 }
 
-#[test]
-fn heartbeat_updates_session_timestamp() {
-    let service = MmGatewayService::new(MmGatewayConfig::default());
+#[tokio::test]
+async fn heartbeat_updates_session_timestamp() {
+    let service = mm_service(MmGatewayConfig::default());
     let mut session =
         MmSession::with_ids("session-1", "connection-1", 10, AuthMode::Disabled, true);
     let message: ClientMessage = serde_json::from_value(json!({
@@ -81,7 +84,7 @@ fn heartbeat_updates_session_timestamp() {
     }))
     .unwrap();
 
-    service.handle_message(&mut session, message, 40);
+    service.handle_message(&mut session, message, 40).await;
 
     assert_eq!(session.last_heartbeat_at_ms, 40);
 }
@@ -210,7 +213,8 @@ fn quote_replace_parses_bid_only() {
             "size_1e8": "100000000",
             "client_order_id": "eth-bid-001",
             "nonce": 1,
-            "signature": "0xabc"
+            "deadline_ms": 9999999999999i64,
+            "signature": VALID_SIGNATURE
         }),
         ValueSide::None,
     ))
@@ -232,7 +236,8 @@ fn quote_replace_parses_ask_only() {
             "size_1e8": "100000000",
             "client_order_id": "eth-ask-001",
             "nonce": 2,
-            "signature": "0xdef"
+            "deadline_ms": 9999999999999i64,
+            "signature": VALID_SIGNATURE
         }),
     ))
     .unwrap();
@@ -252,14 +257,16 @@ fn quote_replace_parses_bid_and_ask() {
             "size_1e8": "100000000",
             "client_order_id": "eth-bid-001",
             "nonce": 1,
-            "signature": "0xabc"
+            "deadline_ms": 9999999999999i64,
+            "signature": VALID_SIGNATURE
         }),
         json!({
             "price_1e8": "300100000000",
             "size_1e8": "100000000",
             "client_order_id": "eth-ask-001",
             "nonce": 2,
-            "signature": "0xdef"
+            "deadline_ms": 9999999999999i64,
+            "signature": VALID_SIGNATURE
         }),
     ))
     .unwrap();
@@ -271,9 +278,9 @@ fn quote_replace_parses_bid_and_ask() {
     assert!(envelope.payload.ask.is_some());
 }
 
-#[test]
-fn bulk_submit_partial_result_shape() {
-    let service = MmGatewayService::new(MmGatewayConfig::default());
+#[tokio::test]
+async fn bulk_submit_partial_result_shape() {
+    let service = mm_service(MmGatewayConfig::default());
     let mut session =
         MmSession::with_ids("session-1", "connection-1", 10, AuthMode::Disabled, true);
     let message: ClientMessage = serde_json::from_value(json!({
@@ -299,7 +306,7 @@ fn bulk_submit_partial_result_shape() {
     }))
     .unwrap();
 
-    let response = service.handle_message(&mut session, message, 20);
+    let response = service.handle_message(&mut session, message, 20).await;
 
     let ServerMessage::BulkSubmitResult(envelope) = response else {
         panic!("expected bulk_submit_result");
@@ -312,9 +319,9 @@ fn bulk_submit_partial_result_shape() {
     assert!(!payload.results[1].ok);
 }
 
-#[test]
-fn get_session_returns_public_session_snapshot() {
-    let service = MmGatewayService::new(MmGatewayConfig::default());
+#[tokio::test]
+async fn get_session_returns_public_session_snapshot() {
+    let service = mm_service(MmGatewayConfig::default());
     let mut session =
         MmSession::with_ids("session-1", "connection-1", 10, AuthMode::Disabled, true);
     session.register_open_client_order_id("open-1");
@@ -325,7 +332,7 @@ fn get_session_returns_public_session_snapshot() {
     }))
     .unwrap();
 
-    let response = service.handle_message(&mut session, message, 20);
+    let response = service.handle_message(&mut session, message, 20).await;
 
     let ServerMessage::GetSessionResult(envelope) = response else {
         panic!("expected get_session_result");
@@ -337,9 +344,9 @@ fn get_session_returns_public_session_snapshot() {
     );
 }
 
-#[test]
-fn disabled_auth_mode_allows_dev_session() {
-    let service = MmGatewayService::new(MmGatewayConfig::default());
+#[tokio::test]
+async fn disabled_auth_mode_allows_dev_session() {
+    let service = mm_service(MmGatewayConfig::default());
     let mut session =
         MmSession::with_ids("session-1", "connection-1", 10, AuthMode::Disabled, true);
     let message: ClientMessage = serde_json::from_value(json!({
@@ -351,18 +358,18 @@ fn disabled_auth_mode_allows_dev_session() {
     }))
     .unwrap();
 
-    let response = service.handle_message(&mut session, message, 20);
+    let response = service.handle_message(&mut session, message, 20).await;
 
     assert!(matches!(response, ServerMessage::BulkSubmitResult(_)));
 }
 
-#[test]
-fn require_auth_mode_rejects_trading_message_before_auth() {
+#[tokio::test]
+async fn require_auth_mode_rejects_trading_message_before_auth() {
     let config = MmGatewayConfig {
         require_auth: true,
         ..MmGatewayConfig::default()
     };
-    let service = MmGatewayService::new(config);
+    let service = mm_service(config);
     let mut session =
         MmSession::with_ids("session-1", "connection-1", 10, AuthMode::Disabled, true);
     let message: ClientMessage = serde_json::from_value(json!({
@@ -374,11 +381,254 @@ fn require_auth_mode_rejects_trading_message_before_auth() {
     }))
     .unwrap();
 
-    let response = service.handle_message(&mut session, message, 20);
+    let response = service.handle_message(&mut session, message, 20).await;
 
     let value = serde_json::to_value(response).unwrap();
     assert_eq!(value["type"], "error");
     assert_eq!(value["error"]["code"], "AUTH_REQUIRED");
+}
+
+#[tokio::test]
+async fn submit_order_mutates_live_orderbook() {
+    let state = AppState::new(EngineState::with_default_markets());
+    let service = MmGatewayService::new(MmGatewayConfig::default(), state.clone());
+    let mut session =
+        MmSession::with_ids("session-1", "connection-1", 10, AuthMode::Disabled, true);
+    let message: ClientMessage = serde_json::from_value(json!({
+        "type": "submit_order",
+        "request_id": "submit-1",
+        "payload": valid_order_with("open-1", "buy", 1)
+    }))
+    .unwrap();
+
+    let response = service.handle_message(&mut session, message, 20).await;
+
+    let ServerMessage::SubmitOrderResult(envelope) = response else {
+        panic!("expected submit_order_result");
+    };
+    assert!(envelope.payload.accepted);
+    assert_eq!(envelope.payload.status, "accepted");
+    assert!(envelope.payload.order_id.is_some());
+    assert_eq!(session.open_client_order_ids.len(), 1);
+    let snapshot = state.engine.lock().unwrap().orderbook_snapshot(1);
+    assert_eq!(snapshot.bids.len(), 1);
+    assert_eq!(snapshot.bids[0].total_size_1e8, 100000000);
+}
+
+#[tokio::test]
+async fn cancel_order_by_client_order_id_mutates_live_orderbook() {
+    let state = AppState::new(EngineState::with_default_markets());
+    let service = MmGatewayService::new(MmGatewayConfig::default(), state.clone());
+    let mut session =
+        MmSession::with_ids("session-1", "connection-1", 10, AuthMode::Disabled, true);
+    service
+        .handle_message(
+            &mut session,
+            serde_json::from_value(json!({
+                "type": "submit_order",
+                "request_id": "submit-1",
+                "payload": valid_order_with("open-1", "buy", 1)
+            }))
+            .unwrap(),
+            20,
+        )
+        .await;
+
+    let response = service
+        .handle_message(
+            &mut session,
+            serde_json::from_value(json!({
+                "type": "cancel_order",
+                "request_id": "cancel-1",
+                "payload": {
+                    "account": "0x0000000000000000000000000000000000000001",
+                    "market_id": 1,
+                    "client_order_id": "open-1"
+                }
+            }))
+            .unwrap(),
+            30,
+        )
+        .await;
+
+    let ServerMessage::CancelOrderResult(envelope) = response else {
+        panic!("expected cancel_order_result");
+    };
+    assert!(envelope.payload.cancelled);
+    assert!(session.open_client_order_ids.is_empty());
+    let snapshot = state.engine.lock().unwrap().orderbook_snapshot(1);
+    assert!(snapshot.bids.is_empty());
+}
+
+#[tokio::test]
+async fn quote_replace_cancels_previous_then_submits_new_legs() {
+    let state = AppState::new(EngineState::with_default_markets());
+    let service = MmGatewayService::new(MmGatewayConfig::default(), state.clone());
+    let mut session =
+        MmSession::with_ids("session-1", "connection-1", 10, AuthMode::Disabled, true);
+    service
+        .handle_message(
+            &mut session,
+            serde_json::from_value(quote_replace_json(
+                quote_leg("old-bid", "299900000000", 1),
+                ValueSide::None,
+            ))
+            .unwrap(),
+            20,
+        )
+        .await;
+
+    let response = service
+        .handle_message(
+            &mut session,
+            serde_json::from_value(quote_replace_json_with_request(
+                "qr-2",
+                quote_leg("new-bid", "299800000000", 2),
+                quote_leg("new-ask", "300200000000", 3),
+            ))
+            .unwrap(),
+            30,
+        )
+        .await;
+
+    let ServerMessage::QuoteReplaceResult(envelope) = response else {
+        panic!("expected quote_replace_result");
+    };
+    assert_eq!(envelope.payload.cancelled, 1);
+    assert_eq!(envelope.payload.submitted, 2);
+    assert_eq!(envelope.payload.rejected, 0);
+    assert_eq!(envelope.payload.results.len(), 2);
+    let snapshot = state.engine.lock().unwrap().orderbook_snapshot(1);
+    assert_eq!(snapshot.bids.len(), 1);
+    assert_eq!(snapshot.bids[0].price_1e8, 299800000000);
+    assert_eq!(snapshot.asks.len(), 1);
+    assert_eq!(snapshot.asks[0].price_1e8, 300200000000);
+}
+
+#[tokio::test]
+async fn cancel_on_disconnect_cancels_real_session_orders() {
+    let state = AppState::new(EngineState::with_default_markets());
+    let service = MmGatewayService::new(MmGatewayConfig::default(), state.clone());
+    let mut session =
+        MmSession::with_ids("session-1", "connection-1", 10, AuthMode::Disabled, true);
+    service
+        .handle_message(
+            &mut session,
+            serde_json::from_value(json!({
+                "type": "submit_order",
+                "request_id": "submit-1",
+                "payload": valid_order_with("open-1", "buy", 1)
+            }))
+            .unwrap(),
+            20,
+        )
+        .await;
+
+    let cancelled = service.cancel_on_disconnect(&mut session).await;
+
+    assert_eq!(cancelled, 1);
+    assert!(session.open_client_order_ids.is_empty());
+    let snapshot = state.engine.lock().unwrap().orderbook_snapshot(1);
+    assert!(snapshot.bids.is_empty());
+}
+
+#[tokio::test]
+async fn cancel_order_rejects_non_owner() {
+    let state = AppState::new(EngineState::with_default_markets());
+    let service = MmGatewayService::new(MmGatewayConfig::default(), state.clone());
+    let mut owner = MmSession::with_ids("session-1", "connection-1", 10, AuthMode::Disabled, true);
+    service
+        .handle_message(
+            &mut owner,
+            serde_json::from_value(json!({
+                "type": "submit_order",
+                "request_id": "submit-1",
+                "payload": valid_order_with("open-1", "buy", 1)
+            }))
+            .unwrap(),
+            20,
+        )
+        .await;
+    let mut other = MmSession::with_ids("session-2", "connection-2", 10, AuthMode::Disabled, true);
+
+    let response = service
+        .handle_message(
+            &mut other,
+            serde_json::from_value(json!({
+                "type": "cancel_order",
+                "request_id": "cancel-1",
+                "payload": {
+                    "account": "0x0000000000000000000000000000000000000002",
+                    "market_id": 1,
+                    "client_order_id": "open-1"
+                }
+            }))
+            .unwrap(),
+            30,
+        )
+        .await;
+
+    let value = serde_json::to_value(response).unwrap();
+    assert_eq!(value["type"], "error");
+    assert_eq!(value["error"]["code"], "CANCEL_REJECTED");
+    let snapshot = state.engine.lock().unwrap().orderbook_snapshot(1);
+    assert_eq!(snapshot.bids.len(), 1);
+}
+
+#[tokio::test]
+async fn cancel_all_cancels_all_account_resting_orders() {
+    let state = AppState::new(EngineState::with_default_markets());
+    let service = MmGatewayService::new(MmGatewayConfig::default(), state.clone());
+    let mut session =
+        MmSession::with_ids("session-1", "connection-1", 10, AuthMode::Disabled, true);
+    service
+        .handle_message(
+            &mut session,
+            serde_json::from_value(json!({
+                "type": "submit_order",
+                "request_id": "submit-1",
+                "payload": valid_order_with("open-1", "buy", 1)
+            }))
+            .unwrap(),
+            20,
+        )
+        .await;
+    service
+        .handle_message(
+            &mut session,
+            serde_json::from_value(json!({
+                "type": "submit_order",
+                "request_id": "submit-2",
+                "payload": valid_order_with("open-2", "buy", 2)
+            }))
+            .unwrap(),
+            30,
+        )
+        .await;
+
+    let response = service
+        .handle_message(
+            &mut session,
+            serde_json::from_value(json!({
+                "type": "cancel_all",
+                "request_id": "cancel-all-1",
+                "payload": {
+                    "account": "0x0000000000000000000000000000000000000001",
+                    "market_id": 1
+                }
+            }))
+            .unwrap(),
+            40,
+        )
+        .await;
+
+    let ServerMessage::CancelAllResult(envelope) = response else {
+        panic!("expected cancel_all_result");
+    };
+    assert_eq!(envelope.payload.cancelled, 2);
+    assert!(session.open_client_order_ids.is_empty());
+    let snapshot = state.engine.lock().unwrap().orderbook_snapshot(1);
+    assert!(snapshot.bids.is_empty());
 }
 
 #[test]
@@ -458,18 +708,26 @@ async fn async_frame_read_write_roundtrip() {
 }
 
 fn valid_order(client_order_id: &str) -> serde_json::Value {
+    valid_order_with(client_order_id, "buy", 1)
+}
+
+fn valid_order_with(client_order_id: &str, side: &str, nonce: u64) -> serde_json::Value {
     json!({
         "market_id": 1,
         "account": "0x0000000000000000000000000000000000000001",
-        "side": "buy",
+        "side": side,
         "price_1e8": "299900000000",
         "size_1e8": "100000000",
         "time_in_force": "gtc",
         "client_order_id": client_order_id,
-        "nonce": 1,
+        "nonce": nonce,
         "deadline_ms": 9999999999999i64,
-        "signature": "0xabc"
+        "signature": VALID_SIGNATURE
     })
+}
+
+fn mm_service(config: MmGatewayConfig) -> MmGatewayService {
+    MmGatewayService::new(config, AppState::new(EngineState::with_default_markets()))
 }
 
 enum ValueSide {
@@ -486,11 +744,19 @@ fn quote_replace_json(
     bid: impl Into<serde_json::Value>,
     ask: impl Into<serde_json::Value>,
 ) -> serde_json::Value {
+    quote_replace_json_with_request("qr-1", bid, ask)
+}
+
+fn quote_replace_json_with_request(
+    request_id: &str,
+    bid: impl Into<serde_json::Value>,
+    ask: impl Into<serde_json::Value>,
+) -> serde_json::Value {
     let bid = bid.into();
     let ask = ask.into();
     json!({
         "type": "quote_replace",
-        "request_id": "qr-1",
+        "request_id": request_id,
         "payload": {
             "market_id": 1,
             "account": "0x0000000000000000000000000000000000000001",
@@ -498,5 +764,16 @@ fn quote_replace_json(
             "bid": if bid.is_null() { serde_json::Value::Null } else { bid },
             "ask": if ask.is_null() { serde_json::Value::Null } else { ask }
         }
+    })
+}
+
+fn quote_leg(client_order_id: &str, price_1e8: &str, nonce: u64) -> serde_json::Value {
+    json!({
+        "price_1e8": price_1e8,
+        "size_1e8": "100000000",
+        "client_order_id": client_order_id,
+        "nonce": nonce,
+        "deadline_ms": 9999999999999i64,
+        "signature": VALID_SIGNATURE
     })
 }

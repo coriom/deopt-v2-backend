@@ -1,59 +1,57 @@
-# NEXT_TASK.md — Market Maker Gateway V1B: WebTransport Adapter
+# NEXT_TASK.md — Market Maker Gateway V1C: Live Orderbook Integration
 
 ## Context
 
-Market Maker Gateway V1A is implemented.
+Market Maker Gateway V1A and V1B are implemented.
 
-V1A provides:
+V1A added:
 
-- transport-neutral protocol envelopes
-- client/server message schemas
+- transport-neutral protocol
 - session state
-- heartbeat logic
-- rate-limit decisions
-- cancel-on-disconnect planning
+- heartbeat
+- rate limits
 - quote_replace/bulk message models
-- transport abstraction traits
-- offline tests
-- docs
+- cancel-on-disconnect planning
+- transport abstraction
 
-The next task is V1B: add the concrete WebTransport adapter.
+V1B added:
 
-Strategic decision:
+- WebTransport adapter using `wtransport`
+- UDP listener
+- TLS cert/key loading
+- reliable bidirectional streams
+- length-prefixed JSON framing
+- smoke client `mm_wt_smoke`
+- heartbeat and get_session verified at runtime
 
-- WebTransport is the primary MM gateway transport.
-- Do not implement WebSocket first.
-- Keep protocol/session/service logic transport-agnostic.
-- WebTransport-specific crate types must remain isolated in the transport adapter.
+Runtime verification succeeded:
 
-Recommended crate from spike:
+- WebTransport listener started on `127.0.0.1:8443`
+- HTTP server remained active on `127.0.0.1:8080`
+- smoke client connected successfully outside sandbox
+- heartbeat returned valid framed JSON
+- get_session returned valid framed JSON
+- gateway and real broadcast were restored disabled afterward
 
-- `wtransport`
+Current limitation:
 
-Reason:
-
-- `quinn` is QUIC only, not WebTransport.
-- `h3` / `h3-quinn` are lower-level HTTP/3 plumbing.
-- `wtransport` exposes WebTransport sessions, bidirectional/unidirectional streams, datagrams, TLS identity/cert loading, and Tokio runtime integration.
+The MM gateway service currently returns deterministic planned results. It does not yet mutate the live orderbook.
 
 ## Goal
 
-Implement a disabled-by-default WebTransport server adapter that:
+Implement Market Maker Gateway V1C: connect the MM gateway service to the real backend orderbook/order lifecycle.
 
-1. Starts only when `MM_GATEWAY_ENABLED=true`.
-2. Binds to `MM_GATEWAY_HOST:MM_GATEWAY_PORT`.
-3. Loads TLS cert/key from:
-   - `MM_GATEWAY_CERT_PATH`
-   - `MM_GATEWAY_KEY_PATH`
-4. Accepts WebTransport sessions.
-5. Accepts reliable bidirectional streams.
-6. Reads framed JSON client messages.
-7. Decodes `MmClientMessage`.
-8. Calls the existing transport-neutral `MmGatewayService`.
-9. Writes framed JSON server responses.
-10. Handles disconnect and invokes cancel-on-disconnect planning.
-11. Does not mutate execution lifecycle.
-12. Does not auto-broadcast.
+The gateway should support real off-chain order management through WebTransport:
+
+- submit_order
+- bulk_submit
+- cancel_order
+- bulk_cancel
+- cancel_all
+- quote_replace
+- cancel-on-disconnect
+
+The gateway must reuse existing backend validation and engine/orderbook logic where possible.
 
 ## Non-Goals
 
@@ -61,14 +59,14 @@ Do not implement:
 
 - RFQ
 - options gateway
-- pricing strategy
-- production wallet signature auth
-- market-data datagrams unless trivial
-- WebSocket fallback
-- real orderbook mutation if V1A service does not yet support it
+- MM strategy/pricing engine
+- market data datagrams
+- production wallet auth
 - auto-broadcast
-- confirmation lifecycle changes
-- Solidity changes
+- automatic signing
+- changes to Solidity
+- changes to PerpTrade ABI
+- execution lifecycle redesign
 
 ## Absolute Safety Rules
 
@@ -76,249 +74,264 @@ Do not:
 
 - modify Solidity
 - deploy contracts
-- change `PerpTrade` ABI
-- change matching semantics
 - enable real broadcast by default
-- auto-broadcast from gateway
-- bypass validation
-- bypass nonce sync
-- fake orders, matches, txs, reconciliations, or confirmations
-- require live RPC/Postgres/private keys/certs/UDP for normal `cargo test`
+- auto-broadcast from MM gateway
+- bypass existing validation
+- bypass on-chain nonce sync if enabled
+- bypass signature/deadline validation
+- fake order IDs
+- fake matches
+- fake execution intents
+- fake tx hashes
+- fake confirmations
+- require live RPC/Postgres/private keys/certs/UDP for normal cargo test
 - commit
 - push
 - expose private keys
 
-## Dependencies
+## Important Architecture Rule
 
-Add `wtransport` to `Cargo.toml`.
+Do not put orderbook business logic inside `webtransport.rs`.
 
-Pin a version that compiles with the current Rust toolchain.
+The flow must remain:
 
-If `wtransport` fails due to MSRV/version conflict:
+```text
+WebTransport adapter
+→ framed ClientMessage
+→ MmGatewayService
+→ shared order/cancel service
+→ engine/orderbook/persistence
+→ framed ServerMessage
 
-- do not replace it with WebSocket
-- do not switch architecture silently
-- report exact conflict
-- try a compatible `wtransport` version
-- preserve the V1A transport abstraction
+Only src/mm/transport/webtransport.rs may depend on WebTransport-specific types.
 
-Use `tokio` and existing async runtime.
+Required Behavior
+1. submit_order
 
-Add helper dependencies only if necessary, for example:
+A submit_order message should create a real backend order using the same behavior as HTTP POST /orders.
 
-- `bytes`
-- `tokio-util`
-- `rustls-pemfile`
+It must return:
 
-Avoid unnecessary dependency bloat.
+{
+  "type": "submit_order_result",
+  "request_id": "...",
+  "ok": true,
+  "payload": {
+    "accepted": true,
+    "order_id": "...",
+    "client_order_id": "...",
+    "status": "accepted",
+    "matched_intents": []
+  }
+}
 
-## Config
+If the order matches immediately and creates execution intents, return their IDs.
 
-Use existing V1A config keys.
+Do not sign, simulate, broadcast, index, reconcile, or confirm from the MM gateway.
 
-Required runtime config:
+2. bulk_submit
 
-```env
-MM_GATEWAY_ENABLED=false
-MM_GATEWAY_TRANSPORT=webtransport
-MM_GATEWAY_HOST=127.0.0.1
-MM_GATEWAY_PORT=8443
-MM_GATEWAY_CERT_PATH=
-MM_GATEWAY_KEY_PATH=
-MM_GATEWAY_MAX_SESSIONS=100
-MM_GATEWAY_MAX_IN_FLIGHT_PER_SESSION=128
-MM_GATEWAY_RATE_LIMIT_PER_SEC=100
-MM_GATEWAY_HEARTBEAT_TIMEOUT_MS=15000
-MM_GATEWAY_MAX_ORDERS_PER_BULK=50
-MM_GATEWAY_MAX_CANCELS_PER_BULK=100
-MM_GATEWAY_MAX_OPEN_ORDERS_PER_ACCOUNT=500
-MM_GATEWAY_CANCEL_ON_DISCONNECT=true
-MM_GATEWAY_AUTH_MODE=disabled
-MM_GATEWAY_REQUIRE_AUTH=false
+Process each order independently.
 
-Startup behavior:
+Partial success is allowed.
 
-If MM_GATEWAY_ENABLED=false, do not start WebTransport server.
-If MM_GATEWAY_ENABLED=true and cert/key path missing, fail startup with clear config error.
-If MM_GATEWAY_ENABLED=true and cert/key file unreadable, fail startup with clear error.
-If MM_GATEWAY_TRANSPORT != webtransport, fail clearly for now.
-WebTransport server must run beside the existing HTTP server.
-Existing HTTP API must continue to work.
-Network Model
+Response shape:
 
-Do not route WebTransport through Axum V1.
+{
+  "accepted": 2,
+  "rejected": 1,
+  "results": [
+    {
+      "client_order_id": "...",
+      "ok": true,
+      "order_id": "...",
+      "matched_intents": []
+    },
+    {
+      "client_order_id": "...",
+      "ok": false,
+      "error": {
+        "code": "ORDER_REJECTED",
+        "message": "..."
+      }
+    }
+  ]
+}
 
-Run it as a separately spawned listener from src/main.rs.
+Enforce:
 
-Conceptual startup:
+MM_GATEWAY_MAX_ORDERS_PER_BULK
+per-session rate limits
+max open orders per account
+existing order validation
+3. cancel_order
 
-HTTP Axum server: TCP 127.0.0.1:8080
-MM WebTransport server: UDP 127.0.0.1:8443
-Framing
+Cancel a real resting off-chain order by:
 
-Use reliable bidirectional streams.
+order_id, or
+client_order_id
 
-Implement a simple, deterministic frame format.
+Only allow cancellation for the owning account/session.
 
-Preferred:
+Do not cancel submitted/broadcast/confirmed execution intents.
 
-u32 big-endian length
-JSON bytes
+4. bulk_cancel
 
-Rules:
+Cancel multiple resting orders.
 
-maximum frame size must be bounded
-reject oversized frame with clear error
-reject invalid JSON with clear error response if possible
-each received client message returns one server response
-keep stream open for multiple messages if feasible
-if implementation is simpler, one request per bidirectional stream is acceptable for V1B, but document it
+Partial success is allowed.
 
-Suggested config or constant:
+Enforce:
 
-MM_GATEWAY_MAX_FRAME_BYTES = 1048576
+MM_GATEWAY_MAX_CANCELS_PER_BULK
+ownership rules
+idempotent behavior where possible
+5. cancel_all
 
-Do not use datagrams for critical order messages.
+Cancel all resting off-chain orders for the session/account.
 
-WebTransport Adapter Module
+Optional filter:
 
-Add:
+market_id
 
-src/mm/transport/webtransport.rs
+Do not mutate execution intents that are already matched/submitted/broadcast/confirmed.
 
-Responsibilities:
+6. quote_replace
 
-load cert/key
-create wtransport::ServerConfig
-create wtransport::Endpoint
-accept sessions
-enforce max sessions if feasible
-spawn per-session task
-accept bidirectional streams
-read frames
-call MmGatewayService::handle_message
-write frames
-detect session end
-run cancel-on-disconnect planning
-log lifecycle events without leaking secrets
+Implement real quote replace:
 
-WebTransport-specific types must not leak into:
+Identify previous open quote orders for the account and market.
+If cancel_previous=true, cancel previous resting quotes.
+Submit new bid and/or ask.
+Return:
+cancelled count
+submitted count
+rejected count
+per-leg result
+matched intent IDs if matching occurred
 
-protocol.rs
-session.rs
-service.rs
-rate_limit.rs
-Service Integration
+The operation should be deterministic.
 
-Use the V1A service.
+If full atomicity is hard, use clear non-atomic semantics and document them:
 
-For each incoming message:
+cancel previous first, then submit new bid/ask independently
+7. cancel-on-disconnect
 
-MmClientMessage
-→ MmGatewayService::handle_message(session, message, now_ms)
-→ MmServerMessage
-→ JSON response frame
+On WebTransport session disconnect:
 
-If service requires mutable session state, pass it safely.
+cancel real open resting off-chain orders owned by that session/account if enabled
+do not cancel submitted/broadcast/confirmed intents
+idempotent
+log cancellation summary
+
+If order ownership tracking is insufficient, add minimal tracking.
+
+Shared Service Extraction
+
+Current HTTP route logic likely owns order/cancel behavior.
+
+Extract minimal shared helpers so both HTTP and MM gateway use the same behavior.
+
+Target structure can be:
+
+src/orders/service.rs
+
+or similar.
 
 Avoid broad refactors.
 
-Cancel-on-Disconnect
+The goal:
 
-On session close:
+HTTP POST /orders
+MM submit_order
 
-call existing V1A cancel-on-disconnect planning
-log planned cancellations
-do not mutate submitted/broadcast/confirmed execution intents
-if actual orderbook cancellation is not implemented yet, return/log planned result only
-do not fake cancellation success
-Auth
+should call the same core order submission logic.
 
-V1B auth mode remains:
+Same for cancel paths.
+
+Session Ownership
+
+The gateway must track which orders were created by each session.
+
+Session should register:
+
+order_id
+client_order_id
+market_id
+account
+
+This enables:
+
+cancel-on-disconnect
+quote_replace
+get_session
+max open orders enforcement
+Nonce Handling
+
+Do not invent on-chain nonces.
+
+If PERP_NONCE_SYNC_ENABLED=true, gateway order submission must respect the existing nonce sync behavior.
+
+If sync is disabled, existing behavior remains.
+
+Do not consume/store local nonces for rejected orders.
+
+Auth V1C
+
+Auth can remain disabled by default:
 
 MM_GATEWAY_AUTH_MODE=disabled
 MM_GATEWAY_REQUIRE_AUTH=false
 
-If MM_GATEWAY_REQUIRE_AUTH=true, trading messages must be rejected unless the V1A service already supports auth state.
+If MM_GATEWAY_REQUIRE_AUTH=true, trading messages should be rejected unless session authenticated.
 
-Do not implement full wallet challenge auth in V1B unless trivial.
+Do not implement full wallet challenge auth unless trivial.
 
 Tests
 
-Normal cargo test must not require:
+Normal cargo test must remain offline.
 
-live WebTransport server
-cert files
-UDP port
-browser/client
-RPC
-Postgres
-private keys
+Add tests for:
 
-Add unit tests for:
+submit_order calls shared order service
+submit_order returns order_id/client_order_id
+bulk_submit partial accept/reject
+bulk_submit respects max orders
+cancel_order rejects non-owned order
+cancel_order cancels owned resting order
+bulk_cancel partial result
+cancel_all cancels only account/session resting orders
+quote_replace cancels previous quote then submits bid/ask
+quote_replace handles bid-only
+quote_replace handles ask-only
+quote_replace returns matched intent IDs if service returns them
+cancel-on-disconnect plans and applies only open resting orders
+cancel-on-disconnect does not touch execution intents
+rate limits still apply
+nonce sync errors are surfaced as ORDER_REJECTED
+HTTP order behavior remains unchanged after helper extraction
 
-frame encode/decode roundtrip
-oversized frame rejected
-invalid JSON rejected
-disabled config does not start gateway
-enabled config without cert/key returns config error
-unsupported transport string returns config error
-WebTransport adapter does not affect HTTP server config
-service response can be serialized into frame
+If full engine tests require complex setup, create pure service tests with mocked order service traits.
 
-If adding live integration tests, mark them ignored:
+Do not require live WebTransport for normal tests.
 
-#[ignore]
-Manual Local Smoke Test
+Runtime Smoke Test
 
-Add documentation and optionally a small dev-only client.
+Extend mm_wt_smoke or add flags so it can optionally send:
 
-Preferred:
+heartbeat
+get_session
+submit_order
+quote_replace
+cancel_all
 
-src/bin/mm_wt_smoke.rs
+It must not broadcast.
 
-or document how to test manually.
+It must not require private keys unless the tested payload requires them.
 
-The smoke client should:
+If signatures are needed and verification mode is disabled in local dev, use shape-valid dummy signatures.
 
-connect to WebTransport server
-send heartbeat
-send get_session
-print responses
-not send real broadcast
-not require private keys
-
-If adding the smoke binary is too much, defer it and document exact gap.
-
-Local Cert Instructions
-
-Document in README:
-
-Option A: mkcert
-
-mkdir -p /tmp/deopt-mm-gateway
-mkcert -cert-file /tmp/deopt-mm-gateway/cert.pem \
-       -key-file /tmp/deopt-mm-gateway/key.pem \
-       localhost 127.0.0.1 ::1
-
-Option B: openssl self-signed
-
-mkdir -p /tmp/deopt-mm-gateway
-openssl req -x509 -newkey rsa:2048 -nodes \
-  -keyout /tmp/deopt-mm-gateway/key.pem \
-  -out /tmp/deopt-mm-gateway/cert.pem \
-  -days 1 \
-  -subj "/CN=localhost"
-
-Then .env:
-
-MM_GATEWAY_ENABLED=true
-MM_GATEWAY_TRANSPORT=webtransport
-MM_GATEWAY_HOST=127.0.0.1
-MM_GATEWAY_PORT=8443
-MM_GATEWAY_CERT_PATH=/tmp/deopt-mm-gateway/cert.pem
-MM_GATEWAY_KEY_PATH=/tmp/deopt-mm-gateway/key.pem
-Docs
+Documentation
 
 Update:
 
@@ -327,16 +340,15 @@ ARCHITECTURE.md
 
 Document:
 
-WebTransport adapter V1B
-UDP/QUIC/HTTP3 requirement
-cert/key requirement
-local cert workflow
-reliable streams for critical messages
-datagrams deferred
-gateway disabled by default
-no auto-broadcast
-current V1B limitations
-V1C will integrate live orderbook mutations if not already integrated
+V1C live orderbook integration
+submit_order over WebTransport
+bulk_submit semantics
+cancel semantics
+quote_replace semantics
+cancel-on-disconnect real behavior
+non-atomic quote_replace caveat if applicable
+safety boundary: no auto-broadcast
+next steps: RFQ and production auth
 Validation
 
 Run:
@@ -349,29 +361,31 @@ Acceptance Criteria
 
 Complete only if:
 
-wtransport dependency compiles
-MM_GATEWAY_ENABLED=false preserves existing behavior
-enabled mode requires cert/key
-WebTransport server can be spawned beside HTTP server
-protocol/session/service remain transport-agnostic
-JSON frame encode/decode exists and is tested
-bidirectional stream handling exists
-heartbeat/get_session can flow through adapter conceptually or via smoke test
+MM submit_order mutates live orderbook through shared backend logic
+bulk_submit works with partial results
+cancel_order cancels real resting orders
+bulk_cancel works with partial results
+cancel_all works for account/session
+quote_replace does real cancel + submit
+cancel-on-disconnect applies real off-chain cancellation
+no auto-broadcast path added
+WebTransport adapter remains transport-only
+HTTP routes still work
 normal tests are offline
-docs include cert/UDP instructions
+docs updated
 cargo fmt passes
 cargo clippy passes with -D warnings
 cargo test passes
 cargo build passes
-Deferred to V1C
-live orderbook mutation through gateway if not completed
-real cancel-on-disconnect mutation
+Deferred
+RFQ
 production wallet challenge auth
 WebTransport datagrams for market data
-RFQ over MM sessions
 options MM gateway
-WebSocket fallback if needed
+MM quality metrics
+inventory/risk-aware quote engine
 EOF
+
 
 
 after all, 
