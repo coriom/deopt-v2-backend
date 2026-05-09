@@ -1,11 +1,15 @@
 use super::series_id::{option_series_id, OptionSeriesIdInput};
 use super::{
+    OptionOrder, OptionOrderFilter, OptionOrderId, OptionOrderStatus, OptionOrderbookLevel,
     OptionOrderbookSnapshot, OptionSeries, OptionSeriesFilter, OptionSeriesId, OptionSeriesSource,
     OptionSeriesStatus,
 };
 use crate::api::AppState;
 use crate::error::{BackendError, Result};
-use crate::types::{now_ms, Price1e8, Size1e8, TimestampMs};
+use crate::signing::eip712::parse_evm_address;
+use crate::signing::signature::validate_signature_shape;
+use crate::types::{now_ms, AccountId, OrderId, Price1e8, Side, Size1e8, TimeInForce, TimestampMs};
+use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CreateOptionSeriesInput {
@@ -19,6 +23,20 @@ pub struct CreateOptionSeriesInput {
     pub contract_size_1e8: Option<Size1e8>,
     pub onchain_product_id: Option<String>,
     pub onchain_series_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubmitOptionOrderInput {
+    pub option_series_id: OptionSeriesId,
+    pub account: AccountId,
+    pub side: Side,
+    pub price_1e8: Price1e8,
+    pub size_1e8: Size1e8,
+    pub time_in_force: TimeInForce,
+    pub client_order_id: Option<String>,
+    pub nonce: Option<u64>,
+    pub deadline_ms: Option<TimestampMs>,
+    pub signature: Option<String>,
 }
 
 pub async fn create_option_series(
@@ -164,12 +182,143 @@ pub async fn get_option_orderbook(
     option_series_id: OptionSeriesId,
 ) -> Result<OptionOrderbookSnapshot> {
     let series = get_option_series(state, &option_series_id).await?;
+    let orders = open_option_orders_for_series(state, &option_series_id).await?;
     Ok(OptionOrderbookSnapshot {
         option_series_id,
         status: series.effective_status(now_sec(now_ms())?),
-        bids: Vec::new(),
-        asks: Vec::new(),
+        bids: aggregate_levels(&orders, Side::Buy),
+        asks: aggregate_levels(&orders, Side::Sell),
     })
+}
+
+pub async fn submit_option_order(
+    state: &AppState,
+    input: SubmitOptionOrderInput,
+) -> Result<OptionOrder> {
+    ensure_enabled(state)?;
+    validate_account(&input.account)?;
+    if input.price_1e8 == 0 {
+        return Err(BackendError::ZeroPrice);
+    }
+    if input.size_1e8 == 0 {
+        return Err(BackendError::ZeroSize);
+    }
+    if input.time_in_force != TimeInForce::Gtc {
+        return Err(BackendError::UnsupportedTimeInForce(format!(
+            "{:?}",
+            input.time_in_force
+        )));
+    }
+    if let Some(deadline_ms) = input.deadline_ms {
+        if now_ms() >= deadline_ms {
+            return Err(BackendError::DeadlineExpired);
+        }
+    }
+    if let Some(signature) = &input.signature {
+        validate_signature_shape(signature)?;
+    }
+
+    let series = get_option_series(state, &input.option_series_id).await?;
+    if series.effective_status(now_sec(now_ms())?) != OptionSeriesStatus::Active {
+        return Err(BackendError::InvalidOptionOrderState(
+            "option series is not active".to_string(),
+        ));
+    }
+
+    let now = now_ms();
+    let order = OptionOrder {
+        order_id: OrderId::new(),
+        option_series_id: input.option_series_id,
+        account: input.account,
+        side: input.side,
+        price_1e8: input.price_1e8,
+        size_1e8: input.size_1e8,
+        remaining_size_1e8: input.size_1e8,
+        time_in_force: input.time_in_force,
+        client_order_id: input.client_order_id,
+        nonce: input.nonce,
+        deadline_ms: input.deadline_ms,
+        signature: input.signature,
+        status: OptionOrderStatus::Open,
+        created_at_ms: now,
+        updated_at_ms: now,
+    };
+
+    if let Some(repository) = state.repository.clone() {
+        repository.insert_option_order(&order).await?;
+        return Ok(order);
+    }
+
+    state
+        .options_store
+        .lock()
+        .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?
+        .insert_order(order)
+}
+
+pub async fn list_option_orders(
+    state: &AppState,
+    filter: OptionOrderFilter,
+) -> Result<Vec<OptionOrder>> {
+    ensure_enabled(state)?;
+    if let Some(repository) = state.repository.clone() {
+        return Ok(repository
+            .list_option_orders()
+            .await?
+            .into_iter()
+            .filter(|order| filter.matches(order))
+            .collect());
+    }
+    Ok(state
+        .options_store
+        .lock()
+        .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?
+        .list_orders(&filter))
+}
+
+pub async fn get_option_order(state: &AppState, order_id: OptionOrderId) -> Result<OptionOrder> {
+    ensure_enabled(state)?;
+    if let Some(repository) = state.repository.clone() {
+        return repository
+            .get_option_order(order_id)
+            .await?
+            .ok_or(BackendError::InvalidOptionOrderId);
+    }
+    state
+        .options_store
+        .lock()
+        .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?
+        .get_order(order_id)
+        .ok_or(BackendError::InvalidOptionOrderId)
+}
+
+pub async fn cancel_option_order(state: &AppState, order_id: OptionOrderId) -> Result<OptionOrder> {
+    ensure_enabled(state)?;
+    let now = now_ms();
+    if let Some(repository) = state.repository.clone() {
+        return repository.cancel_option_order(order_id, now).await;
+    }
+    state
+        .options_store
+        .lock()
+        .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?
+        .cancel_order(order_id, now)
+}
+
+async fn open_option_orders_for_series(
+    state: &AppState,
+    option_series_id: &str,
+) -> Result<Vec<OptionOrder>> {
+    if let Some(repository) = state.repository.clone() {
+        return repository
+            .open_option_orders_for_series(option_series_id)
+            .await;
+    }
+    Ok(state
+        .options_store
+        .lock()
+        .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?
+        .open_orders_for_series(option_series_id))
 }
 
 async fn get_option_series_optional(
@@ -194,6 +343,10 @@ fn ensure_enabled(state: &AppState) -> Result<()> {
     }
 }
 
+fn validate_account(account: &AccountId) -> Result<()> {
+    parse_evm_address(account).map(|_| ())
+}
+
 fn validate_assets(fields: &[(&str, &str)]) -> Result<()> {
     for (field, value) in fields {
         if value.trim().is_empty() {
@@ -212,4 +365,24 @@ fn trim_asset(value: String) -> String {
 fn now_sec(now_ms: TimestampMs) -> Result<u64> {
     u64::try_from(now_ms / 1000)
         .map_err(|_| BackendError::Config("current timestamp cannot be encoded".to_string()))
+}
+
+fn aggregate_levels(orders: &[OptionOrder], side: Side) -> Vec<OptionOrderbookLevel> {
+    let mut by_price = BTreeMap::<Price1e8, Size1e8>::new();
+    for order in orders {
+        if order.side == side && order.status == OptionOrderStatus::Open {
+            *by_price.entry(order.price_1e8).or_default() += order.remaining_size_1e8;
+        }
+    }
+
+    let iter: Box<dyn Iterator<Item = (Price1e8, Size1e8)>> = match side {
+        Side::Buy => Box::new(by_price.into_iter().rev()),
+        Side::Sell => Box::new(by_price.into_iter()),
+    };
+
+    iter.map(|(price_1e8, size_1e8)| OptionOrderbookLevel {
+        price_1e8: price_1e8.to_string(),
+        size_1e8: size_1e8.to_string(),
+    })
+    .collect()
 }

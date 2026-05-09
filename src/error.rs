@@ -41,6 +41,10 @@ pub enum BackendError {
     InvalidOptionSeriesId(String),
     #[error("invalid option series state: {0}")]
     InvalidOptionSeriesState(String),
+    #[error("invalid option order id")]
+    InvalidOptionOrderId,
+    #[error("invalid option order state: {0}")]
+    InvalidOptionOrderState(String),
     #[error("invalid PerpTrade intentId")]
     InvalidPerpTradeIntentId,
     #[error("invalid fixed-point value for {field}: {reason}")]

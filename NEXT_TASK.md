@@ -1,67 +1,68 @@
-# NEXT_TASK.md — Options V1A: Option Series Registry + Orderbooks
+# NEXT_TASK.md — Options V1C: Off-chain Option Matching
 
 ## Context
 
-The backend now supports a validated perp execution stack:
+Options V1A and V1B are implemented and runtime-verified.
 
-- HTTP order intake
-- orderbook matching
-- execution intents
-- PerpTrade signing
-- simulation
-- real broadcast
-- indexer
-- reconciliation
-- confirmation/finality
-- on-chain nonce sync
+V1A:
 
-It also supports:
+- option series registry
+- deterministic option_series_id
+- Postgres persistence
+- list/filter/get/disable endpoints
+- empty orderbook endpoint
 
-- WebTransport Market Maker Gateway
-- live MM submit/cancel/quote_replace
-- RFQ V1A/V1B/V1C
-- signed RFQ quotes
-- RFQ accept creates normal execution_intent
+V1B:
 
-The next major block is Options.
+- off-chain option orders
+- POST /options/orders
+- GET /options/orders
+- GET /options/orders/:order_id
+- POST /options/orders/:order_id/cancel
+- real aggregated option orderbook levels
+- Postgres persistence
+- no execution_intents
+- no execution_transactions
+- no RFQ mutation
 
-Current backend order/matching logic is primarily perp-market oriented.
+Runtime verification passed:
 
-Options need a series-aware orderbook model.
+- order submission persisted
+- duplicate client_order_id rejected
+- orderbook aggregated correctly
+- cancel removed order from book
+- no forbidden mutation occurred
 
 ## Goal
 
-Implement Options V1A:
+Implement Options V1C: off-chain option matching and fill recording.
 
-- option series model
-- option series registry/cache
-- option orderbook keys
-- HTTP endpoints for option series and option orderbooks
-- order submission for option series in backend only
-- no on-chain option execution yet
-- no options RFQ yet
-- no Greeks/risk cache yet
+The backend must support:
 
-This is a backend product/data layer foundation for options.
+- matching buy/sell option orders within same option_series_id
+- recording option fills
+- updating remaining sizes
+- updating order statuses
+- persisting fills
+- returning matched fills in order submission response
+- keeping everything off-chain only
 
 ## Non-Goals
 
 Do not implement:
 
-- on-chain option exercise
-- on-chain option settlement
-- option execution broadcast
-- option PerpTrade equivalent
-- options RFQ
-- options WebTransport RFQ
+- option execution intents
+- on-chain option execution
+- option exercise
+- option settlement
+- option RFQ
+- option MM Gateway messages
 - Greeks
-- implied volatility surface
-- pricing engine
-- margin/risk computation changes
+- IV surface
+- risk/margin changes
 - Solidity changes
 - deployment
 - auto-broadcast
-- options market maker strategy
 
 ## Absolute Safety Rules
 
@@ -70,303 +71,280 @@ Do not:
 - modify Solidity
 - deploy contracts
 - change existing perp execution lifecycle
-- break existing perp orderbook
-- break RFQ
-- break MM gateway
+- break RFQ/MM Gateway
+- create execution_intents from option matches
+- create execution_transactions from option matches
 - fake on-chain option state
 - require live RPC/Postgres/private keys/WebTransport/certs for normal cargo test
 - commit
 - push
 - expose private keys
 
-## Option Series Model
+## Matching Semantics
 
-Add an option series domain model.
+Options V1C matching is off-chain only.
+
+Rules:
+
+- match only orders with the same `option_series_id`
+- buy matches sell if `buy.price_1e8 >= sell.price_1e8`
+- match size = min(buy.remaining_size, sell.remaining_size)
+- fill price rule must be deterministic
+
+Recommended fill price:
+
+```text
+resting maker order price
+
+If an incoming buy crosses resting asks, fill at resting ask price.
+If an incoming sell crosses resting bids, fill at resting bid price.
+
+No floating point arithmetic.
+
+Use integer/string-safe comparison for 1e8 values.
+
+Time Priority
+
+Within same price level:
+
+older order fills first
+
+Use created_at_ms, then order_id as deterministic tie-breaker if needed.
+
+Order Statuses
+
+Existing statuses:
+
+open
+cancelled
+filled
+rejected
+expired
+
+Add if needed:
+
+partially_filled
+
+Recommended status logic:
+
+remaining_size == size => open
+0 < remaining_size < size => partially_filled
+remaining_size == 0 => filled
+cancelled remains cancelled
+
+If adding partially_filled, update docs/tests.
+
+Fill Model
+
+Add option fill model.
 
 Suggested fields:
 
-```text
+fill_id: string
 option_series_id: string
-underlying: string / address
-base_asset: string / address
-quote_asset: string / address
-settlement_asset: string / address
-expiry: u64
-strike_1e8: string
-is_call: bool
-contract_size_1e8: string
-status: active/expired/disabled
-source: manual/onchain
-created_at_ms
-updated_at_ms
+buy_order_id: string
+sell_order_id: string
+buyer: string
+seller: string
+price_1e8: string
+size_1e8: string
+created_at_ms: u64
 
-If the Solidity registry has a specific series/product id, include:
+Optional:
 
-onchain_product_id
-onchain_series_id
+maker_order_id
+taker_order_id
+taker_side
 
-Use naming aligned with existing Solidity if known.
+Recommended fields:
 
-Important numeric rules:
-
-strike is 1e8
-contract size is 1e8
-avoid floats
-use string/integers consistently with current backend style
-Series Identifier
-
-Define deterministic backend option_series_id.
-
-Recommended:
-
-keccak256(
-  underlying/base/quote/settlement/expiry/strike_1e8/is_call/contract_size_1e8
-)
-
-or UUID if easier.
-
-If using hash:
-
-expose hex string
-deterministic across restarts
-tested
+maker_order_id
+taker_order_id
+taker_side
 Database
 
 Add migration:
 
-migrations/0012_option_series.sql
+migrations/0014_option_fills.sql
 
 Suggested table:
 
-CREATE TABLE option_series (
-    option_series_id TEXT PRIMARY KEY,
-    underlying TEXT NOT NULL,
-    base_asset TEXT NOT NULL,
-    quote_asset TEXT NOT NULL,
-    settlement_asset TEXT NOT NULL,
-    expiry BIGINT NOT NULL,
-    strike_1e8 TEXT NOT NULL,
-    is_call BOOLEAN NOT NULL,
-    contract_size_1e8 TEXT NOT NULL,
-    status TEXT NOT NULL,
-    source TEXT NOT NULL,
-    onchain_product_id TEXT NULL,
-    onchain_series_id TEXT NULL,
-    created_at_ms BIGINT NOT NULL,
-    updated_at_ms BIGINT NOT NULL
+CREATE TABLE option_fills (
+    fill_id TEXT PRIMARY KEY,
+    option_series_id TEXT NOT NULL REFERENCES option_series(option_series_id),
+    buy_order_id TEXT NOT NULL REFERENCES option_orders(order_id),
+    sell_order_id TEXT NOT NULL REFERENCES option_orders(order_id),
+    buyer TEXT NOT NULL,
+    seller TEXT NOT NULL,
+    maker_order_id TEXT NOT NULL,
+    taker_order_id TEXT NOT NULL,
+    taker_side TEXT NOT NULL,
+    price_1e8 TEXT NOT NULL,
+    size_1e8 TEXT NOT NULL,
+    created_at_ms BIGINT NOT NULL
 );
 
-CREATE INDEX idx_option_series_status ON option_series(status);
-CREATE INDEX idx_option_series_expiry ON option_series(expiry);
-CREATE INDEX idx_option_series_underlying ON option_series(lower(underlying));
-CREATE INDEX idx_option_series_strike ON option_series(strike_1e8);
-CREATE INDEX idx_option_series_callput ON option_series(is_call);
+CREATE INDEX idx_option_fills_series ON option_fills(option_series_id);
+CREATE INDEX idx_option_fills_buy_order ON option_fills(buy_order_id);
+CREATE INDEX idx_option_fills_sell_order ON option_fills(sell_order_id);
+CREATE INDEX idx_option_fills_buyer ON option_fills(lower(buyer));
+CREATE INDEX idx_option_fills_seller ON option_fills(lower(seller));
+CREATE INDEX idx_option_fills_created_at ON option_fills(created_at_ms);
 
-If existing repository style prefers different naming, follow existing conventions.
+Follow existing repository style if different.
 
-Rust Modules
-
-Add:
-
-src/options/
-  mod.rs
-  types.rs
-  service.rs
-  store.rs
-
-Optional:
-
-src/options/series_id.rs
-Config
-
-Add safe defaults:
-
-OPTIONS_ENABLED=false
-OPTIONS_REQUIRE_PERSISTENCE=true
-OPTIONS_ALLOW_MANUAL_SERIES=true
-OPTIONS_SYNC_ONCHAIN_REGISTRY=false
-OPTIONS_DEFAULT_CONTRACT_SIZE_1E8=100000000
-
-Behavior:
-
-if disabled, option endpoints return clear error
-if enabled and persistence required but unavailable, startup fails clearly
-normal cargo test must not need Postgres
 HTTP Endpoints
 
-Add:
-
-POST /options/series
-GET /options/series
-GET /options/series/:option_series_id
-POST /options/series/:option_series_id/disable
-GET /options/orderbooks/:option_series_id
-POST /options/series
-
-Manual dev/admin series creation.
-
-Request:
-
-{
-  "underlying": "ETH",
-  "base_asset": "ETH",
-  "quote_asset": "USDC",
-  "settlement_asset": "USDC",
-  "expiry": 1770000000,
-  "strike_1e8": "300000000000",
-  "is_call": true,
-  "contract_size_1e8": "100000000",
-  "onchain_product_id": null,
-  "onchain_series_id": null
-}
-
-Response:
-
-{
-  "option_series_id": "...",
-  "status": "active"
-}
-
-Validation:
-
-expiry must be future unless test mode allows otherwise
-strike > 0
-contract_size > 0
-is_call bool
-assets non-empty
-duplicate deterministic series should return existing or reject deterministically; choose and document
-GET /options/series
-
-Support filters:
-
-underlying
-expiry
-is_call
-status
-
-Keep simple.
-
-GET /options/orderbooks/:option_series_id
-
-Return option orderbook for that series.
-
-For V1A, this can reuse existing orderbook representation if possible.
-
-Option Orderbook Keying
-
-Current engine/orderbook likely keys by market_id.
-
-Options need a separate key type.
-
-Add minimal support for:
-
-InstrumentId:
-  PerpMarket(u64)
-  OptionSeries(String)
-
-or equivalent.
-
-Do not break existing perp market orderbooks.
-
-If refactor is too broad, implement an option-specific orderbook store separately:
-
-option_orderbooks: HashMap<option_series_id, OrderBook>
-
-Prefer minimal safe change.
-
-Option Orders V1A
-
-Add HTTP endpoint if feasible:
+Extend:
 
 POST /options/orders
-POST /options/orders/:order_id/cancel
+GET /options/orders/:order_id
+GET /options/orders
+GET /options/orderbooks/:option_series_id
 
-If too broad, defer actual option order submission and only implement series/orderbook read model.
+Add:
 
-Preferred V1A includes option order submission as off-chain only.
+GET /options/fills
+GET /options/fills/:fill_id
+GET /options/orders/:order_id/fills
 
-Request:
+Filters for GET /options/fills:
+
+option_series_id
+account
+order_id
+POST /options/orders Response
+
+Currently returns order.
+
+Extend response with fills:
 
 {
+  "order_id": "...",
   "option_series_id": "...",
-  "account": "0x...",
-  "side": "buy",
-  "price_1e8": "1000000000",
-  "size_1e8": "100000000",
-  "time_in_force": "gtc",
-  "client_order_id": "eth-call-3000-bid-1",
-  "nonce": 1,
-  "deadline_ms": 4102444800000,
-  "signature": "0x..."
+  "status": "partially_filled",
+  "remaining_size_1e8": "50000000",
+  "fills": [
+    {
+      "fill_id": "...",
+      "price_1e8": "1000000000",
+      "size_1e8": "50000000",
+      "buy_order_id": "...",
+      "sell_order_id": "..."
+    }
+  ]
 }
 
-Behavior:
+If no match:
 
-validates series active
-validates price > 0
-validates size > 0
-validates account address
-stores order in option orderbook
-no on-chain execution intent yet
-if matching occurs, either:
-create an option execution intent placeholder disabled by default, or
-do not match options yet
-choose the simpler safe behavior and document
+{
+  "order_id": "...",
+  "status": "open",
+  "fills": []
+}
+Matching Behavior
 
-Recommendation V1A:
+When an incoming order is submitted:
 
-resting option orderbook only, no matching/execution intent yet
+validate option order as V1B
+find opposite-side open/partially_filled orders for same series
+sort by price/time priority:
+incoming buy matches lowest ask first
+incoming sell matches highest bid first
+create fills
+update resting orders remaining/status
+update incoming order remaining/status
+persist all changes atomically if persistence enabled
+return order + fills
 
-But if existing orderbook matching is easy to reuse safely, matching can be included without on-chain execution.
+If persistence transaction support exists, use it.
 
-Market Maker Gateway Impact
+If not, implement minimal safe sequence and document limitation.
 
-Do not integrate options into MM Gateway in V1A unless trivial.
+Orderbook After Matching
 
-Document future:
+GET /options/orderbooks/:option_series_id must reflect only open/partially_filled remaining sizes.
 
-MM Gateway options support will use option_series_id instead of market_id.
+Filled orders must not appear.
+
+Partially filled orders appear with remaining size only.
+
+Cancellation Rules
+
+Existing cancel endpoint must handle:
+
+open order => cancelled
+partially_filled order => cancelled with remaining size cancelled
+filled order => reject or no-op clearly
+cancelled order => deterministic already-cancelled response
+
+Do not delete fills.
+
+Persistence Behavior
+
+When persistence enabled:
+
+option order insert/update/fill write should persist
+fill listing reads DB
+orderbook reads open/partially_filled orders
+
+When persistence disabled:
+
+in-memory store works
+normal tests do not need Postgres
 Tests
 
-Normal cargo test must remain offline.
+Normal cargo test must be offline.
 
 Add tests for:
 
-option series creation success
-rejects zero strike
-rejects zero contract size
-rejects expired expiry if enforced
-deterministic option_series_id
-duplicate series behavior
-list series by status
-list series by underlying
-get series by id
-disable series
-get orderbook for empty active series
-get orderbook rejects unknown series
-option order submission if implemented
-option order rejects inactive series if order submission implemented
-existing perp orderbook tests still pass
+buy order rests when no ask
+sell order rests when no bid
+buy crosses ask and creates fill
+sell crosses bid and creates fill
+no cross when buy price < ask price
+partial fill leaves incoming partially_filled/open remainder
+partial fill updates resting order remaining
+full fill sets status filled
+multiple fills across price levels
+price priority for asks: lowest ask first
+price priority for bids: highest bid first
+time priority within same price
+fill price equals resting maker price
+orderbook removes filled orders
+orderbook shows partially filled remaining size
+cancel partially filled order cancels remaining
+cannot cancel filled order or returns clear already-filled error
+list fills by series
+list fills by order_id
+list fills by account
+get fill by id
+no execution_intent created from option match
+no execution_transaction created from option match
+existing option V1A/V1B tests still pass
+existing perp/RFQ/MM tests still pass
 Documentation
 
 Update:
 
 README.md
 ARCHITECTURE.md
-.env.example
+.env.example if config changed
 
 Document:
 
-Options V1A scope
-option series fields
-option_series_id
-call/put mapping
-strike/contract size 1e8 conventions
-no on-chain option execution yet
-no options RFQ yet
-future MM Gateway options support
-future options RFQ
-future Greeks/risk cache
+Options V1C scope
+off-chain matching only
+price-time priority
+fill price rule
+option_fills
+no execution_intents
+no on-chain settlement/exercise
+future Options V1D:
+option execution intent / settlement design
+options RFQ
+MM Gateway option messages
+Greeks/IV
 Validation
 
 Run:
@@ -379,34 +357,29 @@ Acceptance Criteria
 
 Complete only if:
 
-options config exists
-option series model exists
-migration exists
-service/store exists
-HTTP series endpoints exist
-empty option orderbook endpoint exists
-no existing perp/RFQ/MM behavior broken
+option matching works off-chain
+option fills are recorded
+order statuses and remaining sizes update correctly
+orderbook reflects remaining liquidity
+fill endpoints exist
+no option execution_intents are created
+no execution_transactions are created
 normal tests offline
 docs updated
 cargo fmt passes
 cargo clippy passes
 cargo test passes
 cargo build passes
-Deferred to Options V1B
-option order submission if not completed
-option matching
+Deferred
 option execution intent
-option RFQ
+on-chain option exercise/settlement
+options RFQ
 option MM Gateway messages
 on-chain OptionProductRegistry sync
 Greeks
 IV surface
 risk cache
-expiry settlement integration
 EOF
-
-
-
 
 
 

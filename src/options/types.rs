@@ -1,9 +1,10 @@
 use crate::error::{BackendError, Result};
-use crate::types::{Price1e8, Size1e8, TimestampMs};
+use crate::types::{AccountId, OrderId, Price1e8, Side, Size1e8, TimeInForce, TimestampMs};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
 pub type OptionSeriesId = String;
+pub type OptionOrderId = OrderId;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OptionsConfig {
@@ -156,6 +157,111 @@ pub struct OptionSeriesFilter {
     pub status: Option<OptionSeriesStatus>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OptionOrderStatus {
+    Open,
+    Cancelled,
+    Filled,
+    Rejected,
+    Expired,
+}
+
+impl OptionOrderStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Cancelled => "cancelled",
+            Self::Filled => "filled",
+            Self::Rejected => "rejected",
+            Self::Expired => "expired",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "open" => Ok(Self::Open),
+            "cancelled" => Ok(Self::Cancelled),
+            "filled" => Ok(Self::Filled),
+            "rejected" => Ok(Self::Rejected),
+            "expired" => Ok(Self::Expired),
+            other => Err(BackendError::Persistence(format!(
+                "invalid option order status: {other}"
+            ))),
+        }
+    }
+}
+
+impl FromStr for OptionOrderStatus {
+    type Err = BackendError;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "open" => Ok(Self::Open),
+            "cancelled" => Ok(Self::Cancelled),
+            "filled" => Ok(Self::Filled),
+            "rejected" => Ok(Self::Rejected),
+            "expired" => Ok(Self::Expired),
+            other => Err(BackendError::Config(format!(
+                "invalid option order status filter: {other}"
+            ))),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OptionOrder {
+    pub order_id: OptionOrderId,
+    pub option_series_id: OptionSeriesId,
+    pub account: AccountId,
+    pub side: Side,
+    pub price_1e8: Price1e8,
+    pub size_1e8: Size1e8,
+    pub remaining_size_1e8: Size1e8,
+    pub time_in_force: TimeInForce,
+    pub client_order_id: Option<String>,
+    pub nonce: Option<u64>,
+    pub deadline_ms: Option<TimestampMs>,
+    pub signature: Option<String>,
+    pub status: OptionOrderStatus,
+    pub created_at_ms: TimestampMs,
+    pub updated_at_ms: TimestampMs,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct OptionOrderFilter {
+    pub option_series_id: Option<OptionSeriesId>,
+    pub account: Option<AccountId>,
+    pub status: Option<OptionOrderStatus>,
+    pub side: Option<Side>,
+}
+
+impl OptionOrderFilter {
+    pub fn matches(&self, order: &OptionOrder) -> bool {
+        if let Some(option_series_id) = &self.option_series_id {
+            if &order.option_series_id != option_series_id {
+                return false;
+            }
+        }
+        if let Some(account) = &self.account {
+            if !order.account.0.eq_ignore_ascii_case(&account.0) {
+                return false;
+            }
+        }
+        if let Some(status) = self.status {
+            if order.status != status {
+                return false;
+            }
+        }
+        if let Some(side) = self.side {
+            if order.side != side {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 impl OptionSeriesFilter {
     pub fn matches(&self, series: &OptionSeries, now_sec: u64) -> bool {
         if let Some(underlying) = &self.underlying {
@@ -193,5 +299,5 @@ pub struct OptionOrderbookSnapshot {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct OptionOrderbookLevel {
     pub price_1e8: String,
-    pub total_size_1e8: String,
+    pub size_1e8: String,
 }

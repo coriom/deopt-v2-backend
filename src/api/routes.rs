@@ -18,14 +18,20 @@ use crate::execution::{
 use crate::indexer::{Indexer, IndexerStatus, IndexerTickResult};
 use crate::nonce_sync::{read_perp_nonce, PerpNonceResponse};
 use crate::options::service::{
+    cancel_option_order as cancel_option_order_service,
     create_option_series as create_option_series_service,
     disable_option_series as disable_option_series_service,
+    get_option_order as get_option_order_service,
     get_option_orderbook as get_option_orderbook_service,
     get_option_series as get_option_series_service,
-    list_option_series as list_option_series_service, CreateOptionSeriesInput,
+    list_option_orders as list_option_orders_service,
+    list_option_series as list_option_series_service,
+    submit_option_order as submit_option_order_service, CreateOptionSeriesInput,
+    SubmitOptionOrderInput,
 };
 use crate::options::{
-    OptionOrderbookSnapshot, OptionSeries, OptionSeriesFilter, OptionSeriesStatus,
+    OptionOrder, OptionOrderFilter, OptionOrderStatus, OptionOrderbookSnapshot, OptionSeries,
+    OptionSeriesFilter, OptionSeriesStatus,
 };
 use crate::orders::service::{
     cancel_order as cancel_order_shared, submit_response_from_events, submit_signed_order,
@@ -46,6 +52,7 @@ use crate::rfq::{
     parse_quote_id, parse_rfq_id, rfq_id_to_hex_bytes32, RfqQuote, RfqQuoteSignatureStatus,
     RfqQuoteStatus, RfqRequest, RfqStatus, RFQ_QUOTE_TYPE,
 };
+use crate::types::TimeInForce;
 use crate::types::{now_ms, AccountId, MarketId, OrderId, Side};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -74,6 +81,15 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/options/orderbooks/:option_series_id",
             get(get_option_orderbook),
+        )
+        .route(
+            "/options/orders",
+            post(submit_option_order).get(list_option_orders),
+        )
+        .route("/options/orders/:order_id", get(get_option_order))
+        .route(
+            "/options/orders/:order_id/cancel",
+            post(cancel_option_order),
         )
         .route("/accounts/:address/perp-nonce", get(account_perp_nonce))
         .route("/orders", post(submit_order))
@@ -218,6 +234,28 @@ struct ListOptionSeriesQuery {
     status: Option<OptionSeriesStatus>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+struct SubmitOptionOrderRequest {
+    option_series_id: String,
+    account: AccountId,
+    side: Side,
+    price_1e8: String,
+    size_1e8: String,
+    time_in_force: TimeInForce,
+    client_order_id: Option<String>,
+    nonce: Option<u64>,
+    deadline_ms: Option<i64>,
+    signature: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+struct ListOptionOrdersQuery {
+    option_series_id: Option<String>,
+    account: Option<AccountId>,
+    status: Option<OptionOrderStatus>,
+    side: Option<Side>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 struct OptionSeriesResponse {
     option_series_id: String,
@@ -235,6 +273,47 @@ struct OptionSeriesResponse {
     onchain_series_id: Option<String>,
     created_at_ms: i64,
     updated_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct OptionOrderResponse {
+    order_id: String,
+    option_series_id: String,
+    account: AccountId,
+    side: Side,
+    price_1e8: String,
+    size_1e8: String,
+    remaining_size_1e8: String,
+    time_in_force: TimeInForce,
+    client_order_id: Option<String>,
+    nonce: Option<String>,
+    deadline_ms: Option<i64>,
+    signature: Option<String>,
+    status: OptionOrderStatus,
+    created_at_ms: i64,
+    updated_at_ms: i64,
+}
+
+impl From<OptionOrder> for OptionOrderResponse {
+    fn from(order: OptionOrder) -> Self {
+        Self {
+            order_id: order.order_id.to_string(),
+            option_series_id: order.option_series_id,
+            account: order.account,
+            side: order.side,
+            price_1e8: order.price_1e8.to_string(),
+            size_1e8: order.size_1e8.to_string(),
+            remaining_size_1e8: order.remaining_size_1e8.to_string(),
+            time_in_force: order.time_in_force,
+            client_order_id: order.client_order_id,
+            nonce: order.nonce.map(|value| value.to_string()),
+            deadline_ms: order.deadline_ms,
+            signature: order.signature,
+            status: order.status,
+            created_at_ms: order.created_at_ms,
+            updated_at_ms: order.updated_at_ms,
+        }
+    }
 }
 
 impl From<OptionSeries> for OptionSeriesResponse {
@@ -263,8 +342,14 @@ impl From<OptionSeries> for OptionSeriesResponse {
 struct OptionOrderbookResponse {
     option_series_id: String,
     status: OptionSeriesStatus,
-    bids: Vec<BookLevelResponse>,
-    asks: Vec<BookLevelResponse>,
+    bids: Vec<OptionBookLevelResponse>,
+    asks: Vec<OptionBookLevelResponse>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct OptionBookLevelResponse {
+    price_1e8: String,
+    size_1e8: String,
 }
 
 impl From<OptionOrderbookSnapshot> for OptionOrderbookResponse {
@@ -275,17 +360,17 @@ impl From<OptionOrderbookSnapshot> for OptionOrderbookResponse {
             bids: snapshot
                 .bids
                 .into_iter()
-                .map(|level| BookLevelResponse {
+                .map(|level| OptionBookLevelResponse {
                     price_1e8: level.price_1e8,
-                    total_size_1e8: level.total_size_1e8,
+                    size_1e8: level.size_1e8,
                 })
                 .collect(),
             asks: snapshot
                 .asks
                 .into_iter()
-                .map(|level| BookLevelResponse {
+                .map(|level| OptionBookLevelResponse {
                     price_1e8: level.price_1e8,
-                    total_size_1e8: level.total_size_1e8,
+                    size_1e8: level.size_1e8,
                 })
                 .collect(),
         }
@@ -368,6 +453,68 @@ async fn get_option_orderbook(
         get_option_orderbook_service(&state, option_series_id)
             .await?
             .into(),
+    ))
+}
+
+async fn submit_option_order(
+    State(state): State<AppState>,
+    Json(request): Json<SubmitOptionOrderRequest>,
+) -> Result<Json<OptionOrderResponse>, ApiError> {
+    let order = submit_option_order_service(
+        &state,
+        SubmitOptionOrderInput {
+            option_series_id: request.option_series_id,
+            account: request.account,
+            side: request.side,
+            price_1e8: parse_fixed_u128("price_1e8", &request.price_1e8)?,
+            size_1e8: parse_fixed_u128("size_1e8", &request.size_1e8)?,
+            time_in_force: request.time_in_force,
+            client_order_id: request.client_order_id,
+            nonce: request.nonce,
+            deadline_ms: request.deadline_ms,
+            signature: request.signature,
+        },
+    )
+    .await?;
+    Ok(Json(order.into()))
+}
+
+async fn list_option_orders(
+    State(state): State<AppState>,
+    Query(query): Query<ListOptionOrdersQuery>,
+) -> Result<Json<Vec<OptionOrderResponse>>, ApiError> {
+    let orders = list_option_orders_service(
+        &state,
+        OptionOrderFilter {
+            option_series_id: query.option_series_id,
+            account: query.account,
+            status: query.status,
+            side: query.side,
+        },
+    )
+    .await?;
+    Ok(Json(
+        orders.into_iter().map(OptionOrderResponse::from).collect(),
+    ))
+}
+
+async fn get_option_order(
+    State(state): State<AppState>,
+    Path(order_id): Path<String>,
+) -> Result<Json<OptionOrderResponse>, ApiError> {
+    let order_id = OrderId::from_str(&order_id).map_err(|_| BackendError::InvalidOptionOrderId)?;
+    Ok(Json(
+        get_option_order_service(&state, order_id).await?.into(),
+    ))
+}
+
+async fn cancel_option_order(
+    State(state): State<AppState>,
+    Path(order_id): Path<String>,
+) -> Result<Json<OptionOrderResponse>, ApiError> {
+    let order_id = OrderId::from_str(&order_id).map_err(|_| BackendError::InvalidOptionOrderId)?;
+    Ok(Json(
+        cancel_option_order_service(&state, order_id).await?.into(),
     ))
 }
 
@@ -1956,6 +2103,7 @@ impl From<BackendError> for ApiError {
             BackendError::InvalidExecutionIntentId => StatusCode::NOT_FOUND,
             BackendError::InvalidRfqId | BackendError::InvalidRfqQuoteId => StatusCode::NOT_FOUND,
             BackendError::InvalidOptionSeriesId(_) => StatusCode::NOT_FOUND,
+            BackendError::InvalidOptionOrderId => StatusCode::NOT_FOUND,
             BackendError::OrderNotFound(_) | BackendError::OrderNotOpen(_) => StatusCode::NOT_FOUND,
             BackendError::InvalidFixedPoint { .. } => StatusCode::BAD_REQUEST,
             BackendError::DeadlineExpired
@@ -1966,6 +2114,7 @@ impl From<BackendError> for ApiError {
             | BackendError::InvalidRfqQuoteState(_)
             | BackendError::OptionsDisabled
             | BackendError::InvalidOptionSeriesState(_)
+            | BackendError::InvalidOptionOrderState(_)
             | BackendError::PerpNonceSyncDisabled
             | BackendError::PerpNonceMismatch { .. }
             | BackendError::MalformedSignature

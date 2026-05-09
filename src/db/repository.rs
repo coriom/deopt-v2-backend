@@ -11,7 +11,10 @@ use crate::execution::{
     ExecutionTransactionStatus, SimulationResult, StoredTradeSignatures,
 };
 use crate::indexer::IndexedPerpTrade;
-use crate::options::{OptionSeries, OptionSeriesSource, OptionSeriesStatus};
+use crate::options::{
+    OptionOrder, OptionOrderId, OptionOrderStatus, OptionSeries, OptionSeriesSource,
+    OptionSeriesStatus,
+};
 use crate::reconciliation::{
     normalize_onchain_intent_id, ExecutionReconciliation, ReconciliationCounts,
     ReconciliationStatus,
@@ -20,7 +23,7 @@ use crate::rfq::{
     QuoteId, RfqId, RfqQuote, RfqQuoteSignatureStatus, RfqQuoteStatus, RfqRequest, RfqStatus,
 };
 use crate::signing::SignedOrder;
-use crate::types::{now_ms, AccountId, OrderStatus, Side, TimestampMs};
+use crate::types::{now_ms, AccountId, OrderStatus, Side, TimeInForce, TimestampMs};
 use sqlx::postgres::{PgPool, PgRow};
 use sqlx::{Postgres, Row, Transaction};
 use uuid::Uuid;
@@ -783,6 +786,121 @@ impl PgRepository {
         row.map(option_series_from_row)
             .transpose()?
             .ok_or_else(|| BackendError::InvalidOptionSeriesId(option_series_id.to_string()))
+    }
+
+    pub async fn insert_option_order(&self, order: &OptionOrder) -> Result<()> {
+        let result = sqlx::query(
+            "INSERT INTO option_orders (
+                order_id, option_series_id, account, side, price_1e8, size_1e8,
+                remaining_size_1e8, time_in_force, client_order_id, nonce, deadline_ms,
+                signature, status, created_at_ms, updated_at_ms
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
+        )
+        .bind(order.order_id.to_string())
+        .bind(&order.option_series_id)
+        .bind(&order.account.0)
+        .bind(side_to_str(order.side))
+        .bind(order.price_1e8.to_string())
+        .bind(order.size_1e8.to_string())
+        .bind(order.remaining_size_1e8.to_string())
+        .bind(tif_to_str(order.time_in_force))
+        .bind(&order.client_order_id)
+        .bind(order.nonce.map(|value| value.to_string()))
+        .bind(order.deadline_ms.map(timestamp_to_i64))
+        .bind(&order.signature)
+        .bind(order.status.as_str())
+        .bind(timestamp_to_i64(order.created_at_ms))
+        .bind(timestamp_to_i64(order.updated_at_ms))
+        .execute(&self.pool)
+        .await;
+
+        match result {
+            Ok(_) => Ok(()),
+            Err(error) if is_unique_violation(&error) => {
+                Err(BackendError::InvalidOptionOrderState(
+                    "duplicate open client_order_id for option account".to_string(),
+                ))
+            }
+            Err(error) => Err(BackendError::Persistence(error.to_string())),
+        }
+    }
+
+    pub async fn list_option_orders(&self) -> Result<Vec<OptionOrder>> {
+        let rows = sqlx::query(
+            "SELECT order_id, option_series_id, account, side, price_1e8, size_1e8,
+                    remaining_size_1e8, time_in_force, client_order_id, nonce, deadline_ms,
+                    signature, status, created_at_ms, updated_at_ms
+             FROM option_orders
+             ORDER BY created_at_ms ASC, order_id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        rows.into_iter().map(option_order_from_row).collect()
+    }
+
+    pub async fn get_option_order(&self, order_id: OptionOrderId) -> Result<Option<OptionOrder>> {
+        let row = sqlx::query(
+            "SELECT order_id, option_series_id, account, side, price_1e8, size_1e8,
+                    remaining_size_1e8, time_in_force, client_order_id, nonce, deadline_ms,
+                    signature, status, created_at_ms, updated_at_ms
+             FROM option_orders
+             WHERE order_id = $1",
+        )
+        .bind(order_id.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        row.map(option_order_from_row).transpose()
+    }
+
+    pub async fn cancel_option_order(
+        &self,
+        order_id: OptionOrderId,
+        updated_at_ms: TimestampMs,
+    ) -> Result<OptionOrder> {
+        let row = sqlx::query(
+            "UPDATE option_orders
+             SET status = 'cancelled', updated_at_ms = $2
+             WHERE order_id = $1 AND status = 'open'
+             RETURNING order_id, option_series_id, account, side, price_1e8, size_1e8,
+                       remaining_size_1e8, time_in_force, client_order_id, nonce, deadline_ms,
+                       signature, status, created_at_ms, updated_at_ms",
+        )
+        .bind(order_id.to_string())
+        .bind(timestamp_to_i64(updated_at_ms))
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        if let Some(row) = row {
+            return option_order_from_row(row);
+        }
+        let Some(order) = self.get_option_order(order_id).await? else {
+            return Err(BackendError::InvalidOptionOrderId);
+        };
+        Err(BackendError::InvalidOptionOrderState(format!(
+            "option order is {}",
+            order.status.as_str()
+        )))
+    }
+
+    pub async fn open_option_orders_for_series(
+        &self,
+        option_series_id: &str,
+    ) -> Result<Vec<OptionOrder>> {
+        let rows = sqlx::query(
+            "SELECT order_id, option_series_id, account, side, price_1e8, size_1e8,
+                    remaining_size_1e8, time_in_force, client_order_id, nonce, deadline_ms,
+                    signature, status, created_at_ms, updated_at_ms
+             FROM option_orders
+             WHERE option_series_id = $1 AND status = 'open'
+             ORDER BY created_at_ms ASC, order_id ASC",
+        )
+        .bind(option_series_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        rows.into_iter().map(option_order_from_row).collect()
     }
 
     pub async fn insert_rfq(&self, rfq: &RfqRequest) -> Result<()> {
@@ -1560,6 +1678,87 @@ fn option_series_from_row(row: PgRow) -> Result<OptionSeries> {
         created_at_ms: row_get(&row, "created_at_ms")?,
         updated_at_ms: row_get(&row, "updated_at_ms")?,
     })
+}
+
+fn option_order_from_row(row: PgRow) -> Result<OptionOrder> {
+    let order_id: String = row_get(&row, "order_id")?;
+    let side: String = row_get(&row, "side")?;
+    let time_in_force: String = row_get(&row, "time_in_force")?;
+    let nonce: Option<String> = row_get(&row, "nonce")?;
+    let status: String = row_get(&row, "status")?;
+    Ok(OptionOrder {
+        order_id: order_id.parse().map_err(|error| {
+            BackendError::Persistence(format!("invalid option order id: {error}"))
+        })?,
+        option_series_id: row_get(&row, "option_series_id")?,
+        account: AccountId::new(row_get::<String>(&row, "account")?),
+        side: parse_side(&side)?,
+        price_1e8: row_get::<String>(&row, "price_1e8")?
+            .parse()
+            .map_err(|error| {
+                BackendError::Persistence(format!("invalid option order price: {error}"))
+            })?,
+        size_1e8: row_get::<String>(&row, "size_1e8")?
+            .parse()
+            .map_err(|error| {
+                BackendError::Persistence(format!("invalid option order size: {error}"))
+            })?,
+        remaining_size_1e8: row_get::<String>(&row, "remaining_size_1e8")?
+            .parse()
+            .map_err(|error| {
+                BackendError::Persistence(format!("invalid option order remaining size: {error}"))
+            })?,
+        time_in_force: parse_time_in_force(&time_in_force)?,
+        client_order_id: row_get(&row, "client_order_id")?,
+        nonce: nonce
+            .map(|value| {
+                value.parse().map_err(|error| {
+                    BackendError::Persistence(format!("invalid option order nonce: {error}"))
+                })
+            })
+            .transpose()?,
+        deadline_ms: row_get(&row, "deadline_ms")?,
+        signature: row_get(&row, "signature")?,
+        status: OptionOrderStatus::parse(&status)?,
+        created_at_ms: row_get(&row, "created_at_ms")?,
+        updated_at_ms: row_get(&row, "updated_at_ms")?,
+    })
+}
+
+fn side_to_str(side: Side) -> &'static str {
+    match side {
+        Side::Buy => "buy",
+        Side::Sell => "sell",
+    }
+}
+
+fn parse_side(value: &str) -> Result<Side> {
+    match value {
+        "buy" => Ok(Side::Buy),
+        "sell" => Ok(Side::Sell),
+        other => Err(BackendError::Persistence(format!(
+            "invalid option order side: {other}"
+        ))),
+    }
+}
+
+fn tif_to_str(time_in_force: TimeInForce) -> &'static str {
+    match time_in_force {
+        TimeInForce::Gtc => "gtc",
+        TimeInForce::Ioc => "ioc",
+        TimeInForce::Fok => "fok",
+    }
+}
+
+fn parse_time_in_force(value: &str) -> Result<TimeInForce> {
+    match value {
+        "gtc" => Ok(TimeInForce::Gtc),
+        "ioc" => Ok(TimeInForce::Ioc),
+        "fok" => Ok(TimeInForce::Fok),
+        other => Err(BackendError::Persistence(format!(
+            "invalid option order time_in_force: {other}"
+        ))),
+    }
 }
 
 fn rfq_from_row(row: PgRow) -> Result<RfqRequest> {

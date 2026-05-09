@@ -95,12 +95,12 @@ MM_GATEWAY_REQUIRE_AUTH=false
 `CONFIRMATION_ENABLED=true` requires `RPC_URL`; when `CONFIRMATION_REQUIRE_PERSISTENCE=true`, it also requires `PERSISTENCE_ENABLED=true`. Confirmation is disabled by default, never broadcasts, and rejects startup if `CONFIRMATION_REQUIRE_RECONCILIATION=false`.
 `RFQ_ENABLED=false` is the safe default. When `RFQ_ENABLED=true` and `RFQ_REQUIRE_PERSISTENCE=true`, startup requires `PERSISTENCE_ENABLED=true`. Test and development code can run RFQ in memory with persistence disabled, but production-like RFQ acceptance should use Postgres so RFQ, quote, and execution-intent updates are committed together.
 `RFQ_QUOTE_SIGNATURE_MODE=disabled` preserves the unsigned RFQ V1B flow. `strict` requires each RFQ quote to include a valid EIP-712 `RFQQuote` signature whose recovered signer equals `mm_account`.
-`OPTIONS_ENABLED=false` is the safe default. When `OPTIONS_ENABLED=true` and `OPTIONS_REQUIRE_PERSISTENCE=true`, startup requires `PERSISTENCE_ENABLED=true`. Test and development code can run the option series registry in memory with persistence disabled.
+`OPTIONS_ENABLED=false` is the safe default. When `OPTIONS_ENABLED=true` and `OPTIONS_REQUIRE_PERSISTENCE=true`, startup requires `PERSISTENCE_ENABLED=true`. Test and development code can run option series and off-chain option orders in memory with persistence disabled.
 `MM_GATEWAY_ENABLED=false` is the safe default. When `true`, V1C starts a separate WebTransport UDP listener and requires `MM_GATEWAY_CERT_PATH` and `MM_GATEWAY_KEY_PATH`. It can submit and cancel off-chain perp orders through the live in-memory orderbook, but it does not auto-broadcast, sign, simulate, index, reconcile, or confirm execution intents.
 
-## Options V1A
+## Options V1B
 
-Options V1A adds an option series registry and empty option orderbook read surface. It is a product/data foundation only: no option order submission, no option matching, no option execution intents, no options RFQ, no Greeks, no IV surface, no on-chain option settlement, and no Solidity changes.
+Options V1B adds off-chain option order submission, cancellation, listing, and aggregated option orderbook levels on top of the option series registry. It remains a product/data foundation only: no option matching, no option execution intents, no options RFQ, no Greeks, no IV surface, no on-chain option settlement, and no Solidity changes.
 
 HTTP endpoints:
 
@@ -109,6 +109,10 @@ POST /options/series
 GET /options/series
 GET /options/series/:option_series_id
 POST /options/series/:option_series_id/disable
+POST /options/orders
+GET /options/orders
+GET /options/orders/:order_id
+POST /options/orders/:order_id/cancel
 GET /options/orderbooks/:option_series_id
 ```
 
@@ -118,7 +122,11 @@ Manual series creation accepts `underlying`, `base_asset`, `quote_asset`, `settl
 
 `GET /options/series` supports simple filters: `underlying`, `expiry`, `is_call`, and `status`. Series statuses are `active`, `expired`, and `disabled`; source values are `manual` and `onchain`. `POST /options/series/:option_series_id/disable` marks a known series disabled.
 
-`GET /options/orderbooks/:option_series_id` validates that the series exists and returns an empty bid/ask book in V1A. Option order submission, option matching, MM Gateway options messages, on-chain registry sync, and option execution are deferred.
+`POST /options/orders` accepts an active `option_series_id`, account, `buy` or `sell` side, fixed-point string `price_1e8` and `size_1e8`, `time_in_force`, optional `client_order_id`, optional nonce/deadline, and optional signature. V1B supports resting `gtc` orders only; `ioc` and `fok` are rejected cleanly. Signatures are shape-validated when provided, but option order signer recovery is not implemented in V1B.
+
+`GET /options/orders` supports `option_series_id`, `account`, `status`, and `side` filters. `POST /options/orders/:order_id/cancel` cancels open option orders and returns a clear error for already-cancelled or unknown orders. Duplicate `(account, client_order_id)` submissions are rejected while an existing order with that client id is open.
+
+`GET /options/orderbooks/:option_series_id` validates that the series exists and returns aggregated open bid/ask levels from option orders. Bids are sorted descending by integer price, asks ascending, and same-price levels sum open `remaining_size_1e8`. Option matching, MM Gateway options messages, on-chain registry sync, options RFQ, and option execution are deferred.
 
 ## RFQ V1C
 
@@ -587,7 +595,7 @@ PERSISTENCE_ENABLED=true
 DATABASE_URL=postgres://deopt:deopt@127.0.0.1:5432/deopt_v2_backend
 ```
 
-When enabled, the service connects to Postgres at startup and runs migrations from `migrations/`. Migrations create `used_nonces`, `orders`, `trades`, `execution_intents`, `execution_intent_signatures`, `execution_simulations`, `engine_events`, `indexer_cursors`, `indexed_perp_trades`, `execution_reconciliations`, `execution_transactions`, and `option_series`. RFQ signed quotes add nullable `signature`, `quote_digest`, `quote_nonce`, `signature_status`, and `recovered_signer` fields to `rfq_quotes`. Confirmation adds nullable `confirmed_at_ms`, `confirmed_block_number`, `confirmation_status`, and `confirmation_error` fields to `execution_transactions`.
+When enabled, the service connects to Postgres at startup and runs migrations from `migrations/`. Migrations create `used_nonces`, `orders`, `trades`, `execution_intents`, `execution_intent_signatures`, `execution_simulations`, `engine_events`, `indexer_cursors`, `indexed_perp_trades`, `execution_reconciliations`, `execution_transactions`, `option_series`, and `option_orders`. RFQ signed quotes add nullable `signature`, `quote_digest`, `quote_nonce`, `signature_status`, and `recovered_signer` fields to `rfq_quotes`. Confirmation adds nullable `confirmed_at_ms`, `confirmed_block_number`, `confirmation_status`, and `confirmation_error` fields to `execution_transactions`.
 
 One local setup option:
 
@@ -655,7 +663,7 @@ curl -X DELETE http://127.0.0.1:8080/orders/<order_id>
 - `SIGNATURE_VERIFICATION_MODE=strict` verifies the EIP-712 order digest and recovered secp256k1 signer against `account`.
 - FOK is rejected cleanly.
 - RFQ supports HTTP/dev flow plus basic MM gateway push, quote intake, and optional signed quote verification; options RFQ, multi-leg RFQ, signed taker RFQ requests, MM ranking, production auth, and market data datagrams remain deferred.
-- Options V1A supports manual option series registration, deterministic `option_series_id`, series listing/filtering, disable, and empty option orderbook reads; option order submission, option matching, option RFQ, and option execution remain deferred.
+- Options V1B supports manual option series registration, deterministic `option_series_id`, off-chain resting GTC option orders, cancellation, listing/filtering, and aggregated option orderbook reads; option matching, option RFQ, and option execution remain deferred.
 - Execution intents are provisional off-chain records, not settlement.
 - Indexed `TradeExecuted` events store `onchain_intent_id` for direct reconciliation only; they do not confirm backend intents.
 - Reconciliation rows link indexed events to intents, but still do not prove transaction ownership, finality, or reorg safety.
