@@ -25,6 +25,9 @@ async fn main() -> deopt_v2_backend::Result<()> {
         .confirmation
         .validate_startup(config.persistence_enabled)?;
     config.rfq.validate_startup(config.persistence_enabled)?;
+    config
+        .options
+        .validate_startup(config.persistence_enabled)?;
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::new(config.rust_log.clone()))
         .init();
@@ -53,6 +56,7 @@ async fn main() -> deopt_v2_backend::Result<()> {
         config.indexer.clone(),
         config.reconciliation.clone(),
         config.rfq.clone(),
+        config.options.clone(),
         config.chain_id,
     );
     let app = router(state.clone());
@@ -81,6 +85,7 @@ async fn main() -> deopt_v2_backend::Result<()> {
         execution_enabled = config.execution.execution_enabled,
         confirmation_enabled = config.confirmation.enabled,
         rfq_enabled = config.rfq.enabled,
+        options_enabled = config.options.enabled,
         mm_gateway_enabled = config.mm_gateway.enabled,
         indexer_enabled = config.indexer.enabled,
         reconciliation_enabled = config.reconciliation.enabled,

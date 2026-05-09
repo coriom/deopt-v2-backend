@@ -5,6 +5,7 @@ use crate::execution::{ExecutionConfig, StoredTradeSignatures};
 use crate::indexer::IndexerConfig;
 use crate::mm::MmSessionRegistry;
 use crate::nonce_sync::PerpNonceSyncConfig;
+use crate::options::{OptionSeriesStore, OptionsConfig};
 use crate::reconciliation::ReconciliationConfig;
 use crate::rfq::{RfqConfig, RfqStore};
 use crate::signing::{Eip712Domain, NonceStore, SignatureVerificationMode};
@@ -26,7 +27,9 @@ pub struct AppState {
     pub indexer_config: IndexerConfig,
     pub reconciliation_config: ReconciliationConfig,
     pub rfq_config: RfqConfig,
+    pub options_config: OptionsConfig,
     pub rfq_store: Arc<Mutex<RfqStore>>,
+    pub options_store: Arc<Mutex<OptionSeriesStore>>,
     pub mm_sessions: MmSessionRegistry,
     pub trade_signatures: Arc<Mutex<HashMap<Uuid, StoredTradeSignatures>>>,
 }
@@ -139,6 +142,7 @@ impl AppState {
             indexer_config,
             reconciliation_config,
             RfqConfig::disabled(),
+            OptionsConfig::disabled(),
             chain_id,
         )
     }
@@ -155,6 +159,7 @@ impl AppState {
         indexer_config: IndexerConfig,
         reconciliation_config: ReconciliationConfig,
         rfq_config: RfqConfig,
+        options_config: OptionsConfig,
         chain_id: u64,
     ) -> Self {
         Self {
@@ -170,7 +175,9 @@ impl AppState {
             indexer_config,
             reconciliation_config,
             rfq_config,
+            options_config,
             rfq_store: Arc::new(Mutex::new(RfqStore::new())),
+            options_store: Arc::new(Mutex::new(OptionSeriesStore::new())),
             mm_sessions: MmSessionRegistry::new(),
             trade_signatures: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -188,6 +195,24 @@ impl AppState {
             IndexerConfig::disabled(),
             ReconciliationConfig::disabled(),
             rfq_config,
+            OptionsConfig::disabled(),
+            84532,
+        )
+    }
+
+    pub fn with_options_config(engine: EngineState, options_config: OptionsConfig) -> Self {
+        Self::with_all_config(
+            engine,
+            SignatureVerificationMode::Disabled,
+            Eip712Domain::default(),
+            None,
+            ExecutionConfig::disabled(),
+            PerpNonceSyncConfig::disabled(),
+            ConfirmationConfig::disabled(),
+            IndexerConfig::disabled(),
+            ReconciliationConfig::disabled(),
+            RfqConfig::disabled(),
+            options_config,
             84532,
         )
     }

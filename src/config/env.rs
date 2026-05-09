@@ -5,6 +5,7 @@ use crate::indexer::IndexerConfig;
 use crate::mm::transport::webtransport::validate_webtransport_startup;
 use crate::mm::MmGatewayConfig;
 use crate::nonce_sync::PerpNonceSyncConfig;
+use crate::options::OptionsConfig;
 use crate::reconciliation::ReconciliationConfig;
 use crate::rfq::RfqConfig;
 use crate::signing::signature::SignatureVerificationMode;
@@ -26,6 +27,7 @@ pub struct AppConfig {
     pub indexer: IndexerConfig,
     pub reconciliation: ReconciliationConfig,
     pub rfq: RfqConfig,
+    pub options: OptionsConfig,
     pub mm_gateway: MmGatewayConfig,
     pub signature_verification_mode: SignatureVerificationMode,
     pub eip712_domain: Eip712Domain,
@@ -180,6 +182,21 @@ impl AppConfig {
                 )),
             },
         };
+        let options = OptionsConfig {
+            enabled: parse_env(&mut lookup, "OPTIONS_ENABLED", "false")?,
+            require_persistence: parse_env(&mut lookup, "OPTIONS_REQUIRE_PERSISTENCE", "true")?,
+            allow_manual_series: parse_env(&mut lookup, "OPTIONS_ALLOW_MANUAL_SERIES", "true")?,
+            sync_onchain_registry: parse_env(
+                &mut lookup,
+                "OPTIONS_SYNC_ONCHAIN_REGISTRY",
+                "false",
+            )?,
+            default_contract_size_1e8: parse_env(
+                &mut lookup,
+                "OPTIONS_DEFAULT_CONTRACT_SIZE_1E8",
+                "100000000",
+            )?,
+        };
         let perp_nonce_sync = PerpNonceSyncConfig {
             enabled: parse_env(&mut lookup, "PERP_NONCE_SYNC_ENABLED", "false")?,
             require_rpc: parse_env(&mut lookup, "PERP_NONCE_SYNC_REQUIRE_RPC", "true")?,
@@ -213,6 +230,7 @@ impl AppConfig {
         reconciliation.validate_startup(persistence_enabled)?;
         confirmation.validate_startup(persistence_enabled)?;
         rfq.validate_startup(persistence_enabled)?;
+        options.validate_startup(persistence_enabled)?;
         validate_webtransport_startup(&mm_gateway)?;
 
         Ok(Self {
@@ -227,6 +245,7 @@ impl AppConfig {
             indexer,
             reconciliation,
             rfq,
+            options,
             mm_gateway,
             signature_verification_mode,
             eip712_domain,
@@ -840,6 +859,44 @@ mod tests {
 
         assert!(config.rfq.enabled);
         assert!(!config.rfq.require_persistence);
+    }
+
+    #[test]
+    fn options_use_safe_defaults() {
+        let config = config_from_pairs([("OPTIONS_ENABLED", "false")]).unwrap();
+
+        assert!(!config.options.enabled);
+        assert!(config.options.require_persistence);
+        assert!(config.options.allow_manual_series);
+        assert!(!config.options.sync_onchain_registry);
+        assert_eq!(config.options.default_contract_size_1e8, 100_000_000);
+    }
+
+    #[test]
+    fn options_requiring_persistence_rejects_persistence_disabled() {
+        let error = config_from_pairs([
+            ("OPTIONS_ENABLED", "true"),
+            ("OPTIONS_REQUIRE_PERSISTENCE", "true"),
+            ("PERSISTENCE_ENABLED", "false"),
+        ])
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("Options require persistence enabled"));
+    }
+
+    #[test]
+    fn options_can_run_without_persistence_when_requirement_disabled() {
+        let config = config_from_pairs([
+            ("OPTIONS_ENABLED", "true"),
+            ("OPTIONS_REQUIRE_PERSISTENCE", "false"),
+            ("PERSISTENCE_ENABLED", "false"),
+        ])
+        .unwrap();
+
+        assert!(config.options.enabled);
+        assert!(!config.options.require_persistence);
     }
 
     #[test]

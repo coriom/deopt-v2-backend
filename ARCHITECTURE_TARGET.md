@@ -138,6 +138,7 @@ Implemented Phase 1 foundations:
 - PostgreSQL persistence V1 for nonces, orders, trades, execution intents, and event audit records
 - Manual `eth_call` simulation V1 for calldata-ready execution intents
 - Indexer V1 for persisted `PerpMatchingEngine.TradeExecuted` events and block cursor tracking
+- Options V1A series registry and empty option orderbook read surface
 
 Do not implement:
 - transaction-sending RPC
@@ -145,3 +146,4 @@ Do not implement:
 - full reorg-safe indexer views
 - real WebSocket MM gateway
 - on-chain execution
+- option matching or on-chain option lifecycle

@@ -17,6 +17,16 @@ use crate::execution::{
 };
 use crate::indexer::{Indexer, IndexerStatus, IndexerTickResult};
 use crate::nonce_sync::{read_perp_nonce, PerpNonceResponse};
+use crate::options::service::{
+    create_option_series as create_option_series_service,
+    disable_option_series as disable_option_series_service,
+    get_option_orderbook as get_option_orderbook_service,
+    get_option_series as get_option_series_service,
+    list_option_series as list_option_series_service, CreateOptionSeriesInput,
+};
+use crate::options::{
+    OptionOrderbookSnapshot, OptionSeries, OptionSeriesFilter, OptionSeriesStatus,
+};
 use crate::orders::service::{
     cancel_order as cancel_order_shared, submit_response_from_events, submit_signed_order,
     CancelOrderInput,
@@ -52,6 +62,19 @@ pub fn router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/markets", get(markets))
         .route("/orderbook/:market_id", get(orderbook))
+        .route(
+            "/options/series",
+            post(create_option_series).get(list_option_series),
+        )
+        .route("/options/series/:option_series_id", get(get_option_series))
+        .route(
+            "/options/series/:option_series_id/disable",
+            post(disable_option_series),
+        )
+        .route(
+            "/options/orderbooks/:option_series_id",
+            get(get_option_orderbook),
+        )
         .route("/accounts/:address/perp-nonce", get(account_perp_nonce))
         .route("/orders", post(submit_order))
         .route("/orders/:order_id", delete(cancel_order))
@@ -171,6 +194,181 @@ async fn orderbook(
             })
             .collect(),
     }))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+struct CreateOptionSeriesRequest {
+    underlying: String,
+    base_asset: String,
+    quote_asset: String,
+    settlement_asset: String,
+    expiry: u64,
+    strike_1e8: String,
+    is_call: bool,
+    contract_size_1e8: Option<String>,
+    onchain_product_id: Option<String>,
+    onchain_series_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+struct ListOptionSeriesQuery {
+    underlying: Option<String>,
+    expiry: Option<u64>,
+    is_call: Option<bool>,
+    status: Option<OptionSeriesStatus>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct OptionSeriesResponse {
+    option_series_id: String,
+    underlying: String,
+    base_asset: String,
+    quote_asset: String,
+    settlement_asset: String,
+    expiry: u64,
+    strike_1e8: String,
+    is_call: bool,
+    contract_size_1e8: String,
+    status: OptionSeriesStatus,
+    source: String,
+    onchain_product_id: Option<String>,
+    onchain_series_id: Option<String>,
+    created_at_ms: i64,
+    updated_at_ms: i64,
+}
+
+impl From<OptionSeries> for OptionSeriesResponse {
+    fn from(series: OptionSeries) -> Self {
+        Self {
+            option_series_id: series.option_series_id,
+            underlying: series.underlying,
+            base_asset: series.base_asset,
+            quote_asset: series.quote_asset,
+            settlement_asset: series.settlement_asset,
+            expiry: series.expiry,
+            strike_1e8: series.strike_1e8.to_string(),
+            is_call: series.is_call,
+            contract_size_1e8: series.contract_size_1e8.to_string(),
+            status: series.status,
+            source: series.source.as_str().to_string(),
+            onchain_product_id: series.onchain_product_id,
+            onchain_series_id: series.onchain_series_id,
+            created_at_ms: series.created_at_ms,
+            updated_at_ms: series.updated_at_ms,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct OptionOrderbookResponse {
+    option_series_id: String,
+    status: OptionSeriesStatus,
+    bids: Vec<BookLevelResponse>,
+    asks: Vec<BookLevelResponse>,
+}
+
+impl From<OptionOrderbookSnapshot> for OptionOrderbookResponse {
+    fn from(snapshot: OptionOrderbookSnapshot) -> Self {
+        Self {
+            option_series_id: snapshot.option_series_id,
+            status: snapshot.status,
+            bids: snapshot
+                .bids
+                .into_iter()
+                .map(|level| BookLevelResponse {
+                    price_1e8: level.price_1e8,
+                    total_size_1e8: level.total_size_1e8,
+                })
+                .collect(),
+            asks: snapshot
+                .asks
+                .into_iter()
+                .map(|level| BookLevelResponse {
+                    price_1e8: level.price_1e8,
+                    total_size_1e8: level.total_size_1e8,
+                })
+                .collect(),
+        }
+    }
+}
+
+async fn create_option_series(
+    State(state): State<AppState>,
+    Json(request): Json<CreateOptionSeriesRequest>,
+) -> Result<Json<OptionSeriesResponse>, ApiError> {
+    let series = create_option_series_service(
+        &state,
+        CreateOptionSeriesInput {
+            underlying: request.underlying,
+            base_asset: request.base_asset,
+            quote_asset: request.quote_asset,
+            settlement_asset: request.settlement_asset,
+            expiry: request.expiry,
+            strike_1e8: parse_fixed_u128("strike_1e8", &request.strike_1e8)?,
+            is_call: request.is_call,
+            contract_size_1e8: request
+                .contract_size_1e8
+                .as_deref()
+                .map(|value| parse_fixed_u128("contract_size_1e8", value))
+                .transpose()?,
+            onchain_product_id: request.onchain_product_id,
+            onchain_series_id: request.onchain_series_id,
+        },
+    )
+    .await?;
+    Ok(Json(series.into()))
+}
+
+async fn list_option_series(
+    State(state): State<AppState>,
+    Query(query): Query<ListOptionSeriesQuery>,
+) -> Result<Json<Vec<OptionSeriesResponse>>, ApiError> {
+    let series = list_option_series_service(
+        &state,
+        OptionSeriesFilter {
+            underlying: query.underlying,
+            expiry: query.expiry,
+            is_call: query.is_call,
+            status: query.status,
+        },
+    )
+    .await?;
+    Ok(Json(
+        series.into_iter().map(OptionSeriesResponse::from).collect(),
+    ))
+}
+
+async fn get_option_series(
+    State(state): State<AppState>,
+    Path(option_series_id): Path<String>,
+) -> Result<Json<OptionSeriesResponse>, ApiError> {
+    Ok(Json(
+        get_option_series_service(&state, &option_series_id)
+            .await?
+            .into(),
+    ))
+}
+
+async fn disable_option_series(
+    State(state): State<AppState>,
+    Path(option_series_id): Path<String>,
+) -> Result<Json<OptionSeriesResponse>, ApiError> {
+    Ok(Json(
+        disable_option_series_service(&state, &option_series_id)
+            .await?
+            .into(),
+    ))
+}
+
+async fn get_option_orderbook(
+    State(state): State<AppState>,
+    Path(option_series_id): Path<String>,
+) -> Result<Json<OptionOrderbookResponse>, ApiError> {
+    Ok(Json(
+        get_option_orderbook_service(&state, option_series_id)
+            .await?
+            .into(),
+    ))
 }
 
 async fn submit_order(
@@ -1757,6 +1955,7 @@ impl From<BackendError> for ApiError {
             BackendError::InvalidOrderId => StatusCode::BAD_REQUEST,
             BackendError::InvalidExecutionIntentId => StatusCode::NOT_FOUND,
             BackendError::InvalidRfqId | BackendError::InvalidRfqQuoteId => StatusCode::NOT_FOUND,
+            BackendError::InvalidOptionSeriesId(_) => StatusCode::NOT_FOUND,
             BackendError::OrderNotFound(_) | BackendError::OrderNotOpen(_) => StatusCode::NOT_FOUND,
             BackendError::InvalidFixedPoint { .. } => StatusCode::BAD_REQUEST,
             BackendError::DeadlineExpired
@@ -1765,6 +1964,8 @@ impl From<BackendError> for ApiError {
             | BackendError::RfqDisabled
             | BackendError::InvalidRfqState(_)
             | BackendError::InvalidRfqQuoteState(_)
+            | BackendError::OptionsDisabled
+            | BackendError::InvalidOptionSeriesState(_)
             | BackendError::PerpNonceSyncDisabled
             | BackendError::PerpNonceMismatch { .. }
             | BackendError::MalformedSignature

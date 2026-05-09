@@ -11,6 +11,7 @@ use crate::execution::{
     ExecutionTransactionStatus, SimulationResult, StoredTradeSignatures,
 };
 use crate::indexer::IndexedPerpTrade;
+use crate::options::{OptionSeries, OptionSeriesSource, OptionSeriesStatus};
 use crate::reconciliation::{
     normalize_onchain_intent_id, ExecutionReconciliation, ReconciliationCounts,
     ReconciliationStatus,
@@ -700,6 +701,88 @@ impl PgRepository {
         .map_err(|error| BackendError::Persistence(error.to_string()))?;
         let count: i64 = row_get(&row, "count")?;
         i64_to_u64_persistence("count", count)
+    }
+
+    pub async fn insert_option_series(&self, series: &OptionSeries) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO option_series (
+                option_series_id, underlying, base_asset, quote_asset, settlement_asset,
+                expiry, strike_1e8, is_call, contract_size_1e8, status, source,
+                onchain_product_id, onchain_series_id, created_at_ms, updated_at_ms
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+            ON CONFLICT (option_series_id) DO NOTHING",
+        )
+        .bind(&series.option_series_id)
+        .bind(&series.underlying)
+        .bind(&series.base_asset)
+        .bind(&series.quote_asset)
+        .bind(&series.settlement_asset)
+        .bind(u64_to_i64("expiry", series.expiry)?)
+        .bind(series.strike_1e8.to_string())
+        .bind(series.is_call)
+        .bind(series.contract_size_1e8.to_string())
+        .bind(series.status.as_str())
+        .bind(series.source.as_str())
+        .bind(&series.onchain_product_id)
+        .bind(&series.onchain_series_id)
+        .bind(timestamp_to_i64(series.created_at_ms))
+        .bind(timestamp_to_i64(series.updated_at_ms))
+        .execute(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        Ok(())
+    }
+
+    pub async fn list_option_series(&self) -> Result<Vec<OptionSeries>> {
+        let rows = sqlx::query(
+            "SELECT option_series_id, underlying, base_asset, quote_asset, settlement_asset,
+                    expiry, strike_1e8, is_call, contract_size_1e8, status, source,
+                    onchain_product_id, onchain_series_id, created_at_ms, updated_at_ms
+             FROM option_series
+             ORDER BY expiry ASC, strike_1e8 ASC, option_series_id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        rows.into_iter().map(option_series_from_row).collect()
+    }
+
+    pub async fn get_option_series(&self, option_series_id: &str) -> Result<Option<OptionSeries>> {
+        let row = sqlx::query(
+            "SELECT option_series_id, underlying, base_asset, quote_asset, settlement_asset,
+                    expiry, strike_1e8, is_call, contract_size_1e8, status, source,
+                    onchain_product_id, onchain_series_id, created_at_ms, updated_at_ms
+             FROM option_series
+             WHERE option_series_id = $1",
+        )
+        .bind(option_series_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        row.map(option_series_from_row).transpose()
+    }
+
+    pub async fn disable_option_series(
+        &self,
+        option_series_id: &str,
+        updated_at_ms: TimestampMs,
+    ) -> Result<OptionSeries> {
+        let row = sqlx::query(
+            "UPDATE option_series
+             SET status = 'disabled', updated_at_ms = $2
+             WHERE option_series_id = $1
+             RETURNING option_series_id, underlying, base_asset, quote_asset, settlement_asset,
+                       expiry, strike_1e8, is_call, contract_size_1e8, status, source,
+                       onchain_product_id, onchain_series_id, created_at_ms, updated_at_ms",
+        )
+        .bind(option_series_id)
+        .bind(timestamp_to_i64(updated_at_ms))
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        row.map(option_series_from_row)
+            .transpose()?
+            .ok_or_else(|| BackendError::InvalidOptionSeriesId(option_series_id.to_string()))
     }
 
     pub async fn insert_rfq(&self, rfq: &RfqRequest) -> Result<()> {
@@ -1443,6 +1526,37 @@ fn execution_transaction_from_row(row: PgRow) -> Result<ExecutionTransaction> {
             .map(ConfirmationStatus::parse)
             .transpose()?,
         confirmation_error: row_get(&row, "confirmation_error")?,
+        created_at_ms: row_get(&row, "created_at_ms")?,
+        updated_at_ms: row_get(&row, "updated_at_ms")?,
+    })
+}
+
+fn option_series_from_row(row: PgRow) -> Result<OptionSeries> {
+    let expiry: i64 = row_get(&row, "expiry")?;
+    let status: String = row_get(&row, "status")?;
+    let source: String = row_get(&row, "source")?;
+    Ok(OptionSeries {
+        option_series_id: row_get(&row, "option_series_id")?,
+        underlying: row_get(&row, "underlying")?,
+        base_asset: row_get(&row, "base_asset")?,
+        quote_asset: row_get(&row, "quote_asset")?,
+        settlement_asset: row_get(&row, "settlement_asset")?,
+        expiry: i64_to_u64_persistence("expiry", expiry)?,
+        strike_1e8: row_get::<String>(&row, "strike_1e8")?
+            .parse()
+            .map_err(|error| {
+                BackendError::Persistence(format!("invalid option series strike: {error}"))
+            })?,
+        is_call: row_get(&row, "is_call")?,
+        contract_size_1e8: row_get::<String>(&row, "contract_size_1e8")?
+            .parse()
+            .map_err(|error| {
+                BackendError::Persistence(format!("invalid option contract size: {error}"))
+            })?,
+        status: OptionSeriesStatus::parse(&status)?,
+        source: OptionSeriesSource::parse(&source)?,
+        onchain_product_id: row_get(&row, "onchain_product_id")?,
+        onchain_series_id: row_get(&row, "onchain_series_id")?,
         created_at_ms: row_get(&row, "created_at_ms")?,
         updated_at_ms: row_get(&row, "updated_at_ms")?,
     })

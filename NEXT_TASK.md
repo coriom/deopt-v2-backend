@@ -1,348 +1,353 @@
-# NEXT_TASK.md — RFQ V1C: Signed RFQ Quotes
+# NEXT_TASK.md — Options V1A: Option Series Registry + Orderbooks
 
 ## Context
 
-RFQ V1A and V1B are implemented and runtime-verified.
+The backend now supports a validated perp execution stack:
 
-Validated flow:
+- HTTP order intake
+- orderbook matching
+- execution intents
+- PerpTrade signing
+- simulation
+- real broadcast
+- indexer
+- reconciliation
+- confirmation/finality
+- on-chain nonce sync
 
-```text
-HTTP POST /rfqs
-→ connected MM receives rfq_request over WebTransport
-→ MM sends rfq_quote over WebTransport
-→ quote is persisted in rfq_quotes
-→ HTTP GET /rfqs/:id/quotes sees quote
-→ HTTP accept quote creates execution_intent
-→ MM receives rfq_quote_accepted
-→ no broadcast
+It also supports:
 
-Persistent runtime verification passed with:
+- WebTransport Market Maker Gateway
+- live MM submit/cancel/quote_replace
+- RFQ V1A/V1B/V1C
+- signed RFQ quotes
+- RFQ accept creates normal execution_intent
 
-RFQ accepted
-accepted quote persisted
-execution_intent persisted
-buyer/seller mapping correct
-no executor transaction created
+The next major block is Options.
 
-Current weakness:
+Current backend order/matching logic is primarily perp-market oriented.
 
-RFQ quotes are trusted because they arrive from a session. They are not cryptographically signed by the market maker.
+Options need a series-aware orderbook model.
 
-Goal
+## Goal
 
-Implement RFQ V1C: signed RFQ quotes.
+Implement Options V1A:
 
-A market maker RFQ quote must be signed over a deterministic EIP-712 typed message.
+- option series model
+- option series registry/cache
+- option orderbook keys
+- HTTP endpoints for option series and option orderbooks
+- order submission for option series in backend only
+- no on-chain option execution yet
+- no options RFQ yet
+- no Greeks/risk cache yet
 
-The backend must:
+This is a backend product/data layer foundation for options.
 
-expose an RFQ quote signing payload
-accept RFQ quote signatures
-recover signer
-verify signer equals mm_account
-store signature/digest/signing metadata
-reject invalid signatures in strict mode
-keep unsigned/dev mode available by config
-preserve existing RFQ V1B flow
-keep accepted quote creating normal execution_intent
-never auto-broadcast
-Non-Goals
+## Non-Goals
 
 Do not implement:
 
-production MM wallet challenge auth
-signed taker RFQ request
-options RFQ
-multi-leg RFQ
-MM ranking
-RFQ auction engine
-auto-signing
-auto-simulation
-auto-broadcast
-Solidity changes
-PerpTrade ABI changes
-Absolute Safety Rules
+- on-chain option exercise
+- on-chain option settlement
+- option execution broadcast
+- option PerpTrade equivalent
+- options RFQ
+- options WebTransport RFQ
+- Greeks
+- implied volatility surface
+- pricing engine
+- margin/risk computation changes
+- Solidity changes
+- deployment
+- auto-broadcast
+- options market maker strategy
+
+## Absolute Safety Rules
 
 Do not:
 
-modify Solidity
-deploy contracts
-change execution lifecycle
-enable real broadcast by default
-call /executor/broadcast
-fake signatures
-fake recovered signer
-bypass expiry
-bypass price/size validation
-bypass accepted quote single-winner rule
-require live RPC/Postgres/WebTransport/private keys for normal cargo test
-commit
-push
-expose private keys
-Signature Modes
+- modify Solidity
+- deploy contracts
+- change existing perp execution lifecycle
+- break existing perp orderbook
+- break RFQ
+- break MM gateway
+- fake on-chain option state
+- require live RPC/Postgres/private keys/WebTransport/certs for normal cargo test
+- commit
+- push
+- expose private keys
 
-Add config:
+## Option Series Model
 
-RFQ_QUOTE_SIGNATURE_MODE=disabled
+Add an option series domain model.
 
-Allowed values:
+Suggested fields:
 
-disabled
-strict
+```text
+option_series_id: string
+underlying: string / address
+base_asset: string / address
+quote_asset: string / address
+settlement_asset: string / address
+expiry: u64
+strike_1e8: string
+is_call: bool
+contract_size_1e8: string
+status: active/expired/disabled
+source: manual/onchain
+created_at_ms
+updated_at_ms
+
+If the Solidity registry has a specific series/product id, include:
+
+onchain_product_id
+onchain_series_id
+
+Use naming aligned with existing Solidity if known.
+
+Important numeric rules:
+
+strike is 1e8
+contract size is 1e8
+avoid floats
+use string/integers consistently with current backend style
+Series Identifier
+
+Define deterministic backend option_series_id.
+
+Recommended:
+
+keccak256(
+  underlying/base/quote/settlement/expiry/strike_1e8/is_call/contract_size_1e8
+)
+
+or UUID if easier.
+
+If using hash:
+
+expose hex string
+deterministic across restarts
+tested
+Database
+
+Add migration:
+
+migrations/0012_option_series.sql
+
+Suggested table:
+
+CREATE TABLE option_series (
+    option_series_id TEXT PRIMARY KEY,
+    underlying TEXT NOT NULL,
+    base_asset TEXT NOT NULL,
+    quote_asset TEXT NOT NULL,
+    settlement_asset TEXT NOT NULL,
+    expiry BIGINT NOT NULL,
+    strike_1e8 TEXT NOT NULL,
+    is_call BOOLEAN NOT NULL,
+    contract_size_1e8 TEXT NOT NULL,
+    status TEXT NOT NULL,
+    source TEXT NOT NULL,
+    onchain_product_id TEXT NULL,
+    onchain_series_id TEXT NULL,
+    created_at_ms BIGINT NOT NULL,
+    updated_at_ms BIGINT NOT NULL
+);
+
+CREATE INDEX idx_option_series_status ON option_series(status);
+CREATE INDEX idx_option_series_expiry ON option_series(expiry);
+CREATE INDEX idx_option_series_underlying ON option_series(lower(underlying));
+CREATE INDEX idx_option_series_strike ON option_series(strike_1e8);
+CREATE INDEX idx_option_series_callput ON option_series(is_call);
+
+If existing repository style prefers different naming, follow existing conventions.
+
+Rust Modules
+
+Add:
+
+src/options/
+  mod.rs
+  types.rs
+  service.rs
+  store.rs
+
+Optional:
+
+src/options/series_id.rs
+Config
+
+Add safe defaults:
+
+OPTIONS_ENABLED=false
+OPTIONS_REQUIRE_PERSISTENCE=true
+OPTIONS_ALLOW_MANUAL_SERIES=true
+OPTIONS_SYNC_ONCHAIN_REGISTRY=false
+OPTIONS_DEFAULT_CONTRACT_SIZE_1E8=100000000
 
 Behavior:
 
-disabled
-existing RFQ V1B behavior preserved
-signature field optional
-no cryptographic recovery required
-useful for local/dev smoke tests
-strict
-quote signature required
-backend verifies EIP-712 signature
-recovered signer must equal mm_account
-invalid signature rejected
+if disabled, option endpoints return clear error
+if enabled and persistence required but unavailable, startup fails clearly
+normal cargo test must not need Postgres
+HTTP Endpoints
 
-Startup should reject invalid mode clearly.
+Add:
 
-EIP-712 RFQ Quote Type
+POST /options/series
+GET /options/series
+GET /options/series/:option_series_id
+POST /options/series/:option_series_id/disable
+GET /options/orderbooks/:option_series_id
+POST /options/series
 
-Define typed data:
-
-RFQQuote(
-  bytes32 rfqId,
-  address mmAccount,
-  uint256 marketId,
-  bool takerIsBuyer,
-  uint128 price1e8,
-  uint128 size1e8,
-  uint256 quoteNonce,
-  uint256 expiry
-)
-
-Field meanings:
-
-rfqId: bytes32 derived from RFQ UUID/string
-mmAccount: quote signer
-marketId: RFQ market
-takerIsBuyer: true if RFQ side is buy, false if RFQ side is sell
-price1e8: quoted execution price
-size1e8: quoted size
-quoteNonce: MM-provided RFQ quote nonce for replay/idempotence
-expiry: quote expiry in seconds or milliseconds; choose one and document clearly
-
-Prefer seconds for EIP-712 if aligning with Solidity-style timestamps, but preserve existing ms storage if needed. Be explicit.
-
-Domain:
-
-Use existing backend EIP-712 domain style where possible.
-
-Recommended config:
-
-RFQ_EIP712_NAME=DeOptV2RFQ
-RFQ_EIP712_VERSION=1
-RFQ_EIP712_CHAIN_ID=84532
-RFQ_EIP712_VERIFYING_CONTRACT=0x0000000000000000000000000000000000000000
-
-If reusing existing EIP712 config is cleaner, document the choice.
-
-RFQ ID bytes32
-
-Add deterministic helper:
-
-rfq_id_to_b256(rfq_id: &str) = keccak256(bytes(rfq_id))
-
-Expose hex helper if needed.
-
-API Changes
-GET /rfqs/:rfq_id/quote-signing-payload
-
-Query or body may include quote fields.
-
-Preferred endpoint:
-
-POST /rfqs/:rfq_id/quote-signing-payload
+Manual dev/admin series creation.
 
 Request:
 
 {
-  "mm_account": "0x...",
-  "price_1e8": "300100000000",
-  "size_1e8": "100000000",
-  "client_quote_id": "mm-rfq-quote-001",
-  "quote_nonce": 1,
-  "quote_ttl_ms": 3000
+  "underlying": "ETH",
+  "base_asset": "ETH",
+  "quote_asset": "USDC",
+  "settlement_asset": "USDC",
+  "expiry": 1770000000,
+  "strike_1e8": "300000000000",
+  "is_call": true,
+  "contract_size_1e8": "100000000",
+  "onchain_product_id": null,
+  "onchain_series_id": null
 }
 
 Response:
 
 {
-  "rfq_id": "...",
-  "rfq_id_b32": "0x...",
-  "digest": "0x...",
-  "domain": {...},
-  "types": {...},
-  "message": {
-    "rfqId": "0x...",
-    "mmAccount": "0x...",
-    "marketId": 1,
-    "takerIsBuyer": true,
-    "price1e8": "300100000000",
-    "size1e8": "100000000",
-    "quoteNonce": "1",
-    "expiry": "..."
-  }
+  "option_series_id": "...",
+  "status": "active"
 }
-POST /rfqs/:rfq_id/quotes
 
-Extend request:
+Validation:
+
+expiry must be future unless test mode allows otherwise
+strike > 0
+contract_size > 0
+is_call bool
+assets non-empty
+duplicate deterministic series should return existing or reject deterministically; choose and document
+GET /options/series
+
+Support filters:
+
+underlying
+expiry
+is_call
+status
+
+Keep simple.
+
+GET /options/orderbooks/:option_series_id
+
+Return option orderbook for that series.
+
+For V1A, this can reuse existing orderbook representation if possible.
+
+Option Orderbook Keying
+
+Current engine/orderbook likely keys by market_id.
+
+Options need a separate key type.
+
+Add minimal support for:
+
+InstrumentId:
+  PerpMarket(u64)
+  OptionSeries(String)
+
+or equivalent.
+
+Do not break existing perp market orderbooks.
+
+If refactor is too broad, implement an option-specific orderbook store separately:
+
+option_orderbooks: HashMap<option_series_id, OrderBook>
+
+Prefer minimal safe change.
+
+Option Orders V1A
+
+Add HTTP endpoint if feasible:
+
+POST /options/orders
+POST /options/orders/:order_id/cancel
+
+If too broad, defer actual option order submission and only implement series/orderbook read model.
+
+Preferred V1A includes option order submission as off-chain only.
+
+Request:
 
 {
-  "mm_account": "0x...",
-  "price_1e8": "300100000000",
+  "option_series_id": "...",
+  "account": "0x...",
+  "side": "buy",
+  "price_1e8": "1000000000",
   "size_1e8": "100000000",
-  "client_quote_id": "mm-rfq-quote-001",
-  "quote_nonce": 1,
-  "quote_ttl_ms": 3000,
+  "time_in_force": "gtc",
+  "client_order_id": "eth-call-3000-bid-1",
+  "nonce": 1,
+  "deadline_ms": 4102444800000,
   "signature": "0x..."
 }
 
-In strict mode:
+Behavior:
 
-signature required
-quote_nonce required
-digest recomputed server-side
-recovered signer must equal mm_account
-WebTransport rfq_quote
+validates series active
+validates price > 0
+validates size > 0
+validates account address
+stores order in option orderbook
+no on-chain execution intent yet
+if matching occurs, either:
+create an option execution intent placeholder disabled by default, or
+do not match options yet
+choose the simpler safe behavior and document
 
-Extend payload similarly:
+Recommendation V1A:
 
-{
-  "rfq_id": "...",
-  "mm_account": "0x...",
-  "price_1e8": "300100000000",
-  "size_1e8": "100000000",
-  "client_quote_id": "mm-rfq-quote-001",
-  "quote_nonce": 1,
-  "quote_ttl_ms": 3000,
-  "signature": "0x..."
-}
+resting option orderbook only, no matching/execution intent yet
 
-In disabled mode, smoke flow can omit signature.
+But if existing orderbook matching is easy to reuse safely, matching can be included without on-chain execution.
 
-In strict mode, reject missing/invalid signature.
+Market Maker Gateway Impact
 
-Database
+Do not integrate options into MM Gateway in V1A unless trivial.
 
-Extend rfq_quotes with nullable fields:
+Document future:
 
-signature TEXT NULL,
-quote_digest TEXT NULL,
-quote_nonce TEXT NULL,
-signature_status TEXT NULL,
-recovered_signer TEXT NULL
-
-Add migration:
-
-migrations/0011_signed_rfq_quotes.sql
-
-Do not modify old migration.
-
-signature_status values:
-
-not_required
-verified
-missing
-invalid
-signer_mismatch
-
-In strict mode, only verified quotes can be active.
-
-In disabled mode, store not_required.
-
-Rust Modules
-
-Add or extend:
-
-src/rfq/signing.rs
-src/rfq/types.rs
-src/rfq/service.rs
-src/api/routes.rs
-src/mm/protocol.rs
-src/mm/service.rs
-
-Reuse existing ECDSA/EIP-712 signing utilities if present from PerpTrade signing.
-
-Avoid duplicate crypto code if possible.
-
-Dev CLI
-
-Add optional dev CLI for RFQ quote signing:
-
-src/bin/sign_rfq_quote.rs
-
-Usage:
-
-MM_PRIVATE_KEY=0x... cargo run --bin sign_rfq_quote -- \
-  --payload /tmp/rfq_quote_payload.json
-
-Output:
-
-{
-  "signer_address": "0x...",
-  "signature": "0x..."
-}
-
-Same safety rules:
-
-do not print private key
-reject signer mismatch if role/account provided
-testnet/dev only
-
-If adding this CLI is too much, defer it. But signed RFQ strict mode is hard to test manually without it.
-
+MM Gateway options support will use option_series_id instead of market_id.
 Tests
 
 Normal cargo test must remain offline.
 
 Add tests for:
 
-rfq_id_to_b256 deterministic
-RFQQuote typehash stable
-signing payload digest deterministic
-disabled mode accepts unsigned quote
-strict mode rejects missing signature
-strict mode rejects malformed signature
-strict mode rejects invalid signature
-strict mode rejects signer mismatch
-strict mode accepts valid signature
-HTTP quote endpoint stores signature metadata
-WebTransport rfq_quote supports signature fields
-quote acceptance only accepts active verified quote in strict mode
-quote nonce stored
-duplicate client_quote_id behavior unchanged
-normal RFQ V1B disabled-mode tests still pass
-
-No live RPC/Postgres/WebTransport/private keys required for normal tests.
-
-Runtime Verification After Implementation
-
-After implementation, perform only if feasible:
-
-RFQ_QUOTE_SIGNATURE_MODE=disabled
-existing RFQ smoke still passes
-RFQ_QUOTE_SIGNATURE_MODE=strict
-create RFQ
-get signing payload
-sign with sign_rfq_quote
-submit quote over HTTP
-verify quote accepted active/verified
-accept quote creates execution_intent
-no broadcast
-
-WebTransport strict runtime can be deferred if HTTP strict path is verified.
-
-Docs
+option series creation success
+rejects zero strike
+rejects zero contract size
+rejects expired expiry if enforced
+deterministic option_series_id
+duplicate series behavior
+list series by status
+list series by underlying
+get series by id
+disable series
+get orderbook for empty active series
+get orderbook rejects unknown series
+option order submission if implemented
+option order rejects inactive series if order submission implemented
+existing perp orderbook tests still pass
+Documentation
 
 Update:
 
@@ -352,19 +357,16 @@ ARCHITECTURE.md
 
 Document:
 
-RFQ signed quote purpose
-signature mode config
-EIP-712 RFQQuote type
-quote signing payload endpoint
-strict vs disabled behavior
-quote signature DB metadata
-dev signing CLI
-no auto-broadcast
-future:
-production MM auth
-signed taker RFQ request
-options RFQ
-MM ranking
+Options V1A scope
+option series fields
+option_series_id
+call/put mapping
+strike/contract size 1e8 conventions
+no on-chain option execution yet
+no options RFQ yet
+future MM Gateway options support
+future options RFQ
+future Greeks/risk cache
 Validation
 
 Run:
@@ -377,30 +379,32 @@ Acceptance Criteria
 
 Complete only if:
 
-RFQ quote signature config exists
-quote signing payload endpoint exists
-strict mode verifies signatures
-disabled mode preserves current flow
-RFQ HTTP quote supports signatures
-WebTransport rfq_quote supports signature fields
-signature metadata persisted
-tests cover valid/invalid/missing/mismatch signatures
-no auto-broadcast
+options config exists
+option series model exists
+migration exists
+service/store exists
+HTTP series endpoints exist
+empty option orderbook endpoint exists
+no existing perp/RFQ/MM behavior broken
+normal tests offline
 docs updated
 cargo fmt passes
 cargo clippy passes
 cargo test passes
 cargo build passes
-Deferred
-production MM auth/challenge
-signed taker RFQ request
-RFQ quote cancellation by signed message
-WebTransport strict runtime smoke
-options RFQ
-multi-leg RFQ
-MM ranking/selection
-expiry scheduler
+Deferred to Options V1B
+option order submission if not completed
+option matching
+option execution intent
+option RFQ
+option MM Gateway messages
+on-chain OptionProductRegistry sync
+Greeks
+IV surface
+risk cache
+expiry settlement integration
 EOF
+
 
 
 

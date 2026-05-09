@@ -35,6 +35,12 @@ pub enum BackendError {
     InvalidRfqState(String),
     #[error("invalid RFQ quote state: {0}")]
     InvalidRfqQuoteState(String),
+    #[error("options are disabled")]
+    OptionsDisabled,
+    #[error("invalid option series id: {0}")]
+    InvalidOptionSeriesId(String),
+    #[error("invalid option series state: {0}")]
+    InvalidOptionSeriesState(String),
     #[error("invalid PerpTrade intentId")]
     InvalidPerpTradeIntentId,
     #[error("invalid fixed-point value for {field}: {reason}")]
