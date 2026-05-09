@@ -19,11 +19,11 @@ The long-term backend needs low-latency deterministic matching, RFQ, market-make
 - `reconciliation`: Opt-in Reconciliation V1 that links indexed events to execution intents by direct `onchain_intent_id` equality without marking finality.
 - `confirmation`: Opt-in Confirmation / Finality V1 that reads transaction receipts and block height, then marks submitted execution transactions and intents confirmed only after receipt success, enough blocks, indexed event identity, and matched reconciliation.
 - `db`: Optional PostgreSQL persistence for used nonces, submitted orders, matched trades, execution intents, and engine event audit records.
-- `rfq`: RFQ V1B domain types, in-memory store, service validation, quote lifecycle, MM gateway broadcast/notification coordination, quote acceptance, and execution-intent creation through the existing lifecycle boundary.
+- `rfq`: RFQ V1C domain types, in-memory store, service validation, EIP-712 quote signing payloads, strict/disabled quote signature verification, quote lifecycle, MM gateway broadcast/notification coordination, quote acceptance, and execution-intent creation through the existing lifecycle boundary.
 - `orders`: Shared order/cancel service used by HTTP and the Market Maker Gateway for signed order validation, nonce handling, matching, persistence writes, ownership-checked cancels, cancel-all, and deterministic resting-order lookup.
 - `mm`: Market Maker Gateway protocol, session, heartbeat, rate-limit, live order/cancel handling, quote-replace models, service boundary, adapter traits, and disabled-by-default WebTransport V1C adapter. Protocol/session/service/rate-limit logic remains transport-agnostic.
-- `signing`: signed-order schema, EIP-712 order hashing, strict secp256k1 signer recovery, signature mode, deadline validation, and in-memory nonce tracking.
-- `config`: environment loading for host, port, log level, network name, chain id, disabled execution flag, simulation flags, indexer flags, reconciliation flags, confirmation flags, Market Maker Gateway V1C flags, signature mode, and opt-in persistence.
+- `signing`: signed-order schema, shared EIP-712 helpers, strict secp256k1 signer recovery, signature mode, deadline validation, and in-memory nonce tracking.
+- `config`: environment loading for host, port, log level, network name, chain id, disabled execution flag, simulation flags, indexer flags, reconciliation flags, confirmation flags, RFQ signature mode/domain flags, Market Maker Gateway V1C flags, signature mode, and opt-in persistence.
 
 ## Current v1 Scope
 
@@ -47,12 +47,12 @@ The long-term backend needs low-latency deterministic matching, RFQ, market-make
 - Optional Indexer V1 guarded by `INDEXER_ENABLED=false` by default.
 - Optional Reconciliation V1 guarded by `RECONCILIATION_ENABLED=false` by default.
 - Optional Confirmation / Finality V1 guarded by `CONFIRMATION_ENABLED=false` by default.
-- RFQ V1B guarded by `RFQ_ENABLED=false` by default. Enabled mode exposes HTTP/core RFQ creation, quote submission/listing, cancellation, WebTransport RFQ push/quote intake through connected MM sessions, and acceptance into a pending execution intent without auto-broadcast.
+- RFQ V1C guarded by `RFQ_ENABLED=false` and `RFQ_QUOTE_SIGNATURE_MODE=disabled` by default. Enabled mode exposes HTTP/core RFQ creation, quote signing payloads, quote submission/listing, cancellation, WebTransport RFQ push/quote intake through connected MM sessions, optional strict signed quote verification, and acceptance into a pending execution intent without auto-broadcast.
 - Market Maker Gateway V1C guarded by `MM_GATEWAY_ENABLED=false` by default. Enabled mode starts a separate WebTransport UDP listener with required TLS cert/key config and routes MM order flow through the live off-chain perp orderbook without auto-broadcasting.
 
-## RFQ V1B
+## RFQ V1C
 
-RFQ V1B is an HTTP/core service integrated with the Market Maker Gateway. A taker creates an RFQ through HTTP, the backend broadcasts an `rfq_request` to connected MM sessions when available, market makers submit quotes through either WebTransport `rfq_quote` or the HTTP/dev endpoint, the taker lists quotes through HTTP, and accepting one quote creates a normal pending `ExecutionIntent`. The accepted intent then follows the same signing, simulation, guarded broadcast, indexing, reconciliation, and confirmation lifecycle as orderbook-created intents.
+RFQ V1C is an HTTP/core service integrated with the Market Maker Gateway. A taker creates an RFQ through HTTP, the backend broadcasts an `rfq_request` to connected MM sessions when available, market makers can fetch an EIP-712 `RFQQuote` signing payload, submit quotes through either WebTransport `rfq_quote` or the HTTP/dev endpoint, the taker lists quotes through HTTP, and accepting one quote creates a normal pending `ExecutionIntent`. The accepted intent then follows the same signing, simulation, guarded broadcast, indexing, reconciliation, and confirmation lifecycle as orderbook-created intents.
 
 RFQ statuses are `open`, `expired`, `accepted`, `cancelled`, and `failed`. Quote statuses are `active`, `expired`, `accepted`, `rejected`, and `cancelled`. Expiry is enforced at quote submission and acceptance time. Accepting a quote is single-winner: the RFQ becomes `accepted`, the winning quote becomes `accepted`, and all other active quotes for that RFQ become `rejected`.
 
@@ -65,10 +65,25 @@ side=sell -> buyer=mm_account, seller=taker,      buyer_is_maker=true
 
 RFQ acceptance creates only the execution intent. It does not sign PerpTrade payloads, does not simulate, does not broadcast, does not create transaction hashes, and does not mark confirmation or finality. In persistent mode, the accepted quote, RFQ status, deterministic quote rejection, execution-intent insert, and engine audit event are written in one SQL transaction. In-memory mode is available for normal offline tests and local development.
 
+Signed quote verification is controlled by `RFQ_QUOTE_SIGNATURE_MODE`:
+- `disabled`: preserves the unsigned RFQ V1B flow. Signatures are optional, cryptographic recovery is skipped, and stored quotes use `signature_status=not_required`.
+- `strict`: requires `quote_nonce` and a 65-byte ECDSA signature. The backend recomputes the EIP-712 digest, recovers the signer, and rejects the quote unless the recovered address equals `mm_account`. Active accepted quotes in this mode are verified quotes.
+
+The signed typed payload is:
+
+```text
+RFQQuote(bytes32 rfqId,address mmAccount,uint256 marketId,bool takerIsBuyer,uint128 price1e8,uint128 size1e8,uint256 quoteNonce,uint256 expiry)
+```
+
+`rfqId` is `keccak256(bytes(rfq_uuid_string))`. `takerIsBuyer` is true when RFQ `side=buy`. `quoteNonce` is market-maker supplied. `expiry` is encoded in seconds and currently binds the quote signature to the RFQ expiry; the persisted quote can still expire earlier through `quote_ttl_ms`.
+
+RFQ signatures use a separate configurable EIP-712 domain: `RFQ_EIP712_NAME`, `RFQ_EIP712_VERSION`, `RFQ_EIP712_CHAIN_ID`, and `RFQ_EIP712_VERIFYING_CONTRACT`. The default name is `DeOptV2RFQ` and the verifying contract defaults to the zero address for off-chain/dev operation.
+
 HTTP endpoints:
 - `POST /rfqs`
 - `GET /rfqs`
 - `GET /rfqs/:rfq_id`
+- `POST /rfqs/:rfq_id/quote-signing-payload`
 - `POST /rfqs/:rfq_id/quotes`
 - `GET /rfqs/:rfq_id/quotes`
 - `POST /rfqs/:rfq_id/accept/:quote_id`
@@ -76,12 +91,12 @@ HTTP endpoints:
 
 Market Maker Gateway RFQ protocol messages:
 - `rfq_request`: server-initiated push to active MM sessions with RFQ id, taker, market, side, size, optional limit price, and expiry.
-- `rfq_quote`: MM-submitted quote with RFQ id, MM account, price, size, optional client quote id, and quote TTL.
+- `rfq_quote`: MM-submitted quote with RFQ id, MM account, price, size, optional client quote id, quote TTL, optional quote nonce, and optional signature. In strict mode, quote nonce and signature are required.
 - `rfq_quote_result`: gateway response containing the persisted quote id, RFQ id, active status, and expiry.
 - `rfq_quote_accepted`: best-effort notification to the accepted quote session with execution intent id and on-chain intent id.
 - `rfq_quote_rejected`: best-effort notification to active competing quote sessions after another quote wins.
 
-The session registry is transport-neutral and stores active session snapshots plus outbound message channels. WebTransport code only registers/unregisters sessions and writes server-initiated frames; RFQ validation, persistence, and acceptance behavior stay in RFQ/MM service layers. Signed RFQ quote messages, market-maker selection/ranking, options RFQ, multi-leg RFQ, and expiry schedulers remain deferred.
+The session registry is transport-neutral and stores active session snapshots plus outbound message channels. WebTransport code only registers/unregisters sessions and writes server-initiated frames; RFQ validation, signature verification, persistence, and acceptance behavior stay in RFQ/MM service layers. Production MM auth, signed taker RFQ requests, market-maker selection/ranking, options RFQ, multi-leg RFQ, and expiry schedulers remain deferred.
 
 ## Perp On-chain Nonce Sync V1
 
@@ -200,7 +215,7 @@ HTTP endpoints:
 
 ## RFQ Future Design
 
-Future RFQ phases add production wallet authentication, signed RFQ quote messages, options and multi-leg RFQs, market-maker ranking, auction logic, richer lifecycle notifications, and expiry schedulers. RFQ V1B intentionally stops at basic broadcast to active MM sessions, gateway quote persistence, and best-effort acceptance/rejection notifications.
+Future RFQ phases add production wallet authentication, signed taker RFQ requests, signed quote cancellation, options and multi-leg RFQs, market-maker ranking, auction logic, richer lifecycle notifications, and expiry schedulers. RFQ V1C intentionally stops at signed single-leg perp quote verification, gateway quote persistence, and best-effort acceptance/rejection notifications.
 
 ## Market Maker Gateway V1A
 

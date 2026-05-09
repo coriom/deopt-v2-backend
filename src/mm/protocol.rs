@@ -236,7 +236,9 @@ pub struct RfqQuotePayload {
     pub price_1e8: String,
     pub size_1e8: String,
     pub client_quote_id: Option<String>,
+    pub quote_nonce: Option<u64>,
     pub quote_ttl_ms: u64,
+    pub signature: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Default, Deserialize)]

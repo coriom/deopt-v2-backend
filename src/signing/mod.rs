@@ -4,4 +4,4 @@ pub mod signature;
 
 pub use eip712::{eip712_digest, Eip712Domain, SignedOrder};
 pub use nonce::NonceStore;
-pub use signature::{SignatureVerificationMode, SignatureVerifier};
+pub use signature::{recover_eip712_signer, SignatureVerificationMode, SignatureVerifier};

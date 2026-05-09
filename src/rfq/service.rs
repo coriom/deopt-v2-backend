@@ -1,4 +1,10 @@
-use super::{QuoteId, RfqConfig, RfqId, RfqQuote, RfqQuoteStatus, RfqRequest, RfqStatus};
+use super::signing::{
+    rfq_id_to_b256, rfq_quote_digest, rfq_quote_digest_bytes, RfqQuoteSigningPayload,
+};
+use super::{
+    QuoteId, RfqConfig, RfqId, RfqQuote, RfqQuoteSignatureMode, RfqQuoteSignatureStatus,
+    RfqQuoteStatus, RfqRequest, RfqStatus,
+};
 use crate::api::AppState;
 use crate::error::{BackendError, Result};
 use crate::execution::{intent_id_to_hex_bytes32, ExecutionIntent, ExecutionIntentStatus};
@@ -8,6 +14,7 @@ use crate::mm::protocol::{
 };
 use crate::nonce_sync::read_perp_nonce;
 use crate::signing::eip712::parse_evm_address;
+use crate::signing::recover_eip712_signer;
 use crate::types::{now_ms, AccountId, MarketId, OrderId, Price1e8, Side, Size1e8, TimestampMs};
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -30,7 +37,26 @@ pub struct SubmitQuoteInput {
     pub client_quote_id: Option<String>,
     pub price_1e8: Price1e8,
     pub size_1e8: Size1e8,
+    pub quote_nonce: Option<u64>,
     pub quote_ttl_ms: u64,
+    pub signature: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QuoteSigningPayloadInput {
+    pub rfq_id: RfqId,
+    pub mm_account: AccountId,
+    pub price_1e8: Price1e8,
+    pub size_1e8: Size1e8,
+    pub quote_nonce: u64,
+    pub quote_ttl_ms: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QuoteSigningPayloadOutcome {
+    pub rfq: RfqRequest,
+    pub payload: RfqQuoteSigningPayload,
+    pub digest: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -120,6 +146,47 @@ pub async fn get_rfq(state: &AppState, rfq_id: RfqId) -> Result<RfqRequest> {
         .ok_or(BackendError::InvalidRfqId)
 }
 
+pub async fn quote_signing_payload(
+    state: &AppState,
+    input: QuoteSigningPayloadInput,
+) -> Result<QuoteSigningPayloadOutcome> {
+    ensure_enabled(&state.rfq_config)?;
+    validate_account(&input.mm_account)?;
+    if input.price_1e8 == 0 {
+        return Err(BackendError::ZeroPrice);
+    }
+    if input.size_1e8 == 0 {
+        return Err(BackendError::ZeroSize);
+    }
+    if input.quote_ttl_ms < state.rfq_config.min_quote_ttl_ms {
+        return Err(BackendError::InvalidRfqQuoteState(
+            "quote_ttl_ms is below RFQ_MIN_QUOTE_TTL_MS".to_string(),
+        ));
+    }
+
+    let rfq = get_rfq(state, input.rfq_id).await?;
+    validate_open_rfq(&rfq, now_ms())?;
+    if input.size_1e8 > rfq.size_1e8 {
+        return Err(BackendError::InvalidRfqQuoteState(
+            "quote size exceeds RFQ size".to_string(),
+        ));
+    }
+
+    let payload = rfq_quote_signing_payload(
+        &rfq,
+        input.mm_account,
+        input.price_1e8,
+        input.size_1e8,
+        input.quote_nonce,
+    )?;
+    let digest = rfq_quote_digest(&payload, &state.rfq_config.eip712_domain)?;
+    Ok(QuoteSigningPayloadOutcome {
+        rfq,
+        payload,
+        digest,
+    })
+}
+
 pub async fn submit_quote(state: &AppState, input: SubmitQuoteInput) -> Result<RfqQuote> {
     ensure_enabled(&state.rfq_config)?;
     validate_account(&input.mm_account)?;
@@ -153,6 +220,7 @@ pub async fn submit_quote(state: &AppState, input: SubmitQuoteInput) -> Result<R
 
     let quote_ttl_ms = input.quote_ttl_ms.min(state.rfq_config.max_quote_ttl_ms);
     let expires_at_ms = checked_expiry(now, quote_ttl_ms)?.min(rfq.expires_at_ms);
+    let signature_metadata = verify_quote_signature(state, &rfq, &input)?;
     let quote = RfqQuote {
         quote_id: Uuid::new_v4(),
         rfq_id: input.rfq_id,
@@ -164,6 +232,11 @@ pub async fn submit_quote(state: &AppState, input: SubmitQuoteInput) -> Result<R
         status: RfqQuoteStatus::Active,
         created_at_ms: now,
         expires_at_ms,
+        signature: signature_metadata.signature,
+        quote_digest: signature_metadata.quote_digest,
+        quote_nonce: signature_metadata.quote_nonce,
+        signature_status: signature_metadata.signature_status,
+        recovered_signer: signature_metadata.recovered_signer,
     };
 
     if let Some(repository) = state.repository.clone() {
@@ -323,6 +396,15 @@ fn validate_acceptance(rfq: &RfqRequest, quote: &RfqQuote, now: TimestampMs) -> 
             quote.status.as_str()
         )));
     }
+    if quote.signature_status == RfqQuoteSignatureStatus::Missing
+        || quote.signature_status == RfqQuoteSignatureStatus::Invalid
+        || quote.signature_status == RfqQuoteSignatureStatus::SignerMismatch
+    {
+        return Err(BackendError::InvalidRfqQuoteState(format!(
+            "quote signature is {}",
+            quote.signature_status.as_str()
+        )));
+    }
     if now >= quote.expires_at_ms {
         return Err(BackendError::InvalidRfqQuoteState(
             "quote has expired".to_string(),
@@ -339,6 +421,101 @@ fn validate_acceptance(rfq: &RfqRequest, quote: &RfqQuote, now: TimestampMs) -> 
         ));
     }
     Ok(())
+}
+
+struct QuoteSignatureMetadata {
+    signature: Option<String>,
+    quote_digest: Option<String>,
+    quote_nonce: Option<String>,
+    signature_status: RfqQuoteSignatureStatus,
+    recovered_signer: Option<AccountId>,
+}
+
+fn verify_quote_signature(
+    state: &AppState,
+    rfq: &RfqRequest,
+    input: &SubmitQuoteInput,
+) -> Result<QuoteSignatureMetadata> {
+    match state.rfq_config.quote_signature_mode {
+        RfqQuoteSignatureMode::Disabled => {
+            let quote_digest = input
+                .quote_nonce
+                .map(|quote_nonce| {
+                    let payload = rfq_quote_signing_payload(
+                        rfq,
+                        input.mm_account.clone(),
+                        input.price_1e8,
+                        input.size_1e8,
+                        quote_nonce,
+                    )?;
+                    rfq_quote_digest(&payload, &state.rfq_config.eip712_domain)
+                })
+                .transpose()?;
+            Ok(QuoteSignatureMetadata {
+                signature: input.signature.clone(),
+                quote_digest,
+                quote_nonce: input.quote_nonce.map(|value| value.to_string()),
+                signature_status: RfqQuoteSignatureStatus::NotRequired,
+                recovered_signer: None,
+            })
+        }
+        RfqQuoteSignatureMode::Strict => {
+            let Some(quote_nonce) = input.quote_nonce else {
+                return Err(BackendError::InvalidRfqQuoteState(
+                    "quote_nonce is required when RFQ_QUOTE_SIGNATURE_MODE=strict".to_string(),
+                ));
+            };
+            let Some(signature) = input.signature.as_deref() else {
+                return Err(BackendError::InvalidRfqQuoteState(
+                    "signature is required when RFQ_QUOTE_SIGNATURE_MODE=strict".to_string(),
+                ));
+            };
+            let payload = rfq_quote_signing_payload(
+                rfq,
+                input.mm_account.clone(),
+                input.price_1e8,
+                input.size_1e8,
+                quote_nonce,
+            )?;
+            let digest_bytes = rfq_quote_digest_bytes(&payload, &state.rfq_config.eip712_domain)?;
+            let quote_digest = crate::execution::transaction::hex_0x(&digest_bytes);
+            let recovered_signer = recover_eip712_signer(&digest_bytes, signature)?;
+            let expected = parse_evm_address(&input.mm_account)?;
+            let recovered = parse_evm_address(&recovered_signer)?;
+            if recovered != expected {
+                return Err(BackendError::SignatureSignerMismatch);
+            }
+            Ok(QuoteSignatureMetadata {
+                signature: Some(signature.to_string()),
+                quote_digest: Some(quote_digest),
+                quote_nonce: Some(quote_nonce.to_string()),
+                signature_status: RfqQuoteSignatureStatus::Verified,
+                recovered_signer: Some(recovered_signer),
+            })
+        }
+    }
+}
+
+fn rfq_quote_signing_payload(
+    rfq: &RfqRequest,
+    mm_account: AccountId,
+    price_1e8: Price1e8,
+    size_1e8: Size1e8,
+    quote_nonce: u64,
+) -> Result<RfqQuoteSigningPayload> {
+    let expiry = u128::try_from(rfq.expires_at_ms / 1000).map_err(|_| {
+        BackendError::InvalidRfqState("RFQ expires_at_ms cannot be encoded".to_string())
+    })?;
+    Ok(RfqQuoteSigningPayload {
+        rfq_id: rfq_id_to_b256(&rfq.rfq_id.to_string()),
+        mm_account,
+        market_id: rfq.market_id,
+        taker_is_buyer: rfq.side == Side::Buy,
+        price_1e8,
+        size_1e8,
+        quote_nonce: quote_nonce.into(),
+        expiry,
+    })
 }
 
 fn price_satisfies_limit(side: Side, limit: Option<Price1e8>, price: Price1e8) -> bool {

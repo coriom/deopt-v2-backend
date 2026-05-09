@@ -1,6 +1,8 @@
 use super::eip712::{eip712_digest, keccak256, parse_evm_address, Eip712Domain};
 use super::SignedOrder;
 use crate::error::{BackendError, Result};
+use crate::execution::transaction::hex_0x;
+use crate::types::AccountId;
 use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
@@ -72,6 +74,12 @@ fn verify_strict(order: &SignedOrder, domain: &Eip712Domain) -> Result<()> {
     }
 
     Ok(())
+}
+
+pub fn recover_eip712_signer(digest: &[u8; 32], signature: &str) -> Result<AccountId> {
+    validate_signature_shape(signature)?;
+    let signature = parse_signature(signature)?;
+    Ok(AccountId::new(hex_0x(&recover_signer(digest, &signature)?)))
 }
 
 fn recover_signer(digest: &[u8; 32], signature: &ParsedSignature) -> Result<[u8; 20]> {

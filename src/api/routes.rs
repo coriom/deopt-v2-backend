@@ -29,9 +29,13 @@ use crate::rfq::service::{
     accept_quote as accept_rfq_quote, cancel_rfq as cancel_rfq_service,
     create_rfq as create_rfq_service, get_rfq as get_rfq_service,
     list_quotes as list_rfq_quotes_service, list_rfqs as list_rfqs_service,
-    submit_quote as submit_rfq_quote, AcceptQuoteOutcome, CreateRfqInput, SubmitQuoteInput,
+    quote_signing_payload as rfq_quote_signing_payload, submit_quote as submit_rfq_quote,
+    AcceptQuoteOutcome, CreateRfqInput, QuoteSigningPayloadInput, SubmitQuoteInput,
 };
-use crate::rfq::{parse_quote_id, parse_rfq_id, RfqQuote, RfqQuoteStatus, RfqRequest, RfqStatus};
+use crate::rfq::{
+    parse_quote_id, parse_rfq_id, rfq_id_to_hex_bytes32, RfqQuote, RfqQuoteSignatureStatus,
+    RfqQuoteStatus, RfqRequest, RfqStatus, RFQ_QUOTE_TYPE,
+};
 use crate::types::{now_ms, AccountId, MarketId, OrderId, Side};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -53,6 +57,10 @@ pub fn router(state: AppState) -> Router {
         .route("/orders/:order_id", delete(cancel_order))
         .route("/rfqs", post(create_rfq).get(list_rfqs))
         .route("/rfqs/:rfq_id", get(get_rfq))
+        .route(
+            "/rfqs/:rfq_id/quote-signing-payload",
+            post(rfq_quote_payload),
+        )
         .route("/rfqs/:rfq_id/quotes", post(submit_quote).get(list_quotes))
         .route("/rfqs/:rfq_id/accept/:quote_id", post(accept_quote))
         .route("/rfqs/:rfq_id/cancel", post(cancel_rfq))
@@ -321,7 +329,9 @@ struct SubmitQuoteRequest {
     price_1e8: String,
     size_1e8: String,
     client_quote_id: Option<String>,
+    quote_nonce: Option<u64>,
     quote_ttl_ms: u64,
+    signature: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -336,6 +346,11 @@ struct RfqQuoteResponse {
     status: RfqQuoteStatus,
     created_at_ms: i64,
     expires_at_ms: i64,
+    signature: Option<String>,
+    quote_digest: Option<String>,
+    quote_nonce: Option<String>,
+    signature_status: RfqQuoteSignatureStatus,
+    recovered_signer: Option<AccountId>,
 }
 
 impl From<RfqQuote> for RfqQuoteResponse {
@@ -353,8 +368,99 @@ impl From<RfqQuote> for RfqQuoteResponse {
             status,
             created_at_ms: quote.created_at_ms,
             expires_at_ms: quote.expires_at_ms,
+            signature: quote.signature,
+            quote_digest: quote.quote_digest,
+            quote_nonce: quote.quote_nonce,
+            signature_status: quote.signature_status,
+            recovered_signer: quote.recovered_signer,
         }
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+struct RfqQuoteSigningPayloadRequest {
+    mm_account: AccountId,
+    price_1e8: String,
+    size_1e8: String,
+    client_quote_id: Option<String>,
+    quote_nonce: u64,
+    quote_ttl_ms: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct RfqQuoteSigningPayloadResponse {
+    rfq_id: Uuid,
+    rfq_id_b32: String,
+    digest: String,
+    domain: SigningPayloadDomain,
+    primary_type: &'static str,
+    types: Vec<SigningPayloadTypeField>,
+    message: RfqQuoteSigningPayloadMessage,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct RfqQuoteSigningPayloadMessage {
+    #[serde(rename = "rfqId")]
+    rfq_id: String,
+    #[serde(rename = "mmAccount")]
+    mm_account: String,
+    #[serde(rename = "marketId")]
+    market_id: String,
+    #[serde(rename = "takerIsBuyer")]
+    taker_is_buyer: bool,
+    #[serde(rename = "price1e8")]
+    price_1e8: String,
+    #[serde(rename = "size1e8")]
+    size_1e8: String,
+    #[serde(rename = "quoteNonce")]
+    quote_nonce: String,
+    expiry: String,
+}
+
+async fn rfq_quote_payload(
+    State(state): State<AppState>,
+    Path(rfq_id): Path<String>,
+    Json(request): Json<RfqQuoteSigningPayloadRequest>,
+) -> Result<Json<RfqQuoteSigningPayloadResponse>, ApiError> {
+    let rfq_id = parse_rfq_id(&rfq_id)?;
+    let outcome = rfq_quote_signing_payload(
+        &state,
+        QuoteSigningPayloadInput {
+            rfq_id,
+            mm_account: request.mm_account,
+            price_1e8: parse_fixed_u128("price_1e8", &request.price_1e8)?,
+            size_1e8: parse_fixed_u128("size_1e8", &request.size_1e8)?,
+            quote_nonce: request.quote_nonce,
+            quote_ttl_ms: request.quote_ttl_ms,
+        },
+    )
+    .await?;
+    let domain = state.rfq_config.eip712_domain.clone();
+    let _ = request.client_quote_id;
+
+    Ok(Json(RfqQuoteSigningPayloadResponse {
+        rfq_id,
+        rfq_id_b32: rfq_id_to_hex_bytes32(&rfq_id.to_string()),
+        digest: outcome.digest,
+        domain: SigningPayloadDomain {
+            name: domain.name,
+            version: domain.version,
+            chain_id: domain.chain_id,
+            verifying_contract: domain.verifying_contract.0,
+        },
+        primary_type: "RFQQuote",
+        types: rfq_quote_type_fields(),
+        message: RfqQuoteSigningPayloadMessage {
+            rfq_id: rfq_id_to_hex_bytes32(&outcome.rfq.rfq_id.to_string()),
+            mm_account: outcome.payload.mm_account.0,
+            market_id: outcome.payload.market_id.to_string(),
+            taker_is_buyer: outcome.payload.taker_is_buyer,
+            price_1e8: outcome.payload.price_1e8.to_string(),
+            size_1e8: outcome.payload.size_1e8.to_string(),
+            quote_nonce: outcome.payload.quote_nonce.to_string(),
+            expiry: outcome.payload.expiry.to_string(),
+        },
+    }))
 }
 
 async fn submit_quote(
@@ -371,7 +477,9 @@ async fn submit_quote(
             client_quote_id: request.client_quote_id,
             price_1e8: parse_fixed_u128("price_1e8", &request.price_1e8)?,
             size_1e8: parse_fixed_u128("size_1e8", &request.size_1e8)?,
+            quote_nonce: request.quote_nonce,
             quote_ttl_ms: request.quote_ttl_ms,
+            signature: request.signature,
         },
     )
     .await?;
@@ -1505,6 +1613,44 @@ fn signing_payload_message(payload: PerpTradePayload) -> SigningPayloadMessage {
         seller_nonce: payload.seller_nonce.to_string(),
         deadline: payload.deadline.to_string(),
     }
+}
+
+fn rfq_quote_type_fields() -> Vec<SigningPayloadTypeField> {
+    let _ = RFQ_QUOTE_TYPE;
+    vec![
+        SigningPayloadTypeField {
+            name: "rfqId",
+            type_name: "bytes32",
+        },
+        SigningPayloadTypeField {
+            name: "mmAccount",
+            type_name: "address",
+        },
+        SigningPayloadTypeField {
+            name: "marketId",
+            type_name: "uint256",
+        },
+        SigningPayloadTypeField {
+            name: "takerIsBuyer",
+            type_name: "bool",
+        },
+        SigningPayloadTypeField {
+            name: "price1e8",
+            type_name: "uint128",
+        },
+        SigningPayloadTypeField {
+            name: "size1e8",
+            type_name: "uint128",
+        },
+        SigningPayloadTypeField {
+            name: "quoteNonce",
+            type_name: "uint256",
+        },
+        SigningPayloadTypeField {
+            name: "expiry",
+            type_name: "uint256",
+        },
+    ]
 }
 
 #[cfg(test)]

@@ -1,4 +1,5 @@
 use crate::error::{BackendError, Result};
+use crate::signing::Eip712Domain;
 use crate::types::{AccountId, MarketId, Price1e8, Side, Size1e8, TimestampMs};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
@@ -16,6 +17,8 @@ pub struct RfqConfig {
     pub min_quote_ttl_ms: u64,
     pub max_quote_ttl_ms: u64,
     pub max_quotes_per_rfq: usize,
+    pub quote_signature_mode: RfqQuoteSignatureMode,
+    pub eip712_domain: Eip712Domain,
 }
 
 impl RfqConfig {
@@ -28,6 +31,13 @@ impl RfqConfig {
             min_quote_ttl_ms: 500,
             max_quote_ttl_ms: 10_000,
             max_quotes_per_rfq: 50,
+            quote_signature_mode: RfqQuoteSignatureMode::Disabled,
+            eip712_domain: Eip712Domain {
+                name: "DeOptV2RFQ".to_string(),
+                version: "1".to_string(),
+                chain_id: 84532,
+                verifying_contract: AccountId::new("0x0000000000000000000000000000000000000000"),
+            },
         }
     }
 
@@ -66,6 +76,28 @@ impl RfqConfig {
             ));
         }
         Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RfqQuoteSignatureMode {
+    #[default]
+    Disabled,
+    Strict,
+}
+
+impl FromStr for RfqQuoteSignatureMode {
+    type Err = BackendError;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "disabled" => Ok(Self::Disabled),
+            "strict" => Ok(Self::Strict),
+            other => Err(BackendError::Config(format!(
+                "invalid RFQ_QUOTE_SIGNATURE_MODE: {other}"
+            ))),
+        }
     }
 }
 
@@ -139,6 +171,41 @@ impl RfqQuoteStatus {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RfqQuoteSignatureStatus {
+    NotRequired,
+    Verified,
+    Missing,
+    Invalid,
+    SignerMismatch,
+}
+
+impl RfqQuoteSignatureStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotRequired => "not_required",
+            Self::Verified => "verified",
+            Self::Missing => "missing",
+            Self::Invalid => "invalid",
+            Self::SignerMismatch => "signer_mismatch",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "not_required" => Ok(Self::NotRequired),
+            "verified" => Ok(Self::Verified),
+            "missing" => Ok(Self::Missing),
+            "invalid" => Ok(Self::Invalid),
+            "signer_mismatch" => Ok(Self::SignerMismatch),
+            other => Err(BackendError::Persistence(format!(
+                "invalid RFQ quote signature status: {other}"
+            ))),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RfqRequest {
     pub rfq_id: RfqId,
@@ -176,6 +243,11 @@ pub struct RfqQuote {
     pub status: RfqQuoteStatus,
     pub created_at_ms: TimestampMs,
     pub expires_at_ms: TimestampMs,
+    pub signature: Option<String>,
+    pub quote_digest: Option<String>,
+    pub quote_nonce: Option<String>,
+    pub signature_status: RfqQuoteSignatureStatus,
+    pub recovered_signer: Option<AccountId>,
 }
 
 impl RfqQuote {

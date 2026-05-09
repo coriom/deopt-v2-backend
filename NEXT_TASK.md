@@ -1,345 +1,408 @@
-# NEXT_TASK.md — RFQ V1B Runtime Verification
+# NEXT_TASK.md — RFQ V1C: Signed RFQ Quotes
 
 ## Context
 
-RFQ V1B has been implemented.
+RFQ V1A and V1B are implemented and runtime-verified.
 
-Implemented features:
-
-- RFQ protocol messages:
-  - `rfq_quote`
-  - `rfq_request`
-  - `rfq_quote_result`
-  - `rfq_quote_accepted`
-  - `rfq_quote_rejected`
-  - `rfq_expired`
-- MM session registry
-- RFQ creation broadcasts `rfq_request` to active MM sessions
-- WebTransport MM can submit `rfq_quote`
-- RFQ quotes are persisted through the RFQ service/repository
-- Accepted quote creates a normal pending execution_intent
-- Accepted quote notifies MM session best-effort
-- Competing active session quotes get best-effort rejection
-- No auto-broadcast
-- No Solidity changes
-- No execution lifecycle changes
-
-Validation already passed:
+Validated flow:
 
 ```text
-cargo fmt
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test
-cargo build
+HTTP POST /rfqs
+→ connected MM receives rfq_request over WebTransport
+→ MM sends rfq_quote over WebTransport
+→ quote is persisted in rfq_quotes
+→ HTTP GET /rfqs/:id/quotes sees quote
+→ HTTP accept quote creates execution_intent
+→ MM receives rfq_quote_accepted
+→ no broadcast
 
-Now runtime behavior must be verified.
+Persistent runtime verification passed with:
+
+RFQ accepted
+accepted quote persisted
+execution_intent persisted
+buyer/seller mapping correct
+no executor transaction created
+
+Current weakness:
+
+RFQ quotes are trusted because they arrive from a session. They are not cryptographically signed by the market maker.
 
 Goal
 
-Runtime-verify the complete RFQ V1B flow over real WebTransport.
+Implement RFQ V1C: signed RFQ quotes.
 
-Prove:
+A market maker RFQ quote must be signed over a deterministic EIP-712 typed message.
 
-HTTP taker creates RFQ
-→ connected MM receives rfq_request over WebTransport
-→ MM sends rfq_quote over WebTransport
-→ HTTP quote listing shows MM quote
-→ HTTP accept quote creates execution_intent
-→ MM receives rfq_quote_accepted notification
+The backend must:
+
+expose an RFQ quote signing payload
+accept RFQ quote signatures
+recover signer
+verify signer equals mm_account
+store signature/digest/signing metadata
+reject invalid signatures in strict mode
+keep unsigned/dev mode available by config
+preserve existing RFQ V1B flow
+keep accepted quote creating normal execution_intent
+never auto-broadcast
 Non-Goals
 
 Do not implement:
 
-RFQ V1C
-signed RFQ quotes
+production MM wallet challenge auth
+signed taker RFQ request
 options RFQ
 multi-leg RFQ
 MM ranking
-production auth
-market-data datagrams
+RFQ auction engine
 auto-signing
 auto-simulation
 auto-broadcast
-Safety Rules
+Solidity changes
+PerpTrade ABI changes
+Absolute Safety Rules
 
 Do not:
 
 modify Solidity
 deploy contracts
-change PerpTrade ABI
 change execution lifecycle
-enable real broadcast
+enable real broadcast by default
 call /executor/broadcast
-expose private keys
-fake RFQ success
-fake quote rows
-fake execution intents
-fake notifications
+fake signatures
+fake recovered signer
+bypass expiry
+bypass price/size validation
+bypass accepted quote single-winner rule
+require live RPC/Postgres/WebTransport/private keys for normal cargo test
 commit
 push
+expose private keys
+Signature Modes
 
-If a real code bug is found:
+Add config:
 
-apply minimal patch only
-run full validation:
-cargo fmt
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test
-cargo build
-Runtime Setup
+RFQ_QUOTE_SIGNATURE_MODE=disabled
 
-Use local WebTransport certs under:
+Allowed values:
 
-/tmp/deopt-mm-gateway/cert.pem
-/tmp/deopt-mm-gateway/key.pem
+disabled
+strict
 
-Use ECDSA P-256 cert generation because previous runtime smoke showed RSA cert failed WebTransport client verification.
+Behavior:
 
-Generate if missing:
+disabled
+existing RFQ V1B behavior preserved
+signature field optional
+no cryptographic recovery required
+useful for local/dev smoke tests
+strict
+quote signature required
+backend verifies EIP-712 signature
+recovered signer must equal mm_account
+invalid signature rejected
 
-mkdir -p /tmp/deopt-mm-gateway
+Startup should reject invalid mode clearly.
 
-openssl ecparam -name prime256v1 -genkey -noout \
-  -out /tmp/deopt-mm-gateway/key.pem
+EIP-712 RFQ Quote Type
 
-openssl req -new -x509 \
-  -key /tmp/deopt-mm-gateway/key.pem \
-  -out /tmp/deopt-mm-gateway/cert.pem \
-  -days 1 \
-  -subj "/CN=localhost"
+Define typed data:
 
-Temporarily set .env:
+RFQQuote(
+  bytes32 rfqId,
+  address mmAccount,
+  uint256 marketId,
+  bool takerIsBuyer,
+  uint128 price1e8,
+  uint128 size1e8,
+  uint256 quoteNonce,
+  uint256 expiry
+)
 
-RFQ_ENABLED=true
+Field meanings:
 
-MM_GATEWAY_ENABLED=true
-MM_GATEWAY_TRANSPORT=webtransport
-MM_GATEWAY_HOST=127.0.0.1
-MM_GATEWAY_PORT=8443
-MM_GATEWAY_CERT_PATH=/tmp/deopt-mm-gateway/cert.pem
-MM_GATEWAY_KEY_PATH=/tmp/deopt-mm-gateway/key.pem
-MM_GATEWAY_AUTH_MODE=disabled
-MM_GATEWAY_REQUIRE_AUTH=false
+rfqId: bytes32 derived from RFQ UUID/string
+mmAccount: quote signer
+marketId: RFQ market
+takerIsBuyer: true if RFQ side is buy, false if RFQ side is sell
+price1e8: quoted execution price
+size1e8: quoted size
+quoteNonce: MM-provided RFQ quote nonce for replay/idempotence
+expiry: quote expiry in seconds or milliseconds; choose one and document clearly
 
-EXECUTION_ENABLED=false
-EXECUTOR_REAL_BROADCAST_ENABLED=false
+Prefer seconds for EIP-712 if aligning with Solidity-style timestamps, but preserve existing ms storage if needed. Be explicit.
 
-After the test, restore safe state:
+Domain:
 
-MM_GATEWAY_ENABLED=false
-EXECUTOR_REAL_BROADCAST_ENABLED=false
-EXECUTION_ENABLED=false
-Runtime Test Steps
-1. Start backend
+Use existing backend EIP-712 domain style where possible.
 
-Ensure no old backend is running:
+Recommended config:
 
-pkill -f deopt-v2-backend || true
+RFQ_EIP712_NAME=DeOptV2RFQ
+RFQ_EIP712_VERSION=1
+RFQ_EIP712_CHAIN_ID=84532
+RFQ_EIP712_VERIFYING_CONTRACT=0x0000000000000000000000000000000000000000
 
-Start backend:
+If reusing existing EIP712 config is cleaner, document the choice.
 
-cargo run --bin deopt-v2-backend
+RFQ ID bytes32
 
-Verify:
+Add deterministic helper:
 
-curl http://127.0.0.1:8080/health
+rfq_id_to_b256(rfq_id: &str) = keccak256(bytes(rfq_id))
 
-Expected:
+Expose hex helper if needed.
 
-{"ok":true,"service":"deopt-v2-backend"}
-2. Start MM WebTransport smoke client
+API Changes
+GET /rfqs/:rfq_id/quote-signing-payload
 
-Use src/bin/mm_wt_smoke.rs.
+Query or body may include quote fields.
 
-Extend it minimally if needed so it can:
+Preferred endpoint:
 
-connect
-heartbeat
-get_session
-listen for rfq_request
-send rfq_quote
-listen for rfq_quote_accepted
+POST /rfqs/:rfq_id/quote-signing-payload
 
-Do not require private keys.
-
-Do not broadcast.
-
-Use:
-
-MM_WT_URL=https://127.0.0.1:8443/mm \
-MM_WT_CERT_PATH=/tmp/deopt-mm-gateway/cert.pem \
-cargo run --bin mm_wt_smoke -- rfq
-
-If the current binary uses different flags, adapt minimally and document final command.
-
-3. Create RFQ through HTTP
-
-Use harmless test accounts.
-
-Example:
-
-TAKER=0xc0A76c2A6c6b70C0B065A05E64417886416cc976
-
-curl -X POST http://127.0.0.1:8080/rfqs \
-  -H "Content-Type: application/json" \
-  -d "{
-    \"taker\": \"$TAKER\",
-    \"market_id\": 1,
-    \"side\": \"buy\",
-    \"size_1e8\": \"100000000\",
-    \"limit_price_1e8\": \"305000000000\",
-    \"ttl_ms\": 30000
-  }"
-
-Expected:
-
-RFQ status open
-rfq_id returned
-MM smoke client receives rfq_request
-4. MM sends RFQ quote over WebTransport
-
-Smoke client should send something equivalent to:
+Request:
 
 {
-  "type": "rfq_quote",
-  "request_id": "smoke-rfq-quote-1",
-  "payload": {
-    "rfq_id": "<RFQ_ID>",
-    "mm_account": "0xbAf0976a00a0DCc84Df5B15d927695c8b014B1c3",
-    "price_1e8": "300100000000",
-    "size_1e8": "100000000",
-    "client_quote_id": "smoke-mm-rfq-quote-1",
-    "quote_ttl_ms": 10000
-  }
+  "mm_account": "0x...",
+  "price_1e8": "300100000000",
+  "size_1e8": "100000000",
+  "client_quote_id": "mm-rfq-quote-001",
+  "quote_nonce": 1,
+  "quote_ttl_ms": 3000
 }
 
-Expected response:
+Response:
 
 {
-  "type": "rfq_quote_result",
-  "ok": true,
-  "payload": {
-    "quote_id": "...",
-    "status": "active"
+  "rfq_id": "...",
+  "rfq_id_b32": "0x...",
+  "digest": "0x...",
+  "domain": {...},
+  "types": {...},
+  "message": {
+    "rfqId": "0x...",
+    "mmAccount": "0x...",
+    "marketId": 1,
+    "takerIsBuyer": true,
+    "price1e8": "300100000000",
+    "size1e8": "100000000",
+    "quoteNonce": "1",
+    "expiry": "..."
   }
 }
-5. Verify quote via HTTP
-curl http://127.0.0.1:8080/rfqs/$RFQ_ID/quotes
+POST /rfqs/:rfq_id/quotes
 
-Expected:
-
-quote is listed
-quote has session_id
-quote status active
-mm_account matches smoke MM
-6. Accept quote via HTTP
-curl -X POST http://127.0.0.1:8080/rfqs/$RFQ_ID/accept/$QUOTE_ID
-
-Expected:
-
-RFQ status accepted
-quote status accepted
-execution_intent_id returned
-onchain_intent_id returned if endpoint exposes it
-no broadcast occurred
-7. Verify execution intent exists
-curl http://127.0.0.1:8080/execution-intents
-
-or direct endpoint if available.
-
-Expected:
-
-new execution intent exists
-status pending
-buyer/seller mapping correct:
-taker buy => buyer=taker, seller=mm_account, buyer_is_maker=false
-8. Verify MM notification
-
-Smoke client should receive:
+Extend request:
 
 {
-  "type": "rfq_quote_accepted",
-  "payload": {
-    "rfq_id": "...",
-    "quote_id": "...",
-    "execution_intent_id": "..."
-  }
+  "mm_account": "0x...",
+  "price_1e8": "300100000000",
+  "size_1e8": "100000000",
+  "client_quote_id": "mm-rfq-quote-001",
+  "quote_nonce": 1,
+  "quote_ttl_ms": 3000,
+  "signature": "0x..."
 }
 
-If notification fails but acceptance succeeds, report the warning. Do not fake notification.
+In strict mode:
 
-9. Verify no forbidden mutation
+signature required
+quote_nonce required
+digest recomputed server-side
+recovered signer must equal mm_account
+WebTransport rfq_quote
 
-Confirm:
+Extend payload similarly:
 
-no real broadcast
-no tx_hash created by RFQ accept
-no confirmation created
-no Solidity interaction required
-10. Stop backend and restore .env
+{
+  "rfq_id": "...",
+  "mm_account": "0x...",
+  "price_1e8": "300100000000",
+  "size_1e8": "100000000",
+  "client_quote_id": "mm-rfq-quote-001",
+  "quote_nonce": 1,
+  "quote_ttl_ms": 3000,
+  "signature": "0x..."
+}
 
-Restore safe state:
+In disabled mode, smoke flow can omit signature.
 
-MM_GATEWAY_ENABLED=false
-EXECUTOR_REAL_BROADCAST_ENABLED=false
-EXECUTION_ENABLED=false
+In strict mode, reject missing/invalid signature.
 
-Stop backend.
+Database
 
-If Runtime Fails
+Extend rfq_quotes with nullable fields:
 
-Diagnose precisely:
+signature TEXT NULL,
+quote_digest TEXT NULL,
+quote_nonce TEXT NULL,
+signature_status TEXT NULL,
+recovered_signer TEXT NULL
 
-RFQ disabled config
-MM gateway disabled config
-cert issue
-UDP/QUIC issue
-smoke client issue
-server-initiated message delivery issue
-session registry issue
-rfq_quote parsing issue
-RFQ service validation issue
-persistence issue
-execution_intent creation issue
-notification issue
+Add migration:
 
-If a real bug is found, patch minimally and rerun validation.
+migrations/0011_signed_rfq_quotes.sql
 
+Do not modify old migration.
+
+signature_status values:
+
+not_required
+verified
+missing
+invalid
+signer_mismatch
+
+In strict mode, only verified quotes can be active.
+
+In disabled mode, store not_required.
+
+Rust Modules
+
+Add or extend:
+
+src/rfq/signing.rs
+src/rfq/types.rs
+src/rfq/service.rs
+src/api/routes.rs
+src/mm/protocol.rs
+src/mm/service.rs
+
+Reuse existing ECDSA/EIP-712 signing utilities if present from PerpTrade signing.
+
+Avoid duplicate crypto code if possible.
+
+Dev CLI
+
+Add optional dev CLI for RFQ quote signing:
+
+src/bin/sign_rfq_quote.rs
+
+Usage:
+
+MM_PRIVATE_KEY=0x... cargo run --bin sign_rfq_quote -- \
+  --payload /tmp/rfq_quote_payload.json
+
+Output:
+
+{
+  "signer_address": "0x...",
+  "signature": "0x..."
+}
+
+Same safety rules:
+
+do not print private key
+reject signer mismatch if role/account provided
+testnet/dev only
+
+If adding this CLI is too much, defer it. But signed RFQ strict mode is hard to test manually without it.
+
+Tests
+
+Normal cargo test must remain offline.
+
+Add tests for:
+
+rfq_id_to_b256 deterministic
+RFQQuote typehash stable
+signing payload digest deterministic
+disabled mode accepts unsigned quote
+strict mode rejects missing signature
+strict mode rejects malformed signature
+strict mode rejects invalid signature
+strict mode rejects signer mismatch
+strict mode accepts valid signature
+HTTP quote endpoint stores signature metadata
+WebTransport rfq_quote supports signature fields
+quote acceptance only accepts active verified quote in strict mode
+quote nonce stored
+duplicate client_quote_id behavior unchanged
+normal RFQ V1B disabled-mode tests still pass
+
+No live RPC/Postgres/WebTransport/private keys required for normal tests.
+
+Runtime Verification After Implementation
+
+After implementation, perform only if feasible:
+
+RFQ_QUOTE_SIGNATURE_MODE=disabled
+existing RFQ smoke still passes
+RFQ_QUOTE_SIGNATURE_MODE=strict
+create RFQ
+get signing payload
+sign with sign_rfq_quote
+submit quote over HTTP
+verify quote accepted active/verified
+accept quote creates execution_intent
+no broadcast
+
+WebTransport strict runtime can be deferred if HTTP strict path is verified.
+
+Docs
+
+Update:
+
+README.md
+ARCHITECTURE.md
+.env.example
+
+Document:
+
+RFQ signed quote purpose
+signature mode config
+EIP-712 RFQQuote type
+quote signing payload endpoint
+strict vs disabled behavior
+quote signature DB metadata
+dev signing CLI
+no auto-broadcast
+future:
+production MM auth
+signed taker RFQ request
+options RFQ
+MM ranking
 Validation
 
-If any code was changed, run:
+Run:
 
 cargo fmt
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test
 cargo build
-Final Report Required
+Acceptance Criteria
 
-Return:
+Complete only if:
 
-Files changed.
-Whether code patch was needed.
-Cert generation method.
-Backend startup result.
-HTTP health result.
-WebTransport connection result.
-RFQ creation result.
-Whether MM received rfq_request.
-rfq_quote submission result.
-HTTP quote listing result.
-RFQ accept result.
-Execution intent created:
-intent_id
-onchain_intent_id if available
-buyer
-seller
-buyer_is_maker
-Whether MM received rfq_quote_accepted.
-Verification that no broadcast happened.
-Final .env safety state.
-Validation commands run.
-Remaining blocker, if any.
+RFQ quote signature config exists
+quote signing payload endpoint exists
+strict mode verifies signatures
+disabled mode preserves current flow
+RFQ HTTP quote supports signatures
+WebTransport rfq_quote supports signature fields
+signature metadata persisted
+tests cover valid/invalid/missing/mismatch signatures
+no auto-broadcast
+docs updated
+cargo fmt passes
+cargo clippy passes
+cargo test passes
+cargo build passes
+Deferred
+production MM auth/challenge
+signed taker RFQ request
+RFQ quote cancellation by signed message
+WebTransport strict runtime smoke
+options RFQ
+multi-leg RFQ
+MM ranking/selection
+expiry scheduler
 EOF
+
+
 
 
 

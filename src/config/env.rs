@@ -168,6 +168,17 @@ impl AppConfig {
             min_quote_ttl_ms: parse_env(&mut lookup, "RFQ_MIN_QUOTE_TTL_MS", "500")?,
             max_quote_ttl_ms: parse_env(&mut lookup, "RFQ_MAX_QUOTE_TTL_MS", "10000")?,
             max_quotes_per_rfq: parse_env(&mut lookup, "RFQ_MAX_QUOTES_PER_RFQ", "50")?,
+            quote_signature_mode: parse_env(&mut lookup, "RFQ_QUOTE_SIGNATURE_MODE", "disabled")?,
+            eip712_domain: Eip712Domain {
+                name: get_env(&mut lookup, "RFQ_EIP712_NAME", "DeOptV2RFQ"),
+                version: get_env(&mut lookup, "RFQ_EIP712_VERSION", "1"),
+                chain_id: parse_env(&mut lookup, "RFQ_EIP712_CHAIN_ID", "84532")?,
+                verifying_contract: AccountId::new(get_env(
+                    &mut lookup,
+                    "RFQ_EIP712_VERIFYING_CONTRACT",
+                    "0x0000000000000000000000000000000000000000",
+                )),
+            },
         };
         let perp_nonce_sync = PerpNonceSyncConfig {
             enabled: parse_env(&mut lookup, "PERP_NONCE_SYNC_ENABLED", "false")?,
@@ -774,6 +785,34 @@ mod tests {
         assert_eq!(config.rfq.min_quote_ttl_ms, 500);
         assert_eq!(config.rfq.max_quote_ttl_ms, 10_000);
         assert_eq!(config.rfq.max_quotes_per_rfq, 50);
+        assert_eq!(
+            config.rfq.quote_signature_mode,
+            crate::rfq::RfqQuoteSignatureMode::Disabled
+        );
+        assert_eq!(config.rfq.eip712_domain.name, "DeOptV2RFQ");
+    }
+
+    #[test]
+    fn rfq_quote_signature_mode_accepts_strict() {
+        let config = config_from_pairs([
+            ("RFQ_QUOTE_SIGNATURE_MODE", "strict"),
+            ("PERSISTENCE_ENABLED", "false"),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            config.rfq.quote_signature_mode,
+            crate::rfq::RfqQuoteSignatureMode::Strict
+        );
+    }
+
+    #[test]
+    fn rfq_quote_signature_mode_rejects_invalid_mode() {
+        let error = config_from_pairs([("RFQ_QUOTE_SIGNATURE_MODE", "loose")]).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("invalid RFQ_QUOTE_SIGNATURE_MODE"));
     }
 
     #[test]

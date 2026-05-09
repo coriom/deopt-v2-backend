@@ -15,7 +15,9 @@ use crate::reconciliation::{
     normalize_onchain_intent_id, ExecutionReconciliation, ReconciliationCounts,
     ReconciliationStatus,
 };
-use crate::rfq::{QuoteId, RfqId, RfqQuote, RfqQuoteStatus, RfqRequest, RfqStatus};
+use crate::rfq::{
+    QuoteId, RfqId, RfqQuote, RfqQuoteSignatureStatus, RfqQuoteStatus, RfqRequest, RfqStatus,
+};
 use crate::signing::SignedOrder;
 use crate::types::{now_ms, AccountId, OrderStatus, Side, TimestampMs};
 use sqlx::postgres::{PgPool, PgRow};
@@ -758,8 +760,9 @@ impl PgRepository {
         let result = sqlx::query(
             "INSERT INTO rfq_quotes (
                 quote_id, rfq_id, mm_account, session_id, client_quote_id, price_1e8,
-                size_1e8, status, created_at_ms, expires_at_ms
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+                size_1e8, status, created_at_ms, expires_at_ms, signature, quote_digest,
+                quote_nonce, signature_status, recovered_signer
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
         )
         .bind(quote.quote_id.to_string())
         .bind(quote.rfq_id.to_string())
@@ -771,6 +774,11 @@ impl PgRepository {
         .bind(quote.status.as_str())
         .bind(timestamp_to_i64(quote.created_at_ms))
         .bind(timestamp_to_i64(quote.expires_at_ms))
+        .bind(&quote.signature)
+        .bind(&quote.quote_digest)
+        .bind(&quote.quote_nonce)
+        .bind(quote.signature_status.as_str())
+        .bind(quote.recovered_signer.as_ref().map(|account| &account.0))
         .execute(&self.pool)
         .await;
 
@@ -786,7 +794,8 @@ impl PgRepository {
     pub async fn list_rfq_quotes(&self, rfq_id: RfqId) -> Result<Vec<RfqQuote>> {
         let rows = sqlx::query(
             "SELECT quote_id, rfq_id, mm_account, session_id, client_quote_id, price_1e8,
-                    size_1e8, status, created_at_ms, expires_at_ms
+                    size_1e8, status, created_at_ms, expires_at_ms, signature, quote_digest,
+                    quote_nonce, signature_status, recovered_signer
              FROM rfq_quotes
              WHERE rfq_id = $1
              ORDER BY created_at_ms ASC, quote_id ASC",
@@ -813,7 +822,8 @@ impl PgRepository {
     pub async fn get_rfq_quote(&self, quote_id: QuoteId) -> Result<Option<RfqQuote>> {
         let row = sqlx::query(
             "SELECT quote_id, rfq_id, mm_account, session_id, client_quote_id, price_1e8,
-                    size_1e8, status, created_at_ms, expires_at_ms
+                    size_1e8, status, created_at_ms, expires_at_ms, signature, quote_digest,
+                    quote_nonce, signature_status, recovered_signer
              FROM rfq_quotes
              WHERE quote_id = $1",
         )
@@ -1492,6 +1502,8 @@ fn rfq_quote_from_row(row: PgRow) -> Result<RfqQuote> {
     let quote_id: String = row_get(&row, "quote_id")?;
     let rfq_id: String = row_get(&row, "rfq_id")?;
     let status: String = row_get(&row, "status")?;
+    let signature_status: Option<String> = row_get(&row, "signature_status")?;
+    let recovered_signer: Option<String> = row_get(&row, "recovered_signer")?;
     Ok(RfqQuote {
         quote_id: Uuid::parse_str(&quote_id)
             .map_err(|error| BackendError::Persistence(error.to_string()))?,
@@ -1513,6 +1525,15 @@ fn rfq_quote_from_row(row: PgRow) -> Result<RfqQuote> {
         status: RfqQuoteStatus::parse(&status)?,
         created_at_ms: row_get(&row, "created_at_ms")?,
         expires_at_ms: row_get(&row, "expires_at_ms")?,
+        signature: row_get(&row, "signature")?,
+        quote_digest: row_get(&row, "quote_digest")?,
+        quote_nonce: row_get(&row, "quote_nonce")?,
+        signature_status: signature_status
+            .as_deref()
+            .map(RfqQuoteSignatureStatus::parse)
+            .transpose()?
+            .unwrap_or(RfqQuoteSignatureStatus::NotRequired),
+        recovered_signer: recovered_signer.map(AccountId::new),
     })
 }
 

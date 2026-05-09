@@ -35,6 +35,31 @@ fn parse_valid_heartbeat_message() {
 }
 
 #[test]
+fn parse_rfq_quote_with_signature_fields() {
+    let message: ClientMessage = serde_json::from_value(json!({
+        "type": "rfq_quote",
+        "request_id": "rfq-quote-1",
+        "payload": {
+            "rfq_id": "a1bbb9bf-2f33-4686-9cdc-30e292ff391f",
+            "mm_account": "0x0000000000000000000000000000000000000001",
+            "price_1e8": "300100000000",
+            "size_1e8": "100000000",
+            "client_quote_id": "mm-rfq-quote-001",
+            "quote_nonce": 1,
+            "quote_ttl_ms": 3000,
+            "signature": VALID_SIGNATURE
+        }
+    }))
+    .unwrap();
+
+    let ClientMessage::RfqQuote(envelope) = message else {
+        panic!("expected rfq_quote");
+    };
+    assert_eq!(envelope.payload.quote_nonce, Some(1));
+    assert_eq!(envelope.payload.signature.as_deref(), Some(VALID_SIGNATURE));
+}
+
+#[test]
 fn reject_unknown_message_type() {
     let error = serde_json::from_value::<ClientMessage>(json!({
         "type": "unknown",
@@ -939,6 +964,7 @@ fn rfq_config() -> RfqConfig {
         min_quote_ttl_ms: 1,
         max_quote_ttl_ms: 500,
         max_quotes_per_rfq: 50,
+        ..RfqConfig::disabled()
     }
 }
 
