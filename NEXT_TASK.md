@@ -1,327 +1,418 @@
-# NEXT_TASK.md — Options V1C: Off-chain Option Matching
+# NEXT_TASK.md — Options V1D: Option RFQ V1A
 
 ## Context
 
-Options V1A and V1B are implemented and runtime-verified.
+Options V1A/V1B/V1C are implemented and runtime-verified.
 
-V1A:
+Validated options stack:
 
 - option series registry
 - deterministic option_series_id
-- Postgres persistence
-- list/filter/get/disable endpoints
-- empty orderbook endpoint
-
-V1B:
-
-- off-chain option orders
-- POST /options/orders
-- GET /options/orders
-- GET /options/orders/:order_id
-- POST /options/orders/:order_id/cancel
-- real aggregated option orderbook levels
+- option orders
+- option orderbook aggregation
+- off-chain option matching
+- option fills
 - Postgres persistence
 - no execution_intents
 - no execution_transactions
-- no RFQ mutation
+- no RFQ mutation from options matching
+- no on-chain option execution
 
-Runtime verification passed:
+Existing perp RFQ stack is also implemented:
 
-- order submission persisted
-- duplicate client_order_id rejected
-- orderbook aggregated correctly
-- cancel removed order from book
-- no forbidden mutation occurred
+- RFQ core
+- WebTransport RFQ push
+- signed RFQ quotes
+- quote acceptance
+- execution_intent creation for perps
+
+Next block: Option RFQ.
 
 ## Goal
 
-Implement Options V1C: off-chain option matching and fill recording.
+Implement Options V1D: Option RFQ V1A.
 
-The backend must support:
+This task adds RFQ-style quote/accept flow for options, but remains off-chain only.
 
-- matching buy/sell option orders within same option_series_id
-- recording option fills
-- updating remaining sizes
-- updating order statuses
-- persisting fills
-- returning matched fills in order submission response
-- keeping everything off-chain only
+Flow:
 
-## Non-Goals
+```text
+taker creates option RFQ
+→ MM submits option quote
+→ taker accepts quote
+→ backend creates off-chain option fill
+→ no execution_intent
+→ no on-chain execution
+Non-Goals
 
 Do not implement:
 
-- option execution intents
-- on-chain option execution
-- option exercise
-- option settlement
-- option RFQ
-- option MM Gateway messages
-- Greeks
-- IV surface
-- risk/margin changes
-- Solidity changes
-- deployment
-- auto-broadcast
-
-## Absolute Safety Rules
+on-chain option execution
+option execution intents
+option settlement
+option exercise
+options WebTransport RFQ push
+signed option RFQ quotes
+MM Gateway option messages
+Greeks
+IV surface
+risk/margin changes
+Solidity changes
+deployment
+auto-broadcast
+Absolute Safety Rules
 
 Do not:
 
-- modify Solidity
-- deploy contracts
-- change existing perp execution lifecycle
-- break RFQ/MM Gateway
-- create execution_intents from option matches
-- create execution_transactions from option matches
-- fake on-chain option state
-- require live RPC/Postgres/private keys/WebTransport/certs for normal cargo test
-- commit
-- push
-- expose private keys
+modify Solidity
+deploy contracts
+change existing perp execution lifecycle
+break existing perp RFQ
+break MM Gateway
+create execution_intents from option RFQs
+create execution_transactions from option RFQs
+fake on-chain option state
+require live RPC/Postgres/private keys/WebTransport/certs for normal cargo test
+commit
+push
+expose private keys
+Domain Model
 
-## Matching Semantics
+Add option RFQ models.
 
-Options V1C matching is off-chain only.
+Suggested tables/entities:
 
-Rules:
+option_rfqs
+option_rfq_quotes
 
-- match only orders with the same `option_series_id`
-- buy matches sell if `buy.price_1e8 >= sell.price_1e8`
-- match size = min(buy.remaining_size, sell.remaining_size)
-- fill price rule must be deterministic
-
-Recommended fill price:
-
-```text
-resting maker order price
-
-If an incoming buy crosses resting asks, fill at resting ask price.
-If an incoming sell crosses resting bids, fill at resting bid price.
-
-No floating point arithmetic.
-
-Use integer/string-safe comparison for 1e8 values.
-
-Time Priority
-
-Within same price level:
-
-older order fills first
-
-Use created_at_ms, then order_id as deterministic tie-breaker if needed.
-
-Order Statuses
-
-Existing statuses:
+Option RFQ statuses:
 
 open
-cancelled
-filled
-rejected
 expired
+accepted
+cancelled
+failed
 
-Add if needed:
+Option RFQ quote statuses:
 
-partially_filled
+active
+expired
+accepted
+rejected
+cancelled
+Direction Semantics
 
-Recommended status logic:
+RFQ side is from taker perspective:
 
-remaining_size == size => open
-0 < remaining_size < size => partially_filled
-remaining_size == 0 => filled
-cancelled remains cancelled
+side = buy  => taker wants to buy the option
+side = sell => taker wants to sell the option
 
-If adding partially_filled, update docs/tests.
+Acceptance creates an off-chain option fill.
 
-Fill Model
+Mapping:
 
-Add option fill model.
+If taker side is buy:
 
-Suggested fields:
+buyer = taker
+seller = mm_account
+taker_side = buy
 
-fill_id: string
-option_series_id: string
-buy_order_id: string
-sell_order_id: string
-buyer: string
-seller: string
-price_1e8: string
-size_1e8: string
-created_at_ms: u64
+If taker side is sell:
 
-Optional:
+buyer = mm_account
+seller = taker
+taker_side = sell
 
-maker_order_id
-taker_order_id
-taker_side
+Price is option premium in price_1e8.
 
-Recommended fields:
+Size is number of option contracts in size_1e8.
 
-maker_order_id
-taker_order_id
-taker_side
 Database
 
 Add migration:
 
-migrations/0014_option_fills.sql
+migrations/0015_option_rfqs.sql
+
+Suggested tables:
+
+CREATE TABLE option_rfqs (
+    option_rfq_id TEXT PRIMARY KEY,
+    taker TEXT NOT NULL,
+    option_series_id TEXT NOT NULL REFERENCES option_series(option_series_id),
+    side TEXT NOT NULL,
+    size_1e8 TEXT NOT NULL,
+    limit_price_1e8 TEXT NULL,
+    status TEXT NOT NULL,
+    created_at_ms BIGINT NOT NULL,
+    expires_at_ms BIGINT NOT NULL,
+    accepted_quote_id TEXT NULL,
+    option_fill_id TEXT NULL
+);
+
+CREATE INDEX idx_option_rfqs_series ON option_rfqs(option_series_id);
+CREATE INDEX idx_option_rfqs_taker ON option_rfqs(lower(taker));
+CREATE INDEX idx_option_rfqs_status ON option_rfqs(status);
+CREATE INDEX idx_option_rfqs_expires ON option_rfqs(expires_at_ms);
+
+CREATE TABLE option_rfq_quotes (
+    quote_id TEXT PRIMARY KEY,
+    option_rfq_id TEXT NOT NULL REFERENCES option_rfqs(option_rfq_id),
+    mm_account TEXT NOT NULL,
+    session_id TEXT NULL,
+    client_quote_id TEXT NULL,
+    price_1e8 TEXT NOT NULL,
+    size_1e8 TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_at_ms BIGINT NOT NULL,
+    expires_at_ms BIGINT NOT NULL
+);
+
+CREATE INDEX idx_option_rfq_quotes_rfq ON option_rfq_quotes(option_rfq_id);
+CREATE INDEX idx_option_rfq_quotes_mm ON option_rfq_quotes(lower(mm_account));
+CREATE INDEX idx_option_rfq_quotes_status ON option_rfq_quotes(status);
+
+CREATE UNIQUE INDEX idx_option_rfq_quotes_client_id
+ON option_rfq_quotes(option_rfq_id, lower(mm_account), client_quote_id)
+WHERE client_quote_id IS NOT NULL;
+
+Follow existing repository style.
+
+Rust Modules
+
+Add or extend:
+
+src/options/rfq.rs
+src/options/types.rs
+src/options/service.rs
+src/options/store.rs
+
+Alternative structure is acceptable if consistent.
+
+Config
+
+Add safe defaults:
+
+OPTION_RFQ_ENABLED=false
+OPTION_RFQ_REQUIRE_PERSISTENCE=true
+OPTION_RFQ_DEFAULT_TTL_MS=5000
+OPTION_RFQ_MAX_TTL_MS=30000
+OPTION_RFQ_MIN_QUOTE_TTL_MS=500
+OPTION_RFQ_MAX_QUOTE_TTL_MS=10000
+OPTION_RFQ_MAX_QUOTES_PER_RFQ=50
+
+Startup:
+
+if OPTION_RFQ_ENABLED=true and persistence required but unavailable, fail clearly
+if disabled, endpoints reject with clear error
+
+Normal tests must not require Postgres.
+
+HTTP Endpoints
+
+Add:
+
+POST /options/rfqs
+GET /options/rfqs
+GET /options/rfqs/:option_rfq_id
+POST /options/rfqs/:option_rfq_id/quotes
+GET /options/rfqs/:option_rfq_id/quotes
+POST /options/rfqs/:option_rfq_id/accept/:quote_id
+POST /options/rfqs/:option_rfq_id/cancel
+POST /options/rfqs
+
+Request:
+
+{
+  "taker": "0x...",
+  "option_series_id": "...",
+  "side": "buy",
+  "size_1e8": "100000000",
+  "limit_price_1e8": "1200000000",
+  "ttl_ms": 5000
+}
+
+Validation:
+
+option RFQ enabled
+taker address valid
+option series exists
+option series active
+side buy/sell
+size > 0
+ttl within bounds
+limit_price optional, if present > 0
+
+Response:
+
+{
+  "option_rfq_id": "...",
+  "status": "open",
+  "expires_at_ms": 1770000005000
+}
+POST /options/rfqs/:option_rfq_id/quotes
+
+Request:
+
+{
+  "mm_account": "0x...",
+  "price_1e8": "1100000000",
+  "size_1e8": "100000000",
+  "client_quote_id": "mm-option-quote-001",
+  "quote_ttl_ms": 3000
+}
+
+Validation:
+
+RFQ exists
+RFQ status open
+RFQ not expired
+MM account valid
+price > 0
+size > 0
+quote size <= RFQ size
+quote TTL valid
+quote expires no later than RFQ expiry
+max quotes per RFQ enforced
+duplicate client_quote_id deterministic
+
+Response:
+
+{
+  "quote_id": "...",
+  "option_rfq_id": "...",
+  "status": "active",
+  "expires_at_ms": 1770000003000
+}
+POST /options/rfqs/:option_rfq_id/accept/:quote_id
+
+Acceptance creates an off-chain option fill.
+
+Response:
+
+{
+  "option_rfq_id": "...",
+  "quote_id": "...",
+  "status": "accepted",
+  "option_fill_id": "..."
+}
+
+Validation:
+
+RFQ exists
+quote belongs to RFQ
+RFQ open
+RFQ not expired
+quote active
+quote not expired
+price compatible with taker limit
+size compatible
+only one winning quote
+option series still active
+
+On accept:
+
+create option fill
+set option RFQ status accepted
+set accepted quote status accepted
+reject competing active quotes deterministically
+no execution_intent
+no execution_transaction
+Price Limit Semantics
+
+From taker perspective:
+
+If side = buy:
+
+quote price must be <= limit_price_1e8, if limit present
+
+If side = sell:
+
+quote price must be >= limit_price_1e8, if limit present
+
+Document and test.
+
+Fill Creation
+
+On accept, create option_fill using existing V1C fill model.
+
+Fields:
+
+option_series_id
+buyer
+seller
+price_1e8 = quote price
+size_1e8 = quote size
+taker_side = RFQ side
+maker/taker order ids may not exist
+
+If existing option_fills requires buy_order_id/sell_order_id NOT NULL, do not fake order ids.
+
+Instead choose one of these safe approaches:
+
+extend option_fills to support RFQ fills with nullable order ids, or
+create a separate option_rfq_fills table, or
+create hidden/system option orders only if cleanly designed.
+
+Preferred for V1D:
+
+create separate option_rfq_fills table
+
+This avoids corrupting orderbook fill semantics.
 
 Suggested table:
 
-CREATE TABLE option_fills (
+CREATE TABLE option_rfq_fills (
     fill_id TEXT PRIMARY KEY,
+    option_rfq_id TEXT NOT NULL REFERENCES option_rfqs(option_rfq_id),
+    quote_id TEXT NOT NULL REFERENCES option_rfq_quotes(quote_id),
     option_series_id TEXT NOT NULL REFERENCES option_series(option_series_id),
-    buy_order_id TEXT NOT NULL REFERENCES option_orders(order_id),
-    sell_order_id TEXT NOT NULL REFERENCES option_orders(order_id),
     buyer TEXT NOT NULL,
     seller TEXT NOT NULL,
-    maker_order_id TEXT NOT NULL,
-    taker_order_id TEXT NOT NULL,
+    taker TEXT NOT NULL,
+    mm_account TEXT NOT NULL,
     taker_side TEXT NOT NULL,
     price_1e8 TEXT NOT NULL,
     size_1e8 TEXT NOT NULL,
     created_at_ms BIGINT NOT NULL
 );
 
-CREATE INDEX idx_option_fills_series ON option_fills(option_series_id);
-CREATE INDEX idx_option_fills_buy_order ON option_fills(buy_order_id);
-CREATE INDEX idx_option_fills_sell_order ON option_fills(sell_order_id);
-CREATE INDEX idx_option_fills_buyer ON option_fills(lower(buyer));
-CREATE INDEX idx_option_fills_seller ON option_fills(lower(seller));
-CREATE INDEX idx_option_fills_created_at ON option_fills(created_at_ms);
-
-Follow existing repository style if different.
-
-HTTP Endpoints
-
-Extend:
-
-POST /options/orders
-GET /options/orders/:order_id
-GET /options/orders
-GET /options/orderbooks/:option_series_id
-
-Add:
-
-GET /options/fills
-GET /options/fills/:fill_id
-GET /options/orders/:order_id/fills
-
-Filters for GET /options/fills:
-
-option_series_id
-account
-order_id
-POST /options/orders Response
-
-Currently returns order.
-
-Extend response with fills:
-
-{
-  "order_id": "...",
-  "option_series_id": "...",
-  "status": "partially_filled",
-  "remaining_size_1e8": "50000000",
-  "fills": [
-    {
-      "fill_id": "...",
-      "price_1e8": "1000000000",
-      "size_1e8": "50000000",
-      "buy_order_id": "...",
-      "sell_order_id": "..."
-    }
-  ]
-}
-
-If no match:
-
-{
-  "order_id": "...",
-  "status": "open",
-  "fills": []
-}
-Matching Behavior
-
-When an incoming order is submitted:
-
-validate option order as V1B
-find opposite-side open/partially_filled orders for same series
-sort by price/time priority:
-incoming buy matches lowest ask first
-incoming sell matches highest bid first
-create fills
-update resting orders remaining/status
-update incoming order remaining/status
-persist all changes atomically if persistence enabled
-return order + fills
-
-If persistence transaction support exists, use it.
-
-If not, implement minimal safe sequence and document limitation.
-
-Orderbook After Matching
-
-GET /options/orderbooks/:option_series_id must reflect only open/partially_filled remaining sizes.
-
-Filled orders must not appear.
-
-Partially filled orders appear with remaining size only.
-
-Cancellation Rules
-
-Existing cancel endpoint must handle:
-
-open order => cancelled
-partially_filled order => cancelled with remaining size cancelled
-filled order => reject or no-op clearly
-cancelled order => deterministic already-cancelled response
-
-Do not delete fills.
-
-Persistence Behavior
-
-When persistence enabled:
-
-option order insert/update/fill write should persist
-fill listing reads DB
-orderbook reads open/partially_filled orders
-
-When persistence disabled:
-
-in-memory store works
-normal tests do not need Postgres
+CREATE INDEX idx_option_rfq_fills_rfq ON option_rfq_fills(option_rfq_id);
+CREATE INDEX idx_option_rfq_fills_quote ON option_rfq_fills(quote_id);
+CREATE INDEX idx_option_rfq_fills_series ON option_rfq_fills(option_series_id);
+CREATE INDEX idx_option_rfq_fills_buyer ON option_rfq_fills(lower(buyer));
+CREATE INDEX idx_option_rfq_fills_seller ON option_rfq_fills(lower(seller));
 Tests
 
-Normal cargo test must be offline.
+Normal cargo test must remain offline.
 
 Add tests for:
 
-buy order rests when no ask
-sell order rests when no bid
-buy crosses ask and creates fill
-sell crosses bid and creates fill
-no cross when buy price < ask price
-partial fill leaves incoming partially_filled/open remainder
-partial fill updates resting order remaining
-full fill sets status filled
-multiple fills across price levels
-price priority for asks: lowest ask first
-price priority for bids: highest bid first
-time priority within same price
-fill price equals resting maker price
-orderbook removes filled orders
-orderbook shows partially filled remaining size
-cancel partially filled order cancels remaining
-cannot cancel filled order or returns clear already-filled error
-list fills by series
-list fills by order_id
-list fills by account
-get fill by id
-no execution_intent created from option match
-no execution_transaction created from option match
-existing option V1A/V1B tests still pass
+create option RFQ success
+create rejects unknown series
+create rejects disabled series
+create rejects invalid taker
+create rejects invalid side
+create rejects zero size
+create TTL capping
+submit quote success
+submit quote rejects expired RFQ
+submit quote rejects zero price
+submit quote rejects size > RFQ size
+quote TTL capped to RFQ expiry
+list quotes
+accept quote success taker buy
+accept quote success taker sell
+accept quote rejects expired RFQ
+accept quote rejects expired quote
+accept quote rejects price above buy limit
+accept quote rejects price below sell limit
+accept quote single-winner rule
+accept creates option RFQ fill
+accept does not create execution_intent
+accept does not create execution_transaction
+cancel RFQ prevents acceptance
+duplicate client_quote_id behavior
+existing Options V1A/B/C tests still pass
 existing perp/RFQ/MM tests still pass
 Documentation
 
@@ -329,22 +420,21 @@ Update:
 
 README.md
 ARCHITECTURE.md
-.env.example if config changed
+.env.example
 
 Document:
 
-Options V1C scope
-off-chain matching only
-price-time priority
-fill price rule
-option_fills
-no execution_intents
-no on-chain settlement/exercise
-future Options V1D:
-option execution intent / settlement design
-options RFQ
-MM Gateway option messages
-Greeks/IV
+Option RFQ V1A scope
+HTTP endpoints
+taker side semantics
+limit price semantics
+quote lifecycle
+accept creates off-chain option RFQ fill
+no execution_intent
+no on-chain settlement
+no WebTransport option RFQ yet
+future signed option RFQ quotes
+future MM Gateway option RFQ
 Validation
 
 Run:
@@ -357,28 +447,28 @@ Acceptance Criteria
 
 Complete only if:
 
-option matching works off-chain
-option fills are recorded
-order statuses and remaining sizes update correctly
-orderbook reflects remaining liquidity
-fill endpoints exist
-no option execution_intents are created
-no execution_transactions are created
-normal tests offline
+option RFQ config exists
+migration exists
+option RFQ service/store exists
+HTTP endpoints exist
+quote submission works
+accept quote creates off-chain option RFQ fill
+no execution_intent created
+no execution_transaction created
+tests cover buy/sell mapping and limits
 docs updated
+normal tests offline
 cargo fmt passes
 cargo clippy passes
 cargo test passes
 cargo build passes
-Deferred
-option execution intent
-on-chain option exercise/settlement
-options RFQ
-option MM Gateway messages
-on-chain OptionProductRegistry sync
-Greeks
-IV surface
-risk cache
+Deferred to Options RFQ V1B
+WebTransport option RFQ push
+MM Gateway option quote messages
+signed option RFQ quotes
+production MM auth
+option RFQ ranking
+on-chain settlement/exercise design
 EOF
 
 

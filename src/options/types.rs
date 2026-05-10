@@ -2,9 +2,14 @@ use crate::error::{BackendError, Result};
 use crate::types::{AccountId, OrderId, Price1e8, Side, Size1e8, TimeInForce, TimestampMs};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
+use uuid::Uuid;
 
 pub type OptionSeriesId = String;
 pub type OptionOrderId = OrderId;
+pub type OptionFillId = Uuid;
+pub type OptionRfqId = Uuid;
+pub type OptionRfqQuoteId = Uuid;
+pub type OptionRfqFillId = Uuid;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OptionsConfig {
@@ -13,6 +18,13 @@ pub struct OptionsConfig {
     pub allow_manual_series: bool,
     pub sync_onchain_registry: bool,
     pub default_contract_size_1e8: Size1e8,
+    pub rfq_enabled: bool,
+    pub rfq_require_persistence: bool,
+    pub rfq_default_ttl_ms: u64,
+    pub rfq_max_ttl_ms: u64,
+    pub rfq_min_quote_ttl_ms: u64,
+    pub rfq_max_quote_ttl_ms: u64,
+    pub rfq_max_quotes_per_rfq: usize,
 }
 
 impl OptionsConfig {
@@ -23,6 +35,13 @@ impl OptionsConfig {
             allow_manual_series: true,
             sync_onchain_registry: false,
             default_contract_size_1e8: 100_000_000,
+            rfq_enabled: false,
+            rfq_require_persistence: true,
+            rfq_default_ttl_ms: 5_000,
+            rfq_max_ttl_ms: 30_000,
+            rfq_min_quote_ttl_ms: 500,
+            rfq_max_quote_ttl_ms: 10_000,
+            rfq_max_quotes_per_rfq: 50,
         }
     }
 
@@ -44,6 +63,32 @@ impl OptionsConfig {
         if self.default_contract_size_1e8 == 0 {
             return Err(BackendError::Config(
                 "OPTIONS_DEFAULT_CONTRACT_SIZE_1E8 must be nonzero".to_string(),
+            ));
+        }
+        if self.rfq_enabled && self.rfq_require_persistence && !persistence_enabled {
+            return Err(BackendError::Config(
+                "Option RFQ requires persistence enabled when OPTION_RFQ_REQUIRE_PERSISTENCE=true"
+                    .to_string(),
+            ));
+        }
+        if self.rfq_default_ttl_ms == 0 || self.rfq_max_ttl_ms == 0 {
+            return Err(BackendError::Config(
+                "Option RFQ TTL bounds must be nonzero".to_string(),
+            ));
+        }
+        if self.rfq_default_ttl_ms > self.rfq_max_ttl_ms {
+            return Err(BackendError::Config(
+                "OPTION_RFQ_DEFAULT_TTL_MS must be <= OPTION_RFQ_MAX_TTL_MS".to_string(),
+            ));
+        }
+        if self.rfq_min_quote_ttl_ms == 0 || self.rfq_max_quote_ttl_ms < self.rfq_min_quote_ttl_ms {
+            return Err(BackendError::Config(
+                "Option RFQ quote TTL bounds are invalid".to_string(),
+            ));
+        }
+        if self.rfq_max_quotes_per_rfq == 0 {
+            return Err(BackendError::Config(
+                "OPTION_RFQ_MAX_QUOTES_PER_RFQ must be nonzero".to_string(),
             ));
         }
         Ok(())
@@ -161,6 +206,7 @@ pub struct OptionSeriesFilter {
 #[serde(rename_all = "snake_case")]
 pub enum OptionOrderStatus {
     Open,
+    PartiallyFilled,
     Cancelled,
     Filled,
     Rejected,
@@ -171,6 +217,7 @@ impl OptionOrderStatus {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Open => "open",
+            Self::PartiallyFilled => "partially_filled",
             Self::Cancelled => "cancelled",
             Self::Filled => "filled",
             Self::Rejected => "rejected",
@@ -181,6 +228,7 @@ impl OptionOrderStatus {
     pub fn parse(value: &str) -> Result<Self> {
         match value {
             "open" => Ok(Self::Open),
+            "partially_filled" => Ok(Self::PartiallyFilled),
             "cancelled" => Ok(Self::Cancelled),
             "filled" => Ok(Self::Filled),
             "rejected" => Ok(Self::Rejected),
@@ -198,6 +246,7 @@ impl FromStr for OptionOrderStatus {
     fn from_str(value: &str) -> Result<Self> {
         match value {
             "open" => Ok(Self::Open),
+            "partially_filled" => Ok(Self::PartiallyFilled),
             "cancelled" => Ok(Self::Cancelled),
             "filled" => Ok(Self::Filled),
             "rejected" => Ok(Self::Rejected),
@@ -206,6 +255,12 @@ impl FromStr for OptionOrderStatus {
                 "invalid option order status filter: {other}"
             ))),
         }
+    }
+}
+
+impl OptionOrderStatus {
+    pub fn is_live(self) -> bool {
+        matches!(self, Self::Open | Self::PartiallyFilled)
     }
 }
 
@@ -228,12 +283,197 @@ pub struct OptionOrder {
     pub updated_at_ms: TimestampMs,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OptionFill {
+    pub fill_id: OptionFillId,
+    pub option_series_id: OptionSeriesId,
+    pub buy_order_id: OptionOrderId,
+    pub sell_order_id: OptionOrderId,
+    pub buyer: AccountId,
+    pub seller: AccountId,
+    pub maker_order_id: OptionOrderId,
+    pub taker_order_id: OptionOrderId,
+    pub taker_side: Side,
+    pub price_1e8: Price1e8,
+    pub size_1e8: Size1e8,
+    pub created_at_ms: TimestampMs,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OptionRfqStatus {
+    Open,
+    Expired,
+    Accepted,
+    Cancelled,
+    Failed,
+}
+
+impl OptionRfqStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Expired => "expired",
+            Self::Accepted => "accepted",
+            Self::Cancelled => "cancelled",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "open" => Ok(Self::Open),
+            "expired" => Ok(Self::Expired),
+            "accepted" => Ok(Self::Accepted),
+            "cancelled" => Ok(Self::Cancelled),
+            "failed" => Ok(Self::Failed),
+            other => Err(BackendError::Persistence(format!(
+                "invalid option RFQ status: {other}"
+            ))),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OptionRfqQuoteStatus {
+    Active,
+    Expired,
+    Accepted,
+    Rejected,
+    Cancelled,
+}
+
+impl OptionRfqQuoteStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Expired => "expired",
+            Self::Accepted => "accepted",
+            Self::Rejected => "rejected",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "active" => Ok(Self::Active),
+            "expired" => Ok(Self::Expired),
+            "accepted" => Ok(Self::Accepted),
+            "rejected" => Ok(Self::Rejected),
+            "cancelled" => Ok(Self::Cancelled),
+            other => Err(BackendError::Persistence(format!(
+                "invalid option RFQ quote status: {other}"
+            ))),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OptionRfqRequest {
+    pub option_rfq_id: OptionRfqId,
+    pub taker: AccountId,
+    pub option_series_id: OptionSeriesId,
+    pub side: Side,
+    pub size_1e8: Size1e8,
+    pub limit_price_1e8: Option<Price1e8>,
+    pub status: OptionRfqStatus,
+    pub created_at_ms: TimestampMs,
+    pub expires_at_ms: TimestampMs,
+    pub accepted_quote_id: Option<OptionRfqQuoteId>,
+    pub option_fill_id: Option<OptionRfqFillId>,
+}
+
+impl OptionRfqRequest {
+    pub fn effective_status(&self, now_ms: TimestampMs) -> OptionRfqStatus {
+        if self.status == OptionRfqStatus::Open && now_ms >= self.expires_at_ms {
+            OptionRfqStatus::Expired
+        } else {
+            self.status
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OptionRfqQuote {
+    pub quote_id: OptionRfqQuoteId,
+    pub option_rfq_id: OptionRfqId,
+    pub mm_account: AccountId,
+    pub session_id: Option<String>,
+    pub client_quote_id: Option<String>,
+    pub price_1e8: Price1e8,
+    pub size_1e8: Size1e8,
+    pub status: OptionRfqQuoteStatus,
+    pub created_at_ms: TimestampMs,
+    pub expires_at_ms: TimestampMs,
+}
+
+impl OptionRfqQuote {
+    pub fn effective_status(&self, now_ms: TimestampMs) -> OptionRfqQuoteStatus {
+        if self.status == OptionRfqQuoteStatus::Active && now_ms >= self.expires_at_ms {
+            OptionRfqQuoteStatus::Expired
+        } else {
+            self.status
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OptionRfqFill {
+    pub fill_id: OptionRfqFillId,
+    pub option_rfq_id: OptionRfqId,
+    pub quote_id: OptionRfqQuoteId,
+    pub option_series_id: OptionSeriesId,
+    pub buyer: AccountId,
+    pub seller: AccountId,
+    pub taker: AccountId,
+    pub mm_account: AccountId,
+    pub taker_side: Side,
+    pub price_1e8: Price1e8,
+    pub size_1e8: Size1e8,
+    pub created_at_ms: TimestampMs,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct OptionOrderFilter {
     pub option_series_id: Option<OptionSeriesId>,
     pub account: Option<AccountId>,
     pub status: Option<OptionOrderStatus>,
     pub side: Option<Side>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct OptionFillFilter {
+    pub option_series_id: Option<OptionSeriesId>,
+    pub account: Option<AccountId>,
+    pub order_id: Option<OptionOrderId>,
+}
+
+impl OptionFillFilter {
+    pub fn matches(&self, fill: &OptionFill) -> bool {
+        if let Some(option_series_id) = &self.option_series_id {
+            if &fill.option_series_id != option_series_id {
+                return false;
+            }
+        }
+        if let Some(account) = &self.account {
+            if !fill.buyer.0.eq_ignore_ascii_case(&account.0)
+                && !fill.seller.0.eq_ignore_ascii_case(&account.0)
+            {
+                return false;
+            }
+        }
+        if let Some(order_id) = self.order_id {
+            if fill.buy_order_id != order_id
+                && fill.sell_order_id != order_id
+                && fill.maker_order_id != order_id
+                && fill.taker_order_id != order_id
+            {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 impl OptionOrderFilter {

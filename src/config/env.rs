@@ -196,6 +196,17 @@ impl AppConfig {
                 "OPTIONS_DEFAULT_CONTRACT_SIZE_1E8",
                 "100000000",
             )?,
+            rfq_enabled: parse_env(&mut lookup, "OPTION_RFQ_ENABLED", "false")?,
+            rfq_require_persistence: parse_env(
+                &mut lookup,
+                "OPTION_RFQ_REQUIRE_PERSISTENCE",
+                "true",
+            )?,
+            rfq_default_ttl_ms: parse_env(&mut lookup, "OPTION_RFQ_DEFAULT_TTL_MS", "5000")?,
+            rfq_max_ttl_ms: parse_env(&mut lookup, "OPTION_RFQ_MAX_TTL_MS", "30000")?,
+            rfq_min_quote_ttl_ms: parse_env(&mut lookup, "OPTION_RFQ_MIN_QUOTE_TTL_MS", "500")?,
+            rfq_max_quote_ttl_ms: parse_env(&mut lookup, "OPTION_RFQ_MAX_QUOTE_TTL_MS", "10000")?,
+            rfq_max_quotes_per_rfq: parse_env(&mut lookup, "OPTION_RFQ_MAX_QUOTES_PER_RFQ", "50")?,
         };
         let perp_nonce_sync = PerpNonceSyncConfig {
             enabled: parse_env(&mut lookup, "PERP_NONCE_SYNC_ENABLED", "false")?,
@@ -870,6 +881,13 @@ mod tests {
         assert!(config.options.allow_manual_series);
         assert!(!config.options.sync_onchain_registry);
         assert_eq!(config.options.default_contract_size_1e8, 100_000_000);
+        assert!(!config.options.rfq_enabled);
+        assert!(config.options.rfq_require_persistence);
+        assert_eq!(config.options.rfq_default_ttl_ms, 5_000);
+        assert_eq!(config.options.rfq_max_ttl_ms, 30_000);
+        assert_eq!(config.options.rfq_min_quote_ttl_ms, 500);
+        assert_eq!(config.options.rfq_max_quote_ttl_ms, 10_000);
+        assert_eq!(config.options.rfq_max_quotes_per_rfq, 50);
     }
 
     #[test]
@@ -897,6 +915,37 @@ mod tests {
 
         assert!(config.options.enabled);
         assert!(!config.options.require_persistence);
+    }
+
+    #[test]
+    fn option_rfq_requiring_persistence_rejects_persistence_disabled() {
+        let error = config_from_pairs([
+            ("OPTIONS_ENABLED", "true"),
+            ("OPTIONS_REQUIRE_PERSISTENCE", "false"),
+            ("OPTION_RFQ_ENABLED", "true"),
+            ("OPTION_RFQ_REQUIRE_PERSISTENCE", "true"),
+            ("PERSISTENCE_ENABLED", "false"),
+        ])
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("Option RFQ requires persistence enabled"));
+    }
+
+    #[test]
+    fn option_rfq_can_run_without_persistence_when_requirement_disabled() {
+        let config = config_from_pairs([
+            ("OPTIONS_ENABLED", "true"),
+            ("OPTIONS_REQUIRE_PERSISTENCE", "false"),
+            ("OPTION_RFQ_ENABLED", "true"),
+            ("OPTION_RFQ_REQUIRE_PERSISTENCE", "false"),
+            ("PERSISTENCE_ENABLED", "false"),
+        ])
+        .unwrap();
+
+        assert!(config.options.rfq_enabled);
+        assert!(!config.options.rfq_require_persistence);
     }
 
     #[test]

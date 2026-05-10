@@ -18,20 +18,27 @@ use crate::execution::{
 use crate::indexer::{Indexer, IndexerStatus, IndexerTickResult};
 use crate::nonce_sync::{read_perp_nonce, PerpNonceResponse};
 use crate::options::service::{
+    accept_option_rfq_quote as accept_option_rfq_quote_service,
     cancel_option_order as cancel_option_order_service,
+    cancel_option_rfq as cancel_option_rfq_service, create_option_rfq as create_option_rfq_service,
     create_option_series as create_option_series_service,
     disable_option_series as disable_option_series_service,
-    get_option_order as get_option_order_service,
-    get_option_orderbook as get_option_orderbook_service,
-    get_option_series as get_option_series_service,
+    get_option_fill as get_option_fill_service, get_option_order as get_option_order_service,
+    get_option_order_fills as get_option_order_fills_service,
+    get_option_orderbook as get_option_orderbook_service, get_option_rfq as get_option_rfq_service,
+    get_option_series as get_option_series_service, list_option_fills as list_option_fills_service,
     list_option_orders as list_option_orders_service,
-    list_option_series as list_option_series_service,
-    submit_option_order as submit_option_order_service, CreateOptionSeriesInput,
-    SubmitOptionOrderInput,
+    list_option_rfq_quotes as list_option_rfq_quotes_service,
+    list_option_rfqs as list_option_rfqs_service, list_option_series as list_option_series_service,
+    submit_option_order as submit_option_order_service,
+    submit_option_rfq_quote as submit_option_rfq_quote_service, CreateOptionRfqInput,
+    CreateOptionSeriesInput, SubmitOptionOrderInput, SubmitOptionRfqQuoteInput,
 };
 use crate::options::{
-    OptionOrder, OptionOrderFilter, OptionOrderStatus, OptionOrderbookSnapshot, OptionSeries,
-    OptionSeriesFilter, OptionSeriesStatus,
+    OptionFill, OptionFillFilter, OptionFillId, OptionOrder, OptionOrderFilter, OptionOrderStatus,
+    OptionOrderbookSnapshot, OptionRfqFill, OptionRfqId, OptionRfqQuote, OptionRfqQuoteId,
+    OptionRfqQuoteStatus, OptionRfqRequest, OptionRfqStatus, OptionSeries, OptionSeriesFilter,
+    OptionSeriesStatus,
 };
 use crate::orders::service::{
     cancel_order as cancel_order_shared, submit_response_from_events, submit_signed_order,
@@ -83,8 +90,31 @@ pub fn router(state: AppState) -> Router {
             get(get_option_orderbook),
         )
         .route(
+            "/options/rfqs",
+            post(create_option_rfq).get(list_option_rfqs),
+        )
+        .route("/options/rfqs/:option_rfq_id", get(get_option_rfq))
+        .route(
+            "/options/rfqs/:option_rfq_id/quotes",
+            post(submit_option_rfq_quote).get(list_option_rfq_quotes),
+        )
+        .route(
+            "/options/rfqs/:option_rfq_id/accept/:quote_id",
+            post(accept_option_rfq_quote),
+        )
+        .route(
+            "/options/rfqs/:option_rfq_id/cancel",
+            post(cancel_option_rfq),
+        )
+        .route(
             "/options/orders",
             post(submit_option_order).get(list_option_orders),
+        )
+        .route("/options/fills", get(list_option_fills))
+        .route("/options/fills/:fill_id", get(get_option_fill))
+        .route(
+            "/options/orders/:order_id/fills",
+            get(get_option_order_fills),
         )
         .route("/options/orders/:order_id", get(get_option_order))
         .route(
@@ -256,6 +286,33 @@ struct ListOptionOrdersQuery {
     side: Option<Side>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+struct ListOptionFillsQuery {
+    option_series_id: Option<String>,
+    account: Option<AccountId>,
+    order_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+struct CreateOptionRfqRequest {
+    taker: AccountId,
+    option_series_id: String,
+    side: Side,
+    size_1e8: String,
+    limit_price_1e8: Option<String>,
+    ttl_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+struct SubmitOptionRfqQuoteRequest {
+    mm_account: AccountId,
+    session_id: Option<String>,
+    client_quote_id: Option<String>,
+    price_1e8: String,
+    size_1e8: String,
+    quote_ttl_ms: Option<u64>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 struct OptionSeriesResponse {
     option_series_id: String,
@@ -273,6 +330,117 @@ struct OptionSeriesResponse {
     onchain_series_id: Option<String>,
     created_at_ms: i64,
     updated_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct OptionRfqResponse {
+    option_rfq_id: String,
+    taker: AccountId,
+    option_series_id: String,
+    side: Side,
+    size_1e8: String,
+    limit_price_1e8: Option<String>,
+    status: OptionRfqStatus,
+    created_at_ms: i64,
+    expires_at_ms: i64,
+    accepted_quote_id: Option<String>,
+    option_fill_id: Option<String>,
+}
+
+impl From<OptionRfqRequest> for OptionRfqResponse {
+    fn from(rfq: OptionRfqRequest) -> Self {
+        let status = rfq.effective_status(now_ms());
+        Self {
+            option_rfq_id: rfq.option_rfq_id.to_string(),
+            taker: rfq.taker,
+            option_series_id: rfq.option_series_id,
+            side: rfq.side,
+            size_1e8: rfq.size_1e8.to_string(),
+            limit_price_1e8: rfq.limit_price_1e8.map(|value| value.to_string()),
+            status,
+            created_at_ms: rfq.created_at_ms,
+            expires_at_ms: rfq.expires_at_ms,
+            accepted_quote_id: rfq.accepted_quote_id.map(|id| id.to_string()),
+            option_fill_id: rfq.option_fill_id.map(|id| id.to_string()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct OptionRfqQuoteResponse {
+    quote_id: String,
+    option_rfq_id: String,
+    mm_account: AccountId,
+    session_id: Option<String>,
+    client_quote_id: Option<String>,
+    price_1e8: String,
+    size_1e8: String,
+    status: OptionRfqQuoteStatus,
+    created_at_ms: i64,
+    expires_at_ms: i64,
+}
+
+impl From<OptionRfqQuote> for OptionRfqQuoteResponse {
+    fn from(quote: OptionRfqQuote) -> Self {
+        let status = quote.effective_status(now_ms());
+        Self {
+            quote_id: quote.quote_id.to_string(),
+            option_rfq_id: quote.option_rfq_id.to_string(),
+            mm_account: quote.mm_account,
+            session_id: quote.session_id,
+            client_quote_id: quote.client_quote_id,
+            price_1e8: quote.price_1e8.to_string(),
+            size_1e8: quote.size_1e8.to_string(),
+            status,
+            created_at_ms: quote.created_at_ms,
+            expires_at_ms: quote.expires_at_ms,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct OptionRfqFillResponse {
+    fill_id: String,
+    option_rfq_id: String,
+    quote_id: String,
+    option_series_id: String,
+    buyer: AccountId,
+    seller: AccountId,
+    taker: AccountId,
+    mm_account: AccountId,
+    taker_side: Side,
+    price_1e8: String,
+    size_1e8: String,
+    created_at_ms: i64,
+}
+
+impl From<OptionRfqFill> for OptionRfqFillResponse {
+    fn from(fill: OptionRfqFill) -> Self {
+        Self {
+            fill_id: fill.fill_id.to_string(),
+            option_rfq_id: fill.option_rfq_id.to_string(),
+            quote_id: fill.quote_id.to_string(),
+            option_series_id: fill.option_series_id,
+            buyer: fill.buyer,
+            seller: fill.seller,
+            taker: fill.taker,
+            mm_account: fill.mm_account,
+            taker_side: fill.taker_side,
+            price_1e8: fill.price_1e8.to_string(),
+            size_1e8: fill.size_1e8.to_string(),
+            created_at_ms: fill.created_at_ms,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct AcceptOptionRfqQuoteResponse {
+    option_rfq_id: String,
+    quote_id: String,
+    status: OptionRfqStatus,
+    quote_status: OptionRfqQuoteStatus,
+    option_fill_id: String,
+    fill: OptionRfqFillResponse,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -294,6 +462,13 @@ struct OptionOrderResponse {
     updated_at_ms: i64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct SubmitOptionOrderResponse {
+    #[serde(flatten)]
+    order: OptionOrderResponse,
+    fills: Vec<OptionFillResponse>,
+}
+
 impl From<OptionOrder> for OptionOrderResponse {
     fn from(order: OptionOrder) -> Self {
         Self {
@@ -312,6 +487,41 @@ impl From<OptionOrder> for OptionOrderResponse {
             status: order.status,
             created_at_ms: order.created_at_ms,
             updated_at_ms: order.updated_at_ms,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct OptionFillResponse {
+    fill_id: String,
+    option_series_id: String,
+    buy_order_id: String,
+    sell_order_id: String,
+    buyer: AccountId,
+    seller: AccountId,
+    maker_order_id: String,
+    taker_order_id: String,
+    taker_side: Side,
+    price_1e8: String,
+    size_1e8: String,
+    created_at_ms: i64,
+}
+
+impl From<OptionFill> for OptionFillResponse {
+    fn from(fill: OptionFill) -> Self {
+        Self {
+            fill_id: fill.fill_id.to_string(),
+            option_series_id: fill.option_series_id,
+            buy_order_id: fill.buy_order_id.to_string(),
+            sell_order_id: fill.sell_order_id.to_string(),
+            buyer: fill.buyer,
+            seller: fill.seller,
+            maker_order_id: fill.maker_order_id.to_string(),
+            taker_order_id: fill.taker_order_id.to_string(),
+            taker_side: fill.taker_side,
+            price_1e8: fill.price_1e8.to_string(),
+            size_1e8: fill.size_1e8.to_string(),
+            created_at_ms: fill.created_at_ms,
         }
     }
 }
@@ -459,8 +669,8 @@ async fn get_option_orderbook(
 async fn submit_option_order(
     State(state): State<AppState>,
     Json(request): Json<SubmitOptionOrderRequest>,
-) -> Result<Json<OptionOrderResponse>, ApiError> {
-    let order = submit_option_order_service(
+) -> Result<Json<SubmitOptionOrderResponse>, ApiError> {
+    let outcome = submit_option_order_service(
         &state,
         SubmitOptionOrderInput {
             option_series_id: request.option_series_id,
@@ -476,7 +686,14 @@ async fn submit_option_order(
         },
     )
     .await?;
-    Ok(Json(order.into()))
+    Ok(Json(SubmitOptionOrderResponse {
+        order: outcome.order.into(),
+        fills: outcome
+            .fills
+            .into_iter()
+            .map(OptionFillResponse::from)
+            .collect(),
+    }))
 }
 
 async fn list_option_orders(
@@ -502,9 +719,69 @@ async fn get_option_order(
     State(state): State<AppState>,
     Path(order_id): Path<String>,
 ) -> Result<Json<OptionOrderResponse>, ApiError> {
-    let order_id = OrderId::from_str(&order_id).map_err(|_| BackendError::InvalidOptionOrderId)?;
+    let order_id = parse_option_order_id(&order_id)?;
     Ok(Json(
         get_option_order_service(&state, order_id).await?.into(),
+    ))
+}
+
+fn parse_option_order_id(order_id: &str) -> BackendResult<OrderId> {
+    OrderId::from_str(order_id).map_err(|_| BackendError::InvalidOptionOrderId)
+}
+
+fn parse_option_fill_id(fill_id: &str) -> BackendResult<OptionFillId> {
+    OptionFillId::from_str(fill_id).map_err(|_| BackendError::InvalidOptionFillId)
+}
+
+fn parse_option_rfq_id(option_rfq_id: &str) -> BackendResult<OptionRfqId> {
+    OptionRfqId::from_str(option_rfq_id).map_err(|_| BackendError::InvalidOptionRfqId)
+}
+
+fn parse_option_rfq_quote_id(quote_id: &str) -> BackendResult<OptionRfqQuoteId> {
+    OptionRfqQuoteId::from_str(quote_id).map_err(|_| BackendError::InvalidOptionRfqQuoteId)
+}
+
+async fn list_option_fills(
+    State(state): State<AppState>,
+    Query(query): Query<ListOptionFillsQuery>,
+) -> Result<Json<Vec<OptionFillResponse>>, ApiError> {
+    let order_id = query
+        .order_id
+        .as_deref()
+        .map(parse_option_order_id)
+        .transpose()?;
+    let fills = list_option_fills_service(
+        &state,
+        OptionFillFilter {
+            option_series_id: query.option_series_id,
+            account: query.account,
+            order_id,
+        },
+    )
+    .await?;
+    Ok(Json(
+        fills.into_iter().map(OptionFillResponse::from).collect(),
+    ))
+}
+
+async fn get_option_fill(
+    State(state): State<AppState>,
+    Path(fill_id): Path<String>,
+) -> Result<Json<OptionFillResponse>, ApiError> {
+    Ok(Json(
+        get_option_fill_service(&state, parse_option_fill_id(&fill_id)?)
+            .await?
+            .into(),
+    ))
+}
+
+async fn get_option_order_fills(
+    State(state): State<AppState>,
+    Path(order_id): Path<String>,
+) -> Result<Json<Vec<OptionFillResponse>>, ApiError> {
+    let fills = get_option_order_fills_service(&state, parse_option_order_id(&order_id)?).await?;
+    Ok(Json(
+        fills.into_iter().map(OptionFillResponse::from).collect(),
     ))
 }
 
@@ -512,9 +789,117 @@ async fn cancel_option_order(
     State(state): State<AppState>,
     Path(order_id): Path<String>,
 ) -> Result<Json<OptionOrderResponse>, ApiError> {
-    let order_id = OrderId::from_str(&order_id).map_err(|_| BackendError::InvalidOptionOrderId)?;
+    let order_id = parse_option_order_id(&order_id)?;
     Ok(Json(
         cancel_option_order_service(&state, order_id).await?.into(),
+    ))
+}
+
+async fn create_option_rfq(
+    State(state): State<AppState>,
+    Json(request): Json<CreateOptionRfqRequest>,
+) -> Result<Json<OptionRfqResponse>, ApiError> {
+    let rfq = create_option_rfq_service(
+        &state,
+        CreateOptionRfqInput {
+            taker: request.taker,
+            option_series_id: request.option_series_id,
+            side: request.side,
+            size_1e8: parse_fixed_u128("size_1e8", &request.size_1e8)?,
+            limit_price_1e8: request
+                .limit_price_1e8
+                .as_deref()
+                .map(|value| parse_fixed_u128("limit_price_1e8", value))
+                .transpose()?,
+            ttl_ms: request.ttl_ms,
+        },
+    )
+    .await?;
+    Ok(Json(rfq.into()))
+}
+
+async fn list_option_rfqs(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<OptionRfqResponse>>, ApiError> {
+    let rfqs = list_option_rfqs_service(&state).await?;
+    Ok(Json(
+        rfqs.into_iter().map(OptionRfqResponse::from).collect(),
+    ))
+}
+
+async fn get_option_rfq(
+    State(state): State<AppState>,
+    Path(option_rfq_id): Path<String>,
+) -> Result<Json<OptionRfqResponse>, ApiError> {
+    let option_rfq_id = parse_option_rfq_id(&option_rfq_id)?;
+    Ok(Json(
+        get_option_rfq_service(&state, option_rfq_id).await?.into(),
+    ))
+}
+
+async fn submit_option_rfq_quote(
+    State(state): State<AppState>,
+    Path(option_rfq_id): Path<String>,
+    Json(request): Json<SubmitOptionRfqQuoteRequest>,
+) -> Result<Json<OptionRfqQuoteResponse>, ApiError> {
+    let option_rfq_id = parse_option_rfq_id(&option_rfq_id)?;
+    let quote = submit_option_rfq_quote_service(
+        &state,
+        option_rfq_id,
+        SubmitOptionRfqQuoteInput {
+            mm_account: request.mm_account,
+            session_id: request.session_id,
+            client_quote_id: request.client_quote_id,
+            price_1e8: parse_fixed_u128("price_1e8", &request.price_1e8)?,
+            size_1e8: parse_fixed_u128("size_1e8", &request.size_1e8)?,
+            quote_ttl_ms: request.quote_ttl_ms,
+        },
+    )
+    .await?;
+    Ok(Json(quote.into()))
+}
+
+async fn list_option_rfq_quotes(
+    State(state): State<AppState>,
+    Path(option_rfq_id): Path<String>,
+) -> Result<Json<Vec<OptionRfqQuoteResponse>>, ApiError> {
+    let option_rfq_id = parse_option_rfq_id(&option_rfq_id)?;
+    let quotes = list_option_rfq_quotes_service(&state, option_rfq_id).await?;
+    Ok(Json(
+        quotes
+            .into_iter()
+            .map(OptionRfqQuoteResponse::from)
+            .collect(),
+    ))
+}
+
+async fn accept_option_rfq_quote(
+    State(state): State<AppState>,
+    Path((option_rfq_id, quote_id)): Path<(String, String)>,
+) -> Result<Json<AcceptOptionRfqQuoteResponse>, ApiError> {
+    let option_rfq_id = parse_option_rfq_id(&option_rfq_id)?;
+    let quote_id = parse_option_rfq_quote_id(&quote_id)?;
+    let outcome = accept_option_rfq_quote_service(&state, option_rfq_id, quote_id).await?;
+    let option_fill_id = outcome.fill.fill_id.to_string();
+    Ok(Json(AcceptOptionRfqQuoteResponse {
+        option_rfq_id: outcome.rfq.option_rfq_id.to_string(),
+        quote_id: outcome.quote.quote_id.to_string(),
+        status: outcome.rfq.status,
+        quote_status: outcome.quote.status,
+        option_fill_id,
+        fill: outcome.fill.into(),
+    }))
+}
+
+async fn cancel_option_rfq(
+    State(state): State<AppState>,
+    Path(option_rfq_id): Path<String>,
+) -> Result<Json<OptionRfqResponse>, ApiError> {
+    let option_rfq_id = parse_option_rfq_id(&option_rfq_id)?;
+    Ok(Json(
+        cancel_option_rfq_service(&state, option_rfq_id)
+            .await?
+            .into(),
     ))
 }
 
@@ -2104,6 +2489,10 @@ impl From<BackendError> for ApiError {
             BackendError::InvalidRfqId | BackendError::InvalidRfqQuoteId => StatusCode::NOT_FOUND,
             BackendError::InvalidOptionSeriesId(_) => StatusCode::NOT_FOUND,
             BackendError::InvalidOptionOrderId => StatusCode::NOT_FOUND,
+            BackendError::InvalidOptionFillId => StatusCode::NOT_FOUND,
+            BackendError::InvalidOptionRfqId | BackendError::InvalidOptionRfqQuoteId => {
+                StatusCode::NOT_FOUND
+            }
             BackendError::OrderNotFound(_) | BackendError::OrderNotOpen(_) => StatusCode::NOT_FOUND,
             BackendError::InvalidFixedPoint { .. } => StatusCode::BAD_REQUEST,
             BackendError::DeadlineExpired
@@ -2113,8 +2502,11 @@ impl From<BackendError> for ApiError {
             | BackendError::InvalidRfqState(_)
             | BackendError::InvalidRfqQuoteState(_)
             | BackendError::OptionsDisabled
+            | BackendError::OptionRfqDisabled
             | BackendError::InvalidOptionSeriesState(_)
             | BackendError::InvalidOptionOrderState(_)
+            | BackendError::InvalidOptionRfqState(_)
+            | BackendError::InvalidOptionRfqQuoteState(_)
             | BackendError::PerpNonceSyncDisabled
             | BackendError::PerpNonceMismatch { .. }
             | BackendError::MalformedSignature

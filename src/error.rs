@@ -37,6 +37,8 @@ pub enum BackendError {
     InvalidRfqQuoteState(String),
     #[error("options are disabled")]
     OptionsDisabled,
+    #[error("option RFQ is disabled")]
+    OptionRfqDisabled,
     #[error("invalid option series id: {0}")]
     InvalidOptionSeriesId(String),
     #[error("invalid option series state: {0}")]
@@ -45,6 +47,16 @@ pub enum BackendError {
     InvalidOptionOrderId,
     #[error("invalid option order state: {0}")]
     InvalidOptionOrderState(String),
+    #[error("invalid option fill id")]
+    InvalidOptionFillId,
+    #[error("invalid option RFQ id")]
+    InvalidOptionRfqId,
+    #[error("invalid option RFQ quote id")]
+    InvalidOptionRfqQuoteId,
+    #[error("invalid option RFQ state: {0}")]
+    InvalidOptionRfqState(String),
+    #[error("invalid option RFQ quote state: {0}")]
+    InvalidOptionRfqQuoteState(String),
     #[error("invalid PerpTrade intentId")]
     InvalidPerpTradeIntentId,
     #[error("invalid fixed-point value for {field}: {reason}")]
