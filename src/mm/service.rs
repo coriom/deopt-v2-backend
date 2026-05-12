@@ -2,10 +2,10 @@ use super::protocol::{
     AuthResultPayload, BulkCancelItemResult, BulkCancelPayload, BulkCancelResultPayload,
     BulkSubmitItemResult, BulkSubmitPayload, BulkSubmitResultPayload, CancelAllPayload,
     CancelAllResultPayload, CancelOrderPayload, CancelOrderResultPayload, ClientMessage, ErrorCode,
-    GetSessionResultPayload, HeartbeatResultPayload, ProtocolError, QuoteLegPayload,
-    QuoteReplaceLegResult, QuoteReplacePayload, QuoteReplaceResultPayload, ResultEnvelope,
-    RfqQuotePayload, RfqQuoteResultPayload, ServerMessage, SubmitOrderPayload,
-    SubmitOrderResultPayload,
+    GetSessionResultPayload, HeartbeatResultPayload, OptionRfqQuotePayload,
+    OptionRfqQuoteResultPayload, ProtocolError, QuoteLegPayload, QuoteReplaceLegResult,
+    QuoteReplacePayload, QuoteReplaceResultPayload, ResultEnvelope, RfqQuotePayload,
+    RfqQuoteResultPayload, ServerMessage, SubmitOrderPayload, SubmitOrderResultPayload,
 };
 use super::rate_limit::{
     check_cancels_per_bulk, check_in_flight, check_message_rate, check_open_orders,
@@ -15,6 +15,7 @@ use super::session::MmSession;
 use crate::api::dto::parse_fixed_u128;
 use crate::api::AppState;
 use crate::error::BackendError;
+use crate::options::service::{submit_option_rfq_quote, SubmitOptionRfqQuoteInput};
 use crate::orders::service::{
     cancel_order, cancel_resting_orders, submit_signed_order, CancelOrderInput,
     CancelRestingFilter, SubmitOrderOutcome,
@@ -119,6 +120,10 @@ impl MmGatewayService {
             }
             ClientMessage::RfqQuote(envelope) => {
                 self.handle_rfq_quote(session, envelope.request_id, envelope.payload)
+                    .await
+            }
+            ClientMessage::OptionRfqQuote(envelope) => {
+                self.handle_option_rfq_quote(session, envelope.request_id, envelope.payload)
                     .await
             }
             ClientMessage::GetSession(envelope) => {
@@ -554,6 +559,71 @@ impl MmGatewayService {
                 },
             )),
             Err(error) => backend_error_response(request_id, ErrorCode::RfqQuoteRejected, error),
+        }
+    }
+
+    async fn handle_option_rfq_quote(
+        &self,
+        session: &mut MmSession,
+        request_id: String,
+        payload: OptionRfqQuotePayload,
+    ) -> ServerMessage {
+        let Some(mm_account) = session_account(session, Some(payload.mm_account.clone())) else {
+            return ServerMessage::error(
+                request_id,
+                ErrorCode::OptionRfqQuoteRejected,
+                "option_rfq_quote account does not match authenticated session",
+            );
+        };
+
+        let price_1e8 = match parse_fixed_u128("price_1e8", &payload.price_1e8) {
+            Ok(value) => value,
+            Err(error) => {
+                return backend_error_response(
+                    request_id,
+                    ErrorCode::OptionRfqQuoteRejected,
+                    error,
+                );
+            }
+        };
+        let size_1e8 = match parse_fixed_u128("size_1e8", &payload.size_1e8) {
+            Ok(value) => value,
+            Err(error) => {
+                return backend_error_response(
+                    request_id,
+                    ErrorCode::OptionRfqQuoteRejected,
+                    error,
+                );
+            }
+        };
+
+        match submit_option_rfq_quote(
+            &self.state,
+            payload.option_rfq_id,
+            SubmitOptionRfqQuoteInput {
+                mm_account,
+                session_id: Some(session.session_id.clone()),
+                client_quote_id: payload.client_quote_id,
+                price_1e8,
+                size_1e8,
+                quote_ttl_ms: Some(payload.quote_ttl_ms),
+            },
+        )
+        .await
+        {
+            Ok(quote) => ServerMessage::OptionRfqQuoteResult(ResultEnvelope::new(
+                "option_rfq_quote_result",
+                request_id,
+                OptionRfqQuoteResultPayload {
+                    quote_id: quote.quote_id,
+                    option_rfq_id: quote.option_rfq_id,
+                    status: quote.status,
+                    expires_at_ms: quote.expires_at_ms,
+                },
+            )),
+            Err(error) => {
+                backend_error_response(request_id, ErrorCode::OptionRfqQuoteRejected, error)
+            }
         }
     }
 

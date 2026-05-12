@@ -1,255 +1,172 @@
-# NEXT_TASK.md — Options V1D: Option RFQ V1A
+# NEXT_TASK.md — Options RFQ V1C: Signed Option RFQ Quotes
 
 ## Context
 
-Options V1A/V1B/V1C are implemented and runtime-verified.
+Options RFQ V1A/V1B are implemented and runtime-verified.
 
-Validated options stack:
-
-- option series registry
-- deterministic option_series_id
-- option orders
-- option orderbook aggregation
-- off-chain option matching
-- option fills
-- Postgres persistence
-- no execution_intents
-- no execution_transactions
-- no RFQ mutation from options matching
-- no on-chain option execution
-
-Existing perp RFQ stack is also implemented:
-
-- RFQ core
-- WebTransport RFQ push
-- signed RFQ quotes
-- quote acceptance
-- execution_intent creation for perps
-
-Next block: Option RFQ.
-
-## Goal
-
-Implement Options V1D: Option RFQ V1A.
-
-This task adds RFQ-style quote/accept flow for options, but remains off-chain only.
-
-Flow:
+Validated flow:
 
 ```text
-taker creates option RFQ
-→ MM submits option quote
-→ taker accepts quote
-→ backend creates off-chain option fill
+HTTP POST /options/rfqs
+→ connected MM receives option_rfq_request over WebTransport
+→ MM sends option_rfq_quote over WebTransport
+→ quote persists in option_rfq_quotes
+→ HTTP GET /options/rfqs/:id/quotes sees quote
+→ HTTP accept quote creates option_rfq_fill
+→ MM receives option_rfq_quote_accepted
 → no execution_intent
-→ no on-chain execution
+→ no execution_transaction
+
+Current weakness:
+
+Option RFQ quotes are trusted because they arrive from a MM session. They are not cryptographically signed by the market maker.
+
+Goal
+
+Implement signed Option RFQ quotes.
+
+The backend must:
+
+expose an option RFQ quote signing payload endpoint
+accept option RFQ quote signatures over HTTP and WebTransport
+recover signer
+verify recovered signer equals mm_account
+store signature metadata
+support strict and disabled modes
+preserve existing unsigned dev flow in disabled mode
+never create execution_intents
+never broadcast
 Non-Goals
 
 Do not implement:
 
-on-chain option execution
+production MM wallet auth
+signed taker option RFQ requests
 option execution intents
-option settlement
-option exercise
-options WebTransport RFQ push
-signed option RFQ quotes
-MM Gateway option messages
+on-chain option execution
+option settlement/exercise
 Greeks
 IV surface
-risk/margin changes
+MM ranking
+auto-broadcast
 Solidity changes
 deployment
-auto-broadcast
 Absolute Safety Rules
 
 Do not:
 
 modify Solidity
 deploy contracts
-change existing perp execution lifecycle
-break existing perp RFQ
-break MM Gateway
+change existing perp/RFQ/MM lifecycle
 create execution_intents from option RFQs
 create execution_transactions from option RFQs
-fake on-chain option state
-require live RPC/Postgres/private keys/WebTransport/certs for normal cargo test
+fake signatures
+fake recovered signer
+bypass expiry
+bypass price/size validation
+bypass single-winner rule
+require live RPC/Postgres/WebTransport/private keys for normal cargo test
 commit
 push
 expose private keys
-Domain Model
+Config
 
-Add option RFQ models.
+Add:
 
-Suggested tables/entities:
+OPTION_RFQ_QUOTE_SIGNATURE_MODE=disabled
 
-option_rfqs
-option_rfq_quotes
+Allowed values:
 
-Option RFQ statuses:
+disabled
+strict
 
-open
-expired
-accepted
-cancelled
-failed
+Behavior:
 
-Option RFQ quote statuses:
+disabled
+preserves current Option RFQ V1B behavior
+signature optional
+no cryptographic verification
+store signature_status=not_required
+strict
+signature required
+quote_nonce required
+backend recomputes EIP-712 digest
+recovered signer must equal mm_account
+only verified quotes can become active
 
-active
-expired
-accepted
-rejected
-cancelled
-Direction Semantics
+Invalid mode must fail startup clearly.
 
-RFQ side is from taker perspective:
+EIP-712 Type
 
-side = buy  => taker wants to buy the option
-side = sell => taker wants to sell the option
+Define:
 
-Acceptance creates an off-chain option fill.
+OptionRFQQuote(
+  bytes32 optionRfqId,
+  address mmAccount,
+  bytes32 optionSeriesId,
+  bool takerIsBuyer,
+  uint128 price1e8,
+  uint128 size1e8,
+  uint256 quoteNonce,
+  uint256 expiry
+)
 
-Mapping:
+Field meanings:
 
-If taker side is buy:
+optionRfqId: keccak256(bytes(option_rfq_id))
+mmAccount: quote signer
+optionSeriesId: bytes32 from option_series_id hex
+takerIsBuyer: true if option RFQ side is buy, false if sell
+price1e8: option premium
+size1e8: contract quantity
+quoteNonce: MM-provided quote nonce
+expiry: quote expiry in seconds
 
-buyer = taker
-seller = mm_account
-taker_side = buy
+Use seconds in the EIP-712 message. Existing DB can keep ms timestamps.
 
-If taker side is sell:
+Domain
 
-buyer = mm_account
-seller = taker
-taker_side = sell
+Add config:
 
-Price is option premium in price_1e8.
+OPTION_RFQ_EIP712_NAME=DeOptV2OptionRFQ
+OPTION_RFQ_EIP712_VERSION=1
+OPTION_RFQ_EIP712_CHAIN_ID=84532
+OPTION_RFQ_EIP712_VERIFYING_CONTRACT=0x0000000000000000000000000000000000000000
 
-Size is number of option contracts in size_1e8.
+If reusing existing EIP-712 helpers is cleaner, do so, but keep domain independent from perp RFQ.
 
 Database
 
 Add migration:
 
-migrations/0015_option_rfqs.sql
+migrations/0016_signed_option_rfq_quotes.sql
 
-Suggested tables:
+Extend option_rfq_quotes:
 
-CREATE TABLE option_rfqs (
-    option_rfq_id TEXT PRIMARY KEY,
-    taker TEXT NOT NULL,
-    option_series_id TEXT NOT NULL REFERENCES option_series(option_series_id),
-    side TEXT NOT NULL,
-    size_1e8 TEXT NOT NULL,
-    limit_price_1e8 TEXT NULL,
-    status TEXT NOT NULL,
-    created_at_ms BIGINT NOT NULL,
-    expires_at_ms BIGINT NOT NULL,
-    accepted_quote_id TEXT NULL,
-    option_fill_id TEXT NULL
-);
+ALTER TABLE option_rfq_quotes ADD COLUMN signature TEXT NULL;
+ALTER TABLE option_rfq_quotes ADD COLUMN quote_digest TEXT NULL;
+ALTER TABLE option_rfq_quotes ADD COLUMN quote_nonce TEXT NULL;
+ALTER TABLE option_rfq_quotes ADD COLUMN signature_status TEXT NULL;
+ALTER TABLE option_rfq_quotes ADD COLUMN recovered_signer TEXT NULL;
 
-CREATE INDEX idx_option_rfqs_series ON option_rfqs(option_series_id);
-CREATE INDEX idx_option_rfqs_taker ON option_rfqs(lower(taker));
-CREATE INDEX idx_option_rfqs_status ON option_rfqs(status);
-CREATE INDEX idx_option_rfqs_expires ON option_rfqs(expires_at_ms);
+CREATE INDEX idx_option_rfq_quotes_digest ON option_rfq_quotes(quote_digest);
+CREATE INDEX idx_option_rfq_quotes_signature_status ON option_rfq_quotes(signature_status);
 
-CREATE TABLE option_rfq_quotes (
-    quote_id TEXT PRIMARY KEY,
-    option_rfq_id TEXT NOT NULL REFERENCES option_rfqs(option_rfq_id),
-    mm_account TEXT NOT NULL,
-    session_id TEXT NULL,
-    client_quote_id TEXT NULL,
-    price_1e8 TEXT NOT NULL,
-    size_1e8 TEXT NOT NULL,
-    status TEXT NOT NULL,
-    created_at_ms BIGINT NOT NULL,
-    expires_at_ms BIGINT NOT NULL
-);
+Signature statuses:
 
-CREATE INDEX idx_option_rfq_quotes_rfq ON option_rfq_quotes(option_rfq_id);
-CREATE INDEX idx_option_rfq_quotes_mm ON option_rfq_quotes(lower(mm_account));
-CREATE INDEX idx_option_rfq_quotes_status ON option_rfq_quotes(status);
+not_required
+verified
+missing
+invalid
+signer_mismatch
 
-CREATE UNIQUE INDEX idx_option_rfq_quotes_client_id
-ON option_rfq_quotes(option_rfq_id, lower(mm_account), client_quote_id)
-WHERE client_quote_id IS NOT NULL;
+In strict mode, only verified quotes can be active.
 
-Follow existing repository style.
+API
 
-Rust Modules
+Add endpoint:
 
-Add or extend:
-
-src/options/rfq.rs
-src/options/types.rs
-src/options/service.rs
-src/options/store.rs
-
-Alternative structure is acceptable if consistent.
-
-Config
-
-Add safe defaults:
-
-OPTION_RFQ_ENABLED=false
-OPTION_RFQ_REQUIRE_PERSISTENCE=true
-OPTION_RFQ_DEFAULT_TTL_MS=5000
-OPTION_RFQ_MAX_TTL_MS=30000
-OPTION_RFQ_MIN_QUOTE_TTL_MS=500
-OPTION_RFQ_MAX_QUOTE_TTL_MS=10000
-OPTION_RFQ_MAX_QUOTES_PER_RFQ=50
-
-Startup:
-
-if OPTION_RFQ_ENABLED=true and persistence required but unavailable, fail clearly
-if disabled, endpoints reject with clear error
-
-Normal tests must not require Postgres.
-
-HTTP Endpoints
-
-Add:
-
-POST /options/rfqs
-GET /options/rfqs
-GET /options/rfqs/:option_rfq_id
-POST /options/rfqs/:option_rfq_id/quotes
-GET /options/rfqs/:option_rfq_id/quotes
-POST /options/rfqs/:option_rfq_id/accept/:quote_id
-POST /options/rfqs/:option_rfq_id/cancel
-POST /options/rfqs
-
-Request:
-
-{
-  "taker": "0x...",
-  "option_series_id": "...",
-  "side": "buy",
-  "size_1e8": "100000000",
-  "limit_price_1e8": "1200000000",
-  "ttl_ms": 5000
-}
-
-Validation:
-
-option RFQ enabled
-taker address valid
-option series exists
-option series active
-side buy/sell
-size > 0
-ttl within bounds
-limit_price optional, if present > 0
-
-Response:
-
-{
-  "option_rfq_id": "...",
-  "status": "open",
-  "expires_at_ms": 1770000005000
-}
-POST /options/rfqs/:option_rfq_id/quotes
+POST /options/rfqs/:option_rfq_id/quote-signing-payload
 
 Request:
 
@@ -257,163 +174,154 @@ Request:
   "mm_account": "0x...",
   "price_1e8": "1100000000",
   "size_1e8": "100000000",
-  "client_quote_id": "mm-option-quote-001",
+  "client_quote_id": "mm-option-rfq-quote-001",
+  "quote_nonce": 1001,
   "quote_ttl_ms": 3000
 }
 
-Validation:
-
-RFQ exists
-RFQ status open
-RFQ not expired
-MM account valid
-price > 0
-size > 0
-quote size <= RFQ size
-quote TTL valid
-quote expires no later than RFQ expiry
-max quotes per RFQ enforced
-duplicate client_quote_id deterministic
-
-Response:
-
-{
-  "quote_id": "...",
-  "option_rfq_id": "...",
-  "status": "active",
-  "expires_at_ms": 1770000003000
-}
-POST /options/rfqs/:option_rfq_id/accept/:quote_id
-
-Acceptance creates an off-chain option fill.
-
 Response:
 
 {
   "option_rfq_id": "...",
-  "quote_id": "...",
-  "status": "accepted",
-  "option_fill_id": "..."
+  "option_rfq_id_b32": "0x...",
+  "option_series_id_b32": "0x...",
+  "digest": "0x...",
+  "primary_type": "OptionRFQQuote",
+  "domain": {...},
+  "types": {...},
+  "message": {
+    "optionRfqId": "0x...",
+    "mmAccount": "0x...",
+    "optionSeriesId": "0x...",
+    "takerIsBuyer": true,
+    "price1e8": "1100000000",
+    "size1e8": "100000000",
+    "quoteNonce": "1001",
+    "expiry": "..."
+  }
 }
 
-Validation:
+Extend HTTP quote submission:
 
-RFQ exists
-quote belongs to RFQ
-RFQ open
-RFQ not expired
-quote active
-quote not expired
-price compatible with taker limit
-size compatible
-only one winning quote
-option series still active
+POST /options/rfqs/:option_rfq_id/quotes
 
-On accept:
+Request adds:
 
-create option fill
-set option RFQ status accepted
-set accepted quote status accepted
-reject competing active quotes deterministically
-no execution_intent
-no execution_transaction
-Price Limit Semantics
+{
+  "quote_nonce": 1001,
+  "signature": "0x..."
+}
 
-From taker perspective:
+In strict mode:
 
-If side = buy:
+quote_nonce required
+signature required
+signer must match mm_account
+WebTransport Message
 
-quote price must be <= limit_price_1e8, if limit present
+Extend option_rfq_quote payload:
 
-If side = sell:
+{
+  "option_rfq_id": "...",
+  "mm_account": "0x...",
+  "price_1e8": "1100000000",
+  "size_1e8": "100000000",
+  "client_quote_id": "mm-option-rfq-quote-001",
+  "quote_nonce": 1001,
+  "quote_ttl_ms": 3000,
+  "signature": "0x..."
+}
 
-quote price must be >= limit_price_1e8, if limit present
+Disabled mode may omit signature.
 
-Document and test.
+Strict mode rejects missing/invalid signatures.
 
-Fill Creation
+Rust Modules
 
-On accept, create option_fill using existing V1C fill model.
+Add or extend:
 
-Fields:
+src/options/signing.rs
+src/options/types.rs
+src/options/service.rs
+src/options/store.rs
+src/mm/protocol.rs
+src/mm/service.rs
+src/api/routes.rs
+src/db/repository.rs
+src/config/env.rs
+src/signing/
 
-option_series_id
-buyer
-seller
-price_1e8 = quote price
-size_1e8 = quote size
-taker_side = RFQ side
-maker/taker order ids may not exist
+Reuse existing EIP-712 and ECDSA helpers from RFQ/perp signing.
 
-If existing option_fills requires buy_order_id/sell_order_id NOT NULL, do not fake order ids.
+Avoid duplicating crypto logic.
 
-Instead choose one of these safe approaches:
+Dev CLI
 
-extend option_fills to support RFQ fills with nullable order ids, or
-create a separate option_rfq_fills table, or
-create hidden/system option orders only if cleanly designed.
+Add:
 
-Preferred for V1D:
+src/bin/sign_option_rfq_quote.rs
 
-create separate option_rfq_fills table
+Usage:
 
-This avoids corrupting orderbook fill semantics.
+MM_PRIVATE_KEY=0x... cargo run --bin sign_option_rfq_quote -- \
+  --payload /tmp/option_rfq_quote_payload.json
 
-Suggested table:
+Output:
 
-CREATE TABLE option_rfq_fills (
-    fill_id TEXT PRIMARY KEY,
-    option_rfq_id TEXT NOT NULL REFERENCES option_rfqs(option_rfq_id),
-    quote_id TEXT NOT NULL REFERENCES option_rfq_quotes(quote_id),
-    option_series_id TEXT NOT NULL REFERENCES option_series(option_series_id),
-    buyer TEXT NOT NULL,
-    seller TEXT NOT NULL,
-    taker TEXT NOT NULL,
-    mm_account TEXT NOT NULL,
-    taker_side TEXT NOT NULL,
-    price_1e8 TEXT NOT NULL,
-    size_1e8 TEXT NOT NULL,
-    created_at_ms BIGINT NOT NULL
-);
+{
+  "signer_address": "0x...",
+  "signature": "0x..."
+}
 
-CREATE INDEX idx_option_rfq_fills_rfq ON option_rfq_fills(option_rfq_id);
-CREATE INDEX idx_option_rfq_fills_quote ON option_rfq_fills(quote_id);
-CREATE INDEX idx_option_rfq_fills_series ON option_rfq_fills(option_series_id);
-CREATE INDEX idx_option_rfq_fills_buyer ON option_rfq_fills(lower(buyer));
-CREATE INDEX idx_option_rfq_fills_seller ON option_rfq_fills(lower(seller));
+Safety:
+
+never print private key
+reject invalid private key
+output JSON only
 Tests
 
 Normal cargo test must remain offline.
 
 Add tests for:
 
-create option RFQ success
-create rejects unknown series
-create rejects disabled series
-create rejects invalid taker
-create rejects invalid side
-create rejects zero size
-create TTL capping
-submit quote success
-submit quote rejects expired RFQ
-submit quote rejects zero price
-submit quote rejects size > RFQ size
-quote TTL capped to RFQ expiry
-list quotes
-accept quote success taker buy
-accept quote success taker sell
-accept quote rejects expired RFQ
-accept quote rejects expired quote
-accept quote rejects price above buy limit
-accept quote rejects price below sell limit
-accept quote single-winner rule
-accept creates option RFQ fill
-accept does not create execution_intent
-accept does not create execution_transaction
-cancel RFQ prevents acceptance
-duplicate client_quote_id behavior
-existing Options V1A/B/C tests still pass
-existing perp/RFQ/MM tests still pass
+option_rfq_id_to_b32 deterministic
+option_series_id_b32 parsing
+OptionRFQQuote typehash stable
+digest deterministic
+signing payload endpoint returns expected structure
+disabled mode accepts unsigned HTTP quote
+strict mode rejects missing signature
+strict mode rejects missing quote_nonce
+strict mode rejects malformed signature
+strict mode rejects invalid signature
+strict mode rejects signer mismatch
+strict mode accepts valid signature
+strict mode stores signature metadata
+WebTransport option_rfq_quote supports signature fields
+strict mode rejects unsigned WebTransport option quote
+strict mode accepts signed WebTransport option quote via service test
+quote acceptance only accepts active verified quote in strict mode
+disabled mode preserves existing V1B tests
+no execution_intent created
+no execution_transaction created
+
+No live WebTransport/Postgres/private keys required for normal tests.
+
+Runtime Verification After Implementation
+
+If feasible, verify strict HTTP path:
+
+OPTION_RFQ_QUOTE_SIGNATURE_MODE=strict
+POST /options/rfqs
+POST /options/rfqs/:id/quote-signing-payload
+sign_option_rfq_quote
+POST /options/rfqs/:id/quotes
+POST /options/rfqs/:id/accept/:quote_id
+verify option_rfq_fill
+verify no execution_intents / execution_transactions
+
+WebTransport strict runtime can be deferred to a separate runtime task.
+
 Documentation
 
 Update:
@@ -424,17 +332,15 @@ ARCHITECTURE.md
 
 Document:
 
-Option RFQ V1A scope
-HTTP endpoints
-taker side semantics
-limit price semantics
-quote lifecycle
-accept creates off-chain option RFQ fill
-no execution_intent
-no on-chain settlement
-no WebTransport option RFQ yet
-future signed option RFQ quotes
-future MM Gateway option RFQ
+signed option RFQ quote purpose
+strict vs disabled modes
+EIP-712 OptionRFQQuote type
+signing payload endpoint
+dev signing CLI
+metadata persistence
+no execution_intents
+no broadcast
+future production MM auth
 Validation
 
 Run:
@@ -447,28 +353,31 @@ Acceptance Criteria
 
 Complete only if:
 
-option RFQ config exists
+config exists
 migration exists
-option RFQ service/store exists
-HTTP endpoints exist
-quote submission works
-accept quote creates off-chain option RFQ fill
-no execution_intent created
-no execution_transaction created
-tests cover buy/sell mapping and limits
+signing payload endpoint exists
+strict mode verifies signatures
+disabled mode preserves old flow
+HTTP option RFQ quote supports signatures
+WebTransport option_rfq_quote supports signatures
+metadata persisted
+sign_option_rfq_quote CLI exists or clearly deferred
+tests cover strict/disabled/valid/invalid/mismatch
+no execution_intents created
+no execution_transactions created
 docs updated
-normal tests offline
 cargo fmt passes
 cargo clippy passes
 cargo test passes
 cargo build passes
-Deferred to Options RFQ V1B
-WebTransport option RFQ push
-MM Gateway option quote messages
-signed option RFQ quotes
+Deferred
 production MM auth
+signed taker option RFQ request
+WebTransport strict runtime verification
+on-chain option settlement/exercise
+Greeks
+IV surface
 option RFQ ranking
-on-chain settlement/exercise design
 EOF
 
 

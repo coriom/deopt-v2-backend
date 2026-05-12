@@ -1,5 +1,7 @@
 use deopt_v2_backend::mm::protocol::{
-    NotificationEnvelope, ResultEnvelope, RfqQuoteResultPayload, RfqRequestPayload, ServerMessage,
+    NotificationEnvelope, OptionRfqQuoteAcceptedPayload, OptionRfqQuoteResultPayload,
+    OptionRfqRequestPayload, ResultEnvelope, RfqQuoteResultPayload, RfqRequestPayload,
+    ServerMessage,
 };
 use deopt_v2_backend::mm::rate_limit::{
     check_cancels_per_bulk, check_message_rate, check_open_orders, check_orders_per_bulk,
@@ -12,9 +14,15 @@ use deopt_v2_backend::mm::{
     AuthMode, BulkSubmitResultPayload, ClientMessage, ErrorCode, HeartbeatResultPayload,
     MmGatewayConfig, MmGatewayService, MmSession, RateLimitDecision,
 };
+use deopt_v2_backend::options::service::{
+    accept_option_rfq_quote, create_option_rfq, create_option_series, list_option_rfq_quotes,
+    submit_option_rfq_quote, CreateOptionRfqInput, CreateOptionSeriesInput,
+    SubmitOptionRfqQuoteInput,
+};
+use deopt_v2_backend::options::{OptionRfqQuoteStatus, OptionsConfig};
 use deopt_v2_backend::rfq::service::{create_rfq, CreateRfqInput};
 use deopt_v2_backend::rfq::{RfqConfig, RfqQuoteStatus};
-use deopt_v2_backend::types::{AccountId, Side};
+use deopt_v2_backend::types::{now_ms, AccountId, Side};
 use deopt_v2_backend::{api::AppState, engine::EngineState};
 use serde_json::json;
 use std::time::Duration;
@@ -132,6 +140,34 @@ fn parse_rfq_quote_message() {
 }
 
 #[test]
+fn parse_option_rfq_quote_message() {
+    let option_rfq_id = uuid::Uuid::new_v4();
+    let message: ClientMessage = serde_json::from_value(json!({
+        "type": "option_rfq_quote",
+        "request_id": "mm-option-quote-1",
+        "payload": {
+            "option_rfq_id": option_rfq_id,
+            "mm_account": "0x0000000000000000000000000000000000000001",
+            "price_1e8": "1100000000",
+            "size_1e8": "100000000",
+            "client_quote_id": "mm-option-rfq-quote-001",
+            "quote_ttl_ms": 3000
+        }
+    }))
+    .unwrap();
+
+    let ClientMessage::OptionRfqQuote(envelope) = message else {
+        panic!("expected option_rfq_quote");
+    };
+    assert_eq!(envelope.request_id, "mm-option-quote-1");
+    assert_eq!(envelope.payload.option_rfq_id, option_rfq_id);
+    assert_eq!(
+        envelope.payload.client_quote_id.as_deref(),
+        Some("mm-option-rfq-quote-001")
+    );
+}
+
+#[test]
 fn serialize_rfq_request_message() {
     let rfq_id = uuid::Uuid::new_v4();
     let response = ServerMessage::RfqRequest(NotificationEnvelope::new(
@@ -158,6 +194,32 @@ fn serialize_rfq_request_message() {
 }
 
 #[test]
+fn serialize_option_rfq_request_message() {
+    let option_rfq_id = uuid::Uuid::new_v4();
+    let response = ServerMessage::OptionRfqRequest(NotificationEnvelope::new(
+        "option_rfq_request",
+        "option-rfq-push-1",
+        OptionRfqRequestPayload {
+            option_rfq_id,
+            taker: AccountId::new("0x0000000000000000000000000000000000000002"),
+            option_series_id: "series-1".to_string(),
+            side: Side::Buy,
+            size_1e8: "100000000".to_string(),
+            limit_price_1e8: Some("1200000000".to_string()),
+            expires_at_ms: 1_770_000_005_000,
+        },
+    ));
+
+    let value = serde_json::to_value(response).unwrap();
+
+    assert_eq!(value["type"], "option_rfq_request");
+    assert_eq!(value["request_id"], "option-rfq-push-1");
+    assert_eq!(value["payload"]["option_rfq_id"], option_rfq_id.to_string());
+    assert_eq!(value["payload"]["side"], "buy");
+    assert!(value.get("ok").is_none());
+}
+
+#[test]
 fn serialize_rfq_quote_result_envelope() {
     let rfq_id = uuid::Uuid::new_v4();
     let quote_id = uuid::Uuid::new_v4();
@@ -179,6 +241,58 @@ fn serialize_rfq_quote_result_envelope() {
     assert_eq!(value["ok"], true);
     assert_eq!(value["payload"]["quote_id"], quote_id.to_string());
     assert_eq!(value["payload"]["status"], "active");
+}
+
+#[test]
+fn serialize_option_rfq_quote_result_envelope() {
+    let option_rfq_id = uuid::Uuid::new_v4();
+    let quote_id = uuid::Uuid::new_v4();
+    let response = ServerMessage::OptionRfqQuoteResult(ResultEnvelope::new(
+        "option_rfq_quote_result",
+        "mm-option-quote-1",
+        OptionRfqQuoteResultPayload {
+            quote_id,
+            option_rfq_id,
+            status: OptionRfqQuoteStatus::Active,
+            expires_at_ms: 1_770_000_003_000,
+        },
+    ));
+
+    let value = serde_json::to_value(response).unwrap();
+
+    assert_eq!(value["type"], "option_rfq_quote_result");
+    assert_eq!(value["request_id"], "mm-option-quote-1");
+    assert_eq!(value["ok"], true);
+    assert_eq!(value["payload"]["quote_id"], quote_id.to_string());
+    assert_eq!(value["payload"]["option_rfq_id"], option_rfq_id.to_string());
+    assert_eq!(value["payload"]["status"], "active");
+}
+
+#[test]
+fn serialize_option_rfq_quote_accepted_message() {
+    let option_rfq_id = uuid::Uuid::new_v4();
+    let quote_id = uuid::Uuid::new_v4();
+    let option_fill_id = uuid::Uuid::new_v4();
+    let response = ServerMessage::OptionRfqQuoteAccepted(NotificationEnvelope::new(
+        "option_rfq_quote_accepted",
+        "option-rfq-accepted-1",
+        OptionRfqQuoteAcceptedPayload {
+            option_rfq_id,
+            quote_id,
+            option_fill_id,
+        },
+    ));
+
+    let value = serde_json::to_value(response).unwrap();
+
+    assert_eq!(value["type"], "option_rfq_quote_accepted");
+    assert_eq!(value["request_id"], "option-rfq-accepted-1");
+    assert_eq!(value["payload"]["option_rfq_id"], option_rfq_id.to_string());
+    assert_eq!(value["payload"]["quote_id"], quote_id.to_string());
+    assert_eq!(
+        value["payload"]["option_fill_id"],
+        option_fill_id.to_string()
+    );
 }
 
 #[tokio::test]
@@ -567,6 +681,277 @@ async fn gateway_rfq_quote_rejects_invalid_price_or_size() {
         .as_str()
         .unwrap()
         .contains("zero price"));
+}
+
+#[tokio::test]
+async fn gateway_handles_option_rfq_quote_and_stores_session_id() {
+    let state = option_rfq_state();
+    let option_series_id = active_option_series_id(&state).await;
+    let rfq = create_option_rfq(&state, option_rfq_input(option_series_id, Side::Buy))
+        .await
+        .unwrap();
+    let service = MmGatewayService::new(MmGatewayConfig::default(), state.clone());
+    let mut session = MmSession::with_ids(
+        "session-option-rfq-1",
+        "connection-1",
+        10,
+        AuthMode::Disabled,
+        true,
+    );
+    let message = option_rfq_quote_message(rfq.option_rfq_id, "1000000000", "100000000");
+
+    let response = service.handle_message(&mut session, message, 20).await;
+
+    let ServerMessage::OptionRfqQuoteResult(envelope) = response else {
+        panic!("expected option_rfq_quote_result");
+    };
+    assert_eq!(envelope.payload.option_rfq_id, rfq.option_rfq_id);
+    assert_eq!(envelope.payload.status, OptionRfqQuoteStatus::Active);
+    let quotes = list_option_rfq_quotes(&state, rfq.option_rfq_id)
+        .await
+        .unwrap();
+    assert_eq!(quotes.len(), 1);
+    assert_eq!(
+        quotes[0].session_id.as_deref(),
+        Some("session-option-rfq-1")
+    );
+}
+
+#[tokio::test]
+async fn gateway_option_rfq_quote_rejects_unknown_rfq() {
+    let state = option_rfq_state();
+    let service = MmGatewayService::new(MmGatewayConfig::default(), state);
+    let mut session = MmSession::with_ids(
+        "session-option-rfq-1",
+        "connection-1",
+        10,
+        AuthMode::Disabled,
+        true,
+    );
+
+    let response = service
+        .handle_message(
+            &mut session,
+            option_rfq_quote_message(uuid::Uuid::new_v4(), "1000000000", "100000000"),
+            20,
+        )
+        .await;
+
+    let value = serde_json::to_value(response).unwrap();
+    assert_eq!(value["type"], "error");
+    assert_eq!(value["error"]["code"], "OPTION_RFQ_QUOTE_REJECTED");
+}
+
+#[tokio::test]
+async fn gateway_option_rfq_quote_rejects_expired_rfq() {
+    let state = option_rfq_state();
+    let option_series_id = active_option_series_id(&state).await;
+    let mut input = option_rfq_input(option_series_id, Side::Buy);
+    input.ttl_ms = Some(1);
+    let rfq = create_option_rfq(&state, input).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(2)).await;
+    let service = MmGatewayService::new(MmGatewayConfig::default(), state);
+    let mut session = MmSession::with_ids(
+        "session-option-rfq-1",
+        "connection-1",
+        10,
+        AuthMode::Disabled,
+        true,
+    );
+
+    let response = service
+        .handle_message(
+            &mut session,
+            option_rfq_quote_message(rfq.option_rfq_id, "1000000000", "100000000"),
+            20,
+        )
+        .await;
+
+    let value = serde_json::to_value(response).unwrap();
+    assert_eq!(value["type"], "error");
+    assert_eq!(value["error"]["code"], "OPTION_RFQ_QUOTE_REJECTED");
+    assert!(value["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("not open"));
+}
+
+#[tokio::test]
+async fn gateway_option_rfq_quote_rejects_invalid_price_or_size() {
+    let state = option_rfq_state();
+    let option_series_id = active_option_series_id(&state).await;
+    let rfq = create_option_rfq(&state, option_rfq_input(option_series_id, Side::Buy))
+        .await
+        .unwrap();
+    let service = MmGatewayService::new(MmGatewayConfig::default(), state);
+    let mut session = MmSession::with_ids(
+        "session-option-rfq-1",
+        "connection-1",
+        10,
+        AuthMode::Disabled,
+        true,
+    );
+
+    let response = service
+        .handle_message(
+            &mut session,
+            option_rfq_quote_message(rfq.option_rfq_id, "0", "100000000"),
+            20,
+        )
+        .await;
+
+    let value = serde_json::to_value(response).unwrap();
+    assert_eq!(value["type"], "error");
+    assert_eq!(value["error"]["code"], "OPTION_RFQ_QUOTE_REJECTED");
+    assert!(value["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("zero price"));
+}
+
+#[tokio::test]
+async fn option_rfq_creation_broadcasts_to_connected_mock_session() {
+    let state = option_rfq_state();
+    let option_series_id = active_option_series_id(&state).await;
+    let service = MmGatewayService::new(MmGatewayConfig::default(), state.clone());
+    let session = MmSession::with_ids(
+        "session-option-rfq-1",
+        "connection-1",
+        10,
+        AuthMode::Disabled,
+        true,
+    );
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    service.register_session(&session, sender).unwrap();
+
+    let rfq = create_option_rfq(&state, option_rfq_input(option_series_id, Side::Buy))
+        .await
+        .unwrap();
+
+    let message = receiver.recv().await.unwrap();
+    let ServerMessage::OptionRfqRequest(envelope) = message else {
+        panic!("expected option_rfq_request");
+    };
+    assert_eq!(envelope.payload.option_rfq_id, rfq.option_rfq_id);
+}
+
+#[tokio::test]
+async fn option_rfq_creation_succeeds_with_zero_sessions() {
+    let state = option_rfq_state();
+    let option_series_id = active_option_series_id(&state).await;
+
+    let rfq = create_option_rfq(&state, option_rfq_input(option_series_id, Side::Buy))
+        .await
+        .unwrap();
+
+    assert!(!rfq.option_rfq_id.is_nil());
+}
+
+#[tokio::test]
+async fn option_rfq_accept_sends_accepted_and_competing_rejected_notifications() {
+    let state = option_rfq_state();
+    let option_series_id = active_option_series_id(&state).await;
+    let service = MmGatewayService::new(MmGatewayConfig::default(), state.clone());
+    let accepted_session = MmSession::with_ids(
+        "session-option-accepted",
+        "connection-1",
+        10,
+        AuthMode::Disabled,
+        true,
+    );
+    let rejected_session = MmSession::with_ids(
+        "session-option-rejected",
+        "connection-2",
+        10,
+        AuthMode::Disabled,
+        true,
+    );
+    let (accepted_sender, mut accepted_receiver) = tokio::sync::mpsc::unbounded_channel();
+    let (rejected_sender, mut rejected_receiver) = tokio::sync::mpsc::unbounded_channel();
+    service
+        .register_session(&accepted_session, accepted_sender)
+        .unwrap();
+    service
+        .register_session(&rejected_session, rejected_sender)
+        .unwrap();
+    let rfq = create_option_rfq(&state, option_rfq_input(option_series_id, Side::Buy))
+        .await
+        .unwrap();
+    let _ = accepted_receiver.recv().await.unwrap();
+    let _ = rejected_receiver.recv().await.unwrap();
+    let winner = submit_option_rfq_quote(
+        &state,
+        rfq.option_rfq_id,
+        option_rfq_quote_input(
+            AccountId::new("0x0000000000000000000000000000000000000001"),
+            "session-option-accepted",
+            "winner-option-rfq-quote",
+        ),
+    )
+    .await
+    .unwrap();
+    let loser = submit_option_rfq_quote(
+        &state,
+        rfq.option_rfq_id,
+        option_rfq_quote_input(
+            AccountId::new("0x0000000000000000000000000000000000000002"),
+            "session-option-rejected",
+            "loser-option-rfq-quote",
+        ),
+    )
+    .await
+    .unwrap();
+
+    let outcome = accept_option_rfq_quote(&state, rfq.option_rfq_id, winner.quote_id)
+        .await
+        .unwrap();
+
+    assert!(outcome.mm_notification_sent);
+    assert!(outcome.mm_notification_warning.is_none());
+    let accepted = accepted_receiver.recv().await.unwrap();
+    let ServerMessage::OptionRfqQuoteAccepted(envelope) = accepted else {
+        panic!("expected option_rfq_quote_accepted");
+    };
+    assert_eq!(envelope.payload.quote_id, winner.quote_id);
+    assert_eq!(envelope.payload.option_fill_id, outcome.fill.fill_id);
+    let rejected = rejected_receiver.recv().await.unwrap();
+    let ServerMessage::OptionRfqQuoteRejected(envelope) = rejected else {
+        panic!("expected option_rfq_quote_rejected");
+    };
+    assert_eq!(envelope.payload.quote_id, loser.quote_id);
+    assert_eq!(envelope.payload.reason, "competing quote accepted");
+}
+
+#[tokio::test]
+async fn option_rfq_accept_succeeds_even_if_notification_fails_without_forbidden_mutations() {
+    let state = option_rfq_state();
+    let option_series_id = active_option_series_id(&state).await;
+    let rfq = create_option_rfq(&state, option_rfq_input(option_series_id, Side::Buy))
+        .await
+        .unwrap();
+    let quote = submit_option_rfq_quote(
+        &state,
+        rfq.option_rfq_id,
+        option_rfq_quote_input(
+            AccountId::new("0x0000000000000000000000000000000000000001"),
+            "missing-option-session",
+            "notify-fail-option-rfq-quote",
+        ),
+    )
+    .await
+    .unwrap();
+
+    let outcome = accept_option_rfq_quote(&state, rfq.option_rfq_id, quote.quote_id)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        outcome.rfq.status,
+        deopt_v2_backend::options::OptionRfqStatus::Accepted
+    );
+    assert!(!outcome.mm_notification_sent);
+    assert!(outcome.mm_notification_warning.is_some());
+    assert_eq!(state.engine.lock().unwrap().execution_intents().len(), 0);
 }
 
 #[tokio::test]
@@ -989,6 +1374,83 @@ fn rfq_quote_message(rfq_id: uuid::Uuid, price_1e8: &str, size_1e8: &str) -> Cli
             "price_1e8": price_1e8,
             "size_1e8": size_1e8,
             "client_quote_id": "mm-rfq-quote-001",
+            "quote_ttl_ms": 100
+        }
+    }))
+    .unwrap()
+}
+
+fn option_rfq_state() -> AppState {
+    let mut config = OptionsConfig::enabled_in_memory_for_tests();
+    config.rfq_enabled = true;
+    config.rfq_min_quote_ttl_ms = 1;
+    config.rfq_max_quote_ttl_ms = 500;
+    AppState::with_options_config(EngineState::with_default_markets(), config)
+}
+
+async fn active_option_series_id(state: &AppState) -> String {
+    create_option_series(state, option_series_input())
+        .await
+        .unwrap()
+        .option_series_id
+}
+
+fn option_series_input() -> CreateOptionSeriesInput {
+    let expiry = u64::try_from(now_ms() / 1000).unwrap() + 86_400;
+    CreateOptionSeriesInput {
+        underlying: "ETH".to_string(),
+        base_asset: "ETH".to_string(),
+        quote_asset: "USDC".to_string(),
+        settlement_asset: "USDC".to_string(),
+        expiry,
+        strike_1e8: 300_000_000_000,
+        is_call: true,
+        contract_size_1e8: Some(100_000_000),
+        onchain_product_id: None,
+        onchain_series_id: None,
+    }
+}
+
+fn option_rfq_input(option_series_id: String, side: Side) -> CreateOptionRfqInput {
+    CreateOptionRfqInput {
+        taker: AccountId::new("0x0000000000000000000000000000000000000003"),
+        option_series_id,
+        side,
+        size_1e8: 100_000_000,
+        limit_price_1e8: Some(1_100_000_000),
+        ttl_ms: Some(500),
+    }
+}
+
+fn option_rfq_quote_input(
+    mm_account: AccountId,
+    session_id: &str,
+    client_quote_id: &str,
+) -> SubmitOptionRfqQuoteInput {
+    SubmitOptionRfqQuoteInput {
+        mm_account,
+        session_id: Some(session_id.to_string()),
+        client_quote_id: Some(client_quote_id.to_string()),
+        price_1e8: 1_000_000_000,
+        size_1e8: 100_000_000,
+        quote_ttl_ms: Some(100),
+    }
+}
+
+fn option_rfq_quote_message(
+    option_rfq_id: uuid::Uuid,
+    price_1e8: &str,
+    size_1e8: &str,
+) -> ClientMessage {
+    serde_json::from_value(json!({
+        "type": "option_rfq_quote",
+        "request_id": "mm-option-quote-1",
+        "payload": {
+            "option_rfq_id": option_rfq_id,
+            "mm_account": "0x0000000000000000000000000000000000000001",
+            "price_1e8": price_1e8,
+            "size_1e8": size_1e8,
+            "client_quote_id": "mm-option-rfq-quote-001",
             "quote_ttl_ms": 100
         }
     }))

@@ -1,4 +1,5 @@
 use super::session::PublicSessionSnapshot;
+use crate::options::OptionRfqQuoteStatus;
 use crate::rfq::{RfqQuoteStatus, RfqStatus};
 use crate::types::{AccountId, MarketId, OrderId, Side, TimeInForce, TimestampMs};
 use serde::de::{self, DeserializeOwned};
@@ -21,6 +22,7 @@ pub enum ErrorCode {
     CancelRejected,
     QuoteReplaceFailed,
     RfqQuoteRejected,
+    OptionRfqQuoteRejected,
     InternalError,
     NotImplemented,
 }
@@ -57,6 +59,7 @@ pub enum ClientMessage {
     CancelAll(ClientEnvelope<CancelAllPayload>),
     QuoteReplace(ClientEnvelope<QuoteReplacePayload>),
     RfqQuote(ClientEnvelope<RfqQuotePayload>),
+    OptionRfqQuote(ClientEnvelope<OptionRfqQuotePayload>),
     GetSession(ClientEnvelope<GetSessionPayload>),
 }
 
@@ -72,6 +75,7 @@ impl ClientMessage {
             Self::CancelAll(envelope) => &envelope.request_id,
             Self::QuoteReplace(envelope) => &envelope.request_id,
             Self::RfqQuote(envelope) => &envelope.request_id,
+            Self::OptionRfqQuote(envelope) => &envelope.request_id,
             Self::GetSession(envelope) => &envelope.request_id,
         }
     }
@@ -87,6 +91,7 @@ impl ClientMessage {
             Self::CancelAll(_) => "cancel_all",
             Self::QuoteReplace(_) => "quote_replace",
             Self::RfqQuote(_) => "rfq_quote",
+            Self::OptionRfqQuote(_) => "option_rfq_quote",
             Self::GetSession(_) => "get_session",
         }
     }
@@ -136,6 +141,7 @@ fn parse_raw_client_envelope(raw: RawClientEnvelope) -> Result<ClientMessage, Pr
         "cancel_all" => Ok(ClientMessage::CancelAll(parse_payload(raw)?)),
         "quote_replace" => Ok(ClientMessage::QuoteReplace(parse_payload(raw)?)),
         "rfq_quote" => Ok(ClientMessage::RfqQuote(parse_payload(raw)?)),
+        "option_rfq_quote" => Ok(ClientMessage::OptionRfqQuote(parse_payload(raw)?)),
         "get_session" => Ok(ClientMessage::GetSession(parse_payload(raw)?)),
         _ => Err(ProtocolError::new(
             ErrorCode::UnknownMessageType,
@@ -239,6 +245,16 @@ pub struct RfqQuotePayload {
     pub quote_nonce: Option<u64>,
     pub quote_ttl_ms: u64,
     pub signature: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+pub struct OptionRfqQuotePayload {
+    pub option_rfq_id: uuid::Uuid,
+    pub mm_account: AccountId,
+    pub price_1e8: String,
+    pub size_1e8: String,
+    pub client_quote_id: Option<String>,
+    pub quote_ttl_ms: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Default, Deserialize)]
@@ -373,6 +389,39 @@ pub struct RfqExpiredPayload {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct OptionRfqRequestPayload {
+    pub option_rfq_id: uuid::Uuid,
+    pub taker: AccountId,
+    pub option_series_id: String,
+    pub side: Side,
+    pub size_1e8: String,
+    pub limit_price_1e8: Option<String>,
+    pub expires_at_ms: TimestampMs,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct OptionRfqQuoteResultPayload {
+    pub quote_id: uuid::Uuid,
+    pub option_rfq_id: uuid::Uuid,
+    pub status: OptionRfqQuoteStatus,
+    pub expires_at_ms: TimestampMs,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct OptionRfqQuoteAcceptedPayload {
+    pub option_rfq_id: uuid::Uuid,
+    pub quote_id: uuid::Uuid,
+    pub option_fill_id: uuid::Uuid,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct OptionRfqQuoteRejectedPayload {
+    pub option_rfq_id: uuid::Uuid,
+    pub quote_id: uuid::Uuid,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct GetSessionResultPayload {
     pub session: PublicSessionSnapshot,
 }
@@ -392,6 +441,10 @@ pub enum ServerMessage {
     RfqQuoteAccepted(NotificationEnvelope<RfqQuoteAcceptedPayload>),
     RfqQuoteRejected(NotificationEnvelope<RfqQuoteRejectedPayload>),
     RfqExpired(NotificationEnvelope<RfqExpiredPayload>),
+    OptionRfqRequest(NotificationEnvelope<OptionRfqRequestPayload>),
+    OptionRfqQuoteResult(ResultEnvelope<OptionRfqQuoteResultPayload>),
+    OptionRfqQuoteAccepted(NotificationEnvelope<OptionRfqQuoteAcceptedPayload>),
+    OptionRfqQuoteRejected(NotificationEnvelope<OptionRfqQuoteRejectedPayload>),
     GetSessionResult(ResultEnvelope<GetSessionResultPayload>),
     Error(ErrorEnvelope),
 }
@@ -430,6 +483,10 @@ impl Serialize for ServerMessage {
             Self::RfqQuoteAccepted(envelope) => envelope.serialize(serializer),
             Self::RfqQuoteRejected(envelope) => envelope.serialize(serializer),
             Self::RfqExpired(envelope) => envelope.serialize(serializer),
+            Self::OptionRfqRequest(envelope) => envelope.serialize(serializer),
+            Self::OptionRfqQuoteResult(envelope) => envelope.serialize(serializer),
+            Self::OptionRfqQuoteAccepted(envelope) => envelope.serialize(serializer),
+            Self::OptionRfqQuoteRejected(envelope) => envelope.serialize(serializer),
             Self::GetSessionResult(envelope) => envelope.serialize(serializer),
             Self::Error(envelope) => envelope.serialize(serializer),
         }

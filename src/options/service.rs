@@ -1,16 +1,22 @@
 use super::series_id::{option_series_id, OptionSeriesIdInput};
 use super::{
     OptionFill, OptionFillFilter, OptionFillId, OptionOrder, OptionOrderFilter, OptionOrderId,
-    OptionOrderStatus, OptionOrderbookLevel, OptionOrderbookSnapshot, OptionRfqFill, OptionRfqId,
-    OptionRfqQuote, OptionRfqQuoteId, OptionRfqQuoteStatus, OptionRfqRequest, OptionRfqStatus,
-    OptionSeries, OptionSeriesFilter, OptionSeriesId, OptionSeriesSource, OptionSeriesStatus,
+    OptionOrderStatus, OptionOrderbookLevel, OptionOrderbookSnapshot, OptionRfqFill,
+    OptionRfqFillId, OptionRfqId, OptionRfqQuote, OptionRfqQuoteId, OptionRfqQuoteStatus,
+    OptionRfqRequest, OptionRfqStatus, OptionSeries, OptionSeriesFilter, OptionSeriesId,
+    OptionSeriesSource, OptionSeriesStatus,
 };
 use crate::api::AppState;
 use crate::error::{BackendError, Result};
+use crate::mm::protocol::{
+    NotificationEnvelope, OptionRfqQuoteAcceptedPayload, OptionRfqQuoteRejectedPayload,
+    OptionRfqRequestPayload, ServerMessage,
+};
 use crate::signing::eip712::parse_evm_address;
 use crate::signing::signature::validate_signature_shape;
 use crate::types::{now_ms, AccountId, OrderId, Price1e8, Side, Size1e8, TimeInForce, TimestampMs};
 use std::collections::BTreeMap;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -72,6 +78,8 @@ pub struct AcceptOptionRfqQuoteOutcome {
     pub rfq: OptionRfqRequest,
     pub quote: OptionRfqQuote,
     pub fill: OptionRfqFill,
+    pub mm_notification_sent: bool,
+    pub mm_notification_warning: Option<String>,
 }
 
 pub async fn create_option_series(
@@ -439,17 +447,21 @@ pub async fn create_option_rfq(
 
     if let Some(repository) = state.repository.clone() {
         repository.insert_option_rfq(&rfq).await?;
-        return repository
+        let rfq = repository
             .get_option_rfq(rfq.option_rfq_id)
             .await?
-            .ok_or(BackendError::InvalidOptionRfqId);
+            .ok_or(BackendError::InvalidOptionRfqId)?;
+        broadcast_option_rfq_request(state, &rfq);
+        return Ok(rfq);
     }
 
-    Ok(state
+    let rfq = state
         .options_store
         .lock()
         .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?
-        .insert_option_rfq(rfq))
+        .insert_option_rfq(rfq);
+    broadcast_option_rfq_request(state, &rfq);
+    Ok(rfq)
 }
 
 pub async fn list_option_rfqs(state: &AppState) -> Result<Vec<OptionRfqRequest>> {
@@ -613,6 +625,7 @@ pub async fn accept_option_rfq_quote(
             "option series is not active".to_string(),
         ));
     }
+    let quotes_before_accept = list_option_rfq_quotes(state, option_rfq_id).await?;
 
     let (buyer, seller) = match rfq.side {
         Side::Buy => (rfq.taker.clone(), quote.mm_account.clone()),
@@ -648,7 +661,15 @@ pub async fn accept_option_rfq_quote(
         let fill = repository.get_option_rfq_fill(fill.fill_id).await?.ok_or(
             BackendError::InvalidOptionRfqState("option RFQ fill was not persisted".to_string()),
         )?;
-        return Ok(AcceptOptionRfqQuoteOutcome { rfq, quote, fill });
+        let (mm_notification_sent, mm_notification_warning) =
+            notify_option_rfq_quote_acceptance(state, &quote, &quotes_before_accept, fill.fill_id);
+        return Ok(AcceptOptionRfqQuoteOutcome {
+            rfq,
+            quote,
+            fill,
+            mm_notification_sent,
+            mm_notification_warning,
+        });
     }
 
     let (rfq, quote) = state
@@ -656,7 +677,15 @@ pub async fn accept_option_rfq_quote(
         .lock()
         .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?
         .accept_option_rfq_quote(option_rfq_id, quote_id, fill.clone())?;
-    Ok(AcceptOptionRfqQuoteOutcome { rfq, quote, fill })
+    let (mm_notification_sent, mm_notification_warning) =
+        notify_option_rfq_quote_acceptance(state, &quote, &quotes_before_accept, fill.fill_id);
+    Ok(AcceptOptionRfqQuoteOutcome {
+        rfq,
+        quote,
+        fill,
+        mm_notification_sent,
+        mm_notification_warning,
+    })
 }
 
 pub async fn cancel_option_rfq(
@@ -791,6 +820,106 @@ fn option_rfq_price_satisfies_limit(
         (Side::Buy, Some(limit)) => price_1e8 <= limit,
         (Side::Sell, Some(limit)) => price_1e8 >= limit,
     }
+}
+
+fn broadcast_option_rfq_request(state: &AppState, rfq: &OptionRfqRequest) {
+    let message = ServerMessage::OptionRfqRequest(NotificationEnvelope::new(
+        "option_rfq_request",
+        format!("option-rfq-push-{}", rfq.option_rfq_id),
+        OptionRfqRequestPayload {
+            option_rfq_id: rfq.option_rfq_id,
+            taker: rfq.taker.clone(),
+            option_series_id: rfq.option_series_id.clone(),
+            side: rfq.side,
+            size_1e8: rfq.size_1e8.to_string(),
+            limit_price_1e8: rfq.limit_price_1e8.map(|value| value.to_string()),
+            expires_at_ms: rfq.expires_at_ms,
+        },
+    ));
+    match state.mm_sessions.broadcast(message) {
+        Ok(sent) => {
+            info!(
+                option_rfq_id = %rfq.option_rfq_id,
+                broadcast_count = sent,
+                "broadcast option RFQ request to MM sessions"
+            );
+        }
+        Err(error) => {
+            warn!(
+                option_rfq_id = %rfq.option_rfq_id,
+                error = %error,
+                "option RFQ request broadcast failed"
+            );
+        }
+    }
+}
+
+fn notify_option_rfq_quote_acceptance(
+    state: &AppState,
+    accepted_quote: &OptionRfqQuote,
+    quotes_before_accept: &[OptionRfqQuote],
+    option_fill_id: OptionRfqFillId,
+) -> (bool, Option<String>) {
+    let mut accepted_sent = false;
+    let mut warning = None;
+
+    if let Some(session_id) = accepted_quote.session_id.as_deref() {
+        let message = ServerMessage::OptionRfqQuoteAccepted(NotificationEnvelope::new(
+            "option_rfq_quote_accepted",
+            format!("option-rfq-accepted-{}", accepted_quote.quote_id),
+            OptionRfqQuoteAcceptedPayload {
+                option_rfq_id: accepted_quote.option_rfq_id,
+                quote_id: accepted_quote.quote_id,
+                option_fill_id,
+            },
+        ));
+        match state.mm_sessions.send_to_session(session_id, message) {
+            Ok(()) => {
+                accepted_sent = true;
+            }
+            Err(error) => {
+                let message = error.to_string();
+                warn!(
+                    option_rfq_id = %accepted_quote.option_rfq_id,
+                    quote_id = %accepted_quote.quote_id,
+                    session_id,
+                    error = %message,
+                    "option RFQ quote accepted notification failed"
+                );
+                warning = Some(message);
+            }
+        }
+    }
+
+    for quote in quotes_before_accept {
+        if quote.quote_id == accepted_quote.quote_id || quote.status != OptionRfqQuoteStatus::Active
+        {
+            continue;
+        }
+        let Some(session_id) = quote.session_id.as_deref() else {
+            continue;
+        };
+        let message = ServerMessage::OptionRfqQuoteRejected(NotificationEnvelope::new(
+            "option_rfq_quote_rejected",
+            format!("option-rfq-rejected-{}", quote.quote_id),
+            OptionRfqQuoteRejectedPayload {
+                option_rfq_id: quote.option_rfq_id,
+                quote_id: quote.quote_id,
+                reason: "competing quote accepted".to_string(),
+            },
+        ));
+        if let Err(error) = state.mm_sessions.send_to_session(session_id, message) {
+            warn!(
+                option_rfq_id = %quote.option_rfq_id,
+                quote_id = %quote.quote_id,
+                session_id,
+                error = %error,
+                "option RFQ quote rejected notification failed"
+            );
+        }
+    }
+
+    (accepted_sent, warning)
 }
 
 fn aggregate_levels(orders: &[OptionOrder], side: Side) -> Vec<OptionOrderbookLevel> {

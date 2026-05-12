@@ -46,6 +46,8 @@ async fn main() -> deopt_v2_backend::Result<()> {
         run_v1c_scenario(&connection, &endpoint, &http_base).await?;
     } else if scenario == "rfq" {
         run_rfq_scenario(&connection, &endpoint, &http_base).await?;
+    } else if scenario == "option-rfq" {
+        run_option_rfq_scenario(&connection, &endpoint, &http_base).await?;
     } else {
         let heartbeat = send_request(
             &connection,
@@ -72,6 +74,172 @@ async fn main() -> deopt_v2_backend::Result<()> {
         connection.close(0_u32.into(), b"smoke complete");
         endpoint.wait_idle().await;
     }
+    Ok(())
+}
+
+async fn run_option_rfq_scenario(
+    connection: &wtransport::Connection,
+    endpoint: &Endpoint<wtransport::endpoint::endpoint_side::Client>,
+    http_base: &str,
+) -> deopt_v2_backend::Result<()> {
+    let http = reqwest::Client::new();
+    let taker = env::var("MM_WT_OPTION_RFQ_TAKER").unwrap_or_else(|_| RFQ_TAKER.to_string());
+    let mm_account =
+        env::var("MM_WT_OPTION_RFQ_MM_ACCOUNT").unwrap_or_else(|_| RFQ_MM_ACCOUNT.to_string());
+
+    let heartbeat = send_request(
+        connection,
+        json!({
+            "type": "heartbeat",
+            "request_id": "option-rfq-heartbeat-1",
+            "payload": {}
+        }),
+    )
+    .await?;
+    print_step("heartbeat", &heartbeat);
+    assert_ok(&heartbeat, "heartbeat")?;
+
+    let session = send_request(
+        connection,
+        json!({
+            "type": "get_session",
+            "request_id": "option-rfq-session-1",
+            "payload": {}
+        }),
+    )
+    .await?;
+    print_step("get_session", &session);
+    assert_ok(&session, "get_session")?;
+
+    let intents_before = http_get(&http, http_base, "/execution-intents").await?;
+    let transactions_before = http_get(&http, http_base, "/executor/transactions").await?;
+
+    let expiry = env::var("MM_WT_OPTION_EXPIRY")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or_else(|| {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                + 86_400
+        });
+    let series = http_post(
+        &http,
+        http_base,
+        "/options/series",
+        json!({
+            "underlying": env::var("MM_WT_OPTION_UNDERLYING").unwrap_or_else(|_| "ETH".to_string()),
+            "base_asset": env::var("MM_WT_OPTION_BASE_ASSET").unwrap_or_else(|_| "ETH".to_string()),
+            "quote_asset": env::var("MM_WT_OPTION_QUOTE_ASSET").unwrap_or_else(|_| "USDC".to_string()),
+            "settlement_asset": env::var("MM_WT_OPTION_SETTLEMENT_ASSET").unwrap_or_else(|_| "USDC".to_string()),
+            "expiry": expiry,
+            "strike_1e8": env::var("MM_WT_OPTION_STRIKE_1E8").unwrap_or_else(|_| "300000000000".to_string()),
+            "is_call": env::var("MM_WT_OPTION_IS_CALL")
+                .ok()
+                .and_then(|value| value.parse::<bool>().ok())
+                .unwrap_or(true),
+            "contract_size_1e8": env::var("MM_WT_OPTION_CONTRACT_SIZE_1E8").unwrap_or_else(|_| "100000000".to_string())
+        }),
+    )
+    .await?;
+    print_step("http_create_option_series", &series);
+    let option_series_id = required_str(&series, &["option_series_id"])?;
+
+    let created = http_post(
+        &http,
+        http_base,
+        "/options/rfqs",
+        json!({
+            "taker": taker,
+            "option_series_id": option_series_id,
+            "side": env::var("MM_WT_OPTION_RFQ_SIDE").unwrap_or_else(|_| "buy".to_string()),
+            "size_1e8": env::var("MM_WT_OPTION_RFQ_SIZE_1E8").unwrap_or_else(|_| "100000000".to_string()),
+            "limit_price_1e8": env::var("MM_WT_OPTION_RFQ_LIMIT_PRICE_1E8").unwrap_or_else(|_| "1200000000".to_string()),
+            "ttl_ms": env::var("MM_WT_OPTION_RFQ_TTL_MS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(30000)
+        }),
+    )
+    .await?;
+    print_step("http_create_option_rfq", &created);
+    let option_rfq_id = required_str(&created, &["option_rfq_id"])?;
+
+    let rfq_request = receive_server_message(connection, "option_rfq_request").await?;
+    print_step("option_rfq_request", &rfq_request);
+    if required_str(&rfq_request, &["payload", "option_rfq_id"])? != option_rfq_id {
+        return Err(deopt_v2_backend::BackendError::Config(
+            "option_rfq_request id mismatch".to_string(),
+        ));
+    }
+
+    let quote = send_request(
+        connection,
+        json!({
+            "type": "option_rfq_quote",
+            "request_id": "option-rfq-quote-1",
+            "payload": {
+                "option_rfq_id": option_rfq_id,
+                "mm_account": mm_account,
+                "price_1e8": env::var("MM_WT_OPTION_RFQ_QUOTE_PRICE_1E8").unwrap_or_else(|_| "1100000000".to_string()),
+                "size_1e8": env::var("MM_WT_OPTION_RFQ_QUOTE_SIZE_1E8").unwrap_or_else(|_| "100000000".to_string()),
+                "client_quote_id": env::var("MM_WT_OPTION_RFQ_CLIENT_QUOTE_ID").unwrap_or_else(|_| "smoke-option-rfq-quote-1".to_string()),
+                "quote_ttl_ms": env::var("MM_WT_OPTION_RFQ_QUOTE_TTL_MS")
+                    .ok()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .unwrap_or(10000)
+            }
+        }),
+    )
+    .await?;
+    print_step("option_rfq_quote", &quote);
+    assert_ok(&quote, "option_rfq_quote")?;
+    let quote_id = required_str(&quote, &["payload", "quote_id"])?;
+
+    let quotes = http_get(
+        &http,
+        http_base,
+        &format!("/options/rfqs/{option_rfq_id}/quotes"),
+    )
+    .await?;
+    print_step("http_option_rfq_quotes", &quotes);
+    assert_quote_list_contains(&quotes, &quote_id)?;
+
+    let accepted = http_post(
+        &http,
+        http_base,
+        &format!("/options/rfqs/{option_rfq_id}/accept/{quote_id}"),
+        json!({}),
+    )
+    .await?;
+    print_step("http_accept_option_rfq_quote", &accepted);
+
+    let accepted_notice = receive_server_message(connection, "option_rfq_quote_accepted").await?;
+    print_step("option_rfq_quote_accepted", &accepted_notice);
+    if required_str(&accepted_notice, &["payload", "quote_id"])? != quote_id {
+        return Err(deopt_v2_backend::BackendError::Config(
+            "option_rfq_quote_accepted quote_id mismatch".to_string(),
+        ));
+    }
+
+    let intents_after = http_get(&http, http_base, "/execution-intents").await?;
+    print_step("execution_intents_after_option_rfq", &intents_after);
+    let transactions_after = http_get(&http, http_base, "/executor/transactions").await?;
+    print_step("transactions_after_option_rfq", &transactions_after);
+    if intents_before != intents_after {
+        return Err(deopt_v2_backend::BackendError::Config(
+            "option RFQ acceptance created an execution intent".to_string(),
+        ));
+    }
+    if transactions_before != transactions_after {
+        return Err(deopt_v2_backend::BackendError::Config(
+            "option RFQ acceptance created an execution transaction".to_string(),
+        ));
+    }
+
+    connection.close(0_u32.into(), b"option rfq smoke complete");
+    endpoint.wait_idle().await;
     Ok(())
 }
 

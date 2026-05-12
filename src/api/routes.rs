@@ -441,6 +441,8 @@ struct AcceptOptionRfqQuoteResponse {
     quote_status: OptionRfqQuoteStatus,
     option_fill_id: String,
     fill: OptionRfqFillResponse,
+    mm_notification_sent: bool,
+    mm_notification_warning: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -888,6 +890,8 @@ async fn accept_option_rfq_quote(
         quote_status: outcome.quote.status,
         option_fill_id,
         fill: outcome.fill.into(),
+        mm_notification_sent: outcome.mm_notification_sent,
+        mm_notification_warning: outcome.mm_notification_warning,
     }))
 }
 
