@@ -1,3 +1,4 @@
+use crate::admin::AdminConfig;
 use crate::confirmation::ConfirmationConfig;
 use crate::error::{BackendError, Result};
 use crate::execution::{ExecutionConfig, PrivateKeySecret};
@@ -29,6 +30,7 @@ pub struct AppConfig {
     pub rfq: RfqConfig,
     pub options: OptionsConfig,
     pub mm_gateway: MmGatewayConfig,
+    pub admin: AdminConfig,
     pub signature_verification_mode: SignatureVerificationMode,
     pub eip712_domain: Eip712Domain,
     pub persistence_enabled: bool,
@@ -146,6 +148,11 @@ impl AppConfig {
             auth_mode: parse_env(&mut lookup, "MM_GATEWAY_AUTH_MODE", "disabled")?,
             require_auth: parse_env(&mut lookup, "MM_GATEWAY_REQUIRE_AUTH", "false")?,
         };
+        let admin = AdminConfig::new(
+            parse_env(&mut lookup, "ADMIN_API_ENABLED", "false")?,
+            parse_env(&mut lookup, "ADMIN_API_REQUIRE_TOKEN", "false")?,
+            lookup("ADMIN_API_TOKEN").filter(|value| !value.is_empty()),
+        );
         let confirmation = ConfirmationConfig {
             enabled: parse_env(&mut lookup, "CONFIRMATION_ENABLED", "false")?,
             require_persistence: parse_env(
@@ -258,6 +265,7 @@ impl AppConfig {
         rfq.validate_startup(persistence_enabled)?;
         options.validate_startup(persistence_enabled)?;
         validate_webtransport_startup(&mm_gateway)?;
+        admin.validate_startup()?;
 
         Ok(Self {
             host,
@@ -273,6 +281,7 @@ impl AppConfig {
             rfq,
             options,
             mm_gateway,
+            admin,
             signature_verification_mode,
             eip712_domain,
             persistence_enabled,
@@ -760,6 +769,41 @@ mod tests {
         );
         assert_eq!(config.mm_gateway.host, "127.0.0.1");
         assert_eq!(config.mm_gateway.port, 18443);
+    }
+
+    #[test]
+    fn admin_api_uses_safe_defaults() {
+        let config = config_from_pairs([("PERSISTENCE_ENABLED", "false")]).unwrap();
+
+        assert!(!config.admin.enabled);
+        assert!(!config.admin.require_token);
+        assert!(!config.admin.token_configured());
+    }
+
+    #[test]
+    fn admin_api_token_required_needs_token() {
+        let error = config_from_pairs([
+            ("ADMIN_API_ENABLED", "true"),
+            ("ADMIN_API_REQUIRE_TOKEN", "true"),
+        ])
+        .unwrap_err();
+
+        assert!(error.to_string().contains("ADMIN_API_TOKEN is required"));
+    }
+
+    #[test]
+    fn admin_api_token_is_redacted_from_debug() {
+        let config = config_from_pairs([
+            ("ADMIN_API_ENABLED", "true"),
+            ("ADMIN_API_REQUIRE_TOKEN", "true"),
+            ("ADMIN_API_TOKEN", "super-secret-admin-token"),
+        ])
+        .unwrap();
+
+        let debug = format!("{:?}", config.admin);
+
+        assert!(!debug.contains("super-secret-admin-token"));
+        assert!(debug.contains("<redacted>"));
     }
 
     #[test]

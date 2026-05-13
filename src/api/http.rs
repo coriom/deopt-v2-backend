@@ -1,9 +1,10 @@
+use crate::admin::AdminConfig;
 use crate::confirmation::ConfirmationConfig;
 use crate::db::PgRepository;
 use crate::engine::EngineState;
 use crate::execution::{ExecutionConfig, StoredTradeSignatures};
 use crate::indexer::IndexerConfig;
-use crate::mm::MmSessionRegistry;
+use crate::mm::{MmGatewayConfig, MmSessionRegistry};
 use crate::nonce_sync::PerpNonceSyncConfig;
 use crate::options::{OptionSeriesStore, OptionsConfig};
 use crate::reconciliation::ReconciliationConfig;
@@ -20,6 +21,9 @@ pub struct AppState {
     pub signature_verification_mode: SignatureVerificationMode,
     pub eip712_domain: Eip712Domain,
     pub chain_id: u64,
+    pub network_name: String,
+    pub persistence_enabled: bool,
+    pub database_configured: bool,
     pub repository: Option<PgRepository>,
     pub execution_config: ExecutionConfig,
     pub perp_nonce_sync_config: PerpNonceSyncConfig,
@@ -28,6 +32,8 @@ pub struct AppState {
     pub reconciliation_config: ReconciliationConfig,
     pub rfq_config: RfqConfig,
     pub options_config: OptionsConfig,
+    pub mm_gateway_config: MmGatewayConfig,
+    pub admin_config: AdminConfig,
     pub rfq_store: Arc<Mutex<RfqStore>>,
     pub options_store: Arc<Mutex<OptionSeriesStore>>,
     pub mm_sessions: MmSessionRegistry,
@@ -168,6 +174,9 @@ impl AppState {
             signature_verification_mode,
             eip712_domain,
             chain_id,
+            network_name: "base-sepolia".to_string(),
+            persistence_enabled: repository.is_some(),
+            database_configured: repository.is_some(),
             repository,
             execution_config,
             perp_nonce_sync_config,
@@ -176,6 +185,8 @@ impl AppState {
             reconciliation_config,
             rfq_config,
             options_config,
+            mm_gateway_config: MmGatewayConfig::default(),
+            admin_config: AdminConfig::disabled(),
             rfq_store: Arc::new(Mutex::new(RfqStore::new())),
             options_store: Arc::new(Mutex::new(OptionSeriesStore::new())),
             mm_sessions: MmSessionRegistry::new(),

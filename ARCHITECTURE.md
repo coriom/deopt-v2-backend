@@ -23,8 +23,9 @@ The long-term backend needs low-latency deterministic matching, RFQ, market-make
 - `options`: Options V1D/V1C domain types, deterministic option series ids, manual series registry, off-chain option orders, price-time matching, fill recording, HTTP/core option RFQs, signed MM option RFQ quote verification, MM Gateway option RFQ coordination, off-chain option RFQ fills, in-memory/persistent stores, and aggregated option orderbook read model.
 - `orders`: Shared order/cancel service used by HTTP and the Market Maker Gateway for signed order validation, nonce handling, matching, persistence writes, ownership-checked cancels, cancel-all, and deterministic resting-order lookup.
 - `mm`: Market Maker Gateway protocol, session, heartbeat, rate-limit, live order/cancel handling, quote-replace models, service boundary, adapter traits, and disabled-by-default WebTransport V1C adapter. Protocol/session/service/rate-limit logic remains transport-agnostic.
+- `admin`: Monitoring/Admin V1A configuration and read-only operational observability support. Admin endpoints are disabled by default, optionally protected by a simple local/dev token header, and return sanitized status/config/summaries without exposing secrets or mutating trading state.
 - `signing`: signed-order schema, shared EIP-712 helpers, strict secp256k1 signer recovery, signature mode, deadline validation, and in-memory nonce tracking.
-- `config`: environment loading for host, port, log level, network name, chain id, disabled execution flag, simulation flags, indexer flags, reconciliation flags, confirmation flags, RFQ signature mode/domain flags, Options V1D flags, Market Maker Gateway V1C flags, signature mode, and opt-in persistence.
+- `config`: environment loading for host, port, log level, network name, chain id, disabled execution flag, simulation flags, indexer flags, reconciliation flags, confirmation flags, RFQ signature mode/domain flags, Options V1D flags, Market Maker Gateway V1C flags, Monitoring/Admin V1A flags, signature mode, and opt-in persistence.
 
 ## Current v1 Scope
 
@@ -51,6 +52,25 @@ The long-term backend needs low-latency deterministic matching, RFQ, market-make
 - RFQ V1C guarded by `RFQ_ENABLED=false` and `RFQ_QUOTE_SIGNATURE_MODE=disabled` by default. Enabled mode exposes HTTP/core RFQ creation, quote signing payloads, quote submission/listing, cancellation, WebTransport RFQ push/quote intake through connected MM sessions, optional strict signed quote verification, and acceptance into a pending execution intent without auto-broadcast.
 - Options V1D/V1C guarded by `OPTIONS_ENABLED=false`, `OPTION_RFQ_ENABLED=false`, and `OPTION_RFQ_QUOTE_SIGNATURE_MODE=disabled` by default. Enabled mode exposes manual option series creation/list/get/disable, off-chain GTC option order submit/list/get/cancel, price-time matching, fill listing/get endpoints, aggregated option orderbook reads, HTTP/core option RFQs with off-chain RFQ fills, option RFQ quote signing payloads, optional strict signed MM option RFQ quote verification, and MM Gateway option RFQ request/quote/accept notification messages. Option execution intents, Greeks, IV surfaces, and on-chain option lifecycle are deferred.
 - Market Maker Gateway V1C guarded by `MM_GATEWAY_ENABLED=false` by default. Enabled mode starts a separate WebTransport UDP listener with required TLS cert/key config and routes MM order flow through the live off-chain perp orderbook without auto-broadcasting.
+- Monitoring/Admin V1A guarded by `ADMIN_API_ENABLED=false` by default. Enabled mode exposes read-only `/admin/status`, `/admin/config`, `/admin/db`, `/admin/mm/sessions`, `/admin/execution/summary`, `/admin/rfq/summary`, `/admin/options/summary`, and `/admin/recent` endpoints. The endpoints are local/dev-oriented, optionally require `X-Admin-Token`, sanitize secrets, use bounded read queries, and do not mutate DB rows, RFQs, option state, execution state, or MM sessions.
+
+## Monitoring/Admin V1A
+
+Monitoring/Admin V1A is an observability layer inside the existing Axum API. It exists to inspect operational state before a separate frontend/admin service is built. It is disabled by default:
+
+```text
+ADMIN_API_ENABLED=false
+ADMIN_API_REQUIRE_TOKEN=false
+ADMIN_API_TOKEN=
+```
+
+When enabled, admin endpoints are read-only. `ADMIN_API_REQUIRE_TOKEN=true` performs a simple local/dev header check with `X-Admin-Token`; it is not production authentication. The token is not logged by endpoint code and is never returned by responses.
+
+The admin config response is sanitized. It exposes public network/chain identifiers, feature flags, public contract addresses, signature modes, TTL settings, booleans for RPC/database/private-key configuration, and WebTransport host/port only when the gateway is enabled. It does not expose private keys, raw database URLs, raw RPC URLs, provider keys, admin tokens, or full environment data.
+
+Persistent admin DB reads use simple aggregate/count/recent queries and fixed table names. `/admin/db` reports missing older tables as unavailable in its count response. With persistence disabled, admin endpoints use in-memory engine/RFQ/options/MM session snapshots where available and return empty DB/recent sections otherwise. Normal tests do not require live Postgres, RPC, WebTransport, or private keys.
+
+Monitoring/Admin V1B remains deferred: Prometheus exporter, structured event log, external alerts, Grafana dashboards, frontend admin dashboard, production auth, admin write controls, and risk admin controls.
 
 ## Options V1D / Option RFQ V1C
 

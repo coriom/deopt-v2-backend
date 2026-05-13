@@ -65,11 +65,12 @@ use crate::rfq::{
 use crate::types::TimeInForce;
 use crate::types::{now_ms, AccountId, MarketId, OrderId, Side};
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::str::FromStr;
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
@@ -184,6 +185,14 @@ pub fn router(state: AppState) -> Router {
             get(reconciliations_for_intent),
         )
         .route("/reconciliations", get(reconciliations))
+        .route("/admin/status", get(admin_status))
+        .route("/admin/config", get(admin_config))
+        .route("/admin/db", get(admin_db))
+        .route("/admin/mm/sessions", get(admin_mm_sessions))
+        .route("/admin/execution/summary", get(admin_execution_summary))
+        .route("/admin/rfq/summary", get(admin_rfq_summary))
+        .route("/admin/options/summary", get(admin_options_summary))
+        .route("/admin/recent", get(admin_recent))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -198,6 +207,652 @@ async fn health() -> Json<HealthResponse> {
     Json(HealthResponse {
         ok: true,
         service: "deopt-v2-backend",
+    })
+}
+
+async fn admin_status(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    ensure_admin_access(&state, &headers)?;
+    Ok(Json(serde_json::json!({
+        "service": "deopt-v2-backend",
+        "ok": true,
+        "timestamp_ms": now_ms(),
+        "network": state.network_name,
+        "chain_id": state.chain_id,
+        "persistence_enabled": state.persistence_enabled,
+        "execution_enabled": state.execution_config.execution_enabled,
+        "real_broadcast_enabled": state.execution_config.real_broadcast_enabled,
+        "indexer_enabled": state.indexer_config.enabled,
+        "reconciliation_enabled": state.reconciliation_config.enabled,
+        "confirmation_enabled": state.confirmation_config.enabled,
+        "mm_gateway_enabled": state.mm_gateway_config.enabled,
+        "rfq_enabled": state.rfq_config.enabled,
+        "options_enabled": state.options_config.enabled,
+        "option_rfq_enabled": state.options_config.rfq_enabled
+    })))
+}
+
+async fn admin_config(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    ensure_admin_access(&state, &headers)?;
+    Ok(Json(serde_json::json!({
+        "network": state.network_name,
+        "chain_id": state.chain_id,
+        "admin": {
+            "enabled": state.admin_config.enabled,
+            "require_token": state.admin_config.require_token,
+            "token_configured": state.admin_config.token_configured()
+        },
+        "features": {
+            "persistence_enabled": state.persistence_enabled,
+            "execution_enabled": state.execution_config.execution_enabled,
+            "real_broadcast_enabled": state.execution_config.real_broadcast_enabled,
+            "simulation_enabled": state.execution_config.simulation_enabled,
+            "indexer_enabled": state.indexer_config.enabled,
+            "reconciliation_enabled": state.reconciliation_config.enabled,
+            "confirmation_enabled": state.confirmation_config.enabled,
+            "rfq_enabled": state.rfq_config.enabled,
+            "options_enabled": state.options_config.enabled,
+            "option_rfq_enabled": state.options_config.rfq_enabled,
+            "mm_gateway_enabled": state.mm_gateway_config.enabled,
+            "perp_nonce_sync_enabled": state.perp_nonce_sync_config.enabled
+        },
+        "configured": {
+            "database": state.database_configured,
+            "rpc": state.execution_config.rpc_url.is_some(),
+            "executor_private_key": state.execution_config.executor_private_key.is_some()
+        },
+        "contracts": {
+            "executor_from_address": state.execution_config.executor_from_address,
+            "perp_matching_engine_address": state.execution_config.perp_matching_engine_address,
+            "perp_engine_address": state.execution_config.perp_engine_address,
+            "order_eip712_verifying_contract": state.eip712_domain.verifying_contract,
+            "rfq_eip712_verifying_contract": state.rfq_config.eip712_domain.verifying_contract,
+            "option_rfq_eip712_verifying_contract": state.options_config.rfq_eip712_domain.verifying_contract
+        },
+        "signatures": {
+            "order_mode": state.signature_verification_mode,
+            "rfq_quote_mode": state.rfq_config.quote_signature_mode,
+            "option_rfq_quote_mode": state.options_config.rfq_quote_signature_mode
+        },
+        "execution": {
+            "dry_run": state.execution_config.dry_run,
+            "poll_interval_ms": state.execution_config.poll_interval_ms,
+            "max_batch_size": state.execution_config.max_batch_size,
+            "executor_chain_id": state.execution_config.executor_chain_id,
+            "max_gas_limit": state.execution_config.max_gas_limit,
+            "require_simulation_ok": state.execution_config.require_simulation_ok,
+            "simulation_requires_persistence": state.execution_config.simulation_requires_persistence,
+            "max_fee_per_gas_configured": state.execution_config.max_fee_per_gas_wei.is_some(),
+            "max_priority_fee_per_gas_configured": state.execution_config.max_priority_fee_per_gas_wei.is_some()
+        },
+        "mm_gateway": {
+            "enabled": state.mm_gateway_config.enabled,
+            "transport": mm_gateway_transport_label(&state),
+            "host": state.mm_gateway_config.enabled.then_some(state.mm_gateway_config.host.clone()),
+            "port": state.mm_gateway_config.enabled.then_some(state.mm_gateway_config.port),
+            "cert_configured": state.mm_gateway_config.cert_path.is_some(),
+            "key_configured": state.mm_gateway_config.key_path.is_some(),
+            "max_sessions": state.mm_gateway_config.max_sessions,
+            "max_in_flight_per_session": state.mm_gateway_config.max_in_flight_per_session,
+            "rate_limit_per_sec": state.mm_gateway_config.rate_limit_per_sec,
+            "heartbeat_timeout_ms": state.mm_gateway_config.heartbeat_timeout_ms,
+            "cancel_on_disconnect": state.mm_gateway_config.cancel_on_disconnect,
+            "auth_mode": state.mm_gateway_config.auth_mode,
+            "require_auth": state.mm_gateway_config.require_auth
+        },
+        "rfq": {
+            "enabled": state.rfq_config.enabled,
+            "require_persistence": state.rfq_config.require_persistence,
+            "default_ttl_ms": state.rfq_config.default_ttl_ms,
+            "max_ttl_ms": state.rfq_config.max_ttl_ms,
+            "min_quote_ttl_ms": state.rfq_config.min_quote_ttl_ms,
+            "max_quote_ttl_ms": state.rfq_config.max_quote_ttl_ms,
+            "max_quotes_per_rfq": state.rfq_config.max_quotes_per_rfq,
+            "eip712_name": state.rfq_config.eip712_domain.name,
+            "eip712_version": state.rfq_config.eip712_domain.version,
+            "eip712_chain_id": state.rfq_config.eip712_domain.chain_id
+        },
+        "options": {
+            "enabled": state.options_config.enabled,
+            "require_persistence": state.options_config.require_persistence,
+            "allow_manual_series": state.options_config.allow_manual_series,
+            "sync_onchain_registry": state.options_config.sync_onchain_registry,
+            "default_contract_size_1e8": state.options_config.default_contract_size_1e8.to_string(),
+            "rfq_enabled": state.options_config.rfq_enabled,
+            "rfq_require_persistence": state.options_config.rfq_require_persistence,
+            "rfq_default_ttl_ms": state.options_config.rfq_default_ttl_ms,
+            "rfq_max_ttl_ms": state.options_config.rfq_max_ttl_ms,
+            "rfq_min_quote_ttl_ms": state.options_config.rfq_min_quote_ttl_ms,
+            "rfq_max_quote_ttl_ms": state.options_config.rfq_max_quote_ttl_ms,
+            "rfq_max_quotes_per_rfq": state.options_config.rfq_max_quotes_per_rfq,
+            "rfq_eip712_name": state.options_config.rfq_eip712_domain.name,
+            "rfq_eip712_version": state.options_config.rfq_eip712_domain.version,
+            "rfq_eip712_chain_id": state.options_config.rfq_eip712_domain.chain_id
+        }
+    })))
+}
+
+async fn admin_db(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    ensure_admin_access(&state, &headers)?;
+    let Some(repository) = state.repository.clone() else {
+        return Ok(Json(serde_json::json!({
+            "persistence_enabled": false,
+            "database_configured": state.database_configured,
+            "connected": false,
+            "migrations": {
+                "available": false,
+                "installed_count": 0,
+                "latest_version": null
+            },
+            "counts": {}
+        })));
+    };
+
+    repository.admin_ping().await?;
+    Ok(Json(serde_json::json!({
+        "persistence_enabled": true,
+        "database_configured": state.database_configured,
+        "connected": true,
+        "migrations": repository.admin_migration_status().await?,
+        "counts": repository.admin_table_counts().await?
+    })))
+}
+
+async fn admin_mm_sessions(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    ensure_admin_access(&state, &headers)?;
+    if !state.mm_gateway_config.enabled {
+        return Ok(Json(serde_json::json!({
+            "enabled": false,
+            "sessions": []
+        })));
+    }
+
+    let sessions = state
+        .mm_sessions
+        .list_active()?
+        .into_iter()
+        .map(|session| {
+            serde_json::json!({
+                "session_id": session.session_id,
+                "authenticated": session.authenticated,
+                "account": session.account,
+                "connected_at_ms": session.connected_at_ms,
+                "last_heartbeat_at_ms": session.last_heartbeat_at_ms,
+                "open_client_order_ids_count": session.open_client_order_ids.len(),
+                "cancel_on_disconnect": session.cancel_on_disconnect
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(serde_json::json!({
+        "enabled": true,
+        "sessions": sessions
+    })))
+}
+
+async fn admin_execution_summary(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    ensure_admin_access(&state, &headers)?;
+    if let Some(repository) = state.repository.clone() {
+        let intent_status_counts = repository
+            .admin_count_by_column("execution_intents", "status")
+            .await?;
+        let simulation_status_counts = repository
+            .admin_count_by_column("execution_simulations", "status")
+            .await?;
+        let transaction_status_counts = repository
+            .admin_count_by_column("execution_transactions", "status")
+            .await?;
+        let calldata_ready_intents = repository
+            .admin_count_where(
+                "execution_intent_signatures",
+                "buyer_sig IS NOT NULL AND seller_sig IS NOT NULL",
+            )
+            .await?;
+        let submitted_transactions = repository
+            .admin_count_where("execution_transactions", "status = 'submitted'")
+            .await?;
+        let confirmed_transactions = repository
+            .admin_count_where(
+                "execution_transactions",
+                "confirmation_status = 'confirmed'",
+            )
+            .await?;
+        let recent_unconfirmed_txs = repository
+            .list_submitted_unconfirmed_execution_transactions(10)
+            .await?
+            .into_iter()
+            .map(compact_execution_transaction)
+            .collect::<Vec<_>>();
+        return Ok(Json(serde_json::json!({
+            "persistence_enabled": true,
+            "intent_status_counts": intent_status_counts,
+            "pending_execution_intents": count_from_map(&intent_status_counts, "pending"),
+            "calldata_ready_intents": calldata_ready_intents,
+            "simulation_status_counts": simulation_status_counts,
+            "simulation_ok": count_from_map(&simulation_status_counts, "simulation_ok"),
+            "simulation_failed": count_from_map(&simulation_status_counts, "simulation_failed"),
+            "transaction_status_counts": transaction_status_counts,
+            "submitted_transactions": submitted_transactions,
+            "confirmed_transactions": confirmed_transactions,
+            "recent_failed_simulations": repository.admin_recent_failed_simulations(10).await?,
+            "recent_unconfirmed_transactions": recent_unconfirmed_txs,
+            "recent_confirmation_errors": repository.admin_recent_confirmation_errors(10).await?
+        })));
+    }
+
+    let intents = state
+        .engine
+        .lock()
+        .map_err(|_| ApiError::internal())?
+        .execution_intents();
+    let mut intent_status_counts = BTreeMap::new();
+    for intent in &intents {
+        bump_count(
+            &mut intent_status_counts,
+            execution_status_key(intent.status),
+        );
+    }
+    let calldata_ready_intents = state
+        .trade_signatures
+        .lock()
+        .map_err(|_| ApiError::internal())?
+        .values()
+        .filter(|signatures| signatures.calldata_ready())
+        .count();
+    Ok(Json(serde_json::json!({
+        "persistence_enabled": false,
+        "intent_status_counts": intent_status_counts,
+        "pending_execution_intents": intents.iter().filter(|intent| intent.status == ExecutionIntentStatus::Pending).count(),
+        "calldata_ready_intents": calldata_ready_intents,
+        "simulation_status_counts": {},
+        "simulation_ok": 0,
+        "simulation_failed": 0,
+        "transaction_status_counts": {},
+        "submitted_transactions": 0,
+        "confirmed_transactions": 0,
+        "recent_failed_simulations": [],
+        "recent_unconfirmed_transactions": [],
+        "recent_confirmation_errors": []
+    })))
+}
+
+async fn admin_rfq_summary(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    ensure_admin_access(&state, &headers)?;
+    if let Some(repository) = state.repository.clone() {
+        let rfq_status_counts = repository.admin_count_by_column("rfqs", "status").await?;
+        let quote_status_counts = repository
+            .admin_count_by_column("rfq_quotes", "status")
+            .await?;
+        let quote_signature_status_counts = repository
+            .admin_count_by_column("rfq_quotes", "signature_status")
+            .await?;
+        let recent_rfqs = repository.admin_recent_rfqs(20).await?;
+        let recent_accepted_rfqs = recent_rfqs
+            .iter()
+            .filter(|rfq| rfq["status"] == "accepted")
+            .cloned()
+            .collect::<Vec<_>>();
+        return Ok(Json(serde_json::json!({
+            "persistence_enabled": true,
+            "enabled": state.rfq_config.enabled,
+            "rfq_status_counts": rfq_status_counts,
+            "quote_status_counts": quote_status_counts,
+            "quote_signature_status_counts": quote_signature_status_counts,
+            "verified_quotes": count_from_map(&quote_signature_status_counts, "verified"),
+            "recent_accepted_rfqs": recent_accepted_rfqs,
+            "recent_rfqs": recent_rfqs
+        })));
+    }
+
+    let now = now_ms();
+    let store = state.rfq_store.lock().map_err(|_| ApiError::internal())?;
+    let rfqs = store.list_rfqs();
+    let mut rfq_status_counts = BTreeMap::new();
+    let mut quote_status_counts = BTreeMap::new();
+    let mut quote_signature_status_counts = BTreeMap::new();
+    for rfq in &rfqs {
+        bump_count(&mut rfq_status_counts, rfq.effective_status(now).as_str());
+        for quote in store.list_quotes(rfq.rfq_id) {
+            bump_count(
+                &mut quote_status_counts,
+                quote.effective_status(now).as_str(),
+            );
+            bump_count(
+                &mut quote_signature_status_counts,
+                quote.signature_status.as_str(),
+            );
+        }
+    }
+    let recent_accepted_rfqs = rfqs
+        .iter()
+        .rev()
+        .filter(|rfq| rfq.status == RfqStatus::Accepted)
+        .take(20)
+        .map(compact_rfq)
+        .collect::<Vec<_>>();
+    Ok(Json(serde_json::json!({
+        "persistence_enabled": false,
+        "enabled": state.rfq_config.enabled,
+        "rfq_status_counts": rfq_status_counts,
+        "quote_status_counts": quote_status_counts,
+        "quote_signature_status_counts": quote_signature_status_counts,
+        "verified_quotes": count_from_map(&quote_signature_status_counts, "verified"),
+        "recent_accepted_rfqs": recent_accepted_rfqs,
+        "recent_rfqs": rfqs.iter().rev().take(20).map(compact_rfq).collect::<Vec<_>>()
+    })))
+}
+
+async fn admin_options_summary(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    ensure_admin_access(&state, &headers)?;
+    if let Some(repository) = state.repository.clone() {
+        let series_status_counts = repository
+            .admin_count_by_column("option_series", "status")
+            .await?;
+        let order_status_counts = repository
+            .admin_count_by_column("option_orders", "status")
+            .await?;
+        let option_rfq_status_counts = repository
+            .admin_count_by_column("option_rfqs", "status")
+            .await?;
+        let option_rfq_quote_status_counts = repository
+            .admin_count_by_column("option_rfq_quotes", "status")
+            .await?;
+        let option_rfq_quote_signature_status_counts = repository
+            .admin_count_by_column("option_rfq_quotes", "signature_status")
+            .await?;
+        return Ok(Json(serde_json::json!({
+            "persistence_enabled": true,
+            "enabled": state.options_config.enabled,
+            "option_rfq_enabled": state.options_config.rfq_enabled,
+            "series_status_counts": series_status_counts,
+            "order_status_counts": order_status_counts,
+            "option_fills_count": repository.admin_count_where("option_fills", "TRUE").await?,
+            "option_rfq_status_counts": option_rfq_status_counts,
+            "option_rfq_quote_status_counts": option_rfq_quote_status_counts,
+            "option_rfq_quote_signature_status_counts": option_rfq_quote_signature_status_counts,
+            "verified_option_rfq_quotes": count_from_map(&option_rfq_quote_signature_status_counts, "verified"),
+            "option_rfq_fills_count": repository.admin_count_where("option_rfq_fills", "TRUE").await?,
+            "recent_option_rfq_fills": repository.admin_recent_option_rfq_fills(20).await?,
+            "recent_option_order_fills": repository.admin_recent_option_fills(20).await?
+        })));
+    }
+
+    let now = now_ms();
+    let now_sec = u64::try_from(now / 1000).unwrap_or_default();
+    let store = state
+        .options_store
+        .lock()
+        .map_err(|_| ApiError::internal())?;
+    let series = store.list_series(&OptionSeriesFilter::default(), now_sec);
+    let orders = store.list_orders(&OptionOrderFilter::default());
+    let fills = store.list_fills(&OptionFillFilter::default());
+    let option_rfqs = store.list_option_rfqs();
+    let option_rfq_fills = store.list_option_rfq_fills();
+    let mut series_status_counts = BTreeMap::new();
+    let mut order_status_counts = BTreeMap::new();
+    let mut option_rfq_status_counts = BTreeMap::new();
+    let mut option_rfq_quote_status_counts = BTreeMap::new();
+    let mut option_rfq_quote_signature_status_counts = BTreeMap::new();
+    for item in &series {
+        bump_count(
+            &mut series_status_counts,
+            item.effective_status(now_sec).as_str(),
+        );
+    }
+    for order in &orders {
+        bump_count(&mut order_status_counts, order.status.as_str());
+    }
+    for rfq in &option_rfqs {
+        bump_count(
+            &mut option_rfq_status_counts,
+            rfq.effective_status(now).as_str(),
+        );
+        for quote in store.list_option_rfq_quotes(rfq.option_rfq_id) {
+            bump_count(
+                &mut option_rfq_quote_status_counts,
+                quote.effective_status(now).as_str(),
+            );
+            bump_count(
+                &mut option_rfq_quote_signature_status_counts,
+                quote.signature_status.as_str(),
+            );
+        }
+    }
+    Ok(Json(serde_json::json!({
+        "persistence_enabled": false,
+        "enabled": state.options_config.enabled,
+        "option_rfq_enabled": state.options_config.rfq_enabled,
+        "series_status_counts": series_status_counts,
+        "order_status_counts": order_status_counts,
+        "option_fills_count": fills.len(),
+        "option_rfq_status_counts": option_rfq_status_counts,
+        "option_rfq_quote_status_counts": option_rfq_quote_status_counts,
+        "option_rfq_quote_signature_status_counts": option_rfq_quote_signature_status_counts,
+        "verified_option_rfq_quotes": count_from_map(&option_rfq_quote_signature_status_counts, "verified"),
+        "option_rfq_fills_count": option_rfq_fills.len(),
+        "recent_option_rfq_fills": option_rfq_fills.iter().rev().take(20).map(compact_option_rfq_fill).collect::<Vec<_>>(),
+        "recent_option_order_fills": fills.iter().rev().take(20).map(compact_option_fill).collect::<Vec<_>>()
+    })))
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+struct AdminRecentQuery {
+    limit: Option<u32>,
+}
+
+async fn admin_recent(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Query(query): Query<AdminRecentQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    ensure_admin_access(&state, &headers)?;
+    let limit = query.limit.unwrap_or(20).min(100);
+    if let Some(repository) = state.repository.clone() {
+        let transactions = repository
+            .list_recent_execution_transactions(limit)
+            .await?
+            .into_iter()
+            .map(compact_execution_transaction)
+            .collect::<Vec<_>>();
+        return Ok(Json(serde_json::json!({
+            "limit": limit,
+            "execution_intents": repository.admin_recent_execution_intents(limit).await?,
+            "simulations": repository.admin_recent_execution_simulations(limit).await?,
+            "transactions": transactions,
+            "rfqs": repository.admin_recent_rfqs(limit).await?,
+            "option_rfqs": repository.admin_recent_option_rfqs(limit).await?,
+            "option_fills": repository.admin_recent_option_fills(limit).await?,
+            "option_rfq_fills": repository.admin_recent_option_rfq_fills(limit).await?
+        })));
+    }
+
+    let mut execution_intents = state
+        .engine
+        .lock()
+        .map_err(|_| ApiError::internal())?
+        .execution_intents();
+    execution_intents.sort_by(|left, right| {
+        right
+            .created_at_ms
+            .cmp(&left.created_at_ms)
+            .then_with(|| right.intent_id.cmp(&left.intent_id))
+    });
+    let rfqs = {
+        let store = state.rfq_store.lock().map_err(|_| ApiError::internal())?;
+        store.list_rfqs()
+    };
+    let (option_rfqs, option_fills, option_rfq_fills) = {
+        let store = state
+            .options_store
+            .lock()
+            .map_err(|_| ApiError::internal())?;
+        (
+            store.list_option_rfqs(),
+            store.list_fills(&OptionFillFilter::default()),
+            store.list_option_rfq_fills(),
+        )
+    };
+    Ok(Json(serde_json::json!({
+        "limit": limit,
+        "execution_intents": execution_intents.iter().take(limit as usize).map(compact_execution_intent).collect::<Vec<_>>(),
+        "simulations": [],
+        "transactions": [],
+        "rfqs": rfqs.iter().rev().take(limit as usize).map(compact_rfq).collect::<Vec<_>>(),
+        "option_rfqs": option_rfqs.iter().rev().take(limit as usize).map(compact_option_rfq).collect::<Vec<_>>(),
+        "option_fills": option_fills.iter().rev().take(limit as usize).map(compact_option_fill).collect::<Vec<_>>(),
+        "option_rfq_fills": option_rfq_fills.iter().rev().take(limit as usize).map(compact_option_rfq_fill).collect::<Vec<_>>()
+    })))
+}
+
+fn ensure_admin_access(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
+    if !state.admin_config.enabled {
+        return Err(ApiError::forbidden("admin API is disabled"));
+    }
+    if state.admin_config.require_token {
+        let token = headers
+            .get("x-admin-token")
+            .and_then(|value| value.to_str().ok());
+        match token {
+            Some(token) if state.admin_config.token_matches(token) => {}
+            Some(_) => return Err(ApiError::forbidden("invalid admin token")),
+            None => return Err(ApiError::forbidden("admin token is required")),
+        }
+    }
+    Ok(())
+}
+
+fn mm_gateway_transport_label(_state: &AppState) -> &'static str {
+    "webtransport"
+}
+
+fn bump_count(counts: &mut BTreeMap<String, u64>, key: &str) {
+    *counts.entry(key.to_string()).or_default() += 1;
+}
+
+fn count_from_map(counts: &BTreeMap<String, u64>, key: &str) -> u64 {
+    counts.get(key).copied().unwrap_or_default()
+}
+
+fn execution_status_key(status: ExecutionIntentStatus) -> &'static str {
+    match status {
+        ExecutionIntentStatus::Pending => "pending",
+        ExecutionIntentStatus::DryRun => "dry_run",
+        ExecutionIntentStatus::CalldataReady => "calldata_ready",
+        ExecutionIntentStatus::SimulationOk => "simulation_ok",
+        ExecutionIntentStatus::SimulationFailed => "simulation_failed",
+        ExecutionIntentStatus::Submitted => "submitted",
+        ExecutionIntentStatus::Confirmed => "confirmed",
+        ExecutionIntentStatus::Failed => "failed",
+    }
+}
+
+fn compact_execution_intent(intent: &crate::execution::ExecutionIntent) -> serde_json::Value {
+    serde_json::json!({
+        "intent_id": intent.intent_id,
+        "market_id": intent.market_id,
+        "buyer": intent.buyer,
+        "seller": intent.seller,
+        "price_1e8": intent.price_1e8.to_string(),
+        "size_1e8": intent.size_1e8.to_string(),
+        "status": intent.status,
+        "created_at_ms": intent.created_at_ms
+    })
+}
+
+fn compact_execution_transaction(transaction: ExecutionTransaction) -> serde_json::Value {
+    serde_json::json!({
+        "transaction_id": transaction.transaction_id,
+        "intent_id": transaction.intent_id,
+        "onchain_intent_id": transaction.onchain_intent_id,
+        "target": transaction.target,
+        "tx_hash": transaction.tx_hash,
+        "status": transaction.status,
+        "error": transaction.error,
+        "confirmation_status": transaction.confirmation_status,
+        "confirmation_error": transaction.confirmation_error,
+        "created_at_ms": transaction.created_at_ms,
+        "updated_at_ms": transaction.updated_at_ms
+    })
+}
+
+fn compact_rfq(rfq: &RfqRequest) -> serde_json::Value {
+    serde_json::json!({
+        "rfq_id": rfq.rfq_id,
+        "taker": rfq.taker,
+        "market_id": rfq.market_id,
+        "side": rfq.side,
+        "size_1e8": rfq.size_1e8.to_string(),
+        "limit_price_1e8": rfq.limit_price_1e8.map(|value| value.to_string()),
+        "status": rfq.status,
+        "accepted_quote_id": rfq.accepted_quote_id,
+        "execution_intent_id": rfq.execution_intent_id,
+        "created_at_ms": rfq.created_at_ms,
+        "expires_at_ms": rfq.expires_at_ms
+    })
+}
+
+fn compact_option_rfq(rfq: &OptionRfqRequest) -> serde_json::Value {
+    serde_json::json!({
+        "option_rfq_id": rfq.option_rfq_id,
+        "taker": rfq.taker,
+        "option_series_id": rfq.option_series_id,
+        "side": rfq.side,
+        "size_1e8": rfq.size_1e8.to_string(),
+        "limit_price_1e8": rfq.limit_price_1e8.map(|value| value.to_string()),
+        "status": rfq.status,
+        "accepted_quote_id": rfq.accepted_quote_id,
+        "option_fill_id": rfq.option_fill_id,
+        "created_at_ms": rfq.created_at_ms,
+        "expires_at_ms": rfq.expires_at_ms
+    })
+}
+
+fn compact_option_fill(fill: &OptionFill) -> serde_json::Value {
+    serde_json::json!({
+        "fill_id": fill.fill_id,
+        "option_series_id": fill.option_series_id,
+        "buyer": fill.buyer,
+        "seller": fill.seller,
+        "taker_side": fill.taker_side,
+        "price_1e8": fill.price_1e8.to_string(),
+        "size_1e8": fill.size_1e8.to_string(),
+        "created_at_ms": fill.created_at_ms
+    })
+}
+
+fn compact_option_rfq_fill(fill: &OptionRfqFill) -> serde_json::Value {
+    serde_json::json!({
+        "fill_id": fill.fill_id,
+        "option_rfq_id": fill.option_rfq_id,
+        "quote_id": fill.quote_id,
+        "option_series_id": fill.option_series_id,
+        "buyer": fill.buyer,
+        "seller": fill.seller,
+        "taker": fill.taker,
+        "mm_account": fill.mm_account,
+        "taker_side": fill.taker_side,
+        "price_1e8": fill.price_1e8.to_string(),
+        "size_1e8": fill.size_1e8.to_string(),
+        "created_at_ms": fill.created_at_ms
     })
 }
 
@@ -2537,7 +3192,15 @@ fn option_rfq_quote_type_fields() -> Vec<SigningPayloadTypeField> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::admin::AdminConfig;
+    use crate::engine::EngineState;
     use crate::execution::DecodedRevertError;
+    use crate::mm::protocol::ServerMessage;
+    use crate::mm::{AuthMode, MmGatewayConfig, MmSession};
+    use axum::body::{to_bytes, Body};
+    use axum::http::Request;
+    use tokio::sync::mpsc;
+    use tower::ServiceExt;
 
     #[test]
     fn simulation_response_keeps_submitted_and_confirmed_false() {
@@ -2568,6 +3231,227 @@ mod tests {
             response.decoded_error.unwrap().kind,
             "unknown_custom_error".to_string()
         );
+    }
+
+    #[tokio::test]
+    async fn admin_disabled_returns_clear_error() {
+        let response = router(AppState::new(EngineState::with_default_markets()))
+            .oneshot(get_request("/admin/status", None))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let json = response_json(response).await;
+        assert_eq!(json["error"], "admin API is disabled");
+    }
+
+    #[tokio::test]
+    async fn admin_enabled_status_works() {
+        let response = router(admin_state(false))
+            .oneshot(get_request("/admin/status", None))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["service"], "deopt-v2-backend");
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["network"], "admin-test");
+        assert_eq!(json["real_broadcast_enabled"], false);
+    }
+
+    #[tokio::test]
+    async fn admin_token_required_rejects_missing_token() {
+        let response = router(admin_state(true))
+            .oneshot(get_request("/admin/status", None))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let json = response_json(response).await;
+        assert_eq!(json["error"], "admin token is required");
+    }
+
+    #[tokio::test]
+    async fn admin_token_required_accepts_valid_token() {
+        let response = router(admin_state(true))
+            .oneshot(get_request("/admin/status", Some("test-admin-token")))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn admin_config_redacts_secrets() {
+        let mut state = admin_state(true);
+        state.execution_config.rpc_url = Some("https://rpc.example/sensitive-provider-key".into());
+        let response = router(state)
+            .oneshot(get_request("/admin/config", Some("test-admin-token")))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body_text = String::from_utf8(body.to_vec()).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["configured"]["rpc"], true);
+        assert_eq!(json["admin"]["token_configured"], true);
+        assert!(!body_text.contains("sensitive-provider-key"));
+        assert!(!body_text.contains("test-admin-token"));
+        assert!(json.get("database_url").is_none());
+        assert!(json.get("rpc_url").is_none());
+        assert!(json.get("admin_token").is_none());
+    }
+
+    #[tokio::test]
+    async fn admin_db_handles_persistence_disabled() {
+        let response = router(admin_state(false))
+            .oneshot(get_request("/admin/db", None))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["persistence_enabled"], false);
+        assert_eq!(json["connected"], false);
+        assert_eq!(json["counts"].as_object().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn admin_mm_sessions_empty_when_gateway_disabled() {
+        let response = router(admin_state(false))
+            .oneshot(get_request("/admin/mm/sessions", None))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["enabled"], false);
+        assert_eq!(json["sessions"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn admin_mm_sessions_return_sanitized_snapshot() {
+        let mut state = admin_state(false);
+        state.mm_gateway_config = MmGatewayConfig {
+            enabled: true,
+            ..MmGatewayConfig::default()
+        };
+        let mut session = MmSession::with_ids(
+            "session-admin-1",
+            "connection-admin-1",
+            123,
+            AuthMode::Disabled,
+            true,
+        );
+        session.register_open_client_order_id("order-a");
+        session.register_open_client_order_id("order-b");
+        let (sender, _receiver) = mpsc::unbounded_channel::<ServerMessage>();
+        state.mm_sessions.register(&session, sender).unwrap();
+
+        let response = router(state)
+            .oneshot(get_request("/admin/mm/sessions", None))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["enabled"], true);
+        assert_eq!(json["sessions"][0]["session_id"], "session-admin-1");
+        assert_eq!(json["sessions"][0]["open_client_order_ids_count"], 2);
+        assert!(json["sessions"][0].get("open_client_order_ids").is_none());
+        assert!(json["sessions"][0].get("connection_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn admin_empty_summaries_are_valid() {
+        for path in [
+            "/admin/execution/summary",
+            "/admin/rfq/summary",
+            "/admin/options/summary",
+        ] {
+            let response = router(admin_state(false))
+                .oneshot(get_request(path, None))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let json = response_json(response).await;
+            assert_eq!(json["persistence_enabled"], false);
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_recent_respects_limit_cap() {
+        let response = router(admin_state(false))
+            .oneshot(get_request("/admin/recent?limit=999", None))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["limit"], 100);
+    }
+
+    #[tokio::test]
+    async fn admin_endpoints_do_not_mutate_state() {
+        let state = admin_state(false);
+        let app = router(state.clone());
+        let before_intents = state.engine.lock().unwrap().execution_intents().len();
+        let before_rfqs = state.rfq_store.lock().unwrap().list_rfqs().len();
+        let before_option_rfqs = state.options_store.lock().unwrap().list_option_rfqs().len();
+
+        for path in [
+            "/admin/status",
+            "/admin/config",
+            "/admin/db",
+            "/admin/mm/sessions",
+            "/admin/execution/summary",
+            "/admin/rfq/summary",
+            "/admin/options/summary",
+            "/admin/recent?limit=5",
+        ] {
+            let response = app.clone().oneshot(get_request(path, None)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        assert_eq!(
+            state.engine.lock().unwrap().execution_intents().len(),
+            before_intents
+        );
+        assert_eq!(
+            state.rfq_store.lock().unwrap().list_rfqs().len(),
+            before_rfqs
+        );
+        assert_eq!(
+            state.options_store.lock().unwrap().list_option_rfqs().len(),
+            before_option_rfqs
+        );
+    }
+
+    fn admin_state(require_token: bool) -> AppState {
+        let mut state = AppState::new(EngineState::with_default_markets());
+        state.admin_config = AdminConfig::new(
+            true,
+            require_token,
+            require_token.then(|| "test-admin-token".to_string()),
+        );
+        state.network_name = "admin-test".to_string();
+        state
+    }
+
+    fn get_request(path: &str, token: Option<&str>) -> Request<Body> {
+        let mut builder = Request::builder().uri(path);
+        if let Some(token) = token {
+            builder = builder.header("x-admin-token", token);
+        }
+        builder.body(Body::empty()).unwrap()
+    }
+
+    async fn response_json(response: Response) -> serde_json::Value {
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&body).unwrap()
     }
 }
 
@@ -2628,6 +3512,13 @@ impl ApiError {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: "internal server error".to_string(),
+        }
+    }
+
+    fn forbidden(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            message: message.into(),
         }
     }
 }

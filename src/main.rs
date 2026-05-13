@@ -45,7 +45,7 @@ async fn main() -> deopt_v2_backend::Result<()> {
     } else {
         None
     };
-    let state = AppState::with_all_config(
+    let mut state = AppState::with_all_config(
         EngineState::with_default_markets(),
         config.signature_verification_mode,
         config.eip712_domain.clone(),
@@ -59,6 +59,11 @@ async fn main() -> deopt_v2_backend::Result<()> {
         config.options.clone(),
         config.chain_id,
     );
+    state.network_name = config.network_name.clone();
+    state.persistence_enabled = config.persistence_enabled;
+    state.database_configured = config.database_url.is_some();
+    state.mm_gateway_config = config.mm_gateway.clone();
+    state.admin_config = config.admin.clone();
     let app = router(state.clone());
 
     if config.execution.execution_enabled {

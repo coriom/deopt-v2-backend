@@ -322,6 +322,16 @@ impl OptionSeriesStore {
         self.option_rfq_fills.get(&fill_id).cloned()
     }
 
+    pub fn list_option_rfq_fills(&self) -> Vec<OptionRfqFill> {
+        let mut fills = self.option_rfq_fills.values().cloned().collect::<Vec<_>>();
+        fills.sort_by(|left, right| {
+            left.created_at_ms
+                .cmp(&right.created_at_ms)
+                .then_with(|| left.fill_id.cmp(&right.fill_id))
+        });
+        fills
+    }
+
     pub fn cancel_option_rfq(&mut self, option_rfq_id: OptionRfqId) -> Result<OptionRfqRequest> {
         let rfq = self
             .option_rfqs

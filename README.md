@@ -94,6 +94,9 @@ MM_GATEWAY_MAX_OPEN_ORDERS_PER_ACCOUNT=500
 MM_GATEWAY_CANCEL_ON_DISCONNECT=true
 MM_GATEWAY_AUTH_MODE=disabled
 MM_GATEWAY_REQUIRE_AUTH=false
+ADMIN_API_ENABLED=false
+ADMIN_API_REQUIRE_TOKEN=false
+ADMIN_API_TOKEN=
 ```
 
 `EXECUTION_ENABLED=false` is intentional for this phase.
@@ -109,6 +112,34 @@ MM_GATEWAY_REQUIRE_AUTH=false
 `RFQ_QUOTE_SIGNATURE_MODE=disabled` preserves the unsigned RFQ V1B flow. `strict` requires each RFQ quote to include a valid EIP-712 `RFQQuote` signature whose recovered signer equals `mm_account`.
 `OPTIONS_ENABLED=false` and `OPTION_RFQ_ENABLED=false` are the safe defaults. When either options persistence gate is true and its feature is enabled, startup requires `PERSISTENCE_ENABLED=true`. Test and development code can run option series, off-chain option orders, matching, fills, and option RFQs in memory with persistence disabled. `OPTION_RFQ_QUOTE_SIGNATURE_MODE=disabled` preserves the unsigned Option RFQ V1B flow. `strict` requires each option RFQ quote to include `quote_nonce` and a valid EIP-712 `OptionRFQQuote` signature whose recovered signer equals `mm_account`.
 `MM_GATEWAY_ENABLED=false` is the safe default. When `true`, V1C starts a separate WebTransport UDP listener and requires `MM_GATEWAY_CERT_PATH` and `MM_GATEWAY_KEY_PATH`. It can submit and cancel off-chain perp orders through the live in-memory orderbook, handle perp RFQ and option RFQ messages when those features are enabled, but it does not auto-broadcast, sign, simulate, index, reconcile, or confirm execution intents.
+`ADMIN_API_ENABLED=false` is the safe default for Monitoring/Admin V1A. When enabled, `/admin/*` exposes read-only operational observability only. If `ADMIN_API_REQUIRE_TOKEN=true`, requests must include `X-Admin-Token: <ADMIN_API_TOKEN>`. The token is never returned by the API, and admin config responses expose booleans such as `rpc_configured` and `database_configured` instead of raw RPC URLs, database URLs, private keys, or tokens.
+
+## Monitoring/Admin V1A
+
+Monitoring/Admin V1A adds local/dev-oriented read-only observability endpoints:
+
+```text
+GET /admin/status
+GET /admin/config
+GET /admin/db
+GET /admin/mm/sessions
+GET /admin/execution/summary
+GET /admin/rfq/summary
+GET /admin/options/summary
+GET /admin/recent?limit=20
+```
+
+All admin endpoints are disabled unless `ADMIN_API_ENABLED=true`. When token protection is enabled, only the `X-Admin-Token` header is checked; this is intentionally not production auth. The endpoints never mutate orderbooks, RFQs, options state, execution intents, transactions, or database rows. They do not call RPC, do not broadcast, and do not require live Postgres, WebTransport, RPC, or private keys for normal tests.
+
+`/admin/config` is sanitized: it includes network/chain id, feature flags, public contract addresses, signature modes, TTL/settings, `rpc_configured`, `database_configured`, and WebTransport host/port only when the gateway is enabled. It redacts or omits private keys, raw database URLs, raw RPC URLs, provider keys, admin tokens, and secret env values.
+
+`/admin/db` pings Postgres and reports migration/count metadata only when persistence is enabled. With persistence disabled, it returns a clear disabled/offline shape. Count queries are aggregate-only and handle missing older tables as unavailable in the DB count response.
+
+`/admin/mm/sessions` returns sanitized active MM session snapshots. It reports session id, auth/account fields, heartbeat timestamps, `cancel_on_disconnect`, and open-client-order count, but not connection internals or full client-order id lists. If the gateway is disabled, it returns `enabled=false` with an empty session list.
+
+`/admin/execution/summary`, `/admin/rfq/summary`, `/admin/options/summary`, and `/admin/recent` provide compact bounded summaries from Postgres when persistence is enabled and in-memory summaries otherwise. `/admin/recent` defaults to `limit=20` and caps at `100`.
+
+Monitoring/Admin V1B is deferred: Prometheus metrics, structured event logs, external alerts, Grafana dashboards, frontend admin dashboard, production auth, admin write controls, and risk admin controls.
 
 ## Options V1D / Option RFQ V1C
 

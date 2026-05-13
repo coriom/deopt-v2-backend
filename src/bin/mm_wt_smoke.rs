@@ -3,6 +3,8 @@ use deopt_v2_backend::mm::transport::webtransport::{
 };
 use serde_json::{json, Value};
 use std::env;
+use std::path::PathBuf;
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::time::{sleep, timeout, Duration};
 use wtransport::tls::Certificate;
@@ -48,6 +50,8 @@ async fn main() -> deopt_v2_backend::Result<()> {
         run_rfq_scenario(&connection, &endpoint, &http_base).await?;
     } else if scenario == "option-rfq" {
         run_option_rfq_scenario(&connection, &endpoint, &http_base).await?;
+    } else if scenario == "option-rfq-strict" {
+        run_option_rfq_strict_scenario(&connection, &endpoint, &http_base).await?;
     } else {
         let heartbeat = send_request(
             &connection,
@@ -74,6 +78,146 @@ async fn main() -> deopt_v2_backend::Result<()> {
         connection.close(0_u32.into(), b"smoke complete");
         endpoint.wait_idle().await;
     }
+    Ok(())
+}
+
+async fn run_option_rfq_strict_scenario(
+    connection: &wtransport::Connection,
+    endpoint: &Endpoint<wtransport::endpoint::endpoint_side::Client>,
+    http_base: &str,
+) -> deopt_v2_backend::Result<()> {
+    let http = reqwest::Client::new();
+    let mm_account =
+        env::var("MM_WT_OPTION_RFQ_MM_ACCOUNT").unwrap_or_else(|_| RFQ_MM_ACCOUNT.to_string());
+    let price_1e8 =
+        env::var("MM_WT_OPTION_RFQ_QUOTE_PRICE_1E8").unwrap_or_else(|_| "1100000000".to_string());
+    let size_1e8 =
+        env::var("MM_WT_OPTION_RFQ_QUOTE_SIZE_1E8").unwrap_or_else(|_| "100000000".to_string());
+    let client_quote_id = env::var("MM_WT_OPTION_RFQ_CLIENT_QUOTE_ID")
+        .unwrap_or_else(|_| "smoke-signed-option-rfq-quote-1".to_string());
+    let quote_nonce = env::var("MM_WT_OPTION_RFQ_QUOTE_NONCE")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(1001);
+    let quote_ttl_ms = env::var("MM_WT_OPTION_RFQ_QUOTE_TTL_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(10000);
+    let payload_path = env::var("MM_WT_OPTION_RFQ_PAYLOAD_PATH")
+        .unwrap_or_else(|_| "/tmp/option_rfq_quote_payload.json".to_string());
+
+    let heartbeat = send_request(
+        connection,
+        json!({
+            "type": "heartbeat",
+            "request_id": "option-rfq-strict-heartbeat-1",
+            "payload": {}
+        }),
+    )
+    .await?;
+    print_step("heartbeat", &heartbeat);
+    assert_ok(&heartbeat, "heartbeat")?;
+
+    let session = send_request(
+        connection,
+        json!({
+            "type": "get_session",
+            "request_id": "option-rfq-strict-session-1",
+            "payload": {}
+        }),
+    )
+    .await?;
+    print_step("get_session", &session);
+    assert_ok(&session, "get_session")?;
+
+    let rfq_request = receive_server_message(connection, "option_rfq_request").await?;
+    print_step("option_rfq_request", &rfq_request);
+    let option_rfq_id = required_str(&rfq_request, &["payload", "option_rfq_id"])?;
+
+    let signing_payload = http_post(
+        &http,
+        http_base,
+        &format!("/options/rfqs/{option_rfq_id}/quote-signing-payload"),
+        json!({
+            "mm_account": mm_account,
+            "price_1e8": price_1e8,
+            "size_1e8": size_1e8,
+            "client_quote_id": client_quote_id,
+            "quote_nonce": quote_nonce,
+            "quote_ttl_ms": quote_ttl_ms
+        }),
+    )
+    .await?;
+    print_step("option_rfq_quote_signing_payload", &signing_payload);
+    write_payload_file(&payload_path, &signing_payload)?;
+
+    let signed = sign_option_rfq_quote(&payload_path)?;
+    print_step(
+        "sign_option_rfq_quote",
+        &json!({"signer_address": signed.signer_address}),
+    );
+
+    let quote = send_request(
+        connection,
+        json!({
+            "type": "option_rfq_quote",
+            "request_id": "option-rfq-strict-quote-1",
+            "payload": {
+                "option_rfq_id": option_rfq_id,
+                "mm_account": mm_account,
+                "price_1e8": price_1e8,
+                "size_1e8": size_1e8,
+                "client_quote_id": client_quote_id,
+                "quote_nonce": quote_nonce,
+                "quote_ttl_ms": quote_ttl_ms,
+                "signature": signed.signature
+            }
+        }),
+    )
+    .await?;
+    print_step("option_rfq_quote", &quote);
+    assert_ok(&quote, "option_rfq_quote")?;
+    let quote_id = required_str(&quote, &["payload", "quote_id"])?;
+
+    let quotes = http_get(
+        &http,
+        http_base,
+        &format!("/options/rfqs/{option_rfq_id}/quotes"),
+    )
+    .await?;
+    print_step("http_option_rfq_quotes", &quotes);
+    assert_signed_option_rfq_quote(&quotes, &quote_id, &mm_account, quote_nonce)?;
+
+    let accepted = http_post(
+        &http,
+        http_base,
+        &format!("/options/rfqs/{option_rfq_id}/accept/{quote_id}"),
+        json!({}),
+    )
+    .await?;
+    print_step("http_accept_option_rfq_quote", &accepted);
+
+    let accepted_notice = receive_server_message(connection, "option_rfq_quote_accepted").await?;
+    print_step("option_rfq_quote_accepted", &accepted_notice);
+    if required_str(&accepted_notice, &["payload", "option_rfq_id"])? != option_rfq_id {
+        return Err(deopt_v2_backend::BackendError::Config(
+            "option_rfq_quote_accepted option_rfq_id mismatch".to_string(),
+        ));
+    }
+    if required_str(&accepted_notice, &["payload", "quote_id"])? != quote_id {
+        return Err(deopt_v2_backend::BackendError::Config(
+            "option_rfq_quote_accepted quote_id mismatch".to_string(),
+        ));
+    }
+    let option_fill_id = required_str(&accepted_notice, &["payload", "option_fill_id"])?;
+    if option_fill_id.is_empty() {
+        return Err(deopt_v2_backend::BackendError::Config(
+            "option_rfq_quote_accepted missing option_fill_id".to_string(),
+        ));
+    }
+
+    connection.close(0_u32.into(), b"option rfq strict smoke complete");
+    endpoint.wait_idle().await;
     Ok(())
 }
 
@@ -174,22 +318,29 @@ async fn run_option_rfq_scenario(
         ));
     }
 
+    let mut quote_payload = json!({
+        "option_rfq_id": option_rfq_id,
+        "mm_account": mm_account,
+        "price_1e8": env::var("MM_WT_OPTION_RFQ_QUOTE_PRICE_1E8").unwrap_or_else(|_| "1100000000".to_string()),
+        "size_1e8": env::var("MM_WT_OPTION_RFQ_QUOTE_SIZE_1E8").unwrap_or_else(|_| "100000000".to_string()),
+        "client_quote_id": env::var("MM_WT_OPTION_RFQ_CLIENT_QUOTE_ID").unwrap_or_else(|_| "smoke-option-rfq-quote-1".to_string()),
+        "quote_ttl_ms": env::var("MM_WT_OPTION_RFQ_QUOTE_TTL_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(10000)
+    });
+    if let Some(quote_nonce) = env::var("MM_WT_OPTION_RFQ_QUOTE_NONCE")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        quote_payload["quote_nonce"] = json!(quote_nonce);
+    }
     let quote = send_request(
         connection,
         json!({
             "type": "option_rfq_quote",
             "request_id": "option-rfq-quote-1",
-            "payload": {
-                "option_rfq_id": option_rfq_id,
-                "mm_account": mm_account,
-                "price_1e8": env::var("MM_WT_OPTION_RFQ_QUOTE_PRICE_1E8").unwrap_or_else(|_| "1100000000".to_string()),
-                "size_1e8": env::var("MM_WT_OPTION_RFQ_QUOTE_SIZE_1E8").unwrap_or_else(|_| "100000000".to_string()),
-                "client_quote_id": env::var("MM_WT_OPTION_RFQ_CLIENT_QUOTE_ID").unwrap_or_else(|_| "smoke-option-rfq-quote-1".to_string()),
-                "quote_ttl_ms": env::var("MM_WT_OPTION_RFQ_QUOTE_TTL_MS")
-                    .ok()
-                    .and_then(|value| value.parse::<u64>().ok())
-                    .unwrap_or(10000)
-            }
+            "payload": quote_payload
         }),
     )
     .await?;
@@ -600,14 +751,21 @@ async fn receive_server_message(
     connection: &wtransport::Connection,
     expected_type: &str,
 ) -> deopt_v2_backend::Result<Value> {
-    let mut recv = timeout(Duration::from_secs(10), connection.accept_uni())
-        .await
-        .map_err(|_| {
-            deopt_v2_backend::BackendError::Config(format!(
-                "timed out waiting for server-initiated {expected_type}"
-            ))
-        })?
-        .map_err(|error| deopt_v2_backend::BackendError::Config(error.to_string()))?;
+    let receive_timeout_secs = env::var("MM_WT_RECEIVE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(60);
+    let mut recv = timeout(
+        Duration::from_secs(receive_timeout_secs),
+        connection.accept_uni(),
+    )
+    .await
+    .map_err(|_| {
+        deopt_v2_backend::BackendError::Config(format!(
+            "timed out waiting for server-initiated {expected_type}"
+        ))
+    })?
+    .map_err(|error| deopt_v2_backend::BackendError::Config(error.to_string()))?;
     let payload = read_frame(&mut recv, MM_GATEWAY_MAX_FRAME_BYTES)
         .await
         .map_err(|error| deopt_v2_backend::BackendError::Config(error.to_string()))?
@@ -753,6 +911,119 @@ fn assert_quote_list_contains(quotes: &Value, quote_id: &str) -> deopt_v2_backen
         )));
     }
     Ok(())
+}
+
+fn assert_signed_option_rfq_quote(
+    quotes: &Value,
+    quote_id: &str,
+    mm_account: &str,
+    quote_nonce: u64,
+) -> deopt_v2_backend::Result<()> {
+    assert_quote_list_contains(quotes, quote_id)?;
+    let quotes = quotes.as_array().ok_or_else(|| {
+        deopt_v2_backend::BackendError::Config("quotes response is not an array".to_string())
+    })?;
+    let quote = quotes
+        .iter()
+        .find(|quote| quote["quote_id"].as_str() == Some(quote_id))
+        .ok_or_else(|| {
+            deopt_v2_backend::BackendError::Config(format!(
+                "quote {quote_id} missing from HTTP quote list"
+            ))
+        })?;
+    if quote["signature_status"] != "verified" {
+        return Err(deopt_v2_backend::BackendError::Config(format!(
+            "quote {quote_id} signature_status is not verified: {quote}"
+        )));
+    }
+    if quote["recovered_signer"]
+        .as_str()
+        .map(|value| !value.eq_ignore_ascii_case(mm_account))
+        .unwrap_or(true)
+    {
+        return Err(deopt_v2_backend::BackendError::Config(format!(
+            "quote {quote_id} recovered_signer mismatch: {quote}"
+        )));
+    }
+    if quote["quote_nonce"].as_str() != Some(&quote_nonce.to_string()) {
+        return Err(deopt_v2_backend::BackendError::Config(format!(
+            "quote {quote_id} quote_nonce mismatch: {quote}"
+        )));
+    }
+    if quote["quote_digest"]
+        .as_str()
+        .unwrap_or_default()
+        .is_empty()
+    {
+        return Err(deopt_v2_backend::BackendError::Config(format!(
+            "quote {quote_id} missing quote_digest: {quote}"
+        )));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SignedOptionRfqQuote {
+    signer_address: String,
+    signature: String,
+}
+
+fn write_payload_file(path: &str, payload: &Value) -> deopt_v2_backend::Result<()> {
+    let encoded = serde_json::to_string_pretty(payload)
+        .map_err(|error| deopt_v2_backend::BackendError::Config(error.to_string()))?;
+    std::fs::write(path, encoded).map_err(|error| {
+        deopt_v2_backend::BackendError::Config(format!("failed to write {path}: {error}"))
+    })
+}
+
+fn sign_option_rfq_quote(path: &str) -> deopt_v2_backend::Result<SignedOptionRfqQuote> {
+    let output = if let Some(signer_path) = sibling_signer_binary()? {
+        Command::new(signer_path)
+            .arg("--payload")
+            .arg(path)
+            .output()
+            .map_err(|error| {
+                deopt_v2_backend::BackendError::Config(format!(
+                    "failed to run sign_option_rfq_quote: {error}"
+                ))
+            })?
+    } else {
+        Command::new("cargo")
+            .args([
+                "run",
+                "--quiet",
+                "--bin",
+                "sign_option_rfq_quote",
+                "--",
+                "--payload",
+                path,
+            ])
+            .output()
+            .map_err(|error| {
+                deopt_v2_backend::BackendError::Config(format!(
+                    "failed to run cargo sign_option_rfq_quote: {error}"
+                ))
+            })?
+    };
+    if !output.status.success() {
+        return Err(deopt_v2_backend::BackendError::Config(format!(
+            "sign_option_rfq_quote failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    let value: Value = serde_json::from_slice(&output.stdout)
+        .map_err(|error| deopt_v2_backend::BackendError::Config(error.to_string()))?;
+    Ok(SignedOptionRfqQuote {
+        signer_address: required_str(&value, &["signer_address"])?,
+        signature: required_str(&value, &["signature"])?,
+    })
+}
+
+fn sibling_signer_binary() -> deopt_v2_backend::Result<Option<PathBuf>> {
+    let mut path = env::current_exe()
+        .map_err(|error| deopt_v2_backend::BackendError::Config(error.to_string()))?;
+    path.set_file_name(format!("sign_option_rfq_quote{}", env::consts::EXE_SUFFIX));
+    Ok(path.exists().then_some(path))
 }
 
 async fn assert_book(

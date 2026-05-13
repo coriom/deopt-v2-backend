@@ -30,11 +30,43 @@ use crate::types::{now_ms, AccountId, OrderStatus, Side, TimeInForce, TimestampM
 use sqlx::postgres::{PgArguments, PgPool, PgRow};
 use sqlx::query::Query;
 use sqlx::{Postgres, Row, Transaction};
+use std::collections::BTreeMap;
 use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct PgRepository {
     pool: PgPool,
+}
+
+const ADMIN_TABLE_COUNTS: &[(&str, &str)] = &[
+    ("orders", "orders"),
+    ("used_nonces", "used_nonces"),
+    ("execution_intents", "execution_intents"),
+    ("execution_simulations", "execution_simulations"),
+    ("execution_transactions", "execution_transactions"),
+    ("indexed_perp_trades", "indexed_perp_trades"),
+    ("reconciliations", "execution_reconciliations"),
+    ("rfqs", "rfqs"),
+    ("rfq_quotes", "rfq_quotes"),
+    ("option_series", "option_series"),
+    ("option_orders", "option_orders"),
+    ("option_fills", "option_fills"),
+    ("option_rfqs", "option_rfqs"),
+    ("option_rfq_quotes", "option_rfq_quotes"),
+    ("option_rfq_fills", "option_rfq_fills"),
+];
+
+fn validate_admin_identifier(identifier: &str) -> Result<()> {
+    if identifier
+        .bytes()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        Ok(())
+    } else {
+        Err(BackendError::Config(format!(
+            "invalid admin SQL identifier: {identifier}"
+        )))
+    }
 }
 
 impl PgRepository {
@@ -45,6 +77,393 @@ impl PgRepository {
 
     pub async fn run_migrations(&self) -> Result<()> {
         pool::run_migrations(&self.pool).await
+    }
+
+    pub async fn admin_ping(&self) -> Result<()> {
+        sqlx::query("SELECT 1")
+            .execute(&self.pool)
+            .await
+            .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        Ok(())
+    }
+
+    pub async fn admin_migration_status(&self) -> Result<serde_json::Value> {
+        if !self.admin_table_exists("_sqlx_migrations").await? {
+            return Ok(serde_json::json!({
+                "available": false,
+                "installed_count": 0,
+                "latest_version": null
+            }));
+        }
+        let row = sqlx::query(
+            "SELECT COUNT(*) AS installed_count, MAX(version) AS latest_version
+             FROM _sqlx_migrations",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        let installed_count: i64 = row_get(&row, "installed_count")?;
+        let latest_version: Option<i64> = row_get(&row, "latest_version")?;
+        Ok(serde_json::json!({
+            "available": true,
+            "installed_count": i64_to_u64_persistence("installed_count", installed_count)?,
+            "latest_version": latest_version
+        }))
+    }
+
+    pub async fn admin_table_counts(&self) -> Result<BTreeMap<String, serde_json::Value>> {
+        let mut counts = BTreeMap::new();
+        for (name, table) in ADMIN_TABLE_COUNTS {
+            let value = match self.admin_count_table_if_exists(table).await? {
+                Some(count) => serde_json::json!({
+                    "available": true,
+                    "count": count
+                }),
+                None => serde_json::json!({
+                    "available": false,
+                    "count": null
+                }),
+            };
+            counts.insert((*name).to_string(), value);
+        }
+        Ok(counts)
+    }
+
+    pub async fn admin_count_by_column(
+        &self,
+        table: &'static str,
+        column: &'static str,
+    ) -> Result<BTreeMap<String, u64>> {
+        validate_admin_identifier(table)?;
+        validate_admin_identifier(column)?;
+        if !self.admin_table_exists(table).await? {
+            return Ok(BTreeMap::new());
+        }
+        let rows = sqlx::query(&format!(
+            "SELECT {column} AS bucket, COUNT(*) AS count FROM {table} GROUP BY {column}"
+        ))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        let mut counts = BTreeMap::new();
+        for row in rows {
+            let bucket: Option<String> = row_get(&row, "bucket")?;
+            let count: i64 = row_get(&row, "count")?;
+            counts.insert(
+                bucket.unwrap_or_else(|| "null".to_string()),
+                i64_to_u64_persistence("count", count)?,
+            );
+        }
+        Ok(counts)
+    }
+
+    pub async fn admin_count_where(
+        &self,
+        table: &'static str,
+        where_clause: &'static str,
+    ) -> Result<u64> {
+        validate_admin_identifier(table)?;
+        if !self.admin_table_exists(table).await? {
+            return Ok(0);
+        }
+        let row = sqlx::query(&format!(
+            "SELECT COUNT(*) AS count FROM {table} WHERE {where_clause}"
+        ))
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        let count: i64 = row_get(&row, "count")?;
+        i64_to_u64_persistence("count", count)
+    }
+
+    pub async fn admin_recent_execution_intents(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<serde_json::Value>> {
+        if !self.admin_table_exists("execution_intents").await? {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            "SELECT intent_id, market_id, buyer, seller, price_1e8, size_1e8, status, created_at_ms
+             FROM execution_intents
+             ORDER BY created_at_ms DESC, intent_id DESC
+             LIMIT $1",
+        )
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(serde_json::json!({
+                    "intent_id": row_get::<String>(&row, "intent_id")?,
+                    "market_id": row_get::<i64>(&row, "market_id")?,
+                    "buyer": row_get::<String>(&row, "buyer")?,
+                    "seller": row_get::<String>(&row, "seller")?,
+                    "price_1e8": row_get::<String>(&row, "price_1e8")?,
+                    "size_1e8": row_get::<String>(&row, "size_1e8")?,
+                    "status": row_get::<String>(&row, "status")?,
+                    "created_at_ms": row_get::<i64>(&row, "created_at_ms")?
+                }))
+            })
+            .collect()
+    }
+
+    pub async fn admin_recent_execution_simulations(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<serde_json::Value>> {
+        if !self.admin_table_exists("execution_simulations").await? {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            "SELECT simulation_id, intent_id, status, error, decoded_error, created_at_ms
+             FROM execution_simulations
+             ORDER BY created_at_ms DESC, simulation_id DESC
+             LIMIT $1",
+        )
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(serde_json::json!({
+                    "simulation_id": row_get::<String>(&row, "simulation_id")?,
+                    "intent_id": row_get::<String>(&row, "intent_id")?,
+                    "status": row_get::<String>(&row, "status")?,
+                    "error": row_get::<Option<String>>(&row, "error")?,
+                    "decoded_error": row_get::<Option<String>>(&row, "decoded_error")?,
+                    "created_at_ms": row_get::<i64>(&row, "created_at_ms")?
+                }))
+            })
+            .collect()
+    }
+
+    pub async fn admin_recent_failed_simulations(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<serde_json::Value>> {
+        if !self.admin_table_exists("execution_simulations").await? {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            "SELECT simulation_id, intent_id, status, error, decoded_error, created_at_ms
+             FROM execution_simulations
+             WHERE status = 'simulation_failed'
+             ORDER BY created_at_ms DESC, simulation_id DESC
+             LIMIT $1",
+        )
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(serde_json::json!({
+                    "simulation_id": row_get::<String>(&row, "simulation_id")?,
+                    "intent_id": row_get::<String>(&row, "intent_id")?,
+                    "error": row_get::<Option<String>>(&row, "error")?,
+                    "decoded_error": row_get::<Option<String>>(&row, "decoded_error")?,
+                    "created_at_ms": row_get::<i64>(&row, "created_at_ms")?
+                }))
+            })
+            .collect()
+    }
+
+    pub async fn admin_recent_confirmation_errors(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<serde_json::Value>> {
+        if !self.admin_table_exists("execution_transactions").await? {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            "SELECT transaction_id, intent_id, tx_hash, confirmation_status, confirmation_error,
+                    created_at_ms, updated_at_ms
+             FROM execution_transactions
+             WHERE confirmation_error IS NOT NULL
+             ORDER BY updated_at_ms DESC, transaction_id DESC
+             LIMIT $1",
+        )
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(serde_json::json!({
+                    "transaction_id": row_get::<String>(&row, "transaction_id")?,
+                    "intent_id": row_get::<String>(&row, "intent_id")?,
+                    "tx_hash": row_get::<Option<String>>(&row, "tx_hash")?,
+                    "confirmation_status": row_get::<Option<String>>(&row, "confirmation_status")?,
+                    "confirmation_error": row_get::<Option<String>>(&row, "confirmation_error")?,
+                    "created_at_ms": row_get::<i64>(&row, "created_at_ms")?,
+                    "updated_at_ms": row_get::<i64>(&row, "updated_at_ms")?
+                }))
+            })
+            .collect()
+    }
+
+    pub async fn admin_recent_rfqs(&self, limit: u32) -> Result<Vec<serde_json::Value>> {
+        if !self.admin_table_exists("rfqs").await? {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            "SELECT rfq_id, taker, market_id, side, size_1e8, limit_price_1e8, status,
+                    accepted_quote_id, execution_intent_id, created_at_ms, expires_at_ms
+             FROM rfqs
+             ORDER BY created_at_ms DESC, rfq_id DESC
+             LIMIT $1",
+        )
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(serde_json::json!({
+                    "rfq_id": row_get::<String>(&row, "rfq_id")?,
+                    "taker": row_get::<String>(&row, "taker")?,
+                    "market_id": row_get::<i64>(&row, "market_id")?,
+                    "side": row_get::<String>(&row, "side")?,
+                    "size_1e8": row_get::<String>(&row, "size_1e8")?,
+                    "limit_price_1e8": row_get::<Option<String>>(&row, "limit_price_1e8")?,
+                    "status": row_get::<String>(&row, "status")?,
+                    "accepted_quote_id": row_get::<Option<String>>(&row, "accepted_quote_id")?,
+                    "execution_intent_id": row_get::<Option<String>>(&row, "execution_intent_id")?,
+                    "created_at_ms": row_get::<i64>(&row, "created_at_ms")?,
+                    "expires_at_ms": row_get::<i64>(&row, "expires_at_ms")?
+                }))
+            })
+            .collect()
+    }
+
+    pub async fn admin_recent_option_rfqs(&self, limit: u32) -> Result<Vec<serde_json::Value>> {
+        if !self.admin_table_exists("option_rfqs").await? {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            "SELECT option_rfq_id, taker, option_series_id, side, size_1e8, limit_price_1e8,
+                    status, accepted_quote_id, option_fill_id, created_at_ms, expires_at_ms
+             FROM option_rfqs
+             ORDER BY created_at_ms DESC, option_rfq_id DESC
+             LIMIT $1",
+        )
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(serde_json::json!({
+                    "option_rfq_id": row_get::<String>(&row, "option_rfq_id")?,
+                    "taker": row_get::<String>(&row, "taker")?,
+                    "option_series_id": row_get::<String>(&row, "option_series_id")?,
+                    "side": row_get::<String>(&row, "side")?,
+                    "size_1e8": row_get::<String>(&row, "size_1e8")?,
+                    "limit_price_1e8": row_get::<Option<String>>(&row, "limit_price_1e8")?,
+                    "status": row_get::<String>(&row, "status")?,
+                    "accepted_quote_id": row_get::<Option<String>>(&row, "accepted_quote_id")?,
+                    "option_fill_id": row_get::<Option<String>>(&row, "option_fill_id")?,
+                    "created_at_ms": row_get::<i64>(&row, "created_at_ms")?,
+                    "expires_at_ms": row_get::<i64>(&row, "expires_at_ms")?
+                }))
+            })
+            .collect()
+    }
+
+    pub async fn admin_recent_option_fills(&self, limit: u32) -> Result<Vec<serde_json::Value>> {
+        if !self.admin_table_exists("option_fills").await? {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            "SELECT fill_id, option_series_id, buyer, seller, taker_side, price_1e8, size_1e8,
+                    created_at_ms
+             FROM option_fills
+             ORDER BY created_at_ms DESC, fill_id DESC
+             LIMIT $1",
+        )
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(serde_json::json!({
+                    "fill_id": row_get::<String>(&row, "fill_id")?,
+                    "option_series_id": row_get::<String>(&row, "option_series_id")?,
+                    "buyer": row_get::<String>(&row, "buyer")?,
+                    "seller": row_get::<String>(&row, "seller")?,
+                    "taker_side": row_get::<String>(&row, "taker_side")?,
+                    "price_1e8": row_get::<String>(&row, "price_1e8")?,
+                    "size_1e8": row_get::<String>(&row, "size_1e8")?,
+                    "created_at_ms": row_get::<i64>(&row, "created_at_ms")?
+                }))
+            })
+            .collect()
+    }
+
+    pub async fn admin_recent_option_rfq_fills(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<serde_json::Value>> {
+        if !self.admin_table_exists("option_rfq_fills").await? {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            "SELECT fill_id, option_rfq_id, quote_id, option_series_id, buyer, seller, taker,
+                    mm_account, taker_side, price_1e8, size_1e8, created_at_ms
+             FROM option_rfq_fills
+             ORDER BY created_at_ms DESC, fill_id DESC
+             LIMIT $1",
+        )
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(serde_json::json!({
+                    "fill_id": row_get::<String>(&row, "fill_id")?,
+                    "option_rfq_id": row_get::<String>(&row, "option_rfq_id")?,
+                    "quote_id": row_get::<String>(&row, "quote_id")?,
+                    "option_series_id": row_get::<String>(&row, "option_series_id")?,
+                    "buyer": row_get::<String>(&row, "buyer")?,
+                    "seller": row_get::<String>(&row, "seller")?,
+                    "taker": row_get::<String>(&row, "taker")?,
+                    "mm_account": row_get::<String>(&row, "mm_account")?,
+                    "taker_side": row_get::<String>(&row, "taker_side")?,
+                    "price_1e8": row_get::<String>(&row, "price_1e8")?,
+                    "size_1e8": row_get::<String>(&row, "size_1e8")?,
+                    "created_at_ms": row_get::<i64>(&row, "created_at_ms")?
+                }))
+            })
+            .collect()
+    }
+
+    async fn admin_table_exists(&self, table: &'static str) -> Result<bool> {
+        validate_admin_identifier(table)?;
+        let row = sqlx::query("SELECT to_regclass($1)::text AS relation")
+            .bind(format!("public.{table}"))
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        let relation: Option<String> = row_get(&row, "relation")?;
+        Ok(relation.is_some())
+    }
+
+    async fn admin_count_table_if_exists(&self, table: &'static str) -> Result<Option<u64>> {
+        validate_admin_identifier(table)?;
+        if !self.admin_table_exists(table).await? {
+            return Ok(None);
+        }
+        let row = sqlx::query(&format!("SELECT COUNT(*) AS count FROM {table}"))
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        let count: i64 = row_get(&row, "count")?;
+        Ok(Some(i64_to_u64_persistence("count", count)?))
     }
 
     pub async fn begin(&self) -> Result<Transaction<'_, Postgres>> {
