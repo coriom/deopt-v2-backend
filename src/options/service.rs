@@ -1,18 +1,24 @@
 use super::series_id::{option_series_id, OptionSeriesIdInput};
+use super::signing::{
+    option_rfq_id_to_b256, option_rfq_quote_digest, option_rfq_quote_digest_bytes,
+    option_series_id_to_b256, OptionRfqQuoteSigningPayload,
+};
 use super::{
     OptionFill, OptionFillFilter, OptionFillId, OptionOrder, OptionOrderFilter, OptionOrderId,
     OptionOrderStatus, OptionOrderbookLevel, OptionOrderbookSnapshot, OptionRfqFill,
-    OptionRfqFillId, OptionRfqId, OptionRfqQuote, OptionRfqQuoteId, OptionRfqQuoteStatus,
-    OptionRfqRequest, OptionRfqStatus, OptionSeries, OptionSeriesFilter, OptionSeriesId,
-    OptionSeriesSource, OptionSeriesStatus,
+    OptionRfqFillId, OptionRfqId, OptionRfqQuote, OptionRfqQuoteId, OptionRfqQuoteSignatureMode,
+    OptionRfqQuoteSignatureStatus, OptionRfqQuoteStatus, OptionRfqRequest, OptionRfqStatus,
+    OptionSeries, OptionSeriesFilter, OptionSeriesId, OptionSeriesSource, OptionSeriesStatus,
 };
 use crate::api::AppState;
 use crate::error::{BackendError, Result};
+use crate::execution::transaction::hex_0x;
 use crate::mm::protocol::{
     NotificationEnvelope, OptionRfqQuoteAcceptedPayload, OptionRfqQuoteRejectedPayload,
     OptionRfqRequestPayload, ServerMessage,
 };
 use crate::signing::eip712::parse_evm_address;
+use crate::signing::recover_eip712_signer;
 use crate::signing::signature::validate_signature_shape;
 use crate::types::{now_ms, AccountId, OrderId, Price1e8, Side, Size1e8, TimeInForce, TimestampMs};
 use std::collections::BTreeMap;
@@ -70,7 +76,26 @@ pub struct SubmitOptionRfqQuoteInput {
     pub client_quote_id: Option<String>,
     pub price_1e8: Price1e8,
     pub size_1e8: Size1e8,
+    pub quote_nonce: Option<u64>,
     pub quote_ttl_ms: Option<u64>,
+    pub signature: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OptionRfqQuoteSigningPayloadInput {
+    pub option_rfq_id: OptionRfqId,
+    pub mm_account: AccountId,
+    pub price_1e8: Price1e8,
+    pub size_1e8: Size1e8,
+    pub quote_nonce: u64,
+    pub quote_ttl_ms: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OptionRfqQuoteSigningPayloadOutcome {
+    pub rfq: OptionRfqRequest,
+    pub payload: OptionRfqQuoteSigningPayload,
+    pub digest: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -495,6 +520,52 @@ pub async fn get_option_rfq(
         .ok_or(BackendError::InvalidOptionRfqId)
 }
 
+pub async fn option_rfq_quote_signing_payload(
+    state: &AppState,
+    input: OptionRfqQuoteSigningPayloadInput,
+) -> Result<OptionRfqQuoteSigningPayloadOutcome> {
+    ensure_option_rfq_enabled(state)?;
+    validate_account(&input.mm_account)?;
+    if input.price_1e8 == 0 {
+        return Err(BackendError::ZeroPrice);
+    }
+    if input.size_1e8 == 0 {
+        return Err(BackendError::ZeroSize);
+    }
+    let quote_ttl_ms = input
+        .quote_ttl_ms
+        .min(state.options_config.rfq_max_quote_ttl_ms);
+    validate_option_rfq_quote_ttl(state, quote_ttl_ms)?;
+
+    let rfq = get_option_rfq(state, input.option_rfq_id).await?;
+    let now = now_ms();
+    if rfq.effective_status(now) != OptionRfqStatus::Open {
+        return Err(BackendError::InvalidOptionRfqState(
+            "option RFQ is not open".to_string(),
+        ));
+    }
+    if input.size_1e8 > rfq.size_1e8 {
+        return Err(BackendError::InvalidOptionRfqQuoteState(
+            "option RFQ quote size exceeds requested size".to_string(),
+        ));
+    }
+
+    let payload = option_rfq_quote_payload(
+        &rfq,
+        input.mm_account,
+        input.price_1e8,
+        input.size_1e8,
+        input.quote_nonce,
+        quote_ttl_ms,
+    )?;
+    let digest = option_rfq_quote_digest(&payload, &state.options_config.rfq_eip712_domain)?;
+    Ok(OptionRfqQuoteSigningPayloadOutcome {
+        rfq,
+        payload,
+        digest,
+    })
+}
+
 pub async fn submit_option_rfq_quote(
     state: &AppState,
     option_rfq_id: OptionRfqId,
@@ -532,13 +603,14 @@ pub async fn submit_option_rfq_quote(
         .quote_ttl_ms
         .unwrap_or(state.options_config.rfq_max_quote_ttl_ms)
         .min(state.options_config.rfq_max_quote_ttl_ms);
-    if quote_ttl_ms < state.options_config.rfq_min_quote_ttl_ms {
+    validate_option_rfq_quote_ttl(state, quote_ttl_ms)?;
+    let signature_metadata = verify_option_rfq_quote_signature(state, &rfq, &input, quote_ttl_ms)?;
+    let expires_at_ms = quote_expires_at_ms(state, &rfq, now, quote_ttl_ms)?;
+    if now >= expires_at_ms {
         return Err(BackendError::InvalidOptionRfqQuoteState(
-            "option RFQ quote_ttl_ms is below the minimum".to_string(),
+            "option RFQ quote has expired".to_string(),
         ));
     }
-    let expires_at_ms =
-        checked_expiry(now, quote_ttl_ms, "option RFQ quote expiry")?.min(rfq.expires_at_ms);
 
     let quote = OptionRfqQuote {
         quote_id: Uuid::new_v4(),
@@ -551,6 +623,11 @@ pub async fn submit_option_rfq_quote(
         status: OptionRfqQuoteStatus::Active,
         created_at_ms: now,
         expires_at_ms,
+        signature: signature_metadata.signature,
+        quote_digest: signature_metadata.quote_digest,
+        quote_nonce: signature_metadata.quote_nonce,
+        signature_status: signature_metadata.signature_status,
+        recovered_signer: signature_metadata.recovered_signer,
     };
 
     if let Some(repository) = state.repository.clone() {
@@ -608,6 +685,7 @@ pub async fn accept_option_rfq_quote(
             "option RFQ quote is not active".to_string(),
         ));
     }
+    validate_option_rfq_quote_signature_status(state, &quote)?;
     if quote.size_1e8 == 0 || quote.size_1e8 > rfq.size_1e8 {
         return Err(BackendError::InvalidOptionRfqQuoteState(
             "option RFQ quote size is invalid".to_string(),
@@ -783,6 +861,15 @@ fn validate_account(account: &AccountId) -> Result<()> {
     parse_evm_address(account).map(|_| ())
 }
 
+fn validate_option_rfq_quote_ttl(state: &AppState, quote_ttl_ms: u64) -> Result<()> {
+    if quote_ttl_ms < state.options_config.rfq_min_quote_ttl_ms {
+        return Err(BackendError::InvalidOptionRfqQuoteState(
+            "option RFQ quote_ttl_ms is below the minimum".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_assets(fields: &[(&str, &str)]) -> Result<()> {
     for (field, value) in fields {
         if value.trim().is_empty() {
@@ -820,6 +907,152 @@ fn option_rfq_price_satisfies_limit(
         (Side::Buy, Some(limit)) => price_1e8 <= limit,
         (Side::Sell, Some(limit)) => price_1e8 >= limit,
     }
+}
+
+struct OptionRfqQuoteSignatureMetadata {
+    signature: Option<String>,
+    quote_digest: Option<String>,
+    quote_nonce: Option<String>,
+    signature_status: OptionRfqQuoteSignatureStatus,
+    recovered_signer: Option<AccountId>,
+}
+
+fn verify_option_rfq_quote_signature(
+    state: &AppState,
+    rfq: &OptionRfqRequest,
+    input: &SubmitOptionRfqQuoteInput,
+    quote_ttl_ms: u64,
+) -> Result<OptionRfqQuoteSignatureMetadata> {
+    match state.options_config.rfq_quote_signature_mode {
+        OptionRfqQuoteSignatureMode::Disabled => {
+            let quote_digest = input
+                .quote_nonce
+                .map(|quote_nonce| {
+                    let payload = option_rfq_quote_payload(
+                        rfq,
+                        input.mm_account.clone(),
+                        input.price_1e8,
+                        input.size_1e8,
+                        quote_nonce,
+                        quote_ttl_ms,
+                    )?;
+                    option_rfq_quote_digest(&payload, &state.options_config.rfq_eip712_domain)
+                })
+                .transpose()?;
+            Ok(OptionRfqQuoteSignatureMetadata {
+                signature: input.signature.clone(),
+                quote_digest,
+                quote_nonce: input.quote_nonce.map(|value| value.to_string()),
+                signature_status: OptionRfqQuoteSignatureStatus::NotRequired,
+                recovered_signer: None,
+            })
+        }
+        OptionRfqQuoteSignatureMode::Strict => {
+            let Some(quote_nonce) = input.quote_nonce else {
+                return Err(BackendError::InvalidOptionRfqQuoteState(
+                    "quote_nonce is required when OPTION_RFQ_QUOTE_SIGNATURE_MODE=strict"
+                        .to_string(),
+                ));
+            };
+            let Some(signature) = input.signature.as_deref() else {
+                return Err(BackendError::InvalidOptionRfqQuoteState(
+                    "signature is required when OPTION_RFQ_QUOTE_SIGNATURE_MODE=strict".to_string(),
+                ));
+            };
+            validate_signature_shape(signature)?;
+            let payload = option_rfq_quote_payload(
+                rfq,
+                input.mm_account.clone(),
+                input.price_1e8,
+                input.size_1e8,
+                quote_nonce,
+                quote_ttl_ms,
+            )?;
+            let digest_bytes =
+                option_rfq_quote_digest_bytes(&payload, &state.options_config.rfq_eip712_domain)?;
+            let quote_digest = hex_0x(&digest_bytes);
+            let recovered_signer = recover_eip712_signer(&digest_bytes, signature)?;
+            let expected = parse_evm_address(&input.mm_account)?;
+            let recovered = parse_evm_address(&recovered_signer)?;
+            if recovered != expected {
+                return Err(BackendError::SignatureSignerMismatch);
+            }
+            Ok(OptionRfqQuoteSignatureMetadata {
+                signature: Some(signature.to_string()),
+                quote_digest: Some(quote_digest),
+                quote_nonce: Some(quote_nonce.to_string()),
+                signature_status: OptionRfqQuoteSignatureStatus::Verified,
+                recovered_signer: Some(recovered_signer),
+            })
+        }
+    }
+}
+
+fn quote_expires_at_ms(
+    state: &AppState,
+    rfq: &OptionRfqRequest,
+    now: TimestampMs,
+    quote_ttl_ms: u64,
+) -> Result<TimestampMs> {
+    match state.options_config.rfq_quote_signature_mode {
+        OptionRfqQuoteSignatureMode::Disabled => {
+            checked_expiry(now, quote_ttl_ms, "option RFQ quote expiry")
+                .map(|expires_at_ms| expires_at_ms.min(rfq.expires_at_ms))
+        }
+        OptionRfqQuoteSignatureMode::Strict => signed_quote_expires_at_ms(rfq, quote_ttl_ms),
+    }
+}
+
+fn signed_quote_expires_at_ms(rfq: &OptionRfqRequest, quote_ttl_ms: u64) -> Result<TimestampMs> {
+    let quote_ttl_ms = i64::try_from(quote_ttl_ms).map_err(|_| {
+        BackendError::InvalidOptionRfqQuoteState("quote_ttl_ms cannot be encoded".to_string())
+    })?;
+    rfq.created_at_ms
+        .checked_add(quote_ttl_ms)
+        .map(|expires_at_ms| expires_at_ms.min(rfq.expires_at_ms))
+        .ok_or_else(|| {
+            BackendError::InvalidOptionRfqQuoteState("quote expiry overflow".to_string())
+        })
+}
+
+fn validate_option_rfq_quote_signature_status(
+    state: &AppState,
+    quote: &OptionRfqQuote,
+) -> Result<()> {
+    if state.options_config.rfq_quote_signature_mode != OptionRfqQuoteSignatureMode::Strict {
+        return Ok(());
+    }
+    if quote.signature_status != OptionRfqQuoteSignatureStatus::Verified {
+        return Err(BackendError::InvalidOptionRfqQuoteState(format!(
+            "option RFQ quote signature is {}",
+            quote.signature_status.as_str()
+        )));
+    }
+    Ok(())
+}
+
+fn option_rfq_quote_payload(
+    rfq: &OptionRfqRequest,
+    mm_account: AccountId,
+    price_1e8: Price1e8,
+    size_1e8: Size1e8,
+    quote_nonce: u64,
+    quote_ttl_ms: u64,
+) -> Result<OptionRfqQuoteSigningPayload> {
+    let expires_at_ms = signed_quote_expires_at_ms(rfq, quote_ttl_ms)?;
+    let expiry = u128::try_from(expires_at_ms / 1000).map_err(|_| {
+        BackendError::InvalidOptionRfqQuoteState("quote expiry cannot be encoded".to_string())
+    })?;
+    Ok(OptionRfqQuoteSigningPayload {
+        option_rfq_id: option_rfq_id_to_b256(&rfq.option_rfq_id.to_string()),
+        mm_account,
+        option_series_id: option_series_id_to_b256(&rfq.option_series_id)?,
+        taker_is_buyer: rfq.side == Side::Buy,
+        price_1e8,
+        size_1e8,
+        quote_nonce: quote_nonce.into(),
+        expiry,
+    })
 }
 
 fn broadcast_option_rfq_request(state: &AppState, rfq: &OptionRfqRequest) {

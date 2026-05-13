@@ -207,6 +207,21 @@ impl AppConfig {
             rfq_min_quote_ttl_ms: parse_env(&mut lookup, "OPTION_RFQ_MIN_QUOTE_TTL_MS", "500")?,
             rfq_max_quote_ttl_ms: parse_env(&mut lookup, "OPTION_RFQ_MAX_QUOTE_TTL_MS", "10000")?,
             rfq_max_quotes_per_rfq: parse_env(&mut lookup, "OPTION_RFQ_MAX_QUOTES_PER_RFQ", "50")?,
+            rfq_quote_signature_mode: parse_env(
+                &mut lookup,
+                "OPTION_RFQ_QUOTE_SIGNATURE_MODE",
+                "disabled",
+            )?,
+            rfq_eip712_domain: Eip712Domain {
+                name: get_env(&mut lookup, "OPTION_RFQ_EIP712_NAME", "DeOptV2OptionRFQ"),
+                version: get_env(&mut lookup, "OPTION_RFQ_EIP712_VERSION", "1"),
+                chain_id: parse_env(&mut lookup, "OPTION_RFQ_EIP712_CHAIN_ID", "84532")?,
+                verifying_contract: AccountId::new(get_env(
+                    &mut lookup,
+                    "OPTION_RFQ_EIP712_VERIFYING_CONTRACT",
+                    "0x0000000000000000000000000000000000000000",
+                )),
+            },
         };
         let perp_nonce_sync = PerpNonceSyncConfig {
             enabled: parse_env(&mut lookup, "PERP_NONCE_SYNC_ENABLED", "false")?,
@@ -888,6 +903,31 @@ mod tests {
         assert_eq!(config.options.rfq_min_quote_ttl_ms, 500);
         assert_eq!(config.options.rfq_max_quote_ttl_ms, 10_000);
         assert_eq!(config.options.rfq_max_quotes_per_rfq, 50);
+        assert_eq!(
+            config.options.rfq_quote_signature_mode,
+            crate::options::OptionRfqQuoteSignatureMode::Disabled
+        );
+        assert_eq!(config.options.rfq_eip712_domain.name, "DeOptV2OptionRFQ");
+    }
+
+    #[test]
+    fn option_rfq_quote_signature_mode_accepts_strict() {
+        let config = config_from_pairs([("OPTION_RFQ_QUOTE_SIGNATURE_MODE", "strict")]).unwrap();
+
+        assert_eq!(
+            config.options.rfq_quote_signature_mode,
+            crate::options::OptionRfqQuoteSignatureMode::Strict
+        );
+    }
+
+    #[test]
+    fn option_rfq_quote_signature_mode_rejects_invalid_mode() {
+        let error =
+            config_from_pairs([("OPTION_RFQ_QUOTE_SIGNATURE_MODE", "optional")]).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("invalid OPTION_RFQ_QUOTE_SIGNATURE_MODE"));
     }
 
     #[test]

@@ -7,15 +7,21 @@ use deopt_v2_backend::options::service::{
     create_option_series, disable_option_series, get_option_fill, get_option_order,
     get_option_order_fills, get_option_orderbook, get_option_series, list_option_fills,
     list_option_orders, list_option_rfq_quotes, list_option_rfqs, list_option_series,
-    submit_option_order, submit_option_rfq_quote, CreateOptionRfqInput, CreateOptionSeriesInput,
+    option_rfq_quote_signing_payload, submit_option_order, submit_option_rfq_quote,
+    CreateOptionRfqInput, CreateOptionSeriesInput, OptionRfqQuoteSigningPayloadInput,
     SubmitOptionOrderInput, SubmitOptionRfqQuoteInput,
 };
 use deopt_v2_backend::options::{
-    option_series_id, OptionFillFilter, OptionOrderFilter, OptionOrderStatus, OptionRfqQuoteStatus,
-    OptionRfqStatus, OptionSeriesFilter, OptionSeriesIdInput, OptionSeriesStatus, OptionsConfig,
+    option_rfq_id_to_b256, option_rfq_quote_digest, option_series_id, option_series_id_to_b256,
+    OptionFillFilter, OptionOrderFilter, OptionOrderStatus, OptionRfqQuote,
+    OptionRfqQuoteSignatureMode, OptionRfqQuoteSignatureStatus, OptionRfqQuoteSigningPayload,
+    OptionRfqQuoteStatus, OptionRfqStatus, OptionSeriesFilter, OptionSeriesIdInput,
+    OptionSeriesStatus, OptionsConfig,
 };
 use deopt_v2_backend::types::{now_ms, AccountId, Side, TimeInForce};
+use k256::ecdsa::SigningKey;
 use serde_json::json;
+use sha3::{Digest, Keccak256};
 use tokio::time::{sleep, Duration};
 use tower::ServiceExt;
 
@@ -31,6 +37,13 @@ fn state() -> AppState {
 fn option_rfq_state() -> AppState {
     let mut config = OptionsConfig::enabled_in_memory_for_tests();
     config.rfq_enabled = true;
+    AppState::with_options_config(EngineState::with_default_markets(), config)
+}
+
+fn strict_option_rfq_state() -> AppState {
+    let mut config = OptionsConfig::enabled_in_memory_for_tests();
+    config.rfq_enabled = true;
+    config.rfq_quote_signature_mode = OptionRfqQuoteSignatureMode::Strict;
     AppState::with_options_config(EngineState::with_default_markets(), config)
 }
 
@@ -59,6 +72,10 @@ fn account() -> AccountId {
 
 fn account_two() -> AccountId {
     AccountId::new("0x0000000000000000000000000000000000000002")
+}
+
+fn signing_account() -> AccountId {
+    AccountId::new(test_account())
 }
 
 async fn active_series_id(state: &AppState) -> String {
@@ -108,7 +125,9 @@ fn option_rfq_quote_input(
         client_quote_id: Some(client_quote_id.to_string()),
         price_1e8: 1_000_000_000,
         size_1e8: 100_000_000,
+        quote_nonce: None,
         quote_ttl_ms: Some(5_000),
+        signature: None,
     }
 }
 
@@ -1014,6 +1033,378 @@ async fn http_option_match_returns_fills_and_fill_endpoints() {
     assert_eq!(response_json(listed).await.as_array().unwrap().len(), 1);
 }
 
+#[test]
+fn option_rfq_id_to_b32_is_deterministic() {
+    let option_rfq_id = "a1bbb9bf-2f33-4686-9cdc-30e292ff391f";
+
+    assert_eq!(
+        option_rfq_id_to_b256(option_rfq_id),
+        option_rfq_id_to_b256(option_rfq_id)
+    );
+    assert_ne!(
+        option_rfq_id_to_b256(option_rfq_id),
+        option_rfq_id_to_b256("other-option-rfq-id")
+    );
+}
+
+#[test]
+fn option_series_id_b32_parses_hex_bytes32() {
+    let option_series_id = option_series_id(OptionSeriesIdInput {
+        underlying: "ETH",
+        base_asset: "ETH",
+        quote_asset: "USDC",
+        settlement_asset: "USDC",
+        expiry: 4_102_444_800,
+        strike_1e8: 300_000_000_000,
+        is_call: true,
+        contract_size_1e8: 100_000_000,
+    });
+
+    let parsed = option_series_id_to_b256(&option_series_id).unwrap();
+
+    assert_eq!(parsed.as_slice().len(), 32);
+    assert!(option_series_id_to_b256("not-hex").is_err());
+}
+
+#[test]
+fn option_rfq_quote_typehash_is_stable() {
+    assert_eq!(
+        format!(
+            "0x{}",
+            hex_encode(deopt_v2_backend::options::signing::option_rfq_quote_typehash().as_slice())
+        ),
+        "0xd44f79e2d92feff94554544c51241a58a4e34965412709747eb106545d3cad5e"
+    );
+}
+
+#[test]
+fn option_rfq_quote_digest_is_deterministic() {
+    let payload = OptionRfqQuoteSigningPayload {
+        option_rfq_id: option_rfq_id_to_b256("option-rfq-1"),
+        mm_account: signing_account(),
+        option_series_id: option_series_id_to_b256(
+            "0x1111111111111111111111111111111111111111111111111111111111111111",
+        )
+        .unwrap(),
+        taker_is_buyer: true,
+        price_1e8: 1_000_000_000,
+        size_1e8: 100_000_000,
+        quote_nonce: 7,
+        expiry: 1_778_300_000,
+    };
+    let domain = OptionsConfig::disabled().rfq_eip712_domain;
+
+    assert_eq!(
+        option_rfq_quote_digest(&payload, &domain).unwrap(),
+        option_rfq_quote_digest(&payload, &domain).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn option_rfq_quote_signing_payload_endpoint_returns_expected_structure() {
+    let state = option_rfq_state();
+    let option_series_id = active_series_id(&state).await;
+    let rfq = create_option_rfq(&state, option_rfq_input(option_series_id, Side::Buy))
+        .await
+        .unwrap();
+    let response = router(state)
+        .oneshot(json_post(
+            &format!("/options/rfqs/{}/quote-signing-payload", rfq.option_rfq_id),
+            json!({
+                "mm_account": signing_account().0,
+                "price_1e8": "1000000000",
+                "size_1e8": "100000000",
+                "client_quote_id": "payload-option-rfq-quote",
+                "quote_nonce": 42,
+                "quote_ttl_ms": 5000
+            }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = response_json(response).await;
+    assert_eq!(json["primary_type"], "OptionRFQQuote");
+    assert_eq!(json["message"]["mmAccount"], signing_account().0);
+    assert_eq!(json["message"]["quoteNonce"], "42");
+    assert!(json["option_rfq_id_b32"]
+        .as_str()
+        .unwrap()
+        .starts_with("0x"));
+    assert!(json["option_series_id_b32"]
+        .as_str()
+        .unwrap()
+        .starts_with("0x"));
+    assert!(json["digest"].as_str().unwrap().starts_with("0x"));
+}
+
+#[tokio::test]
+async fn disabled_mode_accepts_unsigned_http_option_rfq_quote() {
+    let state = option_rfq_state();
+    let option_series_id = active_series_id(&state).await;
+    let rfq = create_option_rfq(&state, option_rfq_input(option_series_id, Side::Buy))
+        .await
+        .unwrap();
+    let response = router(state)
+        .oneshot(json_post(
+            &format!("/options/rfqs/{}/quotes", rfq.option_rfq_id),
+            json!({
+                "mm_account": account_two().0,
+                "client_quote_id": "unsigned-http-option-rfq-quote",
+                "price_1e8": "1000000000",
+                "size_1e8": "100000000",
+                "quote_ttl_ms": 5000
+            }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = response_json(response).await;
+    assert_eq!(json["signature_status"], "not_required");
+    assert!(json["signature"].is_null());
+}
+
+#[tokio::test]
+async fn strict_mode_rejects_missing_option_rfq_quote_signature() {
+    let state = strict_option_rfq_state();
+    let option_series_id = active_series_id(&state).await;
+    let rfq = create_option_rfq(&state, option_rfq_input(option_series_id, Side::Buy))
+        .await
+        .unwrap();
+    let mut input = option_rfq_quote_input(signing_account(), "missing-signature");
+    input.quote_nonce = Some(1);
+
+    let error = submit_option_rfq_quote(&state, rfq.option_rfq_id, input)
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("signature is required"));
+}
+
+#[tokio::test]
+async fn strict_mode_rejects_missing_option_rfq_quote_nonce() {
+    let state = strict_option_rfq_state();
+    let option_series_id = active_series_id(&state).await;
+    let rfq = create_option_rfq(&state, option_rfq_input(option_series_id, Side::Buy))
+        .await
+        .unwrap();
+    let mut input = option_rfq_quote_input(signing_account(), "missing-nonce");
+    input.signature = Some(valid_signature_hex(0xaa));
+
+    let error = submit_option_rfq_quote(&state, rfq.option_rfq_id, input)
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("quote_nonce is required"));
+}
+
+#[tokio::test]
+async fn strict_mode_rejects_malformed_option_rfq_quote_signature() {
+    let state = strict_option_rfq_state();
+    let option_series_id = active_series_id(&state).await;
+    let rfq = create_option_rfq(&state, option_rfq_input(option_series_id, Side::Buy))
+        .await
+        .unwrap();
+    let mut input = option_rfq_quote_input(signing_account(), "malformed-signature");
+    input.quote_nonce = Some(1);
+    input.signature = Some("not-a-signature".to_string());
+
+    let error = submit_option_rfq_quote(&state, rfq.option_rfq_id, input)
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("malformed signature"));
+}
+
+#[tokio::test]
+async fn strict_mode_rejects_invalid_option_rfq_quote_signature() {
+    let state = strict_option_rfq_state();
+    let option_series_id = active_series_id(&state).await;
+    let rfq = create_option_rfq(&state, option_rfq_input(option_series_id, Side::Buy))
+        .await
+        .unwrap();
+    let mut input = option_rfq_quote_input(signing_account(), "invalid-signature");
+    input.quote_nonce = Some(1);
+    input.signature = Some(valid_signature_hex(0xaa));
+
+    let error = submit_option_rfq_quote(&state, rfq.option_rfq_id, input)
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("signature"));
+}
+
+#[tokio::test]
+async fn strict_mode_rejects_option_rfq_quote_signer_mismatch() {
+    let state = strict_option_rfq_state();
+    let option_series_id = active_series_id(&state).await;
+    let rfq = create_option_rfq(&state, option_rfq_input(option_series_id, Side::Buy))
+        .await
+        .unwrap();
+    let mut input = option_rfq_quote_input(signing_account(), "signer-mismatch");
+    input.quote_nonce = Some(1);
+    input.signature = Some(sign_option_quote_digest(
+        &option_quote_payload_digest(&state, &rfq, &input).await,
+        other_signing_key(),
+    ));
+
+    let error = submit_option_rfq_quote(&state, rfq.option_rfq_id, input)
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("signer does not match"));
+}
+
+#[tokio::test]
+async fn strict_mode_accepts_valid_option_rfq_quote_signature_and_stores_metadata() {
+    let state = strict_option_rfq_state();
+    let option_series_id = active_series_id(&state).await;
+    let rfq = create_option_rfq(&state, option_rfq_input(option_series_id, Side::Buy))
+        .await
+        .unwrap();
+    let mut input = option_rfq_quote_input(signing_account(), "valid-signature");
+    input.quote_nonce = Some(11);
+    input.signature = Some(sign_option_quote_digest(
+        &option_quote_payload_digest(&state, &rfq, &input).await,
+        test_signing_key(),
+    ));
+
+    let quote = submit_option_rfq_quote(&state, rfq.option_rfq_id, input)
+        .await
+        .unwrap();
+
+    assert_eq!(quote.status, OptionRfqQuoteStatus::Active);
+    assert_eq!(
+        quote.signature_status,
+        OptionRfqQuoteSignatureStatus::Verified
+    );
+    assert_eq!(quote.recovered_signer, Some(signing_account()));
+    assert_eq!(quote.quote_nonce.as_deref(), Some("11"));
+    assert!(quote.quote_digest.as_deref().unwrap().starts_with("0x"));
+}
+
+#[tokio::test]
+async fn strict_http_option_rfq_quote_endpoint_stores_signature_metadata() {
+    let state = strict_option_rfq_state();
+    let option_series_id = active_series_id(&state).await;
+    let rfq = create_option_rfq(&state, option_rfq_input(option_series_id, Side::Buy))
+        .await
+        .unwrap();
+    let payload = option_rfq_quote_signing_payload(
+        &state,
+        OptionRfqQuoteSigningPayloadInput {
+            option_rfq_id: rfq.option_rfq_id,
+            mm_account: signing_account(),
+            price_1e8: 1_000_000_000,
+            size_1e8: 100_000_000,
+            quote_nonce: 21,
+            quote_ttl_ms: 5_000,
+        },
+    )
+    .await
+    .unwrap();
+    let signature = sign_option_quote_digest(&payload.digest, test_signing_key());
+
+    let response = router(state)
+        .oneshot(json_post(
+            &format!("/options/rfqs/{}/quotes", rfq.option_rfq_id),
+            json!({
+                "mm_account": signing_account().0,
+                "client_quote_id": "signed-http-option-rfq-quote",
+                "price_1e8": "1000000000",
+                "size_1e8": "100000000",
+                "quote_nonce": 21,
+                "quote_ttl_ms": 5000,
+                "signature": signature
+            }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = response_json(response).await;
+    assert_eq!(json["signature_status"], "verified");
+    assert_eq!(json["recovered_signer"], signing_account().0);
+    assert_eq!(json["quote_nonce"], "21");
+    assert!(json["quote_digest"].as_str().unwrap().starts_with("0x"));
+}
+
+#[tokio::test]
+async fn strict_acceptance_requires_active_verified_option_rfq_quote() {
+    let state = strict_option_rfq_state();
+    let option_series_id = active_series_id(&state).await;
+    let rfq = create_option_rfq(&state, option_rfq_input(option_series_id, Side::Buy))
+        .await
+        .unwrap();
+    let quote = OptionRfqQuote {
+        quote_id: uuid::Uuid::new_v4(),
+        option_rfq_id: rfq.option_rfq_id,
+        mm_account: signing_account(),
+        session_id: None,
+        client_quote_id: Some("forced-unverified-option-rfq-quote".to_string()),
+        price_1e8: 1_000_000_000,
+        size_1e8: 100_000_000,
+        status: OptionRfqQuoteStatus::Active,
+        created_at_ms: now_ms(),
+        expires_at_ms: rfq.expires_at_ms,
+        signature: None,
+        quote_digest: None,
+        quote_nonce: None,
+        signature_status: OptionRfqQuoteSignatureStatus::Missing,
+        recovered_signer: None,
+    };
+    state
+        .options_store
+        .lock()
+        .unwrap()
+        .insert_option_rfq_quote(quote.clone())
+        .unwrap();
+
+    let error = accept_option_rfq_quote(&state, rfq.option_rfq_id, quote.quote_id)
+        .await
+        .unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("option RFQ quote signature is missing"));
+}
+
+#[tokio::test]
+async fn strict_signed_option_rfq_accept_creates_fill_only() {
+    let state = strict_option_rfq_state();
+    let option_series_id = active_series_id(&state).await;
+    let rfq = create_option_rfq(&state, option_rfq_input(option_series_id, Side::Buy))
+        .await
+        .unwrap();
+    let mut input = option_rfq_quote_input(signing_account(), "signed-accept-fill-only");
+    input.quote_nonce = Some(31);
+    input.signature = Some(sign_option_quote_digest(
+        &option_quote_payload_digest(&state, &rfq, &input).await,
+        test_signing_key(),
+    ));
+    let quote = submit_option_rfq_quote(&state, rfq.option_rfq_id, input)
+        .await
+        .unwrap();
+
+    let outcome = accept_option_rfq_quote(&state, rfq.option_rfq_id, quote.quote_id)
+        .await
+        .unwrap();
+    let transactions = router(state.clone())
+        .oneshot(get_request("/executor/transactions"))
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.rfq.status, OptionRfqStatus::Accepted);
+    assert_eq!(outcome.quote.status, OptionRfqQuoteStatus::Accepted);
+    assert_eq!(outcome.fill.mm_account, signing_account());
+    assert_eq!(state.engine.lock().unwrap().execution_intents().len(), 0);
+    assert_eq!(
+        response_json(transactions).await.as_array().unwrap().len(),
+        0
+    );
+}
+
 #[tokio::test]
 async fn option_rfq_create_quote_accept_buy_creates_offchain_fill_only() {
     let state = option_rfq_state();
@@ -1384,4 +1775,102 @@ fn get_request(uri: &str) -> Request<Body> {
 async fn response_json(response: axum::response::Response) -> serde_json::Value {
     let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     serde_json::from_slice(&bytes).unwrap()
+}
+
+async fn option_quote_payload_digest(
+    state: &AppState,
+    rfq: &deopt_v2_backend::options::OptionRfqRequest,
+    input: &SubmitOptionRfqQuoteInput,
+) -> String {
+    option_rfq_quote_signing_payload(
+        state,
+        OptionRfqQuoteSigningPayloadInput {
+            option_rfq_id: rfq.option_rfq_id,
+            mm_account: input.mm_account.clone(),
+            price_1e8: input.price_1e8,
+            size_1e8: input.size_1e8,
+            quote_nonce: input.quote_nonce.unwrap(),
+            quote_ttl_ms: input.quote_ttl_ms.unwrap(),
+        },
+    )
+    .await
+    .unwrap()
+    .digest
+}
+
+fn sign_option_quote_digest(digest: &str, signing_key: SigningKey) -> String {
+    let digest = parse_digest(digest);
+    let (signature, recovery_id) = signing_key.sign_prehash_recoverable(&digest).unwrap();
+    let mut bytes = Vec::with_capacity(65);
+    bytes.extend_from_slice(&signature.to_bytes());
+    bytes.push(recovery_id.to_byte() + 27);
+    format!("0x{}", hex_encode(&bytes))
+}
+
+fn valid_signature_hex(byte: u8) -> String {
+    let mut signature = String::from("0x");
+    for _ in 0..65 {
+        signature.push_str(&format!("{byte:02x}"));
+    }
+    signature
+}
+
+fn test_account() -> String {
+    let verifying_key = test_signing_key().verifying_key().to_encoded_point(false);
+    let hash = Keccak256::digest(&verifying_key.as_bytes()[1..]);
+    format!("0x{}", hex_encode(&hash[12..]))
+}
+
+fn test_signing_key() -> SigningKey {
+    signing_key_from_hex("4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318")
+}
+
+fn other_signing_key() -> SigningKey {
+    signing_key_from_hex("6c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318")
+}
+
+fn signing_key_from_hex(hex: &str) -> SigningKey {
+    let mut bytes = [0u8; 32];
+    decode_hex_to_slice(hex, &mut bytes).unwrap();
+    SigningKey::from_slice(&bytes).unwrap()
+}
+
+fn parse_digest(value: &str) -> [u8; 32] {
+    let hex = value.strip_prefix("0x").unwrap();
+    let mut bytes = [0u8; 32];
+    decode_hex_to_slice(hex, &mut bytes).unwrap();
+    bytes
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+fn decode_hex_to_slice(hex: &str, out: &mut [u8]) -> std::result::Result<(), ()> {
+    if hex.len() != out.len() * 2 {
+        return Err(());
+    }
+
+    for (index, byte) in out.iter_mut().enumerate() {
+        let high = decode_hex_nibble(hex.as_bytes()[index * 2])?;
+        let low = decode_hex_nibble(hex.as_bytes()[index * 2 + 1])?;
+        *byte = (high << 4) | low;
+    }
+
+    Ok(())
+}
+
+fn decode_hex_nibble(byte: u8) -> std::result::Result<u8, ()> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(()),
+    }
 }

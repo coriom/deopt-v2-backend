@@ -66,6 +66,11 @@ OPTION_RFQ_MAX_TTL_MS=30000
 OPTION_RFQ_MIN_QUOTE_TTL_MS=500
 OPTION_RFQ_MAX_QUOTE_TTL_MS=10000
 OPTION_RFQ_MAX_QUOTES_PER_RFQ=50
+OPTION_RFQ_QUOTE_SIGNATURE_MODE=disabled
+OPTION_RFQ_EIP712_NAME=DeOptV2OptionRFQ
+OPTION_RFQ_EIP712_VERSION=1
+OPTION_RFQ_EIP712_CHAIN_ID=84532
+OPTION_RFQ_EIP712_VERIFYING_CONTRACT=0x0000000000000000000000000000000000000000
 SIGNATURE_VERIFICATION_MODE=disabled
 PERSISTENCE_ENABLED=false
 DATABASE_URL=postgres://deopt:deopt@127.0.0.1:5432/deopt_v2_backend
@@ -102,12 +107,12 @@ MM_GATEWAY_REQUIRE_AUTH=false
 `CONFIRMATION_ENABLED=true` requires `RPC_URL`; when `CONFIRMATION_REQUIRE_PERSISTENCE=true`, it also requires `PERSISTENCE_ENABLED=true`. Confirmation is disabled by default, never broadcasts, and rejects startup if `CONFIRMATION_REQUIRE_RECONCILIATION=false`.
 `RFQ_ENABLED=false` is the safe default. When `RFQ_ENABLED=true` and `RFQ_REQUIRE_PERSISTENCE=true`, startup requires `PERSISTENCE_ENABLED=true`. Test and development code can run RFQ in memory with persistence disabled, but production-like RFQ acceptance should use Postgres so RFQ, quote, and execution-intent updates are committed together.
 `RFQ_QUOTE_SIGNATURE_MODE=disabled` preserves the unsigned RFQ V1B flow. `strict` requires each RFQ quote to include a valid EIP-712 `RFQQuote` signature whose recovered signer equals `mm_account`.
-`OPTIONS_ENABLED=false` and `OPTION_RFQ_ENABLED=false` are the safe defaults. When either options persistence gate is true and its feature is enabled, startup requires `PERSISTENCE_ENABLED=true`. Test and development code can run option series, off-chain option orders, matching, fills, and option RFQs in memory with persistence disabled.
+`OPTIONS_ENABLED=false` and `OPTION_RFQ_ENABLED=false` are the safe defaults. When either options persistence gate is true and its feature is enabled, startup requires `PERSISTENCE_ENABLED=true`. Test and development code can run option series, off-chain option orders, matching, fills, and option RFQs in memory with persistence disabled. `OPTION_RFQ_QUOTE_SIGNATURE_MODE=disabled` preserves the unsigned Option RFQ V1B flow. `strict` requires each option RFQ quote to include `quote_nonce` and a valid EIP-712 `OptionRFQQuote` signature whose recovered signer equals `mm_account`.
 `MM_GATEWAY_ENABLED=false` is the safe default. When `true`, V1C starts a separate WebTransport UDP listener and requires `MM_GATEWAY_CERT_PATH` and `MM_GATEWAY_KEY_PATH`. It can submit and cancel off-chain perp orders through the live in-memory orderbook, handle perp RFQ and option RFQ messages when those features are enabled, but it does not auto-broadcast, sign, simulate, index, reconcile, or confirm execution intents.
 
-## Options V1D / Option RFQ V1B
+## Options V1D / Option RFQ V1C
 
-Options V1D adds an HTTP/core option RFQ service on top of the option series registry and off-chain option orderbook. Option RFQ V1B connects that service to the Market Maker Gateway: HTTP-created option RFQs are pushed to active MM sessions, MMs can submit `option_rfq_quote` over WebTransport, and quote acceptance sends best-effort MM notifications. Option RFQ quote acceptance creates a separate off-chain option RFQ fill record only. It does not create option execution intents or transactions, does not broadcast, does not execute on chain, does not add signed option RFQ quotes, and does not change the existing perp/RFQ/MM execution lifecycle.
+Options V1D adds an HTTP/core option RFQ service on top of the option series registry and off-chain option orderbook. Option RFQ V1C connects that service to the Market Maker Gateway and adds signed market-maker option RFQ quotes: HTTP-created option RFQs are pushed to active MM sessions, MMs can submit `option_rfq_quote` over WebTransport, and quote acceptance sends best-effort MM notifications. Option RFQ quote acceptance creates a separate off-chain option RFQ fill record only. It does not create option execution intents or transactions, does not broadcast, does not execute on chain, and does not change the existing perp/RFQ/MM execution lifecycle.
 
 HTTP endpoints:
 
@@ -127,6 +132,7 @@ GET /options/orderbooks/:option_series_id
 POST /options/rfqs
 GET /options/rfqs
 GET /options/rfqs/:option_rfq_id
+POST /options/rfqs/:option_rfq_id/quote-signing-payload
 POST /options/rfqs/:option_rfq_id/quotes
 GET /options/rfqs/:option_rfq_id/quotes
 POST /options/rfqs/:option_rfq_id/accept/:quote_id
@@ -151,7 +157,15 @@ Option fills store `fill_id`, series id, buy/sell order ids, buyer/seller, maker
 
 `POST /options/rfqs` accepts `taker`, `option_series_id`, taker-perspective `side`, fixed-point string `size_1e8`, optional `limit_price_1e8`, and optional `ttl_ms`. RFQ statuses are `open`, `expired`, `accepted`, `cancelled`, and `failed`.
 
-`POST /options/rfqs/:option_rfq_id/quotes` accepts `mm_account`, fixed-point premium `price_1e8`, `size_1e8`, optional `session_id`, optional `client_quote_id`, and optional `quote_ttl_ms`. Quote statuses are `active`, `expired`, `accepted`, `rejected`, and `cancelled`. Duplicate `(option_rfq_id, mm_account, client_quote_id)` values are rejected when `client_quote_id` is present.
+`POST /options/rfqs/:option_rfq_id/quote-signing-payload` returns the independent option RFQ EIP-712 domain, `OptionRFQQuote` fields, message, and digest for a proposed quote. The message uses:
+
+```text
+OptionRFQQuote(bytes32 optionRfqId,address mmAccount,bytes32 optionSeriesId,bool takerIsBuyer,uint128 price1e8,uint128 size1e8,uint256 quoteNonce,uint256 expiry)
+```
+
+`optionRfqId` is `keccak256(bytes(option_rfq_uuid_string))`, `optionSeriesId` is the 32-byte option series id, `takerIsBuyer` is true when the option RFQ side is `buy`, `quoteNonce` is market-maker supplied, and `expiry` is encoded in seconds. The default domain is `OPTION_RFQ_EIP712_NAME=DeOptV2OptionRFQ`, version `1`, chain id `84532`, and zero verifying contract.
+
+`POST /options/rfqs/:option_rfq_id/quotes` accepts `mm_account`, fixed-point premium `price_1e8`, `size_1e8`, optional `session_id`, optional `client_quote_id`, optional `quote_nonce`, optional `signature`, and optional `quote_ttl_ms`. Quote statuses are `active`, `expired`, `accepted`, `rejected`, and `cancelled`. Duplicate `(option_rfq_id, mm_account, client_quote_id)` values are rejected when `client_quote_id` is present. In disabled signature mode, unsigned quotes remain valid and are stored with `signature_status=not_required`. In strict mode, `quote_nonce` and `signature` are required, the backend recomputes the digest, recovers the signer, and rejects the quote unless the recovered address equals `mm_account`.
 
 Market Maker Gateway option RFQ messages use the same JSON envelope and length-prefixed WebTransport frames as perp RFQ:
 
@@ -163,11 +177,20 @@ server -> MM: option_rfq_quote_accepted
 server -> MM: option_rfq_quote_rejected
 ```
 
-`option_rfq_request` includes option RFQ id, taker, option series id, taker side, size, optional limit price, and expiry. `option_rfq_quote` includes option RFQ id, MM account, premium price, size, optional client quote id, and quote TTL. Gateway-submitted option quotes are persisted through the same option RFQ store as HTTP/dev quotes, including `session_id` when available. V1B broadcasts option RFQ requests to all active MM sessions; zero connected sessions do not block RFQ creation. These V1 behaviors are hardcoded and no additional config flags are required.
+`option_rfq_request` includes option RFQ id, taker, option series id, taker side, size, optional limit price, and expiry. `option_rfq_quote` includes option RFQ id, MM account, premium price, size, optional client quote id, optional quote nonce, optional signature, and quote TTL. Gateway-submitted option quotes are persisted through the same option RFQ store as HTTP/dev quotes, including `session_id` and signature metadata when available. V1C broadcasts option RFQ requests to all active MM sessions; zero connected sessions do not block RFQ creation.
+
+For local signing against a payload response:
+
+```sh
+MM_PRIVATE_KEY=0x... cargo run --bin sign_option_rfq_quote -- \
+  --payload /tmp/option_rfq_quote_payload.json
+```
+
+The CLI prints the signer address and signature only; it does not print the private key.
 
 Accepting one option RFQ quote is single-winner: the RFQ becomes `accepted`, the winning quote becomes `accepted`, active competing quotes become `rejected`, and a row is created in `option_rfq_fills`. For taker `buy`, `buyer=taker`, `seller=mm_account`, and `taker_side=buy`. For taker `sell`, `buyer=mm_account`, `seller=taker`, and `taker_side=sell`. Buy RFQs require quote price `<= limit_price_1e8` when a limit is provided; sell RFQs require quote price `>= limit_price_1e8`. If the winning quote has an active MM `session_id`, acceptance sends `option_rfq_quote_accepted`; active competing session quotes receive best-effort `option_rfq_quote_rejected` with reason `competing quote accepted`. Notification failure is surfaced as `mm_notification_warning` when available and never reverts acceptance.
 
-Option order matching and option RFQ acceptance are both off-chain only. Signed option RFQ quotes, option execution intents, on-chain option execution, Greeks, IV surfaces, on-chain registry sync, settlement, and exercise remain deferred.
+Option order matching and option RFQ acceptance are both off-chain only. Option execution intents, on-chain option execution, Greeks, IV surfaces, on-chain registry sync, settlement, and exercise remain deferred.
 
 ## RFQ V1C
 
@@ -636,7 +659,7 @@ PERSISTENCE_ENABLED=true
 DATABASE_URL=postgres://deopt:deopt@127.0.0.1:5432/deopt_v2_backend
 ```
 
-When enabled, the service connects to Postgres at startup and runs migrations from `migrations/`. Migrations create `used_nonces`, `orders`, `trades`, `execution_intents`, `execution_intent_signatures`, `execution_simulations`, `engine_events`, `indexer_cursors`, `indexed_perp_trades`, `execution_reconciliations`, `execution_transactions`, `option_series`, `option_orders`, `option_fills`, `option_rfqs`, `option_rfq_quotes`, and `option_rfq_fills`. RFQ signed quotes add nullable `signature`, `quote_digest`, `quote_nonce`, `signature_status`, and `recovered_signer` fields to `rfq_quotes`. Confirmation adds nullable `confirmed_at_ms`, `confirmed_block_number`, `confirmation_status`, and `confirmation_error` fields to `execution_transactions`.
+When enabled, the service connects to Postgres at startup and runs migrations from `migrations/`. Migrations create `used_nonces`, `orders`, `trades`, `execution_intents`, `execution_intent_signatures`, `execution_simulations`, `engine_events`, `indexer_cursors`, `indexed_perp_trades`, `execution_reconciliations`, `execution_transactions`, `option_series`, `option_orders`, `option_fills`, `option_rfqs`, `option_rfq_quotes`, and `option_rfq_fills`. RFQ signed quotes add nullable `signature`, `quote_digest`, `quote_nonce`, `signature_status`, and `recovered_signer` fields to `rfq_quotes`. Signed option RFQ quotes add the same nullable metadata fields to `option_rfq_quotes`. Confirmation adds nullable `confirmed_at_ms`, `confirmed_block_number`, `confirmation_status`, and `confirmation_error` fields to `execution_transactions`.
 
 One local setup option:
 
@@ -703,8 +726,8 @@ curl -X DELETE http://127.0.0.1:8080/orders/<order_id>
 - `SIGNATURE_VERIFICATION_MODE=disabled` validates nonce, deadline, and signature shape while skipping cryptographic recovery.
 - `SIGNATURE_VERIFICATION_MODE=strict` verifies the EIP-712 order digest and recovered secp256k1 signer against `account`.
 - FOK is rejected cleanly.
-- RFQ supports HTTP/dev flow plus basic MM gateway push, quote intake, and optional signed quote verification; multi-leg RFQ, signed taker RFQ requests, MM ranking, production auth, signed option RFQ quotes, and market data datagrams remain deferred.
-- Options V1D/V1B supports manual option series registration, deterministic `option_series_id`, off-chain GTC option orders, price-time matching, fill recording/listing, cancellation, listing/filtering, aggregated option orderbook reads, HTTP/core option RFQs with off-chain RFQ fills, and MM Gateway option RFQ request/quote/accept notification messages; option execution intents, signed option RFQ quotes, and on-chain option execution remain deferred.
+- RFQ supports HTTP/dev flow plus basic MM gateway push, quote intake, and optional signed quote verification; multi-leg RFQ, signed taker RFQ requests, MM ranking, production auth, and market data datagrams remain deferred.
+- Options V1D/V1C supports manual option series registration, deterministic `option_series_id`, off-chain GTC option orders, price-time matching, fill recording/listing, cancellation, listing/filtering, aggregated option orderbook reads, HTTP/core option RFQs with off-chain RFQ fills, signed MM option RFQ quotes, and MM Gateway option RFQ request/quote/accept notification messages; option execution intents and on-chain option execution remain deferred.
 - Execution intents are provisional off-chain records, not settlement.
 - Indexed `TradeExecuted` events store `onchain_intent_id` for direct reconciliation only; they do not confirm backend intents.
 - Reconciliation rows link indexed events to intents, but still do not prove transaction ownership, finality, or reorg safety.

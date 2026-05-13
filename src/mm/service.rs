@@ -606,7 +606,9 @@ impl MmGatewayService {
                 client_quote_id: payload.client_quote_id,
                 price_1e8,
                 size_1e8,
+                quote_nonce: payload.quote_nonce,
                 quote_ttl_ms: Some(payload.quote_ttl_ms),
+                signature: payload.signature,
             },
         )
         .await

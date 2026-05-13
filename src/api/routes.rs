@@ -30,15 +30,18 @@ use crate::options::service::{
     list_option_orders as list_option_orders_service,
     list_option_rfq_quotes as list_option_rfq_quotes_service,
     list_option_rfqs as list_option_rfqs_service, list_option_series as list_option_series_service,
+    option_rfq_quote_signing_payload as option_rfq_quote_signing_payload_service,
     submit_option_order as submit_option_order_service,
     submit_option_rfq_quote as submit_option_rfq_quote_service, CreateOptionRfqInput,
-    CreateOptionSeriesInput, SubmitOptionOrderInput, SubmitOptionRfqQuoteInput,
+    CreateOptionSeriesInput, OptionRfqQuoteSigningPayloadInput, SubmitOptionOrderInput,
+    SubmitOptionRfqQuoteInput,
 };
 use crate::options::{
-    OptionFill, OptionFillFilter, OptionFillId, OptionOrder, OptionOrderFilter, OptionOrderStatus,
-    OptionOrderbookSnapshot, OptionRfqFill, OptionRfqId, OptionRfqQuote, OptionRfqQuoteId,
+    option_rfq_id_to_hex_bytes32, option_series_id_to_hex_bytes32, OptionFill, OptionFillFilter,
+    OptionFillId, OptionOrder, OptionOrderFilter, OptionOrderStatus, OptionOrderbookSnapshot,
+    OptionRfqFill, OptionRfqId, OptionRfqQuote, OptionRfqQuoteId, OptionRfqQuoteSignatureStatus,
     OptionRfqQuoteStatus, OptionRfqRequest, OptionRfqStatus, OptionSeries, OptionSeriesFilter,
-    OptionSeriesStatus,
+    OptionSeriesStatus, OPTION_RFQ_QUOTE_TYPE,
 };
 use crate::orders::service::{
     cancel_order as cancel_order_shared, submit_response_from_events, submit_signed_order,
@@ -94,6 +97,10 @@ pub fn router(state: AppState) -> Router {
             post(create_option_rfq).get(list_option_rfqs),
         )
         .route("/options/rfqs/:option_rfq_id", get(get_option_rfq))
+        .route(
+            "/options/rfqs/:option_rfq_id/quote-signing-payload",
+            post(option_rfq_quote_payload),
+        )
         .route(
             "/options/rfqs/:option_rfq_id/quotes",
             post(submit_option_rfq_quote).get(list_option_rfq_quotes),
@@ -310,7 +317,9 @@ struct SubmitOptionRfqQuoteRequest {
     client_quote_id: Option<String>,
     price_1e8: String,
     size_1e8: String,
+    quote_nonce: Option<u64>,
     quote_ttl_ms: Option<u64>,
+    signature: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -378,6 +387,11 @@ struct OptionRfqQuoteResponse {
     status: OptionRfqQuoteStatus,
     created_at_ms: i64,
     expires_at_ms: i64,
+    signature: Option<String>,
+    quote_digest: Option<String>,
+    quote_nonce: Option<String>,
+    signature_status: OptionRfqQuoteSignatureStatus,
+    recovered_signer: Option<AccountId>,
 }
 
 impl From<OptionRfqQuote> for OptionRfqQuoteResponse {
@@ -394,8 +408,54 @@ impl From<OptionRfqQuote> for OptionRfqQuoteResponse {
             status,
             created_at_ms: quote.created_at_ms,
             expires_at_ms: quote.expires_at_ms,
+            signature: quote.signature,
+            quote_digest: quote.quote_digest,
+            quote_nonce: quote.quote_nonce,
+            signature_status: quote.signature_status,
+            recovered_signer: quote.recovered_signer,
         }
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+struct OptionRfqQuoteSigningPayloadRequest {
+    mm_account: AccountId,
+    price_1e8: String,
+    size_1e8: String,
+    client_quote_id: Option<String>,
+    quote_nonce: u64,
+    quote_ttl_ms: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct OptionRfqQuoteSigningPayloadResponse {
+    option_rfq_id: String,
+    option_rfq_id_b32: String,
+    option_series_id_b32: String,
+    digest: String,
+    domain: SigningPayloadDomain,
+    primary_type: &'static str,
+    types: Vec<SigningPayloadTypeField>,
+    message: OptionRfqQuoteSigningPayloadMessage,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct OptionRfqQuoteSigningPayloadMessage {
+    #[serde(rename = "optionRfqId")]
+    option_rfq_id: String,
+    #[serde(rename = "mmAccount")]
+    mm_account: String,
+    #[serde(rename = "optionSeriesId")]
+    option_series_id: String,
+    #[serde(rename = "takerIsBuyer")]
+    taker_is_buyer: bool,
+    #[serde(rename = "price1e8")]
+    price_1e8: String,
+    #[serde(rename = "size1e8")]
+    size_1e8: String,
+    #[serde(rename = "quoteNonce")]
+    quote_nonce: String,
+    expiry: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -839,6 +899,53 @@ async fn get_option_rfq(
     ))
 }
 
+async fn option_rfq_quote_payload(
+    State(state): State<AppState>,
+    Path(option_rfq_id): Path<String>,
+    Json(request): Json<OptionRfqQuoteSigningPayloadRequest>,
+) -> Result<Json<OptionRfqQuoteSigningPayloadResponse>, ApiError> {
+    let option_rfq_id = parse_option_rfq_id(&option_rfq_id)?;
+    let outcome = option_rfq_quote_signing_payload_service(
+        &state,
+        OptionRfqQuoteSigningPayloadInput {
+            option_rfq_id,
+            mm_account: request.mm_account,
+            price_1e8: parse_fixed_u128("price_1e8", &request.price_1e8)?,
+            size_1e8: parse_fixed_u128("size_1e8", &request.size_1e8)?,
+            quote_nonce: request.quote_nonce,
+            quote_ttl_ms: request.quote_ttl_ms,
+        },
+    )
+    .await?;
+    let domain = state.options_config.rfq_eip712_domain.clone();
+    let _ = request.client_quote_id;
+
+    Ok(Json(OptionRfqQuoteSigningPayloadResponse {
+        option_rfq_id: option_rfq_id.to_string(),
+        option_rfq_id_b32: option_rfq_id_to_hex_bytes32(&option_rfq_id.to_string()),
+        option_series_id_b32: option_series_id_to_hex_bytes32(&outcome.rfq.option_series_id)?,
+        digest: outcome.digest,
+        domain: SigningPayloadDomain {
+            name: domain.name,
+            version: domain.version,
+            chain_id: domain.chain_id,
+            verifying_contract: domain.verifying_contract.0,
+        },
+        primary_type: "OptionRFQQuote",
+        types: option_rfq_quote_type_fields(),
+        message: OptionRfqQuoteSigningPayloadMessage {
+            option_rfq_id: option_rfq_id_to_hex_bytes32(&outcome.rfq.option_rfq_id.to_string()),
+            mm_account: outcome.payload.mm_account.0,
+            option_series_id: option_series_id_to_hex_bytes32(&outcome.rfq.option_series_id)?,
+            taker_is_buyer: outcome.payload.taker_is_buyer,
+            price_1e8: outcome.payload.price_1e8.to_string(),
+            size_1e8: outcome.payload.size_1e8.to_string(),
+            quote_nonce: outcome.payload.quote_nonce.to_string(),
+            expiry: outcome.payload.expiry.to_string(),
+        },
+    }))
+}
+
 async fn submit_option_rfq_quote(
     State(state): State<AppState>,
     Path(option_rfq_id): Path<String>,
@@ -854,7 +961,9 @@ async fn submit_option_rfq_quote(
             client_quote_id: request.client_quote_id,
             price_1e8: parse_fixed_u128("price_1e8", &request.price_1e8)?,
             size_1e8: parse_fixed_u128("size_1e8", &request.size_1e8)?,
+            quote_nonce: request.quote_nonce,
             quote_ttl_ms: request.quote_ttl_ms,
+            signature: request.signature,
         },
     )
     .await?;
@@ -2363,6 +2472,44 @@ fn rfq_quote_type_fields() -> Vec<SigningPayloadTypeField> {
         SigningPayloadTypeField {
             name: "marketId",
             type_name: "uint256",
+        },
+        SigningPayloadTypeField {
+            name: "takerIsBuyer",
+            type_name: "bool",
+        },
+        SigningPayloadTypeField {
+            name: "price1e8",
+            type_name: "uint128",
+        },
+        SigningPayloadTypeField {
+            name: "size1e8",
+            type_name: "uint128",
+        },
+        SigningPayloadTypeField {
+            name: "quoteNonce",
+            type_name: "uint256",
+        },
+        SigningPayloadTypeField {
+            name: "expiry",
+            type_name: "uint256",
+        },
+    ]
+}
+
+fn option_rfq_quote_type_fields() -> Vec<SigningPayloadTypeField> {
+    let _ = OPTION_RFQ_QUOTE_TYPE;
+    vec![
+        SigningPayloadTypeField {
+            name: "optionRfqId",
+            type_name: "bytes32",
+        },
+        SigningPayloadTypeField {
+            name: "mmAccount",
+            type_name: "address",
+        },
+        SigningPayloadTypeField {
+            name: "optionSeriesId",
+            type_name: "bytes32",
         },
         SigningPayloadTypeField {
             name: "takerIsBuyer",

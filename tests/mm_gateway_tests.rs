@@ -16,15 +16,17 @@ use deopt_v2_backend::mm::{
 };
 use deopt_v2_backend::options::service::{
     accept_option_rfq_quote, create_option_rfq, create_option_series, list_option_rfq_quotes,
-    submit_option_rfq_quote, CreateOptionRfqInput, CreateOptionSeriesInput,
-    SubmitOptionRfqQuoteInput,
+    option_rfq_quote_signing_payload, submit_option_rfq_quote, CreateOptionRfqInput,
+    CreateOptionSeriesInput, OptionRfqQuoteSigningPayloadInput, SubmitOptionRfqQuoteInput,
 };
-use deopt_v2_backend::options::{OptionRfqQuoteStatus, OptionsConfig};
+use deopt_v2_backend::options::{OptionRfqQuoteSignatureMode, OptionRfqQuoteStatus, OptionsConfig};
 use deopt_v2_backend::rfq::service::{create_rfq, CreateRfqInput};
 use deopt_v2_backend::rfq::{RfqConfig, RfqQuoteStatus};
 use deopt_v2_backend::types::{now_ms, AccountId, Side};
 use deopt_v2_backend::{api::AppState, engine::EngineState};
+use k256::ecdsa::SigningKey;
 use serde_json::json;
+use sha3::{Digest, Keccak256};
 use std::time::Duration;
 
 const VALID_SIGNATURE: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -165,6 +167,33 @@ fn parse_option_rfq_quote_message() {
         envelope.payload.client_quote_id.as_deref(),
         Some("mm-option-rfq-quote-001")
     );
+}
+
+#[test]
+fn parse_option_rfq_quote_with_signature_fields() {
+    let option_rfq_id = uuid::Uuid::new_v4();
+    let message: ClientMessage = serde_json::from_value(json!({
+        "type": "option_rfq_quote",
+        "request_id": "mm-option-quote-1",
+        "payload": {
+            "option_rfq_id": option_rfq_id,
+            "mm_account": "0x0000000000000000000000000000000000000001",
+            "price_1e8": "1100000000",
+            "size_1e8": "100000000",
+            "client_quote_id": "mm-option-rfq-quote-001",
+            "quote_nonce": 1001,
+            "quote_ttl_ms": 3000,
+            "signature": VALID_SIGNATURE
+        }
+    }))
+    .unwrap();
+
+    let ClientMessage::OptionRfqQuote(envelope) = message else {
+        panic!("expected option_rfq_quote");
+    };
+    assert_eq!(envelope.payload.option_rfq_id, option_rfq_id);
+    assert_eq!(envelope.payload.quote_nonce, Some(1001));
+    assert_eq!(envelope.payload.signature.as_deref(), Some(VALID_SIGNATURE));
 }
 
 #[test]
@@ -715,6 +744,79 @@ async fn gateway_handles_option_rfq_quote_and_stores_session_id() {
         quotes[0].session_id.as_deref(),
         Some("session-option-rfq-1")
     );
+}
+
+#[tokio::test]
+async fn strict_gateway_rejects_unsigned_option_rfq_quote() {
+    let state = strict_option_rfq_state();
+    let option_series_id = active_option_series_id(&state).await;
+    let rfq = create_option_rfq(&state, option_rfq_input(option_series_id, Side::Buy))
+        .await
+        .unwrap();
+    let service = MmGatewayService::new(MmGatewayConfig::default(), state);
+    let mut session = MmSession::with_ids(
+        "session-option-rfq-1",
+        "connection-1",
+        10,
+        AuthMode::Disabled,
+        true,
+    );
+
+    let response = service
+        .handle_message(
+            &mut session,
+            option_rfq_quote_message(rfq.option_rfq_id, "1000000000", "100000000"),
+            20,
+        )
+        .await;
+
+    let value = serde_json::to_value(response).unwrap();
+    assert_eq!(value["type"], "error");
+    assert_eq!(value["error"]["code"], "OPTION_RFQ_QUOTE_REJECTED");
+    assert!(value["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("quote_nonce is required"));
+}
+
+#[tokio::test]
+async fn strict_gateway_accepts_signed_option_rfq_quote() {
+    let state = strict_option_rfq_state();
+    let option_series_id = active_option_series_id(&state).await;
+    let rfq = create_option_rfq(&state, option_rfq_input(option_series_id, Side::Buy))
+        .await
+        .unwrap();
+    let signature = sign_option_quote_digest(
+        &gateway_option_quote_payload_digest(&state, rfq.option_rfq_id, 77).await,
+        test_signing_key(),
+    );
+    let service = MmGatewayService::new(MmGatewayConfig::default(), state.clone());
+    let mut session = MmSession::with_ids(
+        "session-option-rfq-1",
+        "connection-1",
+        10,
+        AuthMode::Disabled,
+        true,
+    );
+
+    let response = service
+        .handle_message(
+            &mut session,
+            option_rfq_quote_message_with_signature(rfq.option_rfq_id, 77, &signature),
+            20,
+        )
+        .await;
+
+    let ServerMessage::OptionRfqQuoteResult(envelope) = response else {
+        panic!("expected option_rfq_quote_result");
+    };
+    assert_eq!(envelope.payload.status, OptionRfqQuoteStatus::Active);
+    let quotes = list_option_rfq_quotes(&state, rfq.option_rfq_id)
+        .await
+        .unwrap();
+    assert_eq!(quotes.len(), 1);
+    assert_eq!(quotes[0].quote_nonce.as_deref(), Some("77"));
+    assert_eq!(quotes[0].recovered_signer, Some(signing_account()));
 }
 
 #[tokio::test]
@@ -1388,6 +1490,15 @@ fn option_rfq_state() -> AppState {
     AppState::with_options_config(EngineState::with_default_markets(), config)
 }
 
+fn strict_option_rfq_state() -> AppState {
+    let mut config = OptionsConfig::enabled_in_memory_for_tests();
+    config.rfq_enabled = true;
+    config.rfq_min_quote_ttl_ms = 1;
+    config.rfq_max_quote_ttl_ms = 500;
+    config.rfq_quote_signature_mode = OptionRfqQuoteSignatureMode::Strict;
+    AppState::with_options_config(EngineState::with_default_markets(), config)
+}
+
 async fn active_option_series_id(state: &AppState) -> String {
     create_option_series(state, option_series_input())
         .await
@@ -1433,7 +1544,9 @@ fn option_rfq_quote_input(
         client_quote_id: Some(client_quote_id.to_string()),
         price_1e8: 1_000_000_000,
         size_1e8: 100_000_000,
+        quote_nonce: None,
         quote_ttl_ms: Some(100),
+        signature: None,
     }
 }
 
@@ -1455,6 +1568,118 @@ fn option_rfq_quote_message(
         }
     }))
     .unwrap()
+}
+
+fn option_rfq_quote_message_with_signature(
+    option_rfq_id: uuid::Uuid,
+    quote_nonce: u64,
+    signature: &str,
+) -> ClientMessage {
+    serde_json::from_value(json!({
+        "type": "option_rfq_quote",
+        "request_id": "mm-option-quote-1",
+        "payload": {
+            "option_rfq_id": option_rfq_id,
+            "mm_account": signing_account().0,
+            "price_1e8": "1000000000",
+            "size_1e8": "100000000",
+            "client_quote_id": "mm-option-rfq-signed-quote-001",
+            "quote_nonce": quote_nonce,
+            "quote_ttl_ms": 100,
+            "signature": signature
+        }
+    }))
+    .unwrap()
+}
+
+async fn gateway_option_quote_payload_digest(
+    state: &AppState,
+    option_rfq_id: uuid::Uuid,
+    quote_nonce: u64,
+) -> String {
+    option_rfq_quote_signing_payload(
+        state,
+        OptionRfqQuoteSigningPayloadInput {
+            option_rfq_id,
+            mm_account: signing_account(),
+            price_1e8: 1_000_000_000,
+            size_1e8: 100_000_000,
+            quote_nonce,
+            quote_ttl_ms: 100,
+        },
+    )
+    .await
+    .unwrap()
+    .digest
+}
+
+fn signing_account() -> AccountId {
+    AccountId::new(test_account())
+}
+
+fn sign_option_quote_digest(digest: &str, signing_key: SigningKey) -> String {
+    let digest = parse_digest(digest);
+    let (signature, recovery_id) = signing_key.sign_prehash_recoverable(&digest).unwrap();
+    let mut bytes = Vec::with_capacity(65);
+    bytes.extend_from_slice(&signature.to_bytes());
+    bytes.push(recovery_id.to_byte() + 27);
+    format!("0x{}", hex_encode(&bytes))
+}
+
+fn test_account() -> String {
+    let verifying_key = test_signing_key().verifying_key().to_encoded_point(false);
+    let hash = Keccak256::digest(&verifying_key.as_bytes()[1..]);
+    format!("0x{}", hex_encode(&hash[12..]))
+}
+
+fn test_signing_key() -> SigningKey {
+    signing_key_from_hex("4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318")
+}
+
+fn signing_key_from_hex(hex: &str) -> SigningKey {
+    let mut bytes = [0u8; 32];
+    decode_hex_to_slice(hex, &mut bytes).unwrap();
+    SigningKey::from_slice(&bytes).unwrap()
+}
+
+fn parse_digest(value: &str) -> [u8; 32] {
+    let hex = value.strip_prefix("0x").unwrap();
+    let mut bytes = [0u8; 32];
+    decode_hex_to_slice(hex, &mut bytes).unwrap();
+    bytes
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+fn decode_hex_to_slice(hex: &str, out: &mut [u8]) -> std::result::Result<(), ()> {
+    if hex.len() != out.len() * 2 {
+        return Err(());
+    }
+
+    for (index, byte) in out.iter_mut().enumerate() {
+        let high = decode_hex_nibble(hex.as_bytes()[index * 2])?;
+        let low = decode_hex_nibble(hex.as_bytes()[index * 2 + 1])?;
+        *byte = (high << 4) | low;
+    }
+
+    Ok(())
+}
+
+fn decode_hex_nibble(byte: u8) -> std::result::Result<u8, ()> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(()),
+    }
 }
 
 enum ValueSide {
