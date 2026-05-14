@@ -28,6 +28,9 @@ async fn main() -> deopt_v2_backend::Result<()> {
     config
         .options
         .validate_startup(config.persistence_enabled)?;
+    config
+        .mm_permissions
+        .validate_startup(config.persistence_enabled)?;
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::new(config.rust_log.clone()))
         .init();
@@ -63,6 +66,7 @@ async fn main() -> deopt_v2_backend::Result<()> {
     state.persistence_enabled = config.persistence_enabled;
     state.database_configured = config.database_url.is_some();
     state.mm_gateway_config = config.mm_gateway.clone();
+    state.mm_permissions_config = config.mm_permissions.clone();
     state.admin_config = config.admin.clone();
     let app = router(state.clone());
 
@@ -92,6 +96,7 @@ async fn main() -> deopt_v2_backend::Result<()> {
         rfq_enabled = config.rfq.enabled,
         options_enabled = config.options.enabled,
         mm_gateway_enabled = config.mm_gateway.enabled,
+        mm_permissions_enabled = config.mm_permissions.enabled,
         indexer_enabled = config.indexer.enabled,
         reconciliation_enabled = config.reconciliation.enabled,
         executor_dry_run = config.execution.dry_run,

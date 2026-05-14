@@ -4,7 +4,7 @@ use crate::db::PgRepository;
 use crate::engine::EngineState;
 use crate::execution::{ExecutionConfig, StoredTradeSignatures};
 use crate::indexer::IndexerConfig;
-use crate::mm::{MmGatewayConfig, MmSessionRegistry};
+use crate::mm::{MmGatewayConfig, MmPermissionsConfig, MmPermissionsStore, MmSessionRegistry};
 use crate::nonce_sync::PerpNonceSyncConfig;
 use crate::options::{OptionSeriesStore, OptionsConfig};
 use crate::reconciliation::ReconciliationConfig;
@@ -33,9 +33,11 @@ pub struct AppState {
     pub rfq_config: RfqConfig,
     pub options_config: OptionsConfig,
     pub mm_gateway_config: MmGatewayConfig,
+    pub mm_permissions_config: MmPermissionsConfig,
     pub admin_config: AdminConfig,
     pub rfq_store: Arc<Mutex<RfqStore>>,
     pub options_store: Arc<Mutex<OptionSeriesStore>>,
+    pub mm_permissions: Arc<Mutex<MmPermissionsStore>>,
     pub mm_sessions: MmSessionRegistry,
     pub trade_signatures: Arc<Mutex<HashMap<Uuid, StoredTradeSignatures>>>,
 }
@@ -186,9 +188,11 @@ impl AppState {
             rfq_config,
             options_config,
             mm_gateway_config: MmGatewayConfig::default(),
+            mm_permissions_config: MmPermissionsConfig::disabled(),
             admin_config: AdminConfig::disabled(),
             rfq_store: Arc::new(Mutex::new(RfqStore::new())),
             options_store: Arc::new(Mutex::new(OptionSeriesStore::new())),
+            mm_permissions: Arc::new(Mutex::new(MmPermissionsStore::new())),
             mm_sessions: MmSessionRegistry::new(),
             trade_signatures: Arc::new(Mutex::new(HashMap::new())),
         }

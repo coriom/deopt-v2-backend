@@ -1,50 +1,51 @@
-# NEXT_TASK.md — Production MM Auth V1A: Wallet Challenge Sessions
+# NEXT_TASK.md — MM Permissions V1A: Allowlist and Capability Gating
 
 ## Context
 
-The backend now supports:
+Production MM Auth V1A is implemented.
 
-- WebTransport MM Gateway
-- MM session registry
-- perp RFQ over WebTransport
-- signed perp RFQ quotes
-- option RFQ over WebTransport
-- signed option RFQ quotes
-- read-only admin monitoring
-- frontend admin dashboard
+Current state:
 
-Current weakness:
+- WebTransport MM sessions can authenticate via wallet challenge.
+- Session is bound to mm_account.
+- When auth is required, protected messages require authenticated sessions.
+- Payload account/mm_account must match the authenticated session account.
 
-MM Gateway has been runtime-tested with auth disabled. Quotes can be signed, but the transport session itself is not cryptographically bound to a wallet/account in production mode.
+Missing layer:
+
+Authentication proves identity, but does not decide whether this MM is allowed to quote/trade a given product.
 
 ## Goal
 
-Implement Production MM Auth V1A.
+Implement MM Permissions V1A.
 
-A WebTransport MM session must authenticate by signing a server-issued challenge.
+Add an allowlist/capability layer for authenticated MM accounts.
 
-After authentication:
+The backend must enforce:
 
-- session is bound to a wallet address / mm_account
-- gateway messages requiring an account must match the authenticated account
-- admin session snapshots show authenticated/account state
-- unauthenticated sessions can only call heartbeat/get_session/auth messages
-- existing disabled/dev auth mode remains available for local tests
+- only enabled MM accounts can use protected MM actions when permission enforcement is enabled
+- MM accounts can have separate capabilities:
+  - perp RFQ quotes
+  - option RFQ quotes
+  - perp order submission
+  - option order submission if applicable later
+- optional market-level permissions for perps
+- optional option-series permissions for options
+- disabled/dev mode remains available
 
 ## Non-Goals
 
 Do not implement:
 
-- frontend auth UI
-- admin write controls
-- MM permissions per market/series
-- API keys
-- OAuth
-- production user auth
+- frontend permissions UI
+- admin write endpoints
+- automatic MM approval
+- scoring/ranking
+- incentives/rebates
+- on-chain allowlist
 - Solidity changes
 - deployments
-- auto-broadcast
-- trading logic changes
+- OAuth/API keys
 
 ## Safety Rules
 
@@ -54,207 +55,196 @@ Do not:
 - deploy contracts
 - enable real broadcast by default
 - expose private keys
-- log challenge signatures as secrets if avoidable
-- break existing disabled auth tests
 - require live RPC/Postgres/WebTransport/private keys for normal cargo test
+- break disabled/dev auth mode
 - commit
 - push
 
-## Auth Modes
+## Config
 
-Extend current MM gateway auth config.
+Add:
 
-Supported modes:
-
-```text
-disabled
-wallet_challenge
-
-If current config already has auth mode strings, extend safely.
-
-Config:
-
-MM_GATEWAY_AUTH_MODE=disabled
-MM_GATEWAY_REQUIRE_AUTH=false
-MM_GATEWAY_CHALLENGE_TTL_MS=60000
+```env
+MM_PERMISSIONS_ENABLED=false
+MM_PERMISSIONS_REQUIRE_PERSISTENCE=true
 
 Behavior:
 
-disabled
-preserves current local/dev behavior
-existing tests keep passing
-wallet_challenge
-session starts unauthenticated
-session can request challenge
-server returns challenge payload
-client signs challenge
-server verifies signature
-session becomes authenticated and bound to recovered address
+if disabled: current behavior preserved
+if enabled:
+protected MM actions require account to be enabled in MM permissions store
+missing account is rejected
+disabled account is rejected
+capability mismatch is rejected
 
-If MM_GATEWAY_REQUIRE_AUTH=true:
+If persistence is required and unavailable, startup fails clearly.
 
-order/quote/RFQ messages require authenticated session
-account fields must equal authenticated account
-Protocol Messages
+Database
 
-Add client messages:
+Add migration:
+
+migrations/0017_mm_permissions.sql
+
+Suggested tables:
+
+CREATE TABLE mm_accounts (
+    mm_account TEXT PRIMARY KEY,
+    enabled BOOLEAN NOT NULL,
+    label TEXT NULL,
+    can_submit_perp_orders BOOLEAN NOT NULL DEFAULT FALSE,
+    can_quote_perp_rfq BOOLEAN NOT NULL DEFAULT FALSE,
+    can_quote_option_rfq BOOLEAN NOT NULL DEFAULT FALSE,
+    can_submit_option_orders BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at_ms BIGINT NOT NULL,
+    updated_at_ms BIGINT NOT NULL
+);
+
+CREATE TABLE mm_market_permissions (
+    id TEXT PRIMARY KEY,
+    mm_account TEXT NOT NULL REFERENCES mm_accounts(mm_account),
+    market_id BIGINT NULL,
+    option_series_id TEXT NULL,
+    enabled BOOLEAN NOT NULL,
+    created_at_ms BIGINT NOT NULL,
+    updated_at_ms BIGINT NOT NULL
+);
+
+CREATE INDEX idx_mm_accounts_enabled ON mm_accounts(enabled);
+CREATE INDEX idx_mm_market_permissions_account ON mm_market_permissions(lower(mm_account));
+CREATE INDEX idx_mm_market_permissions_market ON mm_market_permissions(market_id);
+CREATE INDEX idx_mm_market_permissions_option_series ON mm_market_permissions(option_series_id);
+
+Interpretation:
+
+market_id IS NULL AND option_series_id IS NULL can mean global permission if you choose.
+Or use explicit capability-only permissions in mm_accounts.
+Keep semantics simple and document.
+Store / Service
+
+Add:
+
+src/mm/permissions.rs
+
+or extend MM service cleanly.
+
+Expose functions:
+
+check_mm_enabled(account)
+check_can_quote_perp_rfq(account, market_id)
+check_can_quote_option_rfq(account, option_series_id)
+check_can_submit_perp_order(account, market_id)
+Enforcement Points
+
+When MM_PERMISSIONS_ENABLED=true, enforce:
+
+Perp RFQ quote
+
+rfq_quote.mm_account must:
+
+be authenticated session account if auth required
+exist in mm_accounts
+enabled=true
+can_quote_perp_rfq=true
+allowed for market_id if market-level permission is configured
+Option RFQ quote
+
+option_rfq_quote.mm_account must:
+
+be authenticated session account if auth required
+exist in mm_accounts
+enabled=true
+can_quote_option_rfq=true
+allowed for option_series_id if series-level permission is configured
+Perp submit_order / quote_replace
+
+If these paths exist through MM gateway:
+
+account must be enabled
+can_submit_perp_orders=true
+allowed for market_id if configured
+
+Do not overbuild option order MM path if not integrated yet.
+
+Admin Read-only Visibility
+
+Extend existing admin endpoints.
+
+Add:
+
+GET /admin/mm/permissions
+
+Return sanitized list:
 
 {
-  "type": "auth_challenge",
-  "request_id": "auth-1",
-  "payload": {
-    "account": "0x..."
-  }
+  "enabled": true,
+  "accounts": [
+    {
+      "mm_account": "0x...",
+      "enabled": true,
+      "label": "MM Alpha",
+      "can_submit_perp_orders": true,
+      "can_quote_perp_rfq": true,
+      "can_quote_option_rfq": true,
+      "can_submit_option_orders": false
+    }
+  ]
 }
 
-Server response:
+No write endpoint in V1A.
 
-{
-  "type": "auth_challenge_result",
-  "request_id": "auth-1",
-  "ok": true,
-  "payload": {
-    "session_id": "...",
-    "account": "0x...",
-    "challenge": "...",
-    "issued_at_ms": 1770000000000,
-    "expires_at_ms": 1770000060000
-  }
-}
+Manual Seeding
 
-Add client message:
+No admin writes yet.
 
-{
-  "type": "auth_verify",
-  "request_id": "auth-2",
-  "payload": {
-    "account": "0x...",
-    "signature": "0x..."
-  }
-}
+Document manual SQL seed examples:
 
-Server response:
-
-{
-  "type": "auth_verify_result",
-  "request_id": "auth-2",
-  "ok": true,
-  "payload": {
-    "session_id": "...",
-    "authenticated": true,
-    "account": "0x..."
-  }
-}
-Challenge Format
-
-Use a deterministic human-readable challenge string.
-
-Suggested:
-
-DeOpt v2 MM Gateway Authentication
-
-session_id: <session_id>
-account: <account>
-chain_id: <chain_id>
-issued_at_ms: <issued_at_ms>
-expires_at_ms: <expires_at_ms>
-nonce: <random_nonce>
-
-Hash/signing approach:
-
-Use Ethereum personal sign style if existing helpers support it.
-Or use EIP-712 if existing signing helpers make it easy.
-Prefer the simplest reliable path consistent with existing signature recovery utilities.
-
-Document exact signing format.
-
-Session State
-
-Extend MM session with:
-
-auth_mode
-authenticated
-account
-challenge_nonce
-challenge_issued_at_ms
-challenge_expires_at_ms
-
-Do not expose raw signatures in session snapshots.
-
-Message Enforcement
-
-When auth required:
-
-Allow unauthenticated:
-
-heartbeat
-get_session
-auth_challenge
-auth_verify
-
-Reject unauthenticated:
-
-submit_order
-bulk_submit
-cancel_order
-bulk_cancel
-cancel_all
-quote_replace
-rfq_quote
-option_rfq_quote
-
-Account-bound checks:
-
-submit_order.account must equal session.account
-cancel account if present must match session.account
-rfq_quote.mm_account must equal session.account
-option_rfq_quote.mm_account must equal session.account
-
-Use case-insensitive address comparison.
-
-Admin Impact
-
-Update /admin/mm/sessions to show:
-
-authenticated
-account
-auth_mode
-challenge_active boolean
-challenge_expires_at_ms optional
-
-Do not expose challenge string or signatures.
-
-Smoke Client
-
-Extend mm_wt_smoke.rs with optional auth mode if useful:
-
-MM_PRIVATE_KEY=0x... cargo run --bin mm_wt_smoke -- auth
-
-or integrate into existing RFQ smoke modes if auth env is enabled.
-
-No private key should be printed.
-
+INSERT INTO mm_accounts (
+    mm_account,
+    enabled,
+    label,
+    can_submit_perp_orders,
+    can_quote_perp_rfq,
+    can_quote_option_rfq,
+    can_submit_option_orders,
+    created_at_ms,
+    updated_at_ms
+) VALUES (...);
 Tests
 
 Normal cargo test must remain offline.
 
 Add tests for:
 
-auth challenge creation
-challenge contains expected account/session/expiry
-auth verify accepts valid signature
-auth verify rejects missing challenge
-auth verify rejects expired challenge
-auth verify rejects signer mismatch
-require_auth rejects unauthenticated submit_order
-require_auth rejects unauthenticated rfq_quote
-require_auth rejects unauthenticated option_rfq_quote
-authenticated submit_order account must match session account
-authenticated rfq_quote mm_account must match session account
-authenticated option_rfq_quote mm_account must match session account
-disabled mode preserves old behavior
-admin session snapshot shows authenticated/account but not challenge/signature
+permissions disabled preserves existing behavior
+permissions enabled rejects missing MM account
+permissions enabled rejects disabled MM account
+can_quote_perp_rfq required for perp RFQ quote
+can_quote_option_rfq required for option RFQ quote
+can_submit_perp_orders required for submit_order if applicable
+account matching still enforced with auth
+market-level permission allows correct market
+market-level permission rejects wrong market
+option-series permission allows correct series
+option-series permission rejects wrong series
+admin permissions endpoint redacts and returns accounts
+no admin write endpoints added
 existing MM/RFQ/options tests still pass
+Runtime Verification After Implementation
+
+Use process env:
+
+MM_GATEWAY_AUTH_MODE=wallet_challenge
+MM_GATEWAY_REQUIRE_AUTH=true
+MM_PERMISSIONS_ENABLED=true
+
+Seed one MM account manually in Postgres.
+
+Verify:
+
+authenticated allowed MM can send option_rfq_quote
+authenticated but not permissioned MM is rejected
+wrong capability is rejected
+admin endpoint shows permissions
 Documentation
 
 Update:
@@ -265,14 +255,13 @@ ARCHITECTURE.md
 
 Document:
 
-auth modes
-challenge flow
-signing format
-local dev disabled mode
-production wallet_challenge mode
-account binding
-admin session visibility
-future MM permissions
+why auth != permission
+MM onboarding flow
+manual approval model
+config
+SQL seed example
+permission checks
+future admin write UI
 Validation
 
 Run:
@@ -285,26 +274,26 @@ Acceptance Criteria
 
 Complete only if:
 
-wallet challenge auth mode exists
-challenge/verify messages exist
-valid signatures authenticate session
-invalid/expired/mismatch signatures reject
-required-auth blocks unauthenticated quote/order messages
-authenticated account binding enforced
-disabled mode still works
-admin sessions show sanitized auth state
-normal tests offline
+MM permissions config exists
+DB migration exists
+permission service/store exists
+protected MM actions enforce capabilities when enabled
+disabled mode preserves current behavior
+admin read-only permissions endpoint exists
+tests cover missing/disabled/wrong capability/wrong market-series
 docs updated
+normal tests offline
 cargo fmt passes
 cargo clippy passes
 cargo test passes
 cargo build passes
 Deferred
-MM permissions per market/option_series
-admin write controls for allowlists
-frontend MM auth UI
-API key auth
-production user auth
+admin write endpoints
+frontend permissions UI
+automatic MM onboarding
+ranking/scoring
+incentives/rebates
+on-chain allowlist
 EOF
 
 

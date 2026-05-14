@@ -4,7 +4,7 @@ use crate::error::{BackendError, Result};
 use crate::execution::{ExecutionConfig, PrivateKeySecret};
 use crate::indexer::IndexerConfig;
 use crate::mm::transport::webtransport::validate_webtransport_startup;
-use crate::mm::MmGatewayConfig;
+use crate::mm::{MmGatewayConfig, MmPermissionsConfig};
 use crate::nonce_sync::PerpNonceSyncConfig;
 use crate::options::OptionsConfig;
 use crate::reconciliation::ReconciliationConfig;
@@ -30,6 +30,7 @@ pub struct AppConfig {
     pub rfq: RfqConfig,
     pub options: OptionsConfig,
     pub mm_gateway: MmGatewayConfig,
+    pub mm_permissions: MmPermissionsConfig,
     pub admin: AdminConfig,
     pub signature_verification_mode: SignatureVerificationMode,
     pub eip712_domain: Eip712Domain,
@@ -149,6 +150,14 @@ impl AppConfig {
             require_auth: parse_env(&mut lookup, "MM_GATEWAY_REQUIRE_AUTH", "false")?,
             challenge_ttl_ms: parse_env(&mut lookup, "MM_GATEWAY_CHALLENGE_TTL_MS", "60000")?,
         };
+        let mm_permissions = MmPermissionsConfig {
+            enabled: parse_env(&mut lookup, "MM_PERMISSIONS_ENABLED", "false")?,
+            require_persistence: parse_env(
+                &mut lookup,
+                "MM_PERMISSIONS_REQUIRE_PERSISTENCE",
+                "true",
+            )?,
+        };
         let admin = AdminConfig::new(
             parse_env(&mut lookup, "ADMIN_API_ENABLED", "false")?,
             parse_env(&mut lookup, "ADMIN_API_REQUIRE_TOKEN", "false")?,
@@ -265,6 +274,7 @@ impl AppConfig {
         confirmation.validate_startup(persistence_enabled)?;
         rfq.validate_startup(persistence_enabled)?;
         options.validate_startup(persistence_enabled)?;
+        mm_permissions.validate_startup(persistence_enabled)?;
         validate_webtransport_startup(&mm_gateway)?;
         admin.validate_startup()?;
 
@@ -282,6 +292,7 @@ impl AppConfig {
             rfq,
             options,
             mm_gateway,
+            mm_permissions,
             admin,
             signature_verification_mode,
             eip712_domain,
@@ -796,6 +807,40 @@ mod tests {
         );
         assert_eq!(config.mm_gateway.host, "127.0.0.1");
         assert_eq!(config.mm_gateway.port, 18443);
+    }
+
+    #[test]
+    fn mm_permissions_use_safe_defaults() {
+        let config = config_from_pairs([("PERSISTENCE_ENABLED", "false")]).unwrap();
+
+        assert!(!config.mm_permissions.enabled);
+        assert!(config.mm_permissions.require_persistence);
+    }
+
+    #[test]
+    fn mm_permissions_requiring_persistence_rejects_persistence_disabled() {
+        let error = config_from_pairs([
+            ("PERSISTENCE_ENABLED", "false"),
+            ("MM_PERMISSIONS_ENABLED", "true"),
+        ])
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("MM permissions require persistence enabled"));
+    }
+
+    #[test]
+    fn mm_permissions_can_run_without_persistence_when_requirement_disabled() {
+        let config = config_from_pairs([
+            ("PERSISTENCE_ENABLED", "false"),
+            ("MM_PERMISSIONS_ENABLED", "true"),
+            ("MM_PERMISSIONS_REQUIRE_PERSISTENCE", "false"),
+        ])
+        .unwrap();
+
+        assert!(config.mm_permissions.enabled);
+        assert!(!config.mm_permissions.require_persistence);
     }
 
     #[test]

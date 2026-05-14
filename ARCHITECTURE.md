@@ -22,10 +22,10 @@ The long-term backend needs low-latency deterministic matching, RFQ, market-make
 - `rfq`: RFQ V1C domain types, in-memory store, service validation, EIP-712 quote signing payloads, strict/disabled quote signature verification, quote lifecycle, MM gateway broadcast/notification coordination, quote acceptance, and execution-intent creation through the existing lifecycle boundary.
 - `options`: Options V1D/V1C domain types, deterministic option series ids, manual series registry, off-chain option orders, price-time matching, fill recording, HTTP/core option RFQs, signed MM option RFQ quote verification, MM Gateway option RFQ coordination, off-chain option RFQ fills, in-memory/persistent stores, and aggregated option orderbook read model.
 - `orders`: Shared order/cancel service used by HTTP and the Market Maker Gateway for signed order validation, nonce handling, matching, persistence writes, ownership-checked cancels, cancel-all, and deterministic resting-order lookup.
-- `mm`: Market Maker Gateway protocol, session, heartbeat, rate-limit, live order/cancel handling, quote-replace models, service boundary, adapter traits, and disabled-by-default WebTransport V1C adapter. Protocol/session/service/rate-limit logic remains transport-agnostic.
+- `mm`: Market Maker Gateway protocol, session, heartbeat, rate-limit, live order/cancel handling, quote-replace models, MM permission allowlist/capability checks, service boundary, adapter traits, and disabled-by-default WebTransport V1C adapter. Protocol/session/service/rate-limit logic remains transport-agnostic.
 - `admin`: Monitoring/Admin V1A configuration and read-only operational observability support. Admin endpoints are disabled by default, optionally protected by a simple local/dev token header, and return sanitized status/config/summaries without exposing secrets or mutating trading state.
 - `signing`: signed-order schema, shared EIP-712 helpers, strict secp256k1 signer recovery, signature mode, deadline validation, and in-memory nonce tracking.
-- `config`: environment loading for host, port, log level, network name, chain id, disabled execution flag, simulation flags, indexer flags, reconciliation flags, confirmation flags, RFQ signature mode/domain flags, Options V1D flags, Market Maker Gateway V1C flags, Monitoring/Admin V1A flags, signature mode, and opt-in persistence.
+- `config`: environment loading for host, port, log level, network name, chain id, disabled execution flag, simulation flags, indexer flags, reconciliation flags, confirmation flags, RFQ signature mode/domain flags, Options V1D flags, Market Maker Gateway V1C flags, MM Permissions V1A flags, Monitoring/Admin V1A flags, signature mode, and opt-in persistence.
 
 ## Current v1 Scope
 
@@ -53,7 +53,8 @@ The long-term backend needs low-latency deterministic matching, RFQ, market-make
 - Options V1D/V1C guarded by `OPTIONS_ENABLED=false`, `OPTION_RFQ_ENABLED=false`, and `OPTION_RFQ_QUOTE_SIGNATURE_MODE=disabled` by default. Enabled mode exposes manual option series creation/list/get/disable, off-chain GTC option order submit/list/get/cancel, price-time matching, fill listing/get endpoints, aggregated option orderbook reads, HTTP/core option RFQs with off-chain RFQ fills, option RFQ quote signing payloads, optional strict signed MM option RFQ quote verification, and MM Gateway option RFQ request/quote/accept notification messages. Option execution intents, Greeks, IV surfaces, and on-chain option lifecycle are deferred.
 - Market Maker Gateway V1C guarded by `MM_GATEWAY_ENABLED=false` by default. Enabled mode starts a separate WebTransport UDP listener with required TLS cert/key config and routes MM order flow through the live off-chain perp orderbook without auto-broadcasting.
 - Production MM Auth V1A guarded by `MM_GATEWAY_AUTH_MODE=disabled` and `MM_GATEWAY_REQUIRE_AUTH=false` by default. `wallet_challenge` uses server-issued Ethereum personal-sign challenges to bind WebTransport sessions to wallet accounts before trading messages are accepted.
-- Monitoring/Admin V1A guarded by `ADMIN_API_ENABLED=false` by default. Enabled mode exposes read-only `/admin/status`, `/admin/config`, `/admin/db`, `/admin/mm/sessions`, `/admin/execution/summary`, `/admin/rfq/summary`, `/admin/options/summary`, and `/admin/recent` endpoints. The endpoints are local/dev-oriented, optionally require `X-Admin-Token`, sanitize secrets, use bounded read queries, and do not mutate DB rows, RFQs, option state, execution state, or MM sessions.
+- MM Permissions V1A guarded by `MM_PERMISSIONS_ENABLED=false` by default. Enabled mode requires an enabled MM account, capability flags, and optional market or option-series scope rows for protected MM quote/order actions. `MM_PERMISSIONS_REQUIRE_PERSISTENCE=true` requires Postgres for production-like enforcement, while tests can seed permissions in memory.
+- Monitoring/Admin V1A guarded by `ADMIN_API_ENABLED=false` by default. Enabled mode exposes read-only `/admin/status`, `/admin/config`, `/admin/db`, `/admin/mm/sessions`, `/admin/mm/permissions`, `/admin/execution/summary`, `/admin/rfq/summary`, `/admin/options/summary`, and `/admin/recent` endpoints. The endpoints are local/dev-oriented, optionally require `X-Admin-Token`, sanitize secrets, use bounded read queries, and do not mutate DB rows, RFQs, option state, execution state, MM sessions, or MM permission rows.
 
 ## Monitoring/Admin V1A
 
@@ -69,9 +70,9 @@ When enabled, admin endpoints are read-only. `ADMIN_API_REQUIRE_TOKEN=true` perf
 
 The admin config response is sanitized. It exposes public network/chain identifiers, feature flags, public contract addresses, signature modes, TTL settings, booleans for RPC/database/private-key configuration, and WebTransport host/port only when the gateway is enabled. It does not expose private keys, raw database URLs, raw RPC URLs, provider keys, admin tokens, or full environment data.
 
-Persistent admin DB reads use simple aggregate/count/recent queries and fixed table names. `/admin/db` reports missing older tables as unavailable in its count response. With persistence disabled, admin endpoints use in-memory engine/RFQ/options/MM session snapshots where available and return empty DB/recent sections otherwise. Normal tests do not require live Postgres, RPC, WebTransport, or private keys.
+Persistent admin DB reads use simple aggregate/count/recent queries and fixed table names. `/admin/db` reports missing older tables as unavailable in its count response. `/admin/mm/permissions` lists configured MM accounts, capability flags, and product scopes without exposing auth challenges, signatures, tokens, or database URLs. With persistence disabled, admin endpoints use in-memory engine/RFQ/options/MM session/permission snapshots where available and return empty DB/recent sections otherwise. Normal tests do not require live Postgres, RPC, WebTransport, or private keys.
 
-Monitoring/Admin V1B remains deferred: Prometheus exporter, structured event log, external alerts, Grafana dashboards, frontend admin dashboard, production auth, admin write controls, and risk admin controls.
+Monitoring/Admin V1B remains deferred: Prometheus exporter, structured event log, external alerts, Grafana dashboards, frontend admin dashboard, production auth, admin write controls, permission write controls, and risk admin controls.
 
 ## Options V1D / Option RFQ V1C
 
@@ -370,6 +371,38 @@ Gateway cancels are ownership checked against the session account. `cancel_order
 
 Cancel-on-disconnect is live in V1C. On WebTransport session close, the adapter calls the transport-neutral service to cancel tracked resting session orders when enabled, then logs the cancellation summary. WebTransport-specific code remains isolated to `src/mm/transport/webtransport.rs`; orderbook business logic remains outside the transport adapter.
 
+## MM Permissions V1A
+
+MM Permissions V1A adds an authorization layer after MM identity is established. Wallet challenge authentication answers "which account controls this session"; permissions answer "what is that account allowed to do." When `MM_PERMISSIONS_ENABLED=false`, all existing MM gateway and RFQ behavior is preserved.
+
+Configuration:
+
+```text
+MM_PERMISSIONS_ENABLED=false
+MM_PERMISSIONS_REQUIRE_PERSISTENCE=true
+```
+
+When permission enforcement is enabled, startup requires persistence unless `MM_PERMISSIONS_REQUIRE_PERSISTENCE=false`. This keeps production-like allowlists durable while allowing normal offline tests to seed an in-memory `MmPermissionsStore`.
+
+Permission state has two tables:
+- `mm_accounts`: one row per MM account with `enabled`, optional `label`, and capability booleans.
+- `mm_market_permissions`: optional product scopes. Rows can target a perp `market_id`, an `option_series_id`, or be global when both are null.
+
+Enforced capabilities:
+- Perp RFQ quote submission requires `enabled=true`, `can_quote_perp_rfq=true`, and allowed `market_id` when perp market scopes are configured.
+- Option RFQ quote submission requires `enabled=true`, `can_quote_option_rfq=true`, and allowed `option_series_id` when option-series scopes are configured.
+- Gateway `submit_order`, `bulk_submit`, and `quote_replace` require `enabled=true`, `can_submit_perp_orders=true`, and allowed `market_id` when perp market scopes are configured.
+
+Scope semantics are intentionally simple. If an account has no scope rows for a product type, the account-level capability applies globally for that product type. Once any scope row exists for that product type, an enabled exact row or enabled global row is required. Disabled scope rows do not grant access. Cancels remain ownership-checked but are not capability-blocked so a disabled MM is not prevented from reducing already-resting off-chain exposure.
+
+The admin surface is read-only:
+
+```text
+GET /admin/mm/permissions
+```
+
+V1A does not add admin write endpoints, frontend permission UI, automatic onboarding, ranking/scoring, incentives/rebates, on-chain allowlists, Solidity changes, deployments, or real broadcast behavior.
+
 ## Execution-Intent Flow
 
 Every matched trade creates an `ExecutionIntent` with buyer, seller, order IDs, market, price, size, buyer maker flag, buyer/seller order nonces, execution deadline, timestamp, and `Pending` status. Intents are stored in memory and exposed through `GET /execution-intents`.
@@ -383,6 +416,8 @@ The intended lifecycle is: order accepted, matched, execution intent created, Pe
 Persistence is disabled by default. With `PERSISTENCE_ENABLED=false`, the service does not connect to Postgres and retains the original in-memory nonce, orderbook, and execution-intent behavior.
 
 With `PERSISTENCE_ENABLED=true`, startup requires `DATABASE_URL`, connects to Postgres, and runs migrations. The repository persists used nonces, accepted orders, matched trades, execution intents, cancellation/status updates, and a basic `engine_events` audit stream. Persisted nonce uniqueness is scoped to `(account, nonce)`, which prevents replay after restart while still allowing different accounts to use the same nonce.
+
+MM Permissions V1A adds `mm_accounts` and `mm_market_permissions` migrations for manual SQL onboarding and read-only admin visibility. Application code reads these tables for enforcement and admin display; it does not write approval state.
 
 The in-memory engine remains the live matching state in this V1 patch. Database writes for an order submission use a SQL transaction for nonce insertion and event persistence, but full engine-state rollback/replay around database failure is deferred.
 
@@ -429,10 +464,11 @@ Matching decisions are deterministic for a given ordered command stream, market 
 - Self-trade is rejected before fills.
 - Large financial values are represented as integers, not floating point.
 - Disabled signature mode is for local development only; strict mode requires recovered EIP-712 signer equality with `order.account`.
+- MM auth proves session identity; MM permissions are a separate allowlist/capability layer and are disabled by default.
 
 ## Out of Scope
 
-No Redis, frontend auth UI, admin write controls, TypeScript, Python service code, C++, or Solidity changes. Blockchain RPC is limited to manual `eth_call` simulation, opt-in `eth_getLogs` indexing, confirmation receipt/block reads, and explicitly gated `eth_sendRawTransaction` broadcast. ABI encoding is limited to the PerpMatchingEngine calldata builder and guarded transaction request boundary.
+No Redis, frontend auth UI, frontend permissions UI, admin write controls, automatic MM approval, ranking/scoring, incentives/rebates, TypeScript, Python service code, C++, or Solidity changes. Blockchain RPC is limited to manual `eth_call` simulation, opt-in `eth_getLogs` indexing, confirmation receipt/block reads, and explicitly gated `eth_sendRawTransaction` broadcast. ABI encoding is limited to the PerpMatchingEngine calldata builder and guarded transaction request boundary.
 
 ## Acceptance Criteria
 

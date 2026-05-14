@@ -12,7 +12,8 @@ use deopt_v2_backend::mm::transport::webtransport::{
 };
 use deopt_v2_backend::mm::{
     AuthMode, BulkSubmitResultPayload, ClientMessage, ErrorCode, HeartbeatResultPayload,
-    MmGatewayConfig, MmGatewayService, MmSession, RateLimitDecision,
+    MmAccountPermissions, MmGatewayConfig, MmGatewayService, MmPermissionsConfig,
+    MmProductPermission, MmSession, RateLimitDecision,
 };
 use deopt_v2_backend::options::service::{
     accept_option_rfq_quote, create_option_rfq, create_option_series, list_option_rfq_quotes,
@@ -754,6 +755,102 @@ async fn gateway_rfq_quote_rejects_invalid_price_or_size() {
 }
 
 #[tokio::test]
+async fn gateway_rfq_quote_permissions_reject_missing_disabled_and_wrong_capability() {
+    let cases = [
+        ("missing", None),
+        (
+            "disabled",
+            Some(mm_account_permissions(false, false, true, false)),
+        ),
+        (
+            "wrong capability",
+            Some(mm_account_permissions(true, false, false, false)),
+        ),
+    ];
+
+    for (case, account) in cases {
+        let mut state =
+            AppState::with_rfq_config(EngineState::with_default_markets(), rfq_config());
+        state.mm_permissions_config = MmPermissionsConfig::enabled_in_memory_for_tests();
+        if let Some(account) = account {
+            seed_mm_account(&state, account);
+        }
+        let rfq = create_rfq(&state, rfq_input()).await.unwrap();
+        let service = MmGatewayService::new(MmGatewayConfig::default(), state);
+        let mut session = MmSession::with_ids(
+            format!("session-rfq-{case}"),
+            "connection-1",
+            10,
+            AuthMode::Disabled,
+            true,
+        );
+
+        let response = service
+            .handle_message(
+                &mut session,
+                rfq_quote_message(rfq.rfq_id, "300100000000", "100000000"),
+                20,
+            )
+            .await;
+
+        let value = serde_json::to_value(response).unwrap();
+        assert_eq!(value["type"], "error", "{case}");
+        assert_eq!(value["error"]["code"], "RFQ_QUOTE_REJECTED", "{case}");
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("MM permission denied"),
+            "{case}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn gateway_rfq_quote_permissions_enforce_market_scope() {
+    let mut state = AppState::with_rfq_config(EngineState::with_default_markets(), rfq_config());
+    state.mm_permissions_config = MmPermissionsConfig::enabled_in_memory_for_tests();
+    seed_mm_account(&state, mm_account_permissions(true, false, true, false));
+    seed_mm_product_permission(&state, "perp-market-1", Some(1), None, true);
+    let allowed_rfq = create_rfq(&state, rfq_input()).await.unwrap();
+    let mut blocked_input = rfq_input();
+    blocked_input.market_id = 2;
+    let blocked_rfq = create_rfq(&state, blocked_input).await.unwrap();
+    let service = MmGatewayService::new(MmGatewayConfig::default(), state);
+    let mut session = MmSession::with_ids(
+        "session-rfq-scope",
+        "connection-1",
+        10,
+        AuthMode::Disabled,
+        true,
+    );
+
+    let allowed = service
+        .handle_message(
+            &mut session,
+            rfq_quote_message(allowed_rfq.rfq_id, "300100000000", "100000000"),
+            20,
+        )
+        .await;
+    assert!(matches!(allowed, ServerMessage::RfqQuoteResult(_)));
+
+    let blocked = service
+        .handle_message(
+            &mut session,
+            rfq_quote_message(blocked_rfq.rfq_id, "300100000000", "100000000"),
+            30,
+        )
+        .await;
+    let value = serde_json::to_value(blocked).unwrap();
+    assert_eq!(value["type"], "error");
+    assert_eq!(value["error"]["code"], "RFQ_QUOTE_REJECTED");
+    assert!(value["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("market_id 2"));
+}
+
+#[tokio::test]
 async fn gateway_handles_option_rfq_quote_and_stores_session_id() {
     let state = option_rfq_state();
     let option_series_id = active_option_series_id(&state).await;
@@ -950,6 +1047,96 @@ async fn gateway_option_rfq_quote_rejects_invalid_price_or_size() {
         .as_str()
         .unwrap()
         .contains("zero price"));
+}
+
+#[tokio::test]
+async fn gateway_option_rfq_quote_permissions_require_capability() {
+    let mut state = option_rfq_state();
+    state.mm_permissions_config = MmPermissionsConfig::enabled_in_memory_for_tests();
+    seed_mm_account(&state, mm_account_permissions(true, false, true, false));
+    let option_series_id = active_option_series_id(&state).await;
+    let rfq = create_option_rfq(&state, option_rfq_input(option_series_id, Side::Buy))
+        .await
+        .unwrap();
+    let service = MmGatewayService::new(MmGatewayConfig::default(), state);
+    let mut session = MmSession::with_ids(
+        "session-option-permission",
+        "connection-1",
+        10,
+        AuthMode::Disabled,
+        true,
+    );
+
+    let response = service
+        .handle_message(
+            &mut session,
+            option_rfq_quote_message(rfq.option_rfq_id, "1000000000", "100000000"),
+            20,
+        )
+        .await;
+
+    let value = serde_json::to_value(response).unwrap();
+    assert_eq!(value["type"], "error");
+    assert_eq!(value["error"]["code"], "OPTION_RFQ_QUOTE_REJECTED");
+    assert!(value["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("can_quote_option_rfq"));
+}
+
+#[tokio::test]
+async fn gateway_option_rfq_quote_permissions_enforce_series_scope() {
+    let mut state = option_rfq_state();
+    state.mm_permissions_config = MmPermissionsConfig::enabled_in_memory_for_tests();
+    seed_mm_account(&state, mm_account_permissions(true, false, false, true));
+    let allowed_series = active_option_series_id(&state).await;
+    let blocked_series = second_active_option_series_id(&state).await;
+    seed_mm_product_permission(
+        &state,
+        "option-series-1",
+        None,
+        Some(allowed_series.clone()),
+        true,
+    );
+    let allowed_rfq =
+        create_option_rfq(&state, option_rfq_input(allowed_series.clone(), Side::Buy))
+            .await
+            .unwrap();
+    let blocked_rfq = create_option_rfq(&state, option_rfq_input(blocked_series, Side::Buy))
+        .await
+        .unwrap();
+    let service = MmGatewayService::new(MmGatewayConfig::default(), state);
+    let mut session = MmSession::with_ids(
+        "session-option-scope",
+        "connection-1",
+        10,
+        AuthMode::Disabled,
+        true,
+    );
+
+    let allowed = service
+        .handle_message(
+            &mut session,
+            option_rfq_quote_message(allowed_rfq.option_rfq_id, "1000000000", "100000000"),
+            20,
+        )
+        .await;
+    assert!(matches!(allowed, ServerMessage::OptionRfqQuoteResult(_)));
+
+    let blocked = service
+        .handle_message(
+            &mut session,
+            option_rfq_quote_message(blocked_rfq.option_rfq_id, "1000000000", "100000000"),
+            30,
+        )
+        .await;
+    let value = serde_json::to_value(blocked).unwrap();
+    assert_eq!(value["type"], "error");
+    assert_eq!(value["error"]["code"], "OPTION_RFQ_QUOTE_REJECTED");
+    assert!(value["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("option_series_id"));
 }
 
 #[tokio::test]
@@ -1226,7 +1413,10 @@ async fn wallet_challenge_rejects_expired_challenge() {
 
 #[tokio::test]
 async fn wallet_challenge_rejects_trading_account_mismatch() {
-    let service = mm_service(wallet_auth_config());
+    let mut state = AppState::new(EngineState::with_default_markets());
+    state.mm_permissions_config = MmPermissionsConfig::enabled_in_memory_for_tests();
+    seed_mm_account(&state, mm_account_permissions(true, true, true, true));
+    let service = MmGatewayService::new(wallet_auth_config(), state);
     let mut session = authenticated_wallet_session(&service).await;
     let message: ClientMessage = serde_json::from_value(json!({
         "type": "submit_order",
@@ -1317,6 +1507,111 @@ async fn submit_order_mutates_live_orderbook() {
     let snapshot = state.engine.lock().unwrap().orderbook_snapshot(1);
     assert_eq!(snapshot.bids.len(), 1);
     assert_eq!(snapshot.bids[0].total_size_1e8, 100000000);
+}
+
+#[tokio::test]
+async fn submit_order_permissions_require_capability_and_market_scope() {
+    let mut state = AppState::new(EngineState::with_default_markets());
+    state.mm_permissions_config = MmPermissionsConfig::enabled_in_memory_for_tests();
+    seed_mm_account(&state, mm_account_permissions(true, false, true, true));
+    let service = MmGatewayService::new(MmGatewayConfig::default(), state.clone());
+    let mut session = MmSession::with_ids(
+        "session-submit-permission",
+        "connection-1",
+        10,
+        AuthMode::Disabled,
+        true,
+    );
+
+    let rejected = service
+        .handle_message(
+            &mut session,
+            serde_json::from_value(json!({
+                "type": "submit_order",
+                "request_id": "submit-1",
+                "payload": valid_order_with("blocked-cap", "buy", 1)
+            }))
+            .unwrap(),
+            20,
+        )
+        .await;
+    let value = serde_json::to_value(rejected).unwrap();
+    assert_eq!(value["type"], "error");
+    assert_eq!(value["error"]["code"], "ORDER_REJECTED");
+    assert!(value["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("can_submit_perp_orders"));
+
+    seed_mm_account(&state, mm_account_permissions(true, true, true, true));
+    seed_mm_product_permission(&state, "submit-market-2", Some(2), None, true);
+    let wrong_market = service
+        .handle_message(
+            &mut session,
+            serde_json::from_value(json!({
+                "type": "submit_order",
+                "request_id": "submit-2",
+                "payload": valid_order_with("blocked-market", "buy", 2)
+            }))
+            .unwrap(),
+            30,
+        )
+        .await;
+    let value = serde_json::to_value(wrong_market).unwrap();
+    assert_eq!(value["type"], "error");
+    assert_eq!(value["error"]["code"], "ORDER_REJECTED");
+    assert!(value["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("market_id 1"));
+}
+
+#[tokio::test]
+async fn quote_replace_permissions_reject_before_cancelling_previous_quotes() {
+    let mut state = AppState::new(EngineState::with_default_markets());
+    state.mm_permissions_config = MmPermissionsConfig::enabled_in_memory_for_tests();
+    seed_mm_account(&state, mm_account_permissions(true, true, true, true));
+    let service = MmGatewayService::new(MmGatewayConfig::default(), state.clone());
+    let mut session = MmSession::with_ids(
+        "session-qr-permission",
+        "connection-1",
+        10,
+        AuthMode::Disabled,
+        true,
+    );
+    let accepted = service
+        .handle_message(
+            &mut session,
+            serde_json::from_value(quote_replace_json(
+                quote_leg("old-bid-permission", "299900000000", 1),
+                ValueSide::None,
+            ))
+            .unwrap(),
+            20,
+        )
+        .await;
+    assert!(matches!(accepted, ServerMessage::QuoteReplaceResult(_)));
+    seed_mm_account(&state, mm_account_permissions(true, false, true, true));
+
+    let rejected = service
+        .handle_message(
+            &mut session,
+            serde_json::from_value(quote_replace_json_with_request(
+                "qr-permission-2",
+                quote_leg("new-bid-permission", "299800000000", 2),
+                ValueSide::None,
+            ))
+            .unwrap(),
+            30,
+        )
+        .await;
+
+    let value = serde_json::to_value(rejected).unwrap();
+    assert_eq!(value["type"], "error");
+    assert_eq!(value["error"]["code"], "QUOTE_REPLACE_FAILED");
+    let snapshot = state.engine.lock().unwrap().orderbook_snapshot(1);
+    assert_eq!(snapshot.bids.len(), 1);
+    assert_eq!(snapshot.bids[0].price_1e8, 299900000000);
 }
 
 #[tokio::test]
@@ -1712,6 +2007,51 @@ fn mm_service(config: MmGatewayConfig) -> MmGatewayService {
     MmGatewayService::new(config, AppState::new(EngineState::with_default_markets()))
 }
 
+fn mm_account_permissions(
+    enabled: bool,
+    can_submit_perp_orders: bool,
+    can_quote_perp_rfq: bool,
+    can_quote_option_rfq: bool,
+) -> MmAccountPermissions {
+    MmAccountPermissions {
+        mm_account: AccountId::new("0x0000000000000000000000000000000000000001"),
+        enabled,
+        label: Some("MM Alpha".to_string()),
+        can_submit_perp_orders,
+        can_quote_perp_rfq,
+        can_quote_option_rfq,
+        can_submit_option_orders: false,
+        created_at_ms: 1,
+        updated_at_ms: 1,
+    }
+}
+
+fn seed_mm_account(state: &AppState, account: MmAccountPermissions) {
+    state.mm_permissions.lock().unwrap().upsert_account(account);
+}
+
+fn seed_mm_product_permission(
+    state: &AppState,
+    id: &str,
+    market_id: Option<u64>,
+    option_series_id: Option<String>,
+    enabled: bool,
+) {
+    state
+        .mm_permissions
+        .lock()
+        .unwrap()
+        .insert_product_permission(MmProductPermission {
+            id: id.to_string(),
+            mm_account: AccountId::new("0x0000000000000000000000000000000000000001"),
+            market_id,
+            option_series_id,
+            enabled,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        });
+}
+
 fn rfq_config() -> RfqConfig {
     RfqConfig {
         enabled: true,
@@ -1771,6 +2111,15 @@ fn strict_option_rfq_state() -> AppState {
 
 async fn active_option_series_id(state: &AppState) -> String {
     create_option_series(state, option_series_input())
+        .await
+        .unwrap()
+        .option_series_id
+}
+
+async fn second_active_option_series_id(state: &AppState) -> String {
+    let mut input = option_series_input();
+    input.strike_1e8 = 310_000_000_000;
+    create_option_series(state, input)
         .await
         .unwrap()
         .option_series_id

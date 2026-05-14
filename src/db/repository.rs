@@ -11,6 +11,7 @@ use crate::execution::{
     ExecutionTransactionStatus, SimulationResult, StoredTradeSignatures,
 };
 use crate::indexer::IndexedPerpTrade;
+use crate::mm::{MmAccountPermissions, MmProductPermission};
 use crate::options::store::status_for_remaining;
 use crate::options::{
     OptionFill, OptionFillId, OptionOrder, OptionOrderId, OptionOrderStatus, OptionRfqFill,
@@ -54,6 +55,8 @@ const ADMIN_TABLE_COUNTS: &[(&str, &str)] = &[
     ("option_rfqs", "option_rfqs"),
     ("option_rfq_quotes", "option_rfq_quotes"),
     ("option_rfq_fills", "option_rfq_fills"),
+    ("mm_accounts", "mm_accounts"),
+    ("mm_market_permissions", "mm_market_permissions"),
 ];
 
 fn validate_admin_identifier(identifier: &str) -> Result<()> {
@@ -174,6 +177,83 @@ impl PgRepository {
         .map_err(|error| BackendError::Persistence(error.to_string()))?;
         let count: i64 = row_get(&row, "count")?;
         i64_to_u64_persistence("count", count)
+    }
+
+    pub async fn get_mm_permission_account(
+        &self,
+        account: &AccountId,
+    ) -> Result<Option<MmAccountPermissions>> {
+        if !self.admin_table_exists("mm_accounts").await? {
+            return Ok(None);
+        }
+        let row = sqlx::query(
+            "SELECT mm_account, enabled, label, can_submit_perp_orders, can_quote_perp_rfq,
+                    can_quote_option_rfq, can_submit_option_orders, created_at_ms, updated_at_ms
+             FROM mm_accounts
+             WHERE lower(mm_account) = lower($1)",
+        )
+        .bind(&account.0)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        row.map(mm_permission_account_from_row).transpose()
+    }
+
+    pub async fn list_mm_permission_accounts(&self) -> Result<Vec<MmAccountPermissions>> {
+        if !self.admin_table_exists("mm_accounts").await? {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            "SELECT mm_account, enabled, label, can_submit_perp_orders, can_quote_perp_rfq,
+                    can_quote_option_rfq, can_submit_option_orders, created_at_ms, updated_at_ms
+             FROM mm_accounts
+             ORDER BY lower(mm_account) ASC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        rows.into_iter()
+            .map(mm_permission_account_from_row)
+            .collect()
+    }
+
+    pub async fn list_mm_product_permissions_for_account(
+        &self,
+        account: &AccountId,
+    ) -> Result<Vec<MmProductPermission>> {
+        if !self.admin_table_exists("mm_market_permissions").await? {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            "SELECT id, mm_account, market_id, option_series_id, enabled, created_at_ms, updated_at_ms
+             FROM mm_market_permissions
+             WHERE lower(mm_account) = lower($1)
+             ORDER BY created_at_ms ASC, id ASC",
+        )
+        .bind(&account.0)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        rows.into_iter()
+            .map(mm_product_permission_from_row)
+            .collect()
+    }
+
+    pub async fn list_mm_product_permissions(&self) -> Result<Vec<MmProductPermission>> {
+        if !self.admin_table_exists("mm_market_permissions").await? {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            "SELECT id, mm_account, market_id, option_series_id, enabled, created_at_ms, updated_at_ms
+             FROM mm_market_permissions
+             ORDER BY lower(mm_account) ASC, created_at_ms ASC, id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        rows.into_iter()
+            .map(mm_product_permission_from_row)
+            .collect()
     }
 
     pub async fn admin_recent_execution_intents(
@@ -2652,6 +2732,35 @@ fn option_rfq_fill_from_row(row: PgRow) -> Result<OptionRfqFill> {
                 BackendError::Persistence(format!("invalid option RFQ fill size: {error}"))
             })?,
         created_at_ms: row_get(&row, "created_at_ms")?,
+    })
+}
+
+fn mm_permission_account_from_row(row: PgRow) -> Result<MmAccountPermissions> {
+    Ok(MmAccountPermissions {
+        mm_account: AccountId::new(row_get::<String>(&row, "mm_account")?),
+        enabled: row_get(&row, "enabled")?,
+        label: row_get(&row, "label")?,
+        can_submit_perp_orders: row_get(&row, "can_submit_perp_orders")?,
+        can_quote_perp_rfq: row_get(&row, "can_quote_perp_rfq")?,
+        can_quote_option_rfq: row_get(&row, "can_quote_option_rfq")?,
+        can_submit_option_orders: row_get(&row, "can_submit_option_orders")?,
+        created_at_ms: row_get(&row, "created_at_ms")?,
+        updated_at_ms: row_get(&row, "updated_at_ms")?,
+    })
+}
+
+fn mm_product_permission_from_row(row: PgRow) -> Result<MmProductPermission> {
+    let market_id: Option<i64> = row_get(&row, "market_id")?;
+    Ok(MmProductPermission {
+        id: row_get(&row, "id")?,
+        mm_account: AccountId::new(row_get::<String>(&row, "mm_account")?),
+        market_id: market_id
+            .map(|value| i64_to_u64_persistence("market_id", value))
+            .transpose()?,
+        option_series_id: row_get(&row, "option_series_id")?,
+        enabled: row_get(&row, "enabled")?,
+        created_at_ms: row_get(&row, "created_at_ms")?,
+        updated_at_ms: row_get(&row, "updated_at_ms")?,
     })
 }
 

@@ -16,6 +16,9 @@ use crate::execution::{
     TransactionReceiptProvider, PERP_TRADE_TYPE,
 };
 use crate::indexer::{Indexer, IndexerStatus, IndexerTickResult};
+use crate::mm::permissions::{
+    list_permission_accounts, list_product_permissions, MmProductPermission,
+};
 use crate::nonce_sync::{read_perp_nonce, PerpNonceResponse};
 use crate::options::service::{
     accept_option_rfq_quote as accept_option_rfq_quote_service,
@@ -189,6 +192,7 @@ pub fn router(state: AppState) -> Router {
         .route("/admin/config", get(admin_config))
         .route("/admin/db", get(admin_db))
         .route("/admin/mm/sessions", get(admin_mm_sessions))
+        .route("/admin/mm/permissions", get(admin_mm_permissions))
         .route("/admin/execution/summary", get(admin_execution_summary))
         .route("/admin/rfq/summary", get(admin_rfq_summary))
         .route("/admin/options/summary", get(admin_options_summary))
@@ -228,6 +232,7 @@ async fn admin_status(
         "reconciliation_enabled": state.reconciliation_config.enabled,
         "confirmation_enabled": state.confirmation_config.enabled,
         "mm_gateway_enabled": state.mm_gateway_config.enabled,
+        "mm_permissions_enabled": state.mm_permissions_config.enabled,
         "rfq_enabled": state.rfq_config.enabled,
         "options_enabled": state.options_config.enabled,
         "option_rfq_enabled": state.options_config.rfq_enabled
@@ -259,6 +264,7 @@ async fn admin_config(
             "options_enabled": state.options_config.enabled,
             "option_rfq_enabled": state.options_config.rfq_enabled,
             "mm_gateway_enabled": state.mm_gateway_config.enabled,
+            "mm_permissions_enabled": state.mm_permissions_config.enabled,
             "perp_nonce_sync_enabled": state.perp_nonce_sync_config.enabled
         },
         "configured": {
@@ -305,6 +311,10 @@ async fn admin_config(
             "auth_mode": state.mm_gateway_config.auth_mode,
             "require_auth": state.mm_gateway_config.require_auth,
             "challenge_ttl_ms": state.mm_gateway_config.challenge_ttl_ms
+        },
+        "mm_permissions": {
+            "enabled": state.mm_permissions_config.enabled,
+            "require_persistence": state.mm_permissions_config.require_persistence
         },
         "rfq": {
             "enabled": state.rfq_config.enabled,
@@ -401,6 +411,58 @@ async fn admin_mm_sessions(
     Ok(Json(serde_json::json!({
         "enabled": true,
         "sessions": sessions
+    })))
+}
+
+async fn admin_mm_permissions(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    ensure_admin_access(&state, &headers)?;
+    let product_permissions = list_product_permissions(&state).await?;
+    let mut scopes_by_account = BTreeMap::<String, Vec<MmProductPermission>>::new();
+    for permission in product_permissions {
+        scopes_by_account
+            .entry(permission.mm_account.0.to_ascii_lowercase())
+            .or_default()
+            .push(permission);
+    }
+
+    let accounts = list_permission_accounts(&state)
+        .await?
+        .into_iter()
+        .map(|account| {
+            let scopes = scopes_by_account
+                .remove(&account.mm_account.0.to_ascii_lowercase())
+                .unwrap_or_default()
+                .into_iter()
+                .map(|permission| {
+                    serde_json::json!({
+                        "id": permission.id,
+                        "market_id": permission.market_id,
+                        "option_series_id": permission.option_series_id,
+                        "enabled": permission.enabled
+                    })
+                })
+                .collect::<Vec<_>>();
+            serde_json::json!({
+                "mm_account": account.mm_account,
+                "enabled": account.enabled,
+                "label": account.label,
+                "can_submit_perp_orders": account.can_submit_perp_orders,
+                "can_quote_perp_rfq": account.can_quote_perp_rfq,
+                "can_quote_option_rfq": account.can_quote_option_rfq,
+                "can_submit_option_orders": account.can_submit_option_orders,
+                "market_permissions": scopes
+            })
+        })
+        .collect::<Vec<_>>();
+
+    Ok(Json(serde_json::json!({
+        "enabled": state.mm_permissions_config.enabled,
+        "require_persistence": state.mm_permissions_config.require_persistence,
+        "persistence_enabled": state.persistence_enabled,
+        "accounts": accounts
     })))
 }
 
@@ -3200,7 +3262,10 @@ mod tests {
     use crate::engine::EngineState;
     use crate::execution::DecodedRevertError;
     use crate::mm::protocol::ServerMessage;
-    use crate::mm::{AuthMode, MmGatewayConfig, MmSession};
+    use crate::mm::{
+        AuthMode, MmAccountPermissions, MmGatewayConfig, MmPermissionsConfig, MmProductPermission,
+        MmSession,
+    };
     use axum::body::{to_bytes, Body};
     use axum::http::Request;
     use tokio::sync::mpsc;
@@ -3383,6 +3448,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admin_mm_permissions_returns_sanitized_accounts() {
+        let mut state = admin_state(false);
+        state.mm_permissions_config = MmPermissionsConfig::enabled_in_memory_for_tests();
+        state
+            .mm_permissions
+            .lock()
+            .unwrap()
+            .upsert_account(MmAccountPermissions {
+                mm_account: AccountId::new("0x0000000000000000000000000000000000000001"),
+                enabled: true,
+                label: Some("MM Alpha".to_string()),
+                can_submit_perp_orders: true,
+                can_quote_perp_rfq: true,
+                can_quote_option_rfq: true,
+                can_submit_option_orders: false,
+                created_at_ms: 1,
+                updated_at_ms: 2,
+            });
+        state
+            .mm_permissions
+            .lock()
+            .unwrap()
+            .insert_product_permission(MmProductPermission {
+                id: "scope-1".to_string(),
+                mm_account: AccountId::new("0x0000000000000000000000000000000000000001"),
+                market_id: Some(1),
+                option_series_id: None,
+                enabled: true,
+                created_at_ms: 1,
+                updated_at_ms: 2,
+            });
+
+        let response = router(state)
+            .oneshot(get_request("/admin/mm/permissions", None))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["enabled"], true);
+        assert_eq!(json["accounts"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            json["accounts"][0]["mm_account"],
+            "0x0000000000000000000000000000000000000001"
+        );
+        assert_eq!(json["accounts"][0]["label"], "MM Alpha");
+        assert_eq!(json["accounts"][0]["can_submit_perp_orders"], true);
+        assert_eq!(json["accounts"][0]["can_quote_perp_rfq"], true);
+        assert_eq!(json["accounts"][0]["can_quote_option_rfq"], true);
+        assert_eq!(json["accounts"][0]["can_submit_option_orders"], false);
+        assert_eq!(json["accounts"][0]["market_permissions"][0]["market_id"], 1);
+        assert!(json["accounts"][0].get("created_at_ms").is_none());
+        assert!(json["accounts"][0].get("updated_at_ms").is_none());
+    }
+
+    #[tokio::test]
+    async fn admin_mm_permissions_has_no_write_endpoint() {
+        let response = router(admin_state(false))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/mm/permissions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
     async fn admin_empty_summaries_are_valid() {
         for path in [
             "/admin/execution/summary",
@@ -3424,6 +3561,7 @@ mod tests {
             "/admin/config",
             "/admin/db",
             "/admin/mm/sessions",
+            "/admin/mm/permissions",
             "/admin/execution/summary",
             "/admin/rfq/summary",
             "/admin/options/summary",
@@ -3553,6 +3691,7 @@ impl From<BackendError> for ApiError {
                 StatusCode::NOT_FOUND
             }
             BackendError::OrderNotFound(_) | BackendError::OrderNotOpen(_) => StatusCode::NOT_FOUND,
+            BackendError::MmPermissionDenied(_) => StatusCode::FORBIDDEN,
             BackendError::InvalidFixedPoint { .. } => StatusCode::BAD_REQUEST,
             BackendError::DeadlineExpired
             | BackendError::InvalidNonce

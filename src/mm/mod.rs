@@ -1,4 +1,5 @@
 pub mod gateway;
+pub mod permissions;
 pub mod protocol;
 pub mod rate_limit;
 pub mod registry;
@@ -7,6 +8,9 @@ pub mod session;
 pub mod transport;
 
 pub use gateway::{BulkCancel, BulkQuoteUpdate, Heartbeat, MarketMakerSession};
+pub use permissions::{
+    MmAccountPermissions, MmPermissionsConfig, MmPermissionsStore, MmProductPermission,
+};
 pub use protocol::{
     AuthChallengePayload, AuthChallengeResultPayload, AuthPayload, AuthResultPayload,
     AuthVerifyPayload, AuthVerifyResultPayload, BulkCancelPayload, BulkCancelResultPayload,

@@ -39,6 +39,8 @@ pub enum BackendError {
     OptionsDisabled,
     #[error("option RFQ is disabled")]
     OptionRfqDisabled,
+    #[error("MM permission denied: {0}")]
+    MmPermissionDenied(String),
     #[error("invalid option series id: {0}")]
     InvalidOptionSeriesId(String),
     #[error("invalid option series state: {0}")]

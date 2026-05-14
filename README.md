@@ -95,6 +95,8 @@ MM_GATEWAY_CANCEL_ON_DISCONNECT=true
 MM_GATEWAY_AUTH_MODE=disabled
 MM_GATEWAY_REQUIRE_AUTH=false
 MM_GATEWAY_CHALLENGE_TTL_MS=60000
+MM_PERMISSIONS_ENABLED=false
+MM_PERMISSIONS_REQUIRE_PERSISTENCE=true
 ADMIN_API_ENABLED=false
 ADMIN_API_REQUIRE_TOKEN=false
 ADMIN_API_TOKEN=
@@ -114,6 +116,7 @@ ADMIN_API_TOKEN=
 `OPTIONS_ENABLED=false` and `OPTION_RFQ_ENABLED=false` are the safe defaults. When either options persistence gate is true and its feature is enabled, startup requires `PERSISTENCE_ENABLED=true`. Test and development code can run option series, off-chain option orders, matching, fills, and option RFQs in memory with persistence disabled. `OPTION_RFQ_QUOTE_SIGNATURE_MODE=disabled` preserves the unsigned Option RFQ V1B flow. `strict` requires each option RFQ quote to include `quote_nonce` and a valid EIP-712 `OptionRFQQuote` signature whose recovered signer equals `mm_account`.
 `MM_GATEWAY_ENABLED=false` is the safe default. When `true`, V1C starts a separate WebTransport UDP listener and requires `MM_GATEWAY_CERT_PATH` and `MM_GATEWAY_KEY_PATH`. It can submit and cancel off-chain perp orders through the live in-memory orderbook, handle perp RFQ and option RFQ messages when those features are enabled, but it does not auto-broadcast, sign, simulate, index, reconcile, or confirm execution intents.
 `MM_GATEWAY_AUTH_MODE=disabled` preserves local/dev behavior. `wallet_challenge` enables server-issued Ethereum personal-sign challenges. When `MM_GATEWAY_REQUIRE_AUTH=true`, unauthenticated sessions may only use `heartbeat`, `get_session`, `auth_challenge`, and `auth_verify`; trading, quote, and RFQ messages require an authenticated wallet session and account fields must match that wallet address case-insensitively. `MM_GATEWAY_CHALLENGE_TTL_MS` controls challenge expiry.
+`MM_PERMISSIONS_ENABLED=false` preserves existing MM gateway and RFQ behavior. When `true`, protected MM order and quote actions require an enabled row in `mm_accounts`, the relevant capability flag, and any configured market or option-series scope. `MM_PERMISSIONS_REQUIRE_PERSISTENCE=true` requires Postgres when permission enforcement is enabled; tests and local development can set it to `false` for in-memory permission seeding.
 `ADMIN_API_ENABLED=false` is the safe default for Monitoring/Admin V1A. When enabled, `/admin/*` exposes read-only operational observability only. If `ADMIN_API_REQUIRE_TOKEN=true`, requests must include `X-Admin-Token: <ADMIN_API_TOKEN>`. The token is never returned by the API, and admin config responses expose booleans such as `rpc_configured` and `database_configured` instead of raw RPC URLs, database URLs, private keys, or tokens.
 
 ## Monitoring/Admin V1A
@@ -125,6 +128,7 @@ GET /admin/status
 GET /admin/config
 GET /admin/db
 GET /admin/mm/sessions
+GET /admin/mm/permissions
 GET /admin/execution/summary
 GET /admin/rfq/summary
 GET /admin/options/summary
@@ -138,6 +142,7 @@ All admin endpoints are disabled unless `ADMIN_API_ENABLED=true`. When token pro
 `/admin/db` pings Postgres and reports migration/count metadata only when persistence is enabled. With persistence disabled, it returns a clear disabled/offline shape. Count queries are aggregate-only and handle missing older tables as unavailable in the DB count response.
 
 `/admin/mm/sessions` returns sanitized active MM session snapshots. It reports session id, auth mode, authenticated/account fields, challenge-active state and challenge expiry, heartbeat timestamps, `cancel_on_disconnect`, and open-client-order count, but not connection internals, challenge strings, signatures, nonces, or full client-order id lists. If the gateway is disabled, it returns `enabled=false` with an empty session list.
+`/admin/mm/permissions` returns read-only sanitized MM permission visibility: whether enforcement is enabled, whether persistence is required, and configured accounts with capability booleans and product scopes. It never returns private keys, auth challenges, signatures, tokens, or raw database configuration, and V1A intentionally has no admin write endpoint.
 
 `/admin/execution/summary`, `/admin/rfq/summary`, `/admin/options/summary`, and `/admin/recent` provide compact bounded summaries from Postgres when persistence is enabled and in-memory summaries otherwise. `/admin/recent` defaults to `limit=20` and caps at `100`.
 
@@ -420,6 +425,85 @@ Supported live order operations are `submit_order`, `bulk_submit`, `cancel_order
 `quote_replace` uses clear non-atomic semantics: if `cancel_previous=true`, previously tracked quote client order ids for the session are cancelled first for the requested account and market, then the new bid and ask legs are submitted independently as GTC orders. The response reports cancelled, submitted, rejected, per-leg results, backend order ids, and matched execution intent ids.
 
 On WebTransport disconnect, if cancel-on-disconnect is enabled and the session has an account, the adapter asks `MmGatewayService` to cancel the session's tracked resting client order ids and logs the live cancellation count. The WebTransport adapter remains transport-only; orderbook business logic stays in the shared service and gateway service layers.
+
+## MM Permissions V1A
+
+Authentication and permissions are separate. Wallet challenge authentication proves which MM wallet controls a session. MM permissions decide whether that authenticated account is allowed to quote or submit orders for a capability and product.
+
+MM permissions are disabled by default:
+
+```text
+MM_PERMISSIONS_ENABLED=false
+MM_PERMISSIONS_REQUIRE_PERSISTENCE=true
+```
+
+With `MM_PERMISSIONS_ENABLED=false`, existing gateway and RFQ behavior is preserved. With `MM_PERMISSIONS_ENABLED=true`, protected MM actions require:
+
+- an `mm_accounts` row for the MM account
+- `mm_accounts.enabled=true`
+- the matching capability flag
+- a matching product permission when product scopes are configured for that account
+
+Capabilities are stored on `mm_accounts`:
+
+- `can_quote_perp_rfq` for perp RFQ quotes
+- `can_quote_option_rfq` for option RFQ quotes
+- `can_submit_perp_orders` for gateway `submit_order`, `bulk_submit`, and `quote_replace`
+- `can_submit_option_orders` is reserved for a future gateway option order path
+
+Product scopes are optional and stored in `mm_market_permissions`. If an enabled MM account has no perp market scope rows, `can_quote_perp_rfq` / `can_submit_perp_orders` apply to all perp markets. If the account has any perp market scope rows, an enabled row with that `market_id` or an enabled global row (`market_id IS NULL AND option_series_id IS NULL`) is required. Option RFQ scope works the same way with `option_series_id`.
+
+Manual onboarding in V1A is SQL-only. There are no admin writes, no automatic MM approval, no ranking/scoring, no rebates, and no on-chain allowlist. Example seed:
+
+```sql
+INSERT INTO mm_accounts (
+    mm_account,
+    enabled,
+    label,
+    can_submit_perp_orders,
+    can_quote_perp_rfq,
+    can_quote_option_rfq,
+    can_submit_option_orders,
+    created_at_ms,
+    updated_at_ms
+) VALUES (
+    '0x0000000000000000000000000000000000000001',
+    true,
+    'MM Alpha',
+    true,
+    true,
+    true,
+    false,
+    1770000000000,
+    1770000000000
+);
+
+INSERT INTO mm_market_permissions (
+    id,
+    mm_account,
+    market_id,
+    option_series_id,
+    enabled,
+    created_at_ms,
+    updated_at_ms
+) VALUES (
+    'mm-alpha-eth-perp',
+    '0x0000000000000000000000000000000000000001',
+    1,
+    NULL,
+    true,
+    1770000000000,
+    1770000000000
+);
+```
+
+Read-only visibility is available at:
+
+```text
+GET /admin/mm/permissions
+```
+
+Future work can add a production admin UI and audited approval workflow, but V1A deliberately keeps approval manual and database-backed.
 
 ## PerpMatchingEngine Calldata
 
@@ -714,7 +798,7 @@ PERSISTENCE_ENABLED=true
 DATABASE_URL=postgres://deopt:deopt@127.0.0.1:5432/deopt_v2_backend
 ```
 
-When enabled, the service connects to Postgres at startup and runs migrations from `migrations/`. Migrations create `used_nonces`, `orders`, `trades`, `execution_intents`, `execution_intent_signatures`, `execution_simulations`, `engine_events`, `indexer_cursors`, `indexed_perp_trades`, `execution_reconciliations`, `execution_transactions`, `option_series`, `option_orders`, `option_fills`, `option_rfqs`, `option_rfq_quotes`, and `option_rfq_fills`. RFQ signed quotes add nullable `signature`, `quote_digest`, `quote_nonce`, `signature_status`, and `recovered_signer` fields to `rfq_quotes`. Signed option RFQ quotes add the same nullable metadata fields to `option_rfq_quotes`. Confirmation adds nullable `confirmed_at_ms`, `confirmed_block_number`, `confirmation_status`, and `confirmation_error` fields to `execution_transactions`.
+When enabled, the service connects to Postgres at startup and runs migrations from `migrations/`. Migrations create `used_nonces`, `orders`, `trades`, `execution_intents`, `execution_intent_signatures`, `execution_simulations`, `engine_events`, `indexer_cursors`, `indexed_perp_trades`, `execution_reconciliations`, `execution_transactions`, `option_series`, `option_orders`, `option_fills`, `option_rfqs`, `option_rfq_quotes`, `option_rfq_fills`, `mm_accounts`, and `mm_market_permissions`. RFQ signed quotes add nullable `signature`, `quote_digest`, `quote_nonce`, `signature_status`, and `recovered_signer` fields to `rfq_quotes`. Signed option RFQ quotes add the same nullable metadata fields to `option_rfq_quotes`. Confirmation adds nullable `confirmed_at_ms`, `confirmed_block_number`, `confirmation_status`, and `confirmation_error` fields to `execution_transactions`. MM Permissions V1A adds SQL-seeded allowlist and product-scope tables only; it does not add admin write endpoints.
 
 One local setup option:
 
@@ -783,6 +867,7 @@ curl -X DELETE http://127.0.0.1:8080/orders/<order_id>
 - FOK is rejected cleanly.
 - RFQ supports HTTP/dev flow plus basic MM gateway push, quote intake, optional signed quote verification, and wallet challenge MM session auth; multi-leg RFQ, signed taker RFQ requests, MM ranking, and market data datagrams remain deferred.
 - Options V1D/V1C supports manual option series registration, deterministic `option_series_id`, off-chain GTC option orders, price-time matching, fill recording/listing, cancellation, listing/filtering, aggregated option orderbook reads, HTTP/core option RFQs with off-chain RFQ fills, signed MM option RFQ quotes, and MM Gateway option RFQ request/quote/accept notification messages; option execution intents and on-chain option execution remain deferred.
+- MM permissions are SQL-seeded and read-only in the API; frontend permissions UI, admin writes, automatic onboarding, ranking/scoring, incentives/rebates, and on-chain allowlists are deferred.
 - Execution intents are provisional off-chain records, not settlement.
 - Indexed `TradeExecuted` events store `onchain_intent_id` for direct reconciliation only; they do not confirm backend intents.
 - Reconciliation rows link indexed events to intents, but still do not prove transaction ownership, finality, or reorg safety.

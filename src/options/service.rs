@@ -587,6 +587,12 @@ pub async fn submit_option_rfq_quote(
             "option RFQ is not open".to_string(),
         ));
     }
+    crate::mm::permissions::check_can_quote_option_rfq(
+        state,
+        &input.mm_account,
+        &rfq.option_series_id,
+    )
+    .await?;
     if input.size_1e8 > rfq.size_1e8 {
         return Err(BackendError::InvalidOptionRfqQuoteState(
             "option RFQ quote size exceeds requested size".to_string(),

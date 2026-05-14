@@ -205,6 +205,8 @@ pub async fn submit_quote(state: &AppState, input: SubmitQuoteInput) -> Result<R
     let rfq = get_rfq(state, input.rfq_id).await?;
     let now = now_ms();
     validate_open_rfq(&rfq, now)?;
+    crate::mm::permissions::check_can_quote_perp_rfq(state, &input.mm_account, rfq.market_id)
+        .await?;
     if input.size_1e8 > rfq.size_1e8 {
         return Err(BackendError::InvalidRfqQuoteState(
             "quote size exceeds RFQ size".to_string(),

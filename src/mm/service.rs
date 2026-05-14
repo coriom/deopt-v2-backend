@@ -588,6 +588,15 @@ impl MmGatewayService {
                 "quote_replace account does not match authenticated session",
             );
         }
+        if let Err(error) = crate::mm::permissions::check_can_submit_perp_order(
+            &self.state,
+            &payload.account,
+            payload.market_id,
+        )
+        .await
+        {
+            return backend_error_response(request_id, ErrorCode::QuoteReplaceFailed, error);
+        }
 
         let mut cancelled = 0;
         if payload.cancel_previous {
@@ -825,6 +834,13 @@ impl MmGatewayService {
                 "client_order_id is required for MM gateway orders",
             ));
         }
+        crate::mm::permissions::check_can_submit_perp_order(
+            &self.state,
+            &account,
+            payload.market_id,
+        )
+        .await
+        .map_err(|error| protocol_error(ErrorCode::OrderRejected, error))?;
         let open_orders = self
             .live_open_order_count(&account)
             .map_err(|error| protocol_error(ErrorCode::OrderRejected, error))?;
