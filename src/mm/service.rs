@@ -1,11 +1,12 @@
 use super::protocol::{
-    AuthResultPayload, BulkCancelItemResult, BulkCancelPayload, BulkCancelResultPayload,
-    BulkSubmitItemResult, BulkSubmitPayload, BulkSubmitResultPayload, CancelAllPayload,
-    CancelAllResultPayload, CancelOrderPayload, CancelOrderResultPayload, ClientMessage, ErrorCode,
-    GetSessionResultPayload, HeartbeatResultPayload, OptionRfqQuotePayload,
-    OptionRfqQuoteResultPayload, ProtocolError, QuoteLegPayload, QuoteReplaceLegResult,
-    QuoteReplacePayload, QuoteReplaceResultPayload, ResultEnvelope, RfqQuotePayload,
-    RfqQuoteResultPayload, ServerMessage, SubmitOrderPayload, SubmitOrderResultPayload,
+    AuthChallengeResultPayload, AuthResultPayload, AuthVerifyResultPayload, BulkCancelItemResult,
+    BulkCancelPayload, BulkCancelResultPayload, BulkSubmitItemResult, BulkSubmitPayload,
+    BulkSubmitResultPayload, CancelAllPayload, CancelAllResultPayload, CancelOrderPayload,
+    CancelOrderResultPayload, ClientMessage, ErrorCode, GetSessionResultPayload,
+    HeartbeatResultPayload, OptionRfqQuotePayload, OptionRfqQuoteResultPayload, ProtocolError,
+    QuoteLegPayload, QuoteReplaceLegResult, QuoteReplacePayload, QuoteReplaceResultPayload,
+    ResultEnvelope, RfqQuotePayload, RfqQuoteResultPayload, ServerMessage, SubmitOrderPayload,
+    SubmitOrderResultPayload,
 };
 use super::rate_limit::{
     check_cancels_per_bulk, check_in_flight, check_message_rate, check_open_orders,
@@ -21,8 +22,11 @@ use crate::orders::service::{
     CancelRestingFilter, SubmitOrderOutcome,
 };
 use crate::rfq::service::{submit_quote as submit_rfq_quote, SubmitQuoteInput};
+use crate::signing::eip712::parse_evm_address;
+use crate::signing::recover_personal_signer;
 use crate::signing::SignedOrder;
 use crate::types::{AccountId, MarketId, Side, TimeInForce, TimestampMs};
+use crate::{execution::transaction::hex_0x, mm::AuthMode};
 use std::collections::BTreeSet;
 use tracing::info;
 
@@ -44,6 +48,9 @@ impl MmGatewayService {
         now_ms: TimestampMs,
     ) -> ServerMessage {
         let request_id = message.request_id().to_string();
+        if !matches!(&message, ClientMessage::AuthVerify(_)) {
+            session.clear_expired_challenge(now_ms);
+        }
 
         if let Some(response) = decision_to_error(
             &request_id,
@@ -67,6 +74,14 @@ impl MmGatewayService {
         session.increment_in_flight();
         let response = match message {
             ClientMessage::Auth(envelope) => {
+                if self.config.auth_mode == AuthMode::WalletChallenge {
+                    session.decrement_in_flight();
+                    return ServerMessage::error(
+                        envelope.request_id,
+                        ErrorCode::AuthFailed,
+                        "auth message is disabled when MM_GATEWAY_AUTH_MODE=wallet_challenge",
+                    );
+                }
                 if let Some(account) = envelope.payload.account {
                     session.bind_account(account);
                 }
@@ -83,6 +98,19 @@ impl MmGatewayService {
                     },
                 ))
             }
+            ClientMessage::AuthChallenge(envelope) => self.handle_auth_challenge(
+                session,
+                envelope.request_id,
+                envelope.payload.account,
+                now_ms,
+            ),
+            ClientMessage::AuthVerify(envelope) => self.handle_auth_verify(
+                session,
+                envelope.request_id,
+                envelope.payload.account,
+                envelope.payload.signature,
+                now_ms,
+            ),
             ClientMessage::Heartbeat(envelope) => {
                 session.update_heartbeat(now_ms);
                 ServerMessage::HeartbeatResult(ResultEnvelope::new(
@@ -200,6 +228,156 @@ impl MmGatewayService {
 
     pub fn active_sessions(&self) -> crate::error::Result<Vec<super::PublicSessionSnapshot>> {
         self.state.mm_sessions.list_active()
+    }
+
+    fn handle_auth_challenge(
+        &self,
+        session: &mut MmSession,
+        request_id: String,
+        account: AccountId,
+        now_ms: TimestampMs,
+    ) -> ServerMessage {
+        if self.config.auth_mode != AuthMode::WalletChallenge {
+            return ServerMessage::error(
+                request_id,
+                ErrorCode::AuthFailed,
+                "wallet challenge auth is disabled",
+            );
+        }
+        if session.authenticated {
+            return ServerMessage::error(
+                request_id,
+                ErrorCode::AuthFailed,
+                "session is already authenticated",
+            );
+        }
+
+        let account = match canonical_account(&account) {
+            Ok(account) => account,
+            Err(error) => return ServerMessage::error(request_id, error.code, error.message),
+        };
+        let issued_at_ms = now_ms;
+        let expires_at_ms = issued_at_ms.saturating_add(challenge_ttl_i64(&self.config));
+        let nonce = uuid::Uuid::new_v4().to_string();
+        let challenge = mm_auth_challenge_string(
+            &session.session_id,
+            &account,
+            self.state.chain_id,
+            issued_at_ms,
+            expires_at_ms,
+            &nonce,
+        );
+        session.set_challenge(account.clone(), nonce, issued_at_ms, expires_at_ms);
+
+        ServerMessage::AuthChallengeResult(ResultEnvelope::new(
+            "auth_challenge_result",
+            request_id,
+            AuthChallengeResultPayload {
+                session_id: session.session_id.clone(),
+                account,
+                challenge,
+                issued_at_ms,
+                expires_at_ms,
+            },
+        ))
+    }
+
+    fn handle_auth_verify(
+        &self,
+        session: &mut MmSession,
+        request_id: String,
+        account: AccountId,
+        signature: String,
+        now_ms: TimestampMs,
+    ) -> ServerMessage {
+        if self.config.auth_mode != AuthMode::WalletChallenge {
+            return ServerMessage::error(
+                request_id,
+                ErrorCode::AuthFailed,
+                "wallet challenge auth is disabled",
+            );
+        }
+
+        let account = match canonical_account(&account) {
+            Ok(account) => account,
+            Err(error) => return ServerMessage::error(request_id, error.code, error.message),
+        };
+        let Some(challenge_account) = session.challenge_account.clone() else {
+            return ServerMessage::error(
+                request_id,
+                ErrorCode::AuthFailed,
+                "auth challenge missing",
+            );
+        };
+        if !accounts_equal(&challenge_account, &account) {
+            return ServerMessage::error(
+                request_id,
+                ErrorCode::AuthFailed,
+                "auth_verify account does not match active challenge",
+            );
+        }
+        let Some(nonce) = session.challenge_nonce.clone() else {
+            return ServerMessage::error(
+                request_id,
+                ErrorCode::AuthFailed,
+                "auth challenge missing",
+            );
+        };
+        let Some(issued_at_ms) = session.challenge_issued_at_ms else {
+            return ServerMessage::error(
+                request_id,
+                ErrorCode::AuthFailed,
+                "auth challenge missing",
+            );
+        };
+        let Some(expires_at_ms) = session.challenge_expires_at_ms else {
+            return ServerMessage::error(
+                request_id,
+                ErrorCode::AuthFailed,
+                "auth challenge missing",
+            );
+        };
+        if now_ms > expires_at_ms {
+            session.clear_challenge();
+            return ServerMessage::error(
+                request_id,
+                ErrorCode::AuthFailed,
+                "auth challenge expired",
+            );
+        }
+
+        let challenge = mm_auth_challenge_string(
+            &session.session_id,
+            &account,
+            self.state.chain_id,
+            issued_at_ms,
+            expires_at_ms,
+            &nonce,
+        );
+        let recovered = match recover_personal_signer(&challenge, &signature) {
+            Ok(recovered) => recovered,
+            Err(error) => {
+                return ServerMessage::error(request_id, ErrorCode::AuthFailed, error.to_string());
+            }
+        };
+        if !accounts_equal(&recovered, &account) {
+            return ServerMessage::error(
+                request_id,
+                ErrorCode::AuthFailed,
+                "auth signature signer does not match account",
+            );
+        }
+
+        session.bind_account(account.clone());
+        ServerMessage::AuthVerifyResult(ResultEnvelope::new(
+            "auth_verify_result",
+            request_id,
+            AuthVerifyResultPayload {
+                session_id: session.session_id.clone(),
+                authenticated: true,
+                account,
+            },
+        ))
     }
 
     async fn handle_submit_order(
@@ -805,18 +983,50 @@ fn submit_result_payload(outcome: SubmitOrderOutcome) -> SubmitOrderResultPayloa
 
 fn session_account(session: &mut MmSession, account: Option<AccountId>) -> Option<AccountId> {
     match (session.account.clone(), account) {
-        (Some(session_account), Some(payload_account)) if session_account == payload_account => {
+        (Some(session_account), Some(payload_account))
+            if accounts_equal(&session_account, &payload_account) =>
+        {
             Some(session_account)
         }
         (Some(_), Some(_)) => None,
         (Some(session_account), None) => Some(session_account),
-        (None, Some(payload_account)) if !session.authenticated => {
+        (None, Some(payload_account))
+            if !session.authenticated && session.auth_mode == AuthMode::Disabled =>
+        {
             session.bind_account(payload_account.clone());
             Some(payload_account)
         }
         (None, Some(payload_account)) => Some(payload_account),
         (None, None) => None,
     }
+}
+
+fn canonical_account(account: &AccountId) -> Result<AccountId, ProtocolError> {
+    let bytes =
+        parse_evm_address(account).map_err(|error| protocol_error(ErrorCode::AuthFailed, error))?;
+    Ok(AccountId::new(hex_0x(&bytes)))
+}
+
+fn accounts_equal(left: &AccountId, right: &AccountId) -> bool {
+    left.0.eq_ignore_ascii_case(&right.0)
+}
+
+fn challenge_ttl_i64(config: &MmGatewayConfig) -> TimestampMs {
+    TimestampMs::try_from(config.challenge_ttl_ms).unwrap_or(TimestampMs::MAX)
+}
+
+pub fn mm_auth_challenge_string(
+    session_id: &str,
+    account: &AccountId,
+    chain_id: u64,
+    issued_at_ms: TimestampMs,
+    expires_at_ms: TimestampMs,
+    nonce: &str,
+) -> String {
+    format!(
+        "DeOpt v2 MM Gateway Authentication\n\nsession_id: {session_id}\naccount: {}\nchain_id: {chain_id}\nissued_at_ms: {issued_at_ms}\nexpires_at_ms: {expires_at_ms}\nnonce: {nonce}",
+        account.0
+    )
 }
 
 fn protocol_error(code: ErrorCode, error: BackendError) -> ProtocolError {

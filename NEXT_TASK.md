@@ -1,329 +1,260 @@
-# NEXT_TASK.md — Monitoring/Admin V1A: Read-only Operational Observability
+# NEXT_TASK.md — Production MM Auth V1A: Wallet Challenge Sessions
 
 ## Context
 
-The backend now has many validated protocol flows:
+The backend now supports:
 
-Perps:
-- order intake
-- execution intents
-- signing payloads
-- simulation
-- guarded broadcast
-- indexer
-- reconciliation
-- confirmation/finality
-- nonce sync
-
-Market makers:
 - WebTransport MM Gateway
-- sessions
-- heartbeat/get_session
-- live order/cancel/quote_replace
-- cancel-on-disconnect
-
-RFQ:
-- perp RFQ core
+- MM session registry
 - perp RFQ over WebTransport
 - signed perp RFQ quotes
-
-Options:
-- option series registry
-- option orders
-- option orderbook aggregation
-- off-chain option matching
-- option fills
-- option RFQ HTTP/core
 - option RFQ over WebTransport
-- signed option RFQ quotes strict mode
+- signed option RFQ quotes
+- read-only admin monitoring
+- frontend admin dashboard
 
-The protocol layer is now broad enough that operational visibility is required before serious frontend/admin work.
+Current weakness:
+
+MM Gateway has been runtime-tested with auth disabled. Quotes can be signed, but the transport session itself is not cryptographically bound to a wallet/account in production mode.
 
 ## Goal
 
-Implement Monitoring/Admin V1A: read-only backend operational observability.
+Implement Production MM Auth V1A.
 
-Add safe read-only endpoints and lightweight metrics/snapshots for:
+A WebTransport MM session must authenticate by signing a server-issued challenge.
 
-- backend health/readiness
-- database connectivity
-- configured feature flags
-- MM Gateway sessions
-- RFQ/order/fill counts
-- execution lifecycle status
-- recent errors/events if available
-- recent execution simulations/transactions/confirmations
-- recent option RFQs/fills/orders
-- recent perp RFQs/execution intents
+After authentication:
 
-This task must not add dangerous admin writes.
+- session is bound to a wallet address / mm_account
+- gateway messages requiring an account must match the authenticated account
+- admin session snapshots show authenticated/account state
+- unauthenticated sessions can only call heartbeat/get_session/auth messages
+- existing disabled/dev auth mode remains available for local tests
 
 ## Non-Goals
 
 Do not implement:
 
-- frontend
-- admin mutation endpoints
-- risk parameter editing
-- market maker permission management
-- production auth
-- Prometheus exporter if too broad
-- external alerting integrations
-- Grafana dashboards
-- Slack/Telegram alerts
-- on-chain writes
+- frontend auth UI
+- admin write controls
+- MM permissions per market/series
+- API keys
+- OAuth
+- production user auth
 - Solidity changes
 - deployments
+- auto-broadcast
+- trading logic changes
 
-## Absolute Safety Rules
+## Safety Rules
 
 Do not:
 
 - modify Solidity
 - deploy contracts
 - enable real broadcast by default
-- call /executor/broadcast
-- create execution intents
-- create RFQs
-- create option orders
-- mutate DB state except migrations if needed
 - expose private keys
-- expose secrets
-- expose full env
+- log challenge signatures as secrets if avoidable
+- break existing disabled auth tests
+- require live RPC/Postgres/WebTransport/private keys for normal cargo test
 - commit
 - push
 
-Admin/monitoring endpoints must be read-only.
+## Auth Modes
 
-## API Scope
+Extend current MM gateway auth config.
 
-Add endpoints under:
+Supported modes:
 
 ```text
-GET /admin/status
-GET /admin/config
-GET /admin/db
-GET /admin/mm/sessions
-GET /admin/execution/summary
-GET /admin/rfq/summary
-GET /admin/options/summary
-GET /admin/recent
+disabled
+wallet_challenge
 
-If /admin namespace conflicts with current routing, use /ops.
+If current config already has auth mode strings, extend safely.
 
-Security
+Config:
 
-For V1A, keep endpoints local/dev-oriented.
-
-Add config:
-
-ADMIN_API_ENABLED=false
-ADMIN_API_REQUIRE_TOKEN=false
-ADMIN_API_TOKEN=
+MM_GATEWAY_AUTH_MODE=disabled
+MM_GATEWAY_REQUIRE_AUTH=false
+MM_GATEWAY_CHALLENGE_TTL_MS=60000
 
 Behavior:
 
-if disabled, admin endpoints return clear disabled error
-if enabled and token required, require header:
-X-Admin-Token: <token>
-never log token
-never expose token in responses
-normal tests must not require token unless testing token path
+disabled
+preserves current local/dev behavior
+existing tests keep passing
+wallet_challenge
+session starts unauthenticated
+session can request challenge
+server returns challenge payload
+client signs challenge
+server verifies signature
+session becomes authenticated and bound to recovered address
 
-Do not implement complex auth yet.
+If MM_GATEWAY_REQUIRE_AUTH=true:
 
-GET /admin/status
+order/quote/RFQ messages require authenticated session
+account fields must equal authenticated account
+Protocol Messages
 
-Return high-level status:
+Add client messages:
 
 {
-  "service": "deopt-v2-backend",
+  "type": "auth_challenge",
+  "request_id": "auth-1",
+  "payload": {
+    "account": "0x..."
+  }
+}
+
+Server response:
+
+{
+  "type": "auth_challenge_result",
+  "request_id": "auth-1",
   "ok": true,
-  "timestamp_ms": 1770000000000,
-  "network": "base-sepolia",
-  "chain_id": 84532,
-  "persistence_enabled": true,
-  "execution_enabled": false,
-  "real_broadcast_enabled": false,
-  "indexer_enabled": false,
-  "reconciliation_enabled": true,
-  "confirmation_enabled": false,
-  "mm_gateway_enabled": false,
-  "rfq_enabled": true,
-  "options_enabled": true,
-  "option_rfq_enabled": true
+  "payload": {
+    "session_id": "...",
+    "account": "0x...",
+    "challenge": "...",
+    "issued_at_ms": 1770000000000,
+    "expires_at_ms": 1770000060000
+  }
 }
 
-Do not expose secrets or raw RPC URLs if they contain keys.
-
-GET /admin/config
-
-Return sanitized config.
-
-Include:
-
-network
-chain_id
-enabled feature flags
-contract addresses if already public config
-RPC configured boolean, not raw RPC URL
-database configured boolean, not password
-WebTransport host/port if enabled
-signature modes
-RFQ TTL/max settings
-option settings
-
-Must redact:
-
-private keys
-DB password
-RPC provider key if present
-admin token
-any secret env
-GET /admin/db
-
-If persistence enabled:
-
-ping DB
-return migration status if easy
-return counts by important tables
-
-Suggested counts:
-
-orders
-used_nonces
-execution_intents
-execution_simulations
-execution_transactions
-indexed_perp_trades
-reconciliations
-rfqs
-rfq_quotes
-option_series
-option_orders
-option_fills
-option_rfqs
-option_rfq_quotes
-option_rfq_fills
-
-If a table does not exist in older DB, handle gracefully or document.
-
-GET /admin/mm/sessions
-
-Return MM session snapshots.
-
-For each session:
+Add client message:
 
 {
-  "session_id": "...",
-  "authenticated": false,
-  "account": "0x...",
-  "connected_at_ms": 1770000000000,
-  "last_heartbeat_at_ms": 1770000000000,
-  "open_client_order_ids_count": 3,
-  "cancel_on_disconnect": true
+  "type": "auth_verify",
+  "request_id": "auth-2",
+  "payload": {
+    "account": "0x...",
+    "signature": "0x..."
+  }
 }
 
-Do not expose internals that are not useful.
-
-If gateway disabled, return enabled=false and empty sessions.
-
-GET /admin/execution/summary
-
-Return:
-
-count pending execution intents
-count signed/calldata-ready intents if available
-count simulations ok/failed
-count submitted txs
-count confirmed txs
-recent failed simulations with decoded_error if available
-recent unconfirmed txs
-recent confirmation errors
-
-Use repository queries if persistence enabled.
-
-If persistence disabled, return in-memory summary if available.
-
-GET /admin/rfq/summary
-
-Return perp RFQ summary:
-
-count rfqs by status
-count quotes by status
-count signed/verified quotes if metadata exists
-recent accepted RFQs
-recent rejected/expired if easy
-GET /admin/options/summary
-
-Return options summary:
-
-option series count by status
-option orders count by status
-option fills count
-option RFQs count by status
-option RFQ quotes count by status/signature_status
-recent option RFQ fills
-recent option order fills
-GET /admin/recent
-
-Return compact recent operational events from existing DB tables.
-
-Possible sections:
+Server response:
 
 {
-  "execution_intents": [...],
-  "simulations": [...],
-  "transactions": [...],
-  "rfqs": [...],
-  "option_rfqs": [...],
-  "option_fills": [...]
+  "type": "auth_verify_result",
+  "request_id": "auth-2",
+  "ok": true,
+  "payload": {
+    "session_id": "...",
+    "authenticated": true,
+    "account": "0x..."
+  }
 }
+Challenge Format
 
-Limit default: 20.
+Use a deterministic human-readable challenge string.
 
-Support query:
+Suggested:
 
-?limit=20
+DeOpt v2 MM Gateway Authentication
 
-Hard cap: 100.
+session_id: <session_id>
+account: <account>
+chain_id: <chain_id>
+issued_at_ms: <issued_at_ms>
+expires_at_ms: <expires_at_ms>
+nonce: <random_nonce>
 
-Internal Metrics / Repository
+Hash/signing approach:
 
-Add repository helpers if needed.
+Use Ethereum personal sign style if existing helpers support it.
+Or use EIP-712 if existing signing helpers make it easy.
+Prefer the simplest reliable path consistent with existing signature recovery utilities.
 
-Prefer simple SQL aggregate queries.
+Document exact signing format.
 
-Avoid heavy joins.
+Session State
 
-Avoid N+1 queries if obvious.
+Extend MM session with:
 
-All admin queries should be safe and bounded.
+auth_mode
+authenticated
+account
+challenge_nonce
+challenge_issued_at_ms
+challenge_expires_at_ms
+
+Do not expose raw signatures in session snapshots.
+
+Message Enforcement
+
+When auth required:
+
+Allow unauthenticated:
+
+heartbeat
+get_session
+auth_challenge
+auth_verify
+
+Reject unauthenticated:
+
+submit_order
+bulk_submit
+cancel_order
+bulk_cancel
+cancel_all
+quote_replace
+rfq_quote
+option_rfq_quote
+
+Account-bound checks:
+
+submit_order.account must equal session.account
+cancel account if present must match session.account
+rfq_quote.mm_account must equal session.account
+option_rfq_quote.mm_account must equal session.account
+
+Use case-insensitive address comparison.
+
+Admin Impact
+
+Update /admin/mm/sessions to show:
+
+authenticated
+account
+auth_mode
+challenge_active boolean
+challenge_expires_at_ms optional
+
+Do not expose challenge string or signatures.
+
+Smoke Client
+
+Extend mm_wt_smoke.rs with optional auth mode if useful:
+
+MM_PRIVATE_KEY=0x... cargo run --bin mm_wt_smoke -- auth
+
+or integrate into existing RFQ smoke modes if auth env is enabled.
+
+No private key should be printed.
 
 Tests
 
-Normal cargo test must be offline.
+Normal cargo test must remain offline.
 
 Add tests for:
 
-admin disabled returns clear error
-admin enabled status works
-admin token required rejects missing token
-admin token required accepts valid token
-config endpoint redacts secrets
-db endpoint handles persistence disabled
-db endpoint counts known in-memory or mock state if feasible
-mm sessions endpoint returns empty when gateway disabled
-mm sessions endpoint returns mock/session snapshot if existing registry supports it
-execution summary returns valid empty summary
-options summary returns valid empty summary
-rfq summary returns valid empty summary
-recent endpoint respects limit cap
-no endpoint mutates state
-existing perp/RFQ/MM/options tests still pass
-
-Do not require live Postgres for normal tests.
-
+auth challenge creation
+challenge contains expected account/session/expiry
+auth verify accepts valid signature
+auth verify rejects missing challenge
+auth verify rejects expired challenge
+auth verify rejects signer mismatch
+require_auth rejects unauthenticated submit_order
+require_auth rejects unauthenticated rfq_quote
+require_auth rejects unauthenticated option_rfq_quote
+authenticated submit_order account must match session account
+authenticated rfq_quote mm_account must match session account
+authenticated option_rfq_quote mm_account must match session account
+disabled mode preserves old behavior
+admin session snapshot shows authenticated/account but not challenge/signature
+existing MM/RFQ/options tests still pass
 Documentation
 
 Update:
@@ -334,17 +265,14 @@ ARCHITECTURE.md
 
 Document:
 
-admin API purpose
-endpoints
-read-only scope
-token config
-redaction rules
-operational use
-future Monitoring/Admin V1B:
-Prometheus metrics
-structured event log
-external alerts
-frontend admin dashboard
+auth modes
+challenge flow
+signing format
+local dev disabled mode
+production wallet_challenge mode
+account binding
+admin session visibility
+future MM permissions
 Validation
 
 Run:
@@ -357,12 +285,14 @@ Acceptance Criteria
 
 Complete only if:
 
-admin config exists
-endpoints exist
-endpoints are read-only
-secrets are redacted
-token guard works
-status/config/db/mm/execution/rfq/options/recent endpoints work
+wallet challenge auth mode exists
+challenge/verify messages exist
+valid signatures authenticate session
+invalid/expired/mismatch signatures reject
+required-auth blocks unauthenticated quote/order messages
+authenticated account binding enforced
+disabled mode still works
+admin sessions show sanitized auth state
 normal tests offline
 docs updated
 cargo fmt passes
@@ -370,13 +300,11 @@ cargo clippy passes
 cargo test passes
 cargo build passes
 Deferred
-frontend dashboard
-Prometheus exporter
-Grafana dashboard
-external alerts
-production auth
-admin write controls
-risk admin controls
+MM permissions per market/option_series
+admin write controls for allowlists
+frontend MM auth UI
+API key auth
+production user auth
 EOF
 
 

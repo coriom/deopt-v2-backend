@@ -303,7 +303,8 @@ async fn admin_config(
             "heartbeat_timeout_ms": state.mm_gateway_config.heartbeat_timeout_ms,
             "cancel_on_disconnect": state.mm_gateway_config.cancel_on_disconnect,
             "auth_mode": state.mm_gateway_config.auth_mode,
-            "require_auth": state.mm_gateway_config.require_auth
+            "require_auth": state.mm_gateway_config.require_auth,
+            "challenge_ttl_ms": state.mm_gateway_config.challenge_ttl_ms
         },
         "rfq": {
             "enabled": state.rfq_config.enabled,
@@ -387,6 +388,9 @@ async fn admin_mm_sessions(
                 "session_id": session.session_id,
                 "authenticated": session.authenticated,
                 "account": session.account,
+                "auth_mode": session.auth_mode,
+                "challenge_active": session.challenge_active,
+                "challenge_expires_at_ms": session.challenge_expires_at_ms,
                 "connected_at_ms": session.connected_at_ms,
                 "last_heartbeat_at_ms": session.last_heartbeat_at_ms,
                 "open_client_order_ids_count": session.open_client_order_ids.len(),
@@ -3337,14 +3341,21 @@ mod tests {
         let mut state = admin_state(false);
         state.mm_gateway_config = MmGatewayConfig {
             enabled: true,
+            auth_mode: AuthMode::WalletChallenge,
             ..MmGatewayConfig::default()
         };
         let mut session = MmSession::with_ids(
             "session-admin-1",
             "connection-admin-1",
             123,
-            AuthMode::Disabled,
+            AuthMode::WalletChallenge,
             true,
+        );
+        session.set_challenge(
+            AccountId::new("0x0000000000000000000000000000000000000001"),
+            "secret-nonce-not-exposed".to_string(),
+            124,
+            60_124,
         );
         session.register_open_client_order_id("order-a");
         session.register_open_client_order_id("order-b");
@@ -3360,9 +3371,15 @@ mod tests {
         let json = response_json(response).await;
         assert_eq!(json["enabled"], true);
         assert_eq!(json["sessions"][0]["session_id"], "session-admin-1");
+        assert_eq!(json["sessions"][0]["authenticated"], false);
+        assert_eq!(json["sessions"][0]["auth_mode"], "wallet_challenge");
+        assert_eq!(json["sessions"][0]["challenge_active"], true);
+        assert_eq!(json["sessions"][0]["challenge_expires_at_ms"], 60_124);
         assert_eq!(json["sessions"][0]["open_client_order_ids_count"], 2);
         assert!(json["sessions"][0].get("open_client_order_ids").is_none());
         assert!(json["sessions"][0].get("connection_id").is_none());
+        assert!(json["sessions"][0].get("challenge").is_none());
+        assert!(json["sessions"][0].get("challenge_nonce").is_none());
     }
 
     #[tokio::test]

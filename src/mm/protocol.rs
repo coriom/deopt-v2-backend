@@ -51,6 +51,8 @@ impl fmt::Display for ProtocolError {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ClientMessage {
     Auth(ClientEnvelope<AuthPayload>),
+    AuthChallenge(ClientEnvelope<AuthChallengePayload>),
+    AuthVerify(ClientEnvelope<AuthVerifyPayload>),
     Heartbeat(ClientEnvelope<HeartbeatPayload>),
     SubmitOrder(ClientEnvelope<SubmitOrderPayload>),
     BulkSubmit(ClientEnvelope<BulkSubmitPayload>),
@@ -67,6 +69,8 @@ impl ClientMessage {
     pub fn request_id(&self) -> &str {
         match self {
             Self::Auth(envelope) => &envelope.request_id,
+            Self::AuthChallenge(envelope) => &envelope.request_id,
+            Self::AuthVerify(envelope) => &envelope.request_id,
             Self::Heartbeat(envelope) => &envelope.request_id,
             Self::SubmitOrder(envelope) => &envelope.request_id,
             Self::BulkSubmit(envelope) => &envelope.request_id,
@@ -83,6 +87,8 @@ impl ClientMessage {
     pub fn message_type(&self) -> &'static str {
         match self {
             Self::Auth(_) => "auth",
+            Self::AuthChallenge(_) => "auth_challenge",
+            Self::AuthVerify(_) => "auth_verify",
             Self::Heartbeat(_) => "heartbeat",
             Self::SubmitOrder(_) => "submit_order",
             Self::BulkSubmit(_) => "bulk_submit",
@@ -99,7 +105,11 @@ impl ClientMessage {
     pub fn requires_auth(&self) -> bool {
         !matches!(
             self,
-            Self::Auth(_) | Self::Heartbeat(_) | Self::GetSession(_)
+            Self::Auth(_)
+                | Self::AuthChallenge(_)
+                | Self::AuthVerify(_)
+                | Self::Heartbeat(_)
+                | Self::GetSession(_)
         )
     }
 }
@@ -133,6 +143,8 @@ struct RawClientEnvelope {
 fn parse_raw_client_envelope(raw: RawClientEnvelope) -> Result<ClientMessage, ProtocolError> {
     match raw.message_type.as_str() {
         "auth" => Ok(ClientMessage::Auth(parse_payload(raw)?)),
+        "auth_challenge" => Ok(ClientMessage::AuthChallenge(parse_payload(raw)?)),
+        "auth_verify" => Ok(ClientMessage::AuthVerify(parse_payload(raw)?)),
         "heartbeat" => Ok(ClientMessage::Heartbeat(parse_payload(raw)?)),
         "submit_order" => Ok(ClientMessage::SubmitOrder(parse_payload(raw)?)),
         "bulk_submit" => Ok(ClientMessage::BulkSubmit(parse_payload(raw)?)),
@@ -168,6 +180,17 @@ pub struct AuthPayload {
     pub account: Option<AccountId>,
     pub token: Option<String>,
     pub cancel_on_disconnect: Option<bool>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+pub struct AuthChallengePayload {
+    pub account: AccountId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+pub struct AuthVerifyPayload {
+    pub account: AccountId,
+    pub signature: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Default, Deserialize)]
@@ -267,6 +290,22 @@ pub struct AuthResultPayload {
     pub authenticated: bool,
     pub account: Option<AccountId>,
     pub auth_mode: super::session::AuthMode,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct AuthChallengeResultPayload {
+    pub session_id: String,
+    pub account: AccountId,
+    pub challenge: String,
+    pub issued_at_ms: TimestampMs,
+    pub expires_at_ms: TimestampMs,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct AuthVerifyResultPayload {
+    pub session_id: String,
+    pub authenticated: bool,
+    pub account: AccountId,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -431,6 +470,8 @@ pub struct GetSessionResultPayload {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ServerMessage {
     AuthResult(ResultEnvelope<AuthResultPayload>),
+    AuthChallengeResult(ResultEnvelope<AuthChallengeResultPayload>),
+    AuthVerifyResult(ResultEnvelope<AuthVerifyResultPayload>),
     HeartbeatResult(ResultEnvelope<HeartbeatResultPayload>),
     SubmitOrderResult(ResultEnvelope<SubmitOrderResultPayload>),
     BulkSubmitResult(ResultEnvelope<BulkSubmitResultPayload>),
@@ -473,6 +514,8 @@ impl Serialize for ServerMessage {
     {
         match self {
             Self::AuthResult(envelope) => envelope.serialize(serializer),
+            Self::AuthChallengeResult(envelope) => envelope.serialize(serializer),
+            Self::AuthVerifyResult(envelope) => envelope.serialize(serializer),
             Self::HeartbeatResult(envelope) => envelope.serialize(serializer),
             Self::SubmitOrderResult(envelope) => envelope.serialize(serializer),
             Self::BulkSubmitResult(envelope) => envelope.serialize(serializer),

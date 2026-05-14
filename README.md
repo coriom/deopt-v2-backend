@@ -94,6 +94,7 @@ MM_GATEWAY_MAX_OPEN_ORDERS_PER_ACCOUNT=500
 MM_GATEWAY_CANCEL_ON_DISCONNECT=true
 MM_GATEWAY_AUTH_MODE=disabled
 MM_GATEWAY_REQUIRE_AUTH=false
+MM_GATEWAY_CHALLENGE_TTL_MS=60000
 ADMIN_API_ENABLED=false
 ADMIN_API_REQUIRE_TOKEN=false
 ADMIN_API_TOKEN=
@@ -112,6 +113,7 @@ ADMIN_API_TOKEN=
 `RFQ_QUOTE_SIGNATURE_MODE=disabled` preserves the unsigned RFQ V1B flow. `strict` requires each RFQ quote to include a valid EIP-712 `RFQQuote` signature whose recovered signer equals `mm_account`.
 `OPTIONS_ENABLED=false` and `OPTION_RFQ_ENABLED=false` are the safe defaults. When either options persistence gate is true and its feature is enabled, startup requires `PERSISTENCE_ENABLED=true`. Test and development code can run option series, off-chain option orders, matching, fills, and option RFQs in memory with persistence disabled. `OPTION_RFQ_QUOTE_SIGNATURE_MODE=disabled` preserves the unsigned Option RFQ V1B flow. `strict` requires each option RFQ quote to include `quote_nonce` and a valid EIP-712 `OptionRFQQuote` signature whose recovered signer equals `mm_account`.
 `MM_GATEWAY_ENABLED=false` is the safe default. When `true`, V1C starts a separate WebTransport UDP listener and requires `MM_GATEWAY_CERT_PATH` and `MM_GATEWAY_KEY_PATH`. It can submit and cancel off-chain perp orders through the live in-memory orderbook, handle perp RFQ and option RFQ messages when those features are enabled, but it does not auto-broadcast, sign, simulate, index, reconcile, or confirm execution intents.
+`MM_GATEWAY_AUTH_MODE=disabled` preserves local/dev behavior. `wallet_challenge` enables server-issued Ethereum personal-sign challenges. When `MM_GATEWAY_REQUIRE_AUTH=true`, unauthenticated sessions may only use `heartbeat`, `get_session`, `auth_challenge`, and `auth_verify`; trading, quote, and RFQ messages require an authenticated wallet session and account fields must match that wallet address case-insensitively. `MM_GATEWAY_CHALLENGE_TTL_MS` controls challenge expiry.
 `ADMIN_API_ENABLED=false` is the safe default for Monitoring/Admin V1A. When enabled, `/admin/*` exposes read-only operational observability only. If `ADMIN_API_REQUIRE_TOKEN=true`, requests must include `X-Admin-Token: <ADMIN_API_TOKEN>`. The token is never returned by the API, and admin config responses expose booleans such as `rpc_configured` and `database_configured` instead of raw RPC URLs, database URLs, private keys, or tokens.
 
 ## Monitoring/Admin V1A
@@ -135,7 +137,7 @@ All admin endpoints are disabled unless `ADMIN_API_ENABLED=true`. When token pro
 
 `/admin/db` pings Postgres and reports migration/count metadata only when persistence is enabled. With persistence disabled, it returns a clear disabled/offline shape. Count queries are aggregate-only and handle missing older tables as unavailable in the DB count response.
 
-`/admin/mm/sessions` returns sanitized active MM session snapshots. It reports session id, auth/account fields, heartbeat timestamps, `cancel_on_disconnect`, and open-client-order count, but not connection internals or full client-order id lists. If the gateway is disabled, it returns `enabled=false` with an empty session list.
+`/admin/mm/sessions` returns sanitized active MM session snapshots. It reports session id, auth mode, authenticated/account fields, challenge-active state and challenge expiry, heartbeat timestamps, `cancel_on_disconnect`, and open-client-order count, but not connection internals, challenge strings, signatures, nonces, or full client-order id lists. If the gateway is disabled, it returns `enabled=false` with an empty session list.
 
 `/admin/execution/summary`, `/admin/rfq/summary`, `/admin/options/summary`, and `/admin/recent` provide compact bounded summaries from Postgres when persistence is enabled and in-memory summaries otherwise. `/admin/recent` defaults to `limit=20` and caps at `100`.
 
@@ -284,7 +286,7 @@ POST /executor/simulate/:intent_id
 POST /executor/broadcast/:intent_id
 ```
 
-Broadcast remains disabled unless the existing explicit broadcast gates are enabled. RFQ acceptance never fabricates signatures, transaction hashes, confirmations, or finality. If the accepted quote or rejected competing quotes are associated with active MM sessions, the backend sends best-effort WebTransport notifications; notification failure does not revert acceptance. Production MM auth, signed taker RFQ requests, market-maker ranking, multi-leg RFQ, and expiry schedulers remain deferred.
+Broadcast remains disabled unless the existing explicit broadcast gates are enabled. RFQ acceptance never fabricates signatures, transaction hashes, confirmations, or finality. If the accepted quote or rejected competing quotes are associated with active MM sessions, the backend sends best-effort WebTransport notifications; notification failure does not revert acceptance. Signed taker RFQ requests, market-maker ranking, multi-leg RFQ, and expiry schedulers remain deferred.
 
 ## Market Maker Gateway V1A
 
@@ -304,14 +306,36 @@ Success responses use `type="<message>_result"`, the same `request_id`, `ok=true
 
 V1A defines protocol models for `auth`, `heartbeat`, `submit_order`, `bulk_submit`, `cancel_order`, `bulk_cancel`, `cancel_all`, `quote_replace`, and `get_session`. `heartbeat` updates the session timestamp and `get_session` returns a public serializable snapshot containing session id, connection id, optional account, auth mode, heartbeat time, cancel-on-disconnect flag, open client order ids, rate-window counters, and in-flight count.
 
-Gateway auth is shape-only in V1A. The supported default is:
+Gateway wallet auth modes are:
 
 ```text
 MM_GATEWAY_AUTH_MODE=disabled
 MM_GATEWAY_REQUIRE_AUTH=false
+MM_GATEWAY_CHALLENGE_TTL_MS=60000
 ```
 
-In disabled mode, development sessions can process messages without wallet challenge auth when account-bearing payloads include the account. Wallet challenge auth is deferred.
+In disabled mode, development sessions can process messages without wallet challenge auth when account-bearing payloads include the account. In `wallet_challenge` mode, sessions start unauthenticated. A client requests `auth_challenge` with an account, signs the returned challenge string with Ethereum personal-sign semantics, and submits `auth_verify` with the signature. On success the session is bound to the recovered wallet account.
+
+The challenge string is:
+
+```text
+DeOpt v2 MM Gateway Authentication
+
+session_id: <session_id>
+account: <canonical 0x account>
+chain_id: <chain_id>
+issued_at_ms: <issued_at_ms>
+expires_at_ms: <expires_at_ms>
+nonce: <random_nonce>
+```
+
+When `MM_GATEWAY_REQUIRE_AUTH=true`, unauthenticated sessions may only call `heartbeat`, `get_session`, `auth_challenge`, and `auth_verify`. `submit_order`, `bulk_submit`, `cancel_order`, `bulk_cancel`, `cancel_all`, `quote_replace`, `rfq_quote`, and `option_rfq_quote` require authentication, and `account` / `mm_account` fields must equal the authenticated session account using case-insensitive address comparison.
+
+Local WebTransport auth smoke:
+
+```sh
+MM_PRIVATE_KEY=0x... cargo run --bin mm_wt_smoke -- auth
+```
 
 Bulk submit and bulk cancel are partial-result capable and return per-item `ok` / `error` entries. `quote_replace` accepts optional `bid` and `ask` legs plus `cancel_previous`; V1A returns deterministic planned counts and tracks planned client order ids in the session. It does not mutate the live orderbook and does not fabricate backend order ids or matched execution intents.
 
@@ -757,7 +781,7 @@ curl -X DELETE http://127.0.0.1:8080/orders/<order_id>
 - `SIGNATURE_VERIFICATION_MODE=disabled` validates nonce, deadline, and signature shape while skipping cryptographic recovery.
 - `SIGNATURE_VERIFICATION_MODE=strict` verifies the EIP-712 order digest and recovered secp256k1 signer against `account`.
 - FOK is rejected cleanly.
-- RFQ supports HTTP/dev flow plus basic MM gateway push, quote intake, and optional signed quote verification; multi-leg RFQ, signed taker RFQ requests, MM ranking, production auth, and market data datagrams remain deferred.
+- RFQ supports HTTP/dev flow plus basic MM gateway push, quote intake, optional signed quote verification, and wallet challenge MM session auth; multi-leg RFQ, signed taker RFQ requests, MM ranking, and market data datagrams remain deferred.
 - Options V1D/V1C supports manual option series registration, deterministic `option_series_id`, off-chain GTC option orders, price-time matching, fill recording/listing, cancellation, listing/filtering, aggregated option orderbook reads, HTTP/core option RFQs with off-chain RFQ fills, signed MM option RFQ quotes, and MM Gateway option RFQ request/quote/accept notification messages; option execution intents and on-chain option execution remain deferred.
 - Execution intents are provisional off-chain records, not settlement.
 - Indexed `TradeExecuted` events store `onchain_intent_id` for direct reconciliation only; they do not confirm backend intents.
@@ -766,7 +790,7 @@ curl -X DELETE http://127.0.0.1:8080/orders/<order_id>
 - Real broadcast is disabled by default; when enabled it submits only with a real signed raw transaction and never returns fake tx hashes.
 - Indexer V1 stores block hashes when available but does not implement deep reorg rollback.
 - PerpMatchingEngine calldata can be encoded only from complete matched trade payloads and explicit buyer/seller PerpTrade signatures.
-- Optional blockchain RPC includes manual `eth_call` simulation, opt-in indexing, and explicitly gated `eth_sendRawTransaction` broadcast. No production auth, WebSocket API, or options matching.
+- Optional blockchain RPC includes manual `eth_call` simulation, opt-in indexing, and explicitly gated `eth_sendRawTransaction` broadcast. No frontend auth UI, admin write controls, WebSocket API, or on-chain option execution.
 
 ## Deferred Execution Work
 

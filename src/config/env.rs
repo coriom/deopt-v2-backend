@@ -147,6 +147,7 @@ impl AppConfig {
             )?,
             auth_mode: parse_env(&mut lookup, "MM_GATEWAY_AUTH_MODE", "disabled")?,
             require_auth: parse_env(&mut lookup, "MM_GATEWAY_REQUIRE_AUTH", "false")?,
+            challenge_ttl_ms: parse_env(&mut lookup, "MM_GATEWAY_CHALLENGE_TTL_MS", "60000")?,
         };
         let admin = AdminConfig::new(
             parse_env(&mut lookup, "ADMIN_API_ENABLED", "false")?,
@@ -711,6 +712,32 @@ mod tests {
         assert!(config.mm_gateway.cancel_on_disconnect);
         assert_eq!(config.mm_gateway.auth_mode, crate::mm::AuthMode::Disabled);
         assert!(!config.mm_gateway.require_auth);
+        assert_eq!(config.mm_gateway.challenge_ttl_ms, 60_000);
+    }
+
+    #[test]
+    fn mm_gateway_auth_mode_accepts_wallet_challenge() {
+        let config = config_from_pairs([
+            ("PERSISTENCE_ENABLED", "false"),
+            ("MM_GATEWAY_AUTH_MODE", "wallet_challenge"),
+            ("MM_GATEWAY_CHALLENGE_TTL_MS", "120000"),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            config.mm_gateway.auth_mode,
+            crate::mm::AuthMode::WalletChallenge
+        );
+        assert_eq!(config.mm_gateway.challenge_ttl_ms, 120_000);
+    }
+
+    #[test]
+    fn mm_gateway_auth_mode_rejects_invalid_mode() {
+        let error = config_from_pairs([("MM_GATEWAY_AUTH_MODE", "token")]).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("unsupported MM_GATEWAY_AUTH_MODE"));
     }
 
     #[test]

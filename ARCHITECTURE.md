@@ -52,6 +52,7 @@ The long-term backend needs low-latency deterministic matching, RFQ, market-make
 - RFQ V1C guarded by `RFQ_ENABLED=false` and `RFQ_QUOTE_SIGNATURE_MODE=disabled` by default. Enabled mode exposes HTTP/core RFQ creation, quote signing payloads, quote submission/listing, cancellation, WebTransport RFQ push/quote intake through connected MM sessions, optional strict signed quote verification, and acceptance into a pending execution intent without auto-broadcast.
 - Options V1D/V1C guarded by `OPTIONS_ENABLED=false`, `OPTION_RFQ_ENABLED=false`, and `OPTION_RFQ_QUOTE_SIGNATURE_MODE=disabled` by default. Enabled mode exposes manual option series creation/list/get/disable, off-chain GTC option order submit/list/get/cancel, price-time matching, fill listing/get endpoints, aggregated option orderbook reads, HTTP/core option RFQs with off-chain RFQ fills, option RFQ quote signing payloads, optional strict signed MM option RFQ quote verification, and MM Gateway option RFQ request/quote/accept notification messages. Option execution intents, Greeks, IV surfaces, and on-chain option lifecycle are deferred.
 - Market Maker Gateway V1C guarded by `MM_GATEWAY_ENABLED=false` by default. Enabled mode starts a separate WebTransport UDP listener with required TLS cert/key config and routes MM order flow through the live off-chain perp orderbook without auto-broadcasting.
+- Production MM Auth V1A guarded by `MM_GATEWAY_AUTH_MODE=disabled` and `MM_GATEWAY_REQUIRE_AUTH=false` by default. `wallet_challenge` uses server-issued Ethereum personal-sign challenges to bind WebTransport sessions to wallet accounts before trading messages are accepted.
 - Monitoring/Admin V1A guarded by `ADMIN_API_ENABLED=false` by default. Enabled mode exposes read-only `/admin/status`, `/admin/config`, `/admin/db`, `/admin/mm/sessions`, `/admin/execution/summary`, `/admin/rfq/summary`, `/admin/options/summary`, and `/admin/recent` endpoints. The endpoints are local/dev-oriented, optionally require `X-Admin-Token`, sanitize secrets, use bounded read queries, and do not mutate DB rows, RFQs, option state, execution state, or MM sessions.
 
 ## Monitoring/Admin V1A
@@ -212,7 +213,7 @@ Market Maker Gateway RFQ protocol messages:
 - `rfq_quote_accepted`: best-effort notification to the accepted quote session with execution intent id and on-chain intent id.
 - `rfq_quote_rejected`: best-effort notification to active competing quote sessions after another quote wins.
 
-The session registry is transport-neutral and stores active session snapshots plus outbound message channels. WebTransport code only registers/unregisters sessions and writes server-initiated frames; RFQ validation, signature verification, option RFQ validation, persistence, and acceptance behavior stay in RFQ/options/MM service layers. Production MM auth, signed taker RFQ requests, market-maker selection/ranking, multi-leg RFQ, and expiry schedulers remain deferred.
+The session registry is transport-neutral and stores active session snapshots plus outbound message channels. WebTransport code only registers/unregisters sessions and writes server-initiated frames; RFQ validation, signature verification, option RFQ validation, persistence, session auth, and acceptance behavior stay in RFQ/options/MM service layers. Signed taker RFQ requests, market-maker selection/ranking, multi-leg RFQ, and expiry schedulers remain deferred.
 
 ## Perp On-chain Nonce Sync V1
 
@@ -339,9 +340,9 @@ The Market Maker Gateway is the future low-latency market-maker ingress path for
 
 V1A client messages are JSON envelopes with `type`, `request_id`, and `payload`. Success responses use `type="<message>_result"`, `request_id`, `ok=true`, and `payload`. Errors use `type="error"`, `request_id`, `ok=false`, and stable error codes. The defined client message set is `auth`, `heartbeat`, `submit_order`, `bulk_submit`, `cancel_order`, `bulk_cancel`, `cancel_all`, `quote_replace`, and `get_session`.
 
-The session model is transport-neutral and serializable. It tracks `session_id`, `connection_id`, optional `account`, `authenticated`, `auth_mode`, connection and heartbeat timestamps, `cancel_on_disconnect`, open client order ids, per-second message-window counters, and in-flight request count. Pure helpers create sessions, bind accounts after auth, update heartbeat timestamps, detect heartbeat timeout, register/unregister open client order ids, produce cancel-on-disconnect plans, update in-flight count, and return public session snapshots.
+The session model is transport-neutral and serializable. It tracks `session_id`, `connection_id`, optional authenticated `account`, `authenticated`, `auth_mode`, pending challenge account/nonce/issued/expires metadata, connection and heartbeat timestamps, `cancel_on_disconnect`, open client order ids, per-second message-window counters, and in-flight request count. Public snapshots expose only sanitized auth state, challenge active/expiry state, and counts/ids already considered public; they do not expose challenge nonces or signatures.
 
-Auth is shape-only in V1A. The safe default is `MM_GATEWAY_AUTH_MODE=disabled` and `MM_GATEWAY_REQUIRE_AUTH=false`, which allows development sessions to process account-bearing messages without wallet challenge auth. When `MM_GATEWAY_REQUIRE_AUTH=true`, trading messages are rejected before authentication. Production wallet challenge auth is deferred.
+The safe auth default is `MM_GATEWAY_AUTH_MODE=disabled` and `MM_GATEWAY_REQUIRE_AUTH=false`, which preserves development sessions that process account-bearing messages without wallet challenge auth. `MM_GATEWAY_AUTH_MODE=wallet_challenge` starts sessions unauthenticated. Clients call `auth_challenge`, sign the deterministic challenge string with Ethereum personal-sign semantics, and call `auth_verify`; successful verification recovers the signer and binds the session account. When `MM_GATEWAY_REQUIRE_AUTH=true`, unauthenticated sessions may only call `heartbeat`, `get_session`, `auth_challenge`, and `auth_verify`. Order, quote, and RFQ messages require auth, and payload `account` / `mm_account` values must equal the authenticated session account using case-insensitive address comparison.
 
 Rate-limit decisions are pure and cover max messages per second, max in-flight requests per session, max orders per bulk, max cancels per bulk, and max open client order ids per account/session. These limits are parsed from `MM_GATEWAY_*` configuration with safe defaults and no certificate or UDP validation in V1A.
 
@@ -431,7 +432,7 @@ Matching decisions are deterministic for a given ordered command stream, market 
 
 ## Out of Scope
 
-No Redis, production authentication, frontend code, TypeScript, Python service code, C++, or Solidity changes. Blockchain RPC is limited to manual `eth_call` simulation, opt-in `eth_getLogs` indexing, confirmation receipt/block reads, and explicitly gated `eth_sendRawTransaction` broadcast. ABI encoding is limited to the PerpMatchingEngine calldata builder and guarded transaction request boundary.
+No Redis, frontend auth UI, admin write controls, TypeScript, Python service code, C++, or Solidity changes. Blockchain RPC is limited to manual `eth_call` simulation, opt-in `eth_getLogs` indexing, confirmation receipt/block reads, and explicitly gated `eth_sendRawTransaction` broadcast. ABI encoding is limited to the PerpMatchingEngine calldata builder and guarded transaction request boundary.
 
 ## Acceptance Criteria
 

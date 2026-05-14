@@ -8,6 +8,7 @@ use uuid::Uuid;
 #[serde(rename_all = "snake_case")]
 pub enum AuthMode {
     Disabled,
+    WalletChallenge,
 }
 
 impl FromStr for AuthMode {
@@ -16,6 +17,7 @@ impl FromStr for AuthMode {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "disabled" => Ok(Self::Disabled),
+            "wallet_challenge" => Ok(Self::WalletChallenge),
             other => Err(format!("unsupported MM_GATEWAY_AUTH_MODE: {other}")),
         }
     }
@@ -28,6 +30,10 @@ pub struct MmSession {
     pub account: Option<AccountId>,
     pub authenticated: bool,
     pub auth_mode: AuthMode,
+    pub challenge_account: Option<AccountId>,
+    pub challenge_nonce: Option<String>,
+    pub challenge_issued_at_ms: Option<TimestampMs>,
+    pub challenge_expires_at_ms: Option<TimestampMs>,
     pub connected_at_ms: TimestampMs,
     pub last_heartbeat_at_ms: TimestampMs,
     pub cancel_on_disconnect: bool,
@@ -67,6 +73,10 @@ impl MmSession {
             account: None,
             authenticated: false,
             auth_mode,
+            challenge_account: None,
+            challenge_nonce: None,
+            challenge_issued_at_ms: None,
+            challenge_expires_at_ms: None,
             connected_at_ms: now_ms,
             last_heartbeat_at_ms: now_ms,
             cancel_on_disconnect,
@@ -81,6 +91,42 @@ impl MmSession {
     pub fn bind_account(&mut self, account: AccountId) {
         self.account = Some(account);
         self.authenticated = true;
+        self.clear_challenge();
+    }
+
+    pub fn set_challenge(
+        &mut self,
+        account: AccountId,
+        nonce: String,
+        issued_at_ms: TimestampMs,
+        expires_at_ms: TimestampMs,
+    ) {
+        self.challenge_account = Some(account);
+        self.challenge_nonce = Some(nonce);
+        self.challenge_issued_at_ms = Some(issued_at_ms);
+        self.challenge_expires_at_ms = Some(expires_at_ms);
+    }
+
+    pub fn clear_challenge(&mut self) {
+        self.challenge_account = None;
+        self.challenge_nonce = None;
+        self.challenge_issued_at_ms = None;
+        self.challenge_expires_at_ms = None;
+    }
+
+    pub fn clear_expired_challenge(&mut self, now_ms: TimestampMs) {
+        if self
+            .challenge_expires_at_ms
+            .is_some_and(|expires_at_ms| now_ms > expires_at_ms)
+        {
+            self.clear_challenge();
+        }
+    }
+
+    pub fn challenge_active(&self) -> bool {
+        !self.authenticated
+            && self.challenge_nonce.is_some()
+            && self.challenge_expires_at_ms.is_some()
     }
 
     pub fn update_heartbeat(&mut self, now_ms: TimestampMs) {
@@ -141,6 +187,8 @@ impl MmSession {
             account: self.account.clone(),
             authenticated: self.authenticated,
             auth_mode: self.auth_mode,
+            challenge_active: self.challenge_active(),
+            challenge_expires_at_ms: self.challenge_expires_at_ms,
             connected_at_ms: self.connected_at_ms,
             last_heartbeat_at_ms: self.last_heartbeat_at_ms,
             cancel_on_disconnect: self.cancel_on_disconnect,
@@ -166,6 +214,8 @@ pub struct PublicSessionSnapshot {
     pub account: Option<AccountId>,
     pub authenticated: bool,
     pub auth_mode: AuthMode,
+    pub challenge_active: bool,
+    pub challenge_expires_at_ms: Option<TimestampMs>,
     pub connected_at_ms: TimestampMs,
     pub last_heartbeat_at_ms: TimestampMs,
     pub cancel_on_disconnect: bool,

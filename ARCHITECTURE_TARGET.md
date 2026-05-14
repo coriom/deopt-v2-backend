@@ -139,6 +139,7 @@ Implemented Phase 1 foundations:
 - Manual `eth_call` simulation V1 for calldata-ready execution intents
 - Indexer V1 for persisted `PerpMatchingEngine.TradeExecuted` events and block cursor tracking
 - Options V1D/V1C series registry, off-chain option orders, price-time matching, fills, cancellation, listing, aggregated option orderbook read surface, HTTP/core option RFQs with off-chain RFQ fills, signed MM option RFQ quotes, and MM Gateway option RFQ request/quote/accept notifications
+- Production MM Auth V1A wallet challenge sessions for WebTransport market-maker authentication
 - Monitoring/Admin V1A read-only operational observability endpoints for sanitized status/config, DB counts, MM session snapshots, execution/RFQ/options summaries, and compact recent activity
 
 Do not implement:

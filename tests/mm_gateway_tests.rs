@@ -22,6 +22,7 @@ use deopt_v2_backend::options::service::{
 use deopt_v2_backend::options::{OptionRfqQuoteSignatureMode, OptionRfqQuoteStatus, OptionsConfig};
 use deopt_v2_backend::rfq::service::{create_rfq, CreateRfqInput};
 use deopt_v2_backend::rfq::{RfqConfig, RfqQuoteStatus};
+use deopt_v2_backend::signing::personal_sign_digest;
 use deopt_v2_backend::types::{now_ms, AccountId, Side};
 use deopt_v2_backend::{api::AppState, engine::EngineState};
 use k256::ecdsa::SigningKey;
@@ -42,6 +43,46 @@ fn parse_valid_heartbeat_message() {
 
     assert_eq!(message.message_type(), "heartbeat");
     assert_eq!(message.request_id(), "hb-1");
+}
+
+#[test]
+fn parse_auth_challenge_message() {
+    let message: ClientMessage = serde_json::from_value(json!({
+        "type": "auth_challenge",
+        "request_id": "auth-1",
+        "payload": {
+            "account": "0x0000000000000000000000000000000000000001"
+        }
+    }))
+    .unwrap();
+
+    let ClientMessage::AuthChallenge(envelope) = message else {
+        panic!("expected auth_challenge");
+    };
+    assert_eq!(envelope.request_id, "auth-1");
+    assert_eq!(
+        envelope.payload.account,
+        AccountId::new("0x0000000000000000000000000000000000000001")
+    );
+}
+
+#[test]
+fn parse_auth_verify_message() {
+    let message: ClientMessage = serde_json::from_value(json!({
+        "type": "auth_verify",
+        "request_id": "auth-2",
+        "payload": {
+            "account": "0x0000000000000000000000000000000000000001",
+            "signature": VALID_SIGNATURE
+        }
+    }))
+    .unwrap();
+
+    let ClientMessage::AuthVerify(envelope) = message else {
+        panic!("expected auth_verify");
+    };
+    assert_eq!(envelope.request_id, "auth-2");
+    assert_eq!(envelope.payload.signature, VALID_SIGNATURE);
 }
 
 #[test]
@@ -1101,6 +1142,157 @@ async fn require_auth_mode_rejects_trading_message_before_auth() {
 }
 
 #[tokio::test]
+async fn wallet_challenge_authenticates_session_with_personal_signature() {
+    let service = mm_service(wallet_auth_config());
+    let mut session = wallet_challenge_session();
+    let challenge_response = service
+        .handle_message(
+            &mut session,
+            auth_challenge_message(&signing_account().0),
+            100,
+        )
+        .await;
+
+    let ServerMessage::AuthChallengeResult(challenge_envelope) = challenge_response else {
+        panic!("expected auth_challenge_result");
+    };
+    assert_eq!(challenge_envelope.payload.session_id, "session-wallet-1");
+    assert_eq!(challenge_envelope.payload.issued_at_ms, 100);
+    assert_eq!(challenge_envelope.payload.expires_at_ms, 60_100);
+    assert!(!session.authenticated);
+    assert!(session.challenge_active());
+
+    let signature =
+        sign_personal_message(&challenge_envelope.payload.challenge, test_signing_key());
+    let verify_response = service
+        .handle_message(
+            &mut session,
+            auth_verify_message(&signing_account().0, &signature),
+            120,
+        )
+        .await;
+
+    let ServerMessage::AuthVerifyResult(verify_envelope) = verify_response else {
+        panic!("expected auth_verify_result");
+    };
+    assert!(verify_envelope.payload.authenticated);
+    assert_eq!(verify_envelope.payload.account, signing_account());
+    assert!(session.authenticated);
+    assert_eq!(session.account, Some(signing_account()));
+    assert!(!session.challenge_active());
+    assert!(session.challenge_nonce.is_none());
+}
+
+#[tokio::test]
+async fn wallet_challenge_rejects_expired_challenge() {
+    let config = MmGatewayConfig {
+        auth_mode: AuthMode::WalletChallenge,
+        require_auth: true,
+        challenge_ttl_ms: 5,
+        ..MmGatewayConfig::default()
+    };
+    let service = mm_service(config);
+    let mut session = wallet_challenge_session();
+    let challenge_response = service
+        .handle_message(
+            &mut session,
+            auth_challenge_message(&signing_account().0),
+            100,
+        )
+        .await;
+    let ServerMessage::AuthChallengeResult(challenge_envelope) = challenge_response else {
+        panic!("expected auth_challenge_result");
+    };
+    let signature =
+        sign_personal_message(&challenge_envelope.payload.challenge, test_signing_key());
+
+    let response = service
+        .handle_message(
+            &mut session,
+            auth_verify_message(&signing_account().0, &signature),
+            106,
+        )
+        .await;
+
+    let value = serde_json::to_value(response).unwrap();
+    assert_eq!(value["type"], "error");
+    assert_eq!(value["error"]["code"], "AUTH_FAILED");
+    assert!(value["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("expired"));
+    assert!(!session.authenticated);
+}
+
+#[tokio::test]
+async fn wallet_challenge_rejects_trading_account_mismatch() {
+    let service = mm_service(wallet_auth_config());
+    let mut session = authenticated_wallet_session(&service).await;
+    let message: ClientMessage = serde_json::from_value(json!({
+        "type": "submit_order",
+        "request_id": "submit-1",
+        "payload": valid_order_with("wrong-account", "buy", 1)
+    }))
+    .unwrap();
+
+    let response = service.handle_message(&mut session, message, 140).await;
+
+    let value = serde_json::to_value(response).unwrap();
+    assert_eq!(value["type"], "error");
+    assert_eq!(value["error"]["code"], "ORDER_REJECTED");
+    assert!(value["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("does not match authenticated session"));
+}
+
+#[tokio::test]
+async fn wallet_challenge_account_checks_are_case_insensitive() {
+    let service = mm_service(wallet_auth_config());
+    let mixed_case_account = uppercase_hex_account(&signing_account());
+    let mut session = wallet_challenge_session();
+    let challenge_response = service
+        .handle_message(
+            &mut session,
+            auth_challenge_message(&mixed_case_account.0),
+            100,
+        )
+        .await;
+    let ServerMessage::AuthChallengeResult(challenge_envelope) = challenge_response else {
+        panic!("expected auth_challenge_result");
+    };
+    let signature =
+        sign_personal_message(&challenge_envelope.payload.challenge, test_signing_key());
+    let verify_response = service
+        .handle_message(
+            &mut session,
+            auth_verify_message(&mixed_case_account.0, &signature),
+            120,
+        )
+        .await;
+    assert!(matches!(
+        verify_response,
+        ServerMessage::AuthVerifyResult(_)
+    ));
+
+    let mut order = valid_order_with("case-ok", "buy", 1);
+    order["account"] = json!(mixed_case_account.0);
+    let message: ClientMessage = serde_json::from_value(json!({
+        "type": "submit_order",
+        "request_id": "submit-1",
+        "payload": order
+    }))
+    .unwrap();
+
+    let response = service.handle_message(&mut session, message, 140).await;
+
+    let ServerMessage::SubmitOrderResult(envelope) = response else {
+        panic!("expected submit_order_result");
+    };
+    assert!(envelope.payload.accepted);
+}
+
+#[tokio::test]
 async fn submit_order_mutates_live_orderbook() {
     let state = AppState::new(EngineState::with_default_markets());
     let service = MmGatewayService::new(MmGatewayConfig::default(), state.clone());
@@ -1436,6 +1628,84 @@ fn valid_order_with(client_order_id: &str, side: &str, nonce: u64) -> serde_json
         "deadline_ms": 9999999999999i64,
         "signature": VALID_SIGNATURE
     })
+}
+
+fn wallet_auth_config() -> MmGatewayConfig {
+    MmGatewayConfig {
+        auth_mode: AuthMode::WalletChallenge,
+        require_auth: true,
+        ..MmGatewayConfig::default()
+    }
+}
+
+fn wallet_challenge_session() -> MmSession {
+    MmSession::with_ids(
+        "session-wallet-1",
+        "connection-1",
+        10,
+        AuthMode::WalletChallenge,
+        true,
+    )
+}
+
+async fn authenticated_wallet_session(service: &MmGatewayService) -> MmSession {
+    let mut session = wallet_challenge_session();
+    let response = service
+        .handle_message(
+            &mut session,
+            auth_challenge_message(&signing_account().0),
+            100,
+        )
+        .await;
+    let ServerMessage::AuthChallengeResult(envelope) = response else {
+        panic!("expected auth_challenge_result");
+    };
+    let signature = sign_personal_message(&envelope.payload.challenge, test_signing_key());
+    let response = service
+        .handle_message(
+            &mut session,
+            auth_verify_message(&signing_account().0, &signature),
+            120,
+        )
+        .await;
+    assert!(matches!(response, ServerMessage::AuthVerifyResult(_)));
+    session
+}
+
+fn auth_challenge_message(account: &str) -> ClientMessage {
+    serde_json::from_value(json!({
+        "type": "auth_challenge",
+        "request_id": "auth-1",
+        "payload": {
+            "account": account
+        }
+    }))
+    .unwrap()
+}
+
+fn auth_verify_message(account: &str, signature: &str) -> ClientMessage {
+    serde_json::from_value(json!({
+        "type": "auth_verify",
+        "request_id": "auth-2",
+        "payload": {
+            "account": account,
+            "signature": signature
+        }
+    }))
+    .unwrap()
+}
+
+fn sign_personal_message(message: &str, signing_key: SigningKey) -> String {
+    let digest = personal_sign_digest(message);
+    let (signature, recovery_id) = signing_key.sign_prehash_recoverable(&digest).unwrap();
+    let mut bytes = Vec::with_capacity(65);
+    bytes.extend_from_slice(&signature.to_bytes());
+    bytes.push(recovery_id.to_byte() + 27);
+    format!("0x{}", hex_encode(&bytes))
+}
+
+fn uppercase_hex_account(account: &AccountId) -> AccountId {
+    AccountId::new(format!("0x{}", account.0[2..].to_ascii_uppercase()))
 }
 
 fn mm_service(config: MmGatewayConfig) -> MmGatewayService {

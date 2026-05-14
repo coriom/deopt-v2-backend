@@ -1,6 +1,10 @@
 use deopt_v2_backend::mm::transport::webtransport::{
     read_frame, write_json_frame, MM_GATEWAY_MAX_FRAME_BYTES,
 };
+use deopt_v2_backend::{
+    execution::{ExecutorSigner, PrivateKeySecret},
+    signing::personal_sign_digest,
+};
 use serde_json::{json, Value};
 use std::env;
 use std::path::PathBuf;
@@ -44,7 +48,9 @@ async fn main() -> deopt_v2_backend::Result<()> {
         deopt_v2_backend::BackendError::Config(format!("WebTransport connect failed: {error}"))
     })?;
 
-    if scenario == "v1c" {
+    if scenario == "auth" {
+        run_auth_scenario(&connection, &endpoint).await?;
+    } else if scenario == "v1c" {
         run_v1c_scenario(&connection, &endpoint, &http_base).await?;
     } else if scenario == "rfq" {
         run_rfq_scenario(&connection, &endpoint, &http_base).await?;
@@ -79,6 +85,93 @@ async fn main() -> deopt_v2_backend::Result<()> {
         endpoint.wait_idle().await;
     }
     Ok(())
+}
+
+async fn run_auth_scenario(
+    connection: &wtransport::Connection,
+    endpoint: &Endpoint<wtransport::endpoint::endpoint_side::Client>,
+) -> deopt_v2_backend::Result<()> {
+    authenticate_connection(connection).await?;
+    let session = send_request(
+        connection,
+        json!({
+            "type": "get_session",
+            "request_id": "auth-session-1",
+            "payload": {}
+        }),
+    )
+    .await?;
+    print_step("get_session", &session);
+    assert_ok(&session, "get_session")?;
+    if session["payload"]["session"]["authenticated"] != true {
+        return Err(deopt_v2_backend::BackendError::Config(
+            "session was not authenticated after auth_verify".to_string(),
+        ));
+    }
+
+    connection.close(0_u32.into(), b"auth smoke complete");
+    endpoint.wait_idle().await;
+    Ok(())
+}
+
+async fn authenticate_connection(
+    connection: &wtransport::Connection,
+) -> deopt_v2_backend::Result<()> {
+    let private_key = env::var("MM_PRIVATE_KEY").map_err(|_| {
+        deopt_v2_backend::BackendError::Config(
+            "MM_PRIVATE_KEY is required for mm_wt_smoke auth".to_string(),
+        )
+    })?;
+    let signer = ExecutorSigner::from_private_key(&PrivateKeySecret::new(private_key))?;
+    let account = env::var("MM_WT_AUTH_ACCOUNT").unwrap_or_else(|_| signer.address().0.clone());
+    if !account.eq_ignore_ascii_case(&signer.address().0) {
+        return Err(deopt_v2_backend::BackendError::Config(
+            "MM_WT_AUTH_ACCOUNT must match MM_PRIVATE_KEY signer".to_string(),
+        ));
+    }
+
+    let challenge = send_request(
+        connection,
+        json!({
+            "type": "auth_challenge",
+            "request_id": "auth-challenge-1",
+            "payload": {
+                "account": account.clone()
+            }
+        }),
+    )
+    .await?;
+    print_step("auth_challenge", &challenge);
+    assert_ok(&challenge, "auth_challenge")?;
+    let challenge_string = required_str(&challenge, &["payload", "challenge"])?;
+    let signature = sign_personal_message(&signer, &challenge_string)?;
+    let verify = send_request(
+        connection,
+        json!({
+            "type": "auth_verify",
+            "request_id": "auth-verify-1",
+            "payload": {
+                "account": account.clone(),
+                "signature": signature
+            }
+        }),
+    )
+    .await?;
+    print_step("auth_verify", &verify);
+    assert_ok(&verify, "auth_verify")
+}
+
+fn sign_personal_message(
+    signer: &ExecutorSigner,
+    message: &str,
+) -> deopt_v2_backend::Result<String> {
+    let digest = personal_sign_digest(message);
+    let signature = signer.sign_prehash(&digest)?;
+    let mut bytes = Vec::with_capacity(65);
+    bytes.extend_from_slice(&signature.r);
+    bytes.extend_from_slice(&signature.s);
+    bytes.push(signature.y_parity + 27);
+    Ok(hex_0x(&bytes))
 }
 
 async fn run_option_rfq_strict_scenario(
@@ -1158,4 +1251,15 @@ fn nonce_base() -> u64 {
 
 fn print_step(label: &str, value: &Value) {
     println!("{label}:{}", serde_json::to_string(&value).unwrap());
+}
+
+fn hex_0x(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(2 + bytes.len() * 2);
+    encoded.push_str("0x");
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
 }

@@ -39,6 +39,7 @@ pub struct MmGatewayConfig {
     pub cancel_on_disconnect: bool,
     pub auth_mode: AuthMode,
     pub require_auth: bool,
+    pub challenge_ttl_ms: u64,
 }
 
 impl Default for MmGatewayConfig {
@@ -60,6 +61,7 @@ impl Default for MmGatewayConfig {
             cancel_on_disconnect: true,
             auth_mode: AuthMode::Disabled,
             require_auth: false,
+            challenge_ttl_ms: 60_000,
         }
     }
 }

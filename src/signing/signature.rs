@@ -82,6 +82,24 @@ pub fn recover_eip712_signer(digest: &[u8; 32], signature: &str) -> Result<Accou
     Ok(AccountId::new(hex_0x(&recover_signer(digest, &signature)?)))
 }
 
+pub fn personal_sign_digest(message: &str) -> [u8; 32] {
+    let message = message.as_bytes();
+    let prefix = format!("\x19Ethereum Signed Message:\n{}", message.len());
+    let mut encoded = Vec::with_capacity(prefix.len() + message.len());
+    encoded.extend_from_slice(prefix.as_bytes());
+    encoded.extend_from_slice(message);
+    keccak256(&encoded)
+}
+
+pub fn recover_personal_signer(message: &str, signature: &str) -> Result<AccountId> {
+    validate_signature_shape(signature)?;
+    let signature = parse_signature(signature)?;
+    let digest = personal_sign_digest(message);
+    Ok(AccountId::new(hex_0x(&recover_signer(
+        &digest, &signature,
+    )?)))
+}
+
 fn recover_signer(digest: &[u8; 32], signature: &ParsedSignature) -> Result<[u8; 20]> {
     let k256_signature =
         Signature::from_slice(&signature.rs).map_err(|_| BackendError::MalformedSignature)?;

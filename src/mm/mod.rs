@@ -8,15 +8,16 @@ pub mod transport;
 
 pub use gateway::{BulkCancel, BulkQuoteUpdate, Heartbeat, MarketMakerSession};
 pub use protocol::{
-    AuthPayload, AuthResultPayload, BulkCancelPayload, BulkCancelResultPayload, BulkSubmitPayload,
-    BulkSubmitResultPayload, CancelAllPayload, CancelAllResultPayload, CancelOrderPayload,
-    CancelOrderResultPayload, ClientMessage, ErrorCode, ErrorEnvelope, GetSessionPayload,
-    HeartbeatPayload, HeartbeatResultPayload, NotificationEnvelope, OptionRfqQuoteAcceptedPayload,
-    OptionRfqQuotePayload, OptionRfqQuoteRejectedPayload, OptionRfqQuoteResultPayload,
-    OptionRfqRequestPayload, ProtocolError, QuoteReplacePayload, QuoteReplaceResultPayload,
-    RfqExpiredPayload, RfqQuoteAcceptedPayload, RfqQuotePayload, RfqQuoteRejectedPayload,
-    RfqQuoteResultPayload, RfqRequestPayload, ServerMessage, SubmitOrderPayload,
-    SubmitOrderResultPayload,
+    AuthChallengePayload, AuthChallengeResultPayload, AuthPayload, AuthResultPayload,
+    AuthVerifyPayload, AuthVerifyResultPayload, BulkCancelPayload, BulkCancelResultPayload,
+    BulkSubmitPayload, BulkSubmitResultPayload, CancelAllPayload, CancelAllResultPayload,
+    CancelOrderPayload, CancelOrderResultPayload, ClientMessage, ErrorCode, ErrorEnvelope,
+    GetSessionPayload, HeartbeatPayload, HeartbeatResultPayload, NotificationEnvelope,
+    OptionRfqQuoteAcceptedPayload, OptionRfqQuotePayload, OptionRfqQuoteRejectedPayload,
+    OptionRfqQuoteResultPayload, OptionRfqRequestPayload, ProtocolError, QuoteReplacePayload,
+    QuoteReplaceResultPayload, RfqExpiredPayload, RfqQuoteAcceptedPayload, RfqQuotePayload,
+    RfqQuoteRejectedPayload, RfqQuoteResultPayload, RfqRequestPayload, ServerMessage,
+    SubmitOrderPayload, SubmitOrderResultPayload,
 };
 pub use rate_limit::{MmGatewayConfig, MmGatewayTransport, RateLimitDecision};
 pub use registry::{MmSessionRegistry, RegisteredMmSession};
