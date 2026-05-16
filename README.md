@@ -127,6 +127,26 @@ ADMIN_API_TOKEN=
 `MM_PERMISSIONS_ENABLED=false` preserves existing MM gateway and RFQ behavior. When `true`, protected MM order and quote actions require an enabled row in `mm_accounts`, the relevant capability flag, and any configured market or option-series scope. `MM_PERMISSIONS_REQUIRE_PERSISTENCE=true` requires Postgres when permission enforcement is enabled; tests and local development can set it to `false` for in-memory permission seeding.
 `ADMIN_API_ENABLED=false` is the safe default for Monitoring/Admin V1A. When enabled, `/admin/*` exposes read-only operational observability only. If `ADMIN_API_REQUIRE_TOKEN=true`, requests must include `X-Admin-Token: <ADMIN_API_TOKEN>`. The token is never returned by the API, and admin config responses expose booleans such as `rpc_configured` and `database_configured` instead of raw RPC URLs, database URLs, private keys, or tokens.
 
+## E2E Test Harness V1A
+
+E2E Test Harness V1A adds a standard-library Python runner for reproducible local/runtime checks:
+
+```sh
+python3 scripts/e2e/run_e2e.py --flow admin
+python3 scripts/e2e/run_e2e.py --flow fees-options --start-backend
+python3 scripts/e2e/run_e2e.py --flow fees-perps --no-start-backend
+python3 scripts/e2e/run_e2e.py --flow option-rfq
+python3 scripts/e2e/run_e2e.py --flow all-safe --json-out /tmp/deopt-e2e-report.json
+```
+
+Supported flows are `admin`, `fees-options`, `fees-perps`, `option-rfq`, `mm-auth`, and `all-safe`. The harness prints a concise human summary and emits a JSON report with `ok`, `flow`, timestamps, `checks`, `artifacts`, and `errors`.
+
+`--no-start-backend` is the default and targets an already-running backend. `--start-backend` launches `cargo run --bin deopt-v2-backend` with process-only safe overrides, waits for `/health`, and stops the process at the end. It forces `EXECUTION_ENABLED=false`, `EXECUTOR_REAL_BROADCAST_ENABLED=false`, `EXECUTOR_DRY_RUN=true`, `EXECUTOR_PRIVATE_KEY=`, `MM_GATEWAY_ENABLED=false`, and disabled signature modes. It does not call `/executor/broadcast`, does not create execution transactions, does not move funds, and does not edit `.env`.
+
+The fee flows use `psql` for ledger/candidate verification. `fees-options` creates safe off-chain option fills and verifies `fee_events` and `volume_buckets`. `fees-perps` uses only a real existing confirmed/indexed/reconciled perp trade; if none exists, it reports a skipped check and does not fake one. `mm-auth` is a documented V1A placeholder because wrapping `mm_wt_smoke auth` requires live WebTransport cert/key setup and an `MM_PRIVATE_KEY`.
+
+See `scripts/e2e/README.md` for flow details, DB behavior, safety guarantees, and report examples.
+
 ## Monitoring/Admin V1A
 
 Monitoring/Admin V1A adds local/dev-oriented read-only observability endpoints:

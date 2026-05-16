@@ -143,6 +143,7 @@ Implemented Phase 1 foundations:
 - MM Permissions V1A SQL-seeded allowlist/capability gating for authenticated MM accounts, with optional perp market and option-series scopes
 - Fees & Rebates V1B ledger-only option and confirmed perp fee events, volume buckets, option premium caps, RFQ discounts, and permission-gated MM rebate accruals
 - Monitoring/Admin V1A read-only operational observability endpoints for sanitized status/config, DB counts, MM session snapshots, MM permission visibility, execution/RFQ/options/fee summaries, and compact recent activity
+- E2E Test Harness V1A standard-library Python runtime flows for admin, option fees, confirmed perp fees, option RFQ, a documented MM-auth placeholder, and all-safe JSON-reporting verification
 
 Do not implement:
 - transaction-sending RPC

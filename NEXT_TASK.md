@@ -1,315 +1,351 @@
-# NEXT_TASK.md — Fees V1B: Perp Fee Integration
+# NEXT_TASK.md — E2E Test Harness V1A: Reproducible Runtime Flows
 
 ## Context
 
-Fees & Rebates V1A is implemented and runtime-verified.
+DeOpt backend now has many runtime-verified flows:
 
-Validated:
-
-- fee_events table
-- volume_buckets table
-- rebate_accruals table
-- option order fill fee events
-- option RFQ fill fee events
-- tiered launch schedule
-- RFQ discounts
-- maker rebate accruals for permissioned MM
+- backend health
+- admin API token guard
+- admin monitoring
+- MM WebTransport gateway
+- MM wallet challenge auth
+- MM permissions
+- perp execution confirmation
+- index/reconciliation/finality
+- perp fees
+- option series/orders/matching/fills
+- option RFQ HTTP
+- option RFQ WebTransport
+- signed option RFQ quotes
+- option fees/rebates
 - admin fee endpoints
-- frontend admin fees dashboard
-- no payout
-- no on-chain transfer
-- no execution transactions
 
-Current deferred gap:
+Problem:
 
-Perp fees are not yet integrated into the fee ledger.
+Most runtime verification has been performed manually through Codex prompts, shell commands, curl, psql, and smoke binaries.
+
+This is no longer scalable.
 
 ## Goal
 
-Implement Fees V1B: Perp fee integration.
+Implement E2E Test Harness V1A.
 
-Add fee event generation for eligible perp flows.
+Create reproducible scripts for local/testnet runtime verification.
 
-Prioritize:
-
-1. confirmed or executed perp trade lifecycle if enough data exists
-2. perp RFQ accepted/executed path if existing data shape supports it
-3. indexed `TradeExecuted` events if that is the cleanest confirmed source
-
-The result must create:
-
-- `fee_events` with `market_type=perp`
-- `flow_type=orderbook` or `flow_type=rfq`
-- `volume_buckets` with `market_type=perp`
-- `rebate_accruals` for eligible permissioned MM maker when rebates enabled
-
-V1B remains ledger-only.
+The harness must make it easy to run selected E2E flows and produce machine-readable reports.
 
 ## Non-Goals
 
-Do not implement:
-
-- on-chain fee collection
-- rebate payout
-- claim contract
-- treasury transfer
-- Solidity changes
-- deployment
-- frontend changes
-- admin write endpoints
-- fee tier governance
-- auto-broadcast
+Do not implement new protocol features.
+Do not modify Solidity.
+Do not deploy contracts.
+Do not enable real broadcast by default.
+Do not call /executor/broadcast unless an explicit broadcast test flag is passed.
+Do not move funds.
+Do not expose private keys.
+Do not replace unit tests.
+Do not require CI integration yet.
+Do not commit.
+Do not push.
 
 ## Safety Rules
 
-Do not:
-
-- modify Solidity
-- deploy contracts
-- move funds
-- create execution transactions
-- enable real broadcast
-- call /executor/broadcast
-- create fake confirmed trades
-- require live RPC/Postgres/WebTransport/private keys/certs for normal cargo test
-- commit
-- push
-
-## Existing Fee Model
-
-Reuse existing V1A fee service/store/schedule.
-
-Use existing rate unit:
+Default mode must be safe:
 
 ```text
-micro_bps
-1 bps = 10_000 micro_bps
-denominator = 100_000_000
+EXECUTION_ENABLED=false
+EXECUTOR_REAL_BROADCAST_ENABLED=false
+MM_GATEWAY_ENABLED=false unless a gateway test explicitly enables it
 
-Reuse existing fee tables:
+No private keys in logs.
 
-fee_events
-volume_buckets
-rebate_accruals
+No .env permanent edits.
 
-Do not add redundant tables unless necessary.
+Use process env or temporary env files.
 
-Perp Fee Schedule
+Cleanup only rows created by the harness and only when explicitly safe.
 
-Use existing hardcoded V1A launch schedule for:
+Preferred Location
 
-PERP_ORDERBOOK
-PERP_RFQ
+Add scripts under:
 
-Expected tiers:
+scripts/e2e/
 
-Tier	28D Volume	28D Vol Share	Staked DEOPT	Perp Maker	Perp Taker
-4	>= 25M	>= 5%	>= 250k	-0.010%	0.015%
-3	>= 10M	>= 2.5%	>= 100k	-0.0075%	0.0175%
-2	>= 2.5M	>= 1%	>= 50k	-0.005%	0.020%
-1	>= 500k	>= 0.25%	>= 10k	0%	0.025%
-0	< 500k	< 0.25%	< 10k	0.005%	0.030%
+Possible structure:
 
-Negative maker values are rebates only for verified/permissioned MM accounts.
+scripts/e2e/README.md
+scripts/e2e/run_e2e.py
+scripts/e2e/lib/
+scripts/e2e/flows/
 
-Perp Notional
+If Rust binaries are better for this repo, use:
 
-Formula:
+src/bin/e2e_harness.rs
 
-notional_1e8 = execution_price_1e8 * size_1e8 / 1e8
+But prefer Python for orchestration if the repo already uses shell/curl/psql workflows.
 
-Use checked integer arithmetic.
+Do not add heavy dependencies.
 
-No floats.
+Use standard Python library if possible:
 
-Maker/Taker Classification
-Perp orderbook / matching execution
+subprocess
+json
+urllib.request
+argparse
+time
+os
+signal
 
-Use buyer_is_maker if available:
+If needing HTTP convenience, avoid adding dependencies unless already present.
 
-if buyer_is_maker:
-    maker = buyer
-    taker = seller
-else:
-    maker = seller
-    taker = buyer
-Perp RFQ
+Required CLI
 
-Use existing RFQ semantics:
+The harness should support:
 
-maker = mm_account
-taker = RFQ taker
+python3 scripts/e2e/run_e2e.py --flow admin
+python3 scripts/e2e/run_e2e.py --flow fees-options
+python3 scripts/e2e/run_e2e.py --flow fees-perps
+python3 scripts/e2e/run_e2e.py --flow option-rfq
+python3 scripts/e2e/run_e2e.py --flow mm-auth
+python3 scripts/e2e/run_e2e.py --flow all-safe
 
-If current perp RFQ acceptance creates normal execution_intents, use the cleanest confirmed/executed point to avoid fees on unexecuted quotes.
+Optional flags:
 
-Source Selection
+--backend-url http://127.0.0.1:8080
+--database-url postgres://deopt:deopt@127.0.0.1:5432/deopt_v2_backend
+--admin-token local-admin-token-runtime-test
+--start-backend
+--no-start-backend
+--timeout-sec 120
+--json-out /tmp/deopt-e2e-report.json
+--cleanup
+--verbose
+Report Format
 
-Do not create fees too early.
+Each run should output a JSON report:
 
-Preferred source order:
+{
+  "ok": true,
+  "flow": "admin",
+  "started_at_ms": 1770000000000,
+  "finished_at_ms": 1770000001234,
+  "checks": [
+    {
+      "name": "health",
+      "ok": true,
+      "details": {}
+    }
+  ],
+  "artifacts": {
+    "option_series_id": "...",
+    "option_rfq_id": "...",
+    "fee_event_ids": []
+  },
+  "errors": []
+}
 
-confirmed/indexed perp trade event if available
-execution confirmation/reconciliation point
-execution_intent accepted only if explicitly already confirmed/executed
+Also print a concise human summary.
 
-Avoid charging fees for:
+Backend Management
 
-pending execution intents
-failed simulations
-failed broadcasts
-unconfirmed txs
-cancelled/rejected RFQs
-quotes not accepted
+If --start-backend is used:
 
-If only pending data exists, implement helper functions and tests but defer runtime auto-generation until confirmed source is available.
+start cargo run --bin deopt-v2-backend
+pass safe process env
+wait for /health
+kill backend at the end
+ensure no orphan process remains
 
-Source Types
+If backend is already running:
 
-Use clear source_type values:
+use --no-start-backend
+just call endpoints
+Flow: admin
 
-perp_trade
-perp_rfq_fill
-perp_execution
+Verify:
 
-Pick one consistent naming scheme and document.
+/health
+/admin/status with token
+/admin/config
+/admin/db
+/admin/fees/summary
+wrong token rejection
+no secret substrings in /admin/config
+Flow: fees-options
 
-Recommended:
+Verify:
 
-perp_trade
+create active option series
+seed MM permissions if needed
+create option orderbook fill
+verify fee_events.source_type=option_order_fill
+verify volume_buckets.market_type=option
+create option RFQ fill
+verify fee_events.source_type=option_rfq_fill
+verify admin fees endpoints
 
-for confirmed on-chain/indexed trade.
+Do not use private keys.
 
-Use source_id as:
+Do not call broadcast.
 
-tx_hash:log_index
+Flow: fees-perps
 
-or existing indexed event id if available.
+Use an existing confirmed/indexed/reconciled perp trade if available.
 
-Idempotency
+Verify:
 
-Must be idempotent.
+find candidate trade
+trigger POST /executor/confirm/:intent_id
+verify fee_events.source_type=perp_trade
+verify volume_buckets.market_type=perp
+verify idempotency by re-triggering once
+verify no new execution transaction
 
-Same confirmed trade/event must not create duplicate fee events.
+If no candidate trade exists:
 
-Use existing unique source constraints if sufficient.
+report skipped with reason
+do not fake a trade
+Flow: option-rfq
 
-If needed, add migration to tighten uniqueness, but avoid schema churn unless required.
+Verify:
 
-Rebate Eligibility
+create option RFQ
+submit quote
+accept quote
+verify option_rfq_fill
+if strict signature mode enabled, optionally use existing signing CLI
+no execution transaction
 
-Perp maker rebate requires:
+V1A can use unsigned mode unless strict mode env is passed.
 
+Flow: mm-auth
+
+This can be partial in V1A.
+
+If WebTransport runtime is too heavy, expose wrapper that calls existing mm_wt_smoke binary.
+
+Support:
+
+python3 scripts/e2e/run_e2e.py --flow mm-auth --enable-webtransport
+
+It should:
+
+generate ECDSA certs under /tmp/deopt-mm-gateway
+start backend with MM gateway enabled
+run cargo run --bin mm_wt_smoke -- auth
+parse success from exit status/output
+
+If too broad, document as deferred but include placeholder flow that reports skipped.
+
+Flow: all-safe
+
+Run only flows that do not require:
+
+real broadcast
+private keys
+live WebTransport unless explicitly enabled
+
+Recommended included:
+
+admin
+fees-options
+fees-perps if candidate exists
+option-rfq
+DB Helpers
+
+Use psql through subprocess.
+
+Never build unsafe shell strings with untrusted values.
+
+Prefer passing SQL through stdin or psql -c.
+
+Only cleanup rows with recognizable runtime prefixes:
+
+runtime-e2e-
+
+Do not delete historical rows unless explicitly created by harness.
+
+Environment
+
+Default safe environment:
+
+PERSISTENCE_ENABLED=true
+ADMIN_API_ENABLED=true
+ADMIN_API_REQUIRE_TOKEN=true
+EXECUTION_ENABLED=false
+EXECUTOR_REAL_BROADCAST_ENABLED=false
+MM_GATEWAY_ENABLED=false
+FEES_ENABLED=true
 FEES_REBATES_ENABLED=true
+OPTIONS_ENABLED=true
+OPTION_RFQ_ENABLED=true
 MM_PERMISSIONS_ENABLED=true
-maker is enabled in mm_accounts
-maker has relevant capability:
-  can_submit_perp_orders for orderbook/perp trade
-  can_quote_perp_rfq for perp RFQ
 
-If MM permissions disabled:
+Process env only.
 
-no rebates by default
-Admin Endpoints
+Do not write .env.
 
-Existing endpoints should automatically include perp rows:
-
-GET /admin/fees/summary
-GET /admin/fees/events?limit=20
-GET /admin/fees/volumes?account=0x...
-GET /admin/fees/rebates?account=0x...
-
-Update summary if needed to group by:
-
-market_type=perp
-flow_type=orderbook/rfq
-source_type=perp_trade
 Tests
 
-Normal cargo test must remain offline.
+Add lightweight tests if feasible:
 
-Add tests for:
+JSON report builder
+command arg parsing
+URL building
+secret redaction helper
+no mutation method list
 
-perp notional calculation
-buyer_is_maker classification
-buyer_is_taker classification
-perp taker fee event created from confirmed trade-like input
-perp maker fee/rebate event created when maker is permissioned MM
-no rebate when rebates disabled
-no rebate when maker not permissioned
-volume bucket updates market_type=perp
-idempotency for same perp source
-no fee event for pending/failed/unconfirmed execution if those states are represented
-admin fee summary includes perp rows
-existing option fee tests still pass
-existing RFQ/MM/admin tests still pass
+Do not make unit tests depend on live Postgres or backend.
 
-If full integration with real indexed trade repository is too broad, implement service-level tests around a record_perp_trade_fees function and document runtime integration deferred.
-
-Runtime Verification After Implementation
-
-Runtime should be possible if there is already confirmed indexed perp trade data.
-
-If feasible:
-
-use existing indexed TradeExecuted row
-call the fee integration path if endpoint/job exists
-verify fee_events.market_type=perp
-verify volume_buckets.market_type=perp
-verify no execution tx created
-
-If not feasible:
-
-report that runtime requires a new confirmed perp trade and defer runtime to a later E2E.
 Documentation
 
-Update:
+Add:
 
-README.md
-ARCHITECTURE.md
-.env.example if config changed
+scripts/e2e/README.md
 
 Document:
 
-perp fee schedule
-maker/taker classification
-confirmed-source requirement
-no fees for pending intents
-rebate eligibility
-no payout
-no on-chain transfer
-deferred on-chain collection
+prerequisites
+safe defaults
+each flow
+examples
+cleanup behavior
+what is intentionally not tested
+how to run against already-running backend
+
+Update root README if appropriate with a small pointer.
+
 Validation
 
 Run:
 
+python3 scripts/e2e/run_e2e.py --help
 cargo fmt
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test
 cargo build
+
+If Python files are added and syntax check is useful:
+
+python3 -m py_compile scripts/e2e/run_e2e.py
 Acceptance Criteria
 
 Complete only if:
 
-perp fee calculation exists
-maker/taker classification works
-fee events can be created for confirmed perp trade source
-volume buckets update for market_type=perp
-rebate accrual works for eligible permissioned MM
-idempotency holds
-pending/failed/unconfirmed flows do not accrue fees
-admin fee endpoints include perp rows
-normal tests offline
-docs updated
-cargo fmt passes
-cargo clippy passes
-cargo test passes
-cargo build passes
+harness exists
+admin flow works or is implemented
+fees-options flow works or is implemented
+fees-perps flow safely skips if no candidate exists
+reports are JSON
+default env is safe
+no broadcast by default
+docs exist
+validation passes
 Deferred
-on-chain fee collection
-payout / claim
-frontend fee charts
-dynamic fee tiers
-volume-share enforcement
-staked-DEOPT enforcement
-anti-wash scoring
+CI integration
+real broadcast E2E
+full browser E2E
+full WebTransport orchestration if too heavy
+load testing
+chaos testing
 EOF

@@ -565,11 +565,11 @@ async fn accept_quote_still_succeeds_if_notification_fails() {
 #[tokio::test]
 async fn accept_quote_rejects_expired_rfq() {
     let state = state();
-    let mut input = create_input(Side::Buy);
-    input.ttl_ms = Some(10);
-    let rfq = create_rfq(&state, input).await.unwrap();
+    let rfq = create_rfq(&state, create_input(Side::Buy)).await.unwrap();
     let quote = submit_quote(&state, quote_input(rfq.rfq_id)).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(12)).await;
+    let mut expired_rfq = rfq.clone();
+    expired_rfq.expires_at_ms = deopt_v2_backend::types::now_ms() - 1;
+    state.rfq_store.lock().unwrap().insert_rfq(expired_rfq);
 
     let error = accept_quote(&state, rfq.rfq_id, quote.quote_id)
         .await
