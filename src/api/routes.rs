@@ -18,6 +18,7 @@ use crate::execution::{
 use crate::fees::service::{
     admin_fee_events as admin_fee_events_service, admin_fee_rebates as admin_fee_rebates_service,
     admin_fee_summary as admin_fee_summary_service, admin_fee_volumes as admin_fee_volumes_service,
+    record_indexed_perp_trade_fees,
 };
 use crate::indexer::{Indexer, IndexerStatus, IndexerTickResult};
 use crate::mm::permissions::{
@@ -2887,6 +2888,24 @@ async fn confirm_transaction(
         reconciliation_matched,
         require_reconciliation: state.confirmation_config.require_reconciliation,
     });
+    if decision.confirmed && state.fees_config.enabled {
+        let indexed_trade = repository
+            .find_matched_indexed_trade_for_confirmation(
+                transaction.intent_id,
+                onchain_intent_id,
+                &tx_hash_value,
+            )
+            .await?
+            .ok_or_else(|| {
+                BackendError::Persistence(
+                    "matched indexed perp trade not found for confirmed transaction".to_string(),
+                )
+            })?;
+        let flow_type = repository
+            .perp_fee_flow_for_intent(transaction.intent_id)
+            .await?;
+        record_indexed_perp_trade_fees(state, &indexed_trade, flow_type).await?;
+    }
     repository
         .apply_confirmation_decision(
             &transaction.transaction_id,

@@ -10,7 +10,7 @@ use crate::execution::{
     ExecutionIntent, ExecutionIntentRepository, ExecutionIntentStatus, ExecutionTransaction,
     ExecutionTransactionStatus, SimulationResult, StoredTradeSignatures,
 };
-use crate::fees::{FeeEvent, FeeMarketType, RebateAccrual, VolumeBucket};
+use crate::fees::{FeeEvent, FeeFlowType, FeeMarketType, RebateAccrual, VolumeBucket};
 use crate::indexer::IndexedPerpTrade;
 use crate::mm::{MmAccountPermissions, MmProductPermission};
 use crate::options::store::status_for_remaining;
@@ -676,7 +676,8 @@ impl PgRepository {
                 "protocol_total_1e8": "0",
                 "status_counts": {},
                 "source_type_counts": {},
-                "market_type_counts": {}
+                "market_type_counts": {},
+                "flow_type_counts": {}
             }));
         }
         let row = sqlx::query(
@@ -697,7 +698,8 @@ impl PgRepository {
             "protocol_total_1e8": row_get::<String>(&row, "protocol_total_1e8")?,
             "status_counts": self.admin_count_by_column("fee_events", "status").await?,
             "source_type_counts": self.admin_count_by_column("fee_events", "source_type").await?,
-            "market_type_counts": self.admin_count_by_column("fee_events", "market_type").await?
+            "market_type_counts": self.admin_count_by_column("fee_events", "market_type").await?,
+            "flow_type_counts": self.admin_count_by_column("fee_events", "flow_type").await?
         }))
     }
 
@@ -1463,6 +1465,56 @@ impl PgRepository {
         .await
         .map_err(|error| BackendError::Persistence(error.to_string()))?;
         Ok(row.is_some())
+    }
+
+    pub async fn find_matched_indexed_trade_for_confirmation(
+        &self,
+        intent_id: Uuid,
+        onchain_intent_id: &str,
+        tx_hash: &str,
+    ) -> Result<Option<IndexedPerpTrade>> {
+        let row = sqlx::query(
+            "SELECT t.event_id, t.tx_hash, t.log_index, t.block_number, t.block_hash,
+                    t.buyer, t.seller, t.onchain_intent_id, t.market_id, t.size_delta_1e8,
+                    t.execution_price_1e8, t.buyer_is_maker, t.buyer_nonce, t.seller_nonce,
+                    t.created_at_ms
+             FROM execution_reconciliations r
+             JOIN indexed_perp_trades t ON t.event_id = r.indexed_event_id
+             WHERE r.intent_id = $1
+               AND lower(r.onchain_intent_id) = lower($2)
+               AND lower(r.tx_hash) = lower($3)
+               AND r.status = 'matched'
+             ORDER BY t.block_number ASC, t.log_index ASC
+             LIMIT 1",
+        )
+        .bind(intent_id.to_string())
+        .bind(onchain_intent_id.to_ascii_lowercase())
+        .bind(tx_hash.to_ascii_lowercase())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        row.map(indexed_perp_trade_from_row).transpose()
+    }
+
+    pub async fn perp_fee_flow_for_intent(&self, intent_id: Uuid) -> Result<FeeFlowType> {
+        if !self.admin_table_exists("rfqs").await? {
+            return Ok(FeeFlowType::Orderbook);
+        }
+        let row = sqlx::query(
+            "SELECT 1
+             FROM rfqs
+             WHERE execution_intent_id = $1 AND status = 'accepted'
+             LIMIT 1",
+        )
+        .bind(intent_id.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        Ok(if row.is_some() {
+            FeeFlowType::Rfq
+        } else {
+            FeeFlowType::Orderbook
+        })
     }
 
     pub async fn apply_confirmation_decision(

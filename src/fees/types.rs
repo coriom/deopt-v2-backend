@@ -94,6 +94,7 @@ impl FromStr for OptionFeeBasis {
 pub enum FeeSourceType {
     OptionOrderFill,
     OptionRfqFill,
+    PerpTrade,
     PerpExecution,
     PerpRfq,
 }
@@ -103,6 +104,7 @@ impl FeeSourceType {
         match self {
             Self::OptionOrderFill => "option_order_fill",
             Self::OptionRfqFill => "option_rfq_fill",
+            Self::PerpTrade => "perp_trade",
             Self::PerpExecution => "perp_execution",
             Self::PerpRfq => "perp_rfq",
         }
@@ -258,4 +260,5 @@ pub struct FeeLedgerSummary {
     pub status_counts: BTreeMap<String, u64>,
     pub source_type_counts: BTreeMap<String, u64>,
     pub market_type_counts: BTreeMap<String, u64>,
+    pub flow_type_counts: BTreeMap<String, u64>,
 }

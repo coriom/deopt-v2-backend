@@ -141,7 +141,7 @@ Implemented Phase 1 foundations:
 - Options V1D/V1C series registry, off-chain option orders, price-time matching, fills, cancellation, listing, aggregated option orderbook read surface, HTTP/core option RFQs with off-chain RFQ fills, signed MM option RFQ quotes, and MM Gateway option RFQ request/quote/accept notifications
 - Production MM Auth V1A wallet challenge sessions for WebTransport market-maker authentication
 - MM Permissions V1A SQL-seeded allowlist/capability gating for authenticated MM accounts, with optional perp market and option-series scopes
-- Fees & Rebates V1A ledger-only fee events, volume buckets, option premium caps, RFQ discounts, and permission-gated MM rebate accruals
+- Fees & Rebates V1B ledger-only option and confirmed perp fee events, volume buckets, option premium caps, RFQ discounts, and permission-gated MM rebate accruals
 - Monitoring/Admin V1A read-only operational observability endpoints for sanitized status/config, DB counts, MM session snapshots, MM permission visibility, execution/RFQ/options/fee summaries, and compact recent activity
 
 Do not implement:

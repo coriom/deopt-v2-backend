@@ -172,6 +172,7 @@ impl FeeLedgerStore {
             bump_count(&mut summary.status_counts, event.status.as_str())?;
             bump_count(&mut summary.source_type_counts, event.source_type.as_str())?;
             bump_count(&mut summary.market_type_counts, event.market_type.as_str())?;
+            bump_count(&mut summary.flow_type_counts, event.flow_type.as_str())?;
         }
         Ok(summary)
     }
