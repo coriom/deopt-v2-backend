@@ -21,11 +21,12 @@ The long-term backend needs low-latency deterministic matching, RFQ, market-make
 - `db`: Optional PostgreSQL persistence for used nonces, submitted orders, matched trades, execution intents, and engine event audit records.
 - `rfq`: RFQ V1C domain types, in-memory store, service validation, EIP-712 quote signing payloads, strict/disabled quote signature verification, quote lifecycle, MM gateway broadcast/notification coordination, quote acceptance, and execution-intent creation through the existing lifecycle boundary.
 - `options`: Options V1D/V1C domain types, deterministic option series ids, manual series registry, off-chain option orders, price-time matching, fill recording, HTTP/core option RFQs, signed MM option RFQ quote verification, MM Gateway option RFQ coordination, off-chain option RFQ fills, in-memory/persistent stores, and aggregated option orderbook read model.
+- `fees`: Fees & Rebates V1A config, launch fee schedules, `micro_bps` integer math, option premium cap logic, maker/taker fee-event creation, daily volume buckets, ledger-only rebate accruals, and read-only admin fee summaries.
 - `orders`: Shared order/cancel service used by HTTP and the Market Maker Gateway for signed order validation, nonce handling, matching, persistence writes, ownership-checked cancels, cancel-all, and deterministic resting-order lookup.
 - `mm`: Market Maker Gateway protocol, session, heartbeat, rate-limit, live order/cancel handling, quote-replace models, MM permission allowlist/capability checks, service boundary, adapter traits, and disabled-by-default WebTransport V1C adapter. Protocol/session/service/rate-limit logic remains transport-agnostic.
 - `admin`: Monitoring/Admin V1A configuration and read-only operational observability support. Admin endpoints are disabled by default, optionally protected by a simple local/dev token header, and return sanitized status/config/summaries without exposing secrets or mutating trading state.
 - `signing`: signed-order schema, shared EIP-712 helpers, strict secp256k1 signer recovery, signature mode, deadline validation, and in-memory nonce tracking.
-- `config`: environment loading for host, port, log level, network name, chain id, disabled execution flag, simulation flags, indexer flags, reconciliation flags, confirmation flags, RFQ signature mode/domain flags, Options V1D flags, Market Maker Gateway V1C flags, MM Permissions V1A flags, Monitoring/Admin V1A flags, signature mode, and opt-in persistence.
+- `config`: environment loading for host, port, log level, network name, chain id, disabled execution flag, simulation flags, indexer flags, reconciliation flags, confirmation flags, RFQ signature mode/domain flags, Options V1D flags, Fees & Rebates V1A flags, Market Maker Gateway V1C flags, MM Permissions V1A flags, Monitoring/Admin V1A flags, signature mode, and opt-in persistence.
 
 ## Current v1 Scope
 
@@ -54,7 +55,8 @@ The long-term backend needs low-latency deterministic matching, RFQ, market-make
 - Market Maker Gateway V1C guarded by `MM_GATEWAY_ENABLED=false` by default. Enabled mode starts a separate WebTransport UDP listener with required TLS cert/key config and routes MM order flow through the live off-chain perp orderbook without auto-broadcasting.
 - Production MM Auth V1A guarded by `MM_GATEWAY_AUTH_MODE=disabled` and `MM_GATEWAY_REQUIRE_AUTH=false` by default. `wallet_challenge` uses server-issued Ethereum personal-sign challenges to bind WebTransport sessions to wallet accounts before trading messages are accepted.
 - MM Permissions V1A guarded by `MM_PERMISSIONS_ENABLED=false` by default. Enabled mode requires an enabled MM account, capability flags, and optional market or option-series scope rows for protected MM quote/order actions. `MM_PERMISSIONS_REQUIRE_PERSISTENCE=true` requires Postgres for production-like enforcement, while tests can seed permissions in memory.
-- Monitoring/Admin V1A guarded by `ADMIN_API_ENABLED=false` by default. Enabled mode exposes read-only `/admin/status`, `/admin/config`, `/admin/db`, `/admin/mm/sessions`, `/admin/mm/permissions`, `/admin/execution/summary`, `/admin/rfq/summary`, `/admin/options/summary`, and `/admin/recent` endpoints. The endpoints are local/dev-oriented, optionally require `X-Admin-Token`, sanitize secrets, use bounded read queries, and do not mutate DB rows, RFQs, option state, execution state, MM sessions, or MM permission rows.
+- Fees & Rebates V1A guarded by `FEES_ENABLED=false` by default. Enabled mode records ledger-only option order fill and option RFQ fill fee events, daily volume buckets, and optional MM rebate accrual rows. `FEES_REQUIRE_PERSISTENCE=true` requires Postgres for production-like accounting, while tests can use an in-memory fee ledger. V1A does not collect fees on chain, move funds, pay rebates, create execution transactions, or broadcast.
+- Monitoring/Admin V1A guarded by `ADMIN_API_ENABLED=false` by default. Enabled mode exposes read-only `/admin/status`, `/admin/config`, `/admin/db`, `/admin/mm/sessions`, `/admin/mm/permissions`, `/admin/execution/summary`, `/admin/rfq/summary`, `/admin/options/summary`, `/admin/fees/summary`, `/admin/fees/events`, `/admin/fees/volumes`, `/admin/fees/rebates`, and `/admin/recent` endpoints. The endpoints are local/dev-oriented, optionally require `X-Admin-Token`, sanitize secrets, use bounded read queries, and do not mutate DB rows, RFQs, option state, execution state, MM sessions, MM permission rows, or fee ledger rows.
 
 ## Monitoring/Admin V1A
 
@@ -70,9 +72,52 @@ When enabled, admin endpoints are read-only. `ADMIN_API_REQUIRE_TOKEN=true` perf
 
 The admin config response is sanitized. It exposes public network/chain identifiers, feature flags, public contract addresses, signature modes, TTL settings, booleans for RPC/database/private-key configuration, and WebTransport host/port only when the gateway is enabled. It does not expose private keys, raw database URLs, raw RPC URLs, provider keys, admin tokens, or full environment data.
 
-Persistent admin DB reads use simple aggregate/count/recent queries and fixed table names. `/admin/db` reports missing older tables as unavailable in its count response. `/admin/mm/permissions` lists configured MM accounts, capability flags, and product scopes without exposing auth challenges, signatures, tokens, or database URLs. With persistence disabled, admin endpoints use in-memory engine/RFQ/options/MM session/permission snapshots where available and return empty DB/recent sections otherwise. Normal tests do not require live Postgres, RPC, WebTransport, or private keys.
+Persistent admin DB reads use simple aggregate/count/recent queries and fixed table names. `/admin/db` reports missing older tables as unavailable in its count response. `/admin/mm/permissions` lists configured MM accounts, capability flags, and product scopes without exposing auth challenges, signatures, tokens, or database URLs. `/admin/fees/*` exposes bounded fee ledger events, volume buckets, rebate accruals, and aggregate totals without any write action. With persistence disabled, admin endpoints use in-memory engine/RFQ/options/MM session/permission/fee snapshots where available and return empty DB/recent sections otherwise. Normal tests do not require live Postgres, RPC, WebTransport, or private keys.
 
 Monitoring/Admin V1B remains deferred: Prometheus exporter, structured event log, external alerts, Grafana dashboards, frontend admin dashboard, production auth, admin write controls, permission write controls, and risk admin controls.
+
+## Fees & Rebates V1A
+
+Fees & Rebates V1A is an off-chain accounting layer. It is disabled by default:
+
+```text
+FEES_ENABLED=false
+FEES_REQUIRE_PERSISTENCE=true
+FEES_REBATES_ENABLED=false
+FEES_PROTOCOL_FEE_RECIPIENT=treasury
+FEES_DEFAULT_FEE_ASSET=USDC
+FEES_OPTION_FEE_BASIS=premium_or_underlying_capped
+FEES_OPTION_PREMIUM_CAP_PCT=10
+```
+
+When fees are disabled, option order matching and option RFQ acceptance preserve existing behavior and write no fee ledger state. When fees are enabled with `FEES_REQUIRE_PERSISTENCE=true`, startup requires `PERSISTENCE_ENABLED=true`; normal tests can run with `FEES_REQUIRE_PERSISTENCE=false` and the in-memory `FeeLedgerStore`.
+
+Rates are represented as integer `micro_bps`. One basis point is `10_000` micro-bps and the denominator is `100_000_000`, so sub-basis-point schedule entries such as `0.75` bps are exact. The launch schedule is hardcoded in Rust with tier 0 through tier 4 perp and option maker/taker rates, RFQ discounts for options, and fields for 28-day volume, volume-share, and staked-DEOPT thresholds. V1A tier resolution uses ledger volume buckets; volume-share and staking enforcement are deferred.
+
+Option fee events use `premium_or_underlying_capped`: compute an underlying-notional fee from `underlying_notional_1e8 * rate_micro_bps / 100_000_000`, compute `premium_notional_1e8 * FEES_OPTION_PREMIUM_CAP_PCT / 100`, then record the lower amount. The same cap applies to rebate accrual amounts.
+
+Maker/taker classification is source-driven:
+- Option orderbook fills use the resting order as maker and incoming order as taker.
+- Option RFQ fills use `mm_account` as maker and the RFQ taker as taker.
+- Perp schedule/rate support exists for future integration, but V1A records only option order fill and option RFQ fill fee events.
+
+Persistence adds:
+- `fee_events`: idempotent ledger rows keyed by source type, source id, payer, and recipient.
+- `volume_buckets`: daily maker/taker/total volume by account and market type.
+- `rebate_accruals`: ledger-only rebate accruals linked to fee events.
+
+Rebate accrual is intentionally narrow. It requires `FEES_REBATES_ENABLED=true`, `MM_PERMISSIONS_ENABLED=true`, an enabled MM permission account, and an option capability. Option RFQ fills require `can_quote_option_rfq`; option order fills require `can_submit_option_orders` or `can_quote_option_rfq`. If permissions are disabled, missing, or disabled for the maker, fee events can still be recorded but rebate accrual remains zero.
+
+Admin fee endpoints are read-only:
+
+```text
+GET /admin/fees/summary
+GET /admin/fees/events?limit=20
+GET /admin/fees/volumes?account=0x...
+GET /admin/fees/rebates?account=0x...
+```
+
+V1A does not implement on-chain fee collection, rebate payouts, claim contracts, admin write endpoints, frontend fee dashboards, fund movement, execution transaction creation, or broadcast.
 
 ## Options V1D / Option RFQ V1C
 
@@ -401,7 +446,7 @@ The admin surface is read-only:
 GET /admin/mm/permissions
 ```
 
-V1A does not add admin write endpoints, frontend permission UI, automatic onboarding, ranking/scoring, incentives/rebates, on-chain allowlists, Solidity changes, deployments, or real broadcast behavior.
+V1A does not add admin write endpoints, frontend permission UI, automatic onboarding, ranking/scoring, rebate payout workflows, on-chain allowlists, Solidity changes, deployments, or real broadcast behavior.
 
 ## Execution-Intent Flow
 
@@ -417,7 +462,7 @@ Persistence is disabled by default. With `PERSISTENCE_ENABLED=false`, the servic
 
 With `PERSISTENCE_ENABLED=true`, startup requires `DATABASE_URL`, connects to Postgres, and runs migrations. The repository persists used nonces, accepted orders, matched trades, execution intents, cancellation/status updates, and a basic `engine_events` audit stream. Persisted nonce uniqueness is scoped to `(account, nonce)`, which prevents replay after restart while still allowing different accounts to use the same nonce.
 
-MM Permissions V1A adds `mm_accounts` and `mm_market_permissions` migrations for manual SQL onboarding and read-only admin visibility. Application code reads these tables for enforcement and admin display; it does not write approval state.
+MM Permissions V1A adds `mm_accounts` and `mm_market_permissions` migrations for manual SQL onboarding and read-only admin visibility. Application code reads these tables for enforcement and admin display; it does not write approval state. Fees & Rebates V1A adds `fee_events`, `volume_buckets`, and `rebate_accruals` ledger tables; these rows are accounting records only and do not move funds.
 
 The in-memory engine remains the live matching state in this V1 patch. Database writes for an order submission use a SQL transaction for nonce insertion and event persistence, but full engine-state rollback/replay around database failure is deferred.
 
@@ -463,12 +508,13 @@ Matching decisions are deterministic for a given ordered command stream, market 
 - Zero price and zero size are rejected.
 - Self-trade is rejected before fills.
 - Large financial values are represented as integers, not floating point.
+- Fee rates use integer `micro_bps`; fee and rebate ledgers are off-chain accounting only and do not imply funds have moved.
 - Disabled signature mode is for local development only; strict mode requires recovered EIP-712 signer equality with `order.account`.
 - MM auth proves session identity; MM permissions are a separate allowlist/capability layer and are disabled by default.
 
 ## Out of Scope
 
-No Redis, frontend auth UI, frontend permissions UI, admin write controls, automatic MM approval, ranking/scoring, incentives/rebates, TypeScript, Python service code, C++, or Solidity changes. Blockchain RPC is limited to manual `eth_call` simulation, opt-in `eth_getLogs` indexing, confirmation receipt/block reads, and explicitly gated `eth_sendRawTransaction` broadcast. ABI encoding is limited to the PerpMatchingEngine calldata builder and guarded transaction request boundary.
+No Redis, frontend auth UI, frontend permissions UI, frontend fee dashboards, admin write controls, automatic MM approval, ranking/scoring, rebate payouts, claim contracts, on-chain fee collection, TypeScript, Python service code, C++, or Solidity changes. Blockchain RPC is limited to manual `eth_call` simulation, opt-in `eth_getLogs` indexing, confirmation receipt/block reads, and explicitly gated `eth_sendRawTransaction` broadcast. ABI encoding is limited to the PerpMatchingEngine calldata builder and guarded transaction request boundary.
 
 ## Acceptance Criteria
 

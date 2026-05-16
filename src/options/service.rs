@@ -314,6 +314,7 @@ pub async fn submit_option_order(
 
     if let Some(repository) = state.repository.clone() {
         let (order, fills) = repository.submit_option_order_and_match(order, now).await?;
+        crate::fees::service::record_option_order_fills(state, &fills).await?;
         return Ok(SubmitOptionOrderOutcome { order, fills });
     }
 
@@ -322,6 +323,7 @@ pub async fn submit_option_order(
         .lock()
         .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?
         .submit_order_and_match(order, now)?;
+    crate::fees::service::record_option_order_fills(state, &fills).await?;
     Ok(SubmitOptionOrderOutcome { order, fills })
 }
 
@@ -745,6 +747,7 @@ pub async fn accept_option_rfq_quote(
         let fill = repository.get_option_rfq_fill(fill.fill_id).await?.ok_or(
             BackendError::InvalidOptionRfqState("option RFQ fill was not persisted".to_string()),
         )?;
+        crate::fees::service::record_option_rfq_fill(state, &fill, &quote).await?;
         let (mm_notification_sent, mm_notification_warning) =
             notify_option_rfq_quote_acceptance(state, &quote, &quotes_before_accept, fill.fill_id);
         return Ok(AcceptOptionRfqQuoteOutcome {
@@ -761,6 +764,7 @@ pub async fn accept_option_rfq_quote(
         .lock()
         .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?
         .accept_option_rfq_quote(option_rfq_id, quote_id, fill.clone())?;
+    crate::fees::service::record_option_rfq_fill(state, &fill, &quote).await?;
     let (mm_notification_sent, mm_notification_warning) =
         notify_option_rfq_quote_acceptance(state, &quote, &quotes_before_accept, fill.fill_id);
     Ok(AcceptOptionRfqQuoteOutcome {

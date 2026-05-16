@@ -3,6 +3,7 @@ use crate::confirmation::ConfirmationConfig;
 use crate::db::PgRepository;
 use crate::engine::EngineState;
 use crate::execution::{ExecutionConfig, StoredTradeSignatures};
+use crate::fees::{FeeLedgerStore, FeesConfig};
 use crate::indexer::IndexerConfig;
 use crate::mm::{MmGatewayConfig, MmPermissionsConfig, MmPermissionsStore, MmSessionRegistry};
 use crate::nonce_sync::PerpNonceSyncConfig;
@@ -32,11 +33,13 @@ pub struct AppState {
     pub reconciliation_config: ReconciliationConfig,
     pub rfq_config: RfqConfig,
     pub options_config: OptionsConfig,
+    pub fees_config: FeesConfig,
     pub mm_gateway_config: MmGatewayConfig,
     pub mm_permissions_config: MmPermissionsConfig,
     pub admin_config: AdminConfig,
     pub rfq_store: Arc<Mutex<RfqStore>>,
     pub options_store: Arc<Mutex<OptionSeriesStore>>,
+    pub fees_store: Arc<Mutex<FeeLedgerStore>>,
     pub mm_permissions: Arc<Mutex<MmPermissionsStore>>,
     pub mm_sessions: MmSessionRegistry,
     pub trade_signatures: Arc<Mutex<HashMap<Uuid, StoredTradeSignatures>>>,
@@ -151,6 +154,7 @@ impl AppState {
             reconciliation_config,
             RfqConfig::disabled(),
             OptionsConfig::disabled(),
+            FeesConfig::disabled(),
             chain_id,
         )
     }
@@ -168,6 +172,7 @@ impl AppState {
         reconciliation_config: ReconciliationConfig,
         rfq_config: RfqConfig,
         options_config: OptionsConfig,
+        fees_config: FeesConfig,
         chain_id: u64,
     ) -> Self {
         Self {
@@ -187,11 +192,13 @@ impl AppState {
             reconciliation_config,
             rfq_config,
             options_config,
+            fees_config,
             mm_gateway_config: MmGatewayConfig::default(),
             mm_permissions_config: MmPermissionsConfig::disabled(),
             admin_config: AdminConfig::disabled(),
             rfq_store: Arc::new(Mutex::new(RfqStore::new())),
             options_store: Arc::new(Mutex::new(OptionSeriesStore::new())),
+            fees_store: Arc::new(Mutex::new(FeeLedgerStore::new())),
             mm_permissions: Arc::new(Mutex::new(MmPermissionsStore::new())),
             mm_sessions: MmSessionRegistry::new(),
             trade_signatures: Arc::new(Mutex::new(HashMap::new())),
@@ -211,6 +218,7 @@ impl AppState {
             ReconciliationConfig::disabled(),
             rfq_config,
             OptionsConfig::disabled(),
+            FeesConfig::disabled(),
             84532,
         )
     }
@@ -228,6 +236,29 @@ impl AppState {
             ReconciliationConfig::disabled(),
             RfqConfig::disabled(),
             options_config,
+            FeesConfig::disabled(),
+            84532,
+        )
+    }
+
+    pub fn with_options_and_fees_config(
+        engine: EngineState,
+        options_config: OptionsConfig,
+        fees_config: FeesConfig,
+    ) -> Self {
+        Self::with_all_config(
+            engine,
+            SignatureVerificationMode::Disabled,
+            Eip712Domain::default(),
+            None,
+            ExecutionConfig::disabled(),
+            PerpNonceSyncConfig::disabled(),
+            ConfirmationConfig::disabled(),
+            IndexerConfig::disabled(),
+            ReconciliationConfig::disabled(),
+            RfqConfig::disabled(),
+            options_config,
+            fees_config,
             84532,
         )
     }

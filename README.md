@@ -1,6 +1,6 @@
 # DeOpt v2 Rust Trading Backend
 
-Phase 1 Rust backend for DeOpt v2 trading infrastructure. This service provides an in-memory perp orderbook, deterministic matching, a thin HTTP API, RFQ/MM scaffolds, an execution-intent queue, a dry-run PerpMatchingEngine calldata builder boundary, manual RPC simulation for calldata-ready intents, an explicitly gated real broadcast path, and an opt-in Indexer V1 for PerpMatchingEngine events.
+Phase 1 Rust backend for DeOpt v2 trading infrastructure. This service provides an in-memory perp orderbook, deterministic matching, a thin HTTP API, RFQ/MM scaffolds, an execution-intent queue, a dry-run PerpMatchingEngine calldata builder boundary, manual RPC simulation for calldata-ready intents, an explicitly gated real broadcast path, an opt-in Indexer V1 for PerpMatchingEngine events, and a disabled-by-default ledger-only Fees & Rebates V1A module.
 
 Smart contracts remain the final source of truth. By default this backend does not submit transactions, sign transaction payloads, load private keys, or claim final settlement. Optional simulation uses `eth_call` only and never broadcasts. Real transaction signing and `eth_sendRawTransaction` are available only when `EXECUTOR_REAL_BROADCAST_ENABLED=true` and all required signer, fee, RPC, persistence, signature, and simulation gates pass.
 
@@ -71,6 +71,13 @@ OPTION_RFQ_EIP712_NAME=DeOptV2OptionRFQ
 OPTION_RFQ_EIP712_VERSION=1
 OPTION_RFQ_EIP712_CHAIN_ID=84532
 OPTION_RFQ_EIP712_VERIFYING_CONTRACT=0x0000000000000000000000000000000000000000
+FEES_ENABLED=false
+FEES_REQUIRE_PERSISTENCE=true
+FEES_REBATES_ENABLED=false
+FEES_PROTOCOL_FEE_RECIPIENT=treasury
+FEES_DEFAULT_FEE_ASSET=USDC
+FEES_OPTION_FEE_BASIS=premium_or_underlying_capped
+FEES_OPTION_PREMIUM_CAP_PCT=10
 SIGNATURE_VERIFICATION_MODE=disabled
 PERSISTENCE_ENABLED=false
 DATABASE_URL=postgres://deopt:deopt@127.0.0.1:5432/deopt_v2_backend
@@ -114,6 +121,7 @@ ADMIN_API_TOKEN=
 `RFQ_ENABLED=false` is the safe default. When `RFQ_ENABLED=true` and `RFQ_REQUIRE_PERSISTENCE=true`, startup requires `PERSISTENCE_ENABLED=true`. Test and development code can run RFQ in memory with persistence disabled, but production-like RFQ acceptance should use Postgres so RFQ, quote, and execution-intent updates are committed together.
 `RFQ_QUOTE_SIGNATURE_MODE=disabled` preserves the unsigned RFQ V1B flow. `strict` requires each RFQ quote to include a valid EIP-712 `RFQQuote` signature whose recovered signer equals `mm_account`.
 `OPTIONS_ENABLED=false` and `OPTION_RFQ_ENABLED=false` are the safe defaults. When either options persistence gate is true and its feature is enabled, startup requires `PERSISTENCE_ENABLED=true`. Test and development code can run option series, off-chain option orders, matching, fills, and option RFQs in memory with persistence disabled. `OPTION_RFQ_QUOTE_SIGNATURE_MODE=disabled` preserves the unsigned Option RFQ V1B flow. `strict` requires each option RFQ quote to include `quote_nonce` and a valid EIP-712 `OptionRFQQuote` signature whose recovered signer equals `mm_account`.
+`FEES_ENABLED=false` preserves existing behavior and records no fee ledger events. When `FEES_ENABLED=true` and `FEES_REQUIRE_PERSISTENCE=true`, startup requires `PERSISTENCE_ENABLED=true`; tests and local development can set the requirement to `false` for in-memory fee ledgers. V1A is ledger-only: it records fee events, volume buckets, and optional rebate accruals, but never transfers funds, creates execution transactions, broadcasts, or pays rebates.
 `MM_GATEWAY_ENABLED=false` is the safe default. When `true`, V1C starts a separate WebTransport UDP listener and requires `MM_GATEWAY_CERT_PATH` and `MM_GATEWAY_KEY_PATH`. It can submit and cancel off-chain perp orders through the live in-memory orderbook, handle perp RFQ and option RFQ messages when those features are enabled, but it does not auto-broadcast, sign, simulate, index, reconcile, or confirm execution intents.
 `MM_GATEWAY_AUTH_MODE=disabled` preserves local/dev behavior. `wallet_challenge` enables server-issued Ethereum personal-sign challenges. When `MM_GATEWAY_REQUIRE_AUTH=true`, unauthenticated sessions may only use `heartbeat`, `get_session`, `auth_challenge`, and `auth_verify`; trading, quote, and RFQ messages require an authenticated wallet session and account fields must match that wallet address case-insensitively. `MM_GATEWAY_CHALLENGE_TTL_MS` controls challenge expiry.
 `MM_PERMISSIONS_ENABLED=false` preserves existing MM gateway and RFQ behavior. When `true`, protected MM order and quote actions require an enabled row in `mm_accounts`, the relevant capability flag, and any configured market or option-series scope. `MM_PERMISSIONS_REQUIRE_PERSISTENCE=true` requires Postgres when permission enforcement is enabled; tests and local development can set it to `false` for in-memory permission seeding.
@@ -132,6 +140,10 @@ GET /admin/mm/permissions
 GET /admin/execution/summary
 GET /admin/rfq/summary
 GET /admin/options/summary
+GET /admin/fees/summary
+GET /admin/fees/events?limit=20
+GET /admin/fees/volumes?account=0x...
+GET /admin/fees/rebates?account=0x...
 GET /admin/recent?limit=20
 ```
 
@@ -144,9 +156,52 @@ All admin endpoints are disabled unless `ADMIN_API_ENABLED=true`. When token pro
 `/admin/mm/sessions` returns sanitized active MM session snapshots. It reports session id, auth mode, authenticated/account fields, challenge-active state and challenge expiry, heartbeat timestamps, `cancel_on_disconnect`, and open-client-order count, but not connection internals, challenge strings, signatures, nonces, or full client-order id lists. If the gateway is disabled, it returns `enabled=false` with an empty session list.
 `/admin/mm/permissions` returns read-only sanitized MM permission visibility: whether enforcement is enabled, whether persistence is required, and configured accounts with capability booleans and product scopes. It never returns private keys, auth challenges, signatures, tokens, or raw database configuration, and V1A intentionally has no admin write endpoint.
 
-`/admin/execution/summary`, `/admin/rfq/summary`, `/admin/options/summary`, and `/admin/recent` provide compact bounded summaries from Postgres when persistence is enabled and in-memory summaries otherwise. `/admin/recent` defaults to `limit=20` and caps at `100`.
+`/admin/execution/summary`, `/admin/rfq/summary`, `/admin/options/summary`, `/admin/fees/*`, and `/admin/recent` provide compact bounded summaries from Postgres when persistence is enabled and in-memory summaries otherwise. `/admin/recent` and `/admin/fees/events` default to bounded reads and cap `limit` at `100`.
 
 Monitoring/Admin V1B is deferred: Prometheus metrics, structured event logs, external alerts, Grafana dashboards, frontend admin dashboard, production auth, admin write controls, and risk admin controls.
+
+## Fees & Rebates V1A
+
+Fees & Rebates V1A is backend-only ledger accounting. It is disabled by default and does not modify Solidity, deploy contracts, collect on-chain fees, pay rebates, move funds, create execution transactions, or call broadcast paths.
+
+Configuration:
+
+```text
+FEES_ENABLED=false
+FEES_REQUIRE_PERSISTENCE=true
+FEES_REBATES_ENABLED=false
+FEES_PROTOCOL_FEE_RECIPIENT=treasury
+FEES_DEFAULT_FEE_ASSET=USDC
+FEES_OPTION_FEE_BASIS=premium_or_underlying_capped
+FEES_OPTION_PREMIUM_CAP_PCT=10
+```
+
+Rates use `micro_bps`: one basis point is `10_000` micro-bps, and fee math divides by `100_000_000`. This allows exact integer rates such as `7_500` micro-bps for `0.75` bps and avoids floating point accounting.
+
+V1A hardcodes the launch schedule in Rust. Perp tiers use maker fee or rebate and taker fee rates from tier 0 through tier 4: tier 0 is maker `0.005%` / taker `0.030%`, tier 1 maker `0%` / taker `0.025%`, tier 2 maker rebate `0.005%` / taker `0.020%`, tier 3 maker rebate `0.0075%` / taker `0.0175%`, and tier 4 maker rebate `0.010%` / taker `0.015%`. Option tiers are tier 0 maker `0.005%` / taker `0.025%`, tier 1 maker `0%` / taker `0.015%`, tier 2 maker rebate `0.001%` / taker `0.0125%`, tier 3 maker rebate `0.0025%` / taker `0.010%`, and tier 4 maker rebate `0.005%` / taker `0.0075%`. Option RFQ discounts apply to positive RFQ fees only: maker/taker discounts are `0/0`, `25/10`, `50/25`, `75/50`, and `100/75` percent from tier 0 to tier 4. V1A resolves tiers from persisted or in-memory volume buckets; volume-share and staking thresholds are represented in the schedule model but not yet enforced.
+
+Option fee basis is underlying notional capped by premium. The service computes the underlying fee from `underlying_notional_1e8 * rate_micro_bps / 100_000_000`, computes the cap as `premium_notional_1e8 * FEES_OPTION_PREMIUM_CAP_PCT / 100`, then records the lower amount. The same cap is used for maker rebate accruals.
+
+Maker/taker classification follows the fill source. Option orderbook fills use the resting order as maker and incoming order as taker from `maker_order_id`, `taker_order_id`, and `taker_side`. Option RFQ fills use `mm_account` as maker and RFQ taker as taker. Perp schedule support is present for future integrations, but V1A only records option order fill and option RFQ fill fee events.
+
+Persistence adds:
+
+- `fee_events`: one idempotent ledger event per source, payer, and recipient.
+- `volume_buckets`: daily maker/taker/total volume by account and market type.
+- `rebate_accruals`: ledger-only rebate accrual rows linked to fee events.
+
+When fees are disabled, fills behave exactly as before and no fee rows are written. When fees are enabled, option order fills and option RFQ fills record maker and taker fee events, update volume buckets, and can accrue rebates. Rebate accrual requires `FEES_REBATES_ENABLED=true`, `MM_PERMISSIONS_ENABLED=true`, an enabled `mm_accounts` row, and the relevant option MM capability (`can_quote_option_rfq` for option RFQ fills; `can_submit_option_orders` or `can_quote_option_rfq` for option order fills). If MM permissions are disabled or the maker is not enabled/permissioned, no rebate accrues.
+
+Read-only admin visibility is available at:
+
+```text
+GET /admin/fees/summary
+GET /admin/fees/events?limit=20
+GET /admin/fees/volumes?account=0x...
+GET /admin/fees/rebates?account=0x...
+```
+
+There are no admin fee write endpoints. V1B fee work can add on-chain fee collection, rebate payout workflows, claim contracts, volume-share and staking enforcement, richer treasury accounting, and frontend/admin dashboards.
 
 ## Options V1D / Option RFQ V1C
 
@@ -453,7 +508,7 @@ Capabilities are stored on `mm_accounts`:
 
 Product scopes are optional and stored in `mm_market_permissions`. If an enabled MM account has no perp market scope rows, `can_quote_perp_rfq` / `can_submit_perp_orders` apply to all perp markets. If the account has any perp market scope rows, an enabled row with that `market_id` or an enabled global row (`market_id IS NULL AND option_series_id IS NULL`) is required. Option RFQ scope works the same way with `option_series_id`.
 
-Manual onboarding in V1A is SQL-only. There are no admin writes, no automatic MM approval, no ranking/scoring, no rebates, and no on-chain allowlist. Example seed:
+Manual onboarding in V1A is SQL-only. There are no admin writes, no automatic MM approval, no ranking/scoring, no rebate payouts, and no on-chain allowlist. Example seed:
 
 ```sql
 INSERT INTO mm_accounts (
@@ -798,7 +853,7 @@ PERSISTENCE_ENABLED=true
 DATABASE_URL=postgres://deopt:deopt@127.0.0.1:5432/deopt_v2_backend
 ```
 
-When enabled, the service connects to Postgres at startup and runs migrations from `migrations/`. Migrations create `used_nonces`, `orders`, `trades`, `execution_intents`, `execution_intent_signatures`, `execution_simulations`, `engine_events`, `indexer_cursors`, `indexed_perp_trades`, `execution_reconciliations`, `execution_transactions`, `option_series`, `option_orders`, `option_fills`, `option_rfqs`, `option_rfq_quotes`, `option_rfq_fills`, `mm_accounts`, and `mm_market_permissions`. RFQ signed quotes add nullable `signature`, `quote_digest`, `quote_nonce`, `signature_status`, and `recovered_signer` fields to `rfq_quotes`. Signed option RFQ quotes add the same nullable metadata fields to `option_rfq_quotes`. Confirmation adds nullable `confirmed_at_ms`, `confirmed_block_number`, `confirmation_status`, and `confirmation_error` fields to `execution_transactions`. MM Permissions V1A adds SQL-seeded allowlist and product-scope tables only; it does not add admin write endpoints.
+When enabled, the service connects to Postgres at startup and runs migrations from `migrations/`. Migrations create `used_nonces`, `orders`, `trades`, `execution_intents`, `execution_intent_signatures`, `execution_simulations`, `engine_events`, `indexer_cursors`, `indexed_perp_trades`, `execution_reconciliations`, `execution_transactions`, `option_series`, `option_orders`, `option_fills`, `option_rfqs`, `option_rfq_quotes`, `option_rfq_fills`, `mm_accounts`, `mm_market_permissions`, `fee_events`, `volume_buckets`, and `rebate_accruals`. RFQ signed quotes add nullable `signature`, `quote_digest`, `quote_nonce`, `signature_status`, and `recovered_signer` fields to `rfq_quotes`. Signed option RFQ quotes add the same nullable metadata fields to `option_rfq_quotes`. Confirmation adds nullable `confirmed_at_ms`, `confirmed_block_number`, `confirmation_status`, and `confirmation_error` fields to `execution_transactions`. MM Permissions V1A adds SQL-seeded allowlist and product-scope tables only; Fees & Rebates V1A adds ledger-only accounting tables only. Neither adds admin write endpoints.
 
 One local setup option:
 
@@ -867,7 +922,7 @@ curl -X DELETE http://127.0.0.1:8080/orders/<order_id>
 - FOK is rejected cleanly.
 - RFQ supports HTTP/dev flow plus basic MM gateway push, quote intake, optional signed quote verification, and wallet challenge MM session auth; multi-leg RFQ, signed taker RFQ requests, MM ranking, and market data datagrams remain deferred.
 - Options V1D/V1C supports manual option series registration, deterministic `option_series_id`, off-chain GTC option orders, price-time matching, fill recording/listing, cancellation, listing/filtering, aggregated option orderbook reads, HTTP/core option RFQs with off-chain RFQ fills, signed MM option RFQ quotes, and MM Gateway option RFQ request/quote/accept notification messages; option execution intents and on-chain option execution remain deferred.
-- MM permissions are SQL-seeded and read-only in the API; frontend permissions UI, admin writes, automatic onboarding, ranking/scoring, incentives/rebates, and on-chain allowlists are deferred.
+- MM permissions are SQL-seeded and read-only in the API; frontend permissions UI, admin writes, automatic onboarding, ranking/scoring, rebate payout workflows, and on-chain allowlists are deferred.
 - Execution intents are provisional off-chain records, not settlement.
 - Indexed `TradeExecuted` events store `onchain_intent_id` for direct reconciliation only; they do not confirm backend intents.
 - Reconciliation rows link indexed events to intents, but still do not prove transaction ownership, finality, or reorg safety.

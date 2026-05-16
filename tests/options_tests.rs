@@ -2,6 +2,8 @@ use axum::body::{to_bytes, Body};
 use axum::http::{header, Request, StatusCode};
 use deopt_v2_backend::api::{router, AppState};
 use deopt_v2_backend::engine::EngineState;
+use deopt_v2_backend::fees::{FeeMarketType, FeesConfig};
+use deopt_v2_backend::mm::{MmAccountPermissions, MmPermissionsConfig};
 use deopt_v2_backend::options::service::{
     accept_option_rfq_quote, cancel_option_order, cancel_option_rfq, create_option_rfq,
     create_option_series, disable_option_series, get_option_fill, get_option_order,
@@ -26,6 +28,8 @@ use tokio::time::{sleep, Duration};
 use tower::ServiceExt;
 
 const VALID_SIGNATURE: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const ONE_1E8: u128 = 100_000_000;
+const VOLUME_25M_1E8: u128 = 25_000_000 * ONE_1E8;
 
 fn state() -> AppState {
     AppState::with_options_config(
@@ -38,6 +42,14 @@ fn option_rfq_state() -> AppState {
     let mut config = OptionsConfig::enabled_in_memory_for_tests();
     config.rfq_enabled = true;
     AppState::with_options_config(EngineState::with_default_markets(), config)
+}
+
+fn fee_state(rebates_enabled: bool) -> AppState {
+    let mut options = OptionsConfig::enabled_in_memory_for_tests();
+    options.rfq_enabled = true;
+    let mut fees = FeesConfig::enabled_in_memory_for_tests();
+    fees.rebates_enabled = rebates_enabled;
+    AppState::with_options_and_fees_config(EngineState::with_default_markets(), options, fees)
 }
 
 fn strict_option_rfq_state() -> AppState {
@@ -83,6 +95,28 @@ async fn active_series_id(state: &AppState) -> String {
         .await
         .unwrap()
         .option_series_id
+}
+
+fn seed_fee_volume(
+    state: &AppState,
+    account: &AccountId,
+    maker_volume_1e8: u128,
+    taker_volume_1e8: u128,
+) {
+    let bucket_day = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    state
+        .fees_store
+        .lock()
+        .unwrap()
+        .upsert_volume_delta(
+            account,
+            &bucket_day,
+            FeeMarketType::Option,
+            maker_volume_1e8,
+            taker_volume_1e8,
+            now_ms(),
+        )
+        .unwrap();
 }
 
 fn order_input(
@@ -903,6 +937,105 @@ async fn option_match_does_not_create_execution_intent_or_transaction() {
 }
 
 #[tokio::test]
+async fn fees_disabled_preserves_option_fill_behavior_without_fee_events() {
+    let state = state();
+    let option_series_id = active_series_id(&state).await;
+    let mut ask = order_input(option_series_id.clone(), Side::Sell, "fees-off-maker");
+    ask.account = account_two();
+    submit_option_order(&state, ask).await.unwrap();
+
+    let outcome = submit_option_order(
+        &state,
+        order_input(option_series_id, Side::Buy, "fees-off-taker"),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(outcome.fills.len(), 1);
+    let store = state.fees_store.lock().unwrap();
+    assert!(store.list_fee_events(10).is_empty());
+    assert!(store.list_volume_buckets(None).is_empty());
+    assert!(store.list_rebate_accruals(None).is_empty());
+}
+
+#[tokio::test]
+async fn option_order_fill_records_maker_taker_fee_events_and_volumes() {
+    let state = fee_state(false);
+    let option_series_id = active_series_id(&state).await;
+    let mut ask = order_input(option_series_id.clone(), Side::Sell, "fee-maker-ask");
+    ask.account = account_two();
+    ask.price_1e8 = 1_000_000_000;
+    submit_option_order(&state, ask).await.unwrap();
+    let mut buy = order_input(option_series_id, Side::Buy, "fee-taker-buy");
+    buy.price_1e8 = 1_100_000_000;
+
+    let outcome = submit_option_order(&state, buy).await.unwrap();
+
+    assert_eq!(outcome.fills.len(), 1);
+    let store = state.fees_store.lock().unwrap();
+    let events = store.list_fee_events(10);
+    assert_eq!(events.len(), 2);
+    let maker_event = events
+        .iter()
+        .find(|event| event.payer == account_two())
+        .unwrap();
+    let taker_event = events
+        .iter()
+        .find(|event| event.payer == account())
+        .unwrap();
+    assert_eq!(maker_event.source_type.as_str(), "option_order_fill");
+    assert_eq!(maker_event.flow_type.as_str(), "orderbook");
+    assert_eq!(maker_event.maker.as_ref(), Some(&account_two()));
+    assert_eq!(maker_event.taker.as_ref(), Some(&account()));
+    assert_eq!(maker_event.fee_rate_micro_bps, 5_000);
+    assert_eq!(maker_event.fee_amount_1e8, 15_000_000);
+    assert_eq!(taker_event.fee_rate_micro_bps, 25_000);
+    assert_eq!(taker_event.fee_amount_1e8, 75_000_000);
+
+    let volumes = store.list_volume_buckets(None);
+    assert_eq!(volumes.len(), 2);
+    let maker_volume = volumes
+        .iter()
+        .find(|bucket| bucket.account == account_two())
+        .unwrap();
+    let taker_volume = volumes
+        .iter()
+        .find(|bucket| bucket.account == account())
+        .unwrap();
+    assert_eq!(maker_volume.maker_volume_1e8, 300_000_000_000);
+    assert_eq!(maker_volume.taker_volume_1e8, 0);
+    assert_eq!(taker_volume.maker_volume_1e8, 0);
+    assert_eq!(taker_volume.taker_volume_1e8, 300_000_000_000);
+}
+
+#[tokio::test]
+async fn option_order_fee_is_capped_by_premium_notional() {
+    let state = fee_state(false);
+    let option_series_id = active_series_id(&state).await;
+    let mut ask = order_input(option_series_id.clone(), Side::Sell, "cap-maker-ask");
+    ask.account = account_two();
+    ask.price_1e8 = ONE_1E8;
+    submit_option_order(&state, ask).await.unwrap();
+    let mut buy = order_input(option_series_id, Side::Buy, "cap-taker-buy");
+    buy.price_1e8 = 2 * ONE_1E8;
+
+    submit_option_order(&state, buy).await.unwrap();
+
+    let store = state.fees_store.lock().unwrap();
+    let events = store.list_fee_events(10);
+    let maker_event = events
+        .iter()
+        .find(|event| event.payer == account_two())
+        .unwrap();
+    let taker_event = events
+        .iter()
+        .find(|event| event.payer == account())
+        .unwrap();
+    assert_eq!(maker_event.fee_amount_1e8, 10_000_000);
+    assert_eq!(taker_event.fee_amount_1e8, 10_000_000);
+}
+
+#[tokio::test]
 async fn http_option_order_lifecycle() {
     let state = state();
     let option_series_id = active_series_id(&state).await;
@@ -1442,6 +1575,127 @@ async fn option_rfq_create_quote_accept_buy_creates_offchain_fill_only() {
     assert_eq!(quotes.len(), 1);
     assert_eq!(rfqs.len(), 1);
     assert_eq!(state.engine.lock().unwrap().execution_intents().len(), 0);
+}
+
+#[tokio::test]
+async fn option_rfq_fill_records_discounted_taker_fee_for_high_volume_tier() {
+    let state = fee_state(false);
+    seed_fee_volume(&state, &account(), 0, VOLUME_25M_1E8);
+    let option_series_id = active_series_id(&state).await;
+    let rfq = create_option_rfq(&state, option_rfq_input(option_series_id, Side::Buy))
+        .await
+        .unwrap();
+    let quote = submit_option_rfq_quote(
+        &state,
+        rfq.option_rfq_id,
+        option_rfq_quote_input(account_two(), "discounted-rfq-quote"),
+    )
+    .await
+    .unwrap();
+
+    accept_option_rfq_quote(&state, rfq.option_rfq_id, quote.quote_id)
+        .await
+        .unwrap();
+
+    let store = state.fees_store.lock().unwrap();
+    let events = store.list_fee_events(10);
+    assert_eq!(events.len(), 2);
+    let taker_event = events
+        .iter()
+        .find(|event| event.payer == account())
+        .unwrap();
+    assert_eq!(taker_event.source_type.as_str(), "option_rfq_fill");
+    assert_eq!(taker_event.flow_type.as_str(), "rfq");
+    assert_eq!(taker_event.fee_rate_micro_bps, 1_875);
+    assert_eq!(taker_event.fee_amount_1e8, 5_625_000);
+    assert!(store.list_rebate_accruals(None).is_empty());
+}
+
+#[tokio::test]
+async fn rebates_do_not_accrue_when_mm_permissions_are_disabled() {
+    let state = fee_state(true);
+    seed_fee_volume(&state, &account_two(), VOLUME_25M_1E8, 0);
+    let option_series_id = active_series_id(&state).await;
+    let rfq = create_option_rfq(&state, option_rfq_input(option_series_id, Side::Buy))
+        .await
+        .unwrap();
+    let quote = submit_option_rfq_quote(
+        &state,
+        rfq.option_rfq_id,
+        option_rfq_quote_input(account_two(), "no-permission-rebate"),
+    )
+    .await
+    .unwrap();
+
+    accept_option_rfq_quote(&state, rfq.option_rfq_id, quote.quote_id)
+        .await
+        .unwrap();
+
+    let store = state.fees_store.lock().unwrap();
+    let maker_event = store
+        .list_fee_events(10)
+        .into_iter()
+        .find(|event| event.payer == account_two())
+        .unwrap();
+    assert_eq!(maker_event.rebate_rate_micro_bps, 0);
+    assert_eq!(maker_event.rebate_amount_1e8, 0);
+    assert!(store.list_rebate_accruals(None).is_empty());
+}
+
+#[tokio::test]
+async fn permissioned_mm_rebate_accrues_once_for_option_rfq_fill() {
+    let mut state = fee_state(true);
+    state.mm_permissions_config = MmPermissionsConfig::enabled_in_memory_for_tests();
+    state
+        .mm_permissions
+        .lock()
+        .unwrap()
+        .upsert_account(MmAccountPermissions {
+            mm_account: account_two(),
+            enabled: true,
+            label: Some("rebate-mm".to_string()),
+            can_submit_perp_orders: false,
+            can_quote_perp_rfq: false,
+            can_quote_option_rfq: true,
+            can_submit_option_orders: false,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        });
+    seed_fee_volume(&state, &account_two(), VOLUME_25M_1E8, 0);
+    let option_series_id = active_series_id(&state).await;
+    let rfq = create_option_rfq(&state, option_rfq_input(option_series_id, Side::Buy))
+        .await
+        .unwrap();
+    let quote = submit_option_rfq_quote(
+        &state,
+        rfq.option_rfq_id,
+        option_rfq_quote_input(account_two(), "permissioned-rebate"),
+    )
+    .await
+    .unwrap();
+
+    let outcome = accept_option_rfq_quote(&state, rfq.option_rfq_id, quote.quote_id)
+        .await
+        .unwrap();
+    deopt_v2_backend::fees::service::record_option_rfq_fill(&state, &outcome.fill, &outcome.quote)
+        .await
+        .unwrap();
+
+    let store = state.fees_store.lock().unwrap();
+    let events = store.list_fee_events(10);
+    let maker_event = events
+        .iter()
+        .find(|event| event.payer == account_two())
+        .unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(maker_event.fee_rate_micro_bps, 0);
+    assert_eq!(maker_event.fee_amount_1e8, 0);
+    assert_eq!(maker_event.rebate_rate_micro_bps, 5_000);
+    assert_eq!(maker_event.rebate_amount_1e8, 15_000_000);
+    let rebates = store.list_rebate_accruals(Some(&account_two()));
+    assert_eq!(rebates.len(), 1);
+    assert_eq!(rebates[0].fee_event_id, maker_event.fee_event_id);
+    assert_eq!(rebates[0].rebate_amount_1e8, 15_000_000);
 }
 
 #[tokio::test]

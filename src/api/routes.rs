@@ -15,6 +15,10 @@ use crate::execution::{
     StoredTradeSignatures, TradeSignatureStatus, TransactionBroadcastProvider,
     TransactionReceiptProvider, PERP_TRADE_TYPE,
 };
+use crate::fees::service::{
+    admin_fee_events as admin_fee_events_service, admin_fee_rebates as admin_fee_rebates_service,
+    admin_fee_summary as admin_fee_summary_service, admin_fee_volumes as admin_fee_volumes_service,
+};
 use crate::indexer::{Indexer, IndexerStatus, IndexerTickResult};
 use crate::mm::permissions::{
     list_permission_accounts, list_product_permissions, MmProductPermission,
@@ -196,6 +200,10 @@ pub fn router(state: AppState) -> Router {
         .route("/admin/execution/summary", get(admin_execution_summary))
         .route("/admin/rfq/summary", get(admin_rfq_summary))
         .route("/admin/options/summary", get(admin_options_summary))
+        .route("/admin/fees/summary", get(admin_fee_summary))
+        .route("/admin/fees/events", get(admin_fee_events))
+        .route("/admin/fees/volumes", get(admin_fee_volumes))
+        .route("/admin/fees/rebates", get(admin_fee_rebates))
         .route("/admin/recent", get(admin_recent))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -235,7 +243,9 @@ async fn admin_status(
         "mm_permissions_enabled": state.mm_permissions_config.enabled,
         "rfq_enabled": state.rfq_config.enabled,
         "options_enabled": state.options_config.enabled,
-        "option_rfq_enabled": state.options_config.rfq_enabled
+        "option_rfq_enabled": state.options_config.rfq_enabled,
+        "fees_enabled": state.fees_config.enabled,
+        "rebates_enabled": state.fees_config.rebates_enabled
     })))
 }
 
@@ -263,6 +273,8 @@ async fn admin_config(
             "rfq_enabled": state.rfq_config.enabled,
             "options_enabled": state.options_config.enabled,
             "option_rfq_enabled": state.options_config.rfq_enabled,
+            "fees_enabled": state.fees_config.enabled,
+            "rebates_enabled": state.fees_config.rebates_enabled,
             "mm_gateway_enabled": state.mm_gateway_config.enabled,
             "mm_permissions_enabled": state.mm_permissions_config.enabled,
             "perp_nonce_sync_enabled": state.perp_nonce_sync_config.enabled
@@ -315,6 +327,16 @@ async fn admin_config(
         "mm_permissions": {
             "enabled": state.mm_permissions_config.enabled,
             "require_persistence": state.mm_permissions_config.require_persistence
+        },
+        "fees": {
+            "enabled": state.fees_config.enabled,
+            "require_persistence": state.fees_config.require_persistence,
+            "rebates_enabled": state.fees_config.rebates_enabled,
+            "protocol_fee_recipient": state.fees_config.protocol_fee_recipient.clone(),
+            "default_fee_asset": state.fees_config.default_fee_asset.clone(),
+            "option_fee_basis": state.fees_config.option_fee_basis.as_str(),
+            "option_premium_cap_pct": state.fees_config.option_premium_cap_pct,
+            "rate_unit": "micro_bps"
         },
         "rfq": {
             "enabled": state.rfq_config.enabled,
@@ -717,6 +739,65 @@ async fn admin_options_summary(
         "option_rfq_fills_count": option_rfq_fills.len(),
         "recent_option_rfq_fills": option_rfq_fills.iter().rev().take(20).map(compact_option_rfq_fill).collect::<Vec<_>>(),
         "recent_option_order_fills": fills.iter().rev().take(20).map(compact_option_fill).collect::<Vec<_>>()
+    })))
+}
+
+async fn admin_fee_summary(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    ensure_admin_access(&state, &headers)?;
+    Ok(Json(admin_fee_summary_service(&state).await?))
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+struct AdminFeeEventsQuery {
+    limit: Option<u32>,
+}
+
+async fn admin_fee_events(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Query(query): Query<AdminFeeEventsQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    ensure_admin_access(&state, &headers)?;
+    let limit = query.limit.unwrap_or(20).min(100);
+    Ok(Json(serde_json::json!({
+        "limit": limit,
+        "events": admin_fee_events_service(&state, limit).await?
+    })))
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct AdminFeeAccountQuery {
+    account: Option<AccountId>,
+}
+
+async fn admin_fee_volumes(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Query(query): Query<AdminFeeAccountQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    ensure_admin_access(&state, &headers)?;
+    let account = query.account;
+    let volumes = admin_fee_volumes_service(&state, account.clone()).await?;
+    Ok(Json(serde_json::json!({
+        "account": account,
+        "volumes": volumes
+    })))
+}
+
+async fn admin_fee_rebates(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Query(query): Query<AdminFeeAccountQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    ensure_admin_access(&state, &headers)?;
+    let account = query.account;
+    let rebates = admin_fee_rebates_service(&state, account.clone()).await?;
+    Ok(Json(serde_json::json!({
+        "account": account,
+        "rebates": rebates
     })))
 }
 
@@ -3520,11 +3601,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admin_fees_has_no_write_endpoint() {
+        let response = router(admin_state(false))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/fees/summary")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
     async fn admin_empty_summaries_are_valid() {
         for path in [
             "/admin/execution/summary",
             "/admin/rfq/summary",
             "/admin/options/summary",
+            "/admin/fees/summary",
         ] {
             let response = router(admin_state(false))
                 .oneshot(get_request(path, None))
@@ -3555,6 +3653,7 @@ mod tests {
         let before_intents = state.engine.lock().unwrap().execution_intents().len();
         let before_rfqs = state.rfq_store.lock().unwrap().list_rfqs().len();
         let before_option_rfqs = state.options_store.lock().unwrap().list_option_rfqs().len();
+        let before_fee_events = state.fees_store.lock().unwrap().list_fee_events(10).len();
 
         for path in [
             "/admin/status",
@@ -3565,6 +3664,10 @@ mod tests {
             "/admin/execution/summary",
             "/admin/rfq/summary",
             "/admin/options/summary",
+            "/admin/fees/summary",
+            "/admin/fees/events?limit=5",
+            "/admin/fees/volumes",
+            "/admin/fees/rebates",
             "/admin/recent?limit=5",
         ] {
             let response = app.clone().oneshot(get_request(path, None)).await.unwrap();
@@ -3582,6 +3685,10 @@ mod tests {
         assert_eq!(
             state.options_store.lock().unwrap().list_option_rfqs().len(),
             before_option_rfqs
+        );
+        assert_eq!(
+            state.fees_store.lock().unwrap().list_fee_events(10).len(),
+            before_fee_events
         );
     }
 

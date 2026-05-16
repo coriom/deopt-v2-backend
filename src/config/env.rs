@@ -2,6 +2,7 @@ use crate::admin::AdminConfig;
 use crate::confirmation::ConfirmationConfig;
 use crate::error::{BackendError, Result};
 use crate::execution::{ExecutionConfig, PrivateKeySecret};
+use crate::fees::{FeesConfig, OptionFeeBasis};
 use crate::indexer::IndexerConfig;
 use crate::mm::transport::webtransport::validate_webtransport_startup;
 use crate::mm::{MmGatewayConfig, MmPermissionsConfig};
@@ -29,6 +30,7 @@ pub struct AppConfig {
     pub reconciliation: ReconciliationConfig,
     pub rfq: RfqConfig,
     pub options: OptionsConfig,
+    pub fees: FeesConfig,
     pub mm_gateway: MmGatewayConfig,
     pub mm_permissions: MmPermissionsConfig,
     pub admin: AdminConfig,
@@ -158,6 +160,19 @@ impl AppConfig {
                 "true",
             )?,
         };
+        let fees = FeesConfig {
+            enabled: parse_env(&mut lookup, "FEES_ENABLED", "false")?,
+            require_persistence: parse_env(&mut lookup, "FEES_REQUIRE_PERSISTENCE", "true")?,
+            rebates_enabled: parse_env(&mut lookup, "FEES_REBATES_ENABLED", "false")?,
+            protocol_fee_recipient: get_env(&mut lookup, "FEES_PROTOCOL_FEE_RECIPIENT", "treasury"),
+            default_fee_asset: get_env(&mut lookup, "FEES_DEFAULT_FEE_ASSET", "USDC"),
+            option_fee_basis: parse_env(
+                &mut lookup,
+                "FEES_OPTION_FEE_BASIS",
+                OptionFeeBasis::PremiumOrUnderlyingCapped.as_str(),
+            )?,
+            option_premium_cap_pct: parse_env(&mut lookup, "FEES_OPTION_PREMIUM_CAP_PCT", "10")?,
+        };
         let admin = AdminConfig::new(
             parse_env(&mut lookup, "ADMIN_API_ENABLED", "false")?,
             parse_env(&mut lookup, "ADMIN_API_REQUIRE_TOKEN", "false")?,
@@ -275,6 +290,7 @@ impl AppConfig {
         rfq.validate_startup(persistence_enabled)?;
         options.validate_startup(persistence_enabled)?;
         mm_permissions.validate_startup(persistence_enabled)?;
+        fees.validate_startup(persistence_enabled)?;
         validate_webtransport_startup(&mm_gateway)?;
         admin.validate_startup()?;
 
@@ -291,6 +307,7 @@ impl AppConfig {
             reconciliation,
             rfq,
             options,
+            fees,
             mm_gateway,
             mm_permissions,
             admin,
@@ -365,6 +382,49 @@ mod tests {
             config.database_url.as_deref(),
             Some("postgres://deopt:deopt@127.0.0.1:5432/deopt_v2_backend")
         );
+    }
+
+    #[test]
+    fn fees_use_safe_disabled_defaults() {
+        let config = config_from_pairs([("FEES_ENABLED", "false")]).unwrap();
+
+        assert!(!config.fees.enabled);
+        assert!(config.fees.require_persistence);
+        assert!(!config.fees.rebates_enabled);
+        assert_eq!(config.fees.protocol_fee_recipient, "treasury");
+        assert_eq!(config.fees.default_fee_asset, "USDC");
+        assert_eq!(
+            config.fees.option_fee_basis,
+            OptionFeeBasis::PremiumOrUnderlyingCapped
+        );
+        assert_eq!(config.fees.option_premium_cap_pct, 10);
+    }
+
+    #[test]
+    fn fees_enabled_requires_persistence_by_default() {
+        let error = config_from_pairs([("FEES_ENABLED", "true")]).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("Fees require persistence enabled"));
+    }
+
+    #[test]
+    fn fees_enabled_can_run_in_memory_when_requirement_disabled() {
+        let config = config_from_pairs([
+            ("FEES_ENABLED", "true"),
+            ("FEES_REQUIRE_PERSISTENCE", "false"),
+            ("FEES_REBATES_ENABLED", "true"),
+            ("FEES_PROTOCOL_FEE_RECIPIENT", "local-treasury"),
+            ("FEES_DEFAULT_FEE_ASSET", "USDC"),
+            ("FEES_OPTION_PREMIUM_CAP_PCT", "10"),
+        ])
+        .unwrap();
+
+        assert!(config.fees.enabled);
+        assert!(!config.fees.require_persistence);
+        assert!(config.fees.rebates_enabled);
+        assert_eq!(config.fees.protocol_fee_recipient, "local-treasury");
     }
 
     #[test]

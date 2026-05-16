@@ -10,6 +10,7 @@ use crate::execution::{
     ExecutionIntent, ExecutionIntentRepository, ExecutionIntentStatus, ExecutionTransaction,
     ExecutionTransactionStatus, SimulationResult, StoredTradeSignatures,
 };
+use crate::fees::{FeeEvent, FeeMarketType, RebateAccrual, VolumeBucket};
 use crate::indexer::IndexedPerpTrade;
 use crate::mm::{MmAccountPermissions, MmProductPermission};
 use crate::options::store::status_for_remaining;
@@ -57,6 +58,9 @@ const ADMIN_TABLE_COUNTS: &[(&str, &str)] = &[
     ("option_rfq_fills", "option_rfq_fills"),
     ("mm_accounts", "mm_accounts"),
     ("mm_market_permissions", "mm_market_permissions"),
+    ("fee_events", "fee_events"),
+    ("volume_buckets", "volume_buckets"),
+    ("rebate_accruals", "rebate_accruals"),
 ];
 
 fn validate_admin_identifier(identifier: &str) -> Result<()> {
@@ -254,6 +258,147 @@ impl PgRepository {
         rows.into_iter()
             .map(mm_product_permission_from_row)
             .collect()
+    }
+
+    pub async fn insert_fee_event(&self, event: &FeeEvent) -> Result<bool> {
+        let market_id = event
+            .market_id
+            .map(|value| u64_to_i64("market_id", value))
+            .transpose()?;
+        let maker = event.maker.as_ref().map(|account| account.0.as_str());
+        let taker = event.taker.as_ref().map(|account| account.0.as_str());
+        let result = sqlx::query(
+            "INSERT INTO fee_events (
+                fee_event_id, source_type, source_id, market_type, flow_type, market_id,
+                option_series_id, maker, taker, payer, recipient, fee_asset, notional_1e8,
+                fee_rate_micro_bps, fee_amount_1e8, rebate_rate_micro_bps, rebate_amount_1e8,
+                protocol_amount_1e8, status, created_at_ms
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                $11, $12, $13, $14, $15, $16, $17, $18, $19, $20
+            )
+            ON CONFLICT (source_type, source_id, payer, recipient) DO NOTHING",
+        )
+        .bind(&event.fee_event_id)
+        .bind(event.source_type.as_str())
+        .bind(&event.source_id)
+        .bind(event.market_type.as_str())
+        .bind(event.flow_type.as_str())
+        .bind(market_id)
+        .bind(&event.option_series_id)
+        .bind(maker)
+        .bind(taker)
+        .bind(&event.payer.0)
+        .bind(&event.recipient)
+        .bind(&event.fee_asset)
+        .bind(event.notional_1e8.to_string())
+        .bind(u64_to_i64("fee_rate_micro_bps", event.fee_rate_micro_bps)?)
+        .bind(event.fee_amount_1e8.to_string())
+        .bind(u64_to_i64(
+            "rebate_rate_micro_bps",
+            event.rebate_rate_micro_bps,
+        )?)
+        .bind(event.rebate_amount_1e8.to_string())
+        .bind(event.protocol_amount_1e8.to_string())
+        .bind(event.status.as_str())
+        .bind(timestamp_to_i64(event.created_at_ms))
+        .execute(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upsert_fee_volume_delta(
+        &self,
+        account: &AccountId,
+        bucket_day: &str,
+        market_type: FeeMarketType,
+        maker_delta_1e8: u128,
+        taker_delta_1e8: u128,
+        updated_at_ms: TimestampMs,
+    ) -> Result<VolumeBucket> {
+        let total_delta_1e8 = maker_delta_1e8
+            .checked_add(taker_delta_1e8)
+            .ok_or_else(|| BackendError::Config("fee volume delta overflow".to_string()))?;
+        let row = sqlx::query(
+            "INSERT INTO volume_buckets (
+                bucket_id, account, bucket_day, market_type, maker_volume_1e8,
+                taker_volume_1e8, total_volume_1e8, updated_at_ms
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            ON CONFLICT (account, bucket_day, market_type) DO UPDATE
+            SET maker_volume_1e8 =
+                    (volume_buckets.maker_volume_1e8::numeric + EXCLUDED.maker_volume_1e8::numeric)::text,
+                taker_volume_1e8 =
+                    (volume_buckets.taker_volume_1e8::numeric + EXCLUDED.taker_volume_1e8::numeric)::text,
+                total_volume_1e8 =
+                    (volume_buckets.total_volume_1e8::numeric + EXCLUDED.total_volume_1e8::numeric)::text,
+                updated_at_ms = EXCLUDED.updated_at_ms
+            RETURNING bucket_id, account, bucket_day, market_type, maker_volume_1e8,
+                      taker_volume_1e8, total_volume_1e8, updated_at_ms",
+        )
+        .bind(VolumeBucket::key(account, bucket_day, market_type))
+        .bind(&account.0)
+        .bind(bucket_day)
+        .bind(market_type.as_str())
+        .bind(maker_delta_1e8.to_string())
+        .bind(taker_delta_1e8.to_string())
+        .bind(total_delta_1e8.to_string())
+        .bind(timestamp_to_i64(updated_at_ms))
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        volume_bucket_from_row(row)
+    }
+
+    pub async fn fee_rolling_volume_since(
+        &self,
+        account: &AccountId,
+        market_type: FeeMarketType,
+        start_bucket_day: &str,
+    ) -> Result<u128> {
+        if !self.admin_table_exists("volume_buckets").await? {
+            return Ok(0);
+        }
+        let row = sqlx::query(
+            "SELECT COALESCE(SUM(total_volume_1e8::numeric), 0)::text AS total_volume_1e8
+             FROM volume_buckets
+             WHERE lower(account) = lower($1)
+               AND market_type = $2
+               AND bucket_day >= $3",
+        )
+        .bind(&account.0)
+        .bind(market_type.as_str())
+        .bind(start_bucket_day)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        row_get::<String>(&row, "total_volume_1e8")?
+            .parse()
+            .map_err(|error| BackendError::Persistence(format!("invalid fee volume: {error}")))
+    }
+
+    pub async fn insert_rebate_accrual(&self, rebate: &RebateAccrual) -> Result<bool> {
+        let result = sqlx::query(
+            "INSERT INTO rebate_accruals (
+                rebate_id, fee_event_id, account, source_type, source_id, rebate_asset,
+                rebate_amount_1e8, status, created_at_ms
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            ON CONFLICT (fee_event_id, account) DO NOTHING",
+        )
+        .bind(&rebate.rebate_id)
+        .bind(&rebate.fee_event_id)
+        .bind(&rebate.account.0)
+        .bind(rebate.source_type.as_str())
+        .bind(&rebate.source_id)
+        .bind(&rebate.rebate_asset)
+        .bind(rebate.rebate_amount_1e8.to_string())
+        .bind(rebate.status.as_str())
+        .bind(timestamp_to_i64(rebate.created_at_ms))
+        .execute(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        Ok(result.rows_affected() == 1)
     }
 
     pub async fn admin_recent_execution_intents(
@@ -516,6 +661,176 @@ impl PgRepository {
                     "taker_side": row_get::<String>(&row, "taker_side")?,
                     "price_1e8": row_get::<String>(&row, "price_1e8")?,
                     "size_1e8": row_get::<String>(&row, "size_1e8")?,
+                    "created_at_ms": row_get::<i64>(&row, "created_at_ms")?
+                }))
+            })
+            .collect()
+    }
+
+    pub async fn admin_fee_summary(&self) -> Result<serde_json::Value> {
+        if !self.admin_table_exists("fee_events").await? {
+            return Ok(serde_json::json!({
+                "event_count": 0,
+                "fee_total_1e8": "0",
+                "rebate_total_1e8": "0",
+                "protocol_total_1e8": "0",
+                "status_counts": {},
+                "source_type_counts": {},
+                "market_type_counts": {}
+            }));
+        }
+        let row = sqlx::query(
+            "SELECT COUNT(*) AS event_count,
+                    COALESCE(SUM(fee_amount_1e8::numeric), 0)::text AS fee_total_1e8,
+                    COALESCE(SUM(rebate_amount_1e8::numeric), 0)::text AS rebate_total_1e8,
+                    COALESCE(SUM(protocol_amount_1e8::numeric), 0)::text AS protocol_total_1e8
+             FROM fee_events",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        let event_count: i64 = row_get(&row, "event_count")?;
+        Ok(serde_json::json!({
+            "event_count": i64_to_u64_persistence("event_count", event_count)?,
+            "fee_total_1e8": row_get::<String>(&row, "fee_total_1e8")?,
+            "rebate_total_1e8": row_get::<String>(&row, "rebate_total_1e8")?,
+            "protocol_total_1e8": row_get::<String>(&row, "protocol_total_1e8")?,
+            "status_counts": self.admin_count_by_column("fee_events", "status").await?,
+            "source_type_counts": self.admin_count_by_column("fee_events", "source_type").await?,
+            "market_type_counts": self.admin_count_by_column("fee_events", "market_type").await?
+        }))
+    }
+
+    pub async fn admin_recent_fee_events(&self, limit: u32) -> Result<Vec<serde_json::Value>> {
+        if !self.admin_table_exists("fee_events").await? {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            "SELECT fee_event_id, source_type, source_id, market_type, flow_type, market_id,
+                    option_series_id, maker, taker, payer, recipient, fee_asset, notional_1e8,
+                    fee_rate_micro_bps, fee_amount_1e8, rebate_rate_micro_bps,
+                    rebate_amount_1e8, protocol_amount_1e8, status, created_at_ms
+             FROM fee_events
+             ORDER BY created_at_ms DESC, fee_event_id DESC
+             LIMIT $1",
+        )
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(serde_json::json!({
+                    "fee_event_id": row_get::<String>(&row, "fee_event_id")?,
+                    "source_type": row_get::<String>(&row, "source_type")?,
+                    "source_id": row_get::<String>(&row, "source_id")?,
+                    "market_type": row_get::<String>(&row, "market_type")?,
+                    "flow_type": row_get::<String>(&row, "flow_type")?,
+                    "market_id": row_get::<Option<i64>>(&row, "market_id")?,
+                    "option_series_id": row_get::<Option<String>>(&row, "option_series_id")?,
+                    "maker": row_get::<Option<String>>(&row, "maker")?,
+                    "taker": row_get::<Option<String>>(&row, "taker")?,
+                    "payer": row_get::<String>(&row, "payer")?,
+                    "recipient": row_get::<String>(&row, "recipient")?,
+                    "fee_asset": row_get::<String>(&row, "fee_asset")?,
+                    "notional_1e8": row_get::<String>(&row, "notional_1e8")?,
+                    "fee_rate_micro_bps": row_get::<i64>(&row, "fee_rate_micro_bps")?,
+                    "fee_amount_1e8": row_get::<String>(&row, "fee_amount_1e8")?,
+                    "rebate_rate_micro_bps": row_get::<i64>(&row, "rebate_rate_micro_bps")?,
+                    "rebate_amount_1e8": row_get::<String>(&row, "rebate_amount_1e8")?,
+                    "protocol_amount_1e8": row_get::<String>(&row, "protocol_amount_1e8")?,
+                    "status": row_get::<String>(&row, "status")?,
+                    "created_at_ms": row_get::<i64>(&row, "created_at_ms")?
+                }))
+            })
+            .collect()
+    }
+
+    pub async fn admin_fee_volumes(
+        &self,
+        account: Option<&AccountId>,
+    ) -> Result<Vec<serde_json::Value>> {
+        if !self.admin_table_exists("volume_buckets").await? {
+            return Ok(Vec::new());
+        }
+        let rows = if let Some(account) = account {
+            sqlx::query(
+                "SELECT bucket_id, account, bucket_day, market_type, maker_volume_1e8,
+                        taker_volume_1e8, total_volume_1e8, updated_at_ms
+                 FROM volume_buckets
+                 WHERE lower(account) = lower($1)
+                 ORDER BY bucket_day DESC, lower(account) ASC, market_type ASC",
+            )
+            .bind(&account.0)
+            .fetch_all(&self.pool)
+            .await
+        } else {
+            sqlx::query(
+                "SELECT bucket_id, account, bucket_day, market_type, maker_volume_1e8,
+                        taker_volume_1e8, total_volume_1e8, updated_at_ms
+                 FROM volume_buckets
+                 ORDER BY bucket_day DESC, lower(account) ASC, market_type ASC",
+            )
+            .fetch_all(&self.pool)
+            .await
+        }
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(serde_json::json!({
+                    "bucket_id": row_get::<String>(&row, "bucket_id")?,
+                    "account": row_get::<String>(&row, "account")?,
+                    "bucket_day": row_get::<String>(&row, "bucket_day")?,
+                    "market_type": row_get::<String>(&row, "market_type")?,
+                    "maker_volume_1e8": row_get::<String>(&row, "maker_volume_1e8")?,
+                    "taker_volume_1e8": row_get::<String>(&row, "taker_volume_1e8")?,
+                    "total_volume_1e8": row_get::<String>(&row, "total_volume_1e8")?,
+                    "updated_at_ms": row_get::<i64>(&row, "updated_at_ms")?
+                }))
+            })
+            .collect()
+    }
+
+    pub async fn admin_fee_rebates(
+        &self,
+        account: Option<&AccountId>,
+    ) -> Result<Vec<serde_json::Value>> {
+        if !self.admin_table_exists("rebate_accruals").await? {
+            return Ok(Vec::new());
+        }
+        let rows = if let Some(account) = account {
+            sqlx::query(
+                "SELECT rebate_id, fee_event_id, account, source_type, source_id,
+                        rebate_asset, rebate_amount_1e8, status, created_at_ms
+                 FROM rebate_accruals
+                 WHERE lower(account) = lower($1)
+                 ORDER BY created_at_ms DESC, rebate_id DESC",
+            )
+            .bind(&account.0)
+            .fetch_all(&self.pool)
+            .await
+        } else {
+            sqlx::query(
+                "SELECT rebate_id, fee_event_id, account, source_type, source_id,
+                        rebate_asset, rebate_amount_1e8, status, created_at_ms
+                 FROM rebate_accruals
+                 ORDER BY created_at_ms DESC, rebate_id DESC",
+            )
+            .fetch_all(&self.pool)
+            .await
+        }
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(serde_json::json!({
+                    "rebate_id": row_get::<String>(&row, "rebate_id")?,
+                    "fee_event_id": row_get::<String>(&row, "fee_event_id")?,
+                    "account": row_get::<String>(&row, "account")?,
+                    "source_type": row_get::<String>(&row, "source_type")?,
+                    "source_id": row_get::<String>(&row, "source_id")?,
+                    "rebate_asset": row_get::<String>(&row, "rebate_asset")?,
+                    "rebate_amount_1e8": row_get::<String>(&row, "rebate_amount_1e8")?,
+                    "status": row_get::<String>(&row, "status")?,
                     "created_at_ms": row_get::<i64>(&row, "created_at_ms")?
                 }))
             })
@@ -2762,6 +3077,42 @@ fn mm_product_permission_from_row(row: PgRow) -> Result<MmProductPermission> {
         created_at_ms: row_get(&row, "created_at_ms")?,
         updated_at_ms: row_get(&row, "updated_at_ms")?,
     })
+}
+
+fn volume_bucket_from_row(row: PgRow) -> Result<VolumeBucket> {
+    let market_type: String = row_get(&row, "market_type")?;
+    Ok(VolumeBucket {
+        bucket_id: row_get(&row, "bucket_id")?,
+        account: AccountId::new(row_get::<String>(&row, "account")?),
+        bucket_day: row_get(&row, "bucket_day")?,
+        market_type: parse_fee_market_type(&market_type)?,
+        maker_volume_1e8: row_get::<String>(&row, "maker_volume_1e8")?
+            .parse()
+            .map_err(|error| {
+                BackendError::Persistence(format!("invalid maker fee volume: {error}"))
+            })?,
+        taker_volume_1e8: row_get::<String>(&row, "taker_volume_1e8")?
+            .parse()
+            .map_err(|error| {
+                BackendError::Persistence(format!("invalid taker fee volume: {error}"))
+            })?,
+        total_volume_1e8: row_get::<String>(&row, "total_volume_1e8")?
+            .parse()
+            .map_err(|error| {
+                BackendError::Persistence(format!("invalid total fee volume: {error}"))
+            })?,
+        updated_at_ms: row_get(&row, "updated_at_ms")?,
+    })
+}
+
+fn parse_fee_market_type(value: &str) -> Result<FeeMarketType> {
+    match value {
+        "perp" => Ok(FeeMarketType::Perp),
+        "option" => Ok(FeeMarketType::Option),
+        other => Err(BackendError::Persistence(format!(
+            "invalid fee market type: {other}"
+        ))),
+    }
 }
 
 fn insert_option_order_query<'q>(

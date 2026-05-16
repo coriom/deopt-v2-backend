@@ -6,6 +6,7 @@ pub mod db;
 pub mod engine;
 pub mod error;
 pub mod execution;
+pub mod fees;
 pub mod indexer;
 pub mod mm;
 pub mod nonce_sync;
