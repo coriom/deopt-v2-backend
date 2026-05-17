@@ -127,6 +127,21 @@ ADMIN_API_TOKEN=
 `MM_PERMISSIONS_ENABLED=false` preserves existing MM gateway and RFQ behavior. When `true`, protected MM order and quote actions require an enabled row in `mm_accounts`, the relevant capability flag, and any configured market or option-series scope. `MM_PERMISSIONS_REQUIRE_PERSISTENCE=true` requires Postgres when permission enforcement is enabled; tests and local development can set it to `false` for in-memory permission seeding.
 `ADMIN_API_ENABLED=false` is the safe default for Monitoring/Admin V1A. When enabled, `/admin/*` exposes read-only operational observability only. If `ADMIN_API_REQUIRE_TOKEN=true`, requests must include `X-Admin-Token: <ADMIN_API_TOKEN>`. The token is never returned by the API, and admin config responses expose booleans such as `rpc_configured` and `database_configured` instead of raw RPC URLs, database URLs, private keys, or tokens.
 
+## Local Validation
+
+Backend CI runs static validation on pull requests and pushes to `main`. It does not require secrets, live Postgres, private keys, WebTransport certificates, deployment access, or broadcast paths.
+
+Run the same local checks before opening a PR:
+
+```sh
+cargo fmt
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test
+cargo build
+python3 -m py_compile scripts/e2e/run_e2e.py
+python3 scripts/e2e/run_e2e.py --help
+```
+
 ## E2E Test Harness V1A
 
 E2E Test Harness V1A adds a standard-library Python runner for reproducible local/runtime checks:

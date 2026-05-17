@@ -1,0 +1,52 @@
+name: Backend CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  EXECUTION_ENABLED: "false"
+  EXECUTOR_REAL_BROADCAST_ENABLED: "false"
+  MM_GATEWAY_ENABLED: "false"
+
+jobs:
+  backend:
+    name: Backend static validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check Rust formatting
+        run: cargo fmt --check
+
+      - name: Run clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Run tests
+        run: cargo test
+
+      - name: Build backend
+        run: cargo build
+
+      - name: Compile E2E harness
+        run: python3 -m py_compile scripts/e2e/run_e2e.py
+
+      - name: Show E2E harness help
+        run: python3 scripts/e2e/run_e2e.py --help
