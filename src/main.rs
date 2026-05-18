@@ -71,6 +71,7 @@ async fn main() -> deopt_v2_backend::Result<()> {
     state.mm_permissions_config = config.mm_permissions.clone();
     state.fees_config = config.fees.clone();
     state.admin_config = config.admin.clone();
+    state.metrics_config = config.metrics.clone();
     let app = router(state.clone());
 
     if config.execution.execution_enabled {
@@ -100,6 +101,7 @@ async fn main() -> deopt_v2_backend::Result<()> {
         options_enabled = config.options.enabled,
         fees_enabled = config.fees.enabled,
         rebates_enabled = config.fees.rebates_enabled,
+        metrics_enabled = config.metrics.enabled,
         mm_gateway_enabled = config.mm_gateway.enabled,
         mm_permissions_enabled = config.mm_permissions.enabled,
         indexer_enabled = config.indexer.enabled,

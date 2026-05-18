@@ -13,6 +13,7 @@ use crate::execution::{
 use crate::fees::{FeeEvent, FeeFlowType, FeeMarketType, RebateAccrual, VolumeBucket};
 use crate::indexer::IndexedPerpTrade;
 use crate::mm::{MmAccountPermissions, MmProductPermission};
+use crate::monitoring::FeeEventLabels;
 use crate::options::store::status_for_remaining;
 use crate::options::{
     OptionFill, OptionFillId, OptionOrder, OptionOrderId, OptionOrderStatus, OptionRfqFill,
@@ -701,6 +702,35 @@ impl PgRepository {
             "market_type_counts": self.admin_count_by_column("fee_events", "market_type").await?,
             "flow_type_counts": self.admin_count_by_column("fee_events", "flow_type").await?
         }))
+    }
+
+    pub async fn admin_fee_event_label_counts(&self) -> Result<BTreeMap<FeeEventLabels, u64>> {
+        if !self.admin_table_exists("fee_events").await? {
+            return Ok(BTreeMap::new());
+        }
+        let rows = sqlx::query(
+            "SELECT market_type, flow_type, source_type, status, COUNT(*) AS count
+             FROM fee_events
+             GROUP BY market_type, flow_type, source_type, status
+             ORDER BY market_type ASC, flow_type ASC, source_type ASC, status ASC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        let mut counts = BTreeMap::new();
+        for row in rows {
+            let count: i64 = row_get(&row, "count")?;
+            counts.insert(
+                FeeEventLabels {
+                    market_type: row_get(&row, "market_type")?,
+                    flow_type: row_get(&row, "flow_type")?,
+                    source_type: row_get(&row, "source_type")?,
+                    status: row_get(&row, "status")?,
+                },
+                i64_to_u64_persistence("count", count)?,
+            );
+        }
+        Ok(counts)
     }
 
     pub async fn admin_recent_fee_events(&self, limit: u32) -> Result<Vec<serde_json::Value>> {

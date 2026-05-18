@@ -9,6 +9,7 @@ pub mod execution;
 pub mod fees;
 pub mod indexer;
 pub mod mm;
+pub mod monitoring;
 pub mod nonce_sync;
 pub mod options;
 pub mod orderbook;

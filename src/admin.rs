@@ -8,6 +8,12 @@ pub struct AdminConfig {
     token: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MetricsConfig {
+    pub enabled: bool,
+    pub require_admin_token: bool,
+}
+
 impl AdminConfig {
     pub fn disabled() -> Self {
         Self {
@@ -61,5 +67,23 @@ impl fmt::Debug for AdminConfig {
                 },
             )
             .finish()
+    }
+}
+
+impl MetricsConfig {
+    pub fn enabled_by_default() -> Self {
+        Self {
+            enabled: true,
+            require_admin_token: false,
+        }
+    }
+
+    pub fn validate_startup(&self, admin: &AdminConfig) -> Result<()> {
+        if self.enabled && self.require_admin_token && !admin.token_configured() {
+            return Err(BackendError::Config(
+                "ADMIN_API_TOKEN is required when METRICS_REQUIRE_ADMIN_TOKEN=true".to_string(),
+            ));
+        }
+        Ok(())
     }
 }

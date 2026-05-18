@@ -107,6 +107,8 @@ MM_PERMISSIONS_REQUIRE_PERSISTENCE=true
 ADMIN_API_ENABLED=false
 ADMIN_API_REQUIRE_TOKEN=false
 ADMIN_API_TOKEN=
+METRICS_ENABLED=true
+METRICS_REQUIRE_ADMIN_TOKEN=false
 ```
 
 `EXECUTION_ENABLED=false` is intentional for this phase.
@@ -125,7 +127,8 @@ ADMIN_API_TOKEN=
 `MM_GATEWAY_ENABLED=false` is the safe default. When `true`, V1C starts a separate WebTransport UDP listener and requires `MM_GATEWAY_CERT_PATH` and `MM_GATEWAY_KEY_PATH`. It can submit and cancel off-chain perp orders through the live in-memory orderbook, handle perp RFQ and option RFQ messages when those features are enabled, but it does not auto-broadcast, sign, simulate, index, reconcile, or confirm execution intents.
 `MM_GATEWAY_AUTH_MODE=disabled` preserves local/dev behavior. `wallet_challenge` enables server-issued Ethereum personal-sign challenges. When `MM_GATEWAY_REQUIRE_AUTH=true`, unauthenticated sessions may only use `heartbeat`, `get_session`, `auth_challenge`, and `auth_verify`; trading, quote, and RFQ messages require an authenticated wallet session and account fields must match that wallet address case-insensitively. `MM_GATEWAY_CHALLENGE_TTL_MS` controls challenge expiry.
 `MM_PERMISSIONS_ENABLED=false` preserves existing MM gateway and RFQ behavior. When `true`, protected MM order and quote actions require an enabled row in `mm_accounts`, the relevant capability flag, and any configured market or option-series scope. `MM_PERMISSIONS_REQUIRE_PERSISTENCE=true` requires Postgres when permission enforcement is enabled; tests and local development can set it to `false` for in-memory permission seeding.
-`ADMIN_API_ENABLED=false` is the safe default for Monitoring/Admin V1A. When enabled, `/admin/*` exposes read-only operational observability only. If `ADMIN_API_REQUIRE_TOKEN=true`, requests must include `X-Admin-Token: <ADMIN_API_TOKEN>`. The token is never returned by the API, and admin config responses expose booleans such as `rpc_configured` and `database_configured` instead of raw RPC URLs, database URLs, private keys, or tokens.
+`ADMIN_API_ENABLED=false` is the safe default for Monitoring/Admin V1B. When enabled, `/admin/*` exposes read-only operational observability only. If `ADMIN_API_REQUIRE_TOKEN=true`, requests must include `X-Admin-Token: <ADMIN_API_TOKEN>`. The token is never returned by the API, and admin config responses expose booleans such as `rpc_configured` and `database_configured` instead of raw RPC URLs, database URLs, private keys, or tokens.
+`METRICS_ENABLED=true` exposes safe Prometheus-style text metrics at `/metrics` by default for local scraping. Set `METRICS_ENABLED=false` to disable the endpoint. Set `METRICS_REQUIRE_ADMIN_TOKEN=true` to require `X-Admin-Token: <ADMIN_API_TOKEN>` on `/metrics`; this reuses the local/dev admin token and is not production authentication.
 
 ## Local Validation
 
@@ -194,11 +197,13 @@ The fee flows use `psql` for ledger/candidate verification. `fees-options` creat
 
 See `scripts/e2e/README.md` for flow details, DB behavior, safety guarantees, and report examples.
 
-## Monitoring/Admin V1A
+## Monitoring/Admin V1B
 
-Monitoring/Admin V1A adds local/dev-oriented read-only observability endpoints:
+Monitoring/Admin V1B keeps the local/dev-oriented read-only admin endpoints and adds safe runtime metrics/readiness endpoints:
 
 ```text
+GET /metrics
+GET /ready
 GET /admin/status
 GET /admin/config
 GET /admin/db
@@ -216,6 +221,28 @@ GET /admin/recent?limit=20
 
 All admin endpoints are disabled unless `ADMIN_API_ENABLED=true`. When token protection is enabled, only the `X-Admin-Token` header is checked; this is intentionally not production auth. The endpoints never mutate orderbooks, RFQs, options state, execution intents, transactions, or database rows. They do not call RPC, do not broadcast, and do not require live Postgres, WebTransport, RPC, or private keys for normal tests.
 
+`/metrics` is enabled by `METRICS_ENABLED=true` and returns a simple Prometheus text exposition with gauges/counters for process/config state, database reachability, execution/RFQ/options/fees counts, and MM session counts. Metrics labels are intentionally low-cardinality: `status`, `market_type`, `flow_type`, and `source_type` only. The output never includes private keys, admin tokens, raw DB URLs, raw RPC URLs, wallet addresses, tx hashes, UUIDs, session internals, signatures, or per-object ids.
+
+`/ready` separates readiness from `/health`. It reports process/config checks and, when persistence is enabled, requires a successful Postgres ping. Disabled optional services do not fail readiness, and readiness does not require RPC unless a separately enabled feature already required RPC at startup.
+
+Local examples:
+
+```sh
+curl -sS http://127.0.0.1:8080/ready | python3 -m json.tool
+curl -sS http://127.0.0.1:8080/metrics
+curl -sS -H "X-Admin-Token: $ADMIN_API_TOKEN" http://127.0.0.1:8080/metrics
+```
+
+Prometheus scrape example:
+
+```yaml
+scrape_configs:
+  - job_name: deopt-v2-backend
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["127.0.0.1:8080"]
+```
+
 `/admin/config` is sanitized: it includes network/chain id, feature flags, public contract addresses, signature modes, TTL/settings, `rpc_configured`, `database_configured`, and WebTransport host/port only when the gateway is enabled. It redacts or omits private keys, raw database URLs, raw RPC URLs, provider keys, admin tokens, and secret env values.
 
 `/admin/db` pings Postgres and reports migration/count metadata only when persistence is enabled. With persistence disabled, it returns a clear disabled/offline shape. Count queries are aggregate-only and handle missing older tables as unavailable in the DB count response.
@@ -225,7 +252,7 @@ All admin endpoints are disabled unless `ADMIN_API_ENABLED=true`. When token pro
 
 `/admin/execution/summary`, `/admin/rfq/summary`, `/admin/options/summary`, `/admin/fees/*`, and `/admin/recent` provide compact bounded summaries from Postgres when persistence is enabled and in-memory summaries otherwise. `/admin/recent` and `/admin/fees/events` default to bounded reads and cap `limit` at `100`.
 
-Monitoring/Admin V1B is deferred: Prometheus metrics, structured event logs, external alerts, Grafana dashboards, frontend admin dashboard, production auth, admin write controls, and risk admin controls.
+The alerting specification lives in `docs/ALERTING_SPEC.md`. V1B does not implement Grafana dashboards, Prometheus deployment, external alert delivery, frontend monitoring UI, production auth, admin writes, or risk admin controls.
 
 ## Fees & Rebates V1B
 

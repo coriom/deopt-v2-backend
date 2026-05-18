@@ -24,6 +24,7 @@ use crate::indexer::{Indexer, IndexerStatus, IndexerTickResult};
 use crate::mm::permissions::{
     list_permission_accounts, list_product_permissions, MmProductPermission,
 };
+use crate::monitoring::{readiness, render_metrics};
 use crate::nonce_sync::{read_perp_nonce, PerpNonceResponse};
 use crate::options::service::{
     accept_option_rfq_quote as accept_option_rfq_quote_service,
@@ -73,7 +74,7 @@ use crate::rfq::{
 use crate::types::TimeInForce;
 use crate::types::{now_ms, AccountId, MarketId, OrderId, Side};
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
@@ -86,6 +87,8 @@ use uuid::Uuid;
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/ready", get(ready))
+        .route("/metrics", get(metrics))
         .route("/markets", get(markets))
         .route("/orderbook/:market_id", get(orderbook))
         .route(
@@ -223,6 +226,29 @@ async fn health() -> Json<HealthResponse> {
     })
 }
 
+async fn ready(State(state): State<AppState>) -> Response {
+    let response = readiness(&state).await;
+    let status = if response.ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (status, Json(response)).into_response()
+}
+
+async fn metrics(headers: HeaderMap, State(state): State<AppState>) -> Result<Response, ApiError> {
+    ensure_metrics_access(&state, &headers)?;
+    let body = render_metrics(&state).await?;
+    Ok((
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        body,
+    )
+        .into_response())
+}
+
 async fn admin_status(
     headers: HeaderMap,
     State(state): State<AppState>,
@@ -240,6 +266,7 @@ async fn admin_status(
         "indexer_enabled": state.indexer_config.enabled,
         "reconciliation_enabled": state.reconciliation_config.enabled,
         "confirmation_enabled": state.confirmation_config.enabled,
+        "metrics_enabled": state.metrics_config.enabled,
         "mm_gateway_enabled": state.mm_gateway_config.enabled,
         "mm_permissions_enabled": state.mm_permissions_config.enabled,
         "rfq_enabled": state.rfq_config.enabled,
@@ -263,6 +290,10 @@ async fn admin_config(
             "require_token": state.admin_config.require_token,
             "token_configured": state.admin_config.token_configured()
         },
+        "metrics": {
+            "enabled": state.metrics_config.enabled,
+            "require_admin_token": state.metrics_config.require_admin_token
+        },
         "features": {
             "persistence_enabled": state.persistence_enabled,
             "execution_enabled": state.execution_config.execution_enabled,
@@ -271,6 +302,7 @@ async fn admin_config(
             "indexer_enabled": state.indexer_config.enabled,
             "reconciliation_enabled": state.reconciliation_config.enabled,
             "confirmation_enabled": state.confirmation_config.enabled,
+            "metrics_enabled": state.metrics_config.enabled,
             "rfq_enabled": state.rfq_config.enabled,
             "options_enabled": state.options_config.enabled,
             "option_rfq_enabled": state.options_config.rfq_enabled,
@@ -883,6 +915,23 @@ fn ensure_admin_access(state: &AppState, headers: &HeaderMap) -> Result<(), ApiE
             Some(token) if state.admin_config.token_matches(token) => {}
             Some(_) => return Err(ApiError::forbidden("invalid admin token")),
             None => return Err(ApiError::forbidden("admin token is required")),
+        }
+    }
+    Ok(())
+}
+
+fn ensure_metrics_access(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
+    if !state.metrics_config.enabled {
+        return Err(ApiError::forbidden("metrics endpoint is disabled"));
+    }
+    if state.metrics_config.require_admin_token {
+        let token = headers
+            .get("x-admin-token")
+            .and_then(|value| value.to_str().ok());
+        match token {
+            Some(token) if state.admin_config.token_matches(token) => {}
+            Some(_) => return Err(ApiError::forbidden("invalid metrics token")),
+            None => return Err(ApiError::forbidden("metrics token is required")),
         }
     }
     Ok(())
@@ -3358,9 +3407,10 @@ fn option_rfq_quote_type_fields() -> Vec<SigningPayloadTypeField> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::admin::AdminConfig;
+    use crate::admin::{AdminConfig, MetricsConfig};
     use crate::engine::EngineState;
-    use crate::execution::DecodedRevertError;
+    use crate::execution::{DecodedRevertError, PrivateKeySecret};
+    use crate::fees::{FeeEvent, FeeFlowType, FeeMarketType, FeeSourceType, FeeStatus};
     use crate::mm::protocol::ServerMessage;
     use crate::mm::{
         AuthMode, MmAccountPermissions, MmGatewayConfig, MmPermissionsConfig, MmProductPermission,
@@ -3412,6 +3462,182 @@ mod tests {
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         let json = response_json(response).await;
         assert_eq!(json["error"], "admin API is disabled");
+    }
+
+    #[tokio::test]
+    async fn metrics_enabled_by_default_renders_backend_up() {
+        let response = router(AppState::new(EngineState::with_default_markets()))
+            .oneshot(get_request("/metrics", None))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let headers = response.headers().clone();
+        let body = response_text(response).await;
+        assert_eq!(
+            headers
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/plain; version=0.0.4; charset=utf-8")
+        );
+        assert!(body.contains("# HELP deopt_backend_up Backend process is up."));
+        assert!(body.contains("# TYPE deopt_backend_up gauge"));
+        assert!(body.contains("deopt_backend_up 1"));
+        assert!(body.contains("deopt_persistence_enabled 0"));
+        assert!(body.contains("deopt_real_broadcast_enabled 0"));
+    }
+
+    #[tokio::test]
+    async fn metrics_disabled_returns_clear_error() {
+        let mut state = AppState::new(EngineState::with_default_markets());
+        state.metrics_config.enabled = false;
+
+        let response = router(state)
+            .oneshot(get_request("/metrics", None))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let json = response_json(response).await;
+        assert_eq!(json["error"], "metrics endpoint is disabled");
+    }
+
+    #[tokio::test]
+    async fn metrics_token_required_rejects_missing_and_accepts_valid_token() {
+        let mut state = admin_state(true);
+        state.metrics_config = MetricsConfig {
+            enabled: true,
+            require_admin_token: true,
+        };
+        let app = router(state);
+
+        let missing = app
+            .clone()
+            .oneshot(get_request("/metrics", None))
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::FORBIDDEN);
+        let json = response_json(missing).await;
+        assert_eq!(json["error"], "metrics token is required");
+
+        let valid = app
+            .oneshot(get_request("/metrics", Some("test-admin-token")))
+            .await
+            .unwrap();
+        assert_eq!(valid.status(), StatusCode::OK);
+        let body = response_text(valid).await;
+        assert!(body.contains("deopt_metrics_require_admin_token 1"));
+    }
+
+    #[tokio::test]
+    async fn metrics_do_not_expose_secrets_or_high_cardinality_values() {
+        let wallet = "0x00000000000000000000000000000000000000aa";
+        let tx_hash = "0x1111111111111111111111111111111111111111111111111111111111111111";
+        let uuid = "550e8400-e29b-41d4-a716-446655440000";
+        let private_key = "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318";
+        let mut state = admin_state(true);
+        state.execution_config.rpc_url = Some("https://rpc.example/sensitive-provider-key".into());
+        state.execution_config.executor_private_key =
+            Some(PrivateKeySecret::new(private_key.to_string()));
+        state.execution_config.executor_from_address = AccountId::new(wallet);
+        state
+            .fees_store
+            .lock()
+            .unwrap()
+            .insert_fee_event(FeeEvent {
+                fee_event_id: tx_hash.to_string(),
+                source_type: FeeSourceType::PerpTrade,
+                source_id: uuid.to_string(),
+                market_type: FeeMarketType::Perp,
+                flow_type: FeeFlowType::Orderbook,
+                market_id: Some(1),
+                option_series_id: None,
+                maker: Some(AccountId::new(wallet)),
+                taker: None,
+                payer: AccountId::new(wallet),
+                recipient: "treasury".to_string(),
+                fee_asset: "USDC".to_string(),
+                notional_1e8: 100,
+                fee_rate_micro_bps: 1,
+                fee_amount_1e8: 1,
+                rebate_rate_micro_bps: 0,
+                rebate_amount_1e8: 0,
+                protocol_amount_1e8: 1,
+                status: FeeStatus::Accrued,
+                created_at_ms: 1,
+            })
+            .unwrap();
+
+        let response = router(state)
+            .oneshot(get_request("/metrics", None))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_text(response).await;
+        assert!(body.contains(
+            "deopt_fee_events_total{market_type=\"perp\",flow_type=\"orderbook\",source_type=\"perp_trade\",status=\"accrued\"} 1"
+        ));
+        assert!(!body.contains("test-admin-token"));
+        assert!(!body.contains("sensitive-provider-key"));
+        assert!(!body.contains(private_key));
+        assert!(!body.contains(wallet));
+        assert!(!body.contains(tx_hash));
+        assert!(!body.contains(uuid));
+    }
+
+    #[tokio::test]
+    async fn metrics_persistence_disabled_empty_state_renders() {
+        let response = router(AppState::new(EngineState::with_default_markets()))
+            .oneshot(get_request("/metrics", None))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_text(response).await;
+        for metric in [
+            "deopt_db_up 0",
+            "# HELP deopt_execution_intents_total",
+            "# HELP deopt_rfqs_total",
+            "# HELP deopt_option_series_total",
+            "# HELP deopt_fee_events_total",
+            "deopt_mm_sessions_total 0",
+        ] {
+            assert!(body.contains(metric), "missing metric {metric}");
+        }
+    }
+
+    #[tokio::test]
+    async fn ready_succeeds_with_persistence_disabled() {
+        let response = router(AppState::new(EngineState::with_default_markets()))
+            .oneshot(get_request("/ready", None))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["ready"], true);
+        assert_eq!(json["checks"][2]["name"], "database");
+        assert_eq!(json["checks"][2]["status"], "persistence_disabled");
+    }
+
+    #[tokio::test]
+    async fn ready_reports_not_ready_when_persistence_enabled_without_repository() {
+        let mut state = AppState::new(EngineState::with_default_markets());
+        state.persistence_enabled = true;
+        state.database_configured = true;
+        state.repository = None;
+
+        let response = router(state)
+            .oneshot(get_request("/ready", None))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let json = response_json(response).await;
+        assert_eq!(json["ready"], false);
+        assert_eq!(json["checks"][2]["name"], "database");
+        assert_eq!(json["checks"][2]["status"], "repository_unavailable");
     }
 
     #[tokio::test]
@@ -3711,6 +3937,38 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn metrics_and_readiness_do_not_mutate_state() {
+        let state = admin_state(false);
+        let app = router(state.clone());
+        let before_intents = state.engine.lock().unwrap().execution_intents().len();
+        let before_rfqs = state.rfq_store.lock().unwrap().list_rfqs().len();
+        let before_option_rfqs = state.options_store.lock().unwrap().list_option_rfqs().len();
+        let before_fee_events = state.fees_store.lock().unwrap().list_fee_events(10).len();
+
+        for path in ["/metrics", "/ready"] {
+            let response = app.clone().oneshot(get_request(path, None)).await.unwrap();
+            assert!(response.status().is_success());
+        }
+
+        assert_eq!(
+            state.engine.lock().unwrap().execution_intents().len(),
+            before_intents
+        );
+        assert_eq!(
+            state.rfq_store.lock().unwrap().list_rfqs().len(),
+            before_rfqs
+        );
+        assert_eq!(
+            state.options_store.lock().unwrap().list_option_rfqs().len(),
+            before_option_rfqs
+        );
+        assert_eq!(
+            state.fees_store.lock().unwrap().list_fee_events(10).len(),
+            before_fee_events
+        );
+    }
+
     fn admin_state(require_token: bool) -> AppState {
         let mut state = AppState::new(EngineState::with_default_markets());
         state.admin_config = AdminConfig::new(
@@ -3733,6 +3991,11 @@ mod tests {
     async fn response_json(response: Response) -> serde_json::Value {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         serde_json::from_slice(&body).unwrap()
+    }
+
+    async fn response_text(response: Response) -> String {
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        String::from_utf8(body.to_vec()).unwrap()
     }
 }
 

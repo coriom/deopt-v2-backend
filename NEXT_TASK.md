@@ -1,294 +1,252 @@
-# NEXT_TASK.md — Monitoring V1B: Metrics, Structured Observability, and Alert Spec
+# NEXT_TASK.md — Runtime Verify Monitoring V1B
 
 ## Context
 
-DeOpt backend now has:
+Monitoring V1B has been implemented.
 
-- static backend CI
-- runtime E2E CI with Postgres
-- local E2E harness
-- admin read-only endpoints
-- fees/rebates ledger
-- MM auth/permissions
-- RFQ/options/perp execution lifecycle
+Added:
 
-Current admin monitoring is read-only and useful, but not production-grade observability.
+- GET /metrics
+- GET /ready
+- METRICS_ENABLED=true
+- METRICS_REQUIRE_ADMIN_TOKEN=false
+- Prometheus-style text exposition
+- low-cardinality subsystem metrics
+- docs/ALERTING_SPEC.md
+- offline tests
 
-Missing:
+Local validation passed:
 
-- Prometheus-style metrics
-- structured operational counters
-- latency/error metrics
-- alerting specification
-- clearer health/readiness split
+- cargo fmt
+- cargo clippy --all-targets --all-features -- -D warnings
+- cargo test
+- cargo build
 
 ## Goal
 
-Implement Monitoring V1B.
+Runtime-verify Monitoring V1B with PostgreSQL persistence enabled.
 
-Add backend observability primitives:
+Prove that:
 
-- `/metrics` endpoint
-- basic Prometheus text exposition format
-- structured counters/gauges for key subsystems
-- health/readiness distinction if not already present
-- alerting documentation/spec
-- tests
-- docs
+- `/metrics` works
+- `/ready` works
+- metrics include expected subsystem gauges/counters
+- metrics do not expose secrets or high-cardinality values
+- optional metrics token protection works
+- readiness checks Postgres correctly
+- no mutation occurs
 
 ## Non-Goals
 
-Do not implement:
-
-- Grafana dashboard
-- external alert delivery
-- Slack/Telegram alerts
-- Prometheus server deployment
-- production auth
-- admin write endpoints
-- frontend monitoring UI
-- protocol changes
-- Solidity changes
-- broadcast/deploy
+Do not implement new metrics.
+Do not implement Grafana.
+Do not implement external alerts.
+Do not implement frontend monitoring UI.
+Do not modify Solidity.
+Do not deploy.
+Do not enable real broadcast.
+Do not call /executor/broadcast.
+Do not commit.
+Do not push.
 
 ## Safety Rules
 
-Do not:
+Do not expose:
 
-- expose secrets
-- expose private keys
-- expose raw DB URL
-- expose raw RPC URL with keys
-- call /executor/broadcast
-- enable real broadcast
-- require live RPC/Postgres for normal cargo test
-- commit
-- push
+- private keys
+- admin tokens
+- raw DATABASE_URL
+- raw RPC_URL
+- wallet addresses as labels
+- tx hashes as labels
+- UUIDs as labels
+- signatures
+- session internals
 
-## Metrics Endpoint
+Runtime config must keep:
 
-Add:
+```env
+EXECUTION_ENABLED=false
+EXECUTOR_REAL_BROADCAST_ENABLED=false
+MM_GATEWAY_ENABLED=false
+Runtime Setup
 
-```text
-GET /metrics
+Use process env only.
 
-Default behavior:
+Start backend with:
 
-enabled by config
-safe text output
+PERSISTENCE_ENABLED=true \
+DATABASE_URL=postgres://deopt:deopt@127.0.0.1:5432/deopt_v2_backend \
+ADMIN_API_ENABLED=true \
+ADMIN_API_REQUIRE_TOKEN=true \
+ADMIN_API_TOKEN=local-admin-token-runtime-test \
+METRICS_ENABLED=true \
+METRICS_REQUIRE_ADMIN_TOKEN=false \
+EXECUTION_ENABLED=false \
+EXECUTOR_REAL_BROADCAST_ENABLED=false \
+MM_GATEWAY_ENABLED=false \
+cargo run --bin deopt-v2-backend
+Checks
+1. Health
+curl http://127.0.0.1:8080/health
+
+Expected:
+
+{"ok":true,"service":"deopt-v2-backend"}
+2. Readiness
+curl -i http://127.0.0.1:8080/ready
+
+Expected:
+
+HTTP 200
+ready=true or equivalent
+DB ready when persistence enabled
 no secrets
-no labels with unbounded cardinality such as full tx hashes, intent IDs, RFQ IDs, wallet addresses
+3. Metrics open mode
+curl -i http://127.0.0.1:8080/metrics
 
-Config:
+Expected:
 
-METRICS_ENABLED=true
-METRICS_REQUIRE_ADMIN_TOKEN=false
-
-If admin token requirement is easy to reuse, support optional protection. Default can be open for local Prometheus-style scraping, but document production implications.
-
-Metric Format
-
-Use simple Prometheus text format.
-
-Example:
-
-# HELP deopt_backend_up Backend process is up.
-# TYPE deopt_backend_up gauge
-deopt_backend_up 1
-
-# HELP deopt_admin_enabled Admin API enabled.
-# TYPE deopt_admin_enabled gauge
-deopt_admin_enabled 1
-
-Do not add a heavy dependency unless clearly justified.
-
-Manual string rendering is acceptable for V1B.
-
-Required Metrics
-
-Add safe metrics for:
-
-Process / Config
+HTTP 200
+Content-Type text/plain / Prometheus format
+contains:
 deopt_backend_up
 deopt_persistence_enabled
 deopt_execution_enabled
 deopt_real_broadcast_enabled
-deopt_mm_gateway_enabled
-deopt_rfq_enabled
-deopt_options_enabled
-deopt_fees_enabled
-deopt_rebates_enabled
-Database
-
-If persistence enabled and DB accessible:
-
 deopt_db_up
 deopt_db_migrations_installed
+deopt_fee_events_total
+deopt_rebate_accruals_total
+4. Secret scan
 
-If persistence disabled:
+Save metrics:
 
-deopt_db_up 0 or omit with documented behavior
-Execution
+curl http://127.0.0.1:8080/metrics > /tmp/deopt-metrics.txt
 
-If available from repository/admin summary:
+Search forbidden substrings:
 
-deopt_execution_intents_total{status="..."}
-deopt_execution_simulations_total{status="..."}
-deopt_execution_transactions_total{status="..."}
-deopt_execution_confirmed_total
+local-admin-token-runtime-test
+postgres://deopt:deopt
+PRIVATE_KEY
+DEPLOYER_PRIVATE_KEY
+EXECUTOR_PRIVATE_KEY
+RPC_URL
+ADMIN_API_TOKEN
+0x0803794fc97c2ac2e1d178d141b0aee9df4a423f9f2257295560a969c8dc01ac
 
-Keep labels low cardinality.
+Expected:
 
-RFQ
-deopt_rfqs_total{status="..."}
-deopt_rfq_quotes_total{status="..."}
-Options
-deopt_option_series_total{status="..."}
-deopt_option_orders_total{status="..."}
-deopt_option_fills_total
-deopt_option_rfqs_total{status="..."}
-deopt_option_rfq_quotes_total{status="..."}
-Fees
-deopt_fee_events_total{market_type="perp|option",source_type="...",status="..."}
-deopt_rebate_accruals_total{status="..."}
-MM Gateway
+none found
+5. High-cardinality scan
 
-If gateway registry is available:
+Metrics must not expose labels containing:
 
-deopt_mm_sessions_total
-deopt_mm_sessions_authenticated_total
+full wallet addresses
+tx hashes
+UUIDs
+session IDs
+signatures
 
-If disabled:
+Use simple grep patterns for:
 
-deopt_mm_sessions_total 0
-Health / Readiness
+0x[a-fA-F0-9]{40}
+0x[a-fA-F0-9]{64}
+[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}
 
-Current /health exists.
+Expected:
 
-Add or verify:
+no matches in labels or metric lines
+6. Metrics token protection
 
-GET /ready
+Restart backend with:
 
-Readiness should check:
+METRICS_REQUIRE_ADMIN_TOKEN=true
 
-backend process up
-config is valid
-if persistence enabled, DB ping ok
-if required services disabled, do not fail readiness
-do not require RPC unless a feature requiring RPC is enabled
+Then:
 
-If adding /ready is too broad, document why and add tests for /health + /admin/status.
+curl -i http://127.0.0.1:8080/metrics
 
-Structured Logging
+Expected:
 
-Do not rewrite logging system.
+403 or clear token-required error
 
-Add minimal structured log conventions if useful:
+Then:
 
-service
-subsystem
-event
-status
-error_code when available
+curl -i http://127.0.0.1:8080/metrics \
+  -H "X-Admin-Token: wrong-token"
 
-Update docs with expected log fields.
+Expected:
 
-Alert Spec
+403 or clear invalid-token error
 
-Add docs:
+Then:
 
-docs/ALERTING_SPEC.md
+curl -i http://127.0.0.1:8080/metrics \
+  -H "X-Admin-Token: local-admin-token-runtime-test"
 
-Include alert ideas:
+Expected:
 
-backend down
-DB down
-real_broadcast_enabled unexpectedly true
-execution confirmations stuck
-reconciliation unmatched/ambiguous rising
-simulation failures rising
-stale indexer cursor
-RFQ quote rejection spike
-MM session drop
-fee ledger write failures
-oracle stale if exposed later
-liquidation/bad debt alerts later
+200
+metrics render
+7. Readiness DB behavior
 
-This is documentation/spec only. No external alerting implementation.
+If feasible, test persistence-disabled mode:
 
-Tests
+PERSISTENCE_ENABLED=false
 
-Normal cargo test must remain offline.
+Expected:
 
-Add tests for:
+/ready still succeeds if DB is not required
+/metrics still renders safe values
 
-metrics endpoint disabled/enabled config if configurable
-metrics output contains backend_up
-metrics output contains safe config gauges
-metrics output does not contain private keys/admin token/DB URL/RPC URL
-metrics labels do not include wallet addresses / tx hashes / UUIDs
-persistence disabled metrics still render
-empty in-memory state metrics render
-readiness succeeds with persistence disabled
-readiness fails or reports not ready when persistence enabled and DB unavailable, if readiness added
-no mutation from metrics endpoint
-existing admin tests still pass
-Documentation
+Do not break local DB state.
 
-Update:
+8. No mutation
 
-README.md
-ARCHITECTURE.md
-scripts/e2e/README.md if relevant
-docs/ALERTING_SPEC.md
-.env.example
+Record before/after counts for key tables:
 
-Document:
+SELECT COUNT(*) FROM execution_transactions;
+SELECT COUNT(*) FROM execution_intents;
+SELECT COUNT(*) FROM fee_events;
+SELECT COUNT(*) FROM rebate_accruals;
 
-/metrics
-/ready if added
-config flags
-no secrets
-low-cardinality label policy
-local curl examples
-Prometheus scrape example
-alerting spec location
-CI / Validation
+Expected:
 
-Update backend CI only if needed to include new docs/tests.
+unchanged after /metrics and /ready calls
+9. Stop backend
 
-Run:
+Ensure no orphan process remains:
+
+pgrep -af deopt-v2-backend || true
+ss -ltnp | grep ':8080' || true
+If Bug Found
+
+Patch minimally only.
+
+After patch:
 
 cargo fmt
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test
 cargo build
+Final Report
 
-Optionally:
+Return:
 
-python3 scripts/e2e/run_e2e.py --help
-Acceptance Criteria
+files changed
+whether code patch was needed
+backend startup result
+/health result
+/ready result
+/metrics open-mode result
+expected metrics found
+secret scan result
+high-cardinality scan result
+metrics token-protection result
+persistence-disabled readiness result if tested
+no-mutation verification
+backend cleanup result
+validation commands run
+remaining blocker
 
-Complete only if:
-
-/metrics exists
-metrics are safe and low-cardinality
-no secrets exposed
-core subsystem metrics included
-/ready added or explicitly documented as deferred
-alerting spec exists
-tests added
-docs updated
-cargo fmt passes
-cargo clippy passes
-cargo test passes
-cargo build passes
-Deferred
-Grafana dashboard
-Prometheus deployment
-external alert delivery
-frontend metrics UI
-OpenTelemetry tracing
-advanced latency histograms
-WebTransport metrics CI
-EOF

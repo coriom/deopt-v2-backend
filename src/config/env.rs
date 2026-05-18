@@ -1,4 +1,4 @@
-use crate::admin::AdminConfig;
+use crate::admin::{AdminConfig, MetricsConfig};
 use crate::confirmation::ConfirmationConfig;
 use crate::error::{BackendError, Result};
 use crate::execution::{ExecutionConfig, PrivateKeySecret};
@@ -34,6 +34,7 @@ pub struct AppConfig {
     pub mm_gateway: MmGatewayConfig,
     pub mm_permissions: MmPermissionsConfig,
     pub admin: AdminConfig,
+    pub metrics: MetricsConfig,
     pub signature_verification_mode: SignatureVerificationMode,
     pub eip712_domain: Eip712Domain,
     pub persistence_enabled: bool,
@@ -178,6 +179,10 @@ impl AppConfig {
             parse_env(&mut lookup, "ADMIN_API_REQUIRE_TOKEN", "false")?,
             lookup("ADMIN_API_TOKEN").filter(|value| !value.is_empty()),
         );
+        let metrics = MetricsConfig {
+            enabled: parse_env(&mut lookup, "METRICS_ENABLED", "true")?,
+            require_admin_token: parse_env(&mut lookup, "METRICS_REQUIRE_ADMIN_TOKEN", "false")?,
+        };
         let confirmation = ConfirmationConfig {
             enabled: parse_env(&mut lookup, "CONFIRMATION_ENABLED", "false")?,
             require_persistence: parse_env(
@@ -293,6 +298,7 @@ impl AppConfig {
         fees.validate_startup(persistence_enabled)?;
         validate_webtransport_startup(&mm_gateway)?;
         admin.validate_startup()?;
+        metrics.validate_startup(&admin)?;
 
         Ok(Self {
             host,
@@ -311,6 +317,7 @@ impl AppConfig {
             mm_gateway,
             mm_permissions,
             admin,
+            metrics,
             signature_verification_mode,
             eip712_domain,
             persistence_enabled,
@@ -936,6 +943,49 @@ mod tests {
 
         assert!(!debug.contains("super-secret-admin-token"));
         assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn metrics_use_safe_defaults() {
+        let config = config_from_pairs([("PERSISTENCE_ENABLED", "false")]).unwrap();
+
+        assert!(config.metrics.enabled);
+        assert!(!config.metrics.require_admin_token);
+    }
+
+    #[test]
+    fn metrics_can_be_disabled() {
+        let config = config_from_pairs([("METRICS_ENABLED", "false")]).unwrap();
+
+        assert!(!config.metrics.enabled);
+        assert!(!config.metrics.require_admin_token);
+    }
+
+    #[test]
+    fn metrics_token_requirement_reuses_admin_token() {
+        let config = config_from_pairs([
+            ("METRICS_ENABLED", "true"),
+            ("METRICS_REQUIRE_ADMIN_TOKEN", "true"),
+            ("ADMIN_API_TOKEN", "metrics-admin-token"),
+        ])
+        .unwrap();
+
+        assert!(config.metrics.enabled);
+        assert!(config.metrics.require_admin_token);
+        assert!(config.admin.token_configured());
+    }
+
+    #[test]
+    fn metrics_token_requirement_requires_admin_token() {
+        let error = config_from_pairs([
+            ("METRICS_ENABLED", "true"),
+            ("METRICS_REQUIRE_ADMIN_TOKEN", "true"),
+        ])
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("ADMIN_API_TOKEN is required when METRICS_REQUIRE_ADMIN_TOKEN=true"));
     }
 
     #[test]

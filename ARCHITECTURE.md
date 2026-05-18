@@ -25,9 +25,10 @@ The long-term backend needs low-latency deterministic matching, RFQ, market-make
 - `scripts/e2e`: E2E Test Harness V1A Python orchestration for reproducible safe runtime flows, JSON reports, optional safe backend startup, HTTP checks, and PostgreSQL verification queries.
 - `orders`: Shared order/cancel service used by HTTP and the Market Maker Gateway for signed order validation, nonce handling, matching, persistence writes, ownership-checked cancels, cancel-all, and deterministic resting-order lookup.
 - `mm`: Market Maker Gateway protocol, session, heartbeat, rate-limit, live order/cancel handling, quote-replace models, MM permission allowlist/capability checks, service boundary, adapter traits, and disabled-by-default WebTransport V1C adapter. Protocol/session/service/rate-limit logic remains transport-agnostic.
-- `admin`: Monitoring/Admin V1A configuration and read-only operational observability support. Admin endpoints are disabled by default, optionally protected by a simple local/dev token header, and return sanitized status/config/summaries without exposing secrets or mutating trading state.
+- `admin`: Monitoring/Admin V1B admin and metrics configuration. Admin endpoints are disabled by default, metrics are enabled by default for local scraping, and optional token checks reuse the local/dev admin token.
+- `monitoring`: Read-only Prometheus-style metrics rendering and readiness checks. Metrics use low-cardinality labels only and never expose secrets, raw URLs, wallet addresses, tx hashes, UUIDs, signatures, or per-object ids.
 - `signing`: signed-order schema, shared EIP-712 helpers, strict secp256k1 signer recovery, signature mode, deadline validation, and in-memory nonce tracking.
-- `config`: environment loading for host, port, log level, network name, chain id, disabled execution flag, simulation flags, indexer flags, reconciliation flags, confirmation flags, RFQ signature mode/domain flags, Options V1D flags, Fees & Rebates V1B flags, Market Maker Gateway V1C flags, MM Permissions V1A flags, Monitoring/Admin V1A flags, signature mode, and opt-in persistence.
+- `config`: environment loading for host, port, log level, network name, chain id, disabled execution flag, simulation flags, indexer flags, reconciliation flags, confirmation flags, RFQ signature mode/domain flags, Options V1D flags, Fees & Rebates V1B flags, Market Maker Gateway V1C flags, MM Permissions V1A flags, Monitoring/Admin V1B flags, signature mode, and opt-in persistence.
 
 ## Current v1 Scope
 
@@ -57,17 +58,19 @@ The long-term backend needs low-latency deterministic matching, RFQ, market-make
 - Production MM Auth V1A guarded by `MM_GATEWAY_AUTH_MODE=disabled` and `MM_GATEWAY_REQUIRE_AUTH=false` by default. `wallet_challenge` uses server-issued Ethereum personal-sign challenges to bind WebTransport sessions to wallet accounts before trading messages are accepted.
 - MM Permissions V1A guarded by `MM_PERMISSIONS_ENABLED=false` by default. Enabled mode requires an enabled MM account, capability flags, and optional market or option-series scope rows for protected MM quote/order actions. `MM_PERMISSIONS_REQUIRE_PERSISTENCE=true` requires Postgres for production-like enforcement, while tests can seed permissions in memory.
 - Fees & Rebates V1B guarded by `FEES_ENABLED=false` by default. Enabled mode records ledger-only option order fill, option RFQ fill, and confirmed indexed perp trade fee events, daily volume buckets, and optional MM rebate accrual rows. `FEES_REQUIRE_PERSISTENCE=true` requires Postgres for production-like accounting, while tests can use an in-memory fee ledger. V1B does not collect fees on chain, move funds, pay rebates, create execution transactions, or broadcast.
-- Monitoring/Admin V1A guarded by `ADMIN_API_ENABLED=false` by default. Enabled mode exposes read-only `/admin/status`, `/admin/config`, `/admin/db`, `/admin/mm/sessions`, `/admin/mm/permissions`, `/admin/execution/summary`, `/admin/rfq/summary`, `/admin/options/summary`, `/admin/fees/summary`, `/admin/fees/events`, `/admin/fees/volumes`, `/admin/fees/rebates`, and `/admin/recent` endpoints. The endpoints are local/dev-oriented, optionally require `X-Admin-Token`, sanitize secrets, use bounded read queries, and do not mutate DB rows, RFQs, option state, execution state, MM sessions, MM permission rows, or fee ledger rows.
+- Monitoring/Admin V1B guarded by `ADMIN_API_ENABLED=false` for admin endpoints and `METRICS_ENABLED=true` for `/metrics` by default. Enabled admin mode exposes read-only `/admin/status`, `/admin/config`, `/admin/db`, `/admin/mm/sessions`, `/admin/mm/permissions`, `/admin/execution/summary`, `/admin/rfq/summary`, `/admin/options/summary`, `/admin/fees/summary`, `/admin/fees/events`, `/admin/fees/volumes`, `/admin/fees/rebates`, and `/admin/recent` endpoints. `/metrics` emits safe Prometheus-style text metrics, and `/ready` checks process/config plus DB ping when persistence is enabled. These endpoints are local/dev-oriented, optionally require `X-Admin-Token` for admin and metrics, sanitize secrets, use bounded read/aggregate queries, and do not mutate DB rows, RFQs, option state, execution state, MM sessions, MM permission rows, or fee ledger rows.
 - E2E Test Harness V1A under `scripts/e2e` supports safe `admin`, `fees-options`, `fees-perps`, `option-rfq`, `mm-auth`, and `all-safe` flows. It uses standard-library Python, process-only environment overrides, HTTP requests, and `psql` checks; it emits JSON reports and never enables real broadcast by default.
 
-## Monitoring/Admin V1A
+## Monitoring/Admin V1B
 
-Monitoring/Admin V1A is an observability layer inside the existing Axum API. It exists to inspect operational state before a separate frontend/admin service is built. It is disabled by default:
+Monitoring/Admin V1B is a read-only observability layer inside the existing Axum API. Admin endpoints exist to inspect operational state before a separate frontend/admin service is built. Admin is disabled by default, while metrics are enabled for local Prometheus-style scraping:
 
 ```text
 ADMIN_API_ENABLED=false
 ADMIN_API_REQUIRE_TOKEN=false
 ADMIN_API_TOKEN=
+METRICS_ENABLED=true
+METRICS_REQUIRE_ADMIN_TOKEN=false
 ```
 
 When enabled, admin endpoints are read-only. `ADMIN_API_REQUIRE_TOKEN=true` performs a simple local/dev header check with `X-Admin-Token`; it is not production authentication. The token is not logged by endpoint code and is never returned by responses.
@@ -76,7 +79,11 @@ The admin config response is sanitized. It exposes public network/chain identifi
 
 Persistent admin DB reads use simple aggregate/count/recent queries and fixed table names. `/admin/db` reports missing older tables as unavailable in its count response. `/admin/mm/permissions` lists configured MM accounts, capability flags, and product scopes without exposing auth challenges, signatures, tokens, or database URLs. `/admin/fees/*` exposes bounded fee ledger events, volume buckets, rebate accruals, and aggregate totals without any write action. With persistence disabled, admin endpoints use in-memory engine/RFQ/options/MM session/permission/fee snapshots where available and return empty DB/recent sections otherwise. Normal tests do not require live Postgres, RPC, WebTransport, or private keys.
 
-Monitoring/Admin V1B remains deferred: Prometheus exporter, structured event log, external alerts, Grafana dashboards, frontend admin dashboard, production auth, admin write controls, permission write controls, and risk admin controls.
+`/metrics` renders Prometheus text without adding a heavy exporter dependency. Core metrics include `deopt_backend_up`, feature/config gauges, `deopt_db_up`, `deopt_db_migrations_installed`, execution/RFQ/options/fees aggregate counts, and MM session gauges. Labels are limited to `status`, `market_type`, `flow_type`, and `source_type`; wallet addresses, tx hashes, UUIDs, raw DB URLs, raw RPC URLs, private keys, admin tokens, signatures, and session internals are not labels and are not rendered.
+
+`/ready` reports process/config readiness and only requires the DB when persistence is enabled. Disabled optional subsystems do not make readiness fail.
+
+`docs/ALERTING_SPEC.md` defines suggested alert rules for backend down, DB down, unexpected real broadcast, execution confirmation stalls, reconciliation anomalies, simulation failures, stale indexer cursors, RFQ rejection spikes, MM session drops, and fee ledger write failures. V1B still defers Grafana dashboards, Prometheus deployment, external alert delivery, frontend monitoring UI, production auth, admin write controls, permission write controls, and risk admin controls.
 
 ## Fees & Rebates V1B
 
