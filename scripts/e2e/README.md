@@ -28,6 +28,22 @@ Common flags:
 
 `--no-start-backend` is the default. Use it when a backend is already running with the required feature flags. `--start-backend` runs `cargo run --bin deopt-v2-backend` with process-only overrides and stops that process at the end.
 
+## GitHub Actions Runtime E2E
+
+Runtime E2E CI V1A lives in `.github/workflows/backend-e2e-ci.yml`. It starts a local `postgres:16` service with `POSTGRES_USER=deopt`, `POSTGRES_PASSWORD=deopt`, `POSTGRES_DB=deopt_v2_backend`, maps `5432:5432`, and uses `pg_isready -U deopt -d deopt_v2_backend` for container health.
+
+The CI database URL is `postgres://deopt:deopt@127.0.0.1:5432/deopt_v2_backend` and the admin token is a local CI value, not a secret. The job builds the backend, verifies harness compilation and help output, then runs only these fresh-Postgres-safe flows with `--start-backend`:
+
+```sh
+python3 scripts/e2e/run_e2e.py --flow admin --start-backend --database-url "$DATABASE_URL" --admin-token "$ADMIN_API_TOKEN" --json-out "$RUNNER_TEMP/deopt-e2e-admin.json"
+python3 scripts/e2e/run_e2e.py --flow fees-options --start-backend --database-url "$DATABASE_URL" --admin-token "$ADMIN_API_TOKEN" --json-out "$RUNNER_TEMP/deopt-e2e-fees-options.json"
+python3 scripts/e2e/run_e2e.py --flow option-rfq --start-backend --database-url "$DATABASE_URL" --admin-token "$ADMIN_API_TOKEN" --json-out "$RUNNER_TEMP/deopt-e2e-option-rfq.json"
+```
+
+The reports are checked with `python3 -m json.tool` and uploaded as `backend-e2e-reports`.
+
+Deferred CI flows are `fees-perps` until a confirmed trade fixture exists, `mm-auth`/WebTransport, Base Sepolia runtime checks, real broadcast, and frontend/browser E2E. Runtime E2E CI does not require secrets, private keys, deployment access, RPC URLs, or WebTransport cert/key files.
+
 ## Safety Defaults
 
 When the harness starts the backend, it forces:
@@ -37,6 +53,9 @@ EXECUTION_ENABLED=false
 EXECUTOR_DRY_RUN=true
 EXECUTOR_REAL_BROADCAST_ENABLED=false
 EXECUTOR_PRIVATE_KEY=
+PRIVATE_KEY=
+DEPLOYER_PRIVATE_KEY=
+MM_PRIVATE_KEY=
 SIMULATION_ENABLED=false
 INDEXER_ENABLED=false
 PERP_NONCE_SYNC_ENABLED=false
@@ -47,6 +66,8 @@ SIGNATURE_VERIFICATION_MODE=disabled
 ```
 
 It also enables only the read/write surfaces needed for safe local verification: persistence, admin reads, options, option RFQ, and fee ledgers. For `fees-perps` and `all-safe`, confirmation is enabled so an already submitted and confirmed transaction can be rechecked, but broadcast remains disabled.
+
+For the CI-safe `admin`, `fees-options`, and `option-rfq` start-backend flows, the harness also clears inherited `RPC_URL` before launching the backend. `fees-perps` and `all-safe` preserve an explicitly supplied `RPC_URL` because confirmation rechecks require it.
 
 The harness never calls `/executor/broadcast`. It does not create execution transactions. It redacts the admin token and database URL from errors, and backend logs are written to a temporary file path reported as an artifact.
 

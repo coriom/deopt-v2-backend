@@ -142,6 +142,38 @@ python3 -m py_compile scripts/e2e/run_e2e.py
 python3 scripts/e2e/run_e2e.py --help
 ```
 
+## Runtime E2E CI With Postgres
+
+`.github/workflows/backend-e2e-ci.yml` runs safe backend runtime E2E coverage on pull requests and pushes to `main`. The job starts a local `postgres:16` service with:
+
+```text
+POSTGRES_USER=deopt
+POSTGRES_PASSWORD=deopt
+POSTGRES_DB=deopt_v2_backend
+5432:5432
+health: pg_isready -U deopt -d deopt_v2_backend
+```
+
+The workflow uses `DATABASE_URL=postgres://deopt:deopt@127.0.0.1:5432/deopt_v2_backend` and `ADMIN_API_TOKEN=ci-admin-token`, builds `deopt-v2-backend`, verifies the Python harness, then runs:
+
+```sh
+python3 scripts/e2e/run_e2e.py --flow admin --start-backend --database-url "$DATABASE_URL" --admin-token "$ADMIN_API_TOKEN"
+python3 scripts/e2e/run_e2e.py --flow fees-options --start-backend --database-url "$DATABASE_URL" --admin-token "$ADMIN_API_TOKEN"
+python3 scripts/e2e/run_e2e.py --flow option-rfq --start-backend --database-url "$DATABASE_URL" --admin-token "$ADMIN_API_TOKEN"
+```
+
+Each flow writes a JSON report, the workflow validates each report with `python3 -m json.tool`, and reports are uploaded as the `backend-e2e-reports` artifact.
+
+CI forces `EXECUTION_ENABLED=false`, `EXECUTOR_REAL_BROADCAST_ENABLED=false`, `EXECUTOR_DRY_RUN=true`, `MM_GATEWAY_ENABLED=false`, disables simulation/indexer/reconciliation/confirmation/nonces, and clears RPC/private-key-like env vars. It does not require secrets, private keys, deployments, frontend assets, WebTransport certificates, Base Sepolia RPC, or broadcast access. Runtime CI V1A intentionally defers `fees-perps`, `mm-auth`, Base Sepolia runtime checks, broadcast checks, and frontend/browser E2E.
+
+With a local Postgres using the same credentials, run the CI-safe runtime flows locally with:
+
+```sh
+python3 scripts/e2e/run_e2e.py --flow admin --start-backend --database-url postgres://deopt:deopt@127.0.0.1:5432/deopt_v2_backend --admin-token local-admin-token-runtime-test
+python3 scripts/e2e/run_e2e.py --flow fees-options --start-backend --database-url postgres://deopt:deopt@127.0.0.1:5432/deopt_v2_backend --admin-token local-admin-token-runtime-test
+python3 scripts/e2e/run_e2e.py --flow option-rfq --start-backend --database-url postgres://deopt:deopt@127.0.0.1:5432/deopt_v2_backend --admin-token local-admin-token-runtime-test
+```
+
 ## E2E Test Harness V1A
 
 E2E Test Harness V1A adds a standard-library Python runner for reproducible local/runtime checks:

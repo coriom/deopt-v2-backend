@@ -1,0 +1,125 @@
+name: Backend Runtime E2E
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  DATABASE_URL: postgres://deopt:deopt@127.0.0.1:5432/deopt_v2_backend
+  ADMIN_API_TOKEN: ci-admin-token
+  EXECUTION_ENABLED: "false"
+  EXECUTOR_DRY_RUN: "true"
+  EXECUTOR_REAL_BROADCAST_ENABLED: "false"
+  EXECUTOR_PRIVATE_KEY: ""
+  RPC_URL: ""
+  PRIVATE_KEY: ""
+  DEPLOYER_PRIVATE_KEY: ""
+  MM_PRIVATE_KEY: ""
+  SIMULATION_ENABLED: "false"
+  INDEXER_ENABLED: "false"
+  RECONCILIATION_ENABLED: "false"
+  CONFIRMATION_ENABLED: "false"
+  PERP_NONCE_SYNC_ENABLED: "false"
+  MM_GATEWAY_ENABLED: "false"
+  MM_GATEWAY_AUTH_MODE: disabled
+  MM_GATEWAY_REQUIRE_AUTH: "false"
+
+jobs:
+  backend-e2e-postgres:
+    name: Backend runtime E2E with Postgres
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: deopt
+          POSTGRES_PASSWORD: deopt
+          POSTGRES_DB: deopt_v2_backend
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U deopt -d deopt_v2_backend"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install PostgreSQL client
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes postgresql-client
+
+      - name: Check Postgres readiness
+        run: pg_isready -h 127.0.0.1 -p 5432 -U deopt -d deopt_v2_backend
+
+      - name: Build backend
+        run: cargo build --bin deopt-v2-backend
+
+      - name: Compile E2E harness
+        run: python3 -m py_compile scripts/e2e/run_e2e.py
+
+      - name: Show E2E harness help
+        run: python3 scripts/e2e/run_e2e.py --help
+
+      - name: Run admin E2E
+        run: |
+          python3 scripts/e2e/run_e2e.py \
+            --flow admin \
+            --start-backend \
+            --database-url "$DATABASE_URL" \
+            --admin-token "$ADMIN_API_TOKEN" \
+            --json-out "$RUNNER_TEMP/deopt-e2e-admin.json"
+
+      - name: Run fees-options E2E
+        run: |
+          python3 scripts/e2e/run_e2e.py \
+            --flow fees-options \
+            --start-backend \
+            --database-url "$DATABASE_URL" \
+            --admin-token "$ADMIN_API_TOKEN" \
+            --json-out "$RUNNER_TEMP/deopt-e2e-fees-options.json"
+
+      - name: Run option-rfq E2E
+        run: |
+          python3 scripts/e2e/run_e2e.py \
+            --flow option-rfq \
+            --start-backend \
+            --database-url "$DATABASE_URL" \
+            --admin-token "$ADMIN_API_TOKEN" \
+            --json-out "$RUNNER_TEMP/deopt-e2e-option-rfq.json"
+
+      - name: Validate E2E JSON reports
+        run: |
+          python3 -m json.tool "$RUNNER_TEMP/deopt-e2e-admin.json" >/dev/null
+          python3 -m json.tool "$RUNNER_TEMP/deopt-e2e-fees-options.json" >/dev/null
+          python3 -m json.tool "$RUNNER_TEMP/deopt-e2e-option-rfq.json" >/dev/null
+
+      - name: Upload E2E JSON reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-e2e-reports
+          path: ${{ runner.temp }}/deopt-e2e-*.json
+          if-no-files-found: ignore

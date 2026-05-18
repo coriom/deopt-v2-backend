@@ -58,6 +58,9 @@ def sanitize_text(value: str, ctx: "Context") -> str:
     redactions = [
         (ctx.admin_token, "<redacted-admin-token>"),
         (ctx.database_url, "<redacted-database-url>"),
+        (os.environ.get("RPC_URL", ""), "<redacted-rpc-url>"),
+        (os.environ.get("PRIVATE_KEY", ""), "<redacted-private-key>"),
+        (os.environ.get("DEPLOYER_PRIVATE_KEY", ""), "<redacted-deployer-private-key>"),
         (os.environ.get("EXECUTOR_PRIVATE_KEY", ""), "<redacted-executor-private-key>"),
         (os.environ.get("MM_PRIVATE_KEY", ""), "<redacted-mm-private-key>"),
     ]
@@ -274,6 +277,7 @@ def psql_scalar(ctx: Context, sql: str) -> str:
 def build_backend_env(ctx: Context, flow: str) -> Dict[str, str]:
     host, port = backend_host_port(ctx.backend_url)
     confirmation_enabled = "true" if flow in {"fees-perps", "all-safe"} else "false"
+    rpc_url = os.environ.get("RPC_URL", "") if flow in {"fees-perps", "all-safe"} else ""
     env = os.environ.copy()
     env.update(
         {
@@ -289,6 +293,10 @@ def build_backend_env(ctx: Context, flow: str) -> Dict[str, str]:
             "EXECUTOR_DRY_RUN": "true",
             "EXECUTOR_REAL_BROADCAST_ENABLED": "false",
             "EXECUTOR_PRIVATE_KEY": "",
+            "PRIVATE_KEY": "",
+            "DEPLOYER_PRIVATE_KEY": "",
+            "MM_PRIVATE_KEY": "",
+            "RPC_URL": rpc_url,
             "SIMULATION_ENABLED": "false",
             "INDEXER_ENABLED": "false",
             "RECONCILIATION_ENABLED": "false",
