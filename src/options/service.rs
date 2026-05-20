@@ -4,11 +4,16 @@ use super::signing::{
     option_series_id_to_b256, OptionRfqQuoteSigningPayload,
 };
 use super::{
-    OptionFill, OptionFillFilter, OptionFillId, OptionOrder, OptionOrderFilter, OptionOrderId,
-    OptionOrderStatus, OptionOrderbookLevel, OptionOrderbookSnapshot, OptionRfqFill,
-    OptionRfqFillId, OptionRfqId, OptionRfqQuote, OptionRfqQuoteId, OptionRfqQuoteSignatureMode,
-    OptionRfqQuoteSignatureStatus, OptionRfqQuoteStatus, OptionRfqRequest, OptionRfqStatus,
-    OptionSeries, OptionSeriesFilter, OptionSeriesId, OptionSeriesSource, OptionSeriesStatus,
+    encode_option_execute_trade_calldata, normalize_u256_string,
+    option_execution_intent_id_to_hex_bytes32, option_trade_digest, option_trade_digest_bytes,
+    OptionExecutionIntent, OptionExecutionIntentId, OptionExecutionIntentStatus,
+    OptionExecutionSignatureMode, OptionExecutionSourceType, OptionFill, OptionFillFilter,
+    OptionFillId, OptionOrder, OptionOrderFilter, OptionOrderId, OptionOrderStatus,
+    OptionOrderbookLevel, OptionOrderbookSnapshot, OptionRfqFill, OptionRfqFillId, OptionRfqId,
+    OptionRfqQuote, OptionRfqQuoteId, OptionRfqQuoteSignatureMode, OptionRfqQuoteSignatureStatus,
+    OptionRfqQuoteStatus, OptionRfqRequest, OptionRfqStatus, OptionSeries, OptionSeriesFilter,
+    OptionSeriesId, OptionSeriesSource, OptionSeriesStatus, OptionTradePayload,
+    OptionTradeSignatureBundle,
 };
 use crate::api::AppState;
 use crate::error::{BackendError, Result};
@@ -24,6 +29,8 @@ use crate::types::{now_ms, AccountId, OrderId, Price1e8, Side, Size1e8, TimeInFo
 use std::collections::BTreeMap;
 use tracing::{info, warn};
 use uuid::Uuid;
+
+const ONE_CONTRACT_1E8: u128 = 100_000_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CreateOptionSeriesInput {
@@ -105,6 +112,36 @@ pub struct AcceptOptionRfqQuoteOutcome {
     pub fill: OptionRfqFill,
     pub mm_notification_sent: bool,
     pub mm_notification_warning: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OptionExecutionSigningPayloadOutcome {
+    pub intent: OptionExecutionIntent,
+    pub payload: OptionTradePayload,
+    pub digest: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubmitOptionExecutionSignaturesInput {
+    pub buyer_signature: Option<String>,
+    pub seller_signature: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubmitOptionExecutionSignaturesOutcome {
+    pub intent: OptionExecutionIntent,
+    pub buyer_signature_present: bool,
+    pub seller_signature_present: bool,
+    pub calldata_ready: bool,
+    pub missing_signatures: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OptionExecutionCalldataOutcome {
+    pub intent: OptionExecutionIntent,
+    pub calldata: Option<String>,
+    pub calldata_ready: bool,
+    pub missing_signatures: bool,
 }
 
 pub async fn create_option_series(
@@ -292,6 +329,7 @@ pub async fn submit_option_order(
             "option series is not active".to_string(),
         ));
     }
+    validate_option_order_execution_preflight(state, &series, &input).await?;
 
     let now = now_ms();
     let order = OptionOrder {
@@ -314,6 +352,7 @@ pub async fn submit_option_order(
 
     if let Some(repository) = state.repository.clone() {
         let (order, fills) = repository.submit_option_order_and_match(order, now).await?;
+        create_option_orderbook_execution_intents(state, &fills).await?;
         crate::fees::service::record_option_order_fills(state, &fills).await?;
         return Ok(SubmitOptionOrderOutcome { order, fills });
     }
@@ -323,6 +362,7 @@ pub async fn submit_option_order(
         .lock()
         .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?
         .submit_order_and_match(order, now)?;
+    create_option_orderbook_execution_intents(state, &fills).await?;
     crate::fees::service::record_option_order_fills(state, &fills).await?;
     Ok(SubmitOptionOrderOutcome { order, fills })
 }
@@ -711,6 +751,7 @@ pub async fn accept_option_rfq_quote(
             "option series is not active".to_string(),
         ));
     }
+    validate_option_rfq_execution_preflight(state, &series, &quote).await?;
     let quotes_before_accept = list_option_rfq_quotes(state, option_rfq_id).await?;
 
     let (buyer, seller) = match rfq.side {
@@ -747,6 +788,7 @@ pub async fn accept_option_rfq_quote(
         let fill = repository.get_option_rfq_fill(fill.fill_id).await?.ok_or(
             BackendError::InvalidOptionRfqState("option RFQ fill was not persisted".to_string()),
         )?;
+        create_option_rfq_execution_intent(state, &fill).await?;
         crate::fees::service::record_option_rfq_fill(state, &fill, &quote).await?;
         let (mm_notification_sent, mm_notification_warning) =
             notify_option_rfq_quote_acceptance(state, &quote, &quotes_before_accept, fill.fill_id);
@@ -764,6 +806,7 @@ pub async fn accept_option_rfq_quote(
         .lock()
         .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?
         .accept_option_rfq_quote(option_rfq_id, quote_id, fill.clone())?;
+    create_option_rfq_execution_intent(state, &fill).await?;
     crate::fees::service::record_option_rfq_fill(state, &fill, &quote).await?;
     let (mm_notification_sent, mm_notification_warning) =
         notify_option_rfq_quote_acceptance(state, &quote, &quotes_before_accept, fill.fill_id);
@@ -789,6 +832,538 @@ pub async fn cancel_option_rfq(
         .lock()
         .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?
         .cancel_option_rfq(option_rfq_id)
+}
+
+pub async fn list_option_execution_intents(state: &AppState) -> Result<Vec<OptionExecutionIntent>> {
+    ensure_enabled(state)?;
+    if let Some(repository) = state.repository.clone() {
+        return repository.list_option_execution_intents().await;
+    }
+    Ok(state
+        .options_store
+        .lock()
+        .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?
+        .list_option_execution_intents())
+}
+
+pub async fn get_option_execution_intent(
+    state: &AppState,
+    intent_id: OptionExecutionIntentId,
+) -> Result<OptionExecutionIntent> {
+    ensure_enabled(state)?;
+    if let Some(repository) = state.repository.clone() {
+        return repository
+            .get_option_execution_intent(intent_id)
+            .await?
+            .ok_or(BackendError::InvalidOptionExecutionIntentId);
+    }
+    state
+        .options_store
+        .lock()
+        .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?
+        .get_option_execution_intent(intent_id)
+        .ok_or(BackendError::InvalidOptionExecutionIntentId)
+}
+
+pub async fn option_execution_signing_payload(
+    state: &AppState,
+    intent_id: OptionExecutionIntentId,
+) -> Result<OptionExecutionSigningPayloadOutcome> {
+    let intent = get_option_execution_intent(state, intent_id).await?;
+    let payload = OptionTradePayload::from_intent(&intent)?;
+    let digest = option_trade_digest(&payload, &state.options_config.execution_eip712_domain)?;
+    Ok(OptionExecutionSigningPayloadOutcome {
+        intent,
+        payload,
+        digest,
+    })
+}
+
+pub async fn submit_option_execution_signatures(
+    state: &AppState,
+    intent_id: OptionExecutionIntentId,
+    input: SubmitOptionExecutionSignaturesInput,
+) -> Result<SubmitOptionExecutionSignaturesOutcome> {
+    let intent = get_option_execution_intent(state, intent_id).await?;
+    let payload = OptionTradePayload::from_intent(&intent)?;
+    let digest_bytes =
+        option_trade_digest_bytes(&payload, &state.options_config.execution_eip712_domain)?;
+    verify_option_execution_signature(
+        state,
+        input.buyer_signature.as_deref(),
+        &digest_bytes,
+        &intent.buyer,
+    )?;
+    verify_option_execution_signature(
+        state,
+        input.seller_signature.as_deref(),
+        &digest_bytes,
+        &intent.seller,
+    )?;
+
+    let effective_buyer_signature = input
+        .buyer_signature
+        .clone()
+        .or_else(|| intent.buyer_signature.clone());
+    let effective_seller_signature = input
+        .seller_signature
+        .clone()
+        .or_else(|| intent.seller_signature.clone());
+    let (status, calldata) = if let (Some(buyer_signature), Some(seller_signature)) = (
+        effective_buyer_signature.as_deref(),
+        effective_seller_signature.as_deref(),
+    ) {
+        let calldata = build_option_execution_calldata_from_parts(
+            &payload,
+            buyer_signature,
+            seller_signature,
+        )?;
+        (OptionExecutionIntentStatus::CalldataReady, Some(calldata))
+    } else {
+        (OptionExecutionIntentStatus::SignaturesRequired, None)
+    };
+
+    let updated_at_ms = now_ms();
+    let updated = if let Some(repository) = state.repository.clone() {
+        repository
+            .upsert_option_execution_signatures(
+                intent_id,
+                input.buyer_signature,
+                input.seller_signature,
+                status,
+                calldata,
+                updated_at_ms,
+            )
+            .await?
+    } else {
+        state
+            .options_store
+            .lock()
+            .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?
+            .upsert_option_execution_signatures(
+                intent_id,
+                input.buyer_signature,
+                input.seller_signature,
+                status,
+                calldata,
+                updated_at_ms,
+            )?
+    };
+
+    Ok(option_execution_signature_outcome(updated))
+}
+
+pub async fn option_execution_calldata(
+    state: &AppState,
+    intent_id: OptionExecutionIntentId,
+) -> Result<OptionExecutionCalldataOutcome> {
+    let intent = get_option_execution_intent(state, intent_id).await?;
+    if intent.calldata.is_some() {
+        return Ok(OptionExecutionCalldataOutcome {
+            calldata_ready: true,
+            missing_signatures: false,
+            calldata: intent.calldata.clone(),
+            intent,
+        });
+    }
+    let Some(buyer_signature) = intent.buyer_signature.as_deref() else {
+        return Ok(OptionExecutionCalldataOutcome {
+            calldata_ready: false,
+            missing_signatures: true,
+            calldata: None,
+            intent,
+        });
+    };
+    let Some(seller_signature) = intent.seller_signature.as_deref() else {
+        return Ok(OptionExecutionCalldataOutcome {
+            calldata_ready: false,
+            missing_signatures: true,
+            calldata: None,
+            intent,
+        });
+    };
+
+    let payload = OptionTradePayload::from_intent(&intent)?;
+    let calldata =
+        build_option_execution_calldata_from_parts(&payload, buyer_signature, seller_signature)?;
+    let updated_at_ms = now_ms();
+    let updated = if let Some(repository) = state.repository.clone() {
+        repository
+            .upsert_option_execution_signatures(
+                intent_id,
+                None,
+                None,
+                OptionExecutionIntentStatus::CalldataReady,
+                Some(calldata.clone()),
+                updated_at_ms,
+            )
+            .await?
+    } else {
+        state
+            .options_store
+            .lock()
+            .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?
+            .upsert_option_execution_signatures(
+                intent_id,
+                None,
+                None,
+                OptionExecutionIntentStatus::CalldataReady,
+                Some(calldata.clone()),
+                updated_at_ms,
+            )?
+    };
+    Ok(OptionExecutionCalldataOutcome {
+        intent: updated,
+        calldata: Some(calldata),
+        calldata_ready: true,
+        missing_signatures: false,
+    })
+}
+
+pub async fn create_option_orderbook_execution_intent(
+    state: &AppState,
+    fill: &OptionFill,
+) -> Result<Option<OptionExecutionIntent>> {
+    if !state.options_config.execution_enabled {
+        return Ok(None);
+    }
+    let series = get_option_series(state, &fill.option_series_id).await?;
+    let buyer_is_maker = fill.maker_order_id == fill.buy_order_id;
+    let intent = build_option_execution_intent(
+        state,
+        &series,
+        OptionExecutionSourceType::OptionOrderbookFill,
+        fill.fill_id.to_string(),
+        fill.buyer.clone(),
+        fill.seller.clone(),
+        fill.price_1e8,
+        fill.size_1e8,
+        buyer_is_maker,
+        fill.created_at_ms,
+    )?;
+    insert_option_execution_intent(state, intent)
+        .await
+        .map(Some)
+}
+
+pub async fn create_option_rfq_execution_intent(
+    state: &AppState,
+    fill: &OptionRfqFill,
+) -> Result<Option<OptionExecutionIntent>> {
+    if !state.options_config.execution_enabled {
+        return Ok(None);
+    }
+    let series = get_option_series(state, &fill.option_series_id).await?;
+    let buyer_is_maker = fill.buyer.0.eq_ignore_ascii_case(&fill.mm_account.0);
+    let intent = build_option_execution_intent(
+        state,
+        &series,
+        OptionExecutionSourceType::OptionRfqFill,
+        fill.fill_id.to_string(),
+        fill.buyer.clone(),
+        fill.seller.clone(),
+        fill.price_1e8,
+        fill.size_1e8,
+        buyer_is_maker,
+        fill.created_at_ms,
+    )?;
+    insert_option_execution_intent(state, intent)
+        .await
+        .map(Some)
+}
+
+async fn create_option_orderbook_execution_intents(
+    state: &AppState,
+    fills: &[OptionFill],
+) -> Result<Vec<OptionExecutionIntent>> {
+    let mut intents = Vec::new();
+    if !state.options_config.execution_enabled {
+        return Ok(intents);
+    }
+    for fill in fills {
+        if let Some(intent) = create_option_orderbook_execution_intent(state, fill).await? {
+            intents.push(intent);
+        }
+    }
+    Ok(intents)
+}
+
+async fn insert_option_execution_intent(
+    state: &AppState,
+    intent: OptionExecutionIntent,
+) -> Result<OptionExecutionIntent> {
+    if let Some(repository) = state.repository.clone() {
+        return repository.insert_option_execution_intent(&intent).await;
+    }
+    Ok(state
+        .options_store
+        .lock()
+        .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?
+        .insert_option_execution_intent(intent))
+}
+
+async fn validate_option_order_execution_preflight(
+    state: &AppState,
+    series: &OptionSeries,
+    input: &SubmitOptionOrderInput,
+) -> Result<()> {
+    if !state.options_config.execution_enabled {
+        return Ok(());
+    }
+
+    let mut candidates = open_option_orders_for_series(state, &input.option_series_id)
+        .await?
+        .into_iter()
+        .filter(|order| {
+            order.side != input.side
+                && order.status.is_live()
+                && order.remaining_size_1e8 > 0
+                && match input.side {
+                    Side::Buy => input.price_1e8 >= order.price_1e8,
+                    Side::Sell => input.price_1e8 <= order.price_1e8,
+                }
+        })
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return Ok(());
+    }
+
+    validate_executable_option_series(state, series)?;
+    sort_execution_preflight_candidates(&mut candidates, input.side);
+    let mut remaining_size_1e8 = input.size_1e8;
+    for maker in candidates {
+        if remaining_size_1e8 == 0 {
+            break;
+        }
+        let fill_size_1e8 = remaining_size_1e8.min(maker.remaining_size_1e8);
+        validate_option_execution_conversion(state, fill_size_1e8, maker.price_1e8)?;
+        remaining_size_1e8 -= fill_size_1e8;
+    }
+    Ok(())
+}
+
+async fn validate_option_rfq_execution_preflight(
+    state: &AppState,
+    series: &OptionSeries,
+    quote: &OptionRfqQuote,
+) -> Result<()> {
+    if !state.options_config.execution_enabled {
+        return Ok(());
+    }
+    validate_executable_option_series(state, series)?;
+    validate_option_execution_conversion(state, quote.size_1e8, quote.price_1e8)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_option_execution_intent(
+    state: &AppState,
+    series: &OptionSeries,
+    source_type: OptionExecutionSourceType,
+    source_id: String,
+    buyer: AccountId,
+    seller: AccountId,
+    source_price_1e8: Price1e8,
+    source_size_1e8: Size1e8,
+    buyer_is_maker: bool,
+    source_created_at_ms: TimestampMs,
+) -> Result<OptionExecutionIntent> {
+    let metadata = validate_executable_option_series(state, series)?;
+    let quantity_contracts = quantity_contracts_from_size(source_size_1e8)?;
+    let premium_per_contract_native = premium_per_contract_native(
+        source_price_1e8,
+        state.options_config.execution_default_settlement_decimals,
+    )?;
+    let intent_id = Uuid::new_v4();
+    let onchain_intent_id = option_execution_intent_id_to_hex_bytes32(&intent_id.to_string())?;
+    let now = now_ms();
+    Ok(OptionExecutionIntent {
+        intent_id,
+        onchain_intent_id,
+        source_type,
+        source_id,
+        option_series_id: series.option_series_id.clone(),
+        onchain_option_id: metadata.onchain_option_id,
+        buyer,
+        seller,
+        underlying: metadata.underlying,
+        settlement_asset: metadata.settlement_asset,
+        expiry: series.expiry,
+        strike_1e8: series.strike_1e8,
+        is_call: series.is_call,
+        contract_size_1e8: series.contract_size_1e8,
+        quantity_contracts,
+        source_size_1e8,
+        source_price_1e8,
+        premium_per_contract_native,
+        buyer_is_maker,
+        buyer_nonce: Some(0),
+        seller_nonce: Some(0),
+        deadline: 0,
+        buyer_signature: None,
+        seller_signature: None,
+        calldata: None,
+        status: OptionExecutionIntentStatus::SignaturesRequired,
+        error: None,
+        created_at_ms: source_created_at_ms,
+        updated_at_ms: now,
+    })
+}
+
+struct ExecutableOptionSeriesMetadata {
+    onchain_option_id: String,
+    underlying: AccountId,
+    settlement_asset: AccountId,
+}
+
+fn validate_executable_option_series(
+    state: &AppState,
+    series: &OptionSeries,
+) -> Result<ExecutableOptionSeriesMetadata> {
+    let onchain_option_id = series
+        .onchain_series_id
+        .as_deref()
+        .or(series.onchain_product_id.as_deref())
+        .ok_or_else(|| {
+            BackendError::InvalidOptionExecutionIntentState(
+                "option series is missing onchain_series_id or onchain_product_id".to_string(),
+            )
+        })
+        .and_then(|value| normalize_u256_string(value, "optionId"))?;
+    validate_nonzero_execution_address(&series.underlying, "underlying")?;
+    validate_nonzero_execution_address(&series.settlement_asset, "settlement_asset")?;
+    let _ = state;
+    Ok(ExecutableOptionSeriesMetadata {
+        onchain_option_id,
+        underlying: AccountId::new(series.underlying.clone()),
+        settlement_asset: AccountId::new(series.settlement_asset.clone()),
+    })
+}
+
+fn validate_nonzero_execution_address(value: &str, field: &str) -> Result<()> {
+    let account = AccountId::new(value.to_string());
+    let address = parse_evm_address(&account).map_err(|_| {
+        BackendError::InvalidOptionExecutionIntentState(format!(
+            "{field} must be an EVM address when option execution is enabled"
+        ))
+    })?;
+    if address.iter().all(|byte| *byte == 0) {
+        return Err(BackendError::InvalidOptionExecutionIntentState(format!(
+            "{field} must be nonzero when option execution is enabled"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_option_execution_conversion(
+    state: &AppState,
+    size_1e8: Size1e8,
+    price_1e8: Price1e8,
+) -> Result<()> {
+    let _ = quantity_contracts_from_size(size_1e8)?;
+    let _ = premium_per_contract_native(
+        price_1e8,
+        state.options_config.execution_default_settlement_decimals,
+    )?;
+    Ok(())
+}
+
+fn quantity_contracts_from_size(size_1e8: Size1e8) -> Result<u128> {
+    if size_1e8 == 0 {
+        return Err(BackendError::ZeroSize);
+    }
+    if size_1e8 % ONE_CONTRACT_1E8 != 0 {
+        return Err(BackendError::InvalidOptionExecutionIntentState(
+            "size_1e8 must be a whole number of option contracts when option execution is enabled"
+                .to_string(),
+        ));
+    }
+    let quantity = size_1e8 / ONE_CONTRACT_1E8;
+    if quantity == 0 {
+        return Err(BackendError::ZeroSize);
+    }
+    Ok(quantity)
+}
+
+fn premium_per_contract_native(price_1e8: Price1e8, settlement_decimals: u32) -> Result<u128> {
+    if price_1e8 == 0 {
+        return Err(BackendError::ZeroPrice);
+    }
+    let scale = 10u128.checked_pow(settlement_decimals).ok_or_else(|| {
+        BackendError::InvalidOptionExecutionIntentState(
+            "settlement decimals overflow native premium conversion".to_string(),
+        )
+    })?;
+    let premium = price_1e8.checked_mul(scale).ok_or_else(|| {
+        BackendError::InvalidOptionExecutionIntentState(
+            "premium native conversion overflow".to_string(),
+        )
+    })? / ONE_CONTRACT_1E8;
+    if premium == 0 {
+        return Err(BackendError::InvalidOptionExecutionIntentState(
+            "premium_per_contract_native is zero after settlement-native conversion".to_string(),
+        ));
+    }
+    Ok(premium)
+}
+
+fn verify_option_execution_signature(
+    state: &AppState,
+    signature: Option<&str>,
+    digest_bytes: &[u8; 32],
+    expected_signer: &AccountId,
+) -> Result<()> {
+    let Some(signature) = signature else {
+        return Ok(());
+    };
+    validate_signature_shape(signature)?;
+    if state.options_config.execution_signature_mode == OptionExecutionSignatureMode::Strict {
+        let recovered_signer = recover_eip712_signer(digest_bytes, signature)?;
+        let expected = parse_evm_address(expected_signer)?;
+        let recovered = parse_evm_address(&recovered_signer)?;
+        if recovered != expected {
+            return Err(BackendError::SignatureSignerMismatch);
+        }
+    }
+    Ok(())
+}
+
+fn build_option_execution_calldata_from_parts(
+    payload: &OptionTradePayload,
+    buyer_signature: &str,
+    seller_signature: &str,
+) -> Result<String> {
+    let bundle = OptionTradeSignatureBundle::new(buyer_signature, seller_signature)?;
+    Ok(hex_0x(&encode_option_execute_trade_calldata(
+        payload, &bundle,
+    )?))
+}
+
+fn option_execution_signature_outcome(
+    intent: OptionExecutionIntent,
+) -> SubmitOptionExecutionSignaturesOutcome {
+    let buyer_signature_present = intent.buyer_signature.is_some();
+    let seller_signature_present = intent.seller_signature.is_some();
+    let calldata_ready =
+        intent.calldata.is_some() && intent.status == OptionExecutionIntentStatus::CalldataReady;
+    SubmitOptionExecutionSignaturesOutcome {
+        intent,
+        buyer_signature_present,
+        seller_signature_present,
+        calldata_ready,
+        missing_signatures: !(buyer_signature_present && seller_signature_present),
+    }
+}
+
+fn sort_execution_preflight_candidates(orders: &mut [OptionOrder], taker_side: Side) {
+    orders.sort_by(|left, right| {
+        let price_order = match taker_side {
+            Side::Buy => left.price_1e8.cmp(&right.price_1e8),
+            Side::Sell => right.price_1e8.cmp(&left.price_1e8),
+        };
+        price_order
+            .then_with(|| left.created_at_ms.cmp(&right.created_at_ms))
+            .then_with(|| left.order_id.cmp(&right.order_id))
+    });
 }
 
 async fn open_option_orders_for_series(

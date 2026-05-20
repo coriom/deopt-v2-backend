@@ -1,8 +1,9 @@
 use super::{
-    OptionFill, OptionFillFilter, OptionFillId, OptionOrder, OptionOrderFilter, OptionOrderId,
-    OptionOrderStatus, OptionRfqFill, OptionRfqId, OptionRfqQuote, OptionRfqQuoteId,
-    OptionRfqQuoteStatus, OptionRfqRequest, OptionRfqStatus, OptionSeries, OptionSeriesFilter,
-    OptionSeriesId, OptionSeriesStatus,
+    OptionExecutionIntent, OptionExecutionIntentId, OptionExecutionIntentStatus,
+    OptionExecutionSourceType, OptionFill, OptionFillFilter, OptionFillId, OptionOrder,
+    OptionOrderFilter, OptionOrderId, OptionOrderStatus, OptionRfqFill, OptionRfqId,
+    OptionRfqQuote, OptionRfqQuoteId, OptionRfqQuoteStatus, OptionRfqRequest, OptionRfqStatus,
+    OptionSeries, OptionSeriesFilter, OptionSeriesId, OptionSeriesStatus,
 };
 use crate::error::{BackendError, Result};
 use crate::types::{Side, TimestampMs};
@@ -17,6 +18,8 @@ pub struct OptionSeriesStore {
     option_rfqs: HashMap<OptionRfqId, OptionRfqRequest>,
     option_rfq_quotes: HashMap<OptionRfqQuoteId, OptionRfqQuote>,
     option_rfq_fills: HashMap<Uuid, OptionRfqFill>,
+    option_execution_intents: HashMap<OptionExecutionIntentId, OptionExecutionIntent>,
+    option_execution_intents_by_source: HashMap<(String, String), OptionExecutionIntentId>,
 }
 
 impl OptionSeriesStore {
@@ -332,6 +335,83 @@ impl OptionSeriesStore {
         fills
     }
 
+    pub fn insert_option_execution_intent(
+        &mut self,
+        intent: OptionExecutionIntent,
+    ) -> OptionExecutionIntent {
+        let source_key = option_execution_source_key(intent.source_type, &intent.source_id);
+        if let Some(existing_id) = self.option_execution_intents_by_source.get(&source_key) {
+            if let Some(existing) = self.option_execution_intents.get(existing_id) {
+                return existing.clone();
+            }
+        }
+        self.option_execution_intents_by_source
+            .insert(source_key, intent.intent_id);
+        self.option_execution_intents
+            .insert(intent.intent_id, intent.clone());
+        intent
+    }
+
+    pub fn list_option_execution_intents(&self) -> Vec<OptionExecutionIntent> {
+        let mut intents = self
+            .option_execution_intents
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        intents.sort_by(|left, right| {
+            left.created_at_ms
+                .cmp(&right.created_at_ms)
+                .then_with(|| left.intent_id.cmp(&right.intent_id))
+        });
+        intents
+    }
+
+    pub fn get_option_execution_intent(
+        &self,
+        intent_id: OptionExecutionIntentId,
+    ) -> Option<OptionExecutionIntent> {
+        self.option_execution_intents.get(&intent_id).cloned()
+    }
+
+    pub fn get_option_execution_intent_by_source(
+        &self,
+        source_type: OptionExecutionSourceType,
+        source_id: &str,
+    ) -> Option<OptionExecutionIntent> {
+        let source_key = option_execution_source_key(source_type, source_id);
+        self.option_execution_intents_by_source
+            .get(&source_key)
+            .and_then(|intent_id| self.option_execution_intents.get(intent_id))
+            .cloned()
+    }
+
+    pub fn upsert_option_execution_signatures(
+        &mut self,
+        intent_id: OptionExecutionIntentId,
+        buyer_signature: Option<String>,
+        seller_signature: Option<String>,
+        status: OptionExecutionIntentStatus,
+        calldata: Option<String>,
+        updated_at_ms: TimestampMs,
+    ) -> Result<OptionExecutionIntent> {
+        let intent = self
+            .option_execution_intents
+            .get_mut(&intent_id)
+            .ok_or(BackendError::InvalidOptionExecutionIntentId)?;
+        if buyer_signature.is_some() {
+            intent.buyer_signature = buyer_signature;
+        }
+        if seller_signature.is_some() {
+            intent.seller_signature = seller_signature;
+        }
+        if calldata.is_some() {
+            intent.calldata = calldata;
+        }
+        intent.status = status;
+        intent.updated_at_ms = updated_at_ms;
+        Ok(intent.clone())
+    }
+
     pub fn cancel_option_rfq(&mut self, option_rfq_id: OptionRfqId) -> Result<OptionRfqRequest> {
         let rfq = self
             .option_rfqs
@@ -378,6 +458,13 @@ impl OptionSeriesStore {
                 && quote.client_quote_id.as_deref() == Some(client_quote_id)
         })
     }
+}
+
+fn option_execution_source_key(
+    source_type: OptionExecutionSourceType,
+    source_id: &str,
+) -> (String, String) {
+    (source_type.as_str().to_string(), source_id.to_string())
 }
 
 fn can_match(incoming: &OptionOrder, resting: &OptionOrder) -> bool {

@@ -32,25 +32,33 @@ use crate::options::service::{
     cancel_option_rfq as cancel_option_rfq_service, create_option_rfq as create_option_rfq_service,
     create_option_series as create_option_series_service,
     disable_option_series as disable_option_series_service,
+    get_option_execution_intent as get_option_execution_intent_service,
     get_option_fill as get_option_fill_service, get_option_order as get_option_order_service,
     get_option_order_fills as get_option_order_fills_service,
     get_option_orderbook as get_option_orderbook_service, get_option_rfq as get_option_rfq_service,
-    get_option_series as get_option_series_service, list_option_fills as list_option_fills_service,
+    get_option_series as get_option_series_service,
+    list_option_execution_intents as list_option_execution_intents_service,
+    list_option_fills as list_option_fills_service,
     list_option_orders as list_option_orders_service,
     list_option_rfq_quotes as list_option_rfq_quotes_service,
     list_option_rfqs as list_option_rfqs_service, list_option_series as list_option_series_service,
+    option_execution_calldata as option_execution_calldata_service,
+    option_execution_signing_payload as option_execution_signing_payload_service,
     option_rfq_quote_signing_payload as option_rfq_quote_signing_payload_service,
+    submit_option_execution_signatures as submit_option_execution_signatures_service,
     submit_option_order as submit_option_order_service,
     submit_option_rfq_quote as submit_option_rfq_quote_service, CreateOptionRfqInput,
-    CreateOptionSeriesInput, OptionRfqQuoteSigningPayloadInput, SubmitOptionOrderInput,
-    SubmitOptionRfqQuoteInput,
+    CreateOptionSeriesInput, OptionRfqQuoteSigningPayloadInput,
+    SubmitOptionExecutionSignaturesInput, SubmitOptionOrderInput, SubmitOptionRfqQuoteInput,
 };
 use crate::options::{
-    option_rfq_id_to_hex_bytes32, option_series_id_to_hex_bytes32, OptionFill, OptionFillFilter,
-    OptionFillId, OptionOrder, OptionOrderFilter, OptionOrderStatus, OptionOrderbookSnapshot,
-    OptionRfqFill, OptionRfqId, OptionRfqQuote, OptionRfqQuoteId, OptionRfqQuoteSignatureStatus,
-    OptionRfqQuoteStatus, OptionRfqRequest, OptionRfqStatus, OptionSeries, OptionSeriesFilter,
-    OptionSeriesStatus, OPTION_RFQ_QUOTE_TYPE,
+    option_execution_intent_id_to_hex_bytes32, option_rfq_id_to_hex_bytes32,
+    option_series_id_to_hex_bytes32, OptionExecutionIntent, OptionExecutionIntentId,
+    OptionExecutionIntentStatus, OptionFill, OptionFillFilter, OptionFillId, OptionOrder,
+    OptionOrderFilter, OptionOrderStatus, OptionOrderbookSnapshot, OptionRfqFill, OptionRfqId,
+    OptionRfqQuote, OptionRfqQuoteId, OptionRfqQuoteSignatureStatus, OptionRfqQuoteStatus,
+    OptionRfqRequest, OptionRfqStatus, OptionSeries, OptionSeriesFilter, OptionSeriesStatus,
+    OPTION_RFQ_QUOTE_TYPE, OPTION_TRADE_TYPE,
 };
 use crate::orders::service::{
     cancel_order as cancel_order_shared, submit_response_from_events, submit_signed_order,
@@ -128,6 +136,26 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/options/orders",
             post(submit_option_order).get(list_option_orders),
+        )
+        .route(
+            "/options/execution-intents",
+            get(list_option_execution_intents),
+        )
+        .route(
+            "/options/execution-intents/:intent_id",
+            get(get_option_execution_intent),
+        )
+        .route(
+            "/options/execution-intents/:intent_id/signing-payload",
+            get(option_execution_signing_payload),
+        )
+        .route(
+            "/options/execution-intents/:intent_id/signatures",
+            post(submit_option_execution_signatures),
+        )
+        .route(
+            "/options/execution-intents/:intent_id/calldata",
+            get(option_execution_calldata),
         )
         .route("/options/fills", get(list_option_fills))
         .route("/options/fills/:fill_id", get(get_option_fill))
@@ -272,6 +300,7 @@ async fn admin_status(
         "rfq_enabled": state.rfq_config.enabled,
         "options_enabled": state.options_config.enabled,
         "option_rfq_enabled": state.options_config.rfq_enabled,
+        "option_execution_enabled": state.options_config.execution_enabled,
         "fees_enabled": state.fees_config.enabled,
         "rebates_enabled": state.fees_config.rebates_enabled
     })))
@@ -306,6 +335,7 @@ async fn admin_config(
             "rfq_enabled": state.rfq_config.enabled,
             "options_enabled": state.options_config.enabled,
             "option_rfq_enabled": state.options_config.rfq_enabled,
+            "option_execution_enabled": state.options_config.execution_enabled,
             "fees_enabled": state.fees_config.enabled,
             "rebates_enabled": state.fees_config.rebates_enabled,
             "mm_gateway_enabled": state.mm_gateway_config.enabled,
@@ -320,15 +350,18 @@ async fn admin_config(
         "contracts": {
             "executor_from_address": state.execution_config.executor_from_address,
             "perp_matching_engine_address": state.execution_config.perp_matching_engine_address,
+            "option_matching_engine_address": state.options_config.matching_engine_address,
             "perp_engine_address": state.execution_config.perp_engine_address,
             "order_eip712_verifying_contract": state.eip712_domain.verifying_contract,
             "rfq_eip712_verifying_contract": state.rfq_config.eip712_domain.verifying_contract,
-            "option_rfq_eip712_verifying_contract": state.options_config.rfq_eip712_domain.verifying_contract
+            "option_rfq_eip712_verifying_contract": state.options_config.rfq_eip712_domain.verifying_contract,
+            "option_execution_eip712_verifying_contract": state.options_config.execution_eip712_domain.verifying_contract
         },
         "signatures": {
             "order_mode": state.signature_verification_mode,
             "rfq_quote_mode": state.rfq_config.quote_signature_mode,
-            "option_rfq_quote_mode": state.options_config.rfq_quote_signature_mode
+            "option_rfq_quote_mode": state.options_config.rfq_quote_signature_mode,
+            "option_execution_trade_mode": state.options_config.execution_signature_mode
         },
         "execution": {
             "dry_run": state.execution_config.dry_run,
@@ -398,7 +431,14 @@ async fn admin_config(
             "rfq_max_quotes_per_rfq": state.options_config.rfq_max_quotes_per_rfq,
             "rfq_eip712_name": state.options_config.rfq_eip712_domain.name,
             "rfq_eip712_version": state.options_config.rfq_eip712_domain.version,
-            "rfq_eip712_chain_id": state.options_config.rfq_eip712_domain.chain_id
+            "rfq_eip712_chain_id": state.options_config.rfq_eip712_domain.chain_id,
+            "execution_enabled": state.options_config.execution_enabled,
+            "execution_require_persistence": state.options_config.execution_require_persistence,
+            "execution_signature_mode": state.options_config.execution_signature_mode,
+            "execution_default_settlement_decimals": state.options_config.execution_default_settlement_decimals,
+            "execution_eip712_name": state.options_config.execution_eip712_domain.name,
+            "execution_eip712_version": state.options_config.execution_eip712_domain.version,
+            "execution_eip712_chain_id": state.options_config.execution_eip712_domain.chain_id
         }
     })))
 }
@@ -700,10 +740,14 @@ async fn admin_options_summary(
         let option_rfq_quote_signature_status_counts = repository
             .admin_count_by_column("option_rfq_quotes", "signature_status")
             .await?;
+        let option_execution_intent_status_counts = repository
+            .admin_count_by_column("option_execution_intents", "status")
+            .await?;
         return Ok(Json(serde_json::json!({
             "persistence_enabled": true,
             "enabled": state.options_config.enabled,
             "option_rfq_enabled": state.options_config.rfq_enabled,
+            "option_execution_enabled": state.options_config.execution_enabled,
             "series_status_counts": series_status_counts,
             "order_status_counts": order_status_counts,
             "option_fills_count": repository.admin_count_where("option_fills", "TRUE").await?,
@@ -712,6 +756,11 @@ async fn admin_options_summary(
             "option_rfq_quote_signature_status_counts": option_rfq_quote_signature_status_counts,
             "verified_option_rfq_quotes": count_from_map(&option_rfq_quote_signature_status_counts, "verified"),
             "option_rfq_fills_count": repository.admin_count_where("option_rfq_fills", "TRUE").await?,
+            "option_execution_intent_status_counts": option_execution_intent_status_counts,
+            "option_execution_intents_count": repository.admin_count_where("option_execution_intents", "TRUE").await?,
+            "option_execution_calldata_ready": count_from_map(&option_execution_intent_status_counts, "calldata_ready"),
+            "option_execution_pending_signatures": count_from_map(&option_execution_intent_status_counts, "signatures_required"),
+            "recent_option_execution_intents": repository.admin_recent_option_execution_intents(20).await?,
             "recent_option_rfq_fills": repository.admin_recent_option_rfq_fills(20).await?,
             "recent_option_order_fills": repository.admin_recent_option_fills(20).await?
         })));
@@ -728,11 +777,13 @@ async fn admin_options_summary(
     let fills = store.list_fills(&OptionFillFilter::default());
     let option_rfqs = store.list_option_rfqs();
     let option_rfq_fills = store.list_option_rfq_fills();
+    let option_execution_intents = store.list_option_execution_intents();
     let mut series_status_counts = BTreeMap::new();
     let mut order_status_counts = BTreeMap::new();
     let mut option_rfq_status_counts = BTreeMap::new();
     let mut option_rfq_quote_status_counts = BTreeMap::new();
     let mut option_rfq_quote_signature_status_counts = BTreeMap::new();
+    let mut option_execution_intent_status_counts = BTreeMap::new();
     for item in &series {
         bump_count(
             &mut series_status_counts,
@@ -758,10 +809,17 @@ async fn admin_options_summary(
             );
         }
     }
+    for intent in &option_execution_intents {
+        bump_count(
+            &mut option_execution_intent_status_counts,
+            intent.status.as_str(),
+        );
+    }
     Ok(Json(serde_json::json!({
         "persistence_enabled": false,
         "enabled": state.options_config.enabled,
         "option_rfq_enabled": state.options_config.rfq_enabled,
+        "option_execution_enabled": state.options_config.execution_enabled,
         "series_status_counts": series_status_counts,
         "order_status_counts": order_status_counts,
         "option_fills_count": fills.len(),
@@ -770,6 +828,11 @@ async fn admin_options_summary(
         "option_rfq_quote_signature_status_counts": option_rfq_quote_signature_status_counts,
         "verified_option_rfq_quotes": count_from_map(&option_rfq_quote_signature_status_counts, "verified"),
         "option_rfq_fills_count": option_rfq_fills.len(),
+        "option_execution_intent_status_counts": option_execution_intent_status_counts,
+        "option_execution_intents_count": option_execution_intents.len(),
+        "option_execution_calldata_ready": count_from_map(&option_execution_intent_status_counts, "calldata_ready"),
+        "option_execution_pending_signatures": count_from_map(&option_execution_intent_status_counts, "signatures_required"),
+        "recent_option_execution_intents": option_execution_intents.iter().rev().take(20).map(compact_option_execution_intent).collect::<Vec<_>>(),
         "recent_option_rfq_fills": option_rfq_fills.iter().rev().take(20).map(compact_option_rfq_fill).collect::<Vec<_>>(),
         "recent_option_order_fills": fills.iter().rev().take(20).map(compact_option_fill).collect::<Vec<_>>()
     })))
@@ -861,7 +924,8 @@ async fn admin_recent(
             "rfqs": repository.admin_recent_rfqs(limit).await?,
             "option_rfqs": repository.admin_recent_option_rfqs(limit).await?,
             "option_fills": repository.admin_recent_option_fills(limit).await?,
-            "option_rfq_fills": repository.admin_recent_option_rfq_fills(limit).await?
+            "option_rfq_fills": repository.admin_recent_option_rfq_fills(limit).await?,
+            "option_execution_intents": repository.admin_recent_option_execution_intents(limit).await?
         })));
     }
 
@@ -880,7 +944,7 @@ async fn admin_recent(
         let store = state.rfq_store.lock().map_err(|_| ApiError::internal())?;
         store.list_rfqs()
     };
-    let (option_rfqs, option_fills, option_rfq_fills) = {
+    let (option_rfqs, option_fills, option_rfq_fills, option_execution_intents) = {
         let store = state
             .options_store
             .lock()
@@ -889,6 +953,7 @@ async fn admin_recent(
             store.list_option_rfqs(),
             store.list_fills(&OptionFillFilter::default()),
             store.list_option_rfq_fills(),
+            store.list_option_execution_intents(),
         )
     };
     Ok(Json(serde_json::json!({
@@ -899,7 +964,8 @@ async fn admin_recent(
         "rfqs": rfqs.iter().rev().take(limit as usize).map(compact_rfq).collect::<Vec<_>>(),
         "option_rfqs": option_rfqs.iter().rev().take(limit as usize).map(compact_option_rfq).collect::<Vec<_>>(),
         "option_fills": option_fills.iter().rev().take(limit as usize).map(compact_option_fill).collect::<Vec<_>>(),
-        "option_rfq_fills": option_rfq_fills.iter().rev().take(limit as usize).map(compact_option_rfq_fill).collect::<Vec<_>>()
+        "option_rfq_fills": option_rfq_fills.iter().rev().take(limit as usize).map(compact_option_rfq_fill).collect::<Vec<_>>(),
+        "option_execution_intents": option_execution_intents.iter().rev().take(limit as usize).map(compact_option_execution_intent).collect::<Vec<_>>()
     })))
 }
 
@@ -1050,6 +1116,25 @@ fn compact_option_rfq_fill(fill: &OptionRfqFill) -> serde_json::Value {
         "price_1e8": fill.price_1e8.to_string(),
         "size_1e8": fill.size_1e8.to_string(),
         "created_at_ms": fill.created_at_ms
+    })
+}
+
+fn compact_option_execution_intent(intent: &OptionExecutionIntent) -> serde_json::Value {
+    serde_json::json!({
+        "intent_id": intent.intent_id,
+        "onchain_intent_id": intent.onchain_intent_id,
+        "source_type": intent.source_type.as_str(),
+        "source_id": intent.source_id,
+        "option_series_id": intent.option_series_id,
+        "onchain_option_id": intent.onchain_option_id,
+        "buyer": intent.buyer,
+        "seller": intent.seller,
+        "quantity_contracts": intent.quantity_contracts.to_string(),
+        "premium_per_contract_native": intent.premium_per_contract_native.to_string(),
+        "buyer_is_maker": intent.buyer_is_maker,
+        "status": intent.status,
+        "calldata_ready": intent.calldata.is_some(),
+        "created_at_ms": intent.created_at_ms
     })
 }
 
@@ -1440,6 +1525,143 @@ impl From<OptionFill> for OptionFillResponse {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct OptionExecutionIntentResponse {
+    intent_id: String,
+    onchain_intent_id: String,
+    source_type: String,
+    source_id: String,
+    option_series_id: String,
+    onchain_option_id: String,
+    buyer: AccountId,
+    seller: AccountId,
+    underlying: AccountId,
+    settlement_asset: AccountId,
+    expiry: u64,
+    strike_1e8: String,
+    is_call: bool,
+    contract_size_1e8: String,
+    quantity_contracts: String,
+    source_size_1e8: String,
+    source_price_1e8: String,
+    premium_per_contract_native: String,
+    buyer_is_maker: bool,
+    buyer_nonce: Option<String>,
+    seller_nonce: Option<String>,
+    deadline: String,
+    buyer_signature_present: bool,
+    seller_signature_present: bool,
+    calldata_ready: bool,
+    status: OptionExecutionIntentStatus,
+    error: Option<String>,
+    created_at_ms: i64,
+    updated_at_ms: i64,
+}
+
+impl From<OptionExecutionIntent> for OptionExecutionIntentResponse {
+    fn from(intent: OptionExecutionIntent) -> Self {
+        Self {
+            intent_id: intent.intent_id.to_string(),
+            onchain_intent_id: intent.onchain_intent_id,
+            source_type: intent.source_type.as_str().to_string(),
+            source_id: intent.source_id,
+            option_series_id: intent.option_series_id,
+            onchain_option_id: intent.onchain_option_id,
+            buyer: intent.buyer,
+            seller: intent.seller,
+            underlying: intent.underlying,
+            settlement_asset: intent.settlement_asset,
+            expiry: intent.expiry,
+            strike_1e8: intent.strike_1e8.to_string(),
+            is_call: intent.is_call,
+            contract_size_1e8: intent.contract_size_1e8.to_string(),
+            quantity_contracts: intent.quantity_contracts.to_string(),
+            source_size_1e8: intent.source_size_1e8.to_string(),
+            source_price_1e8: intent.source_price_1e8.to_string(),
+            premium_per_contract_native: intent.premium_per_contract_native.to_string(),
+            buyer_is_maker: intent.buyer_is_maker,
+            buyer_nonce: intent.buyer_nonce.map(|value| value.to_string()),
+            seller_nonce: intent.seller_nonce.map(|value| value.to_string()),
+            deadline: intent.deadline.to_string(),
+            buyer_signature_present: intent.buyer_signature.is_some(),
+            seller_signature_present: intent.seller_signature.is_some(),
+            calldata_ready: intent.calldata.is_some(),
+            status: intent.status,
+            error: intent.error,
+            created_at_ms: intent.created_at_ms,
+            updated_at_ms: intent.updated_at_ms,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct OptionExecutionSigningPayloadResponse {
+    intent_id: String,
+    onchain_intent_id: String,
+    digest: String,
+    domain: SigningPayloadDomain,
+    #[serde(rename = "primaryType")]
+    primary_type: &'static str,
+    types: Vec<SigningPayloadTypeField>,
+    message: OptionExecutionSigningPayloadMessage,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct OptionExecutionSigningPayloadMessage {
+    #[serde(rename = "intentId")]
+    intent_id: String,
+    buyer: String,
+    seller: String,
+    #[serde(rename = "optionId")]
+    option_id: String,
+    underlying: String,
+    #[serde(rename = "settlementAsset")]
+    settlement_asset: String,
+    expiry: String,
+    #[serde(rename = "strike1e8")]
+    strike_1e8: String,
+    #[serde(rename = "isCall")]
+    is_call: bool,
+    #[serde(rename = "contractSize1e8")]
+    contract_size_1e8: String,
+    quantity: String,
+    #[serde(rename = "premiumPerContract")]
+    premium_per_contract: String,
+    #[serde(rename = "buyerIsMaker")]
+    buyer_is_maker: bool,
+    #[serde(rename = "buyerNonce")]
+    buyer_nonce: String,
+    #[serde(rename = "sellerNonce")]
+    seller_nonce: String,
+    deadline: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+struct SubmitOptionExecutionSignaturesRequest {
+    buyer_signature: Option<String>,
+    seller_signature: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct SubmitOptionExecutionSignaturesResponse {
+    intent_id: String,
+    status: OptionExecutionIntentStatus,
+    buyer_signature_present: bool,
+    seller_signature_present: bool,
+    calldata_ready: bool,
+    missing_signatures: bool,
+    calldata: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct OptionExecutionCalldataResponse {
+    intent_id: String,
+    status: OptionExecutionIntentStatus,
+    calldata: Option<String>,
+    calldata_ready: bool,
+    missing_signatures: bool,
+}
+
 impl From<OptionSeries> for OptionSeriesResponse {
     fn from(series: OptionSeries) -> Self {
         Self {
@@ -1655,6 +1877,11 @@ fn parse_option_rfq_quote_id(quote_id: &str) -> BackendResult<OptionRfqQuoteId> 
     OptionRfqQuoteId::from_str(quote_id).map_err(|_| BackendError::InvalidOptionRfqQuoteId)
 }
 
+fn parse_option_execution_intent_id(intent_id: &str) -> BackendResult<OptionExecutionIntentId> {
+    OptionExecutionIntentId::from_str(intent_id)
+        .map_err(|_| BackendError::InvalidOptionExecutionIntentId)
+}
+
 async fn list_option_fills(
     State(state): State<AppState>,
     Query(query): Query<ListOptionFillsQuery>,
@@ -1707,6 +1934,112 @@ async fn cancel_option_order(
     Ok(Json(
         cancel_option_order_service(&state, order_id).await?.into(),
     ))
+}
+
+async fn list_option_execution_intents(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<OptionExecutionIntentResponse>>, ApiError> {
+    let intents = list_option_execution_intents_service(&state).await?;
+    Ok(Json(
+        intents
+            .into_iter()
+            .map(OptionExecutionIntentResponse::from)
+            .collect(),
+    ))
+}
+
+async fn get_option_execution_intent(
+    State(state): State<AppState>,
+    Path(intent_id): Path<String>,
+) -> Result<Json<OptionExecutionIntentResponse>, ApiError> {
+    Ok(Json(
+        get_option_execution_intent_service(&state, parse_option_execution_intent_id(&intent_id)?)
+            .await?
+            .into(),
+    ))
+}
+
+async fn option_execution_signing_payload(
+    State(state): State<AppState>,
+    Path(intent_id): Path<String>,
+) -> Result<Json<OptionExecutionSigningPayloadResponse>, ApiError> {
+    let intent_id = parse_option_execution_intent_id(&intent_id)?;
+    let outcome = option_execution_signing_payload_service(&state, intent_id).await?;
+    let domain = state.options_config.execution_eip712_domain.clone();
+    Ok(Json(OptionExecutionSigningPayloadResponse {
+        intent_id: outcome.intent.intent_id.to_string(),
+        onchain_intent_id: option_execution_intent_id_to_hex_bytes32(
+            &outcome.intent.intent_id.to_string(),
+        )?,
+        digest: outcome.digest,
+        domain: SigningPayloadDomain {
+            name: domain.name,
+            version: domain.version,
+            chain_id: domain.chain_id,
+            verifying_contract: domain.verifying_contract.0,
+        },
+        primary_type: "OptionTrade",
+        types: option_trade_type_fields(),
+        message: OptionExecutionSigningPayloadMessage {
+            intent_id: outcome.intent.onchain_intent_id,
+            buyer: outcome.payload.buyer.0,
+            seller: outcome.payload.seller.0,
+            option_id: outcome.intent.onchain_option_id,
+            underlying: outcome.payload.underlying.0,
+            settlement_asset: outcome.payload.settlement_asset.0,
+            expiry: outcome.payload.expiry.to_string(),
+            strike_1e8: outcome.payload.strike_1e8.to_string(),
+            is_call: outcome.payload.is_call,
+            contract_size_1e8: outcome.payload.contract_size_1e8.to_string(),
+            quantity: outcome.payload.quantity.to_string(),
+            premium_per_contract: outcome.payload.premium_per_contract.to_string(),
+            buyer_is_maker: outcome.payload.buyer_is_maker,
+            buyer_nonce: outcome.payload.buyer_nonce.to_string(),
+            seller_nonce: outcome.payload.seller_nonce.to_string(),
+            deadline: outcome.payload.deadline.to_string(),
+        },
+    }))
+}
+
+async fn submit_option_execution_signatures(
+    State(state): State<AppState>,
+    Path(intent_id): Path<String>,
+    Json(request): Json<SubmitOptionExecutionSignaturesRequest>,
+) -> Result<Json<SubmitOptionExecutionSignaturesResponse>, ApiError> {
+    let intent_id = parse_option_execution_intent_id(&intent_id)?;
+    let outcome = submit_option_execution_signatures_service(
+        &state,
+        intent_id,
+        SubmitOptionExecutionSignaturesInput {
+            buyer_signature: request.buyer_signature,
+            seller_signature: request.seller_signature,
+        },
+    )
+    .await?;
+    Ok(Json(SubmitOptionExecutionSignaturesResponse {
+        intent_id: outcome.intent.intent_id.to_string(),
+        status: outcome.intent.status,
+        buyer_signature_present: outcome.buyer_signature_present,
+        seller_signature_present: outcome.seller_signature_present,
+        calldata_ready: outcome.calldata_ready,
+        missing_signatures: outcome.missing_signatures,
+        calldata: outcome.intent.calldata,
+    }))
+}
+
+async fn option_execution_calldata(
+    State(state): State<AppState>,
+    Path(intent_id): Path<String>,
+) -> Result<Json<OptionExecutionCalldataResponse>, ApiError> {
+    let intent_id = parse_option_execution_intent_id(&intent_id)?;
+    let outcome = option_execution_calldata_service(&state, intent_id).await?;
+    Ok(Json(OptionExecutionCalldataResponse {
+        intent_id: outcome.intent.intent_id.to_string(),
+        status: outcome.intent.status,
+        calldata: outcome.calldata,
+        calldata_ready: outcome.calldata_ready,
+        missing_signatures: outcome.missing_signatures,
+    }))
 }
 
 async fn create_option_rfq(
@@ -3404,6 +3737,76 @@ fn option_rfq_quote_type_fields() -> Vec<SigningPayloadTypeField> {
     ]
 }
 
+fn option_trade_type_fields() -> Vec<SigningPayloadTypeField> {
+    let _ = OPTION_TRADE_TYPE;
+    vec![
+        SigningPayloadTypeField {
+            name: "intentId",
+            type_name: "bytes32",
+        },
+        SigningPayloadTypeField {
+            name: "buyer",
+            type_name: "address",
+        },
+        SigningPayloadTypeField {
+            name: "seller",
+            type_name: "address",
+        },
+        SigningPayloadTypeField {
+            name: "optionId",
+            type_name: "uint256",
+        },
+        SigningPayloadTypeField {
+            name: "underlying",
+            type_name: "address",
+        },
+        SigningPayloadTypeField {
+            name: "settlementAsset",
+            type_name: "address",
+        },
+        SigningPayloadTypeField {
+            name: "expiry",
+            type_name: "uint64",
+        },
+        SigningPayloadTypeField {
+            name: "strike1e8",
+            type_name: "uint64",
+        },
+        SigningPayloadTypeField {
+            name: "isCall",
+            type_name: "bool",
+        },
+        SigningPayloadTypeField {
+            name: "contractSize1e8",
+            type_name: "uint128",
+        },
+        SigningPayloadTypeField {
+            name: "quantity",
+            type_name: "uint128",
+        },
+        SigningPayloadTypeField {
+            name: "premiumPerContract",
+            type_name: "uint128",
+        },
+        SigningPayloadTypeField {
+            name: "buyerIsMaker",
+            type_name: "bool",
+        },
+        SigningPayloadTypeField {
+            name: "buyerNonce",
+            type_name: "uint256",
+        },
+        SigningPayloadTypeField {
+            name: "sellerNonce",
+            type_name: "uint256",
+        },
+        SigningPayloadTypeField {
+            name: "deadline",
+            type_name: "uint256",
+        },
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4076,6 +4479,7 @@ impl From<BackendError> for ApiError {
             BackendError::InvalidOptionSeriesId(_) => StatusCode::NOT_FOUND,
             BackendError::InvalidOptionOrderId => StatusCode::NOT_FOUND,
             BackendError::InvalidOptionFillId => StatusCode::NOT_FOUND,
+            BackendError::InvalidOptionExecutionIntentId => StatusCode::NOT_FOUND,
             BackendError::InvalidOptionRfqId | BackendError::InvalidOptionRfqQuoteId => {
                 StatusCode::NOT_FOUND
             }
@@ -4092,6 +4496,7 @@ impl From<BackendError> for ApiError {
             | BackendError::OptionRfqDisabled
             | BackendError::InvalidOptionSeriesState(_)
             | BackendError::InvalidOptionOrderState(_)
+            | BackendError::InvalidOptionExecutionIntentState(_)
             | BackendError::InvalidOptionRfqState(_)
             | BackendError::InvalidOptionRfqQuoteState(_)
             | BackendError::PerpNonceSyncDisabled

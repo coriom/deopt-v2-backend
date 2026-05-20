@@ -7,14 +7,18 @@ use deopt_v2_backend::mm::{MmAccountPermissions, MmPermissionsConfig};
 use deopt_v2_backend::options::service::{
     accept_option_rfq_quote, cancel_option_order, cancel_option_rfq, create_option_rfq,
     create_option_series, disable_option_series, get_option_fill, get_option_order,
-    get_option_order_fills, get_option_orderbook, get_option_series, list_option_fills,
-    list_option_orders, list_option_rfq_quotes, list_option_rfqs, list_option_series,
-    option_rfq_quote_signing_payload, submit_option_order, submit_option_rfq_quote,
-    CreateOptionRfqInput, CreateOptionSeriesInput, OptionRfqQuoteSigningPayloadInput,
+    get_option_order_fills, get_option_orderbook, get_option_series, list_option_execution_intents,
+    list_option_fills, list_option_orders, list_option_rfq_quotes, list_option_rfqs,
+    list_option_series, option_execution_calldata, option_execution_signing_payload,
+    option_rfq_quote_signing_payload, submit_option_execution_signatures, submit_option_order,
+    submit_option_rfq_quote, CreateOptionRfqInput, CreateOptionSeriesInput,
+    OptionRfqQuoteSigningPayloadInput, SubmitOptionExecutionSignaturesInput,
     SubmitOptionOrderInput, SubmitOptionRfqQuoteInput,
 };
 use deopt_v2_backend::options::{
-    option_rfq_id_to_b256, option_rfq_quote_digest, option_series_id, option_series_id_to_b256,
+    expected_option_execute_trade_selector, option_execute_trade_selector, option_rfq_id_to_b256,
+    option_rfq_quote_digest, option_series_id, option_series_id_to_b256,
+    OptionExecutionIntentStatus, OptionExecutionSignatureMode, OptionExecutionSourceType,
     OptionFillFilter, OptionOrderFilter, OptionOrderStatus, OptionRfqQuote,
     OptionRfqQuoteSignatureMode, OptionRfqQuoteSignatureStatus, OptionRfqQuoteSigningPayload,
     OptionRfqQuoteStatus, OptionRfqStatus, OptionSeriesFilter, OptionSeriesIdInput,
@@ -59,6 +63,35 @@ fn strict_option_rfq_state() -> AppState {
     AppState::with_options_config(EngineState::with_default_markets(), config)
 }
 
+fn option_execution_state() -> AppState {
+    let mut config = OptionsConfig::enabled_in_memory_for_tests();
+    config.execution_enabled = true;
+    config.execution_require_persistence = false;
+    config.matching_engine_address = AccountId::new("0x00000000000000000000000000000000000000ee");
+    config.execution_eip712_domain.verifying_contract = config.matching_engine_address.clone();
+    AppState::with_options_config(EngineState::with_default_markets(), config)
+}
+
+fn option_execution_rfq_state() -> AppState {
+    let mut config = OptionsConfig::enabled_in_memory_for_tests();
+    config.rfq_enabled = true;
+    config.execution_enabled = true;
+    config.execution_require_persistence = false;
+    config.matching_engine_address = AccountId::new("0x00000000000000000000000000000000000000ee");
+    config.execution_eip712_domain.verifying_contract = config.matching_engine_address.clone();
+    AppState::with_options_config(EngineState::with_default_markets(), config)
+}
+
+fn strict_option_execution_state() -> AppState {
+    let mut config = OptionsConfig::enabled_in_memory_for_tests();
+    config.execution_enabled = true;
+    config.execution_require_persistence = false;
+    config.execution_signature_mode = OptionExecutionSignatureMode::Strict;
+    config.matching_engine_address = AccountId::new("0x00000000000000000000000000000000000000ee");
+    config.execution_eip712_domain.verifying_contract = config.matching_engine_address.clone();
+    AppState::with_options_config(EngineState::with_default_markets(), config)
+}
+
 fn future_expiry() -> u64 {
     u64::try_from(now_ms() / 1000).unwrap() + 86_400
 }
@@ -78,6 +111,21 @@ fn create_input() -> CreateOptionSeriesInput {
     }
 }
 
+fn onchain_create_input() -> CreateOptionSeriesInput {
+    CreateOptionSeriesInput {
+        underlying: "0x0000000000000000000000000000000000000010".to_string(),
+        base_asset: "ETH".to_string(),
+        quote_asset: "USDC".to_string(),
+        settlement_asset: "0x0000000000000000000000000000000000000020".to_string(),
+        expiry: future_expiry(),
+        strike_1e8: 300_000_000_000,
+        is_call: true,
+        contract_size_1e8: Some(100_000_000),
+        onchain_product_id: None,
+        onchain_series_id: Some("123".to_string()),
+    }
+}
+
 fn account() -> AccountId {
     AccountId::new("0x0000000000000000000000000000000000000001")
 }
@@ -90,8 +138,21 @@ fn signing_account() -> AccountId {
     AccountId::new(test_account())
 }
 
+fn other_signing_account() -> AccountId {
+    let verifying_key = other_signing_key().verifying_key().to_encoded_point(false);
+    let hash = Keccak256::digest(&verifying_key.as_bytes()[1..]);
+    AccountId::new(format!("0x{}", hex_encode(&hash[12..])))
+}
+
 async fn active_series_id(state: &AppState) -> String {
     create_option_series(state, create_input())
+        .await
+        .unwrap()
+        .option_series_id
+}
+
+async fn active_onchain_series_id(state: &AppState) -> String {
+    create_option_series(state, onchain_create_input())
         .await
         .unwrap()
         .option_series_id
@@ -928,12 +989,387 @@ async fn option_match_does_not_create_execution_intent_or_transaction() {
         .unwrap();
 
     assert_eq!(state.engine.lock().unwrap().execution_intents().len(), 0);
+    assert!(list_option_execution_intents(&state)
+        .await
+        .unwrap()
+        .is_empty());
     let response = router(state)
         .oneshot(get_request("/executor/transactions"))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response_json(response).await.as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn option_orderbook_fill_creates_execution_intent_when_enabled() {
+    let state = option_execution_state();
+    let option_series_id = active_onchain_series_id(&state).await;
+    let mut ask = order_input(option_series_id.clone(), Side::Sell, "exec-maker-ask");
+    ask.account = account_two();
+    ask.price_1e8 = 950_000_000;
+    submit_option_order(&state, ask).await.unwrap();
+    let mut buy = order_input(option_series_id, Side::Buy, "exec-taker-buy");
+    buy.price_1e8 = 1_000_000_000;
+
+    let outcome = submit_option_order(&state, buy).await.unwrap();
+    let intents = list_option_execution_intents(&state).await.unwrap();
+
+    assert_eq!(outcome.fills.len(), 1);
+    assert_eq!(intents.len(), 1);
+    let intent = &intents[0];
+    assert_eq!(
+        intent.source_type,
+        OptionExecutionSourceType::OptionOrderbookFill
+    );
+    assert_eq!(intent.source_id, outcome.fills[0].fill_id.to_string());
+    assert_eq!(intent.onchain_option_id, "123");
+    assert_eq!(intent.buyer, account());
+    assert_eq!(intent.seller, account_two());
+    assert_eq!(intent.quantity_contracts, 1);
+    assert_eq!(intent.source_size_1e8, 100_000_000);
+    assert_eq!(intent.source_price_1e8, 950_000_000);
+    assert_eq!(intent.premium_per_contract_native, 9_500_000);
+    assert!(!intent.buyer_is_maker);
+    assert_eq!(
+        intent.status,
+        OptionExecutionIntentStatus::SignaturesRequired
+    );
+    assert!(intent.buyer_signature.is_none());
+    assert!(intent.seller_signature.is_none());
+    assert!(intent.calldata.is_none());
+    assert_eq!(state.engine.lock().unwrap().execution_intents().len(), 0);
+}
+
+#[tokio::test]
+async fn option_orderbook_sell_crossing_bid_marks_buyer_as_maker() {
+    let state = option_execution_state();
+    let option_series_id = active_onchain_series_id(&state).await;
+    let mut bid = order_input(option_series_id.clone(), Side::Buy, "exec-maker-bid");
+    bid.account = account_two();
+    bid.price_1e8 = 1_050_000_000;
+    submit_option_order(&state, bid).await.unwrap();
+    let mut sell = order_input(option_series_id, Side::Sell, "exec-taker-sell");
+    sell.price_1e8 = 1_000_000_000;
+
+    submit_option_order(&state, sell).await.unwrap();
+    let intents = list_option_execution_intents(&state).await.unwrap();
+
+    assert_eq!(intents.len(), 1);
+    assert_eq!(intents[0].buyer, account_two());
+    assert_eq!(intents[0].seller, account());
+    assert!(intents[0].buyer_is_maker);
+}
+
+#[tokio::test]
+async fn option_rfq_fill_creates_execution_intent_when_enabled() {
+    let state = option_execution_rfq_state();
+    let option_series_id = active_onchain_series_id(&state).await;
+    let rfq = create_option_rfq(&state, option_rfq_input(option_series_id, Side::Buy))
+        .await
+        .unwrap();
+    let quote = submit_option_rfq_quote(
+        &state,
+        rfq.option_rfq_id,
+        option_rfq_quote_input(account_two(), "exec-rfq-quote"),
+    )
+    .await
+    .unwrap();
+
+    let outcome = accept_option_rfq_quote(&state, rfq.option_rfq_id, quote.quote_id)
+        .await
+        .unwrap();
+    let intents = list_option_execution_intents(&state).await.unwrap();
+
+    assert_eq!(intents.len(), 1);
+    let intent = &intents[0];
+    assert_eq!(intent.source_type, OptionExecutionSourceType::OptionRfqFill);
+    assert_eq!(intent.source_id, outcome.fill.fill_id.to_string());
+    assert_eq!(intent.buyer, account());
+    assert_eq!(intent.seller, account_two());
+    assert_eq!(intent.quantity_contracts, 1);
+    assert_eq!(intent.premium_per_contract_native, 10_000_000);
+    assert!(!intent.buyer_is_maker);
+}
+
+#[tokio::test]
+async fn option_execution_requires_onchain_option_id_for_matching_fill() {
+    let state = option_execution_state();
+    let mut input = onchain_create_input();
+    input.onchain_series_id = None;
+    input.onchain_product_id = None;
+    let option_series_id = create_option_series(&state, input)
+        .await
+        .unwrap()
+        .option_series_id;
+    let mut ask = order_input(option_series_id.clone(), Side::Sell, "exec-no-id-ask");
+    ask.account = account_two();
+    submit_option_order(&state, ask).await.unwrap();
+
+    let error = submit_option_order(
+        &state,
+        order_input(option_series_id, Side::Buy, "exec-no-id-buy"),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(error.to_string().contains("missing onchain_series_id"));
+    assert!(list_option_execution_intents(&state)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn option_execution_requires_whole_contract_fills() {
+    let state = option_execution_state();
+    let option_series_id = active_onchain_series_id(&state).await;
+    let mut ask = order_input(option_series_id.clone(), Side::Sell, "exec-fractional-ask");
+    ask.account = account_two();
+    ask.size_1e8 = 50_000_000;
+    submit_option_order(&state, ask).await.unwrap();
+    let mut buy = order_input(option_series_id, Side::Buy, "exec-fractional-buy");
+    buy.size_1e8 = 50_000_000;
+
+    let error = submit_option_order(&state, buy).await.unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("whole number of option contracts"));
+    assert!(list_option_execution_intents(&state)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn option_execution_rejects_zero_native_premium_conversion() {
+    let state = option_execution_state();
+    let option_series_id = active_onchain_series_id(&state).await;
+    let mut ask = order_input(
+        option_series_id.clone(),
+        Side::Sell,
+        "exec-tiny-premium-ask",
+    );
+    ask.account = account_two();
+    ask.price_1e8 = 1;
+    submit_option_order(&state, ask).await.unwrap();
+    let mut buy = order_input(option_series_id, Side::Buy, "exec-tiny-premium-buy");
+    buy.price_1e8 = 1;
+
+    let error = submit_option_order(&state, buy).await.unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("premium_per_contract_native is zero"));
+    assert!(list_option_execution_intents(&state)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn option_execution_signing_payload_endpoint_matches_option_trade_shape() {
+    let state = option_execution_state();
+    let option_series_id = active_onchain_series_id(&state).await;
+    let mut ask = order_input(option_series_id, Side::Sell, "exec-payload-ask");
+    ask.account = account_two();
+    let option_series_id = ask.option_series_id.clone();
+    submit_option_order(&state, ask).await.unwrap();
+    submit_option_order(
+        &state,
+        order_input(option_series_id, Side::Buy, "exec-payload-buy"),
+    )
+    .await
+    .unwrap();
+    let intent = list_option_execution_intents(&state)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let app = router(state);
+    let listed = app
+        .clone()
+        .oneshot(get_request("/options/execution-intents"))
+        .await
+        .unwrap();
+    assert_eq!(listed.status(), StatusCode::OK);
+    assert_eq!(response_json(listed).await.as_array().unwrap().len(), 1);
+
+    let fetched = app
+        .clone()
+        .oneshot(get_request(&format!(
+            "/options/execution-intents/{}",
+            intent.intent_id
+        )))
+        .await
+        .unwrap();
+    assert_eq!(fetched.status(), StatusCode::OK);
+    assert_eq!(response_json(fetched).await["onchain_option_id"], "123");
+
+    let response = app
+        .oneshot(get_request(&format!(
+            "/options/execution-intents/{}/signing-payload",
+            intent.intent_id
+        )))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = response_json(response).await;
+    assert_eq!(json["primaryType"], "OptionTrade");
+    assert_eq!(json["message"]["intentId"], intent.onchain_intent_id);
+    assert_eq!(json["message"]["buyer"], account().0);
+    assert_eq!(json["message"]["seller"], account_two().0);
+    assert_eq!(json["message"]["optionId"], "123");
+    assert_eq!(json["message"]["quantity"], "1");
+    assert_eq!(json["message"]["premiumPerContract"], "10000000");
+    assert_eq!(json["message"]["buyerNonce"], "0");
+    assert_eq!(json["message"]["sellerNonce"], "0");
+    assert_eq!(json["domain"]["name"], "DeOptV2-OptionMatchingEngine");
+    assert!(json["digest"].as_str().unwrap().starts_with("0x"));
+    assert_eq!(json["types"].as_array().unwrap()[0]["name"], "intentId");
+}
+
+#[tokio::test]
+async fn option_execution_signature_submission_builds_calldata_without_transaction() {
+    let state = option_execution_state();
+    let option_series_id = active_onchain_series_id(&state).await;
+    let mut ask = order_input(option_series_id, Side::Sell, "exec-calldata-ask");
+    ask.account = account_two();
+    submit_option_order(&state, ask.clone()).await.unwrap();
+    submit_option_order(
+        &state,
+        order_input(ask.option_series_id, Side::Buy, "exec-calldata-buy"),
+    )
+    .await
+    .unwrap();
+    let intent = list_option_execution_intents(&state)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+
+    let app = router(state.clone());
+    let response = app
+        .oneshot(json_post(
+            &format!("/options/execution-intents/{}/signatures", intent.intent_id),
+            json!({
+                "buyer_signature": valid_signature_hex(0xaa),
+                "seller_signature": valid_signature_hex(0xbb)
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = response_json(response).await;
+    assert_eq!(response["status"], "calldata_ready");
+    assert!(response["calldata_ready"].as_bool().unwrap());
+
+    let updated = list_option_execution_intents(&state)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let calldata = option_execution_calldata(&state, intent.intent_id)
+        .await
+        .unwrap();
+    let selector = format!("0x{}", hex_encode(&option_execute_trade_selector()));
+
+    assert_eq!(
+        option_execute_trade_selector(),
+        expected_option_execute_trade_selector()
+    );
+    assert_eq!(updated.status, OptionExecutionIntentStatus::CalldataReady);
+    assert!(updated.calldata.is_some());
+    assert!(calldata.calldata_ready);
+    assert!(calldata.calldata.unwrap().starts_with(&selector));
+    assert_eq!(state.engine.lock().unwrap().execution_intents().len(), 0);
+    let response = router(state)
+        .oneshot(get_request("/executor/transactions"))
+        .await
+        .unwrap();
+    assert_eq!(response_json(response).await.as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn strict_option_execution_signature_submission_recovers_buyer_and_seller() {
+    let state = strict_option_execution_state();
+    let option_series_id = active_onchain_series_id(&state).await;
+    let mut ask = order_input(option_series_id, Side::Sell, "strict-exec-ask");
+    ask.account = other_signing_account();
+    submit_option_order(&state, ask.clone()).await.unwrap();
+    let mut buy = order_input(ask.option_series_id, Side::Buy, "strict-exec-buy");
+    buy.account = signing_account();
+    submit_option_order(&state, buy).await.unwrap();
+    let intent = list_option_execution_intents(&state)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let payload = option_execution_signing_payload(&state, intent.intent_id)
+        .await
+        .unwrap();
+
+    let outcome = submit_option_execution_signatures(
+        &state,
+        intent.intent_id,
+        SubmitOptionExecutionSignaturesInput {
+            buyer_signature: Some(sign_option_quote_digest(
+                &payload.digest,
+                test_signing_key(),
+            )),
+            seller_signature: Some(sign_option_quote_digest(
+                &payload.digest,
+                other_signing_key(),
+            )),
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        outcome.intent.status,
+        OptionExecutionIntentStatus::CalldataReady
+    );
+    assert!(outcome.calldata_ready);
+    assert!(outcome.intent.calldata.is_some());
+}
+
+#[tokio::test]
+async fn strict_option_execution_rejects_signer_mismatch() {
+    let state = strict_option_execution_state();
+    let option_series_id = active_onchain_series_id(&state).await;
+    let mut ask = order_input(option_series_id, Side::Sell, "strict-mismatch-ask");
+    ask.account = other_signing_account();
+    submit_option_order(&state, ask.clone()).await.unwrap();
+    let mut buy = order_input(ask.option_series_id, Side::Buy, "strict-mismatch-buy");
+    buy.account = signing_account();
+    submit_option_order(&state, buy).await.unwrap();
+    let intent = list_option_execution_intents(&state)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let payload = option_execution_signing_payload(&state, intent.intent_id)
+        .await
+        .unwrap();
+
+    let error = submit_option_execution_signatures(
+        &state,
+        intent.intent_id,
+        SubmitOptionExecutionSignaturesInput {
+            buyer_signature: Some(sign_option_quote_digest(
+                &payload.digest,
+                other_signing_key(),
+            )),
+            seller_signature: None,
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert!(error.to_string().contains("signer does not match"));
 }
 
 #[tokio::test]

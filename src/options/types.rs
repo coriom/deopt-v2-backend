@@ -11,6 +11,7 @@ pub type OptionFillId = Uuid;
 pub type OptionRfqId = Uuid;
 pub type OptionRfqQuoteId = Uuid;
 pub type OptionRfqFillId = Uuid;
+pub type OptionExecutionIntentId = Uuid;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OptionsConfig {
@@ -28,6 +29,12 @@ pub struct OptionsConfig {
     pub rfq_max_quotes_per_rfq: usize,
     pub rfq_quote_signature_mode: OptionRfqQuoteSignatureMode,
     pub rfq_eip712_domain: Eip712Domain,
+    pub execution_enabled: bool,
+    pub execution_require_persistence: bool,
+    pub matching_engine_address: AccountId,
+    pub execution_signature_mode: OptionExecutionSignatureMode,
+    pub execution_eip712_domain: Eip712Domain,
+    pub execution_default_settlement_decimals: u32,
 }
 
 impl OptionsConfig {
@@ -52,6 +59,17 @@ impl OptionsConfig {
                 chain_id: 84532,
                 verifying_contract: AccountId::new("0x0000000000000000000000000000000000000000"),
             },
+            execution_enabled: false,
+            execution_require_persistence: true,
+            matching_engine_address: AccountId::new(""),
+            execution_signature_mode: OptionExecutionSignatureMode::Disabled,
+            execution_eip712_domain: Eip712Domain {
+                name: "DeOptV2-OptionMatchingEngine".to_string(),
+                version: "1".to_string(),
+                chain_id: 84532,
+                verifying_contract: AccountId::new(""),
+            },
+            execution_default_settlement_decimals: 6,
         }
     }
 
@@ -101,6 +119,44 @@ impl OptionsConfig {
                 "OPTION_RFQ_MAX_QUOTES_PER_RFQ must be nonzero".to_string(),
             ));
         }
+        if self.execution_enabled && !self.enabled {
+            return Err(BackendError::Config(
+                "Option execution requires OPTIONS_ENABLED=true".to_string(),
+            ));
+        }
+        if self.execution_enabled && self.execution_require_persistence && !persistence_enabled {
+            return Err(BackendError::Config(
+                "Option execution requires persistence enabled when OPTION_EXECUTION_REQUIRE_PERSISTENCE=true".to_string(),
+            ));
+        }
+        if self.execution_enabled {
+            crate::signing::eip712::parse_evm_address(&self.matching_engine_address)
+                .map_err(|_| {
+                    BackendError::Config(
+                        "OPTION_MATCHING_ENGINE_ADDRESS must be a valid address when OPTION_EXECUTION_ENABLED=true".to_string(),
+                    )
+                })?;
+            if self
+                .matching_engine_address
+                .0
+                .eq_ignore_ascii_case("0x0000000000000000000000000000000000000000")
+            {
+                return Err(BackendError::Config(
+                    "OPTION_MATCHING_ENGINE_ADDRESS must be nonzero when OPTION_EXECUTION_ENABLED=true"
+                        .to_string(),
+                ));
+            }
+            if self.execution_eip712_domain.verifying_contract.0 != self.matching_engine_address.0 {
+                return Err(BackendError::Config(
+                    "OPTION_EXECUTION_EIP712 verifying contract must match OPTION_MATCHING_ENGINE_ADDRESS".to_string(),
+                ));
+            }
+        }
+        if self.execution_default_settlement_decimals > 38 {
+            return Err(BackendError::Config(
+                "OPTION_EXECUTION_DEFAULT_SETTLEMENT_DECIMALS must be <= 38".to_string(),
+            ));
+        }
         Ok(())
     }
 }
@@ -125,6 +181,134 @@ impl FromStr for OptionRfqQuoteSignatureMode {
             ))),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OptionExecutionSignatureMode {
+    #[default]
+    Disabled,
+    Strict,
+}
+
+impl FromStr for OptionExecutionSignatureMode {
+    type Err = BackendError;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "disabled" => Ok(Self::Disabled),
+            "strict" => Ok(Self::Strict),
+            other => Err(BackendError::Config(format!(
+                "invalid OPTION_EXECUTION_SIGNATURE_MODE: {other}"
+            ))),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OptionExecutionSourceType {
+    OptionOrderbookFill,
+    OptionRfqFill,
+}
+
+impl OptionExecutionSourceType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OptionOrderbookFill => "option_orderbook_fill",
+            Self::OptionRfqFill => "option_rfq_fill",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "option_orderbook_fill" => Ok(Self::OptionOrderbookFill),
+            "option_rfq_fill" => Ok(Self::OptionRfqFill),
+            other => Err(BackendError::Persistence(format!(
+                "invalid option execution source type: {other}"
+            ))),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OptionExecutionIntentStatus {
+    Pending,
+    SignaturesRequired,
+    SignaturesReady,
+    CalldataReady,
+    SimulationReady,
+    SimulationOk,
+    SimulationFailed,
+    Cancelled,
+    Failed,
+}
+
+impl OptionExecutionIntentStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::SignaturesRequired => "signatures_required",
+            Self::SignaturesReady => "signatures_ready",
+            Self::CalldataReady => "calldata_ready",
+            Self::SimulationReady => "simulation_ready",
+            Self::SimulationOk => "simulation_ok",
+            Self::SimulationFailed => "simulation_failed",
+            Self::Cancelled => "cancelled",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "signatures_required" => Ok(Self::SignaturesRequired),
+            "signatures_ready" => Ok(Self::SignaturesReady),
+            "calldata_ready" => Ok(Self::CalldataReady),
+            "simulation_ready" => Ok(Self::SimulationReady),
+            "simulation_ok" => Ok(Self::SimulationOk),
+            "simulation_failed" => Ok(Self::SimulationFailed),
+            "cancelled" => Ok(Self::Cancelled),
+            "failed" => Ok(Self::Failed),
+            other => Err(BackendError::Persistence(format!(
+                "invalid option execution intent status: {other}"
+            ))),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OptionExecutionIntent {
+    pub intent_id: OptionExecutionIntentId,
+    pub onchain_intent_id: String,
+    pub source_type: OptionExecutionSourceType,
+    pub source_id: String,
+    pub option_series_id: OptionSeriesId,
+    pub onchain_option_id: String,
+    pub buyer: AccountId,
+    pub seller: AccountId,
+    pub underlying: AccountId,
+    pub settlement_asset: AccountId,
+    pub expiry: u64,
+    pub strike_1e8: Price1e8,
+    pub is_call: bool,
+    pub contract_size_1e8: Size1e8,
+    pub quantity_contracts: u128,
+    pub source_size_1e8: Size1e8,
+    pub source_price_1e8: Price1e8,
+    pub premium_per_contract_native: u128,
+    pub buyer_is_maker: bool,
+    pub buyer_nonce: Option<u128>,
+    pub seller_nonce: Option<u128>,
+    pub deadline: u64,
+    pub buyer_signature: Option<String>,
+    pub seller_signature: Option<String>,
+    pub calldata: Option<String>,
+    pub status: OptionExecutionIntentStatus,
+    pub error: Option<String>,
+    pub created_at_ms: TimestampMs,
+    pub updated_at_ms: TimestampMs,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

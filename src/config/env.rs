@@ -219,6 +219,8 @@ impl AppConfig {
                 )),
             },
         };
+        let option_matching_engine_address =
+            AccountId::new(get_env(&mut lookup, "OPTION_MATCHING_ENGINE_ADDRESS", ""));
         let options = OptionsConfig {
             enabled: parse_env(&mut lookup, "OPTIONS_ENABLED", "false")?,
             require_persistence: parse_env(&mut lookup, "OPTIONS_REQUIRE_PERSISTENCE", "true")?,
@@ -259,6 +261,33 @@ impl AppConfig {
                     "0x0000000000000000000000000000000000000000",
                 )),
             },
+            execution_enabled: parse_env(&mut lookup, "OPTION_EXECUTION_ENABLED", "false")?,
+            execution_require_persistence: parse_env(
+                &mut lookup,
+                "OPTION_EXECUTION_REQUIRE_PERSISTENCE",
+                "true",
+            )?,
+            matching_engine_address: option_matching_engine_address.clone(),
+            execution_signature_mode: parse_env(
+                &mut lookup,
+                "OPTION_EXECUTION_SIGNATURE_MODE",
+                "disabled",
+            )?,
+            execution_eip712_domain: Eip712Domain {
+                name: get_env(
+                    &mut lookup,
+                    "OPTION_EXECUTION_EIP712_NAME",
+                    "DeOptV2-OptionMatchingEngine",
+                ),
+                version: get_env(&mut lookup, "OPTION_EXECUTION_EIP712_VERSION", "1"),
+                chain_id: parse_env(&mut lookup, "OPTION_EXECUTION_CHAIN_ID", "84532")?,
+                verifying_contract: option_matching_engine_address,
+            },
+            execution_default_settlement_decimals: parse_env(
+                &mut lookup,
+                "OPTION_EXECUTION_DEFAULT_SETTLEMENT_DECIMALS",
+                "6",
+            )?,
         };
         let perp_nonce_sync = PerpNonceSyncConfig {
             enabled: parse_env(&mut lookup, "PERP_NONCE_SYNC_ENABLED", "false")?,
@@ -1134,6 +1163,20 @@ mod tests {
             crate::options::OptionRfqQuoteSignatureMode::Disabled
         );
         assert_eq!(config.options.rfq_eip712_domain.name, "DeOptV2OptionRFQ");
+        assert!(!config.options.execution_enabled);
+        assert!(config.options.execution_require_persistence);
+        assert_eq!(config.options.matching_engine_address.0, "");
+        assert_eq!(
+            config.options.execution_signature_mode,
+            crate::options::OptionExecutionSignatureMode::Disabled
+        );
+        assert_eq!(
+            config.options.execution_eip712_domain.name,
+            "DeOptV2-OptionMatchingEngine"
+        );
+        assert_eq!(config.options.execution_eip712_domain.version, "1");
+        assert_eq!(config.options.execution_eip712_domain.chain_id, 84532);
+        assert_eq!(config.options.execution_default_settlement_decimals, 6);
     }
 
     #[test]
@@ -1212,6 +1255,88 @@ mod tests {
 
         assert!(config.options.rfq_enabled);
         assert!(!config.options.rfq_require_persistence);
+    }
+
+    #[test]
+    fn option_execution_requiring_persistence_rejects_persistence_disabled() {
+        let error = config_from_pairs([
+            ("OPTIONS_ENABLED", "true"),
+            ("OPTIONS_REQUIRE_PERSISTENCE", "false"),
+            ("OPTION_EXECUTION_ENABLED", "true"),
+            ("OPTION_EXECUTION_REQUIRE_PERSISTENCE", "true"),
+            (
+                "OPTION_MATCHING_ENGINE_ADDRESS",
+                "0x00000000000000000000000000000000000000ee",
+            ),
+            ("PERSISTENCE_ENABLED", "false"),
+        ])
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("Option execution requires persistence enabled"));
+    }
+
+    #[test]
+    fn option_execution_requires_nonzero_matching_engine_address() {
+        let error = config_from_pairs([
+            ("OPTIONS_ENABLED", "true"),
+            ("OPTIONS_REQUIRE_PERSISTENCE", "false"),
+            ("OPTION_EXECUTION_ENABLED", "true"),
+            ("OPTION_EXECUTION_REQUIRE_PERSISTENCE", "false"),
+            (
+                "OPTION_MATCHING_ENGINE_ADDRESS",
+                "0x0000000000000000000000000000000000000000",
+            ),
+            ("PERSISTENCE_ENABLED", "false"),
+        ])
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("OPTION_MATCHING_ENGINE_ADDRESS must be nonzero"));
+    }
+
+    #[test]
+    fn option_execution_can_run_without_persistence_when_requirement_disabled() {
+        let config = config_from_pairs([
+            ("OPTIONS_ENABLED", "true"),
+            ("OPTIONS_REQUIRE_PERSISTENCE", "false"),
+            ("OPTION_EXECUTION_ENABLED", "true"),
+            ("OPTION_EXECUTION_REQUIRE_PERSISTENCE", "false"),
+            ("OPTION_EXECUTION_SIGNATURE_MODE", "strict"),
+            ("OPTION_EXECUTION_CHAIN_ID", "31337"),
+            ("OPTION_EXECUTION_DEFAULT_SETTLEMENT_DECIMALS", "18"),
+            (
+                "OPTION_MATCHING_ENGINE_ADDRESS",
+                "0x00000000000000000000000000000000000000ee",
+            ),
+            ("PERSISTENCE_ENABLED", "false"),
+        ])
+        .unwrap();
+
+        assert!(config.options.execution_enabled);
+        assert!(!config.options.execution_require_persistence);
+        assert_eq!(
+            config.options.execution_signature_mode,
+            crate::options::OptionExecutionSignatureMode::Strict
+        );
+        assert_eq!(config.options.execution_eip712_domain.chain_id, 31337);
+        assert_eq!(
+            config.options.execution_eip712_domain.verifying_contract.0,
+            "0x00000000000000000000000000000000000000ee"
+        );
+        assert_eq!(config.options.execution_default_settlement_decimals, 18);
+    }
+
+    #[test]
+    fn option_execution_rejects_invalid_signature_mode() {
+        let error =
+            config_from_pairs([("OPTION_EXECUTION_SIGNATURE_MODE", "optional")]).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("invalid OPTION_EXECUTION_SIGNATURE_MODE"));
     }
 
     #[test]

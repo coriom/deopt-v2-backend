@@ -51,6 +51,10 @@ pub enum BackendError {
     InvalidOptionOrderState(String),
     #[error("invalid option fill id")]
     InvalidOptionFillId,
+    #[error("invalid option execution intent id")]
+    InvalidOptionExecutionIntentId,
+    #[error("invalid option execution intent state: {0}")]
+    InvalidOptionExecutionIntentState(String),
     #[error("invalid option RFQ id")]
     InvalidOptionRfqId,
     #[error("invalid option RFQ quote id")]

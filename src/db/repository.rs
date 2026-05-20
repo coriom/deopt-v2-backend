@@ -16,10 +16,11 @@ use crate::mm::{MmAccountPermissions, MmProductPermission};
 use crate::monitoring::FeeEventLabels;
 use crate::options::store::status_for_remaining;
 use crate::options::{
-    OptionFill, OptionFillId, OptionOrder, OptionOrderId, OptionOrderStatus, OptionRfqFill,
-    OptionRfqFillId, OptionRfqId, OptionRfqQuote, OptionRfqQuoteId, OptionRfqQuoteSignatureStatus,
-    OptionRfqQuoteStatus, OptionRfqRequest, OptionRfqStatus, OptionSeries, OptionSeriesSource,
-    OptionSeriesStatus,
+    OptionExecutionIntent, OptionExecutionIntentId, OptionExecutionIntentStatus,
+    OptionExecutionSourceType, OptionFill, OptionFillId, OptionOrder, OptionOrderId,
+    OptionOrderStatus, OptionRfqFill, OptionRfqFillId, OptionRfqId, OptionRfqQuote,
+    OptionRfqQuoteId, OptionRfqQuoteSignatureStatus, OptionRfqQuoteStatus, OptionRfqRequest,
+    OptionRfqStatus, OptionSeries, OptionSeriesSource, OptionSeriesStatus,
 };
 use crate::reconciliation::{
     normalize_onchain_intent_id, ExecutionReconciliation, ReconciliationCounts,
@@ -57,6 +58,7 @@ const ADMIN_TABLE_COUNTS: &[(&str, &str)] = &[
     ("option_rfqs", "option_rfqs"),
     ("option_rfq_quotes", "option_rfq_quotes"),
     ("option_rfq_fills", "option_rfq_fills"),
+    ("option_execution_intents", "option_execution_intents"),
     ("mm_accounts", "mm_accounts"),
     ("mm_market_permissions", "mm_market_permissions"),
     ("fee_events", "fee_events"),
@@ -663,6 +665,49 @@ impl PgRepository {
                     "price_1e8": row_get::<String>(&row, "price_1e8")?,
                     "size_1e8": row_get::<String>(&row, "size_1e8")?,
                     "created_at_ms": row_get::<i64>(&row, "created_at_ms")?
+                }))
+            })
+            .collect()
+    }
+
+    pub async fn admin_recent_option_execution_intents(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<serde_json::Value>> {
+        if !self.admin_table_exists("option_execution_intents").await? {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            "SELECT intent_id, onchain_intent_id, source_type, source_id, option_series_id,
+                    onchain_option_id, buyer, seller, quantity_contracts,
+                    premium_per_contract_native, buyer_is_maker, status, calldata,
+                    created_at_ms, updated_at_ms
+             FROM option_execution_intents
+             ORDER BY created_at_ms DESC, intent_id DESC
+             LIMIT $1",
+        )
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(serde_json::json!({
+                    "intent_id": row_get::<String>(&row, "intent_id")?,
+                    "onchain_intent_id": row_get::<String>(&row, "onchain_intent_id")?,
+                    "source_type": row_get::<String>(&row, "source_type")?,
+                    "source_id": row_get::<String>(&row, "source_id")?,
+                    "option_series_id": row_get::<String>(&row, "option_series_id")?,
+                    "onchain_option_id": row_get::<Option<String>>(&row, "onchain_option_id")?,
+                    "buyer": row_get::<String>(&row, "buyer")?,
+                    "seller": row_get::<String>(&row, "seller")?,
+                    "quantity_contracts": row_get::<String>(&row, "quantity_contracts")?,
+                    "premium_per_contract_native": row_get::<String>(&row, "premium_per_contract_native")?,
+                    "buyer_is_maker": row_get::<bool>(&row, "buyer_is_maker")?,
+                    "status": row_get::<String>(&row, "status")?,
+                    "calldata_ready": row_get::<Option<String>>(&row, "calldata")?.is_some(),
+                    "created_at_ms": row_get::<i64>(&row, "created_at_ms")?,
+                    "updated_at_ms": row_get::<i64>(&row, "updated_at_ms")?
                 }))
             })
             .collect()
@@ -1896,6 +1941,137 @@ impl PgRepository {
         rows.into_iter().map(option_fill_from_row).collect()
     }
 
+    pub async fn insert_option_execution_intent(
+        &self,
+        intent: &OptionExecutionIntent,
+    ) -> Result<OptionExecutionIntent> {
+        sqlx::query(
+            "INSERT INTO option_execution_intents (
+                intent_id, onchain_intent_id, source_type, source_id, option_series_id,
+                onchain_option_id, buyer, seller, underlying, settlement_asset, expiry,
+                strike_1e8, is_call, contract_size_1e8, quantity_contracts, source_size_1e8,
+                source_price_1e8, premium_per_contract_native, buyer_is_maker, buyer_nonce,
+                seller_nonce, deadline, buyer_signature, seller_signature, calldata, status,
+                error, created_at_ms, updated_at_ms
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
+                $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29
+            )
+            ON CONFLICT (source_type, source_id) DO NOTHING",
+        )
+        .bind(intent.intent_id.to_string())
+        .bind(&intent.onchain_intent_id)
+        .bind(intent.source_type.as_str())
+        .bind(&intent.source_id)
+        .bind(&intent.option_series_id)
+        .bind(&intent.onchain_option_id)
+        .bind(&intent.buyer.0)
+        .bind(&intent.seller.0)
+        .bind(&intent.underlying.0)
+        .bind(&intent.settlement_asset.0)
+        .bind(u64_to_i64("expiry", intent.expiry)?)
+        .bind(intent.strike_1e8.to_string())
+        .bind(intent.is_call)
+        .bind(intent.contract_size_1e8.to_string())
+        .bind(intent.quantity_contracts.to_string())
+        .bind(intent.source_size_1e8.to_string())
+        .bind(intent.source_price_1e8.to_string())
+        .bind(intent.premium_per_contract_native.to_string())
+        .bind(intent.buyer_is_maker)
+        .bind(intent.buyer_nonce.map(|value| value.to_string()))
+        .bind(intent.seller_nonce.map(|value| value.to_string()))
+        .bind(u64_to_i64("deadline", intent.deadline)?)
+        .bind(&intent.buyer_signature)
+        .bind(&intent.seller_signature)
+        .bind(&intent.calldata)
+        .bind(intent.status.as_str())
+        .bind(&intent.error)
+        .bind(timestamp_to_i64(intent.created_at_ms))
+        .bind(timestamp_to_i64(intent.updated_at_ms))
+        .execute(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+
+        self.get_option_execution_intent_by_source(intent.source_type, &intent.source_id)
+            .await?
+            .ok_or_else(|| {
+                BackendError::Persistence(
+                    "option execution intent insert did not return a row".to_string(),
+                )
+            })
+    }
+
+    pub async fn list_option_execution_intents(&self) -> Result<Vec<OptionExecutionIntent>> {
+        let sql = option_execution_intent_select_sql("ORDER BY created_at_ms ASC, intent_id ASC");
+        let rows = sqlx::query(&sql)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        rows.into_iter()
+            .map(option_execution_intent_from_row)
+            .collect()
+    }
+
+    pub async fn get_option_execution_intent(
+        &self,
+        intent_id: OptionExecutionIntentId,
+    ) -> Result<Option<OptionExecutionIntent>> {
+        let sql = option_execution_intent_select_sql("WHERE intent_id = $1");
+        let rows = sqlx::query(&sql)
+            .bind(intent_id.to_string())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        rows.map(option_execution_intent_from_row).transpose()
+    }
+
+    pub async fn get_option_execution_intent_by_source(
+        &self,
+        source_type: OptionExecutionSourceType,
+        source_id: &str,
+    ) -> Result<Option<OptionExecutionIntent>> {
+        let sql = option_execution_intent_select_sql("WHERE source_type = $1 AND source_id = $2");
+        let rows = sqlx::query(&sql)
+            .bind(source_type.as_str())
+            .bind(source_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        rows.map(option_execution_intent_from_row).transpose()
+    }
+
+    pub async fn upsert_option_execution_signatures(
+        &self,
+        intent_id: OptionExecutionIntentId,
+        buyer_signature: Option<String>,
+        seller_signature: Option<String>,
+        status: OptionExecutionIntentStatus,
+        calldata: Option<String>,
+        updated_at_ms: TimestampMs,
+    ) -> Result<OptionExecutionIntent> {
+        sqlx::query(
+            "UPDATE option_execution_intents
+             SET buyer_signature = COALESCE($2, buyer_signature),
+                 seller_signature = COALESCE($3, seller_signature),
+                 calldata = COALESCE($4, calldata),
+                 status = $5,
+                 updated_at_ms = $6
+             WHERE intent_id = $1",
+        )
+        .bind(intent_id.to_string())
+        .bind(buyer_signature)
+        .bind(seller_signature)
+        .bind(calldata)
+        .bind(status.as_str())
+        .bind(timestamp_to_i64(updated_at_ms))
+        .execute(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        self.get_option_execution_intent(intent_id)
+            .await?
+            .ok_or(BackendError::InvalidOptionExecutionIntentId)
+    }
+
     pub async fn insert_option_rfq(&self, rfq: &OptionRfqRequest) -> Result<()> {
         sqlx::query(
             "INSERT INTO option_rfqs (
@@ -3006,6 +3182,111 @@ fn option_fill_from_row(row: PgRow) -> Result<OptionFill> {
                 BackendError::Persistence(format!("invalid option fill size: {error}"))
             })?,
         created_at_ms: row_get(&row, "created_at_ms")?,
+    })
+}
+
+fn option_execution_intent_select_sql(suffix: &str) -> String {
+    format!(
+        "SELECT intent_id, onchain_intent_id, source_type, source_id, option_series_id,
+                onchain_option_id, buyer, seller, underlying, settlement_asset, expiry,
+                strike_1e8, is_call, contract_size_1e8, quantity_contracts, source_size_1e8,
+                source_price_1e8, premium_per_contract_native, buyer_is_maker, buyer_nonce,
+                seller_nonce, deadline, buyer_signature, seller_signature, calldata, status,
+                error, created_at_ms, updated_at_ms
+         FROM option_execution_intents {suffix}"
+    )
+}
+
+fn option_execution_intent_from_row(row: PgRow) -> Result<OptionExecutionIntent> {
+    let intent_id: String = row_get(&row, "intent_id")?;
+    let source_type: String = row_get(&row, "source_type")?;
+    let expiry: i64 = row_get(&row, "expiry")?;
+    let deadline: i64 = row_get(&row, "deadline")?;
+    let buyer_nonce: Option<String> = row_get(&row, "buyer_nonce")?;
+    let seller_nonce: Option<String> = row_get(&row, "seller_nonce")?;
+    let status: String = row_get(&row, "status")?;
+    Ok(OptionExecutionIntent {
+        intent_id: intent_id.parse().map_err(|error| {
+            BackendError::Persistence(format!("invalid option execution intent id: {error}"))
+        })?,
+        onchain_intent_id: row_get(&row, "onchain_intent_id")?,
+        source_type: OptionExecutionSourceType::parse(&source_type)?,
+        source_id: row_get(&row, "source_id")?,
+        option_series_id: row_get(&row, "option_series_id")?,
+        onchain_option_id: row_get(&row, "onchain_option_id")?,
+        buyer: AccountId::new(row_get::<String>(&row, "buyer")?),
+        seller: AccountId::new(row_get::<String>(&row, "seller")?),
+        underlying: AccountId::new(row_get::<String>(&row, "underlying")?),
+        settlement_asset: AccountId::new(row_get::<String>(&row, "settlement_asset")?),
+        expiry: i64_to_u64_persistence("expiry", expiry)?,
+        strike_1e8: row_get::<String>(&row, "strike_1e8")?
+            .parse()
+            .map_err(|error| {
+                BackendError::Persistence(format!("invalid option execution strike_1e8: {error}"))
+            })?,
+        is_call: row_get(&row, "is_call")?,
+        contract_size_1e8: row_get::<String>(&row, "contract_size_1e8")?
+            .parse()
+            .map_err(|error| {
+                BackendError::Persistence(format!(
+                    "invalid option execution contract_size_1e8: {error}"
+                ))
+            })?,
+        quantity_contracts: row_get::<String>(&row, "quantity_contracts")?
+            .parse()
+            .map_err(|error| {
+                BackendError::Persistence(format!(
+                    "invalid option execution quantity_contracts: {error}"
+                ))
+            })?,
+        source_size_1e8: row_get::<String>(&row, "source_size_1e8")?
+            .parse()
+            .map_err(|error| {
+                BackendError::Persistence(format!(
+                    "invalid option execution source_size_1e8: {error}"
+                ))
+            })?,
+        source_price_1e8: row_get::<String>(&row, "source_price_1e8")?
+            .parse()
+            .map_err(|error| {
+                BackendError::Persistence(format!(
+                    "invalid option execution source_price_1e8: {error}"
+                ))
+            })?,
+        premium_per_contract_native: row_get::<String>(&row, "premium_per_contract_native")?
+            .parse()
+            .map_err(|error| {
+                BackendError::Persistence(format!(
+                    "invalid option execution premium_per_contract_native: {error}"
+                ))
+            })?,
+        buyer_is_maker: row_get(&row, "buyer_is_maker")?,
+        buyer_nonce: buyer_nonce
+            .map(|value| {
+                value.parse().map_err(|error| {
+                    BackendError::Persistence(format!(
+                        "invalid option execution buyer_nonce: {error}"
+                    ))
+                })
+            })
+            .transpose()?,
+        seller_nonce: seller_nonce
+            .map(|value| {
+                value.parse().map_err(|error| {
+                    BackendError::Persistence(format!(
+                        "invalid option execution seller_nonce: {error}"
+                    ))
+                })
+            })
+            .transpose()?,
+        deadline: i64_to_u64_persistence("deadline", deadline)?,
+        buyer_signature: row_get(&row, "buyer_signature")?,
+        seller_signature: row_get(&row, "seller_signature")?,
+        calldata: row_get(&row, "calldata")?,
+        status: OptionExecutionIntentStatus::parse(&status)?,
+        error: row_get(&row, "error")?,
+        created_at_ms: row_get(&row, "created_at_ms")?,
+        updated_at_ms: row_get(&row, "updated_at_ms")?,
     })
 }
 
