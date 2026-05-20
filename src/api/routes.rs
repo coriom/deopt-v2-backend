@@ -25,7 +25,9 @@ use crate::mm::permissions::{
     list_permission_accounts, list_product_permissions, MmProductPermission,
 };
 use crate::monitoring::{readiness, render_metrics};
-use crate::nonce_sync::{read_perp_nonce, PerpNonceResponse};
+use crate::nonce_sync::{
+    read_option_nonce, read_perp_nonce, OptionNonceResponse, PerpNonceResponse,
+};
 use crate::options::service::{
     accept_option_rfq_quote as accept_option_rfq_quote_service,
     cancel_option_order as cancel_option_order_service,
@@ -180,6 +182,7 @@ pub fn router(state: AppState) -> Router {
             post(cancel_option_order),
         )
         .route("/accounts/:address/perp-nonce", get(account_perp_nonce))
+        .route("/accounts/:address/option-nonce", get(account_option_nonce))
         .route("/orders", post(submit_order))
         .route("/orders/:order_id", delete(cancel_order))
         .route("/rfqs", post(create_rfq).get(list_rfqs))
@@ -313,6 +316,7 @@ async fn admin_status(
         "option_rfq_enabled": state.options_config.rfq_enabled,
         "option_execution_enabled": state.options_config.execution_enabled,
         "option_execution_simulation_enabled": state.options_config.execution_simulation_enabled,
+        "option_nonce_sync_enabled": state.option_nonce_sync_config.enabled,
         "fees_enabled": state.fees_config.enabled,
         "rebates_enabled": state.fees_config.rebates_enabled
     })))
@@ -349,6 +353,7 @@ async fn admin_config(
             "option_rfq_enabled": state.options_config.rfq_enabled,
             "option_execution_enabled": state.options_config.execution_enabled,
             "option_execution_simulation_enabled": state.options_config.execution_simulation_enabled,
+            "option_nonce_sync_enabled": state.option_nonce_sync_config.enabled,
             "fees_enabled": state.fees_config.enabled,
             "rebates_enabled": state.fees_config.rebates_enabled,
             "mm_gateway_enabled": state.mm_gateway_config.enabled,
@@ -454,6 +459,10 @@ async fn admin_config(
             "execution_simulation_gas_limit": state.options_config.execution_simulation_gas_limit,
             "execution_simulation_from": state.options_config.execution_simulation_from,
             "execution_simulation_rpc_configured": state.options_config.execution_simulation_rpc_url.is_some(),
+            "option_nonce_sync_enabled": state.option_nonce_sync_config.enabled,
+            "option_nonce_sync_require_rpc": state.option_nonce_sync_config.require_rpc,
+            "option_nonce_sync_strict": state.option_nonce_sync_config.strict,
+            "option_nonce_sync_rpc_configured": state.option_nonce_sync_config.rpc_url.is_some(),
             "execution_eip712_name": state.options_config.execution_eip712_domain.name,
             "execution_eip712_version": state.options_config.execution_eip712_domain.version,
             "execution_eip712_chain_id": state.options_config.execution_eip712_domain.chain_id
@@ -2356,6 +2365,27 @@ async fn account_perp_nonce(
     ))
 }
 
+async fn account_option_nonce(
+    State(state): State<AppState>,
+    Path(address): Path<String>,
+) -> Result<Json<OptionNonceResponse>, ApiError> {
+    if !state.option_nonce_sync_config.enabled {
+        return Err(BackendError::OptionNonceSyncDisabled.into());
+    }
+    let rpc_url = state
+        .option_nonce_sync_config
+        .rpc_url
+        .clone()
+        .ok_or_else(|| {
+            BackendError::Config("RPC_URL is required for option nonce sync".to_string())
+        })?;
+    let provider = HttpJsonRpcProvider::new(rpc_url);
+    let account = crate::types::AccountId::new(address);
+    Ok(Json(
+        read_option_nonce(&state.option_nonce_sync_config, &provider, &account).await?,
+    ))
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 struct CancelOrderResponse {
     status: String,
@@ -3944,6 +3974,7 @@ mod tests {
         AuthMode, MmAccountPermissions, MmGatewayConfig, MmPermissionsConfig, MmProductPermission,
         MmSession,
     };
+    use crate::nonce_sync::OptionNonceSyncConfig;
     use axum::body::{to_bytes, Body};
     use axum::http::Request;
     use tokio::sync::mpsc;
@@ -4499,6 +4530,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn option_nonce_endpoint_disabled_returns_clear_error() {
+        let response = router(AppState::new(EngineState::with_default_markets()))
+            .oneshot(get_request(
+                "/accounts/0x0000000000000000000000000000000000000001/option-nonce",
+                None,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let json = response_json(response).await;
+        assert_eq!(json["error"], "option nonce sync is disabled");
+    }
+
+    #[tokio::test]
+    async fn option_nonce_endpoint_enabled_reads_mocked_onchain_nonce() {
+        let rpc_url = spawn_nonce_rpc(42).await;
+        let mut state = AppState::new(EngineState::with_default_markets());
+        state.option_nonce_sync_config = OptionNonceSyncConfig {
+            enabled: true,
+            require_rpc: true,
+            strict: true,
+            rpc_url: Some(rpc_url),
+            option_matching_engine_address: AccountId::new(
+                "0x00000000000000000000000000000000000000ee",
+            ),
+        };
+
+        let response = router(state)
+            .oneshot(get_request(
+                "/accounts/0x0000000000000000000000000000000000000001/option-nonce",
+                None,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(
+            json["account"],
+            "0x0000000000000000000000000000000000000001"
+        );
+        assert_eq!(
+            json["option_matching_engine"],
+            "0x00000000000000000000000000000000000000ee"
+        );
+        assert_eq!(json["nonce"], "42");
+        assert_eq!(json["source"], "onchain");
+    }
+
+    #[tokio::test]
     async fn admin_options_summary_includes_option_simulation_counts() {
         let mut state = admin_state(false);
         state.options_config = option_simulation_state(true, false).options_config;
@@ -4694,6 +4776,48 @@ mod tests {
         }
     }
 
+    async fn spawn_nonce_rpc(nonce: u128) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let output = uint256_hex(nonce);
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::post(move |Json(payload): Json<serde_json::Value>| {
+                let output = output.clone();
+                async move {
+                    let method = payload
+                        .get("method")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default();
+                    let result = match method {
+                        "eth_blockNumber" => serde_json::json!("0x7b"),
+                        "eth_call" => serde_json::json!(output),
+                        _ => serde_json::Value::Null,
+                    };
+                    Json(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": payload.get("id").cloned().unwrap_or(serde_json::json!(1)),
+                        "result": result
+                    }))
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    fn uint256_hex(value: u128) -> String {
+        let mut bytes = [0u8; 32];
+        bytes[16..32].copy_from_slice(&value.to_be_bytes());
+        let mut encoded = String::from("0x");
+        for byte in bytes {
+            encoded.push_str(&format!("{byte:02x}"));
+        }
+        encoded
+    }
+
     fn get_request(path: &str, token: Option<&str>) -> Request<Body> {
         let mut builder = Request::builder().uri(path);
         if let Some(token) = token {
@@ -4819,6 +4943,7 @@ impl From<BackendError> for ApiError {
             | BackendError::InvalidOptionRfqState(_)
             | BackendError::InvalidOptionRfqQuoteState(_)
             | BackendError::PerpNonceSyncDisabled
+            | BackendError::OptionNonceSyncDisabled
             | BackendError::PerpNonceMismatch { .. }
             | BackendError::MalformedSignature
             | BackendError::MissingTradeSignatures

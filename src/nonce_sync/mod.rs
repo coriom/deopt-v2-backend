@@ -36,11 +36,49 @@ impl PerpNonceSyncConfig {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OptionNonceSyncConfig {
+    pub enabled: bool,
+    pub require_rpc: bool,
+    pub strict: bool,
+    pub rpc_url: Option<String>,
+    pub option_matching_engine_address: AccountId,
+}
+
+impl OptionNonceSyncConfig {
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            require_rpc: true,
+            strict: true,
+            rpc_url: None,
+            option_matching_engine_address: AccountId::new(""),
+        }
+    }
+
+    pub fn validate_startup(&self) -> Result<()> {
+        if !self.enabled || !self.require_rpc {
+            return Ok(());
+        }
+        ensure_option_rpc_url_configured(self)?;
+        ensure_option_matching_engine_configured(self)?;
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct PerpNonceResponse {
     pub account: String,
     pub perp_matching_engine: String,
     pub nonce: u64,
+    pub source: &'static str,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct OptionNonceResponse {
+    pub account: String,
+    pub option_matching_engine: String,
+    pub nonce: String,
     pub source: &'static str,
 }
 
@@ -78,6 +116,40 @@ where
     }
 }
 
+pub trait OptionNonceProvider: Clone + Send + Sync {
+    fn option_matching_nonce(
+        &self,
+        matching_engine: AccountId,
+        account: AccountId,
+    ) -> RpcFuture<'_, u128>;
+}
+
+impl<T> OptionNonceProvider for T
+where
+    T: EthCallProvider + Clone + Send + Sync,
+{
+    fn option_matching_nonce(
+        &self,
+        matching_engine: AccountId,
+        account: AccountId,
+    ) -> RpcFuture<'_, u128> {
+        Box::pin(async move {
+            let data = encode_nonces_call(&account)?;
+            let output = self
+                .eth_call(EthCallRequest {
+                    from: zero_address(),
+                    to: matching_engine,
+                    data,
+                    value: 0,
+                    gas_limit: None,
+                })
+                .await?
+                .output;
+            decode_uint256_to_u128(&output)
+        })
+    }
+}
+
 pub async fn read_perp_nonce<P>(
     config: &PerpNonceSyncConfig,
     provider: &P,
@@ -98,6 +170,42 @@ where
         nonce,
         source: "onchain",
     })
+}
+
+pub async fn read_option_nonce<P>(
+    config: &OptionNonceSyncConfig,
+    provider: &P,
+    account: &AccountId,
+) -> Result<OptionNonceResponse>
+where
+    P: OptionNonceProvider,
+{
+    let nonce = read_option_nonce_value(config, provider, account).await?;
+    Ok(OptionNonceResponse {
+        account: account.0.to_ascii_lowercase(),
+        option_matching_engine: config.option_matching_engine_address.0.to_ascii_lowercase(),
+        nonce: nonce.to_string(),
+        source: "onchain",
+    })
+}
+
+pub async fn read_option_nonce_value<P>(
+    config: &OptionNonceSyncConfig,
+    provider: &P,
+    account: &AccountId,
+) -> Result<u128>
+where
+    P: OptionNonceProvider,
+{
+    ensure_option_enabled(config)?;
+    ensure_option_ready_for_read(config)?;
+    parse_evm_address(account)?;
+    provider
+        .option_matching_nonce(
+            config.option_matching_engine_address.clone(),
+            account.clone(),
+        )
+        .await
 }
 
 pub async fn validate_order_perp_nonce<P>(
@@ -130,9 +238,23 @@ fn ensure_enabled(config: &PerpNonceSyncConfig) -> Result<()> {
     }
 }
 
+fn ensure_option_enabled(config: &OptionNonceSyncConfig) -> Result<()> {
+    if config.enabled {
+        Ok(())
+    } else {
+        Err(BackendError::OptionNonceSyncDisabled)
+    }
+}
+
 fn ensure_ready_for_read(config: &PerpNonceSyncConfig) -> Result<()> {
     ensure_rpc_url_configured(config)?;
     ensure_matching_engine_configured(config)?;
+    Ok(())
+}
+
+fn ensure_option_ready_for_read(config: &OptionNonceSyncConfig) -> Result<()> {
+    ensure_option_rpc_url_configured(config)?;
+    ensure_option_matching_engine_configured(config)?;
     Ok(())
 }
 
@@ -142,6 +264,16 @@ fn ensure_rpc_url_configured(config: &PerpNonceSyncConfig) -> Result<()> {
     } else {
         Err(BackendError::Config(
             "RPC_URL is required for perp nonce sync".to_string(),
+        ))
+    }
+}
+
+fn ensure_option_rpc_url_configured(config: &OptionNonceSyncConfig) -> Result<()> {
+    if config.rpc_url.is_some() {
+        Ok(())
+    } else {
+        Err(BackendError::Config(
+            "RPC_URL is required for option nonce sync".to_string(),
         ))
     }
 }
@@ -162,6 +294,26 @@ fn ensure_matching_engine_configured(config: &PerpNonceSyncConfig) -> Result<()>
             "PERP_MATCHING_ENGINE_ADDRESS is required for perp nonce sync".to_string(),
         ));
     }
+    Ok(())
+}
+
+fn ensure_option_matching_engine_configured(config: &OptionNonceSyncConfig) -> Result<()> {
+    if config
+        .option_matching_engine_address
+        .0
+        .eq_ignore_ascii_case("0x0000000000000000000000000000000000000000")
+        || config.option_matching_engine_address.0.is_empty()
+    {
+        return Err(BackendError::Config(
+            "OPTION_MATCHING_ENGINE_ADDRESS is required for option nonce sync".to_string(),
+        ));
+    }
+    parse_evm_address(&config.option_matching_engine_address).map_err(|_| {
+        BackendError::Config(
+            "OPTION_MATCHING_ENGINE_ADDRESS must be a valid EVM address for option nonce sync"
+                .to_string(),
+        )
+    })?;
     Ok(())
 }
 
@@ -195,6 +347,22 @@ fn decode_uint256_to_u64(output: &[u8]) -> Result<u64> {
     Ok(u64::from_be_bytes(bytes))
 }
 
+fn decode_uint256_to_u128(output: &[u8]) -> Result<u128> {
+    if output.len() != 32 {
+        return Err(BackendError::Simulation(
+            "OptionMatchingEngine.nonces returned invalid uint256 output".to_string(),
+        ));
+    }
+    if output[..16].iter().any(|byte| *byte != 0) {
+        return Err(BackendError::Simulation(
+            "OptionMatchingEngine.nonces value exceeds u128".to_string(),
+        ));
+    }
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&output[16..32]);
+    Ok(u128::from_be_bytes(bytes))
+}
+
 fn zero_address() -> AccountId {
     AccountId::new("0x0000000000000000000000000000000000000000")
 }
@@ -202,6 +370,7 @@ fn zero_address() -> AccountId {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::execution::EthCallSuccess;
     use crate::signing::NonceStore;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
@@ -227,6 +396,25 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct MockEthCallProvider {
+        output: Vec<u8>,
+        calls: Arc<std::sync::Mutex<Vec<EthCallRequest>>>,
+    }
+
+    impl MockEthCallProvider {
+        fn new_u128(nonce: u128) -> Self {
+            Self {
+                output: uint256_output_u128(nonce),
+                calls: Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+
+        fn calls(&self) -> Vec<EthCallRequest> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
     impl PerpNonceProvider for MockNonceProvider {
         fn perp_matching_nonce(
             &self,
@@ -236,6 +424,20 @@ mod tests {
             Box::pin(async move {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 Ok(self.nonce)
+            })
+        }
+    }
+
+    impl EthCallProvider for MockEthCallProvider {
+        fn eth_call(&self, request: EthCallRequest) -> RpcFuture<'_, EthCallSuccess> {
+            let output = self.output.clone();
+            let calls = self.calls.clone();
+            Box::pin(async move {
+                calls.lock().unwrap().push(request);
+                Ok(EthCallSuccess {
+                    block_number: Some(123),
+                    output,
+                })
             })
         }
     }
@@ -334,6 +536,68 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn option_nonce_endpoint_read_uses_eth_call_nonces_selector() {
+        let provider = MockEthCallProvider::new_u128(42);
+        let response = read_option_nonce(&enabled_option_config(), &provider, &account())
+            .await
+            .unwrap();
+
+        assert_eq!(response.account, account().0);
+        assert_eq!(
+            response.option_matching_engine,
+            "0x00000000000000000000000000000000000000ee"
+        );
+        assert_eq!(response.nonce, "42");
+        assert_eq!(response.source, "onchain");
+        let calls = provider.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].to.0, "0x00000000000000000000000000000000000000ee");
+        assert_eq!(calls[0].from.0, zero_address().0);
+        assert_eq!(&calls[0].data[..4], &nonces_selector());
+        assert_eq!(calls[0].value, 0);
+        assert_eq!(calls[0].gas_limit, None);
+    }
+
+    #[tokio::test]
+    async fn option_nonce_sync_disabled_returns_clear_error() {
+        let error = read_option_nonce(
+            &OptionNonceSyncConfig::disabled(),
+            &MockEthCallProvider::new_u128(42),
+            &account(),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "option nonce sync is disabled");
+    }
+
+    #[test]
+    fn option_startup_requires_rpc_when_enabled_and_require_rpc_true() {
+        let mut config = enabled_option_config();
+        config.rpc_url = None;
+
+        let error = config.validate_startup().unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "configuration error: RPC_URL is required for option nonce sync"
+        );
+    }
+
+    #[test]
+    fn option_startup_requires_matching_engine_when_enabled_and_require_rpc_true() {
+        let mut config = enabled_option_config();
+        config.option_matching_engine_address = AccountId::new("");
+
+        let error = config.validate_startup().unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "configuration error: OPTION_MATCHING_ENGINE_ADDRESS is required for option nonce sync"
+        );
+    }
+
     #[test]
     fn startup_requires_rpc_when_enabled_and_require_rpc_true() {
         let mut config = enabled_config();
@@ -359,7 +623,25 @@ mod tests {
         }
     }
 
+    fn enabled_option_config() -> OptionNonceSyncConfig {
+        OptionNonceSyncConfig {
+            enabled: true,
+            require_rpc: true,
+            strict: true,
+            rpc_url: Some("http://127.0.0.1:8545".to_string()),
+            option_matching_engine_address: AccountId::new(
+                "0x00000000000000000000000000000000000000ee",
+            ),
+        }
+    }
+
     fn account() -> AccountId {
         AccountId::new("0x0000000000000000000000000000000000000001")
+    }
+
+    fn uint256_output_u128(value: u128) -> Vec<u8> {
+        let mut output = vec![0u8; 32];
+        output[16..32].copy_from_slice(&value.to_be_bytes());
+        output
     }
 }

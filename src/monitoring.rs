@@ -129,6 +129,11 @@ pub async fn render_metrics(state: &AppState) -> Result<String> {
         bool_value(state.perp_nonce_sync_config.enabled),
     );
     metrics.gauge(
+        "deopt_option_nonce_sync_enabled",
+        "Option on-chain nonce sync enabled.",
+        bool_value(state.option_nonce_sync_config.enabled),
+    );
+    metrics.gauge(
         "deopt_mm_gateway_enabled",
         "Market Maker Gateway enabled.",
         bool_value(state.mm_gateway_config.enabled),

@@ -1,244 +1,283 @@
-# NEXT_TASK.md — Option Execution Nonce Sync V1E
+# NEXT_TASK.md — Runtime Verify Option Execution Nonce Sync V1E
 
 ## Context
 
-Backend Option Execution Intents V1C/V1D are implemented and runtime-verified.
+Option Execution Nonce Sync V1E has been implemented.
 
-Validated:
+Implemented:
 
-- option orderbook fill creates option_execution_intent
-- option RFQ fill creates option_execution_intent
-- EIP-712 OptionTrade signing payload
-- signature submission
-- calldata builder
-- simulation endpoints
-- safe disabled/missing-RPC runtime behavior
-- no broadcast
-- no execution_transactions
+- OPTION_NONCE_SYNC_ENABLED=false
+- OPTION_NONCE_SYNC_REQUIRE_RPC=true
+- OPTION_NONCE_SYNC_STRICT=true
+- GET /accounts/:address/option-nonce
+- eth_call OptionMatchingEngine.nonces(address)
+- option orderbook/RFQ intent creation uses synced nonces when enabled
+- signing payload uses stored intent nonces
+- calldata uses stored intent nonces
+- strict mode aborts intent creation on nonce read failure
+- non-strict mode falls back to zero nonces with warning
+- tests pass offline
 
-Current gap:
+## Goal
 
-Option execution intents currently default buyer/seller nonces to `0`.
+Runtime-verify Option Nonce Sync V1E in safe local mode.
 
-Before live eth_call and broadcast can be reliable, backend must sync nonces from:
+Verify:
 
-```solidity
-OptionMatchingEngine.nonces(address)
-Goal
+1. disabled endpoint behavior
+2. startup guards
+3. enabled no-RPC behavior
+4. strict failure behavior
+5. non-strict fallback behavior
+6. signing payload and calldata use stored nonces
+7. no execution transactions
+8. no broadcast
 
-Implement Option Execution Nonce Sync V1E.
+## Non-Goals
 
-Add backend support to read and use on-chain option execution nonces from OptionMatchingEngine.
-
-Non-Goals
-
+Do not deploy OptionMatchingEngine.
 Do not broadcast.
+Do not call /executor/broadcast.
 Do not submit transactions.
 Do not create execution_transactions.
-Do not implement indexer/reconciliation/confirmation.
+Do not use private keys.
 Do not modify Solidity.
 Do not modify frontend.
-Do not deploy.
-Do not require private keys.
+Do not require live RPC.
 Do not commit.
 Do not push.
 
-Safety Rules
+## Safety Rules
 
-Defaults remain safe:
+Runtime must keep:
 
+```env
 EXECUTION_ENABLED=false
 EXECUTOR_REAL_BROADCAST_ENABLED=false
+MM_GATEWAY_ENABLED=false
 
-No private keys.
-
+No private keys in logs.
 No tx hash fabrication.
+No submitted/confirmed option lifecycle.
 
-No confirmed/submitted option status.
+Runtime Setup A — Disabled Nonce Sync
 
-Config
+Start backend with process env:
 
-Add:
+PERSISTENCE_ENABLED=true \
+DATABASE_URL=postgres://deopt:deopt@127.0.0.1:5432/deopt_v2_backend \
+OPTIONS_ENABLED=true \
+OPTIONS_REQUIRE_PERSISTENCE=true \
+OPTION_RFQ_ENABLED=true \
+OPTION_RFQ_REQUIRE_PERSISTENCE=true \
+OPTION_EXECUTION_ENABLED=true \
+OPTION_EXECUTION_REQUIRE_PERSISTENCE=true \
+OPTION_MATCHING_ENGINE_ADDRESS=0x1111111111111111111111111111111111111111 \
+OPTION_EXECUTION_SIGNATURE_MODE=disabled \
+OPTION_EXECUTION_CHAIN_ID=84532 \
+OPTION_EXECUTION_EIP712_NAME=DeOptV2-OptionMatchingEngine \
+OPTION_EXECUTION_EIP712_VERSION=1 \
+OPTION_EXECUTION_DEFAULT_SETTLEMENT_DECIMALS=6 \
+OPTION_NONCE_SYNC_ENABLED=false \
+OPTION_NONCE_SYNC_REQUIRE_RPC=true \
+OPTION_NONCE_SYNC_STRICT=true \
+ADMIN_API_ENABLED=true \
+ADMIN_API_REQUIRE_TOKEN=true \
+ADMIN_API_TOKEN=local-admin-token-runtime-test \
+EXECUTION_ENABLED=false \
+EXECUTOR_REAL_BROADCAST_ENABLED=false \
+MM_GATEWAY_ENABLED=false \
+cargo run --bin deopt-v2-backend
 
-OPTION_NONCE_SYNC_ENABLED=false
+Checks:
+
+curl http://127.0.0.1:8080/health
+
+curl http://127.0.0.1:8080/accounts/0xbAf0976a00a0DCc84Df5B15d927695c8b014B1c3/option-nonce
+
+Expected:
+
+health ok
+option nonce endpoint returns clear disabled error
+Runtime Setup B — Startup Guards
+Missing RPC
+
+Start backend with:
+
+OPTION_NONCE_SYNC_ENABLED=true
 OPTION_NONCE_SYNC_REQUIRE_RPC=true
+RPC_URL=
+OPTION_MATCHING_ENGINE_ADDRESS=0x1111111111111111111111111111111111111111
+
+Expected:
+
+startup rejects clearly because RPC_URL is missing
+Missing OptionMatchingEngine
+
+Start backend with:
+
+OPTION_NONCE_SYNC_ENABLED=true
+OPTION_NONCE_SYNC_REQUIRE_RPC=true
+RPC_URL=http://127.0.0.1:8545
+OPTION_MATCHING_ENGINE_ADDRESS=
+
+Expected:
+
+startup rejects clearly because OptionMatchingEngine address is missing or invalid
+Runtime Setup C — Enabled, Non-Strict, No RPC
+
+Start backend with:
+
+OPTION_NONCE_SYNC_ENABLED=true
+OPTION_NONCE_SYNC_REQUIRE_RPC=false
+OPTION_NONCE_SYNC_STRICT=false
+RPC_URL=
+OPTION_MATCHING_ENGINE_ADDRESS=0x1111111111111111111111111111111111111111
+
+Expected:
+
+backend starts
+nonce endpoint returns clear RPC unavailable/config error
+creating option execution intent falls back to buyer_nonce=0 and seller_nonce=0
+signing payload shows nonces 0
+calldata uses nonces 0
+no execution transaction
+Runtime Setup D — Enabled, Strict, No RPC
+
+Start backend with:
+
+OPTION_NONCE_SYNC_ENABLED=true
+OPTION_NONCE_SYNC_REQUIRE_RPC=false
 OPTION_NONCE_SYNC_STRICT=true
+RPC_URL=
+OPTION_MATCHING_ENGINE_ADDRESS=0x1111111111111111111111111111111111111111
 
-Behavior:
+Expected:
 
-disabled: current behavior preserved
-enabled: backend reads OptionMatchingEngine.nonces(address) via eth_call
-strict: intent creation/signing requires synced nonce values
-require RPC: startup rejects if sync enabled but RPC or matching engine address is missing
+backend starts
+creating option execution intent fails clearly because nonce sync cannot read RPC
+no partial invalid intent is created
+Common Flow for Non-Strict Mode
+Record TEST_START_MS.
+Create option series with onchain id.
+Create crossing option orderbook fill.
+Verify option_execution_intent exists.
+Verify buyer_nonce=0 and seller_nonce=0 fallback.
+Fetch signing payload and verify nonces 0.
+Submit dummy shape-valid signatures.
+Fetch calldata and verify it exists.
+Verify no execution transaction.
 
-Reuse existing perp nonce sync patterns where possible.
-
-API
-
-Add:
-
-GET /options/accounts/:address/nonce
-
-or:
-
-GET /accounts/:address/option-nonce
-
-Preferred: match existing perp nonce endpoint style.
-
-Response:
+Use dummy 65-byte signatures:
 
 {
-  "account": "0x...",
-  "nonce": "0",
-  "source": "onchain",
-  "option_matching_engine": "0x..."
+  "buyer_signature": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "seller_signature": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 }
+Common Flow for Strict Mode
+Record TEST_START_MS.
+Create option series with onchain id.
+Try to create crossing fill.
+Expect clear failure or fill without execution intent depending on current implementation.
+Verify no invalid option_execution_intent exists.
+SQL Checks
 
-Disabled mode should return a clear error:
+No execution tx:
 
-{"error":"option nonce sync is disabled"}
-Integration
+SELECT COUNT(*) FROM execution_transactions WHERE created_at_ms >= <TEST_START_MS>;
 
-When OPTION_EXECUTION_ENABLED=true and OPTION_NONCE_SYNC_ENABLED=true:
+Inspect runtime intents:
 
-Option execution intent creation
+SELECT intent_id, buyer_nonce, seller_nonce, status, error
+FROM option_execution_intents
+WHERE created_at_ms >= <TEST_START_MS>
+ORDER BY created_at_ms;
 
-For buyer and seller:
+Duplicate source check:
 
-read on-chain nonce
-set buyer_nonce
-set seller_nonce
-store values in option_execution_intents
-Signing payload
+SELECT source_type, source_id, COUNT(*)
+FROM option_execution_intents
+WHERE created_at_ms >= <TEST_START_MS>
+GROUP BY source_type, source_id
+HAVING COUNT(*) > 1;
 
-Payload must use stored buyer/seller nonce.
+Expected:
 
-Signature submission
+no execution transactions
+no duplicate source intents
+strict mode creates no invalid intent
+Admin / Metrics
 
-Do not mutate nonces.
+Call:
 
-Calldata
+curl http://127.0.0.1:8080/admin/config \
+  -H "X-Admin-Token: local-admin-token-runtime-test"
 
-Calldata must use stored nonces.
+curl http://127.0.0.1:8080/admin/options/summary \
+  -H "X-Admin-Token: local-admin-token-runtime-test"
 
-Strict Mode
+curl http://127.0.0.1:8080/metrics
 
-If OPTION_NONCE_SYNC_STRICT=true:
+Expected:
 
-fail intent creation if nonce cannot be read
-do not create partial invalid intent
-return explicit error
-
-If OPTION_NONCE_SYNC_STRICT=false:
-
-allow fallback to 0 or configured local value
-mark source clearly if stored model supports it
-document that non-strict mode is dev-only
-
-Preferred V1E: strict mode for enabled sync.
-
-RPC Behavior
-
-Use eth_call:
-
-to = OPTION_MATCHING_ENGINE_ADDRESS
-data = nonces(address)
-
-No private key.
-
-No state change.
-
-Reuse existing RPC helpers from perp nonce sync and option simulation.
-
-Database
-
-If useful, add fields:
-
-buyer_nonce_source TEXT NULL
-seller_nonce_source TEXT NULL
-
-But avoid schema churn unless needed.
-
-At minimum, existing buyer_nonce and seller_nonce must be populated correctly.
-
-Tests
-
-Normal cargo test must remain offline.
-
-Add tests for:
-
-disabled nonce sync preserves current behavior
-nonce endpoint disabled returns clear error
-nonce endpoint enabled returns mocked on-chain nonce
-intent creation uses mocked buyer/seller on-chain nonces
-signing payload uses stored synced nonces
-calldata uses stored synced nonces
-strict mode rejects when RPC unavailable
-startup rejects missing RPC when enabled and require RPC
-startup rejects missing OptionMatchingEngine address when enabled
-failed nonce sync does not consume local nonces or create invalid intent
-no execution_transaction created
-existing option execution tests still pass
-
-Use mock RPC or existing test abstractions. Do not require live RPC for tests.
-
-Runtime Verification Scope
-
-V1E runtime should verify:
-
-disabled endpoint behavior
-startup guard behavior
-enabled with no RPC behavior
-if live RPC + deployed OptionMatchingEngine available, real nonce read
-
-If no deployed contract is available, live nonce read is deferred.
-
-Documentation
-
-Update:
-
-README.md
-ARCHITECTURE.md
-docs/OPTION_EXECUTION_BACKEND.md
-.env.example
-
-Document:
-
-config
-endpoint
-strict mode
+option nonce sync booleans exposed safely if implemented
+no secrets
 no private keys
-no tx submission
-relation to signing payload
-live RPC requirement
-Validation
+metrics safe
+Optional Live RPC Check
 
-Run:
+Only if deployed OptionMatchingEngine and RPC are already available:
+
+set RPC_URL
+set OPTION_MATCHING_ENGINE_ADDRESS
+set OPTION_NONCE_SYNC_ENABLED=true
+call /accounts/:address/option-nonce
+verify real nonce returned
+
+If unavailable, report live nonce read deferred.
+
+Cleanup
+
+Delete only runtime-created rows:
+
+option_execution_intents
+option_fills
+option_orders
+option_series
+option_rfqs / option_rfq_quotes / option_rfq_fills if used
+
+Stop backend.
+
+Verify:
+
+pgrep -af deopt-v2-backend || true
+ss -ltnp | grep ':8080' || true
+If Bug Found
+
+Patch minimally only.
+
+After patch:
 
 cargo fmt
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test
 cargo build
-Acceptance Criteria
+Final Report
 
-Complete only if:
+Return:
 
-config exists
-endpoint exists
-on-chain nonce read path exists
-intent creation can use synced nonces
-signing payload uses synced nonces
-calldata uses synced nonces
-strict startup guards work
-no broadcast
-no execution transaction
-tests added
-docs updated
-cargo fmt/clippy/test/build pass
-Deferred
-live Base Sepolia nonce runtime if no OptionMatchingEngine deployed
-option broadcast
-option indexer
-option reconciliation
-option confirmation
-frontend UI
+files changed
+whether code patch was needed
+disabled endpoint result
+startup guard missing RPC result
+startup guard missing matching engine result
+non-strict no-RPC fallback result
+signing payload nonce result
+calldata nonce result
+strict no-RPC failure result
+no forbidden mutation verification
+admin/metrics result
+cleanup result
+optional live RPC result or deferred reason
+validation commands run
+remaining blocker

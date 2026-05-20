@@ -175,13 +175,16 @@ OPTION_EXECUTION_CHAIN_ID=84532
 OPTION_EXECUTION_EIP712_NAME=DeOptV2-OptionMatchingEngine
 OPTION_EXECUTION_EIP712_VERSION=1
 OPTION_EXECUTION_DEFAULT_SETTLEMENT_DECIMALS=6
+OPTION_NONCE_SYNC_ENABLED=false
+OPTION_NONCE_SYNC_REQUIRE_RPC=true
+OPTION_NONCE_SYNC_STRICT=true
 OPTION_EXECUTION_SIMULATION_ENABLED=false
 OPTION_EXECUTION_REQUIRE_RPC_FOR_SIMULATION=true
 OPTION_EXECUTION_SIMULATION_GAS_LIMIT=0
 OPTION_EXECUTION_SIMULATION_FROM=
 ```
 
-When options are enabled with `OPTIONS_REQUIRE_PERSISTENCE=true`, startup requires persistence. When option RFQ is enabled with `OPTION_RFQ_REQUIRE_PERSISTENCE=true`, startup also requires persistence. When option execution is enabled with `OPTION_EXECUTION_REQUIRE_PERSISTENCE=true`, startup requires persistence and a valid nonzero `OPTION_MATCHING_ENGINE_ADDRESS`; that address is also the EIP-712 verifying contract. Normal tests can run options, option RFQs, and option execution intent signing/calldata in memory with persistence disabled. `OPTION_RFQ_QUOTE_SIGNATURE_MODE=disabled` preserves unsigned quotes; `strict` requires `quote_nonce`, a valid EIP-712 `OptionRFQQuote` signature, and recovered signer equality with `mm_account`. `OPTION_EXECUTION_SIGNATURE_MODE=disabled` shape-validates provided OptionTrade signatures only; `strict` recovers buyer/seller signers from the OptionTrade digest. `OPTION_EXECUTION_SIMULATION_ENABLED=true` enables manual option `eth_call` simulation, requires `RPC_URL` by default, and uses `OPTION_EXECUTION_SIMULATION_FROM` or `EXECUTOR_FROM_ADDRESS` as the call sender. `OPTIONS_SYNC_ONCHAIN_REGISTRY=false` is a placeholder for a future read-only registry sync and does not call RPC in V1D.
+When options are enabled with `OPTIONS_REQUIRE_PERSISTENCE=true`, startup requires persistence. When option RFQ is enabled with `OPTION_RFQ_REQUIRE_PERSISTENCE=true`, startup also requires persistence. When option execution is enabled with `OPTION_EXECUTION_REQUIRE_PERSISTENCE=true`, startup requires persistence and a valid nonzero `OPTION_MATCHING_ENGINE_ADDRESS`; that address is also the EIP-712 verifying contract. Normal tests can run options, option RFQs, and option execution intent signing/calldata in memory with persistence disabled. `OPTION_RFQ_QUOTE_SIGNATURE_MODE=disabled` preserves unsigned quotes; `strict` requires `quote_nonce`, a valid EIP-712 `OptionRFQQuote` signature, and recovered signer equality with `mm_account`. `OPTION_EXECUTION_SIGNATURE_MODE=disabled` shape-validates provided OptionTrade signatures only; `strict` recovers buyer/seller signers from the OptionTrade digest. `OPTION_NONCE_SYNC_ENABLED=true` enables read-only `OptionMatchingEngine.nonces(address)` sync using `RPC_URL` and `OPTION_MATCHING_ENGINE_ADDRESS`; by default startup requires both and strict intent creation fails if buyer or seller nonce cannot be read. `OPTION_EXECUTION_SIMULATION_ENABLED=true` enables manual option `eth_call` simulation, requires `RPC_URL` by default, and uses `OPTION_EXECUTION_SIMULATION_FROM` or `EXECUTOR_FROM_ADDRESS` as the call sender. `OPTIONS_SYNC_ONCHAIN_REGISTRY=false` is a placeholder for a future read-only registry sync and does not call RPC in V1E.
 
 HTTP endpoints:
 - `POST /options/series`
@@ -236,13 +239,13 @@ Option RFQ acceptance is single-winner. It validates RFQ and quote freshness, se
 
 ## Option Execution Intents V1C
 
-Option Execution Intents V1D is opt-in and scoped to artifacts and `eth_call` simulation for the Solidity `OptionMatchingEngine`; it is not an executor. When `OPTION_EXECUTION_ENABLED=false`, option orderbook fills and option RFQ fills keep the previous off-chain behavior and no option execution intent rows are created.
+Option Execution Intents V1E is opt-in and scoped to artifacts, read-only nonce sync, and `eth_call` simulation for the Solidity `OptionMatchingEngine`; it is not an executor. When `OPTION_EXECUTION_ENABLED=false`, option orderbook fills and option RFQ fills keep the previous off-chain behavior and no option execution intent rows are created.
 
 When enabled, each option orderbook fill and accepted option RFQ fill creates one idempotent `OptionExecutionIntent` keyed by `(source_type, source_id)`. The source types are `option_orderbook_fill` and `option_rfq_fill`. Orderbook `buyer_is_maker` is derived from the resting side: a resting bid makes the buyer maker, and a resting ask makes the seller maker. Option RFQ `buyer_is_maker` is true when the market maker is the buyer.
 
 The service requires executable series metadata before creating a matching fill. The option series must have an on-chain option id in `onchain_series_id` or `onchain_product_id`, and `underlying` and `settlement_asset` must be nonzero EVM addresses. `size_1e8` must convert to whole contracts with `quantity = size_1e8 / 100000000`; fractional-contract fills are rejected while option execution is enabled. Premium converts from backend fixed point to settlement-token native units as `premiumPerContract = price_1e8 * 10^OPTION_EXECUTION_DEFAULT_SETTLEMENT_DECIMALS / 100000000`, and a zero result is rejected.
 
-Intent state stores the backend UUID, derived `onchain_intent_id = keccak256(bytes(uuid_string))`, source fill identity, series id, on-chain option id, buyer/seller, underlying/settlement asset, expiry, strike, call/put flag, contract size, converted quantity, source price/size, converted premium, maker flag, buyer/seller nonces, deadline, optional signatures, optional calldata, status, error, nullable simulation result fields, and timestamps. V1D defaults buyer and seller nonces to `0` and deadline to `0` because on-chain `OptionMatchingEngine.nonces` sync is deferred.
+Intent state stores the backend UUID, derived `onchain_intent_id = keccak256(bytes(uuid_string))`, source fill identity, series id, on-chain option id, buyer/seller, underlying/settlement asset, expiry, strike, call/put flag, contract size, converted quantity, source price/size, converted premium, maker flag, buyer/seller nonces, deadline, optional signatures, optional calldata, status, error, nullable simulation result fields, and timestamps. With `OPTION_NONCE_SYNC_ENABLED=false`, buyer and seller nonces default to `0`. With `OPTION_NONCE_SYNC_ENABLED=true`, creation reads `OptionMatchingEngine.nonces(address)` for both parties and stores those values before any signing payload or calldata is produced.
 
 Endpoints:
 
@@ -254,6 +257,7 @@ POST /options/execution-intents/:intent_id/signatures
 GET /options/execution-intents/:intent_id/calldata
 POST /options/execution-intents/:intent_id/simulate
 GET /options/execution-intents/:intent_id/simulation
+GET /accounts/:address/option-nonce
 ```
 
 The signing-payload endpoint returns the independent option execution EIP-712 domain and a digest for:
@@ -264,9 +268,11 @@ OptionTrade(bytes32 intentId,address buyer,address seller,uint256 optionId,addre
 
 The signature endpoint stores buyer and seller signatures. In disabled signature mode it validates only 65-byte `0x` signature shape. In strict mode it recovers the EIP-712 signer from the `OptionTrade` digest and requires buyer signature equality with `buyer` and seller signature equality with `seller`. Once both signatures are present, the calldata builder encodes `OptionMatchingEngine.executeTrade(OptionTrade,bytes,bytes)` and marks the intent `calldata_ready`.
 
+The option nonce endpoint performs `eth_call` to `OPTION_MATCHING_ENGINE_ADDRESS` with `data=nonces(address)`, `value=0`, and the zero address as `from`. It returns `source=onchain` and the nonce as a decimal string. It is read-only and does not require a private key. When `OPTION_NONCE_SYNC_STRICT=true`, intent creation fails if either nonce read fails and no option execution intent is inserted. Non-strict mode falls back to zero nonces and is documented as local-development only.
+
 The simulation endpoint validates an existing calldata-ready intent and performs `eth_call` to `OPTION_MATCHING_ENGINE_ADDRESS` with `data=intent.calldata`, `value=0`, optional configured gas, and `from=OPTION_EXECUTION_SIMULATION_FROM` or `EXECUTOR_FROM_ADDRESS`. It persists `simulation_ok`, `simulation_failed`, or `simulation_unavailable` with error/revert data and block number where available. Because `OptionMatchingEngine.executeTrade` is executor-gated, the simulation sender must be an allowed executor on-chain or the call will revert.
 
-V1D safety boundaries are explicit: it does not call `/executor/broadcast`, does not create `execution_transactions`, does not fabricate tx hashes, does not use private keys, does not call live RPC in normal tests, and does not set submitted or confirmed statuses. Indexing, reconciliation, confirmation, on-chain option nonce sync, and option exercise/settlement workflows remain deferred. No option execution broadcast, Greek, IV, risk-cache, settlement, or exercise behavior exists in V1D.
+V1E safety boundaries are explicit: it does not call `/executor/broadcast`, does not create `execution_transactions`, does not fabricate tx hashes, does not use private keys, does not call live RPC in normal tests, and does not set submitted or confirmed statuses. Indexing, reconciliation, confirmation, and option exercise/settlement workflows remain deferred. No option execution broadcast, Greek, IV, risk-cache, settlement, or exercise behavior exists in V1E.
 
 ## RFQ V1C
 
@@ -538,6 +544,8 @@ Prepared execution calls remain non-broadcastable in this phase. `is_broadcastab
 Simulation V1 is a manual safety check exposed by `POST /executor/simulate/:intent_id`. It loads the intent and stored PerpTrade signatures, rebuilds the same `executeTrade` calldata, and performs `eth_call` from `EXECUTOR_FROM_ADDRESS` or the zero address to `PERP_MATCHING_ENGINE_ADDRESS`. A successful call marks the intent `simulation_ok`; a revert or RPC failure marks it `simulation_failed` with the error text. Revert Diagnostics V1 extracts revert data from common JSON-RPC error shapes, decodes Solidity `Error(string)` and `Panic(uint256)`, maps known custom-error selectors such as `InvalidSignature`, `NotAuthorized`, `InsufficientMargin`, and `OracleStale`, and persists the raw data, selector, and decoded JSON on the simulation row. These statuses and diagnostics are a safety gate before real broadcast; they are not submission, confirmation, settlement, or finality.
 
 Option Execution Simulation V1D is separate from the perp executor and is exposed by `POST /options/execution-intents/:intent_id/simulate` plus `GET /options/execution-intents/:intent_id/simulation`. It uses the existing `EthCallProvider` abstraction to call `OPTION_MATCHING_ENGINE_ADDRESS` with stored option calldata and no value. It stores only option simulation fields on `option_execution_intents`; it does not create `execution_transactions`, does not call `/executor/broadcast`, does not submit transactions, and does not affect submitted or confirmed lifecycle state.
+
+Option Nonce Sync V1E is also separate from the perp executor. It exposes `GET /accounts/:address/option-nonce` and uses the same `EthCallProvider` abstraction to call `OptionMatchingEngine.nonces(address)`. When enabled, new option execution intents store synced buyer/seller nonces and downstream signing/calldata paths use those stored values unchanged. It never signs, broadcasts, or creates transaction rows.
 
 Real Broadcast V1 is exposed through `POST /executor/broadcast/:intent_id`, `GET /executor/transactions`, and `GET /executor/transactions/:intent_id`. With `EXECUTOR_REAL_BROADCAST_ENABLED=false`, the broadcast endpoint returns a disabled refusal with `submitted=false`, `confirmed=false`, and no tx hash. The transaction request builder requires both PerpTrade signatures, non-empty `executeTrade` calldata, a configured matching-engine target, static EIP-1559 fee values, and `simulation_ok` when required.
 

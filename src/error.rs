@@ -75,6 +75,8 @@ pub enum BackendError {
     NonceAlreadyUsed,
     #[error("perp nonce sync is disabled")]
     PerpNonceSyncDisabled,
+    #[error("option nonce sync is disabled")]
+    OptionNonceSyncDisabled,
     #[error("perp nonce mismatch: expected on-chain nonce {expected}, got {got}")]
     PerpNonceMismatch { expected: u64, got: u64 },
     #[error("malformed signature")]

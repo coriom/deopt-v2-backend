@@ -79,6 +79,9 @@ OPTION_EXECUTION_CHAIN_ID=84532
 OPTION_EXECUTION_EIP712_NAME=DeOptV2-OptionMatchingEngine
 OPTION_EXECUTION_EIP712_VERSION=1
 OPTION_EXECUTION_DEFAULT_SETTLEMENT_DECIMALS=6
+OPTION_NONCE_SYNC_ENABLED=false
+OPTION_NONCE_SYNC_REQUIRE_RPC=true
+OPTION_NONCE_SYNC_STRICT=true
 OPTION_EXECUTION_SIMULATION_ENABLED=false
 OPTION_EXECUTION_REQUIRE_RPC_FOR_SIMULATION=true
 OPTION_EXECUTION_SIMULATION_GAS_LIMIT=0
@@ -388,7 +391,19 @@ The signing payload endpoint returns the `OptionMatchingEngine` EIP-712 domain, 
 OptionTrade(bytes32 intentId,address buyer,address seller,uint256 optionId,address underlying,address settlementAsset,uint64 expiry,uint64 strike1e8,bool isCall,uint128 contractSize1e8,uint128 quantity,uint128 premiumPerContract,bool buyerIsMaker,uint256 buyerNonce,uint256 sellerNonce,uint256 deadline)
 ```
 
-`intentId` is `keccak256(bytes(option_execution_intent_uuid_string))`. `quantity` is whole contracts, not `1e8` fixed point. `premiumPerContract` is settlement-token native units per contract. Current V1C defaults buyer/seller nonces to `0` and deadline to `0`; on-chain nonce sync is deferred. Once both buyer and seller signatures are stored, the calldata endpoint builds `OptionMatchingEngine.executeTrade(OptionTrade,bytes,bytes)` calldata and leaves the intent at `calldata_ready`.
+`intentId` is `keccak256(bytes(option_execution_intent_uuid_string))`. `quantity` is whole contracts, not `1e8` fixed point. `premiumPerContract` is settlement-token native units per contract. With `OPTION_NONCE_SYNC_ENABLED=false`, buyer/seller nonces default to `0` to preserve the V1C/V1D flow. With `OPTION_NONCE_SYNC_ENABLED=true`, intent creation reads `OptionMatchingEngine.nonces(address)` for buyer and seller and stores those values on the intent. The signing payload and calldata builder use the stored nonces and signature submission does not mutate them. Once both buyer and seller signatures are stored, the calldata endpoint builds `OptionMatchingEngine.executeTrade(OptionTrade,bytes,bytes)` calldata and leaves the intent at `calldata_ready`.
+
+Option nonce sync V1E is enabled separately:
+
+```text
+OPTION_NONCE_SYNC_ENABLED=true
+OPTION_NONCE_SYNC_REQUIRE_RPC=true
+OPTION_NONCE_SYNC_STRICT=true
+RPC_URL=https://...
+OPTION_MATCHING_ENGINE_ADDRESS=0x...
+```
+
+`GET /accounts/:address/option-nonce` reads `OptionMatchingEngine.nonces(address)` with `eth_call` only and returns the account, option matching engine, nonce string, and `source=onchain`. When `OPTION_NONCE_SYNC_REQUIRE_RPC=true`, startup rejects enabled option nonce sync unless `RPC_URL` and a valid nonzero `OPTION_MATCHING_ENGINE_ADDRESS` are configured. When strict mode is enabled, option execution intent creation fails if either buyer or seller nonce cannot be read and no option execution intent is created. Non-strict mode falls back to zero nonces and is intended only for local development.
 
 Option execution simulation V1D is enabled separately with `OPTION_EXECUTION_SIMULATION_ENABLED=true`. `POST /options/execution-intents/:intent_id/simulate` requires an existing intent, both signatures, stored calldata, a nonzero `OPTION_MATCHING_ENGINE_ADDRESS`, and `RPC_URL` when `OPTION_EXECUTION_REQUIRE_RPC_FOR_SIMULATION=true`. It performs `eth_call` to `OPTION_MATCHING_ENGINE_ADDRESS` with `data=intent.calldata`, `value=0`, optional `gas` from `OPTION_EXECUTION_SIMULATION_GAS_LIMIT`, and `from=OPTION_EXECUTION_SIMULATION_FROM` or `EXECUTOR_FROM_ADDRESS`. `OptionMatchingEngine.executeTrade` is executor-gated, so the simulated `from` address must be allowed on-chain or the call will revert. The result is stored on `option_execution_intents` as `simulation_status`, `simulation_error`, `simulation_block_number`, `simulation_revert_data`, `simulation_revert_selector`, and `simulated_at_ms`. `GET /options/execution-intents/:intent_id/simulation` returns the persisted result, or `simulation_pending` before any simulation. Option simulation never calls `/executor/broadcast`, never creates `execution_transactions`, never submits transactions, never fabricates tx hashes, and never marks option intents submitted or confirmed.
 
@@ -875,6 +890,16 @@ OPTION_MATCHING_ENGINE_ADDRESS=0x...
 
 `POST /options/execution-intents/<intent_id>/simulate` runs `eth_call` only for calldata-ready option execution intents. Success stores `simulation_ok` with the RPC block number when available; reverts or RPC errors store `simulation_failed` plus raw revert data and selector when the provider returns them; unavailable local preconditions store `simulation_unavailable`. The option intent remains an off-chain artifact and no option broadcast endpoint exists.
 
+Option nonce sync uses a separate read endpoint and does not submit transactions:
+
+```text
+OPTION_NONCE_SYNC_ENABLED=true
+OPTION_NONCE_SYNC_REQUIRE_RPC=true
+OPTION_NONCE_SYNC_STRICT=true
+```
+
+`GET /accounts/<address>/option-nonce` performs `eth_call` to `OptionMatchingEngine.nonces(address)` using `RPC_URL` and `OPTION_MATCHING_ENGINE_ADDRESS`. It never requires a private key. Synced buyer/seller nonces are stored on new option execution intents and are then used unchanged by signing payloads and calldata generation.
+
 ## Real Broadcast V1
 
 Broadcast V1 is disabled by default and only submits when explicitly enabled:
@@ -1027,6 +1052,7 @@ curl http://127.0.0.1:8080/health
 curl http://127.0.0.1:8080/markets
 curl http://127.0.0.1:8080/orderbook/1
 curl http://127.0.0.1:8080/accounts/0x0000000000000000000000000000000000000001/perp-nonce
+curl http://127.0.0.1:8080/accounts/0x0000000000000000000000000000000000000001/option-nonce
 curl http://127.0.0.1:8080/execution-intents
 curl http://127.0.0.1:8080/options/execution-intents
 ```
@@ -1083,3 +1109,13 @@ curl -X DELETE http://127.0.0.1:8080/orders/<order_id>
 ## Deferred Execution Work
 
 - Add background confirmation polling, transaction ownership proofs beyond persisted broadcast rows, gas estimation, fee discovery, retries, nonce reservation, and deep reorg rollback.
+
+
+
+
+## ⚖️ License
+
+This repository is part of the **deopt** ecosystem and is licensed under the **Business Source License 1.1** (BSL 1.1).
+
+* **Non-Production & Educational use** is fully authorized.
+* **Commercial & Production use** is strictly prohibited until **May 20, 2030**, after which the code will automatically transition to the **GNU General Public License v3.0 (GPL-3.0)**.

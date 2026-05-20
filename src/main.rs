@@ -15,6 +15,7 @@ async fn main() -> deopt_v2_backend::Result<()> {
         .execution
         .validate_startup(config.persistence_enabled)?;
     config.perp_nonce_sync.validate_startup()?;
+    config.option_nonce_sync.validate_startup()?;
     config
         .indexer
         .validate_startup(config.persistence_enabled)?;
@@ -56,6 +57,7 @@ async fn main() -> deopt_v2_backend::Result<()> {
         repository.clone(),
         config.execution.clone(),
         config.perp_nonce_sync.clone(),
+        config.option_nonce_sync.clone(),
         config.confirmation.clone(),
         config.indexer.clone(),
         config.reconciliation.clone(),

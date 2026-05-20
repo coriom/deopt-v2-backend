@@ -20,11 +20,12 @@ use super::{
 use crate::api::AppState;
 use crate::error::{BackendError, Result};
 use crate::execution::transaction::hex_0x;
-use crate::execution::EthCallProvider;
+use crate::execution::{EthCallProvider, HttpJsonRpcProvider};
 use crate::mm::protocol::{
     NotificationEnvelope, OptionRfqQuoteAcceptedPayload, OptionRfqQuoteRejectedPayload,
     OptionRfqRequestPayload, ServerMessage,
 };
+use crate::nonce_sync::{read_option_nonce_value, OptionNonceProvider};
 use crate::signing::eip712::parse_evm_address;
 use crate::signing::recover_eip712_signer;
 use crate::signing::signature::validate_signature_shape;
@@ -1090,11 +1091,26 @@ pub async fn create_option_orderbook_execution_intent(
     state: &AppState,
     fill: &OptionFill,
 ) -> Result<Option<OptionExecutionIntent>> {
+    let provider = option_nonce_provider(state)?;
+    create_option_orderbook_execution_intent_with_nonce_provider(state, fill, provider.as_ref())
+        .await
+}
+
+async fn create_option_orderbook_execution_intent_with_nonce_provider<P>(
+    state: &AppState,
+    fill: &OptionFill,
+    nonce_provider: Option<&P>,
+) -> Result<Option<OptionExecutionIntent>>
+where
+    P: OptionNonceProvider,
+{
     if !state.options_config.execution_enabled {
         return Ok(None);
     }
     let series = get_option_series(state, &fill.option_series_id).await?;
     let buyer_is_maker = fill.maker_order_id == fill.buy_order_id;
+    let (buyer_nonce, seller_nonce) =
+        option_execution_nonces(state, nonce_provider, &fill.buyer, &fill.seller).await?;
     let intent = build_option_execution_intent(
         state,
         &series,
@@ -1105,6 +1121,8 @@ pub async fn create_option_orderbook_execution_intent(
         fill.price_1e8,
         fill.size_1e8,
         buyer_is_maker,
+        buyer_nonce,
+        seller_nonce,
         fill.created_at_ms,
     )?;
     insert_option_execution_intent(state, intent)
@@ -1116,11 +1134,25 @@ pub async fn create_option_rfq_execution_intent(
     state: &AppState,
     fill: &OptionRfqFill,
 ) -> Result<Option<OptionExecutionIntent>> {
+    let provider = option_nonce_provider(state)?;
+    create_option_rfq_execution_intent_with_nonce_provider(state, fill, provider.as_ref()).await
+}
+
+async fn create_option_rfq_execution_intent_with_nonce_provider<P>(
+    state: &AppState,
+    fill: &OptionRfqFill,
+    nonce_provider: Option<&P>,
+) -> Result<Option<OptionExecutionIntent>>
+where
+    P: OptionNonceProvider,
+{
     if !state.options_config.execution_enabled {
         return Ok(None);
     }
     let series = get_option_series(state, &fill.option_series_id).await?;
     let buyer_is_maker = fill.buyer.0.eq_ignore_ascii_case(&fill.mm_account.0);
+    let (buyer_nonce, seller_nonce) =
+        option_execution_nonces(state, nonce_provider, &fill.buyer, &fill.seller).await?;
     let intent = build_option_execution_intent(
         state,
         &series,
@@ -1131,6 +1163,8 @@ pub async fn create_option_rfq_execution_intent(
         fill.price_1e8,
         fill.size_1e8,
         buyer_is_maker,
+        buyer_nonce,
+        seller_nonce,
         fill.created_at_ms,
     )?;
     insert_option_execution_intent(state, intent)
@@ -1182,6 +1216,57 @@ async fn persist_option_execution_simulation_result(
         .lock()
         .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?
         .persist_option_execution_simulation_result(result)
+}
+
+fn option_nonce_provider(state: &AppState) -> Result<Option<HttpJsonRpcProvider>> {
+    if !state.option_nonce_sync_config.enabled {
+        return Ok(None);
+    }
+    Ok(state
+        .option_nonce_sync_config
+        .rpc_url
+        .clone()
+        .map(HttpJsonRpcProvider::new))
+}
+
+async fn option_execution_nonces<P>(
+    state: &AppState,
+    nonce_provider: Option<&P>,
+    buyer: &AccountId,
+    seller: &AccountId,
+) -> Result<(u128, u128)>
+where
+    P: OptionNonceProvider,
+{
+    if !state.option_nonce_sync_config.enabled {
+        return Ok((0, 0));
+    }
+
+    let result = async {
+        let provider = nonce_provider.ok_or_else(|| {
+            BackendError::Config("RPC_URL is required for option nonce sync".to_string())
+        })?;
+        let buyer_nonce =
+            read_option_nonce_value(&state.option_nonce_sync_config, provider, buyer).await?;
+        let seller_nonce =
+            read_option_nonce_value(&state.option_nonce_sync_config, provider, seller).await?;
+        Ok((buyer_nonce, seller_nonce))
+    }
+    .await;
+
+    match result {
+        Ok(nonces) => Ok(nonces),
+        Err(error) if state.option_nonce_sync_config.strict => Err(error),
+        Err(error) => {
+            warn!(
+                buyer = %buyer.0,
+                seller = %seller.0,
+                error = %error,
+                "option nonce sync failed in non-strict mode; falling back to zero nonces"
+            );
+            Ok((0, 0))
+        }
+    }
 }
 
 fn validate_option_execution_simulation_preflight(
@@ -1268,6 +1353,8 @@ fn build_option_execution_intent(
     source_price_1e8: Price1e8,
     source_size_1e8: Size1e8,
     buyer_is_maker: bool,
+    buyer_nonce: u128,
+    seller_nonce: u128,
     source_created_at_ms: TimestampMs,
 ) -> Result<OptionExecutionIntent> {
     let metadata = validate_executable_option_series(state, series)?;
@@ -1299,8 +1386,8 @@ fn build_option_execution_intent(
         source_price_1e8,
         premium_per_contract_native,
         buyer_is_maker,
-        buyer_nonce: Some(0),
-        seller_nonce: Some(0),
+        buyer_nonce: Some(buyer_nonce),
+        seller_nonce: Some(seller_nonce),
         deadline: 0,
         buyer_signature: None,
         seller_signature: None,
@@ -1886,6 +1973,7 @@ mod tests {
     use crate::engine::EngineState;
     use crate::execution::rpc::{EthCallRequest, EthCallSuccess, RpcFuture};
     use crate::execution::{DecodedRevertError, RevertDiagnostics};
+    use crate::nonce_sync::OptionNonceSyncConfig;
     use crate::options::{OptionExecutionSimulationStatus, OptionsConfig};
     use std::sync::{Arc, Mutex};
 
@@ -1899,6 +1987,14 @@ mod tests {
     struct MockProvider {
         outcome: MockOutcome,
         calls: Arc<Mutex<Vec<EthCallRequest>>>,
+    }
+
+    #[derive(Clone)]
+    struct MockOptionNonceProvider {
+        buyer_nonce: u128,
+        seller_nonce: u128,
+        fail: bool,
+        calls: Arc<Mutex<Vec<AccountId>>>,
     }
 
     impl MockProvider {
@@ -1928,6 +2024,30 @@ mod tests {
         }
     }
 
+    impl MockOptionNonceProvider {
+        fn success(buyer_nonce: u128, seller_nonce: u128) -> Self {
+            Self {
+                buyer_nonce,
+                seller_nonce,
+                fail: false,
+                calls: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn failure() -> Self {
+            Self {
+                buyer_nonce: 0,
+                seller_nonce: 0,
+                fail: true,
+                calls: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn calls(&self) -> Vec<AccountId> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
     impl EthCallProvider for MockProvider {
         fn eth_call(&self, request: EthCallRequest) -> RpcFuture<'_, EthCallSuccess> {
             let outcome = self.outcome.clone();
@@ -1945,6 +2065,159 @@ mod tests {
                 }
             })
         }
+    }
+
+    impl OptionNonceProvider for MockOptionNonceProvider {
+        fn option_matching_nonce(
+            &self,
+            _matching_engine: AccountId,
+            account: AccountId,
+        ) -> RpcFuture<'_, u128> {
+            let calls = self.calls.clone();
+            let buyer_nonce = self.buyer_nonce;
+            let seller_nonce = self.seller_nonce;
+            let fail = self.fail;
+            Box::pin(async move {
+                calls.lock().unwrap().push(account.clone());
+                if fail {
+                    return Err(BackendError::Simulation(
+                        "option nonce RPC unavailable".to_string(),
+                    ));
+                }
+                if account.0.ends_with("0001") {
+                    Ok(buyer_nonce)
+                } else {
+                    Ok(seller_nonce)
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn option_nonce_sync_disabled_preserves_zero_intent_nonces() {
+        let state = state_with_simulation(false);
+        insert_executable_series(&state);
+        let fill = orderbook_fill();
+
+        let intent = create_option_orderbook_execution_intent_with_nonce_provider::<
+            MockOptionNonceProvider,
+        >(&state, &fill, None)
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(intent.buyer_nonce, Some(0));
+        assert_eq!(intent.seller_nonce, Some(0));
+    }
+
+    #[tokio::test]
+    async fn option_execution_intent_uses_synced_option_nonces() {
+        let state = state_with_option_nonce_sync(true);
+        insert_executable_series(&state);
+        let provider = MockOptionNonceProvider::success(17, 23);
+        let fill = orderbook_fill();
+
+        let intent = create_option_orderbook_execution_intent_with_nonce_provider(
+            &state,
+            &fill,
+            Some(&provider),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(intent.buyer_nonce, Some(17));
+        assert_eq!(intent.seller_nonce, Some(23));
+        let calls = provider.calls();
+        assert_eq!(calls, vec![fill.buyer, fill.seller]);
+    }
+
+    #[tokio::test]
+    async fn strict_option_nonce_sync_failure_does_not_create_intent() {
+        let state = state_with_option_nonce_sync(true);
+        insert_executable_series(&state);
+        let fill = orderbook_fill();
+        let provider = MockOptionNonceProvider::failure();
+
+        let error = create_option_orderbook_execution_intent_with_nonce_provider(
+            &state,
+            &fill,
+            Some(&provider),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("option nonce RPC unavailable"));
+        assert!(state
+            .options_store
+            .lock()
+            .unwrap()
+            .list_option_execution_intents()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn non_strict_option_nonce_sync_failure_falls_back_to_zero() {
+        let state = state_with_option_nonce_sync(false);
+        insert_executable_series(&state);
+        let provider = MockOptionNonceProvider::failure();
+
+        let intent = create_option_orderbook_execution_intent_with_nonce_provider(
+            &state,
+            &orderbook_fill(),
+            Some(&provider),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(intent.buyer_nonce, Some(0));
+        assert_eq!(intent.seller_nonce, Some(0));
+    }
+
+    #[tokio::test]
+    async fn option_execution_signing_payload_uses_stored_synced_nonces() {
+        let state = state_with_simulation(false);
+        let mut intent = calldata_ready_intent();
+        intent.buyer_nonce = Some(17);
+        intent.seller_nonce = Some(23);
+        let intent = insert_intent(&state, intent);
+
+        let outcome = option_execution_signing_payload(&state, intent.intent_id)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.payload.buyer_nonce, 17);
+        assert_eq!(outcome.payload.seller_nonce, 23);
+    }
+
+    #[tokio::test]
+    async fn option_execution_calldata_uses_stored_synced_nonces() {
+        let state = state_with_simulation(false);
+        let mut intent = calldata_ready_intent();
+        intent.buyer_nonce = Some(17);
+        intent.seller_nonce = Some(23);
+        intent.calldata = None;
+        intent.status = OptionExecutionIntentStatus::SignaturesRequired;
+        intent.buyer_signature = Some(signature_hex(0xaa));
+        intent.seller_signature = Some(signature_hex(0xbb));
+        let expected_payload = OptionTradePayload::from_intent(&intent).unwrap();
+        let expected_calldata = build_option_execution_calldata_from_parts(
+            &expected_payload,
+            intent.buyer_signature.as_deref().unwrap(),
+            intent.seller_signature.as_deref().unwrap(),
+        )
+        .unwrap();
+        let intent = insert_intent(&state, intent);
+
+        let outcome = option_execution_calldata(&state, intent.intent_id)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome.calldata.as_deref(),
+            Some(expected_calldata.as_str())
+        );
     }
 
     #[tokio::test]
@@ -2080,6 +2353,59 @@ mod tests {
         AppState::with_options_config(EngineState::with_default_markets(), options_config)
     }
 
+    fn state_with_option_nonce_sync(strict: bool) -> AppState {
+        let mut state = state_with_simulation(false);
+        state.option_nonce_sync_config = OptionNonceSyncConfig {
+            enabled: true,
+            require_rpc: true,
+            strict,
+            rpc_url: Some("http://127.0.0.1:8545".to_string()),
+            option_matching_engine_address: state.options_config.matching_engine_address.clone(),
+        };
+        state
+    }
+
+    fn insert_executable_series(state: &AppState) {
+        state
+            .options_store
+            .lock()
+            .unwrap()
+            .insert_series(OptionSeries {
+                option_series_id: "series-1".to_string(),
+                underlying: "0x0000000000000000000000000000000000000010".to_string(),
+                base_asset: "ETH".to_string(),
+                quote_asset: "USDC".to_string(),
+                settlement_asset: "0x0000000000000000000000000000000000000020".to_string(),
+                expiry: 4_102_444_800,
+                strike_1e8: 300_000_000_000,
+                is_call: true,
+                contract_size_1e8: 100_000_000,
+                status: OptionSeriesStatus::Active,
+                source: OptionSeriesSource::Manual,
+                onchain_product_id: None,
+                onchain_series_id: Some("1".to_string()),
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            });
+    }
+
+    fn orderbook_fill() -> OptionFill {
+        OptionFill {
+            fill_id: Uuid::from_u128(101),
+            option_series_id: "series-1".to_string(),
+            buy_order_id: OrderId(Uuid::from_u128(201)),
+            sell_order_id: OrderId(Uuid::from_u128(202)),
+            buyer: AccountId::new("0x0000000000000000000000000000000000000001"),
+            seller: AccountId::new("0x0000000000000000000000000000000000000002"),
+            maker_order_id: OrderId(Uuid::from_u128(202)),
+            taker_order_id: OrderId(Uuid::from_u128(201)),
+            taker_side: Side::Buy,
+            price_1e8: 10_000_000,
+            size_1e8: 100_000_000,
+            created_at_ms: 123,
+        }
+    }
+
     fn insert_intent(state: &AppState, intent: OptionExecutionIntent) -> OptionExecutionIntent {
         state
             .options_store
@@ -2127,5 +2453,13 @@ mod tests {
             created_at_ms: 1,
             updated_at_ms: 1,
         }
+    }
+
+    fn signature_hex(byte: u8) -> String {
+        let mut signature = String::from("0x");
+        for _ in 0..65 {
+            signature.push_str(&format!("{byte:02x}"));
+        }
+        signature
     }
 }

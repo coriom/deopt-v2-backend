@@ -6,7 +6,7 @@ use crate::execution::{ExecutionConfig, StoredTradeSignatures};
 use crate::fees::{FeeLedgerStore, FeesConfig};
 use crate::indexer::IndexerConfig;
 use crate::mm::{MmGatewayConfig, MmPermissionsConfig, MmPermissionsStore, MmSessionRegistry};
-use crate::nonce_sync::PerpNonceSyncConfig;
+use crate::nonce_sync::{OptionNonceSyncConfig, PerpNonceSyncConfig};
 use crate::options::{OptionSeriesStore, OptionsConfig};
 use crate::reconciliation::ReconciliationConfig;
 use crate::rfq::{RfqConfig, RfqStore};
@@ -28,6 +28,7 @@ pub struct AppState {
     pub repository: Option<PgRepository>,
     pub execution_config: ExecutionConfig,
     pub perp_nonce_sync_config: PerpNonceSyncConfig,
+    pub option_nonce_sync_config: OptionNonceSyncConfig,
     pub confirmation_config: ConfirmationConfig,
     pub indexer_config: IndexerConfig,
     pub reconciliation_config: ReconciliationConfig,
@@ -150,6 +151,7 @@ impl AppState {
             repository,
             execution_config,
             PerpNonceSyncConfig::disabled(),
+            OptionNonceSyncConfig::disabled(),
             ConfirmationConfig::disabled(),
             indexer_config,
             reconciliation_config,
@@ -168,6 +170,7 @@ impl AppState {
         repository: Option<PgRepository>,
         execution_config: ExecutionConfig,
         perp_nonce_sync_config: PerpNonceSyncConfig,
+        option_nonce_sync_config: OptionNonceSyncConfig,
         confirmation_config: ConfirmationConfig,
         indexer_config: IndexerConfig,
         reconciliation_config: ReconciliationConfig,
@@ -188,6 +191,7 @@ impl AppState {
             repository,
             execution_config,
             perp_nonce_sync_config,
+            option_nonce_sync_config,
             confirmation_config,
             indexer_config,
             reconciliation_config,
@@ -215,6 +219,7 @@ impl AppState {
             None,
             ExecutionConfig::disabled(),
             PerpNonceSyncConfig::disabled(),
+            OptionNonceSyncConfig::disabled(),
             ConfirmationConfig::disabled(),
             IndexerConfig::disabled(),
             ReconciliationConfig::disabled(),
@@ -233,6 +238,7 @@ impl AppState {
             None,
             ExecutionConfig::disabled(),
             PerpNonceSyncConfig::disabled(),
+            OptionNonceSyncConfig::disabled(),
             ConfirmationConfig::disabled(),
             IndexerConfig::disabled(),
             ReconciliationConfig::disabled(),
@@ -255,6 +261,7 @@ impl AppState {
             None,
             ExecutionConfig::disabled(),
             PerpNonceSyncConfig::disabled(),
+            OptionNonceSyncConfig::disabled(),
             ConfirmationConfig::disabled(),
             IndexerConfig::disabled(),
             ReconciliationConfig::disabled(),

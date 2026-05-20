@@ -6,7 +6,7 @@ use crate::fees::{FeesConfig, OptionFeeBasis};
 use crate::indexer::IndexerConfig;
 use crate::mm::transport::webtransport::validate_webtransport_startup;
 use crate::mm::{MmGatewayConfig, MmPermissionsConfig};
-use crate::nonce_sync::PerpNonceSyncConfig;
+use crate::nonce_sync::{OptionNonceSyncConfig, PerpNonceSyncConfig};
 use crate::options::OptionsConfig;
 use crate::reconciliation::ReconciliationConfig;
 use crate::rfq::RfqConfig;
@@ -25,6 +25,7 @@ pub struct AppConfig {
     pub network_name: String,
     pub execution: ExecutionConfig,
     pub perp_nonce_sync: PerpNonceSyncConfig,
+    pub option_nonce_sync: OptionNonceSyncConfig,
     pub confirmation: ConfirmationConfig,
     pub indexer: IndexerConfig,
     pub reconciliation: ReconciliationConfig,
@@ -315,6 +316,13 @@ impl AppConfig {
             rpc_url: execution.rpc_url.clone(),
             perp_matching_engine_address: execution.perp_matching_engine_address.clone(),
         };
+        let option_nonce_sync = OptionNonceSyncConfig {
+            enabled: parse_env(&mut lookup, "OPTION_NONCE_SYNC_ENABLED", "false")?,
+            require_rpc: parse_env(&mut lookup, "OPTION_NONCE_SYNC_REQUIRE_RPC", "true")?,
+            strict: parse_env(&mut lookup, "OPTION_NONCE_SYNC_STRICT", "true")?,
+            rpc_url: execution.rpc_url.clone(),
+            option_matching_engine_address: options.matching_engine_address.clone(),
+        };
         let signature_verification_mode =
             parse_env(&mut lookup, "SIGNATURE_VERIFICATION_MODE", "disabled")?;
         let eip712_domain = Eip712Domain {
@@ -337,6 +345,7 @@ impl AppConfig {
         }
         execution.validate_startup(persistence_enabled)?;
         perp_nonce_sync.validate_startup()?;
+        option_nonce_sync.validate_startup()?;
         indexer.validate_startup(persistence_enabled)?;
         reconciliation.validate_startup(persistence_enabled)?;
         confirmation.validate_startup(persistence_enabled)?;
@@ -356,6 +365,7 @@ impl AppConfig {
             network_name,
             execution,
             perp_nonce_sync,
+            option_nonce_sync,
             confirmation,
             indexer,
             reconciliation,
@@ -512,6 +522,20 @@ mod tests {
     }
 
     #[test]
+    fn option_nonce_sync_uses_safe_defaults() {
+        let config = config_from_pairs([("OPTION_NONCE_SYNC_ENABLED", "false")]).unwrap();
+
+        assert!(!config.option_nonce_sync.enabled);
+        assert!(config.option_nonce_sync.require_rpc);
+        assert!(config.option_nonce_sync.strict);
+        assert_eq!(config.option_nonce_sync.rpc_url, None);
+        assert_eq!(
+            config.option_nonce_sync.option_matching_engine_address.0,
+            ""
+        );
+    }
+
+    #[test]
     fn perp_nonce_sync_enabled_requires_rpc_when_required() {
         let error = config_from_pairs([
             ("PERP_NONCE_SYNC_ENABLED", "true"),
@@ -552,6 +576,50 @@ mod tests {
 
         assert!(config.perp_nonce_sync.enabled);
         assert!(!config.perp_nonce_sync.require_rpc);
+    }
+
+    #[test]
+    fn option_nonce_sync_enabled_requires_rpc_when_required() {
+        let error = config_from_pairs([
+            ("OPTION_NONCE_SYNC_ENABLED", "true"),
+            ("OPTION_NONCE_SYNC_REQUIRE_RPC", "true"),
+            (
+                "OPTION_MATCHING_ENGINE_ADDRESS",
+                "0x00000000000000000000000000000000000000ee",
+            ),
+        ])
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("RPC_URL is required for option nonce sync"));
+    }
+
+    #[test]
+    fn option_nonce_sync_enabled_requires_matching_engine_when_required() {
+        let error = config_from_pairs([
+            ("OPTION_NONCE_SYNC_ENABLED", "true"),
+            ("OPTION_NONCE_SYNC_REQUIRE_RPC", "true"),
+            ("RPC_URL", "https://example.invalid"),
+        ])
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("OPTION_MATCHING_ENGINE_ADDRESS is required for option nonce sync"));
+    }
+
+    #[test]
+    fn option_nonce_sync_enabled_can_defer_rpc_validation() {
+        let config = config_from_pairs([
+            ("OPTION_NONCE_SYNC_ENABLED", "true"),
+            ("OPTION_NONCE_SYNC_REQUIRE_RPC", "false"),
+        ])
+        .unwrap();
+
+        assert!(config.option_nonce_sync.enabled);
+        assert!(!config.option_nonce_sync.require_rpc);
+        assert!(config.option_nonce_sync.strict);
     }
 
     #[test]
