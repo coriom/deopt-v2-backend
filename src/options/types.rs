@@ -35,6 +35,11 @@ pub struct OptionsConfig {
     pub execution_signature_mode: OptionExecutionSignatureMode,
     pub execution_eip712_domain: Eip712Domain,
     pub execution_default_settlement_decimals: u32,
+    pub execution_simulation_enabled: bool,
+    pub execution_require_rpc_for_simulation: bool,
+    pub execution_simulation_gas_limit: u64,
+    pub execution_simulation_from: Option<AccountId>,
+    pub execution_simulation_rpc_url: Option<String>,
 }
 
 impl OptionsConfig {
@@ -70,6 +75,11 @@ impl OptionsConfig {
                 verifying_contract: AccountId::new(""),
             },
             execution_default_settlement_decimals: 6,
+            execution_simulation_enabled: false,
+            execution_require_rpc_for_simulation: true,
+            execution_simulation_gas_limit: 0,
+            execution_simulation_from: None,
+            execution_simulation_rpc_url: None,
         }
     }
 
@@ -156,6 +166,26 @@ impl OptionsConfig {
             return Err(BackendError::Config(
                 "OPTION_EXECUTION_DEFAULT_SETTLEMENT_DECIMALS must be <= 38".to_string(),
             ));
+        }
+        if self.execution_simulation_enabled && !self.enabled {
+            return Err(BackendError::Config(
+                "Option execution simulation requires OPTIONS_ENABLED=true".to_string(),
+            ));
+        }
+        if self.execution_simulation_enabled
+            && self.execution_require_rpc_for_simulation
+            && self.execution_simulation_rpc_url.is_none()
+        {
+            return Err(BackendError::Config(
+                "RPC_URL is required when OPTION_EXECUTION_SIMULATION_ENABLED=true and OPTION_EXECUTION_REQUIRE_RPC_FOR_SIMULATION=true".to_string(),
+            ));
+        }
+        if let Some(from) = self.execution_simulation_from.as_ref() {
+            crate::signing::eip712::parse_evm_address(from).map_err(|_| {
+                BackendError::Config(
+                    "OPTION_EXECUTION_SIMULATION_FROM must be a valid address".to_string(),
+                )
+            })?;
         }
         Ok(())
     }
@@ -245,6 +275,38 @@ pub enum OptionExecutionIntentStatus {
     Failed,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OptionExecutionSimulationStatus {
+    SimulationPending,
+    SimulationOk,
+    SimulationFailed,
+    SimulationUnavailable,
+}
+
+impl OptionExecutionSimulationStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SimulationPending => "simulation_pending",
+            Self::SimulationOk => "simulation_ok",
+            Self::SimulationFailed => "simulation_failed",
+            Self::SimulationUnavailable => "simulation_unavailable",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "simulation_pending" => Ok(Self::SimulationPending),
+            "simulation_ok" => Ok(Self::SimulationOk),
+            "simulation_failed" => Ok(Self::SimulationFailed),
+            "simulation_unavailable" => Ok(Self::SimulationUnavailable),
+            other => Err(BackendError::Persistence(format!(
+                "invalid option execution simulation status: {other}"
+            ))),
+        }
+    }
+}
+
 impl OptionExecutionIntentStatus {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -278,6 +340,17 @@ impl OptionExecutionIntentStatus {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct OptionExecutionSimulationResult {
+    pub intent_id: OptionExecutionIntentId,
+    pub simulation_status: OptionExecutionSimulationStatus,
+    pub block_number: Option<u64>,
+    pub error: Option<String>,
+    pub revert_data: Option<String>,
+    pub revert_selector: Option<String>,
+    pub simulated_at_ms: TimestampMs,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct OptionExecutionIntent {
     pub intent_id: OptionExecutionIntentId,
@@ -307,6 +380,12 @@ pub struct OptionExecutionIntent {
     pub calldata: Option<String>,
     pub status: OptionExecutionIntentStatus,
     pub error: Option<String>,
+    pub simulation_status: Option<OptionExecutionSimulationStatus>,
+    pub simulation_error: Option<String>,
+    pub simulation_block_number: Option<u64>,
+    pub simulation_revert_data: Option<String>,
+    pub simulation_revert_selector: Option<String>,
+    pub simulated_at_ms: Option<TimestampMs>,
     pub created_at_ms: TimestampMs,
     pub updated_at_ms: TimestampMs,
 }

@@ -1,6 +1,6 @@
-# Option Execution Backend V1C
+# Option Execution Backend V1D
 
-Backend Option Execution Intents V1C turns option fills into signing and calldata artifacts for Solidity `OptionMatchingEngine`.
+Backend Option Execution Intents V1D turns option fills into signing/calldata artifacts for Solidity `OptionMatchingEngine` and adds safe `eth_call` simulation for calldata-ready intents.
 
 It is disabled by default:
 
@@ -13,6 +13,10 @@ OPTION_EXECUTION_CHAIN_ID=84532
 OPTION_EXECUTION_EIP712_NAME=DeOptV2-OptionMatchingEngine
 OPTION_EXECUTION_EIP712_VERSION=1
 OPTION_EXECUTION_DEFAULT_SETTLEMENT_DECIMALS=6
+OPTION_EXECUTION_SIMULATION_ENABLED=false
+OPTION_EXECUTION_REQUIRE_RPC_FOR_SIMULATION=true
+OPTION_EXECUTION_SIMULATION_GAS_LIMIT=0
+OPTION_EXECUTION_SIMULATION_FROM=
 ```
 
 When enabled, startup requires `OPTIONS_ENABLED=true`. If `OPTION_EXECUTION_REQUIRE_PERSISTENCE=true`, startup also requires `PERSISTENCE_ENABLED=true`. `OPTION_MATCHING_ENGINE_ADDRESS` must be a valid nonzero EVM address and is used as the EIP-712 verifying contract.
@@ -46,8 +50,41 @@ OptionTrade(bytes32 intentId,address buyer,address seller,uint256 optionId,addre
 
 When both signatures are stored, the backend builds `OptionMatchingEngine.executeTrade(OptionTrade,bytes,bytes)` calldata and marks the option execution intent `calldata_ready`. `GET /options/execution-intents/:intent_id/calldata` returns the stored calldata or builds it from stored signatures.
 
+## Simulation
+
+`POST /options/execution-intents/:intent_id/simulate` is a manual V1D `eth_call` safety check for calldata-ready option execution intents. It is disabled unless `OPTION_EXECUTION_SIMULATION_ENABLED=true`.
+
+Simulation requires:
+
+- existing option execution intent
+- buyer and seller signatures
+- stored calldata
+- nonzero `OPTION_MATCHING_ENGINE_ADDRESS`
+- `RPC_URL` when `OPTION_EXECUTION_REQUIRE_RPC_FOR_SIMULATION=true`
+
+The call uses:
+
+- `to = OPTION_MATCHING_ENGINE_ADDRESS`
+- `data = intent.calldata`
+- `value = 0`
+- optional `gas = OPTION_EXECUTION_SIMULATION_GAS_LIMIT` when nonzero
+- `from = OPTION_EXECUTION_SIMULATION_FROM` when set, otherwise `EXECUTOR_FROM_ADDRESS`
+
+`OptionMatchingEngine.executeTrade` is executor-gated. If the configured `from` address is not an allowed executor on-chain, simulation is expected to fail with a revert.
+
+Results are stored directly on `option_execution_intents`:
+
+- `simulation_status`: `simulation_pending`, `simulation_ok`, `simulation_failed`, or `simulation_unavailable`
+- `simulation_error`
+- `simulation_block_number`
+- `simulation_revert_data`
+- `simulation_revert_selector`
+- `simulated_at_ms`
+
+`GET /options/execution-intents/:intent_id/simulation` returns the persisted result, or `simulation_pending` before a simulation has been run.
+
 ## Safety Boundary
 
-V1C does not broadcast. It does not call `/executor/broadcast`, create `execution_transactions`, fabricate transaction hashes, require private keys, require live RPC for normal tests, or set submitted/confirmed option statuses.
+V1D does not broadcast. Simulation uses `eth_call` only. It does not call `/executor/broadcast`, create `execution_transactions`, fabricate transaction hashes, require private keys, require live RPC for normal tests, or set submitted/confirmed option statuses. Option execution broadcast, indexer, reconciliation, and confirmation remain deferred.
 
-Deferred items include option nonce sync from `OptionMatchingEngine`, option simulation, option indexer/reconciliation/confirmation, on-chain submission, settlement, exercise, and frontend surfaces.
+Deferred items include option nonce sync from `OptionMatchingEngine`, option broadcast, option indexer/reconciliation/confirmation, on-chain submission, settlement, exercise, and frontend surfaces.

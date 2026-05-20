@@ -17,10 +17,11 @@ use crate::monitoring::FeeEventLabels;
 use crate::options::store::status_for_remaining;
 use crate::options::{
     OptionExecutionIntent, OptionExecutionIntentId, OptionExecutionIntentStatus,
-    OptionExecutionSourceType, OptionFill, OptionFillId, OptionOrder, OptionOrderId,
-    OptionOrderStatus, OptionRfqFill, OptionRfqFillId, OptionRfqId, OptionRfqQuote,
-    OptionRfqQuoteId, OptionRfqQuoteSignatureStatus, OptionRfqQuoteStatus, OptionRfqRequest,
-    OptionRfqStatus, OptionSeries, OptionSeriesSource, OptionSeriesStatus,
+    OptionExecutionSimulationResult, OptionExecutionSimulationStatus, OptionExecutionSourceType,
+    OptionFill, OptionFillId, OptionOrder, OptionOrderId, OptionOrderStatus, OptionRfqFill,
+    OptionRfqFillId, OptionRfqId, OptionRfqQuote, OptionRfqQuoteId, OptionRfqQuoteSignatureStatus,
+    OptionRfqQuoteStatus, OptionRfqRequest, OptionRfqStatus, OptionSeries, OptionSeriesSource,
+    OptionSeriesStatus,
 };
 use crate::reconciliation::{
     normalize_onchain_intent_id, ExecutionReconciliation, ReconciliationCounts,
@@ -681,6 +682,8 @@ impl PgRepository {
             "SELECT intent_id, onchain_intent_id, source_type, source_id, option_series_id,
                     onchain_option_id, buyer, seller, quantity_contracts,
                     premium_per_contract_native, buyer_is_maker, status, calldata,
+                    simulation_status, simulation_error, simulation_block_number,
+                    simulation_revert_data, simulation_revert_selector, simulated_at_ms,
                     created_at_ms, updated_at_ms
              FROM option_execution_intents
              ORDER BY created_at_ms DESC, intent_id DESC
@@ -706,6 +709,12 @@ impl PgRepository {
                     "buyer_is_maker": row_get::<bool>(&row, "buyer_is_maker")?,
                     "status": row_get::<String>(&row, "status")?,
                     "calldata_ready": row_get::<Option<String>>(&row, "calldata")?.is_some(),
+                    "simulation_status": row_get::<Option<String>>(&row, "simulation_status")?,
+                    "simulation_error": row_get::<Option<String>>(&row, "simulation_error")?,
+                    "simulation_block_number": row_get::<Option<i64>>(&row, "simulation_block_number")?,
+                    "simulation_revert_data": row_get::<Option<String>>(&row, "simulation_revert_data")?,
+                    "simulation_revert_selector": row_get::<Option<String>>(&row, "simulation_revert_selector")?,
+                    "simulated_at_ms": row_get::<Option<i64>>(&row, "simulated_at_ms")?,
                     "created_at_ms": row_get::<i64>(&row, "created_at_ms")?,
                     "updated_at_ms": row_get::<i64>(&row, "updated_at_ms")?
                 }))
@@ -2055,6 +2064,12 @@ impl PgRepository {
                  seller_signature = COALESCE($3, seller_signature),
                  calldata = COALESCE($4, calldata),
                  status = $5,
+                 simulation_status = NULL,
+                 simulation_error = NULL,
+                 simulation_block_number = NULL,
+                 simulation_revert_data = NULL,
+                 simulation_revert_selector = NULL,
+                 simulated_at_ms = NULL,
                  updated_at_ms = $6
              WHERE intent_id = $1",
         )
@@ -2068,6 +2083,45 @@ impl PgRepository {
         .await
         .map_err(|error| BackendError::Persistence(error.to_string()))?;
         self.get_option_execution_intent(intent_id)
+            .await?
+            .ok_or(BackendError::InvalidOptionExecutionIntentId)
+    }
+
+    pub async fn persist_option_execution_simulation_result(
+        &self,
+        result: &OptionExecutionSimulationResult,
+    ) -> Result<OptionExecutionIntent> {
+        let rows = sqlx::query(
+            "UPDATE option_execution_intents
+             SET simulation_status = $2,
+                 simulation_error = $3,
+                 simulation_block_number = $4,
+                 simulation_revert_data = $5,
+                 simulation_revert_selector = $6,
+                 simulated_at_ms = $7,
+                 updated_at_ms = $7
+             WHERE intent_id = $1",
+        )
+        .bind(result.intent_id.to_string())
+        .bind(result.simulation_status.as_str())
+        .bind(&result.error)
+        .bind(
+            result
+                .block_number
+                .map(|value| u64_to_i64("simulation_block_number", value))
+                .transpose()?,
+        )
+        .bind(&result.revert_data)
+        .bind(&result.revert_selector)
+        .bind(timestamp_to_i64(result.simulated_at_ms))
+        .execute(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?
+        .rows_affected();
+        if rows == 0 {
+            return Err(BackendError::InvalidOptionExecutionIntentId);
+        }
+        self.get_option_execution_intent(result.intent_id)
             .await?
             .ok_or(BackendError::InvalidOptionExecutionIntentId)
     }
@@ -3192,7 +3246,9 @@ fn option_execution_intent_select_sql(suffix: &str) -> String {
                 strike_1e8, is_call, contract_size_1e8, quantity_contracts, source_size_1e8,
                 source_price_1e8, premium_per_contract_native, buyer_is_maker, buyer_nonce,
                 seller_nonce, deadline, buyer_signature, seller_signature, calldata, status,
-                error, created_at_ms, updated_at_ms
+                error, simulation_status, simulation_error, simulation_block_number,
+                simulation_revert_data, simulation_revert_selector, simulated_at_ms,
+                created_at_ms, updated_at_ms
          FROM option_execution_intents {suffix}"
     )
 }
@@ -3205,6 +3261,8 @@ fn option_execution_intent_from_row(row: PgRow) -> Result<OptionExecutionIntent>
     let buyer_nonce: Option<String> = row_get(&row, "buyer_nonce")?;
     let seller_nonce: Option<String> = row_get(&row, "seller_nonce")?;
     let status: String = row_get(&row, "status")?;
+    let simulation_status: Option<String> = row_get(&row, "simulation_status")?;
+    let simulation_block_number: Option<i64> = row_get(&row, "simulation_block_number")?;
     Ok(OptionExecutionIntent {
         intent_id: intent_id.parse().map_err(|error| {
             BackendError::Persistence(format!("invalid option execution intent id: {error}"))
@@ -3285,6 +3343,17 @@ fn option_execution_intent_from_row(row: PgRow) -> Result<OptionExecutionIntent>
         calldata: row_get(&row, "calldata")?,
         status: OptionExecutionIntentStatus::parse(&status)?,
         error: row_get(&row, "error")?,
+        simulation_status: simulation_status
+            .as_deref()
+            .map(OptionExecutionSimulationStatus::parse)
+            .transpose()?,
+        simulation_error: row_get(&row, "simulation_error")?,
+        simulation_block_number: simulation_block_number
+            .map(|value| i64_to_u64_persistence("simulation_block_number", value))
+            .transpose()?,
+        simulation_revert_data: row_get(&row, "simulation_revert_data")?,
+        simulation_revert_selector: row_get(&row, "simulation_revert_selector")?,
+        simulated_at_ms: row_get(&row, "simulated_at_ms")?,
         created_at_ms: row_get(&row, "created_at_ms")?,
         updated_at_ms: row_get(&row, "updated_at_ms")?,
     })

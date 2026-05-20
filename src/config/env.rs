@@ -288,6 +288,25 @@ impl AppConfig {
                 "OPTION_EXECUTION_DEFAULT_SETTLEMENT_DECIMALS",
                 "6",
             )?,
+            execution_simulation_enabled: parse_env(
+                &mut lookup,
+                "OPTION_EXECUTION_SIMULATION_ENABLED",
+                "false",
+            )?,
+            execution_require_rpc_for_simulation: parse_env(
+                &mut lookup,
+                "OPTION_EXECUTION_REQUIRE_RPC_FOR_SIMULATION",
+                "true",
+            )?,
+            execution_simulation_gas_limit: parse_env(
+                &mut lookup,
+                "OPTION_EXECUTION_SIMULATION_GAS_LIMIT",
+                "0",
+            )?,
+            execution_simulation_from: lookup("OPTION_EXECUTION_SIMULATION_FROM")
+                .filter(|value| !value.is_empty())
+                .map(AccountId::new),
+            execution_simulation_rpc_url: execution.rpc_url.clone(),
         };
         let perp_nonce_sync = PerpNonceSyncConfig {
             enabled: parse_env(&mut lookup, "PERP_NONCE_SYNC_ENABLED", "false")?,
@@ -1177,6 +1196,11 @@ mod tests {
         assert_eq!(config.options.execution_eip712_domain.version, "1");
         assert_eq!(config.options.execution_eip712_domain.chain_id, 84532);
         assert_eq!(config.options.execution_default_settlement_decimals, 6);
+        assert!(!config.options.execution_simulation_enabled);
+        assert!(config.options.execution_require_rpc_for_simulation);
+        assert_eq!(config.options.execution_simulation_gas_limit, 0);
+        assert_eq!(config.options.execution_simulation_from, None);
+        assert_eq!(config.options.execution_simulation_rpc_url, None);
     }
 
     #[test]
@@ -1307,6 +1331,14 @@ mod tests {
             ("OPTION_EXECUTION_SIGNATURE_MODE", "strict"),
             ("OPTION_EXECUTION_CHAIN_ID", "31337"),
             ("OPTION_EXECUTION_DEFAULT_SETTLEMENT_DECIMALS", "18"),
+            ("OPTION_EXECUTION_SIMULATION_ENABLED", "true"),
+            ("OPTION_EXECUTION_REQUIRE_RPC_FOR_SIMULATION", "true"),
+            ("OPTION_EXECUTION_SIMULATION_GAS_LIMIT", "500000"),
+            (
+                "OPTION_EXECUTION_SIMULATION_FROM",
+                "0x00000000000000000000000000000000000000aa",
+            ),
+            ("RPC_URL", "https://example.invalid"),
             (
                 "OPTION_MATCHING_ENGINE_ADDRESS",
                 "0x00000000000000000000000000000000000000ee",
@@ -1327,6 +1359,70 @@ mod tests {
             "0x00000000000000000000000000000000000000ee"
         );
         assert_eq!(config.options.execution_default_settlement_decimals, 18);
+        assert!(config.options.execution_simulation_enabled);
+        assert!(config.options.execution_require_rpc_for_simulation);
+        assert_eq!(config.options.execution_simulation_gas_limit, 500_000);
+        assert_eq!(
+            config
+                .options
+                .execution_simulation_from
+                .as_ref()
+                .map(|account| account.0.as_str()),
+            Some("0x00000000000000000000000000000000000000aa")
+        );
+        assert_eq!(
+            config.options.execution_simulation_rpc_url.as_deref(),
+            Some("https://example.invalid")
+        );
+    }
+
+    #[test]
+    fn option_execution_simulation_requires_rpc_when_required() {
+        let error = config_from_pairs([
+            ("OPTIONS_ENABLED", "true"),
+            ("OPTIONS_REQUIRE_PERSISTENCE", "false"),
+            ("OPTION_EXECUTION_SIMULATION_ENABLED", "true"),
+            ("OPTION_EXECUTION_REQUIRE_RPC_FOR_SIMULATION", "true"),
+            ("PERSISTENCE_ENABLED", "false"),
+        ])
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("RPC_URL is required when OPTION_EXECUTION_SIMULATION_ENABLED=true"));
+    }
+
+    #[test]
+    fn option_execution_simulation_can_defer_rpc_requirement() {
+        let config = config_from_pairs([
+            ("OPTIONS_ENABLED", "true"),
+            ("OPTIONS_REQUIRE_PERSISTENCE", "false"),
+            ("OPTION_EXECUTION_SIMULATION_ENABLED", "true"),
+            ("OPTION_EXECUTION_REQUIRE_RPC_FOR_SIMULATION", "false"),
+            ("PERSISTENCE_ENABLED", "false"),
+        ])
+        .unwrap();
+
+        assert!(config.options.execution_simulation_enabled);
+        assert!(!config.options.execution_require_rpc_for_simulation);
+        assert_eq!(config.options.execution_simulation_rpc_url, None);
+    }
+
+    #[test]
+    fn option_execution_simulation_rejects_invalid_from_address() {
+        let error = config_from_pairs([
+            ("OPTIONS_ENABLED", "true"),
+            ("OPTIONS_REQUIRE_PERSISTENCE", "false"),
+            ("OPTION_EXECUTION_SIMULATION_ENABLED", "true"),
+            ("OPTION_EXECUTION_REQUIRE_RPC_FOR_SIMULATION", "false"),
+            ("OPTION_EXECUTION_SIMULATION_FROM", "not-an-address"),
+            ("PERSISTENCE_ENABLED", "false"),
+        ])
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("OPTION_EXECUTION_SIMULATION_FROM must be a valid address"));
     }
 
     #[test]

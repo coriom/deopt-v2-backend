@@ -44,7 +44,10 @@ use crate::options::service::{
     list_option_rfqs as list_option_rfqs_service, list_option_series as list_option_series_service,
     option_execution_calldata as option_execution_calldata_service,
     option_execution_signing_payload as option_execution_signing_payload_service,
+    option_execution_simulation_status as option_execution_simulation_status_service,
     option_rfq_quote_signing_payload as option_rfq_quote_signing_payload_service,
+    persist_option_execution_simulation_unavailable, prepare_option_execution_simulation,
+    simulate_prepared_option_execution_intent,
     submit_option_execution_signatures as submit_option_execution_signatures_service,
     submit_option_order as submit_option_order_service,
     submit_option_rfq_quote as submit_option_rfq_quote_service, CreateOptionRfqInput,
@@ -54,11 +57,11 @@ use crate::options::service::{
 use crate::options::{
     option_execution_intent_id_to_hex_bytes32, option_rfq_id_to_hex_bytes32,
     option_series_id_to_hex_bytes32, OptionExecutionIntent, OptionExecutionIntentId,
-    OptionExecutionIntentStatus, OptionFill, OptionFillFilter, OptionFillId, OptionOrder,
-    OptionOrderFilter, OptionOrderStatus, OptionOrderbookSnapshot, OptionRfqFill, OptionRfqId,
-    OptionRfqQuote, OptionRfqQuoteId, OptionRfqQuoteSignatureStatus, OptionRfqQuoteStatus,
-    OptionRfqRequest, OptionRfqStatus, OptionSeries, OptionSeriesFilter, OptionSeriesStatus,
-    OPTION_RFQ_QUOTE_TYPE, OPTION_TRADE_TYPE,
+    OptionExecutionIntentStatus, OptionExecutionSimulationResult, OptionExecutionSimulationStatus,
+    OptionFill, OptionFillFilter, OptionFillId, OptionOrder, OptionOrderFilter, OptionOrderStatus,
+    OptionOrderbookSnapshot, OptionRfqFill, OptionRfqId, OptionRfqQuote, OptionRfqQuoteId,
+    OptionRfqQuoteSignatureStatus, OptionRfqQuoteStatus, OptionRfqRequest, OptionRfqStatus,
+    OptionSeries, OptionSeriesFilter, OptionSeriesStatus, OPTION_RFQ_QUOTE_TYPE, OPTION_TRADE_TYPE,
 };
 use crate::orders::service::{
     cancel_order as cancel_order_shared, submit_response_from_events, submit_signed_order,
@@ -156,6 +159,14 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/options/execution-intents/:intent_id/calldata",
             get(option_execution_calldata),
+        )
+        .route(
+            "/options/execution-intents/:intent_id/simulate",
+            post(simulate_option_execution_intent),
+        )
+        .route(
+            "/options/execution-intents/:intent_id/simulation",
+            get(option_execution_simulation),
         )
         .route("/options/fills", get(list_option_fills))
         .route("/options/fills/:fill_id", get(get_option_fill))
@@ -301,6 +312,7 @@ async fn admin_status(
         "options_enabled": state.options_config.enabled,
         "option_rfq_enabled": state.options_config.rfq_enabled,
         "option_execution_enabled": state.options_config.execution_enabled,
+        "option_execution_simulation_enabled": state.options_config.execution_simulation_enabled,
         "fees_enabled": state.fees_config.enabled,
         "rebates_enabled": state.fees_config.rebates_enabled
     })))
@@ -336,6 +348,7 @@ async fn admin_config(
             "options_enabled": state.options_config.enabled,
             "option_rfq_enabled": state.options_config.rfq_enabled,
             "option_execution_enabled": state.options_config.execution_enabled,
+            "option_execution_simulation_enabled": state.options_config.execution_simulation_enabled,
             "fees_enabled": state.fees_config.enabled,
             "rebates_enabled": state.fees_config.rebates_enabled,
             "mm_gateway_enabled": state.mm_gateway_config.enabled,
@@ -436,6 +449,11 @@ async fn admin_config(
             "execution_require_persistence": state.options_config.execution_require_persistence,
             "execution_signature_mode": state.options_config.execution_signature_mode,
             "execution_default_settlement_decimals": state.options_config.execution_default_settlement_decimals,
+            "execution_simulation_enabled": state.options_config.execution_simulation_enabled,
+            "execution_require_rpc_for_simulation": state.options_config.execution_require_rpc_for_simulation,
+            "execution_simulation_gas_limit": state.options_config.execution_simulation_gas_limit,
+            "execution_simulation_from": state.options_config.execution_simulation_from,
+            "execution_simulation_rpc_configured": state.options_config.execution_simulation_rpc_url.is_some(),
             "execution_eip712_name": state.options_config.execution_eip712_domain.name,
             "execution_eip712_version": state.options_config.execution_eip712_domain.version,
             "execution_eip712_chain_id": state.options_config.execution_eip712_domain.chain_id
@@ -743,11 +761,20 @@ async fn admin_options_summary(
         let option_execution_intent_status_counts = repository
             .admin_count_by_column("option_execution_intents", "status")
             .await?;
+        let mut option_execution_simulation_status_counts = repository
+            .admin_count_by_column("option_execution_intents", "simulation_status")
+            .await?;
+        if let Some(pending) = option_execution_simulation_status_counts.remove("null") {
+            *option_execution_simulation_status_counts
+                .entry("simulation_pending".to_string())
+                .or_default() += pending;
+        }
         return Ok(Json(serde_json::json!({
             "persistence_enabled": true,
             "enabled": state.options_config.enabled,
             "option_rfq_enabled": state.options_config.rfq_enabled,
             "option_execution_enabled": state.options_config.execution_enabled,
+            "option_execution_simulation_enabled": state.options_config.execution_simulation_enabled,
             "series_status_counts": series_status_counts,
             "order_status_counts": order_status_counts,
             "option_fills_count": repository.admin_count_where("option_fills", "TRUE").await?,
@@ -757,9 +784,13 @@ async fn admin_options_summary(
             "verified_option_rfq_quotes": count_from_map(&option_rfq_quote_signature_status_counts, "verified"),
             "option_rfq_fills_count": repository.admin_count_where("option_rfq_fills", "TRUE").await?,
             "option_execution_intent_status_counts": option_execution_intent_status_counts,
+            "option_execution_simulation_status_counts": option_execution_simulation_status_counts,
             "option_execution_intents_count": repository.admin_count_where("option_execution_intents", "TRUE").await?,
             "option_execution_calldata_ready": count_from_map(&option_execution_intent_status_counts, "calldata_ready"),
             "option_execution_pending_signatures": count_from_map(&option_execution_intent_status_counts, "signatures_required"),
+            "option_execution_simulation_ok": count_from_map(&option_execution_simulation_status_counts, "simulation_ok"),
+            "option_execution_simulation_failed": count_from_map(&option_execution_simulation_status_counts, "simulation_failed"),
+            "option_execution_simulation_unavailable": count_from_map(&option_execution_simulation_status_counts, "simulation_unavailable"),
             "recent_option_execution_intents": repository.admin_recent_option_execution_intents(20).await?,
             "recent_option_rfq_fills": repository.admin_recent_option_rfq_fills(20).await?,
             "recent_option_order_fills": repository.admin_recent_option_fills(20).await?
@@ -784,6 +815,7 @@ async fn admin_options_summary(
     let mut option_rfq_quote_status_counts = BTreeMap::new();
     let mut option_rfq_quote_signature_status_counts = BTreeMap::new();
     let mut option_execution_intent_status_counts = BTreeMap::new();
+    let mut option_execution_simulation_status_counts = BTreeMap::new();
     for item in &series {
         bump_count(
             &mut series_status_counts,
@@ -814,12 +846,20 @@ async fn admin_options_summary(
             &mut option_execution_intent_status_counts,
             intent.status.as_str(),
         );
+        bump_count(
+            &mut option_execution_simulation_status_counts,
+            intent
+                .simulation_status
+                .unwrap_or(OptionExecutionSimulationStatus::SimulationPending)
+                .as_str(),
+        );
     }
     Ok(Json(serde_json::json!({
         "persistence_enabled": false,
         "enabled": state.options_config.enabled,
         "option_rfq_enabled": state.options_config.rfq_enabled,
         "option_execution_enabled": state.options_config.execution_enabled,
+        "option_execution_simulation_enabled": state.options_config.execution_simulation_enabled,
         "series_status_counts": series_status_counts,
         "order_status_counts": order_status_counts,
         "option_fills_count": fills.len(),
@@ -829,9 +869,13 @@ async fn admin_options_summary(
         "verified_option_rfq_quotes": count_from_map(&option_rfq_quote_signature_status_counts, "verified"),
         "option_rfq_fills_count": option_rfq_fills.len(),
         "option_execution_intent_status_counts": option_execution_intent_status_counts,
+        "option_execution_simulation_status_counts": option_execution_simulation_status_counts,
         "option_execution_intents_count": option_execution_intents.len(),
         "option_execution_calldata_ready": count_from_map(&option_execution_intent_status_counts, "calldata_ready"),
         "option_execution_pending_signatures": count_from_map(&option_execution_intent_status_counts, "signatures_required"),
+        "option_execution_simulation_ok": count_from_map(&option_execution_simulation_status_counts, "simulation_ok"),
+        "option_execution_simulation_failed": count_from_map(&option_execution_simulation_status_counts, "simulation_failed"),
+        "option_execution_simulation_unavailable": count_from_map(&option_execution_simulation_status_counts, "simulation_unavailable"),
         "recent_option_execution_intents": option_execution_intents.iter().rev().take(20).map(compact_option_execution_intent).collect::<Vec<_>>(),
         "recent_option_rfq_fills": option_rfq_fills.iter().rev().take(20).map(compact_option_rfq_fill).collect::<Vec<_>>(),
         "recent_option_order_fills": fills.iter().rev().take(20).map(compact_option_fill).collect::<Vec<_>>()
@@ -1134,6 +1178,12 @@ fn compact_option_execution_intent(intent: &OptionExecutionIntent) -> serde_json
         "buyer_is_maker": intent.buyer_is_maker,
         "status": intent.status,
         "calldata_ready": intent.calldata.is_some(),
+        "simulation_status": intent.simulation_status.map(|status| status.as_str()),
+        "simulation_error": intent.simulation_error,
+        "simulation_block_number": intent.simulation_block_number,
+        "simulation_revert_data": intent.simulation_revert_data,
+        "simulation_revert_selector": intent.simulation_revert_selector,
+        "simulated_at_ms": intent.simulated_at_ms,
         "created_at_ms": intent.created_at_ms
     })
 }
@@ -1554,6 +1604,12 @@ struct OptionExecutionIntentResponse {
     calldata_ready: bool,
     status: OptionExecutionIntentStatus,
     error: Option<String>,
+    simulation_status: Option<OptionExecutionSimulationStatus>,
+    simulation_error: Option<String>,
+    simulation_block_number: Option<u64>,
+    simulation_revert_data: Option<String>,
+    simulation_revert_selector: Option<String>,
+    simulated_at_ms: Option<i64>,
     created_at_ms: i64,
     updated_at_ms: i64,
 }
@@ -1588,8 +1644,43 @@ impl From<OptionExecutionIntent> for OptionExecutionIntentResponse {
             calldata_ready: intent.calldata.is_some(),
             status: intent.status,
             error: intent.error,
+            simulation_status: intent.simulation_status,
+            simulation_error: intent.simulation_error,
+            simulation_block_number: intent.simulation_block_number,
+            simulation_revert_data: intent.simulation_revert_data,
+            simulation_revert_selector: intent.simulation_revert_selector,
+            simulated_at_ms: intent.simulated_at_ms,
             created_at_ms: intent.created_at_ms,
             updated_at_ms: intent.updated_at_ms,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct OptionExecutionSimulationResponse {
+    intent_id: String,
+    simulation_status: OptionExecutionSimulationStatus,
+    block_number: Option<u64>,
+    error: Option<String>,
+    revert_data: Option<String>,
+    revert_selector: Option<String>,
+    simulated_at_ms: Option<i64>,
+    submitted: bool,
+    confirmed: bool,
+}
+
+impl From<OptionExecutionSimulationResult> for OptionExecutionSimulationResponse {
+    fn from(result: OptionExecutionSimulationResult) -> Self {
+        Self {
+            intent_id: result.intent_id.to_string(),
+            simulation_status: result.simulation_status,
+            block_number: result.block_number,
+            error: result.error,
+            revert_data: result.revert_data,
+            revert_selector: result.revert_selector,
+            simulated_at_ms: (result.simulated_at_ms > 0).then_some(result.simulated_at_ms),
+            submitted: false,
+            confirmed: false,
         }
     }
 }
@@ -2040,6 +2131,40 @@ async fn option_execution_calldata(
         calldata_ready: outcome.calldata_ready,
         missing_signatures: outcome.missing_signatures,
     }))
+}
+
+async fn simulate_option_execution_intent(
+    State(state): State<AppState>,
+    Path(intent_id): Path<String>,
+) -> Result<Json<OptionExecutionSimulationResponse>, ApiError> {
+    let intent_id = parse_option_execution_intent_id(&intent_id)?;
+    let intent = prepare_option_execution_simulation(&state, intent_id).await?;
+    let Some(rpc_url) = state.options_config.execution_simulation_rpc_url.clone() else {
+        let error = if state.options_config.execution_require_rpc_for_simulation {
+            "RPC_URL is required for option execution simulation"
+        } else {
+            "RPC_URL is not configured for option execution simulation"
+        };
+        let result =
+            persist_option_execution_simulation_unavailable(&state, intent.intent_id, error)
+                .await?;
+        if state.options_config.execution_require_rpc_for_simulation {
+            return Err(BackendError::Config(error.to_string()).into());
+        }
+        return Ok(Json(OptionExecutionSimulationResponse::from(result)));
+    };
+    let provider = HttpJsonRpcProvider::new(rpc_url);
+    let result = simulate_prepared_option_execution_intent(&state, &intent, &provider).await?;
+    Ok(Json(OptionExecutionSimulationResponse::from(result)))
+}
+
+async fn option_execution_simulation(
+    State(state): State<AppState>,
+    Path(intent_id): Path<String>,
+) -> Result<Json<OptionExecutionSimulationResponse>, ApiError> {
+    let intent_id = parse_option_execution_intent_id(&intent_id)?;
+    let result = option_execution_simulation_status_service(&state, intent_id).await?;
+    Ok(Json(OptionExecutionSimulationResponse::from(result)))
 }
 
 async fn create_option_rfq(
@@ -4283,6 +4408,127 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn option_execution_simulate_disabled_returns_clear_error() {
+        let state = option_simulation_state(false, true);
+        let intent = insert_route_option_intent(&state, route_calldata_ready_intent());
+
+        let response = router(state)
+            .oneshot(post_request(&format!(
+                "/options/execution-intents/{}/simulate",
+                intent.intent_id
+            )))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let json = response_json(response).await;
+        assert_eq!(
+            json["error"],
+            "configuration error: option execution simulation is disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn option_execution_simulate_missing_rpc_rejects_and_records_unavailable() {
+        let state = option_simulation_state(true, true);
+        let intent = insert_route_option_intent(&state, route_calldata_ready_intent());
+        let app = router(state);
+
+        let response = app
+            .clone()
+            .oneshot(post_request(&format!(
+                "/options/execution-intents/{}/simulate",
+                intent.intent_id
+            )))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let json = response_json(response).await;
+        assert_eq!(
+            json["error"],
+            "configuration error: RPC_URL is required for option execution simulation"
+        );
+
+        let status = app
+            .clone()
+            .oneshot(get_request(
+                &format!("/options/execution-intents/{}/simulation", intent.intent_id),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(status.status(), StatusCode::OK);
+        let json = response_json(status).await;
+        assert_eq!(json["simulation_status"], "simulation_unavailable");
+        assert_eq!(
+            json["error"],
+            "RPC_URL is required for option execution simulation"
+        );
+        assert_eq!(json["submitted"], false);
+        assert_eq!(json["confirmed"], false);
+
+        let transactions = app
+            .oneshot(get_request("/executor/transactions", None))
+            .await
+            .unwrap();
+        assert_eq!(transactions.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(transactions).await.as_array().unwrap().len(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn option_execution_simulation_status_defaults_pending() {
+        let state = option_simulation_state(true, false);
+        let intent = insert_route_option_intent(&state, route_calldata_ready_intent());
+
+        let response = router(state)
+            .oneshot(get_request(
+                &format!("/options/execution-intents/{}/simulation", intent.intent_id),
+                None,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["simulation_status"], "simulation_pending");
+        assert_eq!(json["error"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn admin_options_summary_includes_option_simulation_counts() {
+        let mut state = admin_state(false);
+        state.options_config = option_simulation_state(true, false).options_config;
+        let mut simulated = route_calldata_ready_intent();
+        simulated.simulation_status = Some(OptionExecutionSimulationStatus::SimulationOk);
+        insert_route_option_intent(&state, simulated);
+        let mut pending = route_calldata_ready_intent();
+        pending.intent_id = Uuid::from_u128(12);
+        pending.source_id = "fill-2".to_string();
+        insert_route_option_intent(&state, pending);
+
+        let response = router(state)
+            .oneshot(get_request("/admin/options/summary", None))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(
+            json["option_execution_simulation_status_counts"]["simulation_ok"],
+            1
+        );
+        assert_eq!(
+            json["option_execution_simulation_status_counts"]["simulation_pending"],
+            1
+        );
+        assert_eq!(json["option_execution_simulation_ok"], 1);
+    }
+
+    #[tokio::test]
     async fn admin_recent_respects_limit_cap() {
         let response = router(admin_state(false))
             .oneshot(get_request("/admin/recent?limit=999", None))
@@ -4383,12 +4629,85 @@ mod tests {
         state
     }
 
+    fn option_simulation_state(simulation_enabled: bool, require_rpc: bool) -> AppState {
+        let mut options_config = crate::options::OptionsConfig::enabled_in_memory_for_tests();
+        options_config.execution_enabled = true;
+        options_config.execution_require_persistence = false;
+        options_config.matching_engine_address =
+            AccountId::new("0x00000000000000000000000000000000000000ee");
+        options_config.execution_eip712_domain.verifying_contract =
+            options_config.matching_engine_address.clone();
+        options_config.execution_simulation_enabled = simulation_enabled;
+        options_config.execution_require_rpc_for_simulation = require_rpc;
+        AppState::with_options_config(EngineState::with_default_markets(), options_config)
+    }
+
+    fn insert_route_option_intent(
+        state: &AppState,
+        intent: OptionExecutionIntent,
+    ) -> OptionExecutionIntent {
+        state
+            .options_store
+            .lock()
+            .unwrap()
+            .insert_option_execution_intent(intent)
+    }
+
+    fn route_calldata_ready_intent() -> OptionExecutionIntent {
+        OptionExecutionIntent {
+            intent_id: Uuid::from_u128(11),
+            onchain_intent_id: "0x1111111111111111111111111111111111111111111111111111111111111111"
+                .to_string(),
+            source_type: crate::options::OptionExecutionSourceType::OptionOrderbookFill,
+            source_id: "fill-1".to_string(),
+            option_series_id: "series-1".to_string(),
+            onchain_option_id: "1".to_string(),
+            buyer: AccountId::new("0x0000000000000000000000000000000000000001"),
+            seller: AccountId::new("0x0000000000000000000000000000000000000002"),
+            underlying: AccountId::new("0x0000000000000000000000000000000000000010"),
+            settlement_asset: AccountId::new("0x0000000000000000000000000000000000000020"),
+            expiry: 4_102_444_800,
+            strike_1e8: 300_000_000_000,
+            is_call: true,
+            contract_size_1e8: 100_000_000,
+            quantity_contracts: 1,
+            source_size_1e8: 100_000_000,
+            source_price_1e8: 10_000_000,
+            premium_per_contract_native: 10_000,
+            buyer_is_maker: false,
+            buyer_nonce: Some(0),
+            seller_nonce: Some(0),
+            deadline: 0,
+            buyer_signature: Some("0x01".to_string()),
+            seller_signature: Some("0x02".to_string()),
+            calldata: Some("0x12345678".to_string()),
+            status: OptionExecutionIntentStatus::CalldataReady,
+            error: None,
+            simulation_status: None,
+            simulation_error: None,
+            simulation_block_number: None,
+            simulation_revert_data: None,
+            simulation_revert_selector: None,
+            simulated_at_ms: None,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        }
+    }
+
     fn get_request(path: &str, token: Option<&str>) -> Request<Body> {
         let mut builder = Request::builder().uri(path);
         if let Some(token) = token {
             builder = builder.header("x-admin-token", token);
         }
         builder.body(Body::empty()).unwrap()
+    }
+
+    fn post_request(path: &str) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(path)
+            .body(Body::empty())
+            .unwrap()
     }
 
     async fn response_json(response: Response) -> serde_json::Value {

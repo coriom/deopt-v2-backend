@@ -62,6 +62,7 @@ where
         to: call.target.clone(),
         data: call.calldata,
         value: call.value,
+        gas_limit: None,
     };
     let created_at_ms = now_ms();
     match provider.eth_call(request).await {

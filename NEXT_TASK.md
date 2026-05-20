@@ -1,40 +1,36 @@
-# NEXT_TASK.md — Option Execution Simulation V1D
+# NEXT_TASK.md — Option Execution Nonce Sync V1E
 
 ## Context
 
-Backend Option Execution Intents V1C is implemented and runtime-verified.
+Backend Option Execution Intents V1C/V1D are implemented and runtime-verified.
 
 Validated:
 
 - option orderbook fill creates option_execution_intent
 - option RFQ fill creates option_execution_intent
-- signing payload endpoint works
-- dummy 65-byte signatures accepted in disabled mode
-- calldata builder works
-- admin options summary exposes option execution intent counts
-- no execution_transactions
+- EIP-712 OptionTrade signing payload
+- signature submission
+- calldata builder
+- simulation endpoints
+- safe disabled/missing-RPC runtime behavior
 - no broadcast
-- no tx hash fabrication
+- no execution_transactions
 
 Current gap:
 
-Option execution intents cannot yet be simulated against the chain.
+Option execution intents currently default buyer/seller nonces to `0`.
 
-## Goal
+Before live eth_call and broadcast can be reliable, backend must sync nonces from:
 
-Implement Option Execution Simulation V1D.
+```solidity
+OptionMatchingEngine.nonces(address)
+Goal
 
-Add a safe simulation path for option execution intents.
+Implement Option Execution Nonce Sync V1E.
 
-The backend should be able to:
+Add backend support to read and use on-chain option execution nonces from OptionMatchingEngine.
 
-- take a calldata-ready option execution intent
-- run `eth_call` against `OPTION_MATCHING_ENGINE_ADDRESS`
-- persist simulation result
-- expose simulation endpoint/status
-- keep broadcast disabled and unimplemented for options
-
-## Non-Goals
+Non-Goals
 
 Do not broadcast.
 Do not submit transactions.
@@ -44,143 +40,126 @@ Do not modify Solidity.
 Do not modify frontend.
 Do not deploy.
 Do not require private keys.
-Do not fabricate tx hashes.
-Do not mark intents submitted/confirmed.
 Do not commit.
 Do not push.
 
-## Safety Rules
+Safety Rules
 
 Defaults remain safe:
 
-```env
 EXECUTION_ENABLED=false
 EXECUTOR_REAL_BROADCAST_ENABLED=false
 
-Simulation may require RPC only when explicitly enabled.
-
 No private keys.
 
-No /executor/broadcast.
+No tx hash fabrication.
+
+No confirmed/submitted option status.
 
 Config
 
-Add or reuse config:
+Add:
 
-OPTION_EXECUTION_SIMULATION_ENABLED=false
-OPTION_EXECUTION_REQUIRE_RPC_FOR_SIMULATION=true
-OPTION_EXECUTION_SIMULATION_GAS_LIMIT=0
+OPTION_NONCE_SYNC_ENABLED=false
+OPTION_NONCE_SYNC_REQUIRE_RPC=true
+OPTION_NONCE_SYNC_STRICT=true
 
 Behavior:
 
-disabled: simulation endpoint returns clear error
-enabled: requires RPC_URL unless require flag is false
-simulation does not require private key
-simulation does not create execution transaction
-simulation does not change on-chain state
-Database
+disabled: current behavior preserved
+enabled: backend reads OptionMatchingEngine.nonces(address) via eth_call
+strict: intent creation/signing requires synced nonce values
+require RPC: startup rejects if sync enabled but RPC or matching engine address is missing
 
-Either extend option_execution_intents or add a new table.
+Reuse existing perp nonce sync patterns where possible.
 
-Preferred simple V1D extension:
-
-ALTER TABLE option_execution_intents
-ADD COLUMN simulation_status TEXT NULL,
-ADD COLUMN simulation_error TEXT NULL,
-ADD COLUMN simulation_block_number BIGINT NULL,
-ADD COLUMN simulation_revert_data TEXT NULL,
-ADD COLUMN simulation_revert_selector TEXT NULL,
-ADD COLUMN simulated_at_ms BIGINT NULL;
-
-If migration needed:
-
-migrations/0020_option_execution_simulation.sql
-
-Statuses:
-
-simulation_pending
-simulation_ok
-simulation_failed
-simulation_unavailable
 API
 
-Add endpoints:
+Add:
 
-POST /options/execution-intents/:intent_id/simulate
-GET  /options/execution-intents/:intent_id/simulation
+GET /options/accounts/:address/nonce
 
-Behavior:
+or:
 
-intent must exist
-calldata must exist
-matching engine address must be configured
-RPC must be configured if required
-perform eth_call
-persist result
-return structured JSON
+GET /accounts/:address/option-nonce
 
-Response shape should include:
+Preferred: match existing perp nonce endpoint style.
+
+Response:
 
 {
-  "intent_id": "...",
-  "simulation_status": "simulation_ok",
-  "block_number": 123,
-  "error": null,
-  "revert_data": null,
-  "revert_selector": null
+  "account": "0x...",
+  "nonce": "0",
+  "source": "onchain",
+  "option_matching_engine": "0x..."
 }
 
-For revert:
+Disabled mode should return a clear error:
 
-{
-  "simulation_status": "simulation_failed",
-  "error": "...",
-  "revert_data": "0x...",
-  "revert_selector": "0x..."
-}
+{"error":"option nonce sync is disabled"}
+Integration
+
+When OPTION_EXECUTION_ENABLED=true and OPTION_NONCE_SYNC_ENABLED=true:
+
+Option execution intent creation
+
+For buyer and seller:
+
+read on-chain nonce
+set buyer_nonce
+set seller_nonce
+store values in option_execution_intents
+Signing payload
+
+Payload must use stored buyer/seller nonce.
+
+Signature submission
+
+Do not mutate nonces.
+
+Calldata
+
+Calldata must use stored nonces.
+
+Strict Mode
+
+If OPTION_NONCE_SYNC_STRICT=true:
+
+fail intent creation if nonce cannot be read
+do not create partial invalid intent
+return explicit error
+
+If OPTION_NONCE_SYNC_STRICT=false:
+
+allow fallback to 0 or configured local value
+mark source clearly if stored model supports it
+document that non-strict mode is dev-only
+
+Preferred V1E: strict mode for enabled sync.
+
 RPC Behavior
 
-Use existing RPC helper patterns from perp execution simulation if available.
+Use eth_call:
 
-Do not duplicate low-level JSON-RPC code unnecessarily.
-
-Call:
-
-eth_call
 to = OPTION_MATCHING_ENGINE_ADDRESS
-data = intent.calldata
-from = configured executor address if required, otherwise zero/safe caller
+data = nonces(address)
 
-Important:
+No private key.
 
-Solidity OptionMatchingEngine.executeTrade is executor-gated. Simulation must use a caller address that is expected to be allowed executor on-chain.
+No state change.
 
-Add config if needed:
+Reuse existing RPC helpers from perp nonce sync and option simulation.
 
-OPTION_EXECUTION_SIMULATION_FROM=
+Database
 
-If empty, use existing executor address config if safe.
+If useful, add fields:
 
-Document that simulation will fail with unauthorized executor unless the from address is allowed in OptionMatchingEngine.
+buyer_nonce_source TEXT NULL
+seller_nonce_source TEXT NULL
 
-Validation Rules
+But avoid schema churn unless needed.
 
-Reject simulation if:
-
-intent missing
-intent has no calldata
-signatures missing
-matching engine address missing
-RPC missing when required
-option execution simulation disabled
-
-Do not reject simply because broadcast is disabled.
-
-Admin
-
-Extend /admin/options/summary with simulation counts if simple.
-
-Do not add admin writes.
+At minimum, existing buyer_nonce and seller_nonce must be populated correctly.
 
 Tests
 
@@ -188,34 +167,31 @@ Normal cargo test must remain offline.
 
 Add tests for:
 
-simulation disabled returns clear error
-missing intent rejects
-missing calldata rejects
-missing RPC config rejected when required
-successful mock RPC eth_call stores simulation_ok
-reverted mock RPC stores simulation_failed and revert data
-simulation does not create execution_transaction
-simulation does not change submitted/confirmed status
-admin summary includes simulation counts if implemented
-existing option execution intent tests still pass
+disabled nonce sync preserves current behavior
+nonce endpoint disabled returns clear error
+nonce endpoint enabled returns mocked on-chain nonce
+intent creation uses mocked buyer/seller on-chain nonces
+signing payload uses stored synced nonces
+calldata uses stored synced nonces
+strict mode rejects when RPC unavailable
+startup rejects missing RPC when enabled and require RPC
+startup rejects missing OptionMatchingEngine address when enabled
+failed nonce sync does not consume local nonces or create invalid intent
+no execution_transaction created
+existing option execution tests still pass
 
-Use mock RPC abstractions if existing perp simulation tests have one.
+Use mock RPC or existing test abstractions. Do not require live RPC for tests.
 
-If mocking RPC is too broad, isolate simulation planner logic and document live runtime verification deferred.
+Runtime Verification Scope
 
-E2E Harness
+V1E runtime should verify:
 
-Do not require live RPC in default all-safe.
+disabled endpoint behavior
+startup guard behavior
+enabled with no RPC behavior
+if live RPC + deployed OptionMatchingEngine available, real nonce read
 
-Optionally add a skipped flow:
-
-option-execution-simulate
-
-that requires:
-
---require-rpc
-
-If too broad, defer.
+If no deployed contract is available, live nonce read is deferred.
 
 Documentation
 
@@ -228,13 +204,13 @@ docs/OPTION_EXECUTION_BACKEND.md
 
 Document:
 
-simulation config
-endpoints
-RPC requirement
-executor from requirement
-no broadcast
-no tx hash
-V1E deferred broadcast/index/reconciliation
+config
+endpoint
+strict mode
+no private keys
+no tx submission
+relation to signing payload
+live RPC requirement
 Validation
 
 Run:
@@ -247,21 +223,22 @@ Acceptance Criteria
 
 Complete only if:
 
-simulation config exists
-migration exists if DB changed
-simulation endpoints exist
-eth_call path exists or is cleanly abstracted/mocked
-result persistence exists
+config exists
+endpoint exists
+on-chain nonce read path exists
+intent creation can use synced nonces
+signing payload uses synced nonces
+calldata uses synced nonces
+strict startup guards work
 no broadcast
 no execution transaction
 tests added
 docs updated
 cargo fmt/clippy/test/build pass
 Deferred
+live Base Sepolia nonce runtime if no OptionMatchingEngine deployed
 option broadcast
 option indexer
 option reconciliation
 option confirmation
-nonce sync
 frontend UI
-live RPC E2E CI

@@ -1,9 +1,9 @@
 use super::{
     OptionExecutionIntent, OptionExecutionIntentId, OptionExecutionIntentStatus,
-    OptionExecutionSourceType, OptionFill, OptionFillFilter, OptionFillId, OptionOrder,
-    OptionOrderFilter, OptionOrderId, OptionOrderStatus, OptionRfqFill, OptionRfqId,
-    OptionRfqQuote, OptionRfqQuoteId, OptionRfqQuoteStatus, OptionRfqRequest, OptionRfqStatus,
-    OptionSeries, OptionSeriesFilter, OptionSeriesId, OptionSeriesStatus,
+    OptionExecutionSimulationResult, OptionExecutionSourceType, OptionFill, OptionFillFilter,
+    OptionFillId, OptionOrder, OptionOrderFilter, OptionOrderId, OptionOrderStatus, OptionRfqFill,
+    OptionRfqId, OptionRfqQuote, OptionRfqQuoteId, OptionRfqQuoteStatus, OptionRfqRequest,
+    OptionRfqStatus, OptionSeries, OptionSeriesFilter, OptionSeriesId, OptionSeriesStatus,
 };
 use crate::error::{BackendError, Result};
 use crate::types::{Side, TimestampMs};
@@ -407,8 +407,27 @@ impl OptionSeriesStore {
         if calldata.is_some() {
             intent.calldata = calldata;
         }
+        clear_option_execution_simulation(intent);
         intent.status = status;
         intent.updated_at_ms = updated_at_ms;
+        Ok(intent.clone())
+    }
+
+    pub fn persist_option_execution_simulation_result(
+        &mut self,
+        result: &OptionExecutionSimulationResult,
+    ) -> Result<OptionExecutionIntent> {
+        let intent = self
+            .option_execution_intents
+            .get_mut(&result.intent_id)
+            .ok_or(BackendError::InvalidOptionExecutionIntentId)?;
+        intent.simulation_status = Some(result.simulation_status);
+        intent.simulation_error = result.error.clone();
+        intent.simulation_block_number = result.block_number;
+        intent.simulation_revert_data = result.revert_data.clone();
+        intent.simulation_revert_selector = result.revert_selector.clone();
+        intent.simulated_at_ms = Some(result.simulated_at_ms);
+        intent.updated_at_ms = result.simulated_at_ms;
         Ok(intent.clone())
     }
 
@@ -465,6 +484,15 @@ fn option_execution_source_key(
     source_id: &str,
 ) -> (String, String) {
     (source_type.as_str().to_string(), source_id.to_string())
+}
+
+fn clear_option_execution_simulation(intent: &mut OptionExecutionIntent) {
+    intent.simulation_status = None;
+    intent.simulation_error = None;
+    intent.simulation_block_number = None;
+    intent.simulation_revert_data = None;
+    intent.simulation_revert_selector = None;
+    intent.simulated_at_ms = None;
 }
 
 fn can_match(incoming: &OptionOrder, resting: &OptionOrder) -> bool {

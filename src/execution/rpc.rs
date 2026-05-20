@@ -14,6 +14,7 @@ pub struct EthCallRequest {
     pub to: AccountId,
     pub data: Vec<u8>,
     pub value: u128,
+    pub gas_limit: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -153,6 +154,7 @@ impl EthCallProvider for HttpJsonRpcProvider {
                             to: request.to.0,
                             data: hex_0x(&request.data),
                             value: hex_quantity_u128(request.value),
+                            gas: request.gas_limit.map(hex_quantity_u64),
                         },
                         "latest",
                     ),
@@ -254,6 +256,8 @@ struct EthCallParams {
     to: String,
     data: String,
     value: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gas: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -309,6 +313,10 @@ fn hex_0x(bytes: &[u8]) -> String {
 }
 
 fn hex_quantity_u128(value: u128) -> String {
+    format!("0x{value:x}")
+}
+
+fn hex_quantity_u64(value: u64) -> String {
     format!("0x{value:x}")
 }
 

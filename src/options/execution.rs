@@ -1,9 +1,14 @@
-use super::OptionExecutionIntent;
+use super::{
+    OptionExecutionIntent, OptionExecutionIntentStatus, OptionExecutionSimulationResult,
+    OptionExecutionSimulationStatus,
+};
 use crate::error::{BackendError, Result};
+use crate::execution::rpc::{EthCallProvider, EthCallRequest};
 use crate::execution::transaction::hex_0x;
+use crate::execution::RevertDiagnostics;
 use crate::signing::eip712::{keccak256, parse_evm_address, EIP712_DOMAIN_TYPE};
 use crate::signing::Eip712Domain;
-use crate::types::AccountId;
+use crate::types::{now_ms, AccountId};
 use alloy_primitives::{Address, Bytes, B256, U256};
 use alloy_sol_types::{sol, SolCall};
 
@@ -227,6 +232,138 @@ pub fn encode_option_execute_trade_calldata(
     Ok(call.abi_encode())
 }
 
+pub async fn simulate_option_execution_intent<P>(
+    provider: &P,
+    intent: &OptionExecutionIntent,
+    matching_engine_address: &AccountId,
+    from: &AccountId,
+    gas_limit: u64,
+) -> Result<OptionExecutionSimulationResult>
+where
+    P: EthCallProvider,
+{
+    validate_simulation_intent(intent)?;
+    validate_simulation_target(matching_engine_address)?;
+    parse_evm_address(from)?;
+    let calldata = decode_0x_hex(
+        intent
+            .calldata
+            .as_deref()
+            .ok_or_else(missing_calldata_error)?,
+        "option execution calldata",
+    )?;
+    let request = EthCallRequest {
+        from: from.clone(),
+        to: matching_engine_address.clone(),
+        data: calldata,
+        value: 0,
+        gas_limit: (gas_limit > 0).then_some(gas_limit),
+    };
+    let simulated_at_ms = now_ms();
+    match provider.eth_call(request).await {
+        Ok(success) => Ok(OptionExecutionSimulationResult {
+            intent_id: intent.intent_id,
+            simulation_status: OptionExecutionSimulationStatus::SimulationOk,
+            block_number: success.block_number,
+            error: None,
+            revert_data: None,
+            revert_selector: None,
+            simulated_at_ms,
+        }),
+        Err(error) => {
+            let diagnostics = diagnostics_from_backend_error(&error);
+            Ok(OptionExecutionSimulationResult {
+                intent_id: intent.intent_id,
+                simulation_status: OptionExecutionSimulationStatus::SimulationFailed,
+                block_number: None,
+                error: Some(error.to_string()),
+                revert_data: diagnostics.revert_data,
+                revert_selector: diagnostics.revert_selector,
+                simulated_at_ms,
+            })
+        }
+    }
+}
+
+pub fn option_execution_simulation_unavailable(
+    intent_id: uuid::Uuid,
+    error: impl Into<String>,
+) -> OptionExecutionSimulationResult {
+    OptionExecutionSimulationResult {
+        intent_id,
+        simulation_status: OptionExecutionSimulationStatus::SimulationUnavailable,
+        block_number: None,
+        error: Some(error.into()),
+        revert_data: None,
+        revert_selector: None,
+        simulated_at_ms: now_ms(),
+    }
+}
+
+pub fn option_execution_simulation_pending(
+    intent: &OptionExecutionIntent,
+) -> OptionExecutionSimulationResult {
+    OptionExecutionSimulationResult {
+        intent_id: intent.intent_id,
+        simulation_status: intent
+            .simulation_status
+            .unwrap_or(OptionExecutionSimulationStatus::SimulationPending),
+        block_number: intent.simulation_block_number,
+        error: intent.simulation_error.clone(),
+        revert_data: intent.simulation_revert_data.clone(),
+        revert_selector: intent.simulation_revert_selector.clone(),
+        simulated_at_ms: intent.simulated_at_ms.unwrap_or(0),
+    }
+}
+
+pub fn validate_simulation_intent(intent: &OptionExecutionIntent) -> Result<()> {
+    if intent.buyer_signature.is_none() || intent.seller_signature.is_none() {
+        return Err(BackendError::MissingTradeSignatures);
+    }
+    let calldata = intent
+        .calldata
+        .as_deref()
+        .ok_or_else(missing_calldata_error)?;
+    if calldata == "0x" {
+        return Err(missing_calldata_error());
+    }
+    if intent.status != OptionExecutionIntentStatus::CalldataReady {
+        return Err(BackendError::InvalidOptionExecutionIntentState(
+            "option execution intent must be calldata_ready for simulation".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_simulation_target(target: &AccountId) -> Result<()> {
+    let address = parse_evm_address(target).map_err(|_| {
+        BackendError::Config(
+            "OPTION_MATCHING_ENGINE_ADDRESS must be a valid address for option execution simulation"
+                .to_string(),
+        )
+    })?;
+    if is_zero_address(&address) {
+        return Err(BackendError::Config(
+            "OPTION_MATCHING_ENGINE_ADDRESS is required for option execution simulation"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn missing_calldata_error() -> BackendError {
+    BackendError::InvalidOptionExecutionIntentState(
+        "option execution calldata is required for simulation".to_string(),
+    )
+}
+
+fn diagnostics_from_backend_error(error: &BackendError) -> RevertDiagnostics {
+    match error {
+        BackendError::SimulationReverted(diagnostics) => diagnostics.as_ref().clone(),
+        other => RevertDiagnostics::missing(other.to_string()),
+    }
+}
+
 fn domain_separator(domain: &Eip712Domain) -> Result<[u8; 32]> {
     let verifying_contract = parse_evm_address(&domain.verifying_contract)?;
     let mut encoded = Vec::with_capacity(160);
@@ -329,6 +466,24 @@ fn decode_signature(signature: &str) -> Result<Vec<u8>> {
     }
     let mut bytes = vec![0u8; 65];
     decode_hex_to_slice(hex, &mut bytes).map_err(|_| BackendError::MalformedSignature)?;
+    Ok(bytes)
+}
+
+fn decode_0x_hex(value: &str, field: &str) -> Result<Vec<u8>> {
+    let hex = value.strip_prefix("0x").ok_or_else(|| {
+        BackendError::InvalidOptionExecutionIntentState(format!("{field} must be 0x-prefixed hex"))
+    })?;
+    if hex.is_empty() || hex.len() % 2 != 0 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(BackendError::InvalidOptionExecutionIntentState(format!(
+            "{field} must be non-empty 0x-prefixed hex"
+        )));
+    }
+    let mut bytes = vec![0u8; hex.len() / 2];
+    decode_hex_to_slice(hex, &mut bytes).map_err(|_| {
+        BackendError::InvalidOptionExecutionIntentState(format!(
+            "{field} must be non-empty 0x-prefixed hex"
+        ))
+    })?;
     Ok(bytes)
 }
 

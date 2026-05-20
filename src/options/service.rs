@@ -5,19 +5,22 @@ use super::signing::{
 };
 use super::{
     encode_option_execute_trade_calldata, normalize_u256_string,
-    option_execution_intent_id_to_hex_bytes32, option_trade_digest, option_trade_digest_bytes,
+    option_execution_intent_id_to_hex_bytes32, option_execution_simulation_pending,
+    option_execution_simulation_unavailable, option_trade_digest, option_trade_digest_bytes,
+    simulate_option_execution_intent, validate_simulation_intent, validate_simulation_target,
     OptionExecutionIntent, OptionExecutionIntentId, OptionExecutionIntentStatus,
-    OptionExecutionSignatureMode, OptionExecutionSourceType, OptionFill, OptionFillFilter,
-    OptionFillId, OptionOrder, OptionOrderFilter, OptionOrderId, OptionOrderStatus,
-    OptionOrderbookLevel, OptionOrderbookSnapshot, OptionRfqFill, OptionRfqFillId, OptionRfqId,
-    OptionRfqQuote, OptionRfqQuoteId, OptionRfqQuoteSignatureMode, OptionRfqQuoteSignatureStatus,
-    OptionRfqQuoteStatus, OptionRfqRequest, OptionRfqStatus, OptionSeries, OptionSeriesFilter,
-    OptionSeriesId, OptionSeriesSource, OptionSeriesStatus, OptionTradePayload,
-    OptionTradeSignatureBundle,
+    OptionExecutionSignatureMode, OptionExecutionSimulationResult, OptionExecutionSourceType,
+    OptionFill, OptionFillFilter, OptionFillId, OptionOrder, OptionOrderFilter, OptionOrderId,
+    OptionOrderStatus, OptionOrderbookLevel, OptionOrderbookSnapshot, OptionRfqFill,
+    OptionRfqFillId, OptionRfqId, OptionRfqQuote, OptionRfqQuoteId, OptionRfqQuoteSignatureMode,
+    OptionRfqQuoteSignatureStatus, OptionRfqQuoteStatus, OptionRfqRequest, OptionRfqStatus,
+    OptionSeries, OptionSeriesFilter, OptionSeriesId, OptionSeriesSource, OptionSeriesStatus,
+    OptionTradePayload, OptionTradeSignatureBundle,
 };
 use crate::api::AppState;
 use crate::error::{BackendError, Result};
 use crate::execution::transaction::hex_0x;
+use crate::execution::EthCallProvider;
 use crate::mm::protocol::{
     NotificationEnvelope, OptionRfqQuoteAcceptedPayload, OptionRfqQuoteRejectedPayload,
     OptionRfqRequestPayload, ServerMessage,
@@ -1020,6 +1023,69 @@ pub async fn option_execution_calldata(
     })
 }
 
+pub async fn option_execution_simulation_status(
+    state: &AppState,
+    intent_id: OptionExecutionIntentId,
+) -> Result<OptionExecutionSimulationResult> {
+    let intent = get_option_execution_intent(state, intent_id).await?;
+    Ok(option_execution_simulation_pending(&intent))
+}
+
+pub async fn prepare_option_execution_simulation(
+    state: &AppState,
+    intent_id: OptionExecutionIntentId,
+) -> Result<OptionExecutionIntent> {
+    ensure_option_execution_simulation_enabled(state)?;
+    let intent = get_option_execution_intent(state, intent_id).await?;
+    if let Err(error) = validate_option_execution_simulation_preflight(state, &intent) {
+        let unavailable =
+            option_execution_simulation_unavailable(intent.intent_id, error.to_string());
+        persist_option_execution_simulation_result(state, &unavailable).await?;
+        return Err(error);
+    }
+    Ok(intent)
+}
+
+pub async fn simulate_prepared_option_execution_intent<P>(
+    state: &AppState,
+    intent: &OptionExecutionIntent,
+    provider: &P,
+) -> Result<OptionExecutionSimulationResult>
+where
+    P: EthCallProvider,
+{
+    let from = option_execution_simulation_from(state)?;
+    let result = match simulate_option_execution_intent(
+        provider,
+        intent,
+        &state.options_config.matching_engine_address,
+        &from,
+        state.options_config.execution_simulation_gas_limit,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            let unavailable =
+                option_execution_simulation_unavailable(intent.intent_id, error.to_string());
+            persist_option_execution_simulation_result(state, &unavailable).await?;
+            return Err(error);
+        }
+    };
+    persist_option_execution_simulation_result(state, &result).await?;
+    Ok(result)
+}
+
+pub async fn persist_option_execution_simulation_unavailable(
+    state: &AppState,
+    intent_id: OptionExecutionIntentId,
+    error: impl Into<String>,
+) -> Result<OptionExecutionSimulationResult> {
+    let result = option_execution_simulation_unavailable(intent_id, error.into());
+    persist_option_execution_simulation_result(state, &result).await?;
+    Ok(result)
+}
+
 pub async fn create_option_orderbook_execution_intent(
     state: &AppState,
     fill: &OptionFill,
@@ -1100,6 +1166,43 @@ async fn insert_option_execution_intent(
         .lock()
         .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?
         .insert_option_execution_intent(intent))
+}
+
+async fn persist_option_execution_simulation_result(
+    state: &AppState,
+    result: &OptionExecutionSimulationResult,
+) -> Result<OptionExecutionIntent> {
+    if let Some(repository) = state.repository.clone() {
+        return repository
+            .persist_option_execution_simulation_result(result)
+            .await;
+    }
+    state
+        .options_store
+        .lock()
+        .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?
+        .persist_option_execution_simulation_result(result)
+}
+
+fn validate_option_execution_simulation_preflight(
+    state: &AppState,
+    intent: &OptionExecutionIntent,
+) -> Result<()> {
+    validate_simulation_target(&state.options_config.matching_engine_address)?;
+    validate_simulation_intent(intent)?;
+    let from = option_execution_simulation_from(state)?;
+    parse_evm_address(&from)?;
+    Ok(())
+}
+
+fn option_execution_simulation_from(state: &AppState) -> Result<AccountId> {
+    let from = state
+        .options_config
+        .execution_simulation_from
+        .clone()
+        .unwrap_or_else(|| state.execution_config.executor_from_address.clone());
+    parse_evm_address(&from)?;
+    Ok(from)
 }
 
 async fn validate_option_order_execution_preflight(
@@ -1204,6 +1307,12 @@ fn build_option_execution_intent(
         calldata: None,
         status: OptionExecutionIntentStatus::SignaturesRequired,
         error: None,
+        simulation_status: None,
+        simulation_error: None,
+        simulation_block_number: None,
+        simulation_revert_data: None,
+        simulation_revert_selector: None,
+        simulated_at_ms: None,
         created_at_ms: source_created_at_ms,
         updated_at_ms: now,
     })
@@ -1439,6 +1548,17 @@ fn ensure_option_rfq_enabled(state: &AppState) -> Result<()> {
         Ok(())
     } else {
         Err(BackendError::OptionRfqDisabled)
+    }
+}
+
+fn ensure_option_execution_simulation_enabled(state: &AppState) -> Result<()> {
+    ensure_enabled(state)?;
+    if state.options_config.execution_simulation_enabled {
+        Ok(())
+    } else {
+        Err(BackendError::Config(
+            "option execution simulation is disabled".to_string(),
+        ))
     }
 }
 
@@ -1758,4 +1878,254 @@ fn aggregate_levels(orders: &[OptionOrder], side: Side) -> Vec<OptionOrderbookLe
         size_1e8: size_1e8.to_string(),
     })
     .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::EngineState;
+    use crate::execution::rpc::{EthCallRequest, EthCallSuccess, RpcFuture};
+    use crate::execution::{DecodedRevertError, RevertDiagnostics};
+    use crate::options::{OptionExecutionSimulationStatus, OptionsConfig};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone)]
+    enum MockOutcome {
+        Success,
+        Revert(RevertDiagnostics),
+    }
+
+    #[derive(Clone)]
+    struct MockProvider {
+        outcome: MockOutcome,
+        calls: Arc<Mutex<Vec<EthCallRequest>>>,
+    }
+
+    impl MockProvider {
+        fn success() -> Self {
+            Self {
+                outcome: MockOutcome::Success,
+                calls: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn revert(revert_data: &str) -> Self {
+            Self {
+                outcome: MockOutcome::Revert(RevertDiagnostics {
+                    raw_error: "execution reverted".to_string(),
+                    revert_data: Some(revert_data.to_string()),
+                    revert_selector: Some(revert_data[..10].to_string()),
+                    decoded_error: DecodedRevertError {
+                        kind: "unknown_custom_error".to_string(),
+                        name: None,
+                        selector: Some(revert_data[..10].to_string()),
+                        args: None,
+                        decoded: None,
+                    },
+                }),
+                calls: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    impl EthCallProvider for MockProvider {
+        fn eth_call(&self, request: EthCallRequest) -> RpcFuture<'_, EthCallSuccess> {
+            let outcome = self.outcome.clone();
+            let calls = self.calls.clone();
+            Box::pin(async move {
+                calls.lock().unwrap().push(request);
+                match outcome {
+                    MockOutcome::Success => Ok(EthCallSuccess {
+                        block_number: Some(123),
+                        output: Vec::new(),
+                    }),
+                    MockOutcome::Revert(diagnostics) => {
+                        Err(BackendError::SimulationReverted(Box::new(diagnostics)))
+                    }
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn option_execution_simulation_disabled_rejects() {
+        let state = state_with_simulation(false);
+        let intent = insert_intent(&state, calldata_ready_intent());
+
+        let error = prepare_option_execution_simulation(&state, intent.intent_id)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, BackendError::Config(message) if message.contains("option execution simulation is disabled"))
+        );
+    }
+
+    #[tokio::test]
+    async fn option_execution_simulation_missing_intent_rejects() {
+        let state = state_with_simulation(true);
+
+        let error = prepare_option_execution_simulation(&state, Uuid::from_u128(99))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            BackendError::InvalidOptionExecutionIntentId
+        ));
+    }
+
+    #[tokio::test]
+    async fn option_execution_simulation_missing_calldata_rejects_and_stores_unavailable() {
+        let state = state_with_simulation(true);
+        let intent = insert_intent(
+            &state,
+            OptionExecutionIntent {
+                calldata: None,
+                ..calldata_ready_intent()
+            },
+        );
+
+        let error = prepare_option_execution_simulation(&state, intent.intent_id)
+            .await
+            .unwrap_err();
+        let status = option_execution_simulation_status(&state, intent.intent_id)
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(error, BackendError::InvalidOptionExecutionIntentState(message) if message.contains("calldata"))
+        );
+        assert_eq!(
+            status.simulation_status,
+            OptionExecutionSimulationStatus::SimulationUnavailable
+        );
+        assert!(status.error.unwrap().contains("calldata"));
+    }
+
+    #[tokio::test]
+    async fn option_execution_simulation_success_stores_ok_without_changing_intent_status() {
+        let state = state_with_simulation(true);
+        let intent = insert_intent(&state, calldata_ready_intent());
+        let provider = MockProvider::success();
+
+        let prepared = prepare_option_execution_simulation(&state, intent.intent_id)
+            .await
+            .unwrap();
+        let result = simulate_prepared_option_execution_intent(&state, &prepared, &provider)
+            .await
+            .unwrap();
+        let stored = get_option_execution_intent(&state, intent.intent_id)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.simulation_status,
+            OptionExecutionSimulationStatus::SimulationOk
+        );
+        assert_eq!(result.block_number, Some(123));
+        assert_eq!(stored.status, OptionExecutionIntentStatus::CalldataReady);
+        assert_eq!(
+            stored.simulation_status,
+            Some(OptionExecutionSimulationStatus::SimulationOk)
+        );
+        assert_eq!(stored.simulation_block_number, Some(123));
+        let calls = provider.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].to.0, "0x00000000000000000000000000000000000000ee");
+        assert_eq!(calls[0].gas_limit, Some(500_000));
+    }
+
+    #[tokio::test]
+    async fn option_execution_simulation_revert_stores_failed_and_revert_data() {
+        let state = state_with_simulation(true);
+        let intent = insert_intent(&state, calldata_ready_intent());
+        let provider = MockProvider::revert("0x12345678");
+
+        let prepared = prepare_option_execution_simulation(&state, intent.intent_id)
+            .await
+            .unwrap();
+        let result = simulate_prepared_option_execution_intent(&state, &prepared, &provider)
+            .await
+            .unwrap();
+        let stored = get_option_execution_intent(&state, intent.intent_id)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.simulation_status,
+            OptionExecutionSimulationStatus::SimulationFailed
+        );
+        assert_eq!(result.revert_data.as_deref(), Some("0x12345678"));
+        assert_eq!(result.revert_selector.as_deref(), Some("0x12345678"));
+        assert_eq!(
+            stored.simulation_status,
+            Some(OptionExecutionSimulationStatus::SimulationFailed)
+        );
+        assert_eq!(stored.simulation_revert_data.as_deref(), Some("0x12345678"));
+        assert_eq!(stored.status, OptionExecutionIntentStatus::CalldataReady);
+    }
+
+    fn state_with_simulation(enabled: bool) -> AppState {
+        let mut options_config = OptionsConfig::enabled_in_memory_for_tests();
+        options_config.execution_enabled = true;
+        options_config.execution_require_persistence = false;
+        options_config.matching_engine_address =
+            AccountId::new("0x00000000000000000000000000000000000000ee");
+        options_config.execution_eip712_domain.verifying_contract =
+            options_config.matching_engine_address.clone();
+        options_config.execution_simulation_enabled = enabled;
+        options_config.execution_require_rpc_for_simulation = false;
+        options_config.execution_simulation_gas_limit = 500_000;
+        AppState::with_options_config(EngineState::with_default_markets(), options_config)
+    }
+
+    fn insert_intent(state: &AppState, intent: OptionExecutionIntent) -> OptionExecutionIntent {
+        state
+            .options_store
+            .lock()
+            .unwrap()
+            .insert_option_execution_intent(intent)
+    }
+
+    fn calldata_ready_intent() -> OptionExecutionIntent {
+        OptionExecutionIntent {
+            intent_id: Uuid::from_u128(1),
+            onchain_intent_id: "0x1111111111111111111111111111111111111111111111111111111111111111"
+                .to_string(),
+            source_type: OptionExecutionSourceType::OptionOrderbookFill,
+            source_id: "fill-1".to_string(),
+            option_series_id: "series-1".to_string(),
+            onchain_option_id: "1".to_string(),
+            buyer: AccountId::new("0x0000000000000000000000000000000000000001"),
+            seller: AccountId::new("0x0000000000000000000000000000000000000002"),
+            underlying: AccountId::new("0x0000000000000000000000000000000000000010"),
+            settlement_asset: AccountId::new("0x0000000000000000000000000000000000000020"),
+            expiry: 4_102_444_800,
+            strike_1e8: 300_000_000_000,
+            is_call: true,
+            contract_size_1e8: 100_000_000,
+            quantity_contracts: 1,
+            source_size_1e8: 100_000_000,
+            source_price_1e8: 10_000_000,
+            premium_per_contract_native: 10_000,
+            buyer_is_maker: false,
+            buyer_nonce: Some(0),
+            seller_nonce: Some(0),
+            deadline: 0,
+            buyer_signature: Some("0x01".to_string()),
+            seller_signature: Some("0x02".to_string()),
+            calldata: Some("0x12345678".to_string()),
+            status: OptionExecutionIntentStatus::CalldataReady,
+            error: None,
+            simulation_status: None,
+            simulation_error: None,
+            simulation_block_number: None,
+            simulation_revert_data: None,
+            simulation_revert_selector: None,
+            simulated_at_ms: None,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        }
+    }
 }
