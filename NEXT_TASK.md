@@ -1,129 +1,65 @@
-# NEXT_TASK.md — Valid Option Execution Signatures V1H
+# NEXT_TASK.md — Runtime Verify Option Execution Broadcast V1I Safe Mode
 
 ## Context
 
-Live Base Sepolia option simulation now reaches OptionMatchingEngine.
+Option Execution Broadcast V1I has been implemented offline.
 
-Confirmed:
+Implemented:
 
-- OptionMatchingEngine deployed:
-  0xf2D1D85cD363Be3bc160d14883C80e7C2c4F420b
-- MarginEngine.matchingEngine points to OptionMatchingEngine.
-- Tested option series is active.
-- Live nonce sync works.
-- Backend creates option_execution_intent.
-- Signing payload uses synced nonces.
-- Calldata is generated.
-- Live simulation performs eth_call.
-- Previous revert selector:
-  0x8baa579f = InvalidSignature()
-- This proves series activation is fixed and execution reaches signature verification.
+- migration 0021_option_execution_broadcast.sql
+- dedicated option_execution_transactions table
+- config:
+  - OPTION_EXECUTION_BROADCAST_ENABLED=false
+  - OPTION_EXECUTION_REQUIRE_SIMULATION_OK=true
+  - OPTION_EXECUTION_BROADCAST_GAS_LIMIT=0
+- endpoint:
+  - POST /options/execution-intents/:intent_id/broadcast
+- disabled-by-default behavior
+- simulation_ok gate
+- tx hash persistence only after successful send
+- idempotency for submitted tx
+- no confirmed/reconciled lifecycle
+- mock tests passing
 
-Current blocker:
+Current goal:
 
-The simulation uses dummy buyer/seller signatures. Need valid EIP-712 signatures for OptionTrade.
+Runtime verify the broadcast endpoint in safe disabled mode.
 
 ## Goal
 
-Implement or verify a safe dev signing path for option execution intents, then runtime-test with valid buyer/seller signatures.
+Prove that V1I is safe at runtime before any live broadcast.
 
-The goal is to progress beyond `InvalidSignature()`.
+Verify:
 
-Acceptable next result:
-
-- `simulation_ok`, if margin/collateral is sufficient
-- or `simulation_failed` with a later-stage revert, likely `MarginRequirementBreached(address)`
-
-Unacceptable:
-
-- `InvalidSignature()`
-- `SeriesInactive()`
-- no RPC call
-- panic
-- broadcast
-- execution transaction creation
+1. backend starts with broadcast disabled
+2. broadcast endpoint rejects when disabled
+3. no option_execution_transactions are created
+4. no execution_transactions are created
+5. no /executor/broadcast is called
+6. simulation_ok intent remains unbroadcasted
+7. admin/config exposes safe booleans without secrets
+8. cleanup works
 
 ## Non-Goals
 
-Do not broadcast.
-Do not call /executor/broadcast.
+Do not perform live broadcast.
 Do not submit transactions.
+Do not call /executor/broadcast.
 Do not create execution_transactions.
 Do not modify Solidity.
 Do not modify frontend.
 Do not deploy.
+Do not use or print private keys.
 Do not commit.
 Do not push.
-Do not print private keys.
 
-## Safety Rules
+## Runtime Config
 
-Keep:
+Start backend with process env only.
+
+Use live Base Sepolia RPC for nonce/simulation, but keep broadcast disabled:
 
 ```env
-EXECUTION_ENABLED=false
-EXECUTOR_REAL_BROADCAST_ENABLED=false
-MM_GATEWAY_ENABLED=false
-
-Private keys may only be read from process env for local dev signing.
-
-Never log private keys.
-
-No tx hash fabrication.
-
-No submitted/confirmed option status.
-
-Required Work
-
-Inspect existing signing CLIs:
-
-src/bin/sign_rfq_quote.rs
-src/bin/sign_option_rfq_quote.rs
-src/signing/*
-src/options/execution.rs
-
-Determine whether there is already a reusable EIP-712 signing helper.
-
-If no option execution signing CLI exists, add:
-
-src/bin/sign_option_execution_intent.rs
-
-CLI behavior:
-
-Input:
-
-intent id
-backend URL or signing payload JSON file
-private key from env only
-
-Env vars:
-
-OPTION_EXECUTION_SIGNER_PRIVATE_KEY=
-
-or support explicit role envs:
-
-BUYER_PRIVATE_KEY=
-SELLER_PRIVATE_KEY=
-
-Preferred safe design:
-
-cargo run --bin sign_option_execution_intent -- \
-  --payload-file /tmp/option_trade_payload.json \
-  --private-key-env BUYER_PRIVATE_KEY
-
-Output only JSON:
-
-{
-  "signer_address": "0x...",
-  "signature": "0x..."
-}
-
-Do not print payload private key, raw secret, mnemonic, or env values.
-
-Runtime Verification
-
-Start backend with live Base Sepolia process env:
-
 PERSISTENCE_ENABLED=true
 OPTIONS_ENABLED=true
 OPTION_RFQ_ENABLED=true
@@ -145,84 +81,84 @@ OPTION_EXECUTION_SIMULATION_ENABLED=true
 OPTION_EXECUTION_REQUIRE_RPC_FOR_SIMULATION=true
 OPTION_EXECUTION_SIMULATION_FROM=0xc35F7A8A103A9A4464adfaa76B9B514093D23C27
 
+OPTION_EXECUTION_BROADCAST_ENABLED=false
+OPTION_EXECUTION_REQUIRE_SIMULATION_OK=true
+OPTION_EXECUTION_BROADCAST_GAS_LIMIT=0
+
 EXECUTION_ENABLED=false
 EXECUTOR_REAL_BROADCAST_ENABLED=false
 MM_GATEWAY_ENABLED=false
 
-Use RPC_URL but do not print it.
+Use existing RPC_URL, but do not print it.
 
-Test Flow
-Create backend option series mapped to active on-chain option id:
+Runtime Flow
+Record TEST_START_MS.
+Start backend.
+Verify /health.
+Verify /admin/config:
+option execution enabled
+option nonce sync enabled
+option simulation enabled
+option broadcast disabled
+rpc=true
+executor_private_key=false
+real_broadcast_enabled=false
+no secrets
+Create backend option series mapped to active on-chain optionId:
 24145907678156652148089862289363692212069910767044828147380657249455352740183
-Create crossing option orderbook fill.
-Verify option_execution_intent exists.
-Fetch signing payload:
-GET /options/execution-intents/:intent_id/signing-payload
-Save payload to temp file.
-Sign as buyer with buyer private key.
-Sign as seller with seller private key.
-Submit signatures:
-POST /options/execution-intents/:intent_id/signatures
-Confirm strict signature verification succeeds.
+Create crossing option orders to produce:
+option fill
+option execution intent
+Fetch signing payload.
+Sign buyer/seller with existing local dev signing flow:
+sign_option_execution_intent
+BUYER_PRIVATE_KEY / SELLER_PRIVATE_KEY from env
+do not print keys
+Submit signatures in strict mode.
 Fetch calldata.
-Run live simulation:
-POST /options/execution-intents/:intent_id/simulate
-Verify result is not InvalidSignature().
-Verify result is not SeriesInactive().
-Verify no execution_transactions.
-Cleanup backend runtime rows only.
-Important Buyer/Seller Matching
+Run live simulation.
+Confirm simulation_ok.
+Call:
+POST /options/execution-intents/:intent_id/broadcast
 
-The private keys must correspond exactly to the buyer/seller addresses used in the option fill.
+Expected:
 
-If using known dev accounts:
+HTTP 400/403 clear error: option execution broadcast is disabled
+Verify no transaction rows:
+SELECT COUNT(*) FROM option_execution_transactions WHERE created_at_ms >= <TEST_START_MS>;
+SELECT COUNT(*) FROM execution_transactions WHERE created_at_ms >= <TEST_START_MS>;
 
-buyer order account must match BUYER_PRIVATE_KEY
-seller order account must match SELLER_PRIVATE_KEY
+Expected:
 
-If only one private key is available, create both orders with accounts controlled by available keys only if protocol allows different buyer/seller addresses controlled locally.
+0
+0
+Verify intent remains not submitted/confirmed.
+Cleanup backend runtime rows only:
+option_execution_transactions if any failed rows were created
+option_execution_intents
+option_fills
+option_orders
+option_series
+Stop backend and verify no listener.
+Additional Negative Checks
 
-Do not fake recovered signer.
+If easy, also verify:
 
-Expected Result
+broadcast rejects intent without simulation_ok
+broadcast rejects missing intent
+broadcast rejects missing calldata/signatures
 
-Preferred:
+Do not broaden if it risks muddying the runtime flow.
 
-simulation_failed
-revert != InvalidSignature()
-revert != SeriesInactive()
-likely MarginRequirementBreached(address)
+If Bug Found
 
-or:
+Patch minimally only.
 
-simulation_ok
-
-Either is acceptable.
-
-Tests
-
-If a new CLI is added, add offline tests for:
-
-payload parsing
-signature output shape
-recovered signer matches expected
-no private key logged
-invalid payload rejected
-
-If no code patch is needed, no tests are required.
-
-Validation
-
-If code changed, run:
+After patch:
 
 cargo fmt
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test
-cargo build
-
-If no code changed, at least run:
-
-cargo fmt --check
 cargo build
 Final Report
 
@@ -230,15 +166,12 @@ Return:
 
 files changed
 whether code patch was needed
-signing CLI/helper summary
-buyer/seller signer addresses
-execution intent id
-synced buyer/seller nonces
-strict signature submission result
-calldata result
-live simulation result
-whether InvalidSignature is gone
-whether SeriesInactive is gone
+backend startup result
+admin config result
+intent/simulation_ok result
+broadcast disabled result
+option_execution_transactions count
+execution_transactions count
 no forbidden mutation verification
 cleanup result
 validation commands run

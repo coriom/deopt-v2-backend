@@ -1,10 +1,11 @@
 use super::{
     OptionExecutionIntent, OptionExecutionIntentStatus, OptionExecutionSimulationResult,
-    OptionExecutionSimulationStatus,
+    OptionExecutionSimulationStatus, OptionsConfig,
 };
 use crate::error::{BackendError, Result};
 use crate::execution::rpc::{EthCallProvider, EthCallRequest};
-use crate::execution::transaction::hex_0x;
+use crate::execution::transaction::{hex_0x, ExecutionTransactionRequest};
+use crate::execution::ExecutionConfig;
 use crate::execution::RevertDiagnostics;
 use crate::signing::eip712::{keccak256, parse_evm_address, EIP712_DOMAIN_TYPE};
 use crate::signing::Eip712Domain;
@@ -232,6 +233,34 @@ pub fn encode_option_execute_trade_calldata(
     Ok(call.abi_encode())
 }
 
+pub fn build_option_execution_transaction_request(
+    execution_config: &ExecutionConfig,
+    options_config: &OptionsConfig,
+    intent: &OptionExecutionIntent,
+) -> Result<ExecutionTransactionRequest> {
+    validate_broadcast_target(&options_config.matching_engine_address)?;
+    validate_broadcast_intent(options_config, intent)?;
+    let calldata = decode_0x_hex(
+        intent
+            .calldata
+            .as_deref()
+            .ok_or_else(missing_broadcast_calldata_error)?,
+        "option execution calldata",
+    )?;
+    Ok(ExecutionTransactionRequest {
+        intent_id: intent.intent_id,
+        onchain_intent_id: intent.onchain_intent_id.clone(),
+        from: execution_config.executor_from_address.clone(),
+        to: options_config.matching_engine_address.clone(),
+        value_wei: 0,
+        calldata,
+        chain_id: execution_config.executor_chain_id,
+        gas_limit: option_execution_broadcast_gas_limit(execution_config, options_config)?,
+        max_fee_per_gas_wei: execution_config.max_fee_per_gas_wei.clone(),
+        max_priority_fee_per_gas_wei: execution_config.max_priority_fee_per_gas_wei.clone(),
+    })
+}
+
 pub async fn simulate_option_execution_intent<P>(
     provider: &P,
     intent: &OptionExecutionIntent,
@@ -351,9 +380,80 @@ pub fn validate_simulation_target(target: &AccountId) -> Result<()> {
     Ok(())
 }
 
+fn validate_broadcast_intent(
+    options_config: &OptionsConfig,
+    intent: &OptionExecutionIntent,
+) -> Result<()> {
+    if intent.buyer_signature.is_none() || intent.seller_signature.is_none() {
+        return Err(BackendError::MissingTradeSignatures);
+    }
+    let calldata = intent
+        .calldata
+        .as_deref()
+        .ok_or_else(missing_broadcast_calldata_error)?;
+    if calldata == "0x" {
+        return Err(missing_broadcast_calldata_error());
+    }
+    if options_config.execution_require_simulation_ok
+        && intent.simulation_status != Some(OptionExecutionSimulationStatus::SimulationOk)
+    {
+        return Err(BackendError::BroadcastRejected(
+            "simulation_ok status is required before option execution broadcast".to_string(),
+        ));
+    }
+    if !matches!(
+        intent.status,
+        OptionExecutionIntentStatus::CalldataReady
+            | OptionExecutionIntentStatus::SimulationReady
+            | OptionExecutionIntentStatus::SimulationOk
+    ) {
+        return Err(BackendError::InvalidOptionExecutionIntentState(
+            "option execution intent must be calldata_ready before broadcast".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_broadcast_target(target: &AccountId) -> Result<()> {
+    let address = parse_evm_address(target).map_err(|_| {
+        BackendError::Config(
+            "OPTION_MATCHING_ENGINE_ADDRESS must be a valid address for option execution broadcast"
+                .to_string(),
+        )
+    })?;
+    if is_zero_address(&address) {
+        return Err(BackendError::Config(
+            "OPTION_MATCHING_ENGINE_ADDRESS is required for option execution broadcast".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn option_execution_broadcast_gas_limit(
+    execution_config: &ExecutionConfig,
+    options_config: &OptionsConfig,
+) -> Result<u64> {
+    if options_config.execution_broadcast_gas_limit > 0 {
+        return Ok(options_config.execution_broadcast_gas_limit);
+    }
+    if execution_config.max_gas_limit == 0 {
+        return Err(BackendError::Config(
+            "EXECUTOR_MAX_GAS_LIMIT must be greater than zero for option execution broadcast"
+                .to_string(),
+        ));
+    }
+    Ok(execution_config.max_gas_limit)
+}
+
 fn missing_calldata_error() -> BackendError {
     BackendError::InvalidOptionExecutionIntentState(
         "option execution calldata is required for simulation".to_string(),
+    )
+}
+
+fn missing_broadcast_calldata_error() -> BackendError {
+    BackendError::InvalidOptionExecutionIntentState(
+        "option execution calldata is required before broadcast".to_string(),
     )
 }
 

@@ -1,4 +1,5 @@
 use crate::error::{BackendError, Result};
+use crate::execution::ExecutionTransactionStatus;
 use crate::signing::Eip712Domain;
 use crate::types::{AccountId, OrderId, Price1e8, Side, Size1e8, TimeInForce, TimestampMs};
 use serde::{Deserialize, Serialize};
@@ -40,6 +41,9 @@ pub struct OptionsConfig {
     pub execution_simulation_gas_limit: u64,
     pub execution_simulation_from: Option<AccountId>,
     pub execution_simulation_rpc_url: Option<String>,
+    pub execution_broadcast_enabled: bool,
+    pub execution_require_simulation_ok: bool,
+    pub execution_broadcast_gas_limit: u64,
 }
 
 impl OptionsConfig {
@@ -80,6 +84,9 @@ impl OptionsConfig {
             execution_simulation_gas_limit: 0,
             execution_simulation_from: None,
             execution_simulation_rpc_url: None,
+            execution_broadcast_enabled: false,
+            execution_require_simulation_ok: true,
+            execution_broadcast_gas_limit: 0,
         }
     }
 
@@ -170,6 +177,16 @@ impl OptionsConfig {
         if self.execution_simulation_enabled && !self.enabled {
             return Err(BackendError::Config(
                 "Option execution simulation requires OPTIONS_ENABLED=true".to_string(),
+            ));
+        }
+        if self.execution_broadcast_enabled && !self.enabled {
+            return Err(BackendError::Config(
+                "Option execution broadcast requires OPTIONS_ENABLED=true".to_string(),
+            ));
+        }
+        if self.execution_broadcast_enabled && !self.execution_enabled {
+            return Err(BackendError::Config(
+                "Option execution broadcast requires OPTION_EXECUTION_ENABLED=true".to_string(),
             ));
         }
         if self.execution_simulation_enabled
@@ -271,6 +288,8 @@ pub enum OptionExecutionIntentStatus {
     SimulationReady,
     SimulationOk,
     SimulationFailed,
+    BroadcastSubmitted,
+    BroadcastFailed,
     Cancelled,
     Failed,
 }
@@ -317,6 +336,8 @@ impl OptionExecutionIntentStatus {
             Self::SimulationReady => "simulation_ready",
             Self::SimulationOk => "simulation_ok",
             Self::SimulationFailed => "simulation_failed",
+            Self::BroadcastSubmitted => "broadcast_submitted",
+            Self::BroadcastFailed => "broadcast_failed",
             Self::Cancelled => "cancelled",
             Self::Failed => "failed",
         }
@@ -331,6 +352,8 @@ impl OptionExecutionIntentStatus {
             "simulation_ready" => Ok(Self::SimulationReady),
             "simulation_ok" => Ok(Self::SimulationOk),
             "simulation_failed" => Ok(Self::SimulationFailed),
+            "broadcast_submitted" => Ok(Self::BroadcastSubmitted),
+            "broadcast_failed" => Ok(Self::BroadcastFailed),
             "cancelled" => Ok(Self::Cancelled),
             "failed" => Ok(Self::Failed),
             other => Err(BackendError::Persistence(format!(
@@ -386,6 +409,23 @@ pub struct OptionExecutionIntent {
     pub simulation_revert_data: Option<String>,
     pub simulation_revert_selector: Option<String>,
     pub simulated_at_ms: Option<TimestampMs>,
+    pub created_at_ms: TimestampMs,
+    pub updated_at_ms: TimestampMs,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct OptionExecutionTransaction {
+    pub transaction_id: String,
+    pub intent_id: OptionExecutionIntentId,
+    pub onchain_intent_id: Option<String>,
+    pub from: AccountId,
+    pub to: AccountId,
+    pub calldata: String,
+    pub value_wei: String,
+    pub gas_limit: Option<u64>,
+    pub tx_hash: Option<String>,
+    pub status: ExecutionTransactionStatus,
+    pub error: Option<String>,
     pub created_at_ms: TimestampMs,
     pub updated_at_ms: TimestampMs,
 }

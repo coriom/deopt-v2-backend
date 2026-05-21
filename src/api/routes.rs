@@ -30,6 +30,7 @@ use crate::nonce_sync::{
 };
 use crate::options::service::{
     accept_option_rfq_quote as accept_option_rfq_quote_service,
+    broadcast_option_execution_intent as broadcast_option_execution_intent_service,
     cancel_option_order as cancel_option_order_service,
     cancel_option_rfq as cancel_option_rfq_service, create_option_rfq as create_option_rfq_service,
     create_option_series as create_option_series_service,
@@ -169,6 +170,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/options/execution-intents/:intent_id/simulation",
             get(option_execution_simulation),
+        )
+        .route(
+            "/options/execution-intents/:intent_id/broadcast",
+            post(broadcast_option_execution_intent),
         )
         .route("/options/fills", get(list_option_fills))
         .route("/options/fills/:fill_id", get(get_option_fill))
@@ -316,6 +321,7 @@ async fn admin_status(
         "option_rfq_enabled": state.options_config.rfq_enabled,
         "option_execution_enabled": state.options_config.execution_enabled,
         "option_execution_simulation_enabled": state.options_config.execution_simulation_enabled,
+        "option_execution_broadcast_enabled": state.options_config.execution_broadcast_enabled,
         "option_nonce_sync_enabled": state.option_nonce_sync_config.enabled,
         "fees_enabled": state.fees_config.enabled,
         "rebates_enabled": state.fees_config.rebates_enabled
@@ -353,6 +359,7 @@ async fn admin_config(
             "option_rfq_enabled": state.options_config.rfq_enabled,
             "option_execution_enabled": state.options_config.execution_enabled,
             "option_execution_simulation_enabled": state.options_config.execution_simulation_enabled,
+            "option_execution_broadcast_enabled": state.options_config.execution_broadcast_enabled,
             "option_nonce_sync_enabled": state.option_nonce_sync_config.enabled,
             "fees_enabled": state.fees_config.enabled,
             "rebates_enabled": state.fees_config.rebates_enabled,
@@ -459,6 +466,9 @@ async fn admin_config(
             "execution_simulation_gas_limit": state.options_config.execution_simulation_gas_limit,
             "execution_simulation_from": state.options_config.execution_simulation_from,
             "execution_simulation_rpc_configured": state.options_config.execution_simulation_rpc_url.is_some(),
+            "execution_broadcast_enabled": state.options_config.execution_broadcast_enabled,
+            "execution_require_simulation_ok": state.options_config.execution_require_simulation_ok,
+            "execution_broadcast_gas_limit": state.options_config.execution_broadcast_gas_limit,
             "option_nonce_sync_enabled": state.option_nonce_sync_config.enabled,
             "option_nonce_sync_require_rpc": state.option_nonce_sync_config.require_rpc,
             "option_nonce_sync_strict": state.option_nonce_sync_config.strict,
@@ -770,6 +780,10 @@ async fn admin_options_summary(
         let option_execution_intent_status_counts = repository
             .admin_count_by_column("option_execution_intents", "status")
             .await?;
+        let option_execution_transaction_status_counts = repository
+            .admin_count_by_column("option_execution_transactions", "status")
+            .await
+            .unwrap_or_default();
         let mut option_execution_simulation_status_counts = repository
             .admin_count_by_column("option_execution_intents", "simulation_status")
             .await?;
@@ -784,6 +798,7 @@ async fn admin_options_summary(
             "option_rfq_enabled": state.options_config.rfq_enabled,
             "option_execution_enabled": state.options_config.execution_enabled,
             "option_execution_simulation_enabled": state.options_config.execution_simulation_enabled,
+            "option_execution_broadcast_enabled": state.options_config.execution_broadcast_enabled,
             "series_status_counts": series_status_counts,
             "order_status_counts": order_status_counts,
             "option_fills_count": repository.admin_count_where("option_fills", "TRUE").await?,
@@ -794,9 +809,12 @@ async fn admin_options_summary(
             "option_rfq_fills_count": repository.admin_count_where("option_rfq_fills", "TRUE").await?,
             "option_execution_intent_status_counts": option_execution_intent_status_counts,
             "option_execution_simulation_status_counts": option_execution_simulation_status_counts,
+            "option_execution_transaction_status_counts": option_execution_transaction_status_counts,
             "option_execution_intents_count": repository.admin_count_where("option_execution_intents", "TRUE").await?,
+            "option_execution_transactions_count": repository.admin_count_where("option_execution_transactions", "TRUE").await.unwrap_or_default(),
             "option_execution_calldata_ready": count_from_map(&option_execution_intent_status_counts, "calldata_ready"),
             "option_execution_pending_signatures": count_from_map(&option_execution_intent_status_counts, "signatures_required"),
+            "option_execution_broadcast_submitted": count_from_map(&option_execution_intent_status_counts, "broadcast_submitted"),
             "option_execution_simulation_ok": count_from_map(&option_execution_simulation_status_counts, "simulation_ok"),
             "option_execution_simulation_failed": count_from_map(&option_execution_simulation_status_counts, "simulation_failed"),
             "option_execution_simulation_unavailable": count_from_map(&option_execution_simulation_status_counts, "simulation_unavailable"),
@@ -869,6 +887,7 @@ async fn admin_options_summary(
         "option_rfq_enabled": state.options_config.rfq_enabled,
         "option_execution_enabled": state.options_config.execution_enabled,
         "option_execution_simulation_enabled": state.options_config.execution_simulation_enabled,
+        "option_execution_broadcast_enabled": state.options_config.execution_broadcast_enabled,
         "series_status_counts": series_status_counts,
         "order_status_counts": order_status_counts,
         "option_fills_count": fills.len(),
@@ -879,9 +898,12 @@ async fn admin_options_summary(
         "option_rfq_fills_count": option_rfq_fills.len(),
         "option_execution_intent_status_counts": option_execution_intent_status_counts,
         "option_execution_simulation_status_counts": option_execution_simulation_status_counts,
+        "option_execution_transaction_status_counts": {},
         "option_execution_intents_count": option_execution_intents.len(),
+        "option_execution_transactions_count": 0,
         "option_execution_calldata_ready": count_from_map(&option_execution_intent_status_counts, "calldata_ready"),
         "option_execution_pending_signatures": count_from_map(&option_execution_intent_status_counts, "signatures_required"),
+        "option_execution_broadcast_submitted": count_from_map(&option_execution_intent_status_counts, "broadcast_submitted"),
         "option_execution_simulation_ok": count_from_map(&option_execution_simulation_status_counts, "simulation_ok"),
         "option_execution_simulation_failed": count_from_map(&option_execution_simulation_status_counts, "simulation_failed"),
         "option_execution_simulation_unavailable": count_from_map(&option_execution_simulation_status_counts, "simulation_unavailable"),
@@ -1762,6 +1784,20 @@ struct OptionExecutionCalldataResponse {
     missing_signatures: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct OptionExecutionBroadcastResponse {
+    intent_id: String,
+    status: OptionExecutionIntentStatus,
+    tx_hash: Option<String>,
+    to: AccountId,
+    from: AccountId,
+    transaction_id: String,
+    broadcast_enabled: bool,
+    submitted: bool,
+    duplicate: bool,
+    confirmed: bool,
+}
+
 impl From<OptionSeries> for OptionSeriesResponse {
     fn from(series: OptionSeries) -> Self {
         Self {
@@ -2174,6 +2210,26 @@ async fn option_execution_simulation(
     let intent_id = parse_option_execution_intent_id(&intent_id)?;
     let result = option_execution_simulation_status_service(&state, intent_id).await?;
     Ok(Json(OptionExecutionSimulationResponse::from(result)))
+}
+
+async fn broadcast_option_execution_intent(
+    State(state): State<AppState>,
+    Path(intent_id): Path<String>,
+) -> Result<Json<OptionExecutionBroadcastResponse>, ApiError> {
+    let intent_id = parse_option_execution_intent_id(&intent_id)?;
+    let outcome = broadcast_option_execution_intent_service(&state, intent_id).await?;
+    Ok(Json(OptionExecutionBroadcastResponse {
+        intent_id: outcome.intent.intent_id.to_string(),
+        status: outcome.intent.status,
+        tx_hash: outcome.transaction.tx_hash,
+        to: outcome.transaction.to,
+        from: outcome.transaction.from,
+        transaction_id: outcome.transaction.transaction_id,
+        broadcast_enabled: outcome.broadcast_enabled,
+        submitted: outcome.submitted,
+        duplicate: outcome.duplicate,
+        confirmed: false,
+    }))
 }
 
 async fn create_option_rfq(
@@ -4527,6 +4583,27 @@ mod tests {
         let json = response_json(response).await;
         assert_eq!(json["simulation_status"], "simulation_pending");
         assert_eq!(json["error"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn option_execution_broadcast_disabled_returns_clear_error() {
+        let state = option_simulation_state(true, false);
+        let intent = insert_route_option_intent(&state, route_calldata_ready_intent());
+
+        let response = router(state)
+            .oneshot(post_request(&format!(
+                "/options/execution-intents/{}/broadcast",
+                intent.intent_id
+            )))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let json = response_json(response).await;
+        assert_eq!(
+            json["error"],
+            "configuration error: option execution broadcast is disabled"
+        );
     }
 
     #[tokio::test]

@@ -1,11 +1,13 @@
 use super::{
     OptionExecutionIntent, OptionExecutionIntentId, OptionExecutionIntentStatus,
-    OptionExecutionSimulationResult, OptionExecutionSourceType, OptionFill, OptionFillFilter,
-    OptionFillId, OptionOrder, OptionOrderFilter, OptionOrderId, OptionOrderStatus, OptionRfqFill,
-    OptionRfqId, OptionRfqQuote, OptionRfqQuoteId, OptionRfqQuoteStatus, OptionRfqRequest,
-    OptionRfqStatus, OptionSeries, OptionSeriesFilter, OptionSeriesId, OptionSeriesStatus,
+    OptionExecutionSimulationResult, OptionExecutionSourceType, OptionExecutionTransaction,
+    OptionFill, OptionFillFilter, OptionFillId, OptionOrder, OptionOrderFilter, OptionOrderId,
+    OptionOrderStatus, OptionRfqFill, OptionRfqId, OptionRfqQuote, OptionRfqQuoteId,
+    OptionRfqQuoteStatus, OptionRfqRequest, OptionRfqStatus, OptionSeries, OptionSeriesFilter,
+    OptionSeriesId, OptionSeriesStatus,
 };
 use crate::error::{BackendError, Result};
+use crate::execution::ExecutionTransactionStatus;
 use crate::types::{Side, TimestampMs};
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -20,6 +22,7 @@ pub struct OptionSeriesStore {
     option_rfq_fills: HashMap<Uuid, OptionRfqFill>,
     option_execution_intents: HashMap<OptionExecutionIntentId, OptionExecutionIntent>,
     option_execution_intents_by_source: HashMap<(String, String), OptionExecutionIntentId>,
+    option_execution_transactions: HashMap<String, OptionExecutionTransaction>,
 }
 
 impl OptionSeriesStore {
@@ -429,6 +432,82 @@ impl OptionSeriesStore {
         intent.simulated_at_ms = Some(result.simulated_at_ms);
         intent.updated_at_ms = result.simulated_at_ms;
         Ok(intent.clone())
+    }
+
+    pub fn update_option_execution_intent_status(
+        &mut self,
+        intent_id: OptionExecutionIntentId,
+        status: OptionExecutionIntentStatus,
+        error: Option<String>,
+        updated_at_ms: TimestampMs,
+    ) -> Result<OptionExecutionIntent> {
+        let intent = self
+            .option_execution_intents
+            .get_mut(&intent_id)
+            .ok_or(BackendError::InvalidOptionExecutionIntentId)?;
+        intent.status = status;
+        intent.error = error;
+        intent.updated_at_ms = updated_at_ms;
+        Ok(intent.clone())
+    }
+
+    pub fn insert_option_execution_transaction(
+        &mut self,
+        transaction: OptionExecutionTransaction,
+    ) -> Result<OptionExecutionTransaction> {
+        if transaction.status == ExecutionTransactionStatus::Submitted
+            && self
+                .find_submitted_option_execution_transaction_by_intent(transaction.intent_id)
+                .is_some()
+        {
+            return Err(BackendError::BroadcastRejected(
+                "option execution intent already has a submitted transaction".to_string(),
+            ));
+        }
+        self.option_execution_transactions
+            .insert(transaction.transaction_id.clone(), transaction.clone());
+        Ok(transaction)
+    }
+
+    pub fn find_submitted_option_execution_transaction_by_intent(
+        &self,
+        intent_id: OptionExecutionIntentId,
+    ) -> Option<OptionExecutionTransaction> {
+        let mut transactions = self
+            .option_execution_transactions
+            .values()
+            .filter(|transaction| {
+                transaction.intent_id == intent_id
+                    && transaction.status == ExecutionTransactionStatus::Submitted
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        transactions.sort_by(|left, right| {
+            right
+                .created_at_ms
+                .cmp(&left.created_at_ms)
+                .then_with(|| right.transaction_id.cmp(&left.transaction_id))
+        });
+        transactions.into_iter().next()
+    }
+
+    pub fn option_execution_transactions_for_intent(
+        &self,
+        intent_id: OptionExecutionIntentId,
+    ) -> Vec<OptionExecutionTransaction> {
+        let mut transactions = self
+            .option_execution_transactions
+            .values()
+            .filter(|transaction| transaction.intent_id == intent_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        transactions.sort_by(|left, right| {
+            right
+                .created_at_ms
+                .cmp(&left.created_at_ms)
+                .then_with(|| right.transaction_id.cmp(&left.transaction_id))
+        });
+        transactions
     }
 
     pub fn cancel_option_rfq(&mut self, option_rfq_id: OptionRfqId) -> Result<OptionRfqRequest> {

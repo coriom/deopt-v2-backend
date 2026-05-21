@@ -18,10 +18,10 @@ use crate::options::store::status_for_remaining;
 use crate::options::{
     OptionExecutionIntent, OptionExecutionIntentId, OptionExecutionIntentStatus,
     OptionExecutionSimulationResult, OptionExecutionSimulationStatus, OptionExecutionSourceType,
-    OptionFill, OptionFillId, OptionOrder, OptionOrderId, OptionOrderStatus, OptionRfqFill,
-    OptionRfqFillId, OptionRfqId, OptionRfqQuote, OptionRfqQuoteId, OptionRfqQuoteSignatureStatus,
-    OptionRfqQuoteStatus, OptionRfqRequest, OptionRfqStatus, OptionSeries, OptionSeriesSource,
-    OptionSeriesStatus,
+    OptionExecutionTransaction, OptionFill, OptionFillId, OptionOrder, OptionOrderId,
+    OptionOrderStatus, OptionRfqFill, OptionRfqFillId, OptionRfqId, OptionRfqQuote,
+    OptionRfqQuoteId, OptionRfqQuoteSignatureStatus, OptionRfqQuoteStatus, OptionRfqRequest,
+    OptionRfqStatus, OptionSeries, OptionSeriesSource, OptionSeriesStatus,
 };
 use crate::reconciliation::{
     normalize_onchain_intent_id, ExecutionReconciliation, ReconciliationCounts,
@@ -60,6 +60,10 @@ const ADMIN_TABLE_COUNTS: &[(&str, &str)] = &[
     ("option_rfq_quotes", "option_rfq_quotes"),
     ("option_rfq_fills", "option_rfq_fills"),
     ("option_execution_intents", "option_execution_intents"),
+    (
+        "option_execution_transactions",
+        "option_execution_transactions",
+    ),
     ("mm_accounts", "mm_accounts"),
     ("mm_market_permissions", "mm_market_permissions"),
     ("fee_events", "fee_events"),
@@ -2126,6 +2130,109 @@ impl PgRepository {
             .ok_or(BackendError::InvalidOptionExecutionIntentId)
     }
 
+    pub async fn update_option_execution_intent_status(
+        &self,
+        intent_id: OptionExecutionIntentId,
+        status: OptionExecutionIntentStatus,
+        error: Option<String>,
+        updated_at_ms: TimestampMs,
+    ) -> Result<OptionExecutionIntent> {
+        let rows = sqlx::query(
+            "UPDATE option_execution_intents
+             SET status = $2,
+                 error = $3,
+                 updated_at_ms = $4
+             WHERE intent_id = $1",
+        )
+        .bind(intent_id.to_string())
+        .bind(status.as_str())
+        .bind(error)
+        .bind(timestamp_to_i64(updated_at_ms))
+        .execute(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?
+        .rows_affected();
+        if rows == 0 {
+            return Err(BackendError::InvalidOptionExecutionIntentId);
+        }
+        self.get_option_execution_intent(intent_id)
+            .await?
+            .ok_or(BackendError::InvalidOptionExecutionIntentId)
+    }
+
+    pub async fn insert_option_execution_transaction(
+        &self,
+        transaction: &OptionExecutionTransaction,
+    ) -> Result<u64> {
+        let result = sqlx::query(
+            "INSERT INTO option_execution_transactions (
+                transaction_id, intent_id, onchain_intent_id, sender, target, calldata,
+                value_wei, gas_limit, tx_hash, status, error, created_at_ms, updated_at_ms
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+        )
+        .bind(&transaction.transaction_id)
+        .bind(transaction.intent_id.to_string())
+        .bind(&transaction.onchain_intent_id)
+        .bind(&transaction.from.0)
+        .bind(&transaction.to.0)
+        .bind(&transaction.calldata)
+        .bind(&transaction.value_wei)
+        .bind(
+            transaction
+                .gas_limit
+                .map(|value| u64_to_i64("gas_limit", value))
+                .transpose()?,
+        )
+        .bind(&transaction.tx_hash)
+        .bind(transaction.status.as_str())
+        .bind(&transaction.error)
+        .bind(timestamp_to_i64(transaction.created_at_ms))
+        .bind(timestamp_to_i64(transaction.updated_at_ms))
+        .execute(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        Ok(result.rows_affected())
+    }
+
+    pub async fn find_submitted_option_execution_transaction_by_intent(
+        &self,
+        intent_id: OptionExecutionIntentId,
+    ) -> Result<Option<OptionExecutionTransaction>> {
+        let row = sqlx::query(
+            "SELECT transaction_id, intent_id, onchain_intent_id, sender, target, calldata,
+                    value_wei, gas_limit, tx_hash, status, error, created_at_ms, updated_at_ms
+             FROM option_execution_transactions
+             WHERE intent_id = $1 AND status = 'submitted'
+             ORDER BY created_at_ms DESC, transaction_id DESC
+             LIMIT 1",
+        )
+        .bind(intent_id.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        row.map(option_execution_transaction_from_row).transpose()
+    }
+
+    pub async fn get_option_execution_transactions_for_intent(
+        &self,
+        intent_id: OptionExecutionIntentId,
+    ) -> Result<Vec<OptionExecutionTransaction>> {
+        let rows = sqlx::query(
+            "SELECT transaction_id, intent_id, onchain_intent_id, sender, target, calldata,
+                    value_wei, gas_limit, tx_hash, status, error, created_at_ms, updated_at_ms
+             FROM option_execution_transactions
+             WHERE intent_id = $1
+             ORDER BY created_at_ms DESC, transaction_id DESC",
+        )
+        .bind(intent_id.to_string())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        rows.into_iter()
+            .map(option_execution_transaction_from_row)
+            .collect()
+    }
+
     pub async fn insert_option_rfq(&self, rfq: &OptionRfqRequest) -> Result<()> {
         sqlx::query(
             "INSERT INTO option_rfqs (
@@ -3354,6 +3461,31 @@ fn option_execution_intent_from_row(row: PgRow) -> Result<OptionExecutionIntent>
         simulation_revert_data: row_get(&row, "simulation_revert_data")?,
         simulation_revert_selector: row_get(&row, "simulation_revert_selector")?,
         simulated_at_ms: row_get(&row, "simulated_at_ms")?,
+        created_at_ms: row_get(&row, "created_at_ms")?,
+        updated_at_ms: row_get(&row, "updated_at_ms")?,
+    })
+}
+
+fn option_execution_transaction_from_row(row: PgRow) -> Result<OptionExecutionTransaction> {
+    let intent_id: String = row_get(&row, "intent_id")?;
+    let gas_limit: Option<i64> = row_get(&row, "gas_limit")?;
+    let status: String = row_get(&row, "status")?;
+    Ok(OptionExecutionTransaction {
+        transaction_id: row_get(&row, "transaction_id")?,
+        intent_id: intent_id.parse().map_err(|error| {
+            BackendError::Persistence(format!("invalid option execution intent id: {error}"))
+        })?,
+        onchain_intent_id: row_get(&row, "onchain_intent_id")?,
+        from: AccountId::new(row_get::<String>(&row, "sender")?),
+        to: AccountId::new(row_get::<String>(&row, "target")?),
+        calldata: row_get(&row, "calldata")?,
+        value_wei: row_get(&row, "value_wei")?,
+        gas_limit: gas_limit
+            .map(|value| i64_to_u64_persistence("gas_limit", value))
+            .transpose()?,
+        tx_hash: row_get(&row, "tx_hash")?,
+        status: ExecutionTransactionStatus::parse(&status)?,
+        error: row_get(&row, "error")?,
         created_at_ms: row_get(&row, "created_at_ms")?,
         updated_at_ms: row_get(&row, "updated_at_ms")?,
     })

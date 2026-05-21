@@ -1,6 +1,6 @@
-# Option Execution Backend V1E
+# Option Execution Backend V1I
 
-Backend Option Execution Intents V1E turns option fills into signing/calldata artifacts for Solidity `OptionMatchingEngine`, adds safe `eth_call` simulation for calldata-ready intents, and can sync option execution nonces from `OptionMatchingEngine.nonces(address)`.
+Backend Option Execution Intents V1I turns option fills into signing/calldata artifacts for Solidity `OptionMatchingEngine`, adds safe `eth_call` simulation for calldata-ready intents, can sync option execution nonces from `OptionMatchingEngine.nonces(address)`, and provides a disabled-by-default controlled broadcast endpoint.
 
 It is disabled by default:
 
@@ -20,6 +20,9 @@ OPTION_EXECUTION_SIMULATION_ENABLED=false
 OPTION_EXECUTION_REQUIRE_RPC_FOR_SIMULATION=true
 OPTION_EXECUTION_SIMULATION_GAS_LIMIT=0
 OPTION_EXECUTION_SIMULATION_FROM=
+OPTION_EXECUTION_BROADCAST_ENABLED=false
+OPTION_EXECUTION_REQUIRE_SIMULATION_OK=true
+OPTION_EXECUTION_BROADCAST_GAS_LIMIT=0
 ```
 
 When enabled, startup requires `OPTIONS_ENABLED=true`. If `OPTION_EXECUTION_REQUIRE_PERSISTENCE=true`, startup also requires `PERSISTENCE_ENABLED=true`. `OPTION_MATCHING_ENGINE_ADDRESS` must be a valid nonzero EVM address and is used as the EIP-712 verifying contract.
@@ -112,8 +115,38 @@ Results are stored directly on `option_execution_intents`:
 
 `GET /options/execution-intents/:intent_id/simulation` returns the persisted result, or `simulation_pending` before a simulation has been run.
 
+## Broadcast
+
+`POST /options/execution-intents/:intent_id/broadcast` is the V1I controlled transaction submission path for calldata-ready option execution intents. It is disabled unless `OPTION_EXECUTION_BROADCAST_ENABLED=true`.
+
+Broadcast requires:
+
+- `OPTION_EXECUTION_ENABLED=true`
+- `OPTION_EXECUTION_BROADCAST_ENABLED=true`
+- `EXECUTION_ENABLED=true`
+- `EXECUTOR_REAL_BROADCAST_ENABLED=true`
+- `RPC_URL`
+- `EXECUTOR_PRIVATE_KEY`
+- nonzero `OPTION_MATCHING_ENGINE_ADDRESS`
+- stored calldata
+- stored buyer and seller signatures
+- persisted `simulation_status=simulation_ok` when `OPTION_EXECUTION_REQUIRE_SIMULATION_OK=true`
+
+The transaction uses:
+
+- `to = OPTION_MATCHING_ENGINE_ADDRESS`
+- `data = intent.calldata`
+- `value = 0`
+- optional gas override from `OPTION_EXECUTION_BROADCAST_GAS_LIMIT` when nonzero; otherwise the existing executor gas limit is used by the current raw-transaction sender
+
+The endpoint uses the backend transaction signer and `TransactionBroadcastProvider` abstraction. Normal tests use a mock provider; they do not require live RPC or private keys. The route does not call `/executor/broadcast`.
+
+Successful sends insert an `option_execution_transactions` row with `status=submitted` and the tx hash returned by the provider, then move the option intent to `broadcast_submitted`. Failed sends insert `status=failed` with no tx hash and move the intent to `broadcast_failed`. Duplicate calls for an intent that already has a submitted transaction return the existing transaction metadata and do not send another transaction.
+
+V1I does not mark option intents confirmed or reconciled, does not fabricate tx hashes, and does not index option execution events. Live operator broadcast remains an explicit opt-in runtime action.
+
 ## Safety Boundary
 
-V1E does not broadcast. Nonce sync and simulation use `eth_call` only. They do not call `/executor/broadcast`, create `execution_transactions`, fabricate transaction hashes, require private keys, require live RPC for normal tests, or set submitted/confirmed option statuses. Option execution broadcast, indexer, reconciliation, and confirmation remain deferred.
+Nonce sync and simulation use `eth_call` only. Option broadcast is disabled by default and uses a separate option-specific endpoint and transaction table when explicitly enabled. Option execution does not call `/executor/broadcast`, create perp `execution_transactions`, fabricate transaction hashes, require live RPC for normal tests, or set confirmed option statuses. Option indexer, reconciliation, and confirmation remain deferred.
 
-Deferred items include option broadcast, option indexer/reconciliation/confirmation, on-chain submission, settlement, exercise, and frontend surfaces.
+Deferred items include option indexer/reconciliation/confirmation, settlement, exercise, and frontend surfaces.

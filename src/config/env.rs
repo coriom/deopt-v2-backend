@@ -308,6 +308,21 @@ impl AppConfig {
                 .filter(|value| !value.is_empty())
                 .map(AccountId::new),
             execution_simulation_rpc_url: execution.rpc_url.clone(),
+            execution_broadcast_enabled: parse_env(
+                &mut lookup,
+                "OPTION_EXECUTION_BROADCAST_ENABLED",
+                "false",
+            )?,
+            execution_require_simulation_ok: parse_env(
+                &mut lookup,
+                "OPTION_EXECUTION_REQUIRE_SIMULATION_OK",
+                "true",
+            )?,
+            execution_broadcast_gas_limit: parse_env(
+                &mut lookup,
+                "OPTION_EXECUTION_BROADCAST_GAS_LIMIT",
+                "0",
+            )?,
         };
         let perp_nonce_sync = PerpNonceSyncConfig {
             enabled: parse_env(&mut lookup, "PERP_NONCE_SYNC_ENABLED", "false")?,
@@ -351,6 +366,7 @@ impl AppConfig {
         confirmation.validate_startup(persistence_enabled)?;
         rfq.validate_startup(persistence_enabled)?;
         options.validate_startup(persistence_enabled)?;
+        validate_option_execution_broadcast_startup(&options, &execution)?;
         mm_permissions.validate_startup(persistence_enabled)?;
         fees.validate_startup(persistence_enabled)?;
         validate_webtransport_startup(&mm_gateway)?;
@@ -407,6 +423,38 @@ where
     value
         .parse()
         .map_err(|error| BackendError::Config(format!("invalid {key}: {error}")))
+}
+
+fn validate_option_execution_broadcast_startup(
+    options: &OptionsConfig,
+    execution: &ExecutionConfig,
+) -> Result<()> {
+    if !options.execution_broadcast_enabled {
+        return Ok(());
+    }
+    if !execution.execution_enabled {
+        return Err(BackendError::Config(
+            "OPTION_EXECUTION_BROADCAST_ENABLED=true requires EXECUTION_ENABLED=true".to_string(),
+        ));
+    }
+    if !execution.real_broadcast_enabled {
+        return Err(BackendError::Config(
+            "OPTION_EXECUTION_BROADCAST_ENABLED=true requires EXECUTOR_REAL_BROADCAST_ENABLED=true"
+                .to_string(),
+        ));
+    }
+    if execution.executor_private_key.is_none() {
+        return Err(BackendError::Config(
+            "EXECUTOR_PRIVATE_KEY is required when OPTION_EXECUTION_BROADCAST_ENABLED=true"
+                .to_string(),
+        ));
+    }
+    if execution.rpc_url.is_none() {
+        return Err(BackendError::Config(
+            "RPC_URL is required when OPTION_EXECUTION_BROADCAST_ENABLED=true".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -533,6 +581,35 @@ mod tests {
             config.option_nonce_sync.option_matching_engine_address.0,
             ""
         );
+    }
+
+    #[test]
+    fn option_execution_broadcast_uses_safe_defaults() {
+        let config = config_from_pairs([("OPTION_EXECUTION_BROADCAST_ENABLED", "false")]).unwrap();
+
+        assert!(!config.options.execution_broadcast_enabled);
+        assert!(config.options.execution_require_simulation_ok);
+        assert_eq!(config.options.execution_broadcast_gas_limit, 0);
+    }
+
+    #[test]
+    fn option_execution_broadcast_enabled_requires_execution_flags() {
+        let error = config_from_pairs([
+            ("OPTIONS_ENABLED", "true"),
+            ("OPTIONS_REQUIRE_PERSISTENCE", "false"),
+            ("OPTION_EXECUTION_ENABLED", "true"),
+            ("OPTION_EXECUTION_REQUIRE_PERSISTENCE", "false"),
+            (
+                "OPTION_MATCHING_ENGINE_ADDRESS",
+                "0x00000000000000000000000000000000000000ee",
+            ),
+            ("OPTION_EXECUTION_BROADCAST_ENABLED", "true"),
+        ])
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("requires EXECUTION_ENABLED=true"));
     }
 
     #[test]

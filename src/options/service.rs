@@ -4,12 +4,13 @@ use super::signing::{
     option_series_id_to_b256, OptionRfqQuoteSigningPayload,
 };
 use super::{
-    encode_option_execute_trade_calldata, normalize_u256_string,
-    option_execution_intent_id_to_hex_bytes32, option_execution_simulation_pending,
-    option_execution_simulation_unavailable, option_trade_digest, option_trade_digest_bytes,
-    simulate_option_execution_intent, validate_simulation_intent, validate_simulation_target,
-    OptionExecutionIntent, OptionExecutionIntentId, OptionExecutionIntentStatus,
-    OptionExecutionSignatureMode, OptionExecutionSimulationResult, OptionExecutionSourceType,
+    build_option_execution_transaction_request, encode_option_execute_trade_calldata,
+    normalize_u256_string, option_execution_intent_id_to_hex_bytes32,
+    option_execution_simulation_pending, option_execution_simulation_unavailable,
+    option_trade_digest, option_trade_digest_bytes, simulate_option_execution_intent,
+    validate_simulation_intent, validate_simulation_target, OptionExecutionIntent,
+    OptionExecutionIntentId, OptionExecutionIntentStatus, OptionExecutionSignatureMode,
+    OptionExecutionSimulationResult, OptionExecutionSourceType, OptionExecutionTransaction,
     OptionFill, OptionFillFilter, OptionFillId, OptionOrder, OptionOrderFilter, OptionOrderId,
     OptionOrderStatus, OptionOrderbookLevel, OptionOrderbookSnapshot, OptionRfqFill,
     OptionRfqFillId, OptionRfqId, OptionRfqQuote, OptionRfqQuoteId, OptionRfqQuoteSignatureMode,
@@ -20,7 +21,10 @@ use super::{
 use crate::api::AppState;
 use crate::error::{BackendError, Result};
 use crate::execution::transaction::hex_0x;
-use crate::execution::{EthCallProvider, HttpJsonRpcProvider};
+use crate::execution::{
+    sign_eip1559_transaction, EthCallProvider, ExecutionTransactionRequest,
+    ExecutionTransactionStatus, ExecutorSigner, HttpJsonRpcProvider, TransactionBroadcastProvider,
+};
 use crate::mm::protocol::{
     NotificationEnvelope, OptionRfqQuoteAcceptedPayload, OptionRfqQuoteRejectedPayload,
     OptionRfqRequestPayload, ServerMessage,
@@ -146,6 +150,15 @@ pub struct OptionExecutionCalldataOutcome {
     pub calldata: Option<String>,
     pub calldata_ready: bool,
     pub missing_signatures: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OptionExecutionBroadcastOutcome {
+    pub intent: OptionExecutionIntent,
+    pub transaction: OptionExecutionTransaction,
+    pub broadcast_enabled: bool,
+    pub submitted: bool,
+    pub duplicate: bool,
 }
 
 pub async fn create_option_series(
@@ -1087,6 +1100,136 @@ pub async fn persist_option_execution_simulation_unavailable(
     Ok(result)
 }
 
+pub async fn broadcast_option_execution_intent(
+    state: &AppState,
+    intent_id: OptionExecutionIntentId,
+) -> Result<OptionExecutionBroadcastOutcome> {
+    ensure_option_execution_broadcast_enabled(state)?;
+    let rpc_url = state.execution_config.rpc_url.clone().ok_or_else(|| {
+        BackendError::Config("RPC_URL is required for option execution broadcast".to_string())
+    })?;
+    let provider = HttpJsonRpcProvider::new(rpc_url);
+    broadcast_option_execution_intent_with_provider(state, intent_id, &provider).await
+}
+
+pub async fn broadcast_option_execution_intent_with_provider<P>(
+    state: &AppState,
+    intent_id: OptionExecutionIntentId,
+    provider: &P,
+) -> Result<OptionExecutionBroadcastOutcome>
+where
+    P: TransactionBroadcastProvider,
+{
+    ensure_option_execution_broadcast_enabled(state)?;
+    let intent = get_option_execution_intent(state, intent_id).await?;
+    if let Some(transaction) = find_submitted_option_execution_transaction(state, intent_id).await?
+    {
+        return Ok(OptionExecutionBroadcastOutcome {
+            intent,
+            transaction,
+            broadcast_enabled: true,
+            submitted: true,
+            duplicate: true,
+        });
+    }
+    if state.execution_config.rpc_url.is_none() {
+        return Err(BackendError::Config(
+            "RPC_URL is required for option execution broadcast".to_string(),
+        ));
+    }
+    let private_key = state
+        .execution_config
+        .executor_private_key
+        .as_ref()
+        .ok_or_else(|| {
+            BackendError::Config(
+                "EXECUTOR_PRIVATE_KEY is required for option execution broadcast".to_string(),
+            )
+        })?;
+    let request = build_option_execution_transaction_request(
+        &state.execution_config,
+        &state.options_config,
+        &intent,
+    )?;
+    let signer = ExecutorSigner::from_private_key(private_key)?;
+    let rpc_chain_id = provider.chain_id().await?;
+    if rpc_chain_id != request.chain_id {
+        return Err(BackendError::BroadcastRejected(format!(
+            "RPC chain id {rpc_chain_id} does not match EXECUTOR_CHAIN_ID {}",
+            request.chain_id
+        )));
+    }
+
+    let now = now_ms();
+    let from = signer.address().clone();
+    let nonce = provider.transaction_count(from.clone()).await?;
+    let raw_transaction = sign_eip1559_transaction(&request, nonce, &signer)?;
+    let tx_hash = match provider.send_raw_transaction(raw_transaction).await {
+        Ok(tx_hash) => {
+            if !is_valid_tx_hash(&tx_hash) {
+                let error = "broadcast provider returned an invalid transaction hash".to_string();
+                let transaction = option_execution_transaction_from_request(
+                    &request,
+                    from,
+                    None,
+                    Some(error.clone()),
+                    now,
+                );
+                insert_option_execution_transaction(state, transaction.clone()).await?;
+                update_option_execution_intent_status(
+                    state,
+                    intent_id,
+                    OptionExecutionIntentStatus::BroadcastFailed,
+                    Some(error.clone()),
+                    now,
+                )
+                .await?;
+                return Err(BackendError::BroadcastRejected(error));
+            }
+            tx_hash.to_ascii_lowercase()
+        }
+        Err(error) => {
+            let transaction = option_execution_transaction_from_request(
+                &request,
+                from,
+                None,
+                Some(error.to_string()),
+                now,
+            );
+            insert_option_execution_transaction(state, transaction).await?;
+            update_option_execution_intent_status(
+                state,
+                intent_id,
+                OptionExecutionIntentStatus::BroadcastFailed,
+                Some(error.to_string()),
+                now,
+            )
+            .await?;
+            return Err(error);
+        }
+    };
+
+    let transaction =
+        option_execution_transaction_from_request(&request, from, Some(tx_hash), None, now);
+    let transaction = insert_option_execution_transaction(state, transaction).await?;
+    let updated_intent = update_option_execution_intent_status(
+        state,
+        intent_id,
+        OptionExecutionIntentStatus::BroadcastSubmitted,
+        None,
+        now,
+    )
+    .await?;
+
+    Ok(OptionExecutionBroadcastOutcome {
+        intent: updated_intent,
+        transaction,
+        broadcast_enabled: true,
+        submitted: true,
+        duplicate: false,
+    })
+}
+
 pub async fn create_option_orderbook_execution_intent(
     state: &AppState,
     fill: &OptionFill,
@@ -1216,6 +1359,94 @@ async fn persist_option_execution_simulation_result(
         .lock()
         .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?
         .persist_option_execution_simulation_result(result)
+}
+
+async fn update_option_execution_intent_status(
+    state: &AppState,
+    intent_id: OptionExecutionIntentId,
+    status: OptionExecutionIntentStatus,
+    error: Option<String>,
+    updated_at_ms: TimestampMs,
+) -> Result<OptionExecutionIntent> {
+    if let Some(repository) = state.repository.clone() {
+        return repository
+            .update_option_execution_intent_status(intent_id, status, error, updated_at_ms)
+            .await;
+    }
+    state
+        .options_store
+        .lock()
+        .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?
+        .update_option_execution_intent_status(intent_id, status, error, updated_at_ms)
+}
+
+async fn insert_option_execution_transaction(
+    state: &AppState,
+    transaction: OptionExecutionTransaction,
+) -> Result<OptionExecutionTransaction> {
+    if let Some(repository) = state.repository.clone() {
+        repository
+            .insert_option_execution_transaction(&transaction)
+            .await?;
+        return Ok(transaction);
+    }
+    state
+        .options_store
+        .lock()
+        .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?
+        .insert_option_execution_transaction(transaction)
+}
+
+async fn find_submitted_option_execution_transaction(
+    state: &AppState,
+    intent_id: OptionExecutionIntentId,
+) -> Result<Option<OptionExecutionTransaction>> {
+    if let Some(repository) = state.repository.clone() {
+        return repository
+            .find_submitted_option_execution_transaction_by_intent(intent_id)
+            .await;
+    }
+    Ok(state
+        .options_store
+        .lock()
+        .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?
+        .find_submitted_option_execution_transaction_by_intent(intent_id))
+}
+
+fn option_execution_transaction_from_request(
+    request: &ExecutionTransactionRequest,
+    from: AccountId,
+    tx_hash: Option<String>,
+    error: Option<String>,
+    now: TimestampMs,
+) -> OptionExecutionTransaction {
+    let status = if tx_hash.is_some() {
+        ExecutionTransactionStatus::Submitted
+    } else {
+        ExecutionTransactionStatus::Failed
+    };
+    OptionExecutionTransaction {
+        transaction_id: Uuid::new_v4().to_string(),
+        intent_id: request.intent_id,
+        onchain_intent_id: Some(request.onchain_intent_id.clone()),
+        from,
+        to: request.to.clone(),
+        calldata: request.calldata_hex(),
+        value_wei: request.value_wei.to_string(),
+        gas_limit: Some(request.gas_limit),
+        tx_hash,
+        status,
+        error,
+        created_at_ms: now,
+        updated_at_ms: now,
+    }
+}
+
+fn is_valid_tx_hash(value: &str) -> bool {
+    let Some(hex) = value.strip_prefix("0x") else {
+        return false;
+    };
+    hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn option_nonce_provider(state: &AppState) -> Result<Option<HttpJsonRpcProvider>> {
@@ -1649,6 +1880,32 @@ fn ensure_option_execution_simulation_enabled(state: &AppState) -> Result<()> {
     }
 }
 
+fn ensure_option_execution_broadcast_enabled(state: &AppState) -> Result<()> {
+    if !state.options_config.execution_broadcast_enabled {
+        return Err(BackendError::Config(
+            "option execution broadcast is disabled".to_string(),
+        ));
+    }
+    ensure_enabled(state)?;
+    if !state.options_config.execution_enabled {
+        return Err(BackendError::Config(
+            "OPTION_EXECUTION_ENABLED=true is required for option execution broadcast".to_string(),
+        ));
+    }
+    if !state.execution_config.execution_enabled {
+        return Err(BackendError::Config(
+            "EXECUTION_ENABLED=true is required for option execution broadcast".to_string(),
+        ));
+    }
+    if !state.execution_config.real_broadcast_enabled {
+        return Err(BackendError::Config(
+            "EXECUTOR_REAL_BROADCAST_ENABLED=true is required for option execution broadcast"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_account(account: &AccountId) -> Result<()> {
     parse_evm_address(account).map(|_| ())
 }
@@ -1997,6 +2254,15 @@ mod tests {
         calls: Arc<Mutex<Vec<AccountId>>>,
     }
 
+    #[derive(Clone)]
+    struct MockBroadcastProvider {
+        chain_id: u64,
+        tx_hash: String,
+        fail_send: bool,
+        send_calls: Arc<Mutex<Vec<String>>>,
+        nonce_calls: Arc<Mutex<Vec<AccountId>>>,
+    }
+
     impl MockProvider {
         fn success() -> Self {
             Self {
@@ -2048,6 +2314,37 @@ mod tests {
         }
     }
 
+    impl MockBroadcastProvider {
+        fn success() -> Self {
+            Self {
+                chain_id: 84532,
+                tx_hash: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_string(),
+                fail_send: false,
+                send_calls: Arc::new(Mutex::new(Vec::new())),
+                nonce_calls: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn invalid_hash() -> Self {
+            Self {
+                tx_hash: "0xnot-a-tx-hash".to_string(),
+                ..Self::success()
+            }
+        }
+
+        fn fail_send() -> Self {
+            Self {
+                fail_send: true,
+                ..Self::success()
+            }
+        }
+
+        fn send_count(&self) -> usize {
+            self.send_calls.lock().unwrap().len()
+        }
+    }
+
     impl EthCallProvider for MockProvider {
         fn eth_call(&self, request: EthCallRequest) -> RpcFuture<'_, EthCallSuccess> {
             let outcome = self.outcome.clone();
@@ -2089,6 +2386,34 @@ mod tests {
                 } else {
                     Ok(seller_nonce)
                 }
+            })
+        }
+    }
+
+    impl TransactionBroadcastProvider for MockBroadcastProvider {
+        fn chain_id(&self) -> RpcFuture<'_, u64> {
+            let chain_id = self.chain_id;
+            Box::pin(async move { Ok(chain_id) })
+        }
+
+        fn transaction_count(&self, address: AccountId) -> RpcFuture<'_, u64> {
+            let calls = self.nonce_calls.clone();
+            Box::pin(async move {
+                calls.lock().unwrap().push(address);
+                Ok(7)
+            })
+        }
+
+        fn send_raw_transaction(&self, raw_transaction: String) -> RpcFuture<'_, String> {
+            let calls = self.send_calls.clone();
+            let tx_hash = self.tx_hash.clone();
+            let fail_send = self.fail_send;
+            Box::pin(async move {
+                calls.lock().unwrap().push(raw_transaction);
+                if fail_send {
+                    return Err(BackendError::Simulation("mock send failed".to_string()));
+                }
+                Ok(tx_hash)
             })
         }
     }
@@ -2339,6 +2664,215 @@ mod tests {
         assert_eq!(stored.status, OptionExecutionIntentStatus::CalldataReady);
     }
 
+    #[tokio::test]
+    async fn option_execution_broadcast_disabled_rejects_without_send() {
+        let state = state_with_broadcast(false);
+        let intent = insert_intent(&state, broadcast_ready_intent());
+        let provider = MockBroadcastProvider::success();
+
+        let error =
+            broadcast_option_execution_intent_with_provider(&state, intent.intent_id, &provider)
+                .await
+                .unwrap_err();
+
+        assert!(
+            matches!(error, BackendError::Config(message) if message.contains("broadcast is disabled"))
+        );
+        assert_eq!(provider.send_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn option_execution_broadcast_missing_intent_rejects() {
+        let state = state_with_broadcast(true);
+        let provider = MockBroadcastProvider::success();
+
+        let error =
+            broadcast_option_execution_intent_with_provider(&state, Uuid::from_u128(99), &provider)
+                .await
+                .unwrap_err();
+
+        assert!(matches!(
+            error,
+            BackendError::InvalidOptionExecutionIntentId
+        ));
+        assert_eq!(provider.send_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn option_execution_broadcast_missing_calldata_rejects_without_transaction() {
+        let state = state_with_broadcast(true);
+        let mut intent = broadcast_ready_intent();
+        intent.calldata = None;
+        let intent = insert_intent(&state, intent);
+        let provider = MockBroadcastProvider::success();
+
+        let error =
+            broadcast_option_execution_intent_with_provider(&state, intent.intent_id, &provider)
+                .await
+                .unwrap_err();
+
+        assert!(
+            matches!(error, BackendError::InvalidOptionExecutionIntentState(message) if message.contains("calldata"))
+        );
+        assert_eq!(provider.send_count(), 0);
+        assert!(option_transactions(&state, intent.intent_id).is_empty());
+    }
+
+    #[tokio::test]
+    async fn option_execution_broadcast_missing_signatures_rejects_without_send() {
+        let state = state_with_broadcast(true);
+        let mut intent = broadcast_ready_intent();
+        intent.buyer_signature = None;
+        let intent = insert_intent(&state, intent);
+        let provider = MockBroadcastProvider::success();
+
+        let error =
+            broadcast_option_execution_intent_with_provider(&state, intent.intent_id, &provider)
+                .await
+                .unwrap_err();
+
+        assert!(matches!(error, BackendError::MissingTradeSignatures));
+        assert_eq!(provider.send_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn option_execution_broadcast_requires_simulation_ok_by_default() {
+        let state = state_with_broadcast(true);
+        let mut intent = broadcast_ready_intent();
+        intent.simulation_status = Some(OptionExecutionSimulationStatus::SimulationFailed);
+        let intent = insert_intent(&state, intent);
+        let provider = MockBroadcastProvider::success();
+
+        let error =
+            broadcast_option_execution_intent_with_provider(&state, intent.intent_id, &provider)
+                .await
+                .unwrap_err();
+
+        assert!(
+            matches!(error, BackendError::BroadcastRejected(message) if message.contains("simulation_ok"))
+        );
+        assert_eq!(provider.send_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn option_execution_broadcast_missing_rpc_or_private_key_rejects() {
+        let mut missing_rpc = state_with_broadcast(true);
+        missing_rpc.execution_config.rpc_url = None;
+        let intent = insert_intent(&missing_rpc, broadcast_ready_intent());
+        let provider = MockBroadcastProvider::success();
+
+        let error = broadcast_option_execution_intent_with_provider(
+            &missing_rpc,
+            intent.intent_id,
+            &provider,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, BackendError::Config(message) if message.contains("RPC_URL")));
+        assert_eq!(provider.send_count(), 0);
+
+        let mut missing_key = state_with_broadcast(true);
+        missing_key.execution_config.executor_private_key = None;
+        let intent = insert_intent(&missing_key, broadcast_ready_intent());
+        let error = broadcast_option_execution_intent_with_provider(
+            &missing_key,
+            intent.intent_id,
+            &provider,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, BackendError::Config(message) if message.contains("EXECUTOR_PRIVATE_KEY"))
+        );
+        assert_eq!(provider.send_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn option_execution_broadcast_mock_success_persists_submitted_hash_once() {
+        let state = state_with_broadcast(true);
+        let intent = insert_intent(&state, broadcast_ready_intent());
+        let provider = MockBroadcastProvider::success();
+
+        let outcome =
+            broadcast_option_execution_intent_with_provider(&state, intent.intent_id, &provider)
+                .await
+                .unwrap();
+        let stored = get_option_execution_intent(&state, intent.intent_id)
+            .await
+            .unwrap();
+        let transactions = option_transactions(&state, intent.intent_id);
+
+        assert!(outcome.submitted);
+        assert!(!outcome.duplicate);
+        assert_eq!(
+            outcome.transaction.tx_hash.as_deref(),
+            Some("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        assert_eq!(
+            stored.status,
+            OptionExecutionIntentStatus::BroadcastSubmitted
+        );
+        assert_eq!(transactions.len(), 1);
+        assert_eq!(
+            transactions[0].status,
+            ExecutionTransactionStatus::Submitted
+        );
+        assert_eq!(
+            transactions[0].tx_hash.as_deref(),
+            Some("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        assert_eq!(provider.send_count(), 1);
+
+        let duplicate =
+            broadcast_option_execution_intent_with_provider(&state, intent.intent_id, &provider)
+                .await
+                .unwrap();
+        assert!(duplicate.duplicate);
+        assert_eq!(
+            duplicate.transaction.transaction_id,
+            transactions[0].transaction_id
+        );
+        assert_eq!(provider.send_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn option_execution_broadcast_does_not_persist_invalid_or_failed_tx_hashes() {
+        let state = state_with_broadcast(true);
+        let intent = insert_intent(&state, broadcast_ready_intent());
+        let provider = MockBroadcastProvider::invalid_hash();
+
+        let error =
+            broadcast_option_execution_intent_with_provider(&state, intent.intent_id, &provider)
+                .await
+                .unwrap_err();
+        let transactions = option_transactions(&state, intent.intent_id);
+        let stored = get_option_execution_intent(&state, intent.intent_id)
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(error, BackendError::BroadcastRejected(message) if message.contains("invalid transaction hash"))
+        );
+        assert_eq!(transactions.len(), 1);
+        assert_eq!(transactions[0].status, ExecutionTransactionStatus::Failed);
+        assert_eq!(transactions[0].tx_hash, None);
+        assert_eq!(stored.status, OptionExecutionIntentStatus::BroadcastFailed);
+
+        let state = state_with_broadcast(true);
+        let intent = insert_intent(&state, broadcast_ready_intent());
+        let provider = MockBroadcastProvider::fail_send();
+        let error =
+            broadcast_option_execution_intent_with_provider(&state, intent.intent_id, &provider)
+                .await
+                .unwrap_err();
+        let transactions = option_transactions(&state, intent.intent_id);
+
+        assert!(error.to_string().contains("mock send failed"));
+        assert_eq!(transactions.len(), 1);
+        assert_eq!(transactions[0].status, ExecutionTransactionStatus::Failed);
+        assert_eq!(transactions[0].tx_hash, None);
+    }
+
     fn state_with_simulation(enabled: bool) -> AppState {
         let mut options_config = OptionsConfig::enabled_in_memory_for_tests();
         options_config.execution_enabled = true;
@@ -2351,6 +2885,27 @@ mod tests {
         options_config.execution_require_rpc_for_simulation = false;
         options_config.execution_simulation_gas_limit = 500_000;
         AppState::with_options_config(EngineState::with_default_markets(), options_config)
+    }
+
+    fn state_with_broadcast(broadcast_enabled: bool) -> AppState {
+        let mut state = state_with_simulation(false);
+        state.options_config.execution_broadcast_enabled = broadcast_enabled;
+        state.options_config.execution_require_simulation_ok = true;
+        state.options_config.execution_broadcast_gas_limit = 600_000;
+        state.execution_config = crate::execution::ExecutionConfig {
+            execution_enabled: true,
+            real_broadcast_enabled: true,
+            executor_private_key: Some(crate::execution::PrivateKeySecret::new(
+                "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318".to_string(),
+            )),
+            rpc_url: Some("http://127.0.0.1:8545".to_string()),
+            max_fee_per_gas_wei: Some("1000000000".to_string()),
+            max_priority_fee_per_gas_wei: Some("100000000".to_string()),
+            max_gas_limit: 1_000_000,
+            executor_chain_id: 84532,
+            ..crate::execution::ExecutionConfig::disabled()
+        };
+        state
     }
 
     fn state_with_option_nonce_sync(strict: bool) -> AppState {
@@ -2412,6 +2967,26 @@ mod tests {
             .lock()
             .unwrap()
             .insert_option_execution_intent(intent)
+    }
+
+    fn option_transactions(
+        state: &AppState,
+        intent_id: OptionExecutionIntentId,
+    ) -> Vec<OptionExecutionTransaction> {
+        state
+            .options_store
+            .lock()
+            .unwrap()
+            .option_execution_transactions_for_intent(intent_id)
+    }
+
+    fn broadcast_ready_intent() -> OptionExecutionIntent {
+        OptionExecutionIntent {
+            buyer_signature: Some(signature_hex(0xaa)),
+            seller_signature: Some(signature_hex(0xbb)),
+            simulation_status: Some(OptionExecutionSimulationStatus::SimulationOk),
+            ..calldata_ready_intent()
+        }
     }
 
     fn calldata_ready_intent() -> OptionExecutionIntent {
