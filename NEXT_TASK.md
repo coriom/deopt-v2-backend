@@ -1,44 +1,30 @@
-# NEXT_TASK.md — Runtime Verify Option Execution Broadcast V1I Safe Mode
+# NEXT_TASK.md — Option Live Broadcast Preflight V1L
 
 ## Context
 
-Option Execution Broadcast V1I has been implemented offline.
+Option execution pre-broadcast path is now fully verified.
 
-Implemented:
+Confirmed:
 
-- migration 0021_option_execution_broadcast.sql
-- dedicated option_execution_transactions table
-- config:
-  - OPTION_EXECUTION_BROADCAST_ENABLED=false
-  - OPTION_EXECUTION_REQUIRE_SIMULATION_OK=true
-  - OPTION_EXECUTION_BROADCAST_GAS_LIMIT=0
-- endpoint:
-  - POST /options/execution-intents/:intent_id/broadcast
-- disabled-by-default behavior
-- simulation_ok gate
-- tx hash persistence only after successful send
-- idempotency for submitted tx
-- no confirmed/reconciled lifecycle
-- mock tests passing
+- OptionMatchingEngine deployed:
+  0xf2D1D85cD363Be3bc160d14883C80e7C2c4F420b
+- MarginEngine.matchingEngine points to OptionMatchingEngine.
+- Option series active.
+- Backend computes registry-compatible optionId.
+- Backend rejects metadata mismatches before execution.
+- Valid buyer/seller EIP-712 signatures accepted in strict mode.
+- Live Base Sepolia eth_call returns simulation_ok.
+- No option execution transaction has been broadcast yet.
 
 Current goal:
 
-Runtime verify the broadcast endpoint in safe disabled mode.
+Prepare the first live option execution broadcast without performing it.
 
 ## Goal
 
-Prove that V1I is safe at runtime before any live broadcast.
+Perform a live broadcast preflight.
 
-Verify:
-
-1. backend starts with broadcast disabled
-2. broadcast endpoint rejects when disabled
-3. no option_execution_transactions are created
-4. no execution_transactions are created
-5. no /executor/broadcast is called
-6. simulation_ok intent remains unbroadcasted
-7. admin/config exposes safe booleans without secrets
-8. cleanup works
+Verify all runtime prerequisites for a real option execution broadcast, but do not enable all broadcast gates simultaneously and do not send a transaction.
 
 ## Non-Goals
 
@@ -49,17 +35,70 @@ Do not create execution_transactions.
 Do not modify Solidity.
 Do not modify frontend.
 Do not deploy.
-Do not use or print private keys.
 Do not commit.
 Do not push.
+Do not print private keys.
 
-## Runtime Config
+## Safety Rules
 
-Start backend with process env only.
-
-Use live Base Sepolia RPC for nonce/simulation, but keep broadcast disabled:
+Keep real broadcast disabled in this task:
 
 ```env
+OPTION_EXECUTION_BROADCAST_ENABLED=false
+EXECUTION_ENABLED=false
+EXECUTOR_REAL_BROADCAST_ENABLED=false
+
+Private keys may be checked only by deriving public addresses.
+
+Never print private keys.
+
+No tx hash fabrication.
+
+Required Checks
+1. Environment alignment
+
+Verify without printing secrets:
+
+RPC_URL set
+BUYER_PRIVATE_KEY set
+SELLER_PRIVATE_KEY set
+EXECUTOR_PRIVATE_KEY set or explicitly absent
+
+If EXECUTOR_PRIVATE_KEY is set, derive address:
+
+cast wallet address --private-key "$EXECUTOR_PRIVATE_KEY"
+
+Record only the address.
+
+If EXECUTOR_PRIVATE_KEY is absent, report it as the remaining blocker for live broadcast.
+
+2. Executor authorization
+
+For the derived executor address, check:
+
+cast call 0xf2D1D85cD363Be3bc160d14883C80e7C2c4F420b \
+  "isExecutor(address)(bool)" \
+  "<EXECUTOR_ADDRESS>" \
+  --rpc-url "$RPC_URL"
+
+Expected before live broadcast:
+
+true
+
+If false, document manual-only command:
+
+cast send 0xf2D1D85cD363Be3bc160d14883C80e7C2c4F420b \
+  "setExecutor(address,bool)" \
+  "<EXECUTOR_ADDRESS>" true \
+  --rpc-url "$RPC_URL" \
+  --private-key "$DEPLOYER_PRIVATE_KEY"
+
+Do not run it unless explicitly approved by the human.
+
+3. Reproduce simulation_ok
+
+Start backend with:
+
 PERSISTENCE_ENABLED=true
 OPTIONS_ENABLED=true
 OPTION_RFQ_ENABLED=true
@@ -79,7 +118,7 @@ OPTION_NONCE_SYNC_STRICT=true
 
 OPTION_EXECUTION_SIMULATION_ENABLED=true
 OPTION_EXECUTION_REQUIRE_RPC_FOR_SIMULATION=true
-OPTION_EXECUTION_SIMULATION_FROM=0xc35F7A8A103A9A4464adfaa76B9B514093D23C27
+OPTION_EXECUTION_SIMULATION_FROM=<EXECUTOR_ADDRESS_OR_AUTHORIZED_SIMULATION_ADDRESS>
 
 OPTION_EXECUTION_BROADCAST_ENABLED=false
 OPTION_EXECUTION_REQUIRE_SIMULATION_OK=true
@@ -89,42 +128,33 @@ EXECUTION_ENABLED=false
 EXECUTOR_REAL_BROADCAST_ENABLED=false
 MM_GATEWAY_ENABLED=false
 
-Use existing RPC_URL, but do not print it.
+Use active on-chain optionId:
 
-Runtime Flow
-Record TEST_START_MS.
-Start backend.
-Verify /health.
-Verify /admin/config:
-option execution enabled
-option nonce sync enabled
-option simulation enabled
-option broadcast disabled
-rpc=true
-executor_private_key=false
-real_broadcast_enabled=false
-no secrets
-Create backend option series mapped to active on-chain optionId:
 24145907678156652148089862289363692212069910767044828147380657249455352740183
-Create crossing option orders to produce:
-option fill
-option execution intent
-Fetch signing payload.
-Sign buyer/seller with existing local dev signing flow:
-sign_option_execution_intent
-BUYER_PRIVATE_KEY / SELLER_PRIVATE_KEY from env
-do not print keys
-Submit signatures in strict mode.
-Fetch calldata.
-Run live simulation.
-Confirm simulation_ok.
+
+Flow:
+
+create backend option series
+create crossing option orders
+create option execution intent
+fetch signing payload
+sign buyer/seller with sign_option_execution_intent
+submit signatures
+fetch calldata
+simulate
+confirm simulation_ok
+4. Broadcast endpoint must reject while disabled
+
 Call:
+
 POST /options/execution-intents/:intent_id/broadcast
 
 Expected:
 
-HTTP 400/403 clear error: option execution broadcast is disabled
-Verify no transaction rows:
+configuration error: option execution broadcast is disabled
+
+Verify no rows:
+
 SELECT COUNT(*) FROM option_execution_transactions WHERE created_at_ms >= <TEST_START_MS>;
 SELECT COUNT(*) FROM execution_transactions WHERE created_at_ms >= <TEST_START_MS>;
 
@@ -132,33 +162,71 @@ Expected:
 
 0
 0
-Verify intent remains not submitted/confirmed.
-Cleanup backend runtime rows only:
-option_execution_transactions if any failed rows were created
+5. Config gate matrix
+
+Document exact flags required for real broadcast:
+
+OPTION_EXECUTION_BROADCAST_ENABLED=true
+EXECUTION_ENABLED=true
+EXECUTOR_REAL_BROADCAST_ENABLED=true
+EXECUTOR_PRIVATE_KEY=<set locally only>
+RPC_URL=<set locally only>
+OPTION_MATCHING_ENGINE_ADDRESS=0xf2D1D85cD363Be3bc160d14883C80e7C2c4F420b
+
+Do not run with all three broadcast gates true in this task.
+
+6. Manual broadcast command plan
+
+Document the exact backend command or API call that will be used later.
+
+Expected later API call:
+
+curl -X POST http://127.0.0.1:8080/options/execution-intents/<INTENT_ID>/broadcast
+
+Only after the human explicitly starts backend with all broadcast flags enabled.
+
+Output File
+
+Create:
+
+docs/OPTION_LIVE_BROADCAST_PREFLIGHT.md
+
+Include:
+
+executor private key derived address, if available
+executor authorization status
+simulation_ok reproduction result
+broadcast disabled rejection result
+transaction table counts
+exact broadcast flag matrix
+manual live broadcast procedure
+remaining blocker
+Cleanup
+
+Delete backend runtime rows only:
+
+option_execution_transactions if any
 option_execution_intents
 option_fills
 option_orders
 option_series
-Stop backend and verify no listener.
-Additional Negative Checks
 
-If easy, also verify:
-
-broadcast rejects intent without simulation_ok
-broadcast rejects missing intent
-broadcast rejects missing calldata/signatures
-
-Do not broaden if it risks muddying the runtime flow.
+Stop backend.
 
 If Bug Found
 
 Patch minimally only.
 
-After patch:
+If code changed:
 
 cargo fmt
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test
+cargo build
+
+If no code changed:
+
+cargo fmt --check
 cargo build
 Final Report
 
@@ -166,13 +234,14 @@ Return:
 
 files changed
 whether code patch was needed
-backend startup result
-admin config result
-intent/simulation_ok result
-broadcast disabled result
+executor private key derived address or absent
+executor authorization status
+simulation_ok result
+broadcast disabled rejection result
 option_execution_transactions count
 execution_transactions count
 no forbidden mutation verification
+doc summary
 cleanup result
 validation commands run
 remaining blocker

@@ -36,7 +36,7 @@ The backend creates option execution intents from:
 
 Creation is idempotent by `(source_type, source_id)`. The stored source types are `option_orderbook_fill` and `option_rfq_fill`.
 
-The source option series must have an on-chain option id in `onchain_series_id` or `onchain_product_id`. `underlying` and `settlement_asset` must be nonzero EVM addresses. Fill size must be a whole number of contracts: `quantity = size_1e8 / 100000000`. Premium is converted to settlement-native units per contract: `premiumPerContract = price_1e8 * 10^OPTION_EXECUTION_DEFAULT_SETTLEMENT_DECIMALS / 100000000`.
+The source option series must have an on-chain option id in `onchain_series_id` or `onchain_product_id`. `underlying` and `settlement_asset` must be nonzero EVM addresses. The option id must match the local series metadata using the same ABI encoding as `OptionProductRegistry._computeOptionId()` for either `isEuropean=true` or `isEuropean=false`; otherwise executable intent creation and stored `OptionTrade` payload construction are rejected before signing/calldata. Fill size must be a whole number of contracts: `quantity = size_1e8 / 100000000`. Premium is converted to settlement-native units per contract: `premiumPerContract = price_1e8 * 10^OPTION_EXECUTION_DEFAULT_SETTLEMENT_DECIMALS / 100000000`.
 
 ## EIP-712 Payload
 

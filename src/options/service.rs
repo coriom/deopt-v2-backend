@@ -1658,12 +1658,54 @@ fn validate_executable_option_series(
         .and_then(|value| normalize_u256_string(value, "optionId"))?;
     validate_nonzero_execution_address(&series.underlying, "underlying")?;
     validate_nonzero_execution_address(&series.settlement_asset, "settlement_asset")?;
+    validate_series_option_id_matches_metadata(series, &onchain_option_id)?;
     let _ = state;
     Ok(ExecutableOptionSeriesMetadata {
         onchain_option_id,
         underlying: AccountId::new(series.underlying.clone()),
         settlement_asset: AccountId::new(series.settlement_asset.clone()),
     })
+}
+
+fn validate_series_option_id_matches_metadata(
+    series: &OptionSeries,
+    onchain_option_id: &str,
+) -> Result<()> {
+    let strike_1e8 = u64::try_from(series.strike_1e8).map_err(|_| {
+        BackendError::InvalidOptionExecutionIntentState("strike_1e8 exceeds uint64".to_string())
+    })?;
+    let option_id =
+        alloy_primitives::U256::from_str_radix(onchain_option_id, 10).map_err(|error| {
+            BackendError::InvalidOptionExecutionIntentState(format!(
+                "optionId must be a uint256: {error}"
+            ))
+        })?;
+    let underlying = AccountId::new(series.underlying.clone());
+    let settlement_asset = AccountId::new(series.settlement_asset.clone());
+    let european_id = crate::options::option_product_registry_option_id(
+        &underlying,
+        &settlement_asset,
+        series.expiry,
+        strike_1e8,
+        series.contract_size_1e8,
+        series.is_call,
+        true,
+    )?;
+    let american_id = crate::options::option_product_registry_option_id(
+        &underlying,
+        &settlement_asset,
+        series.expiry,
+        strike_1e8,
+        series.contract_size_1e8,
+        series.is_call,
+        false,
+    )?;
+    if option_id != european_id && option_id != american_id {
+        return Err(BackendError::InvalidOptionExecutionIntentState(
+            "optionId does not match option metadata for either isEuropean value".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_nonzero_execution_address(value: &str, field: &str) -> Result<()> {
@@ -2921,24 +2963,38 @@ mod tests {
     }
 
     fn insert_executable_series(state: &AppState) {
+        let expiry = 4_102_444_800;
+        let underlying = AccountId::new("0x0000000000000000000000000000000000000010");
+        let settlement_asset = AccountId::new("0x0000000000000000000000000000000000000020");
+        let onchain_option_id = crate::options::option_product_registry_option_id(
+            &underlying,
+            &settlement_asset,
+            expiry,
+            300_000_000_000,
+            100_000_000,
+            true,
+            true,
+        )
+        .unwrap()
+        .to_string();
         state
             .options_store
             .lock()
             .unwrap()
             .insert_series(OptionSeries {
                 option_series_id: "series-1".to_string(),
-                underlying: "0x0000000000000000000000000000000000000010".to_string(),
+                underlying: underlying.0,
                 base_asset: "ETH".to_string(),
                 quote_asset: "USDC".to_string(),
-                settlement_asset: "0x0000000000000000000000000000000000000020".to_string(),
-                expiry: 4_102_444_800,
+                settlement_asset: settlement_asset.0,
+                expiry,
                 strike_1e8: 300_000_000_000,
                 is_call: true,
                 contract_size_1e8: 100_000_000,
                 status: OptionSeriesStatus::Active,
                 source: OptionSeriesSource::Manual,
                 onchain_product_id: None,
-                onchain_series_id: Some("1".to_string()),
+                onchain_series_id: Some(onchain_option_id),
                 created_at_ms: 1,
                 updated_at_ms: 1,
             });
@@ -2990,6 +3046,20 @@ mod tests {
     }
 
     fn calldata_ready_intent() -> OptionExecutionIntent {
+        let expiry = 4_102_444_800;
+        let underlying = AccountId::new("0x0000000000000000000000000000000000000010");
+        let settlement_asset = AccountId::new("0x0000000000000000000000000000000000000020");
+        let onchain_option_id = crate::options::option_product_registry_option_id(
+            &underlying,
+            &settlement_asset,
+            expiry,
+            300_000_000_000,
+            100_000_000,
+            true,
+            true,
+        )
+        .unwrap()
+        .to_string();
         OptionExecutionIntent {
             intent_id: Uuid::from_u128(1),
             onchain_intent_id: "0x1111111111111111111111111111111111111111111111111111111111111111"
@@ -2997,12 +3067,12 @@ mod tests {
             source_type: OptionExecutionSourceType::OptionOrderbookFill,
             source_id: "fill-1".to_string(),
             option_series_id: "series-1".to_string(),
-            onchain_option_id: "1".to_string(),
+            onchain_option_id,
             buyer: AccountId::new("0x0000000000000000000000000000000000000001"),
             seller: AccountId::new("0x0000000000000000000000000000000000000002"),
-            underlying: AccountId::new("0x0000000000000000000000000000000000000010"),
-            settlement_asset: AccountId::new("0x0000000000000000000000000000000000000020"),
-            expiry: 4_102_444_800,
+            underlying,
+            settlement_asset,
+            expiry,
             strike_1e8: 300_000_000_000,
             is_call: true,
             contract_size_1e8: 100_000_000,

@@ -16,13 +16,13 @@ use deopt_v2_backend::options::service::{
     SubmitOptionOrderInput, SubmitOptionRfqQuoteInput,
 };
 use deopt_v2_backend::options::{
-    expected_option_execute_trade_selector, option_execute_trade_selector, option_rfq_id_to_b256,
-    option_rfq_quote_digest, option_series_id, option_series_id_to_b256,
-    OptionExecutionIntentStatus, OptionExecutionSignatureMode, OptionExecutionSourceType,
-    OptionFillFilter, OptionOrderFilter, OptionOrderStatus, OptionRfqQuote,
-    OptionRfqQuoteSignatureMode, OptionRfqQuoteSignatureStatus, OptionRfqQuoteSigningPayload,
-    OptionRfqQuoteStatus, OptionRfqStatus, OptionSeriesFilter, OptionSeriesIdInput,
-    OptionSeriesStatus, OptionsConfig,
+    expected_option_execute_trade_selector, option_execute_trade_selector,
+    option_product_registry_option_id, option_rfq_id_to_b256, option_rfq_quote_digest,
+    option_series_id, option_series_id_to_b256, OptionExecutionIntentStatus,
+    OptionExecutionSignatureMode, OptionExecutionSourceType, OptionFillFilter, OptionOrderFilter,
+    OptionOrderStatus, OptionRfqQuote, OptionRfqQuoteSignatureMode, OptionRfqQuoteSignatureStatus,
+    OptionRfqQuoteSigningPayload, OptionRfqQuoteStatus, OptionRfqStatus, OptionSeriesFilter,
+    OptionSeriesIdInput, OptionSeriesStatus, OptionsConfig,
 };
 use deopt_v2_backend::types::{now_ms, AccountId, Side, TimeInForce};
 use k256::ecdsa::SigningKey;
@@ -112,17 +112,64 @@ fn create_input() -> CreateOptionSeriesInput {
 }
 
 fn onchain_create_input() -> CreateOptionSeriesInput {
+    let expiry = future_expiry();
+    let underlying = AccountId::new("0x0000000000000000000000000000000000000010");
+    let settlement_asset = AccountId::new("0x0000000000000000000000000000000000000020");
+    let onchain_option_id = onchain_option_id_for(expiry);
     CreateOptionSeriesInput {
-        underlying: "0x0000000000000000000000000000000000000010".to_string(),
+        underlying: underlying.0,
         base_asset: "ETH".to_string(),
         quote_asset: "USDC".to_string(),
-        settlement_asset: "0x0000000000000000000000000000000000000020".to_string(),
-        expiry: future_expiry(),
+        settlement_asset: settlement_asset.0,
+        expiry,
         strike_1e8: 300_000_000_000,
         is_call: true,
         contract_size_1e8: Some(100_000_000),
         onchain_product_id: None,
-        onchain_series_id: Some("123".to_string()),
+        onchain_series_id: Some(onchain_option_id),
+    }
+}
+
+fn onchain_option_id_for(expiry: u64) -> String {
+    option_product_registry_option_id(
+        &AccountId::new("0x0000000000000000000000000000000000000010"),
+        &AccountId::new("0x0000000000000000000000000000000000000020"),
+        expiry,
+        300_000_000_000,
+        100_000_000,
+        true,
+        true,
+    )
+    .unwrap()
+    .to_string()
+}
+
+fn mismatched_onchain_create_input() -> CreateOptionSeriesInput {
+    let expiry = future_expiry();
+    let underlying = AccountId::new("0x0000000000000000000000000000000000000010");
+    let settlement_asset = AccountId::new("0x0000000000000000000000000000000000000020");
+    let onchain_option_id = option_product_registry_option_id(
+        &underlying,
+        &settlement_asset,
+        expiry + 1,
+        300_000_000_000,
+        100_000_000,
+        true,
+        true,
+    )
+    .unwrap()
+    .to_string();
+    CreateOptionSeriesInput {
+        underlying: underlying.0,
+        base_asset: "ETH".to_string(),
+        quote_asset: "USDC".to_string(),
+        settlement_asset: settlement_asset.0,
+        expiry,
+        strike_1e8: 300_000_000_000,
+        is_call: true,
+        contract_size_1e8: Some(100_000_000),
+        onchain_product_id: None,
+        onchain_series_id: Some(onchain_option_id),
     }
 }
 
@@ -1023,7 +1070,10 @@ async fn option_orderbook_fill_creates_execution_intent_when_enabled() {
         OptionExecutionSourceType::OptionOrderbookFill
     );
     assert_eq!(intent.source_id, outcome.fills[0].fill_id.to_string());
-    assert_eq!(intent.onchain_option_id, "123");
+    assert_eq!(
+        intent.onchain_option_id,
+        onchain_option_id_for(intent.expiry)
+    );
     assert_eq!(intent.buyer, account());
     assert_eq!(intent.seller, account_two());
     assert_eq!(intent.quantity_contracts, 1);
@@ -1039,6 +1089,33 @@ async fn option_orderbook_fill_creates_execution_intent_when_enabled() {
     assert!(intent.seller_signature.is_none());
     assert!(intent.calldata.is_none());
     assert_eq!(state.engine.lock().unwrap().execution_intents().len(), 0);
+}
+
+#[tokio::test]
+async fn option_execution_rejects_onchain_option_id_metadata_mismatch() {
+    let state = option_execution_state();
+    let option_series_id = create_option_series(&state, mismatched_onchain_create_input())
+        .await
+        .unwrap()
+        .option_series_id;
+    let mut ask = order_input(option_series_id.clone(), Side::Sell, "exec-mismatch-ask");
+    ask.account = account_two();
+    submit_option_order(&state, ask).await.unwrap();
+
+    let error = submit_option_order(
+        &state,
+        order_input(option_series_id, Side::Buy, "exec-mismatch-buy"),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("optionId does not match option metadata"));
+    assert!(list_option_execution_intents(&state)
+        .await
+        .unwrap()
+        .is_empty());
 }
 
 #[tokio::test]
@@ -1205,7 +1282,10 @@ async fn option_execution_signing_payload_endpoint_matches_option_trade_shape() 
         .await
         .unwrap();
     assert_eq!(fetched.status(), StatusCode::OK);
-    assert_eq!(response_json(fetched).await["onchain_option_id"], "123");
+    assert_eq!(
+        response_json(fetched).await["onchain_option_id"],
+        onchain_option_id_for(intent.expiry)
+    );
 
     let response = app
         .oneshot(get_request(&format!(
@@ -1221,7 +1301,10 @@ async fn option_execution_signing_payload_endpoint_matches_option_trade_shape() 
     assert_eq!(json["message"]["intentId"], intent.onchain_intent_id);
     assert_eq!(json["message"]["buyer"], account().0);
     assert_eq!(json["message"]["seller"], account_two().0);
-    assert_eq!(json["message"]["optionId"], "123");
+    assert_eq!(
+        json["message"]["optionId"],
+        onchain_option_id_for(intent.expiry)
+    );
     assert_eq!(json["message"]["quantity"], "1");
     assert_eq!(json["message"]["premiumPerContract"], "10000000");
     assert_eq!(json["message"]["buyerNonce"], "0");

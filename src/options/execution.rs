@@ -136,6 +136,11 @@ impl OptionTradePayload {
         if self.premium_per_contract == 0 {
             return Err(BackendError::ZeroPrice);
         }
+        if !option_id_matches_registry_metadata(self)? {
+            return Err(BackendError::InvalidOptionExecutionIntentState(
+                "optionId does not match option metadata for either isEuropean value".to_string(),
+            ));
+        }
         Ok(())
     }
 }
@@ -201,6 +206,28 @@ pub fn option_execute_trade_selector() -> [u8; 4] {
 pub fn expected_option_execute_trade_selector() -> [u8; 4] {
     let hash = keccak256(OPTION_EXECUTE_TRADE_SIGNATURE.as_bytes());
     [hash[0], hash[1], hash[2], hash[3]]
+}
+
+pub fn option_product_registry_option_id(
+    underlying: &AccountId,
+    settlement_asset: &AccountId,
+    expiry: u64,
+    strike_1e8: u64,
+    contract_size_1e8: u128,
+    is_call: bool,
+    is_european: bool,
+) -> Result<U256> {
+    let underlying = parse_evm_address(underlying)?;
+    let settlement_asset = parse_evm_address(settlement_asset)?;
+    let mut encoded = Vec::with_capacity(224);
+    encoded.extend_from_slice(&encode_address(&underlying));
+    encoded.extend_from_slice(&encode_address(&settlement_asset));
+    encoded.extend_from_slice(&encode_u64(expiry));
+    encoded.extend_from_slice(&encode_u64(strike_1e8));
+    encoded.extend_from_slice(&encode_u128(contract_size_1e8));
+    encoded.extend_from_slice(&encode_bool(is_call));
+    encoded.extend_from_slice(&encode_bool(is_european));
+    Ok(U256::from_be_slice(&keccak256(&encoded)))
 }
 
 pub fn encode_option_execute_trade_calldata(
@@ -503,6 +530,28 @@ fn option_trade_hash(payload: &OptionTradePayload) -> Result<[u8; 32]> {
     Ok(keccak256(&encoded))
 }
 
+fn option_id_matches_registry_metadata(payload: &OptionTradePayload) -> Result<bool> {
+    let european_id = option_product_registry_option_id(
+        &payload.underlying,
+        &payload.settlement_asset,
+        payload.expiry,
+        payload.strike_1e8,
+        payload.contract_size_1e8,
+        payload.is_call,
+        true,
+    )?;
+    let american_id = option_product_registry_option_id(
+        &payload.underlying,
+        &payload.settlement_asset,
+        payload.expiry,
+        payload.strike_1e8,
+        payload.contract_size_1e8,
+        payload.is_call,
+        false,
+    )?;
+    Ok(payload.option_id == european_id || payload.option_id == american_id)
+}
+
 fn parse_u256(value: &str, field: &str) -> Result<U256> {
     let value = value.trim();
     if value.is_empty() {
@@ -699,20 +748,104 @@ mod tests {
         assert_eq!(&calldata[..4], option_execute_trade_selector().as_slice());
     }
 
+    #[test]
+    fn option_product_registry_option_id_matches_active_base_sepolia_series() {
+        let option_id = option_product_registry_option_id(
+            &AccountId::new("0x4DeEBc5f537F3b8ba0E3393807B4D699D72bDd02"),
+            &AccountId::new("0x6eAe407f5640B006faC9965182e238582A3B412E"),
+            1_893_456_000,
+            300_000_000_000,
+            100_000_000,
+            true,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(
+            option_id.to_string(),
+            "24145907678156652148089862289363692212069910767044828147380657249455352740183"
+        );
+    }
+
+    #[test]
+    fn option_trade_payload_rejects_option_id_metadata_mismatch() {
+        let mut payload = payload();
+        payload.expiry += 1;
+
+        let error = payload.validate().unwrap_err();
+
+        assert!(matches!(
+            error,
+            BackendError::InvalidOptionExecutionIntentState(message)
+                if message.contains("optionId does not match option metadata")
+        ));
+    }
+
+    #[test]
+    fn option_execute_trade_calldata_decodes_expected_trade_fields() {
+        let payload = payload();
+        let calldata = encode_option_execute_trade_calldata(&payload, &signature_bundle()).unwrap();
+        let decoded = executeTradeCall::abi_decode(&calldata, true).unwrap();
+
+        assert_eq!(decoded.t.intentId, payload.intent_id);
+        assert_eq!(
+            decoded.t.buyer,
+            Address::from(parse_evm_address(&payload.buyer).unwrap())
+        );
+        assert_eq!(
+            decoded.t.seller,
+            Address::from(parse_evm_address(&payload.seller).unwrap())
+        );
+        assert_eq!(decoded.t.optionId, payload.option_id);
+        assert_eq!(
+            decoded.t.underlying,
+            Address::from(parse_evm_address(&payload.underlying).unwrap())
+        );
+        assert_eq!(
+            decoded.t.settlementAsset,
+            Address::from(parse_evm_address(&payload.settlement_asset).unwrap())
+        );
+        assert_eq!(decoded.t.expiry, payload.expiry);
+        assert_eq!(decoded.t.strike1e8, payload.strike_1e8);
+        assert_eq!(decoded.t.isCall, payload.is_call);
+        assert_eq!(decoded.t.contractSize1e8, 100_000_000);
+        assert_eq!(decoded.t.quantity, 3);
+        assert_eq!(decoded.t.premiumPerContract, payload.premium_per_contract);
+        assert_eq!(decoded.t.buyerIsMaker, payload.buyer_is_maker);
+        assert_eq!(decoded.t.buyerNonce, U256::from(payload.buyer_nonce));
+        assert_eq!(decoded.t.sellerNonce, U256::from(payload.seller_nonce));
+        assert_eq!(decoded.t.deadline, U256::from(payload.deadline));
+    }
+
     fn payload() -> OptionTradePayload {
+        let underlying = AccountId::new("0x0000000000000000000000000000000000000010");
+        let settlement_asset = AccountId::new("0x0000000000000000000000000000000000000020");
+        let expiry = 4_102_444_800;
+        let strike_1e8 = 300_000_000_000;
+        let contract_size_1e8 = 100_000_000;
+        let is_call = true;
         OptionTradePayload {
             intent_id: option_execution_intent_id_to_b256("00000000-0000-0000-0000-000000000001")
                 .unwrap(),
             buyer: AccountId::new("0x0000000000000000000000000000000000000001"),
             seller: AccountId::new("0x0000000000000000000000000000000000000002"),
-            option_id: U256::from(123u64),
-            underlying: AccountId::new("0x0000000000000000000000000000000000000010"),
-            settlement_asset: AccountId::new("0x0000000000000000000000000000000000000020"),
-            expiry: 4_102_444_800,
-            strike_1e8: 300_000_000_000,
-            is_call: true,
-            contract_size_1e8: 100_000_000,
-            quantity: 1,
+            option_id: option_product_registry_option_id(
+                &underlying,
+                &settlement_asset,
+                expiry,
+                strike_1e8,
+                contract_size_1e8,
+                is_call,
+                true,
+            )
+            .unwrap(),
+            underlying,
+            settlement_asset,
+            expiry,
+            strike_1e8,
+            is_call,
+            contract_size_1e8,
+            quantity: 3,
             premium_per_contract: 10_000_000,
             buyer_is_maker: false,
             buyer_nonce: 0,

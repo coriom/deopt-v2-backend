@@ -10,9 +10,9 @@ pub use execution::{
     expected_option_execute_trade_selector, normalize_u256_string, option_execute_trade_selector,
     option_execution_intent_id_to_b256, option_execution_intent_id_to_hex_bytes32,
     option_execution_simulation_pending, option_execution_simulation_unavailable,
-    option_trade_digest, option_trade_digest_bytes, simulate_option_execution_intent,
-    validate_simulation_intent, validate_simulation_target, OptionTradePayload,
-    OptionTradeSignatureBundle, OPTION_TRADE_TYPE,
+    option_product_registry_option_id, option_trade_digest, option_trade_digest_bytes,
+    simulate_option_execution_intent, validate_simulation_intent, validate_simulation_target,
+    OptionTradePayload, OptionTradeSignatureBundle, OPTION_TRADE_TYPE,
 };
 pub use series_id::{option_series_id, OptionSeriesIdInput};
 pub use signing::{
