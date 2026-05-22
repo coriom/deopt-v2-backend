@@ -16,12 +16,13 @@ use crate::mm::{MmAccountPermissions, MmProductPermission};
 use crate::monitoring::FeeEventLabels;
 use crate::options::store::status_for_remaining;
 use crate::options::{
-    OptionExecutionGasCheckStatus, OptionExecutionIntent, OptionExecutionIntentId,
-    OptionExecutionIntentStatus, OptionExecutionSimulationResult, OptionExecutionSimulationStatus,
-    OptionExecutionSourceType, OptionExecutionTransaction, OptionFill, OptionFillId, OptionOrder,
-    OptionOrderId, OptionOrderStatus, OptionRfqFill, OptionRfqFillId, OptionRfqId, OptionRfqQuote,
-    OptionRfqQuoteId, OptionRfqQuoteSignatureStatus, OptionRfqQuoteStatus, OptionRfqRequest,
-    OptionRfqStatus, OptionSeries, OptionSeriesSource, OptionSeriesStatus,
+    OptionExecutionConfirmationStatus, OptionExecutionGasCheckStatus, OptionExecutionIntent,
+    OptionExecutionIntentId, OptionExecutionIntentStatus, OptionExecutionSimulationResult,
+    OptionExecutionSimulationStatus, OptionExecutionSourceType, OptionExecutionTransaction,
+    OptionFill, OptionFillId, OptionOrder, OptionOrderId, OptionOrderStatus, OptionRfqFill,
+    OptionRfqFillId, OptionRfqId, OptionRfqQuote, OptionRfqQuoteId, OptionRfqQuoteSignatureStatus,
+    OptionRfqQuoteStatus, OptionRfqRequest, OptionRfqStatus, OptionSeries, OptionSeriesSource,
+    OptionSeriesStatus,
 };
 use crate::reconciliation::{
     normalize_onchain_intent_id, ExecutionReconciliation, ReconciliationCounts,
@@ -2236,7 +2237,9 @@ impl PgRepository {
             "SELECT transaction_id, intent_id, onchain_intent_id, sender, target, calldata,
                     value_wei, gas_limit, tx_hash, status, error, created_at_ms, updated_at_ms,
                     estimated_gas, required_gas, simulation_gas_limit, broadcast_gas_limit,
-                    gas_safety_bps, gas_check_status, gas_check_error
+                    gas_safety_bps, gas_check_status, gas_check_error,
+                    confirmation_status, confirmed_at_ms, confirmed_block_number,
+                    receipt_status, confirmation_error
              FROM option_execution_transactions
              WHERE intent_id = $1 AND status = 'submitted'
              ORDER BY created_at_ms DESC, transaction_id DESC
@@ -2249,6 +2252,67 @@ impl PgRepository {
         row.map(option_execution_transaction_from_row).transpose()
     }
 
+    pub async fn get_option_execution_transaction(
+        &self,
+        transaction_id: &str,
+    ) -> Result<Option<OptionExecutionTransaction>> {
+        let row = sqlx::query(
+            "SELECT transaction_id, intent_id, onchain_intent_id, sender, target, calldata,
+                    value_wei, gas_limit, tx_hash, status, error, created_at_ms, updated_at_ms,
+                    estimated_gas, required_gas, simulation_gas_limit, broadcast_gas_limit,
+                    gas_safety_bps, gas_check_status, gas_check_error,
+                    confirmation_status, confirmed_at_ms, confirmed_block_number,
+                    receipt_status, confirmation_error
+             FROM option_execution_transactions
+             WHERE transaction_id = $1",
+        )
+        .bind(transaction_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        row.map(option_execution_transaction_from_row).transpose()
+    }
+
+    pub async fn update_option_execution_confirmation(
+        &self,
+        transaction_id: &str,
+        confirmation_status: OptionExecutionConfirmationStatus,
+        confirmed_at_ms: TimestampMs,
+        confirmed_block_number: Option<u64>,
+        receipt_status: Option<u64>,
+        confirmation_error: Option<String>,
+    ) -> Result<u64> {
+        let rows = sqlx::query(
+            "UPDATE option_execution_transactions
+             SET confirmation_status = $1,
+                 confirmed_at_ms = $2,
+                 confirmed_block_number = $3,
+                 receipt_status = $4,
+                 confirmation_error = $5,
+                 updated_at_ms = $2
+             WHERE transaction_id = $6",
+        )
+        .bind(confirmation_status.as_str())
+        .bind(timestamp_to_i64(confirmed_at_ms))
+        .bind(
+            confirmed_block_number
+                .map(|value| u64_to_i64("confirmed_block_number", value))
+                .transpose()?,
+        )
+        .bind(
+            receipt_status
+                .map(|value| u64_to_i64("receipt_status", value))
+                .transpose()?,
+        )
+        .bind(confirmation_error)
+        .bind(transaction_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?
+        .rows_affected();
+        Ok(rows)
+    }
+
     pub async fn get_option_execution_transactions_for_intent(
         &self,
         intent_id: OptionExecutionIntentId,
@@ -2257,7 +2321,9 @@ impl PgRepository {
             "SELECT transaction_id, intent_id, onchain_intent_id, sender, target, calldata,
                     value_wei, gas_limit, tx_hash, status, error, created_at_ms, updated_at_ms,
                     estimated_gas, required_gas, simulation_gas_limit, broadcast_gas_limit,
-                    gas_safety_bps, gas_check_status, gas_check_error
+                    gas_safety_bps, gas_check_status, gas_check_error,
+                    confirmation_status, confirmed_at_ms, confirmed_block_number,
+                    receipt_status, confirmation_error
              FROM option_execution_transactions
              WHERE intent_id = $1
              ORDER BY created_at_ms DESC, transaction_id DESC",
@@ -3514,6 +3580,9 @@ fn option_execution_transaction_from_row(row: PgRow) -> Result<OptionExecutionTr
     let broadcast_gas_limit: Option<i64> = row_get(&row, "broadcast_gas_limit")?;
     let gas_safety_bps: Option<i32> = row_get(&row, "gas_safety_bps")?;
     let gas_check_status: Option<String> = row_get(&row, "gas_check_status")?;
+    let confirmation_status: Option<String> = row_get(&row, "confirmation_status")?;
+    let confirmed_block_number: Option<i64> = row_get(&row, "confirmed_block_number")?;
+    let receipt_status: Option<i64> = row_get(&row, "receipt_status")?;
     Ok(OptionExecutionTransaction {
         transaction_id: row_get(&row, "transaction_id")?,
         intent_id: intent_id.parse().map_err(|error| {
@@ -3556,6 +3625,18 @@ fn option_execution_transaction_from_row(row: PgRow) -> Result<OptionExecutionTr
             .map(OptionExecutionGasCheckStatus::parse)
             .transpose()?,
         gas_check_error: row_get(&row, "gas_check_error")?,
+        confirmation_status: confirmation_status
+            .as_deref()
+            .map(OptionExecutionConfirmationStatus::parse)
+            .transpose()?,
+        confirmed_at_ms: row_get(&row, "confirmed_at_ms")?,
+        confirmed_block_number: confirmed_block_number
+            .map(|value| i64_to_u64_persistence("confirmed_block_number", value))
+            .transpose()?,
+        receipt_status: receipt_status
+            .map(|value| i64_to_u64_persistence("receipt_status", value))
+            .transpose()?,
+        confirmation_error: row_get(&row, "confirmation_error")?,
         created_at_ms: row_get(&row, "created_at_ms")?,
         updated_at_ms: row_get(&row, "updated_at_ms")?,
     })

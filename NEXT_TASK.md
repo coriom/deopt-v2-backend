@@ -1,401 +1,299 @@
-# NEXT_TASK.md — Option First Successful Live Broadcast V1P
+# NEXT_TASK.md — Option Broadcast Confirmation And Reconciliation V1T
 
 ## Context
 
-The first live option execution broadcast on Base Sepolia failed because the real transaction gas cap was too low.
+V1S completed the first successful live option execution broadcast on Base Sepolia.
 
-Previous failed tx:
-0xe832365b11ead105e020b65a25570516e87ab1af2b1225b698561f090eff8b7c
+Successful tx:
 
-Root cause:
-- uncapped simulation succeeded
-- broadcast gas limit was `1000000`
-- `eth_estimateGas` was approximately `1040080`
-- tx failed with top-level `OutOfGas`
+```text
+0x5964a7b3d2c18d051baaa780413d31c44d419ce530f45263cb4c46f720881125
 
-A backend gas safety patch has now been implemented.
+Intent:
 
-New behavior:
-- backend calls `eth_estimateGas` for the exact option tx
-- backend computes `required_gas = estimated_gas * OPTION_EXECUTION_GAS_SAFETY_BPS / 10000`
-- backend rejects if `broadcast_gas_limit < estimated_gas`
-- backend rejects if `broadcast_gas_limit < required_gas`
-- gas-check fields are persisted in `option_execution_transactions`
-- `/admin/config` exposes `execution_gas_safety_bps`
+e6d2941b-65f7-413a-958f-74ab22c53b08
 
-Important:
-The preserved intent `4075afe3-fe42-457d-a9ca-eb0907d09a74` must not be retried. It is already tied to the failed broadcast.
+Broadcast response:
 
-## Goal
+status: broadcast_submitted
+transaction_id: cae8c7e7-ed61-4265-aa7d-75edd94ef03c
+from: 0xc35f7a8a103a9a4464adfaa76b9b514093d23c27
+to: 0xf2D1D85cD363Be3bc160d14883C80e7C2c4F420b
+gas_check_status: ok
+estimated_gas: 1_091_120
+required_gas: 1_363_900
+broadcast_gas_limit: 1_500_000
+gas_safety_bps: 12_500
 
-Perform one clean successful live option execution broadcast on Base Sepolia using a fresh intent, fresh signatures, fresh simulation, fresh gas estimate, and the new gas safety gate.
+Receipt:
 
-This task may perform exactly one real option broadcast if all preflight checks pass.
+status: 1
+block: 41856964
+gasUsed: 1_057_772
+effectiveGasPrice: 6_000_000
+selector: 0x031f77b3
+chainId: 84532
+tx nonce: 523
 
-## Hard Rules
+Known event evidence:
 
-Never print private keys.
-Do not retry automatically.
-Do not submit more than one real transaction.
-Do not call `/executor/broadcast`.
-Do not use the generic executor path.
-Do not create generic `execution_transactions`.
-Do not reuse intent `4075afe3-fe42-457d-a9ca-eb0907d09a74`.
-Do not cleanup the previous failed evidence row.
-Do not cleanup the new broadcast evidence row.
+CollateralVault premium transfer logs
+two MarginEngine.applyTrade emits
+buyer/seller OptionPositionUpdated
+OptionTradeExecuted
+on-chain intent id:
+0x0a77c7c9570198c969b1fa597ea193cb6fee563e3bfae514e9a3f0c4e01705f5
+Goal
+
+Confirm and reconcile the successful V1S option broadcast.
+
+This task is read-first and patch-only-if-needed.
+
+It must:
+
+read the preserved DB intent and transaction rows;
+read the on-chain transaction and receipt;
+decode or attribute logs/events;
+verify expected on-chain state changes;
+decide whether backend needs a confirmation/reconciliation patch;
+if safe and supported, mark the transaction as confirmed/reconciled or implement the missing backend path;
+create a durable report.
+Hard Rules
+
+Do not broadcast.
+Do not retry.
+Do not submit transactions.
+Do not call /executor/broadcast.
+Do not call POST /options/execution-intents/:id/broadcast.
+Do not create new option execution intents.
+Do not create new option_execution_transactions.
+Do not create generic execution_transactions.
+Do not cleanup evidence rows.
 Do not modify Solidity.
 Do not modify frontend.
 Do not deploy contracts.
-Do not mark confirmed/reconciled in this task.
-Do not push unless explicitly asked after final report.
+Do not print private keys.
 
-Abort immediately if any required preflight check fails.
+Any DB write must be limited to confirmation/reconciliation status for the already-submitted V1S tx, and only if the schema/service supports it safely.
 
-## Required Preflight 0 — Git And Validation
+If the backend has no safe confirmation/reconciliation path yet, do not force manual DB writes. Instead implement the minimal backend confirmation/indexing patch.
 
-In `~/DEOPT/deopt-v2-backend`:
+Required Evidence — DB
 
-Check:
+Query:
 
-git status --short
-git branch --show-current
-git log -1 --oneline
-git status -sb
+select * from option_execution_intents
+where intent_id = 'e6d2941b-65f7-413a-958f-74ab22c53b08';
 
-Then run:
+select * from option_execution_transactions
+where id = 'cae8c7e7-ed61-4265-aa7d-75edd94ef03c'
+   or tx_hash = '0x5964a7b3d2c18d051baaa780413d31c44d419ce530f45263cb4c46f720881125';
 
-cargo fmt --check
+select count(*) from execution_transactions
+where created_at_ms >= 1779482214252;
+
+Collect:
+
+intent status
+source_type/source_id
+buyer/seller
+buyer_nonce/seller_nonce
+option_id
+quantity
+premium
+calldata prefix/length
+simulation status/block/timestamp
+transaction status
+tx hash
+from/to
+gas fields
+created/updated timestamps
+
+Expected:
+
+intent status currently broadcast_submitted
+transaction status currently submitted
+generic execution_transactions count remains 0
+Required Evidence — On-chain Receipt And Tx
+
+Run:
+
+cast receipt 0x5964a7b3d2c18d051baaa780413d31c44d419ce530f45263cb4c46f720881125 \
+  --rpc-url "$RPC_URL"
+
+cast tx 0x5964a7b3d2c18d051baaa780413d31c44d419ce530f45263cb4c46f720881125 \
+  --rpc-url "$RPC_URL"
+
+Verify:
+
+receipt.status = 1
+tx.to = 0xf2D1D85cD363Be3bc160d14883C80e7C2c4F420b
+tx.from = 0xc35f7a8a103a9a4464adfaa76b9b514093d23c27
+selector = 0x031f77b3
+gasLimit = 1500000
+gasUsed = 1057772
+Required Evidence — Event Decoding
+
+Decode receipt logs using ABI/source.
+
+Search relevant Solidity events:
+
+cd ~/DEOPT/deopt-v2-sol
+rg "event .*Option|event .*Trade|event .*Position|event .*Transfer|event .*Margin|event .*Collateral" src
+
+Decode or manually attribute:
+
+OptionTradeExecuted
+buyer OptionPositionUpdated
+seller OptionPositionUpdated
+premium transfer / vault movement events
+margin engine trade application events
+
+Confirm that OptionTradeExecuted references:
+
+0x0a77c7c9570198c969b1fa597ea193cb6fee563e3bfae514e9a3f0c4e01705f5
+
+Compare that to the DB stored onchain intent id.
+
+Required Evidence — State Reconciliation
+
+Read on-chain after tx.
+
+Check nonces:
+
+cast call 0xf2D1D85cD363Be3bc160d14883C80e7C2c4F420b \
+  "nonces(address)(uint256)" \
+  0xc0A76c2A6c6b70C0B065A05E64417886416cc976 \
+  --rpc-url "$RPC_URL"
+
+cast call 0xf2D1D85cD363Be3bc160d14883C80e7C2c4F420b \
+  "nonces(address)(uint256)" \
+  0xbAf0976a00a0DCc84Df5B15d927695c8b014B1c3 \
+  --rpc-url "$RPC_URL"
+
+Expected:
+
+buyer nonce advanced by 1 from pre-broadcast value
+seller nonce advanced by 1 from pre-broadcast value
+
+Check positions using the relevant MarginEngine or OptionMatchingEngine view functions.
+
+Search if function names are uncertain:
+
+rg "function .*position|positions|openInterest|nonce|balance" ~/DEOPT/deopt-v2-sol/src
+
+Verify:
+
+buyer option position increased as expected
+seller option position decreased or opposite-side position recorded as expected
+open interest changed if protocol tracks it
+no paused state
+option series still valid
+
+Check vault balances if practical:
+
+buyer premium debit
+seller premium credit
+fees if any
+
+Do not invent results. If a view is missing, document the missing view.
+
+Backend Patch Decision
+
+Inspect backend code for existing support:
+
+rg "confirmed|reconciled|receipt|receipt_status|block_number|gas_used|effective_gas|option_execution_transactions" src migrations
+
+If backend already supports safe status update:
+
+use the service/repository path
+mark V1S tx as confirmed/mined_success
+record receipt fields
+mark intent confirmed if supported
+
+If backend does not support it:
+
+implement minimal confirmation/reconciliation support for option execution transactions.
+
+Suggested minimal patch:
+
+migration adding nullable fields if absent:
+receipt_status
+block_number
+block_hash
+gas_used
+effective_gas_price
+confirmed_at_ms
+confirmation_error
+repository update method for option tx confirmation
+optional intent status transition:
+broadcast_submitted → broadcast_confirmed
+no automatic broad reconciliation if unsupported
+tests for successful receipt update and failed receipt update
+
+Do not overbuild an indexer in this task.
+
+Validation Commands
+
+If code changed:
+
+cargo fmt --all
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features
 cargo build --all-targets --all-features
 
-If dirty files exist, document them.
+If no code changed:
 
-Do not continue to live broadcast if the gas safety patch is not present.
-
-Confirm these exist:
-
-migrations/0022_option_execution_gas_safety.sql
-docs/OPTION_BROADCAST_GAS_SAFETY.md
-OPTION_EXECUTION_GAS_SAFETY_BPS parsing in config
-gas-check fields in option execution broadcast response
-Required Preflight 1 — Apply Live DB Migration
-
-Apply migration:
-
-sqlx migrate run
-
-or the project’s standard migration command.
-
-Then verify the live DB has the new columns:
-
-estimated_gas
-required_gas
-simulation_gas_limit
-broadcast_gas_limit
-gas_safety_bps
-gas_check_status
-gas_check_error
-
-on table:
-
-option_execution_transactions
-
-Abort if migration is not applied.
-
-Required Preflight 2 — Reload Env
-
-If terminal or PC was restarted, reload env.
-
-Use project-local .env only.
-
-Do not print private key values.
-
-Required env names:
-
-RPC_URL
-DATABASE_URL
-BUYER_PRIVATE_KEY
-SELLER_PRIVATE_KEY
-EXECUTOR_PRIVATE_KEY
-BUYER_ADDRESS
-SELLER_ADDRESS
-EXECUTOR_FROM_ADDRESS
-OPTION_MATCHING_ENGINE_ADDRESS
-
-Required flags:
-
-PERSISTENCE_ENABLED=true
-OPTIONS_ENABLED=true
-OPTION_EXECUTION_ENABLED=true
-OPTION_MATCHING_ENGINE_ADDRESS=0xf2D1D85cD363Be3bc160d14883C80e7C2c4F420b
-OPTION_EXECUTION_SIGNATURE_MODE=strict
-OPTION_EXECUTION_CHAIN_ID=84532
-OPTION_EXECUTION_EIP712_NAME=DeOptV2-OptionMatchingEngine
-OPTION_EXECUTION_EIP712_VERSION=1
-OPTION_NONCE_SYNC_ENABLED=true
-OPTION_NONCE_SYNC_REQUIRE_RPC=true
-OPTION_NONCE_SYNC_STRICT=true
-OPTION_EXECUTION_SIMULATION_ENABLED=true
-OPTION_EXECUTION_REQUIRE_RPC_FOR_SIMULATION=true
-OPTION_EXECUTION_REQUIRE_SIMULATION_OK=true
-OPTION_EXECUTION_BROADCAST_ENABLED=true
-EXECUTION_ENABLED=true
-EXECUTOR_REAL_BROADCAST_ENABLED=true
-EXECUTOR_DRY_RUN=false
-OPTION_EXECUTION_GAS_SAFETY_BPS=12500
-OPTION_EXECUTION_BROADCAST_GAS_LIMIT=1300000
-
-OPTION_EXECUTION_BROADCAST_GAS_LIMIT=1300000 is the initial intended cap for this run.
-
-If gas estimate + safety margin exceeds 1300000, abort and report the required cap. Do not broadcast.
-
-Required Preflight 3 — Derive Public Addresses Only
-
-Derive public addresses from:
-
-buyer private key
-seller private key
-executor private key
-
-Print only public addresses.
-
-Expected:
-
-Buyer:    0xc0A76c2A6c6b70C0B065A05E64417886416cc976
-Seller:   0xbAf0976a00a0DCc84Df5B15d927695c8b014B1c3
-Executor: 0xc35F7A8A103A9A4464adfaa76B9B514093D23C27
-
-Abort if any mismatch.
-
-Required Preflight 4 — On-chain Read-only Checks
-
-Use cast call only.
-
-Check executor:
-
-cast call 0xf2D1D85cD363Be3bc160d14883C80e7C2c4F420b \
-  "isExecutor(address)(bool)" \
-  0xc35F7A8A103A9A4464adfaa76B9B514093D23C27 \
-  --rpc-url "$RPC_URL"
-
-Must be true.
-
-Check buyer/seller nonces:
-
-cast call 0xf2D1D85cD363Be3bc160d14883C80e7C2c4F420b \
-  "nonces(address)(uint256)" \
-  "$BUYER_ADDRESS" \
-  --rpc-url "$RPC_URL"
-
-cast call 0xf2D1D85cD363Be3bc160d14883C80e7C2c4F420b \
-  "nonces(address)(uint256)" \
-  "$SELLER_ADDRESS" \
-  --rpc-url "$RPC_URL"
-
-Record both.
-
-Check active series:
-
-cast call 0x3d52b033Fab00ed6104DD3bc0a715F8648344ecA \
-  "getSeries(uint256)((address,address,uint64,uint64,bool,uint128,bool,bool,uint256))" \
-  24145907678156652148089862289363692212069910767044828147380657249455352740183 \
-  --rpc-url "$RPC_URL"
-
-Must show active series with expected metadata.
-
-Check oracle freshness with the project’s known oracle/router calls.
-
-Abort if oracle is stale or unsafe.
-
-If mock feeds are stale, refresh mock feeds first using the existing Solidity script. Then rerun read-only checks.
-
-Required Preflight 5 — Backend Admin Config
-
-Start/restart backend with the env above.
-
-Check sanitized admin config.
-
-Confirm:
-
-option execution enabled
-option simulation enabled
-option broadcast enabled
-real broadcast enabled
-dry run false
-option matching engine address correct
-chain id 84532
-EIP-712 name/version correct
-gas safety bps 12500
-broadcast gas limit 1300000
-
-Do not continue if /admin/config does not reflect expected values.
-
-Required Preflight 6 — DB Baseline
-
-Set:
-
-TEST_START_MS=$(date +%s%3N)
-
-Record current counts:
-
-select count(*) from option_execution_transactions;
-select count(*) from execution_transactions;
-
-Also record counts since TEST_START_MS, expected 0.
-
-Required Execution Flow
-
-Create a fresh option execution intent.
-
-Do not reuse:
-
-4075afe3-fe42-457d-a9ca-eb0907d09a74
-
-Use active option:
-
-optionId = 24145907678156652148089862289363692212069910767044828147380657249455352740183
-
-Expected domain:
-
-name: DeOptV2-OptionMatchingEngine
-version: 1
-chainId: 84532
-verifyingContract: 0xf2D1D85cD363Be3bc160d14883C80e7C2c4F420b
-
-Steps:
-
-Create fresh intent.
-Fetch EIP-712 signing payload.
-Sign buyer.
-Sign seller.
-Submit strict signatures.
-Fetch calldata.
-Simulate.
-Require simulation_ok.
-Let backend run gas safety check.
-Broadcast exactly once via:
-POST /options/execution-intents/<NEW_INTENT_ID>/broadcast
-
-Only this endpoint is allowed.
-
-Forbidden:
-
-/executor/broadcast
-Required Post-broadcast Checks
-
-After broadcast response:
-
-Collect:
-
-intent id
-tx hash
-gas check status
-estimated gas
-required gas
-simulation gas limit
-broadcast gas limit
-gas safety bps
-
-Verify DB:
-
-select count(*) from option_execution_transactions where created_at_ms >= :TEST_START_MS;
-select count(*) from execution_transactions where created_at_ms >= :TEST_START_MS;
-
-Expected:
-
-option_execution_transactions since TEST_START_MS = 1
-execution_transactions since TEST_START_MS = 0
-
-Check tx receipt read-only:
-
-cast receipt <TX_HASH> --rpc-url "$RPC_URL"
-
-Expected:
-
-status = 1
-
-If status is 0, do not retry. Diagnose only.
-
-If pending, wait/read only. Do not resubmit.
-
-Check tx read-only:
-
-cast tx <TX_HASH> --rpc-url "$RPC_URL"
-
-Verify:
-
-to == OPTION_MATCHING_ENGINE_ADDRESS
-from == EXECUTOR_FROM_ADDRESS
-selector 0x031f77b3
-
-Do not mark confirmed/reconciled in DB.
-
+cargo fmt --check
+cargo build --all-targets --all-features
 Output Doc
 
 Create:
 
-docs/OPTION_FIRST_SUCCESSFUL_LIVE_BROADCAST.md
+docs/OPTION_BROADCAST_CONFIRMATION_RECONCILIATION_V1T.md
 
 Include:
 
-summary
-env safety flags used, sanitized
-migration confirmation
-derived public addresses
-on-chain preflight checks
-oracle freshness result
-DB baseline
-fresh intent id
-simulation result
-gas estimate
-required gas
-broadcast gas limit
-gas check status
-tx hash
-receipt status
-DB post-checks
-no generic executor verification
-no retry statement
-whether reconciliation was intentionally deferred
-recommended next task
+V1S tx hash
+DB intent/transaction evidence
+receipt summary
+tx summary
+decoded event summary
+nonce reconciliation
+position reconciliation
+vault/premium evidence if available
+whether backend patch was needed
+any DB status updates performed
+remaining missing indexer/reconciliation work
+explicit statement: no broadcast, no retry, no generic executor
 Acceptance Criteria
 
 Complete only if:
 
-migration applied
-env verified
-public addresses match
-executor authorized
-oracle fresh
-fresh intent used
-strict signatures accepted
-simulation_ok fresh
-gas safety check ok
-exactly one option broadcast submitted
-receipt status inspected
-generic execution_transactions count remains 0
-docs created
+tx receipt inspected
+DB evidence collected
+events decoded or attributed
+nonce/state reconciliation attempted
+no new broadcast
 no retry
-no /executor/broadcast
-no private keys printed
+no generic executor use
+V1S evidence row preserved
+docs created
+validation commands run
+backend confirmation gap either patched or documented
 Final Report
 
 Return:
 
 files changed
-migration applied or not
-env/config summary
-derived address summary
-on-chain preflight summary
-fresh intent id
-simulation result
-gas safety result
-tx hash
-receipt status
-DB mutation summary
-no forbidden endpoint verification
-no retry verification
-docs updated
+code patch needed or not
+DB evidence summary
+receipt summary
+event decoding summary
+nonce reconciliation
+position/vault reconciliation
+DB status updates if any
+no forbidden mutation verification
 validation commands run
 remaining blocker
+

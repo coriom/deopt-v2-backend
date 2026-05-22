@@ -1,10 +1,10 @@
 use super::{
-    OptionExecutionIntent, OptionExecutionIntentId, OptionExecutionIntentStatus,
-    OptionExecutionSimulationResult, OptionExecutionSourceType, OptionExecutionTransaction,
-    OptionFill, OptionFillFilter, OptionFillId, OptionOrder, OptionOrderFilter, OptionOrderId,
-    OptionOrderStatus, OptionRfqFill, OptionRfqId, OptionRfqQuote, OptionRfqQuoteId,
-    OptionRfqQuoteStatus, OptionRfqRequest, OptionRfqStatus, OptionSeries, OptionSeriesFilter,
-    OptionSeriesId, OptionSeriesStatus,
+    OptionExecutionConfirmationStatus, OptionExecutionIntent, OptionExecutionIntentId,
+    OptionExecutionIntentStatus, OptionExecutionSimulationResult, OptionExecutionSourceType,
+    OptionExecutionTransaction, OptionFill, OptionFillFilter, OptionFillId, OptionOrder,
+    OptionOrderFilter, OptionOrderId, OptionOrderStatus, OptionRfqFill, OptionRfqId,
+    OptionRfqQuote, OptionRfqQuoteId, OptionRfqQuoteStatus, OptionRfqRequest, OptionRfqStatus,
+    OptionSeries, OptionSeriesFilter, OptionSeriesId, OptionSeriesStatus,
 };
 use crate::error::{BackendError, Result};
 use crate::execution::ExecutionTransactionStatus;
@@ -489,6 +489,32 @@ impl OptionSeriesStore {
                 .then_with(|| right.transaction_id.cmp(&left.transaction_id))
         });
         transactions.into_iter().next()
+    }
+
+    pub fn update_option_execution_confirmation(
+        &mut self,
+        transaction_id: &str,
+        confirmation_status: OptionExecutionConfirmationStatus,
+        confirmed_at_ms: TimestampMs,
+        confirmed_block_number: Option<u64>,
+        receipt_status: Option<u64>,
+        confirmation_error: Option<String>,
+    ) -> Result<OptionExecutionTransaction> {
+        let transaction = self
+            .option_execution_transactions
+            .get_mut(transaction_id)
+            .ok_or_else(|| {
+                BackendError::Persistence(format!(
+                    "option execution transaction {transaction_id} not found"
+                ))
+            })?;
+        transaction.confirmation_status = Some(confirmation_status);
+        transaction.confirmed_at_ms = Some(confirmed_at_ms);
+        transaction.confirmed_block_number = confirmed_block_number;
+        transaction.receipt_status = receipt_status;
+        transaction.confirmation_error = confirmation_error;
+        transaction.updated_at_ms = confirmed_at_ms;
+        Ok(transaction.clone())
     }
 
     pub fn option_execution_transactions_for_intent(

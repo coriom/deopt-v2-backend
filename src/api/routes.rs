@@ -32,7 +32,9 @@ use crate::options::service::{
     accept_option_rfq_quote as accept_option_rfq_quote_service,
     broadcast_option_execution_intent as broadcast_option_execution_intent_service,
     cancel_option_order as cancel_option_order_service,
-    cancel_option_rfq as cancel_option_rfq_service, create_option_rfq as create_option_rfq_service,
+    cancel_option_rfq as cancel_option_rfq_service,
+    confirm_option_execution_intent as confirm_option_execution_intent_service,
+    create_option_rfq as create_option_rfq_service,
     create_option_series as create_option_series_service,
     disable_option_series as disable_option_series_service,
     get_option_execution_intent as get_option_execution_intent_service,
@@ -174,6 +176,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/options/execution-intents/:intent_id/broadcast",
             post(broadcast_option_execution_intent),
+        )
+        .route(
+            "/options/execution-intents/:intent_id/confirm",
+            post(confirm_option_execution_intent),
         )
         .route("/options/fills", get(list_option_fills))
         .route("/options/fills/:fill_id", get(get_option_fill))
@@ -1786,6 +1792,19 @@ struct OptionExecutionCalldataResponse {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct OptionExecutionConfirmationResponse {
+    intent_id: String,
+    intent_status: OptionExecutionIntentStatus,
+    transaction_id: String,
+    tx_hash: Option<String>,
+    confirmation_status: crate::options::OptionExecutionConfirmationStatus,
+    receipt_status: Option<u64>,
+    confirmed_block_number: Option<u64>,
+    confirmed_at_ms: Option<crate::types::TimestampMs>,
+    confirmation_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 struct OptionExecutionBroadcastResponse {
     intent_id: String,
     status: OptionExecutionIntentStatus,
@@ -2218,6 +2237,25 @@ async fn option_execution_simulation(
     let intent_id = parse_option_execution_intent_id(&intent_id)?;
     let result = option_execution_simulation_status_service(&state, intent_id).await?;
     Ok(Json(OptionExecutionSimulationResponse::from(result)))
+}
+
+async fn confirm_option_execution_intent(
+    State(state): State<AppState>,
+    Path(intent_id): Path<String>,
+) -> Result<Json<OptionExecutionConfirmationResponse>, ApiError> {
+    let intent_id = parse_option_execution_intent_id(&intent_id)?;
+    let outcome = confirm_option_execution_intent_service(&state, intent_id).await?;
+    Ok(Json(OptionExecutionConfirmationResponse {
+        intent_id: outcome.intent.intent_id.to_string(),
+        intent_status: outcome.intent.status,
+        transaction_id: outcome.transaction.transaction_id,
+        tx_hash: outcome.transaction.tx_hash,
+        confirmation_status: outcome.confirmation_status,
+        receipt_status: outcome.receipt_status,
+        confirmed_block_number: outcome.block_number,
+        confirmed_at_ms: outcome.transaction.confirmed_at_ms,
+        confirmation_error: outcome.error,
+    }))
 }
 
 async fn broadcast_option_execution_intent(

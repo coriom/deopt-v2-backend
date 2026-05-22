@@ -9,15 +9,15 @@ use super::{
     option_execution_simulation_pending, option_execution_simulation_unavailable,
     option_trade_digest, option_trade_digest_bytes, perform_option_broadcast_gas_safety_check,
     simulate_option_execution_intent, validate_simulation_intent, validate_simulation_target,
-    OptionExecutionGasSafetyCheck, OptionExecutionIntent, OptionExecutionIntentId,
-    OptionExecutionIntentStatus, OptionExecutionSignatureMode, OptionExecutionSimulationResult,
-    OptionExecutionSourceType, OptionExecutionTransaction, OptionFill, OptionFillFilter,
-    OptionFillId, OptionOrder, OptionOrderFilter, OptionOrderId, OptionOrderStatus,
-    OptionOrderbookLevel, OptionOrderbookSnapshot, OptionRfqFill, OptionRfqFillId, OptionRfqId,
-    OptionRfqQuote, OptionRfqQuoteId, OptionRfqQuoteSignatureMode, OptionRfqQuoteSignatureStatus,
-    OptionRfqQuoteStatus, OptionRfqRequest, OptionRfqStatus, OptionSeries, OptionSeriesFilter,
-    OptionSeriesId, OptionSeriesSource, OptionSeriesStatus, OptionTradePayload,
-    OptionTradeSignatureBundle,
+    OptionExecutionConfirmationStatus, OptionExecutionGasSafetyCheck, OptionExecutionIntent,
+    OptionExecutionIntentId, OptionExecutionIntentStatus, OptionExecutionSignatureMode,
+    OptionExecutionSimulationResult, OptionExecutionSourceType, OptionExecutionTransaction,
+    OptionFill, OptionFillFilter, OptionFillId, OptionOrder, OptionOrderFilter, OptionOrderId,
+    OptionOrderStatus, OptionOrderbookLevel, OptionOrderbookSnapshot, OptionRfqFill,
+    OptionRfqFillId, OptionRfqId, OptionRfqQuote, OptionRfqQuoteId, OptionRfqQuoteSignatureMode,
+    OptionRfqQuoteSignatureStatus, OptionRfqQuoteStatus, OptionRfqRequest, OptionRfqStatus,
+    OptionSeries, OptionSeriesFilter, OptionSeriesId, OptionSeriesSource, OptionSeriesStatus,
+    OptionTradePayload, OptionTradeSignatureBundle,
 };
 use crate::api::AppState;
 use crate::error::{BackendError, Result};
@@ -25,7 +25,7 @@ use crate::execution::transaction::hex_0x;
 use crate::execution::{
     sign_eip1559_transaction, EthCallProvider, ExecutionTransactionRequest,
     ExecutionTransactionStatus, ExecutorSigner, GasEstimateProvider, HttpJsonRpcProvider,
-    TransactionBroadcastProvider,
+    TransactionBroadcastProvider, TransactionReceiptProvider,
 };
 use crate::mm::protocol::{
     NotificationEnvelope, OptionRfqQuoteAcceptedPayload, OptionRfqQuoteRejectedPayload,
@@ -161,6 +161,16 @@ pub struct OptionExecutionBroadcastOutcome {
     pub broadcast_enabled: bool,
     pub submitted: bool,
     pub duplicate: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OptionExecutionConfirmationOutcome {
+    pub intent: OptionExecutionIntent,
+    pub transaction: OptionExecutionTransaction,
+    pub confirmation_status: OptionExecutionConfirmationStatus,
+    pub receipt_status: Option<u64>,
+    pub block_number: Option<u64>,
+    pub error: Option<String>,
 }
 
 pub async fn create_option_series(
@@ -1275,6 +1285,167 @@ where
     })
 }
 
+pub async fn confirm_option_execution_intent(
+    state: &AppState,
+    intent_id: OptionExecutionIntentId,
+) -> Result<OptionExecutionConfirmationOutcome> {
+    let rpc_url = state.execution_config.rpc_url.clone().ok_or_else(|| {
+        BackendError::Config("RPC_URL is required for option execution confirmation".to_string())
+    })?;
+    let provider = HttpJsonRpcProvider::new(rpc_url);
+    confirm_option_execution_intent_with_provider(state, intent_id, &provider).await
+}
+
+pub async fn confirm_option_execution_intent_with_provider<P>(
+    state: &AppState,
+    intent_id: OptionExecutionIntentId,
+    provider: &P,
+) -> Result<OptionExecutionConfirmationOutcome>
+where
+    P: TransactionReceiptProvider,
+{
+    let intent = get_option_execution_intent(state, intent_id).await?;
+    let transaction = find_submitted_option_execution_transaction(state, intent_id)
+        .await?
+        .ok_or_else(|| {
+            BackendError::InvalidOptionExecutionIntentState(
+                "no submitted option execution transaction to confirm".to_string(),
+            )
+        })?;
+    let tx_hash = transaction.tx_hash.clone().ok_or_else(|| {
+        BackendError::InvalidOptionExecutionIntentState(
+            "submitted option execution transaction is missing a tx hash".to_string(),
+        )
+    })?;
+
+    let receipt_result = provider.transaction_receipt(tx_hash.clone()).await;
+    let now = now_ms();
+
+    let (status, receipt_status_value, block_number, error_string) = match receipt_result {
+        Ok(Some(receipt)) => {
+            if !receipt.tx_hash.eq_ignore_ascii_case(&tx_hash) {
+                (
+                    OptionExecutionConfirmationStatus::ReceiptMissing,
+                    None,
+                    None,
+                    Some(format!(
+                        "receipt tx hash {} does not match submitted {}",
+                        receipt.tx_hash, tx_hash
+                    )),
+                )
+            } else {
+                let mapped = match receipt.status {
+                    Some(1) => OptionExecutionConfirmationStatus::MinedSuccess,
+                    Some(_) => OptionExecutionConfirmationStatus::MinedReverted,
+                    None => OptionExecutionConfirmationStatus::ReceiptError,
+                };
+                let err = if mapped == OptionExecutionConfirmationStatus::ReceiptError {
+                    Some("receipt missing status field".to_string())
+                } else {
+                    None
+                };
+                (mapped, receipt.status, receipt.block_number, err)
+            }
+        }
+        Ok(None) => (
+            OptionExecutionConfirmationStatus::ReceiptMissing,
+            None,
+            None,
+            Some("receipt not yet available".to_string()),
+        ),
+        Err(error) => (
+            OptionExecutionConfirmationStatus::ReceiptError,
+            None,
+            None,
+            Some(error.to_string()),
+        ),
+    };
+
+    let updated_transaction = persist_option_execution_confirmation(
+        state,
+        &transaction.transaction_id,
+        status,
+        now,
+        block_number,
+        receipt_status_value,
+        error_string.clone(),
+    )
+    .await?;
+
+    let next_intent_status = match status {
+        OptionExecutionConfirmationStatus::MinedSuccess => {
+            Some(OptionExecutionIntentStatus::BroadcastConfirmed)
+        }
+        OptionExecutionConfirmationStatus::MinedReverted => {
+            Some(OptionExecutionIntentStatus::BroadcastReverted)
+        }
+        _ => None,
+    };
+
+    let updated_intent = if let Some(next) = next_intent_status {
+        update_option_execution_intent_status(state, intent_id, next, None, now).await?
+    } else {
+        intent.clone()
+    };
+
+    Ok(OptionExecutionConfirmationOutcome {
+        intent: updated_intent,
+        transaction: updated_transaction,
+        confirmation_status: status,
+        receipt_status: receipt_status_value,
+        block_number,
+        error: error_string,
+    })
+}
+
+async fn persist_option_execution_confirmation(
+    state: &AppState,
+    transaction_id: &str,
+    confirmation_status: OptionExecutionConfirmationStatus,
+    confirmed_at_ms: TimestampMs,
+    confirmed_block_number: Option<u64>,
+    receipt_status: Option<u64>,
+    confirmation_error: Option<String>,
+) -> Result<OptionExecutionTransaction> {
+    if let Some(repository) = state.repository.clone() {
+        let rows = repository
+            .update_option_execution_confirmation(
+                transaction_id,
+                confirmation_status,
+                confirmed_at_ms,
+                confirmed_block_number,
+                receipt_status,
+                confirmation_error.clone(),
+            )
+            .await?;
+        if rows == 0 {
+            return Err(BackendError::Persistence(format!(
+                "option execution transaction {transaction_id} not found"
+            )));
+        }
+        let tx = repository
+            .get_option_execution_transaction(transaction_id)
+            .await?;
+        return tx.ok_or_else(|| {
+            BackendError::Persistence(format!(
+                "option execution transaction {transaction_id} disappeared after update"
+            ))
+        });
+    }
+    state
+        .options_store
+        .lock()
+        .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?
+        .update_option_execution_confirmation(
+            transaction_id,
+            confirmation_status,
+            confirmed_at_ms,
+            confirmed_block_number,
+            receipt_status,
+            confirmation_error,
+        )
+}
+
 pub async fn create_option_orderbook_execution_intent(
     state: &AppState,
     fill: &OptionFill,
@@ -1490,6 +1661,11 @@ fn option_execution_transaction_from_request(
         gas_safety_bps: gas_check.map(|check| check.gas_safety_bps),
         gas_check_status: gas_check.map(|check| check.status),
         gas_check_error: gas_check.and_then(|check| check.error.clone()),
+        confirmation_status: None,
+        confirmed_at_ms: None,
+        confirmed_block_number: None,
+        receipt_status: None,
+        confirmation_error: None,
         created_at_ms: now,
         updated_at_ms: now,
     }
@@ -2322,12 +2498,14 @@ fn aggregate_levels(orders: &[OptionOrder], side: Side) -> Vec<OptionOrderbookLe
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::confirmation::ConfirmationReceipt;
     use crate::engine::EngineState;
     use crate::execution::rpc::{EstimateGasRequest, EthCallRequest, EthCallSuccess, RpcFuture};
     use crate::execution::{DecodedRevertError, RevertDiagnostics};
     use crate::nonce_sync::OptionNonceSyncConfig;
     use crate::options::{
-        OptionExecutionGasCheckStatus, OptionExecutionSimulationStatus, OptionsConfig,
+        OptionExecutionConfirmationStatus, OptionExecutionGasCheckStatus,
+        OptionExecutionSimulationStatus, OptionsConfig,
     };
     use std::sync::{Arc, Mutex};
 
@@ -3183,6 +3361,305 @@ mod tests {
         // which has no concept of `execution_transactions` (the generic perp table).
         assert!(state.repository.is_none());
         assert!(state.trade_signatures.lock().unwrap().is_empty());
+    }
+
+    #[derive(Clone)]
+    enum MockReceiptOutcome {
+        Receipt(ConfirmationReceipt),
+        NotFound,
+        Error(String),
+    }
+
+    #[derive(Clone)]
+    struct MockReceiptProvider {
+        outcome: MockReceiptOutcome,
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl MockReceiptProvider {
+        fn mined_success(tx_hash: &str, block: u64) -> Self {
+            Self {
+                outcome: MockReceiptOutcome::Receipt(ConfirmationReceipt {
+                    tx_hash: tx_hash.to_string(),
+                    status: Some(1),
+                    block_number: Some(block),
+                }),
+                calls: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn mined_reverted(tx_hash: &str, block: u64) -> Self {
+            Self {
+                outcome: MockReceiptOutcome::Receipt(ConfirmationReceipt {
+                    tx_hash: tx_hash.to_string(),
+                    status: Some(0),
+                    block_number: Some(block),
+                }),
+                calls: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn missing() -> Self {
+            Self {
+                outcome: MockReceiptOutcome::NotFound,
+                calls: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn rpc_error(message: &str) -> Self {
+            Self {
+                outcome: MockReceiptOutcome::Error(message.to_string()),
+                calls: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.lock().unwrap().len()
+        }
+    }
+
+    impl TransactionReceiptProvider for MockReceiptProvider {
+        fn block_number(&self) -> RpcFuture<'_, u64> {
+            Box::pin(async move { Ok(0) })
+        }
+
+        fn transaction_receipt(
+            &self,
+            tx_hash: String,
+        ) -> RpcFuture<'_, Option<ConfirmationReceipt>> {
+            let outcome = self.outcome.clone();
+            let calls = self.calls.clone();
+            Box::pin(async move {
+                calls.lock().unwrap().push(tx_hash);
+                match outcome {
+                    MockReceiptOutcome::Receipt(r) => Ok(Some(r)),
+                    MockReceiptOutcome::NotFound => Ok(None),
+                    MockReceiptOutcome::Error(message) => Err(BackendError::Simulation(message)),
+                }
+            })
+        }
+    }
+
+    fn broadcast_submitted_intent_with_tx(
+        state: &AppState,
+        tx_hash: &str,
+    ) -> (OptionExecutionIntent, OptionExecutionTransaction) {
+        let intent = broadcast_ready_intent();
+        let intent = insert_intent(state, intent);
+        // Move intent to broadcast_submitted in-memory and insert a matching tx row.
+        let now = now_ms();
+        let updated = state
+            .options_store
+            .lock()
+            .unwrap()
+            .update_option_execution_intent_status(
+                intent.intent_id,
+                OptionExecutionIntentStatus::BroadcastSubmitted,
+                None,
+                now,
+            )
+            .unwrap();
+        let tx = OptionExecutionTransaction {
+            transaction_id: Uuid::new_v4().to_string(),
+            intent_id: intent.intent_id,
+            onchain_intent_id: Some(intent.onchain_intent_id.clone()),
+            from: AccountId::new("0xc35f7a8a103a9a4464adfaa76b9b514093d23c27"),
+            to: AccountId::new("0xf2D1D85cD363Be3bc160d14883C80e7C2c4F420b"),
+            calldata: "0x031f77b3".to_string(),
+            value_wei: "0".to_string(),
+            gas_limit: Some(1_500_000),
+            tx_hash: Some(tx_hash.to_string()),
+            status: ExecutionTransactionStatus::Submitted,
+            error: None,
+            estimated_gas: Some(1_091_120),
+            required_gas: Some(1_363_900),
+            simulation_gas_limit: Some(0),
+            broadcast_gas_limit: Some(1_500_000),
+            gas_safety_bps: Some(12_500),
+            gas_check_status: Some(OptionExecutionGasCheckStatus::Ok),
+            gas_check_error: None,
+            confirmation_status: None,
+            confirmed_at_ms: None,
+            confirmed_block_number: None,
+            receipt_status: None,
+            confirmation_error: None,
+            created_at_ms: now,
+            updated_at_ms: now,
+        };
+        let stored_tx = state
+            .options_store
+            .lock()
+            .unwrap()
+            .insert_option_execution_transaction(tx)
+            .unwrap();
+        (updated, stored_tx)
+    }
+
+    #[tokio::test]
+    async fn option_execution_confirm_mined_success_transitions_to_broadcast_confirmed() {
+        let state = state_with_broadcast(true);
+        let tx_hash = "0x5964a7b3d2c18d051baaa780413d31c44d419ce530f45263cb4c46f720881125";
+        let (intent, tx) = broadcast_submitted_intent_with_tx(&state, tx_hash);
+        let provider = MockReceiptProvider::mined_success(tx_hash, 41856964);
+
+        let outcome =
+            confirm_option_execution_intent_with_provider(&state, intent.intent_id, &provider)
+                .await
+                .unwrap();
+
+        assert_eq!(
+            outcome.confirmation_status,
+            OptionExecutionConfirmationStatus::MinedSuccess
+        );
+        assert_eq!(outcome.receipt_status, Some(1));
+        assert_eq!(outcome.block_number, Some(41856964));
+        assert_eq!(
+            outcome.intent.status,
+            OptionExecutionIntentStatus::BroadcastConfirmed
+        );
+        assert_eq!(
+            outcome.transaction.confirmation_status,
+            Some(OptionExecutionConfirmationStatus::MinedSuccess)
+        );
+        assert_eq!(outcome.transaction.confirmed_block_number, Some(41856964));
+        assert_eq!(outcome.transaction.receipt_status, Some(1));
+        assert_eq!(outcome.transaction.transaction_id, tx.transaction_id);
+        assert_eq!(provider.call_count(), 1);
+        assert_no_generic_execution_rows(&state);
+    }
+
+    #[tokio::test]
+    async fn option_execution_confirm_mined_reverted_transitions_to_broadcast_reverted() {
+        let state = state_with_broadcast(true);
+        let tx_hash = "0x1111111111111111111111111111111111111111111111111111111111111111";
+        let (intent, _tx) = broadcast_submitted_intent_with_tx(&state, tx_hash);
+        let provider = MockReceiptProvider::mined_reverted(tx_hash, 100);
+
+        let outcome =
+            confirm_option_execution_intent_with_provider(&state, intent.intent_id, &provider)
+                .await
+                .unwrap();
+
+        assert_eq!(
+            outcome.confirmation_status,
+            OptionExecutionConfirmationStatus::MinedReverted
+        );
+        assert_eq!(outcome.receipt_status, Some(0));
+        assert_eq!(
+            outcome.intent.status,
+            OptionExecutionIntentStatus::BroadcastReverted
+        );
+        assert_eq!(
+            outcome.transaction.confirmation_status,
+            Some(OptionExecutionConfirmationStatus::MinedReverted)
+        );
+        assert_no_generic_execution_rows(&state);
+    }
+
+    #[tokio::test]
+    async fn option_execution_confirm_missing_receipt_does_not_change_intent_status() {
+        let state = state_with_broadcast(true);
+        let tx_hash = "0x2222222222222222222222222222222222222222222222222222222222222222";
+        let (intent, _tx) = broadcast_submitted_intent_with_tx(&state, tx_hash);
+        let provider = MockReceiptProvider::missing();
+
+        let outcome =
+            confirm_option_execution_intent_with_provider(&state, intent.intent_id, &provider)
+                .await
+                .unwrap();
+
+        assert_eq!(
+            outcome.confirmation_status,
+            OptionExecutionConfirmationStatus::ReceiptMissing
+        );
+        assert_eq!(
+            outcome.intent.status,
+            OptionExecutionIntentStatus::BroadcastSubmitted
+        );
+        assert_eq!(
+            outcome.transaction.confirmation_status,
+            Some(OptionExecutionConfirmationStatus::ReceiptMissing)
+        );
+        assert!(outcome.error.is_some());
+        assert_no_generic_execution_rows(&state);
+    }
+
+    #[tokio::test]
+    async fn option_execution_confirm_receipt_error_does_not_change_intent_status() {
+        let state = state_with_broadcast(true);
+        let tx_hash = "0x3333333333333333333333333333333333333333333333333333333333333333";
+        let (intent, _tx) = broadcast_submitted_intent_with_tx(&state, tx_hash);
+        let provider = MockReceiptProvider::rpc_error("rpc temporarily unavailable");
+
+        let outcome =
+            confirm_option_execution_intent_with_provider(&state, intent.intent_id, &provider)
+                .await
+                .unwrap();
+
+        assert_eq!(
+            outcome.confirmation_status,
+            OptionExecutionConfirmationStatus::ReceiptError
+        );
+        assert_eq!(
+            outcome.intent.status,
+            OptionExecutionIntentStatus::BroadcastSubmitted
+        );
+        assert!(outcome
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("rpc temporarily unavailable"));
+    }
+
+    #[tokio::test]
+    async fn option_execution_confirm_rejects_intent_without_submitted_transaction() {
+        let state = state_with_broadcast(true);
+        let intent = insert_intent(&state, broadcast_ready_intent());
+        let provider = MockReceiptProvider::mined_success("0xabc", 1);
+
+        let error =
+            confirm_option_execution_intent_with_provider(&state, intent.intent_id, &provider)
+                .await
+                .unwrap_err();
+
+        assert!(matches!(
+            error,
+            BackendError::InvalidOptionExecutionIntentState(message)
+                if message.contains("no submitted option execution transaction")
+        ));
+        assert_eq!(provider.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn option_execution_confirm_idempotent_on_already_confirmed_row() {
+        let state = state_with_broadcast(true);
+        let tx_hash = "0x4444444444444444444444444444444444444444444444444444444444444444";
+        let (intent, _tx) = broadcast_submitted_intent_with_tx(&state, tx_hash);
+        let provider = MockReceiptProvider::mined_success(tx_hash, 200);
+
+        let first =
+            confirm_option_execution_intent_with_provider(&state, intent.intent_id, &provider)
+                .await
+                .unwrap();
+        let second =
+            confirm_option_execution_intent_with_provider(&state, intent.intent_id, &provider)
+                .await
+                .unwrap();
+
+        assert_eq!(
+            first.confirmation_status,
+            OptionExecutionConfirmationStatus::MinedSuccess
+        );
+        assert_eq!(
+            second.confirmation_status,
+            OptionExecutionConfirmationStatus::MinedSuccess
+        );
+        assert_eq!(
+            second.intent.status,
+            OptionExecutionIntentStatus::BroadcastConfirmed
+        );
+        // Provider was called both times — confirm() does not memoize on its own.
+        assert_eq!(provider.call_count(), 2);
     }
 
     fn state_with_simulation(enabled: bool) -> AppState {

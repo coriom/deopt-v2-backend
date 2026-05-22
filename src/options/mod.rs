@@ -24,14 +24,15 @@ pub use signing::{
 };
 pub use store::OptionSeriesStore;
 pub use types::{
-    OptionExecutionGasCheckStatus, OptionExecutionIntent, OptionExecutionIntentId,
-    OptionExecutionIntentStatus, OptionExecutionSignatureMode, OptionExecutionSimulationResult,
-    OptionExecutionSimulationStatus, OptionExecutionSourceType, OptionExecutionTransaction,
-    OptionFill, OptionFillFilter, OptionFillId, OptionOrder, OptionOrderFilter, OptionOrderId,
-    OptionOrderStatus, OptionOrderbookLevel, OptionOrderbookSnapshot, OptionRfqFill,
-    OptionRfqFillId, OptionRfqId, OptionRfqQuote, OptionRfqQuoteId, OptionRfqQuoteSignatureMode,
-    OptionRfqQuoteSignatureStatus, OptionRfqQuoteStatus, OptionRfqRequest, OptionRfqStatus,
-    OptionSeries, OptionSeriesFilter, OptionSeriesId, OptionSeriesSource, OptionSeriesStatus,
-    OptionsConfig, OPTION_EXECUTION_GAS_SAFETY_BPS_DEFAULT, OPTION_EXECUTION_GAS_SAFETY_BPS_MAX,
+    OptionExecutionConfirmationStatus, OptionExecutionGasCheckStatus, OptionExecutionIntent,
+    OptionExecutionIntentId, OptionExecutionIntentStatus, OptionExecutionSignatureMode,
+    OptionExecutionSimulationResult, OptionExecutionSimulationStatus, OptionExecutionSourceType,
+    OptionExecutionTransaction, OptionFill, OptionFillFilter, OptionFillId, OptionOrder,
+    OptionOrderFilter, OptionOrderId, OptionOrderStatus, OptionOrderbookLevel,
+    OptionOrderbookSnapshot, OptionRfqFill, OptionRfqFillId, OptionRfqId, OptionRfqQuote,
+    OptionRfqQuoteId, OptionRfqQuoteSignatureMode, OptionRfqQuoteSignatureStatus,
+    OptionRfqQuoteStatus, OptionRfqRequest, OptionRfqStatus, OptionSeries, OptionSeriesFilter,
+    OptionSeriesId, OptionSeriesSource, OptionSeriesStatus, OptionsConfig,
+    OPTION_EXECUTION_GAS_SAFETY_BPS_DEFAULT, OPTION_EXECUTION_GAS_SAFETY_BPS_MAX,
     OPTION_EXECUTION_GAS_SAFETY_BPS_MIN,
 };

@@ -305,6 +305,8 @@ pub enum OptionExecutionIntentStatus {
     SimulationOk,
     SimulationFailed,
     BroadcastSubmitted,
+    BroadcastConfirmed,
+    BroadcastReverted,
     BroadcastFailed,
     Cancelled,
     Failed,
@@ -353,6 +355,8 @@ impl OptionExecutionIntentStatus {
             Self::SimulationOk => "simulation_ok",
             Self::SimulationFailed => "simulation_failed",
             Self::BroadcastSubmitted => "broadcast_submitted",
+            Self::BroadcastConfirmed => "broadcast_confirmed",
+            Self::BroadcastReverted => "broadcast_reverted",
             Self::BroadcastFailed => "broadcast_failed",
             Self::Cancelled => "cancelled",
             Self::Failed => "failed",
@@ -369,6 +373,8 @@ impl OptionExecutionIntentStatus {
             "simulation_ok" => Ok(Self::SimulationOk),
             "simulation_failed" => Ok(Self::SimulationFailed),
             "broadcast_submitted" => Ok(Self::BroadcastSubmitted),
+            "broadcast_confirmed" => Ok(Self::BroadcastConfirmed),
+            "broadcast_reverted" => Ok(Self::BroadcastReverted),
             "broadcast_failed" => Ok(Self::BroadcastFailed),
             "cancelled" => Ok(Self::Cancelled),
             "failed" => Ok(Self::Failed),
@@ -449,8 +455,48 @@ pub struct OptionExecutionTransaction {
     pub gas_safety_bps: Option<u32>,
     pub gas_check_status: Option<OptionExecutionGasCheckStatus>,
     pub gas_check_error: Option<String>,
+    pub confirmation_status: Option<OptionExecutionConfirmationStatus>,
+    pub confirmed_at_ms: Option<TimestampMs>,
+    pub confirmed_block_number: Option<u64>,
+    pub receipt_status: Option<u64>,
+    pub confirmation_error: Option<String>,
     pub created_at_ms: TimestampMs,
     pub updated_at_ms: TimestampMs,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OptionExecutionConfirmationStatus {
+    Pending,
+    MinedSuccess,
+    MinedReverted,
+    ReceiptMissing,
+    ReceiptError,
+}
+
+impl OptionExecutionConfirmationStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::MinedSuccess => "mined_success",
+            Self::MinedReverted => "mined_reverted",
+            Self::ReceiptMissing => "receipt_missing",
+            Self::ReceiptError => "receipt_error",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "mined_success" => Ok(Self::MinedSuccess),
+            "mined_reverted" => Ok(Self::MinedReverted),
+            "receipt_missing" => Ok(Self::ReceiptMissing),
+            "receipt_error" => Ok(Self::ReceiptError),
+            other => Err(BackendError::Persistence(format!(
+                "invalid option execution confirmation status: {other}"
+            ))),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
