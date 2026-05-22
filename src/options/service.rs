@@ -7,23 +7,25 @@ use super::{
     build_option_execution_transaction_request, encode_option_execute_trade_calldata,
     normalize_u256_string, option_execution_intent_id_to_hex_bytes32,
     option_execution_simulation_pending, option_execution_simulation_unavailable,
-    option_trade_digest, option_trade_digest_bytes, simulate_option_execution_intent,
-    validate_simulation_intent, validate_simulation_target, OptionExecutionIntent,
-    OptionExecutionIntentId, OptionExecutionIntentStatus, OptionExecutionSignatureMode,
-    OptionExecutionSimulationResult, OptionExecutionSourceType, OptionExecutionTransaction,
-    OptionFill, OptionFillFilter, OptionFillId, OptionOrder, OptionOrderFilter, OptionOrderId,
-    OptionOrderStatus, OptionOrderbookLevel, OptionOrderbookSnapshot, OptionRfqFill,
-    OptionRfqFillId, OptionRfqId, OptionRfqQuote, OptionRfqQuoteId, OptionRfqQuoteSignatureMode,
-    OptionRfqQuoteSignatureStatus, OptionRfqQuoteStatus, OptionRfqRequest, OptionRfqStatus,
-    OptionSeries, OptionSeriesFilter, OptionSeriesId, OptionSeriesSource, OptionSeriesStatus,
-    OptionTradePayload, OptionTradeSignatureBundle,
+    option_trade_digest, option_trade_digest_bytes, perform_option_broadcast_gas_safety_check,
+    simulate_option_execution_intent, validate_simulation_intent, validate_simulation_target,
+    OptionExecutionGasSafetyCheck, OptionExecutionIntent, OptionExecutionIntentId,
+    OptionExecutionIntentStatus, OptionExecutionSignatureMode, OptionExecutionSimulationResult,
+    OptionExecutionSourceType, OptionExecutionTransaction, OptionFill, OptionFillFilter,
+    OptionFillId, OptionOrder, OptionOrderFilter, OptionOrderId, OptionOrderStatus,
+    OptionOrderbookLevel, OptionOrderbookSnapshot, OptionRfqFill, OptionRfqFillId, OptionRfqId,
+    OptionRfqQuote, OptionRfqQuoteId, OptionRfqQuoteSignatureMode, OptionRfqQuoteSignatureStatus,
+    OptionRfqQuoteStatus, OptionRfqRequest, OptionRfqStatus, OptionSeries, OptionSeriesFilter,
+    OptionSeriesId, OptionSeriesSource, OptionSeriesStatus, OptionTradePayload,
+    OptionTradeSignatureBundle,
 };
 use crate::api::AppState;
 use crate::error::{BackendError, Result};
 use crate::execution::transaction::hex_0x;
 use crate::execution::{
     sign_eip1559_transaction, EthCallProvider, ExecutionTransactionRequest,
-    ExecutionTransactionStatus, ExecutorSigner, HttpJsonRpcProvider, TransactionBroadcastProvider,
+    ExecutionTransactionStatus, ExecutorSigner, GasEstimateProvider, HttpJsonRpcProvider,
+    TransactionBroadcastProvider,
 };
 use crate::mm::protocol::{
     NotificationEnvelope, OptionRfqQuoteAcceptedPayload, OptionRfqQuoteRejectedPayload,
@@ -1118,7 +1120,7 @@ pub async fn broadcast_option_execution_intent_with_provider<P>(
     provider: &P,
 ) -> Result<OptionExecutionBroadcastOutcome>
 where
-    P: TransactionBroadcastProvider,
+    P: TransactionBroadcastProvider + GasEstimateProvider,
 {
     ensure_option_execution_broadcast_enabled(state)?;
     let intent = get_option_execution_intent(state, intent_id).await?;
@@ -1152,6 +1154,42 @@ where
         &intent,
     )?;
     let signer = ExecutorSigner::from_private_key(private_key)?;
+    let from = signer.address().clone();
+
+    let gas_check = perform_option_broadcast_gas_safety_check(
+        provider,
+        &state.execution_config,
+        &state.options_config,
+        &intent,
+        &from,
+    )
+    .await?;
+
+    if !gas_check.is_ok() {
+        let reason = gas_check
+            .reject_reason()
+            .unwrap_or_else(|| "option execution gas safety check failed".to_string());
+        let now = now_ms();
+        let transaction = option_execution_transaction_from_request(
+            &request,
+            from,
+            None,
+            Some(reason.clone()),
+            now,
+            Some(&gas_check),
+        );
+        insert_option_execution_transaction(state, transaction).await?;
+        update_option_execution_intent_status(
+            state,
+            intent_id,
+            OptionExecutionIntentStatus::BroadcastFailed,
+            Some(reason.clone()),
+            now,
+        )
+        .await?;
+        return Err(BackendError::BroadcastRejected(reason));
+    }
+
     let rpc_chain_id = provider.chain_id().await?;
     if rpc_chain_id != request.chain_id {
         return Err(BackendError::BroadcastRejected(format!(
@@ -1161,7 +1199,6 @@ where
     }
 
     let now = now_ms();
-    let from = signer.address().clone();
     let nonce = provider.transaction_count(from.clone()).await?;
     let raw_transaction = sign_eip1559_transaction(&request, nonce, &signer)?;
     let tx_hash = match provider.send_raw_transaction(raw_transaction).await {
@@ -1174,6 +1211,7 @@ where
                     None,
                     Some(error.clone()),
                     now,
+                    Some(&gas_check),
                 );
                 insert_option_execution_transaction(state, transaction.clone()).await?;
                 update_option_execution_intent_status(
@@ -1195,6 +1233,7 @@ where
                 None,
                 Some(error.to_string()),
                 now,
+                Some(&gas_check),
             );
             insert_option_execution_transaction(state, transaction).await?;
             update_option_execution_intent_status(
@@ -1209,8 +1248,14 @@ where
         }
     };
 
-    let transaction =
-        option_execution_transaction_from_request(&request, from, Some(tx_hash), None, now);
+    let transaction = option_execution_transaction_from_request(
+        &request,
+        from,
+        Some(tx_hash),
+        None,
+        now,
+        Some(&gas_check),
+    );
     let transaction = insert_option_execution_transaction(state, transaction).await?;
     let updated_intent = update_option_execution_intent_status(
         state,
@@ -1419,6 +1464,7 @@ fn option_execution_transaction_from_request(
     tx_hash: Option<String>,
     error: Option<String>,
     now: TimestampMs,
+    gas_check: Option<&OptionExecutionGasSafetyCheck>,
 ) -> OptionExecutionTransaction {
     let status = if tx_hash.is_some() {
         ExecutionTransactionStatus::Submitted
@@ -1437,6 +1483,13 @@ fn option_execution_transaction_from_request(
         tx_hash,
         status,
         error,
+        estimated_gas: gas_check.and_then(|check| check.estimated_gas),
+        required_gas: gas_check.and_then(|check| check.required_gas),
+        simulation_gas_limit: gas_check.map(|check| check.simulation_gas_limit),
+        broadcast_gas_limit: gas_check.map(|check| check.broadcast_gas_limit),
+        gas_safety_bps: gas_check.map(|check| check.gas_safety_bps),
+        gas_check_status: gas_check.map(|check| check.status),
+        gas_check_error: gas_check.and_then(|check| check.error.clone()),
         created_at_ms: now,
         updated_at_ms: now,
     }
@@ -2270,10 +2323,12 @@ fn aggregate_levels(orders: &[OptionOrder], side: Side) -> Vec<OptionOrderbookLe
 mod tests {
     use super::*;
     use crate::engine::EngineState;
-    use crate::execution::rpc::{EthCallRequest, EthCallSuccess, RpcFuture};
+    use crate::execution::rpc::{EstimateGasRequest, EthCallRequest, EthCallSuccess, RpcFuture};
     use crate::execution::{DecodedRevertError, RevertDiagnostics};
     use crate::nonce_sync::OptionNonceSyncConfig;
-    use crate::options::{OptionExecutionSimulationStatus, OptionsConfig};
+    use crate::options::{
+        OptionExecutionGasCheckStatus, OptionExecutionSimulationStatus, OptionsConfig,
+    };
     use std::sync::{Arc, Mutex};
 
     #[derive(Clone)]
@@ -2297,12 +2352,20 @@ mod tests {
     }
 
     #[derive(Clone)]
+    enum MockEstimateOutcome {
+        Value(u64),
+        Failure(String),
+    }
+
+    #[derive(Clone)]
     struct MockBroadcastProvider {
         chain_id: u64,
         tx_hash: String,
         fail_send: bool,
         send_calls: Arc<Mutex<Vec<String>>>,
         nonce_calls: Arc<Mutex<Vec<AccountId>>>,
+        estimate_outcome: MockEstimateOutcome,
+        estimate_calls: Arc<Mutex<Vec<EstimateGasRequest>>>,
     }
 
     impl MockProvider {
@@ -2365,6 +2428,8 @@ mod tests {
                 fail_send: false,
                 send_calls: Arc::new(Mutex::new(Vec::new())),
                 nonce_calls: Arc::new(Mutex::new(Vec::new())),
+                estimate_outcome: MockEstimateOutcome::Value(450_000),
+                estimate_calls: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -2382,8 +2447,26 @@ mod tests {
             }
         }
 
+        fn with_estimate(estimated_gas: u64) -> Self {
+            Self {
+                estimate_outcome: MockEstimateOutcome::Value(estimated_gas),
+                ..Self::success()
+            }
+        }
+
+        fn with_estimate_failure(error: impl Into<String>) -> Self {
+            Self {
+                estimate_outcome: MockEstimateOutcome::Failure(error.into()),
+                ..Self::success()
+            }
+        }
+
         fn send_count(&self) -> usize {
             self.send_calls.lock().unwrap().len()
+        }
+
+        fn estimate_count(&self) -> usize {
+            self.estimate_calls.lock().unwrap().len()
         }
     }
 
@@ -2427,6 +2510,20 @@ mod tests {
                     Ok(buyer_nonce)
                 } else {
                     Ok(seller_nonce)
+                }
+            })
+        }
+    }
+
+    impl GasEstimateProvider for MockBroadcastProvider {
+        fn estimate_gas(&self, request: EstimateGasRequest) -> RpcFuture<'_, u64> {
+            let calls = self.estimate_calls.clone();
+            let outcome = self.estimate_outcome.clone();
+            Box::pin(async move {
+                calls.lock().unwrap().push(request);
+                match outcome {
+                    MockEstimateOutcome::Value(value) => Ok(value),
+                    MockEstimateOutcome::Failure(message) => Err(BackendError::Simulation(message)),
                 }
             })
         }
@@ -2913,6 +3010,179 @@ mod tests {
         assert_eq!(transactions.len(), 1);
         assert_eq!(transactions[0].status, ExecutionTransactionStatus::Failed);
         assert_eq!(transactions[0].tx_hash, None);
+    }
+
+    #[tokio::test]
+    async fn option_execution_broadcast_rejects_when_cap_below_estimated_gas() {
+        let state = state_with_broadcast(true);
+        let intent = insert_intent(&state, broadcast_ready_intent());
+        // broadcast cap 600_000 < estimated 750_000 → broadcast_cap_too_low
+        let provider = MockBroadcastProvider::with_estimate(750_000);
+
+        let error =
+            broadcast_option_execution_intent_with_provider(&state, intent.intent_id, &provider)
+                .await
+                .unwrap_err();
+        let transactions = option_transactions(&state, intent.intent_id);
+
+        assert!(
+            matches!(&error, BackendError::BroadcastRejected(message) if message.contains("below estimated_gas"))
+        );
+        assert_eq!(provider.send_count(), 0);
+        assert_eq!(provider.estimate_count(), 1);
+        assert_eq!(transactions.len(), 1);
+        assert_eq!(transactions[0].status, ExecutionTransactionStatus::Failed);
+        assert_eq!(transactions[0].tx_hash, None);
+        assert_eq!(
+            transactions[0].gas_check_status,
+            Some(OptionExecutionGasCheckStatus::BroadcastCapTooLow)
+        );
+        assert_eq!(transactions[0].estimated_gas, Some(750_000));
+        assert_eq!(transactions[0].broadcast_gas_limit, Some(600_000));
+        assert_eq!(transactions[0].gas_safety_bps, Some(12_500));
+        let stored = get_option_execution_intent(&state, intent.intent_id)
+            .await
+            .unwrap();
+        assert_eq!(stored.status, OptionExecutionIntentStatus::BroadcastFailed);
+        assert_no_generic_execution_rows(&state);
+    }
+
+    #[tokio::test]
+    async fn option_execution_broadcast_rejects_when_cap_below_safety_margin() {
+        let state = state_with_broadcast(true);
+        let intent = insert_intent(&state, broadcast_ready_intent());
+        // estimated 500_000; required = 500_000 * 1.25 = 625_000; cap 600_000 < required
+        let provider = MockBroadcastProvider::with_estimate(500_000);
+
+        let error =
+            broadcast_option_execution_intent_with_provider(&state, intent.intent_id, &provider)
+                .await
+                .unwrap_err();
+        let transactions = option_transactions(&state, intent.intent_id);
+
+        assert!(
+            matches!(&error, BackendError::BroadcastRejected(message) if message.contains("below required_gas"))
+        );
+        assert_eq!(provider.send_count(), 0);
+        assert_eq!(provider.estimate_count(), 1);
+        assert_eq!(transactions.len(), 1);
+        assert_eq!(transactions[0].status, ExecutionTransactionStatus::Failed);
+        assert_eq!(transactions[0].tx_hash, None);
+        assert_eq!(
+            transactions[0].gas_check_status,
+            Some(OptionExecutionGasCheckStatus::BelowSafetyMargin)
+        );
+        assert_eq!(transactions[0].estimated_gas, Some(500_000));
+        assert_eq!(transactions[0].required_gas, Some(625_000));
+        assert_eq!(transactions[0].broadcast_gas_limit, Some(600_000));
+        let stored = get_option_execution_intent(&state, intent.intent_id)
+            .await
+            .unwrap();
+        assert_eq!(stored.status, OptionExecutionIntentStatus::BroadcastFailed);
+        assert_no_generic_execution_rows(&state);
+    }
+
+    #[tokio::test]
+    async fn option_execution_broadcast_allows_when_cap_satisfies_safety_margin() {
+        let state = state_with_broadcast(true);
+        let intent = insert_intent(&state, broadcast_ready_intent());
+        // estimated 400_000; required = 500_000; cap 600_000 >= required → ok
+        let provider = MockBroadcastProvider::with_estimate(400_000);
+
+        let outcome =
+            broadcast_option_execution_intent_with_provider(&state, intent.intent_id, &provider)
+                .await
+                .unwrap();
+
+        assert!(outcome.submitted);
+        assert_eq!(provider.send_count(), 1);
+        assert_eq!(provider.estimate_count(), 1);
+        assert_eq!(
+            outcome.transaction.gas_check_status,
+            Some(OptionExecutionGasCheckStatus::Ok)
+        );
+        assert_eq!(outcome.transaction.estimated_gas, Some(400_000));
+        assert_eq!(outcome.transaction.required_gas, Some(500_000));
+        assert_eq!(outcome.transaction.broadcast_gas_limit, Some(600_000));
+        assert_eq!(outcome.transaction.gas_safety_bps, Some(12_500));
+        assert_no_generic_execution_rows(&state);
+    }
+
+    #[tokio::test]
+    async fn option_execution_broadcast_uncapped_simulation_cannot_bypass_capped_broadcast() {
+        // Reproduces the V1L failure: simulation runs with no gas cap (`OPTION_EXECUTION_SIMULATION_GAS_LIMIT=0`)
+        // and produces simulation_ok, but the live broadcast cap inherited from EXECUTOR_MAX_GAS_LIMIT is
+        // smaller than the eth_estimateGas result. The preflight must reject before signing or sending.
+        let mut state = state_with_broadcast(true);
+        state.options_config.execution_simulation_gas_limit = 0;
+        state.options_config.execution_broadcast_gas_limit = 0; // fall back to EXECUTOR_MAX_GAS_LIMIT
+        state.execution_config.max_gas_limit = 1_000_000;
+        let intent = insert_intent(&state, broadcast_ready_intent());
+        // mirrors the live failure: estimate 1_040_080, cap 1_000_000 → too low
+        let provider = MockBroadcastProvider::with_estimate(1_040_080);
+
+        let error =
+            broadcast_option_execution_intent_with_provider(&state, intent.intent_id, &provider)
+                .await
+                .unwrap_err();
+        let transactions = option_transactions(&state, intent.intent_id);
+
+        assert!(matches!(&error, BackendError::BroadcastRejected(_)));
+        assert_eq!(provider.send_count(), 0);
+        assert_eq!(provider.estimate_count(), 1);
+        assert_eq!(transactions.len(), 1);
+        assert_eq!(transactions[0].status, ExecutionTransactionStatus::Failed);
+        assert_eq!(transactions[0].tx_hash, None);
+        assert_eq!(
+            transactions[0].gas_check_status,
+            Some(OptionExecutionGasCheckStatus::BroadcastCapTooLow)
+        );
+        // simulation_gas_limit recorded as 0 (the uncapped sentinel), confirming the bypass attempt
+        // was visible to the preflight rather than relied upon for safety.
+        assert_eq!(transactions[0].simulation_gas_limit, Some(0));
+        assert_eq!(transactions[0].broadcast_gas_limit, Some(1_000_000));
+        assert_eq!(transactions[0].estimated_gas, Some(1_040_080));
+        assert_no_generic_execution_rows(&state);
+    }
+
+    #[tokio::test]
+    async fn option_execution_broadcast_rejects_when_estimate_fails() {
+        let state = state_with_broadcast(true);
+        let intent = insert_intent(&state, broadcast_ready_intent());
+        let provider = MockBroadcastProvider::with_estimate_failure("estimate gas rpc down");
+
+        let error =
+            broadcast_option_execution_intent_with_provider(&state, intent.intent_id, &provider)
+                .await
+                .unwrap_err();
+        let transactions = option_transactions(&state, intent.intent_id);
+
+        assert!(
+            matches!(&error, BackendError::BroadcastRejected(message) if message.contains("eth_estimateGas failed"))
+        );
+        assert_eq!(provider.send_count(), 0);
+        assert_eq!(transactions.len(), 1);
+        assert_eq!(transactions[0].status, ExecutionTransactionStatus::Failed);
+        assert_eq!(
+            transactions[0].gas_check_status,
+            Some(OptionExecutionGasCheckStatus::EstimateFailed)
+        );
+        assert_eq!(transactions[0].estimated_gas, None);
+        assert!(transactions[0]
+            .gas_check_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("estimate gas rpc down"));
+        assert_no_generic_execution_rows(&state);
+    }
+
+    fn assert_no_generic_execution_rows(state: &AppState) {
+        // The option execution path must never write to the generic execution_transactions
+        // store or call the generic executor's broadcast endpoint. In tests we run without
+        // a Postgres repository, so the only persistence sink is the in-memory option store,
+        // which has no concept of `execution_transactions` (the generic perp table).
+        assert!(state.repository.is_none());
+        assert!(state.trade_signatures.lock().unwrap().is_empty());
     }
 
     fn state_with_simulation(enabled: bool) -> AppState {

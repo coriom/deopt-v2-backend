@@ -76,7 +76,7 @@ async fn main() -> deopt_v2_backend::Result<()> {
     state.metrics_config = config.metrics.clone();
     let app = router(state.clone());
 
-    if config.execution.execution_enabled {
+    if config.execution.execution_enabled && config.execution.dry_run {
         if let Some(repository) = repository.clone() {
             spawn_executor(
                 Executor::new(config.execution.clone(), repository),

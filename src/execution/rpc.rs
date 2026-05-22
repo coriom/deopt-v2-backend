@@ -23,8 +23,20 @@ pub struct EthCallSuccess {
     pub output: Vec<u8>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EstimateGasRequest {
+    pub from: AccountId,
+    pub to: AccountId,
+    pub data: Vec<u8>,
+    pub value: u128,
+}
+
 pub trait EthCallProvider: Clone + Send + Sync {
     fn eth_call(&self, request: EthCallRequest) -> RpcFuture<'_, EthCallSuccess>;
+}
+
+pub trait GasEstimateProvider: Clone + Send + Sync {
+    fn estimate_gas(&self, request: EstimateGasRequest) -> RpcFuture<'_, u64>;
 }
 
 pub trait TransactionBroadcastProvider: Clone + Send + Sync {
@@ -183,6 +195,46 @@ impl EthCallProvider for HttpJsonRpcProvider {
     }
 }
 
+impl GasEstimateProvider for HttpJsonRpcProvider {
+    fn estimate_gas(&self, request: EstimateGasRequest) -> RpcFuture<'_, u64> {
+        Box::pin(async move {
+            let response: JsonRpcResponse<String> = self
+                .client
+                .post(&self.rpc_url)
+                .json(&JsonRpcRequest {
+                    jsonrpc: "2.0",
+                    id: 1,
+                    method: "eth_estimateGas",
+                    params: (
+                        EstimateGasParams {
+                            from: request.from.0,
+                            to: request.to.0,
+                            data: hex_0x(&request.data),
+                            value: hex_quantity_u128(request.value),
+                        },
+                        "latest",
+                    ),
+                })
+                .send()
+                .await
+                .map_err(|error| BackendError::Simulation(error.to_string()))?
+                .json()
+                .await
+                .map_err(|error| BackendError::Simulation(error.to_string()))?;
+
+            if let Some(error) = response.error {
+                return Err(BackendError::SimulationReverted(Box::new(
+                    diagnostics_from_rpc_error(&error.message, error.data.as_ref()),
+                )));
+            }
+            let result = response.result.ok_or_else(|| {
+                BackendError::Simulation("eth_estimateGas returned no result".to_string())
+            })?;
+            parse_hex_quantity_u64(&result)
+        })
+    }
+}
+
 impl TransactionReceiptProvider for HttpJsonRpcProvider {
     fn block_number(&self) -> RpcFuture<'_, u64> {
         Box::pin(async move {
@@ -258,6 +310,15 @@ struct EthCallParams {
     value: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     gas: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EstimateGasParams {
+    from: String,
+    to: String,
+    data: String,
+    value: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]

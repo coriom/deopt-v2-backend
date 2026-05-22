@@ -3,10 +3,13 @@ use super::{
     OptionExecutionSimulationStatus, OptionsConfig,
 };
 use crate::error::{BackendError, Result};
-use crate::execution::rpc::{EthCallProvider, EthCallRequest};
+use crate::execution::rpc::{
+    EstimateGasRequest, EthCallProvider, EthCallRequest, GasEstimateProvider,
+};
 use crate::execution::transaction::{hex_0x, ExecutionTransactionRequest};
 use crate::execution::ExecutionConfig;
 use crate::execution::RevertDiagnostics;
+use crate::options::OptionExecutionGasCheckStatus;
 use crate::signing::eip712::{keccak256, parse_evm_address, EIP712_DOMAIN_TYPE};
 use crate::signing::Eip712Domain;
 use crate::types::{now_ms, AccountId};
@@ -456,7 +459,7 @@ fn validate_broadcast_target(target: &AccountId) -> Result<()> {
     Ok(())
 }
 
-fn option_execution_broadcast_gas_limit(
+pub fn option_execution_broadcast_gas_limit(
     execution_config: &ExecutionConfig,
     options_config: &OptionsConfig,
 ) -> Result<u64> {
@@ -470,6 +473,145 @@ fn option_execution_broadcast_gas_limit(
         ));
     }
     Ok(execution_config.max_gas_limit)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OptionExecutionGasSafetyCheck {
+    pub status: OptionExecutionGasCheckStatus,
+    pub estimated_gas: Option<u64>,
+    pub required_gas: Option<u64>,
+    pub simulation_gas_limit: u64,
+    pub broadcast_gas_limit: u64,
+    pub gas_safety_bps: u32,
+    pub error: Option<String>,
+}
+
+impl OptionExecutionGasSafetyCheck {
+    pub fn is_ok(&self) -> bool {
+        matches!(self.status, OptionExecutionGasCheckStatus::Ok)
+    }
+
+    pub fn reject_reason(&self) -> Option<String> {
+        match self.status {
+            OptionExecutionGasCheckStatus::Ok | OptionExecutionGasCheckStatus::Skipped => None,
+            OptionExecutionGasCheckStatus::EstimateFailed => Some(format!(
+                "eth_estimateGas failed for option execution broadcast: {}",
+                self.error.clone().unwrap_or_default()
+            )),
+            OptionExecutionGasCheckStatus::BroadcastCapTooLow => Some(format!(
+                "broadcast gas limit {} is below estimated_gas {}",
+                self.broadcast_gas_limit,
+                self.estimated_gas.unwrap_or_default()
+            )),
+            OptionExecutionGasCheckStatus::BelowSafetyMargin => Some(format!(
+                "broadcast gas limit {} is below required_gas {} (estimated_gas {} * safety {} bps)",
+                self.broadcast_gas_limit,
+                self.required_gas.unwrap_or_default(),
+                self.estimated_gas.unwrap_or_default(),
+                self.gas_safety_bps
+            )),
+            OptionExecutionGasCheckStatus::UncappedBroadcastRejected => Some(
+                "broadcast gas limit must be positive for option execution; uncapped broadcast is not supported"
+                    .to_string(),
+            ),
+        }
+    }
+}
+
+pub fn compute_required_gas(estimated_gas: u64, gas_safety_bps: u32) -> Result<u64> {
+    let estimated = u128::from(estimated_gas);
+    let bps = u128::from(gas_safety_bps);
+    let scaled = estimated.checked_mul(bps).ok_or_else(|| {
+        BackendError::Config(
+            "required_gas overflow while applying OPTION_EXECUTION_GAS_SAFETY_BPS".to_string(),
+        )
+    })?;
+    let required = scaled / 10_000;
+    u64::try_from(required).map_err(|_| {
+        BackendError::Config(
+            "required_gas exceeds u64 after applying OPTION_EXECUTION_GAS_SAFETY_BPS".to_string(),
+        )
+    })
+}
+
+pub async fn perform_option_broadcast_gas_safety_check<P>(
+    provider: &P,
+    execution_config: &ExecutionConfig,
+    options_config: &OptionsConfig,
+    intent: &OptionExecutionIntent,
+    from: &AccountId,
+) -> Result<OptionExecutionGasSafetyCheck>
+where
+    P: GasEstimateProvider,
+{
+    let broadcast_gas_limit =
+        option_execution_broadcast_gas_limit(execution_config, options_config)?;
+    let simulation_gas_limit = options_config.execution_simulation_gas_limit;
+    let gas_safety_bps = options_config.execution_gas_safety_bps;
+
+    let calldata = decode_0x_hex(
+        intent
+            .calldata
+            .as_deref()
+            .ok_or_else(missing_broadcast_calldata_error)?,
+        "option execution calldata",
+    )?;
+
+    if broadcast_gas_limit == 0 {
+        return Ok(OptionExecutionGasSafetyCheck {
+            status: OptionExecutionGasCheckStatus::UncappedBroadcastRejected,
+            estimated_gas: None,
+            required_gas: None,
+            simulation_gas_limit,
+            broadcast_gas_limit,
+            gas_safety_bps,
+            error: Some(
+                "option execution broadcast gas limit resolved to zero; refusing uncapped broadcast"
+                    .to_string(),
+            ),
+        });
+    }
+
+    let request = EstimateGasRequest {
+        from: from.clone(),
+        to: options_config.matching_engine_address.clone(),
+        data: calldata,
+        value: 0,
+    };
+    let estimated_gas = match provider.estimate_gas(request).await {
+        Ok(value) => value,
+        Err(error) => {
+            return Ok(OptionExecutionGasSafetyCheck {
+                status: OptionExecutionGasCheckStatus::EstimateFailed,
+                estimated_gas: None,
+                required_gas: None,
+                simulation_gas_limit,
+                broadcast_gas_limit,
+                gas_safety_bps,
+                error: Some(error.to_string()),
+            });
+        }
+    };
+
+    let required_gas = compute_required_gas(estimated_gas, gas_safety_bps)?;
+
+    let status = if broadcast_gas_limit < estimated_gas {
+        OptionExecutionGasCheckStatus::BroadcastCapTooLow
+    } else if broadcast_gas_limit < required_gas {
+        OptionExecutionGasCheckStatus::BelowSafetyMargin
+    } else {
+        OptionExecutionGasCheckStatus::Ok
+    };
+
+    Ok(OptionExecutionGasSafetyCheck {
+        status,
+        estimated_gas: Some(estimated_gas),
+        required_gas: Some(required_gas),
+        simulation_gas_limit,
+        broadcast_gas_limit,
+        gas_safety_bps,
+        error: None,
+    })
 }
 
 fn missing_calldata_error() -> BackendError {
@@ -746,6 +888,15 @@ mod tests {
 
         assert!(!calldata.is_empty());
         assert_eq!(&calldata[..4], option_execute_trade_selector().as_slice());
+    }
+
+    #[test]
+    fn compute_required_gas_applies_safety_multiplier() {
+        assert_eq!(compute_required_gas(1_040_080, 12_500).unwrap(), 1_300_100);
+        assert_eq!(compute_required_gas(500_000, 12_500).unwrap(), 625_000);
+        assert_eq!(compute_required_gas(0, 12_500).unwrap(), 0);
+        // 10_000 bps = no margin (estimated == required)
+        assert_eq!(compute_required_gas(750_000, 10_000).unwrap(), 750_000);
     }
 
     #[test]

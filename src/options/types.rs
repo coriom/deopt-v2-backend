@@ -44,7 +44,12 @@ pub struct OptionsConfig {
     pub execution_broadcast_enabled: bool,
     pub execution_require_simulation_ok: bool,
     pub execution_broadcast_gas_limit: u64,
+    pub execution_gas_safety_bps: u32,
 }
+
+pub const OPTION_EXECUTION_GAS_SAFETY_BPS_MIN: u32 = 10_000;
+pub const OPTION_EXECUTION_GAS_SAFETY_BPS_MAX: u32 = 50_000;
+pub const OPTION_EXECUTION_GAS_SAFETY_BPS_DEFAULT: u32 = 12_500;
 
 impl OptionsConfig {
     pub fn disabled() -> Self {
@@ -87,6 +92,7 @@ impl OptionsConfig {
             execution_broadcast_enabled: false,
             execution_require_simulation_ok: true,
             execution_broadcast_gas_limit: 0,
+            execution_gas_safety_bps: OPTION_EXECUTION_GAS_SAFETY_BPS_DEFAULT,
         }
     }
 
@@ -203,6 +209,16 @@ impl OptionsConfig {
                     "OPTION_EXECUTION_SIMULATION_FROM must be a valid address".to_string(),
                 )
             })?;
+        }
+        if self.execution_gas_safety_bps < OPTION_EXECUTION_GAS_SAFETY_BPS_MIN {
+            return Err(BackendError::Config(format!(
+                "OPTION_EXECUTION_GAS_SAFETY_BPS must be >= {OPTION_EXECUTION_GAS_SAFETY_BPS_MIN} (no safety margin below 100%)"
+            )));
+        }
+        if self.execution_gas_safety_bps > OPTION_EXECUTION_GAS_SAFETY_BPS_MAX {
+            return Err(BackendError::Config(format!(
+                "OPTION_EXECUTION_GAS_SAFETY_BPS must be <= {OPTION_EXECUTION_GAS_SAFETY_BPS_MAX}"
+            )));
         }
         Ok(())
     }
@@ -426,8 +442,53 @@ pub struct OptionExecutionTransaction {
     pub tx_hash: Option<String>,
     pub status: ExecutionTransactionStatus,
     pub error: Option<String>,
+    pub estimated_gas: Option<u64>,
+    pub required_gas: Option<u64>,
+    pub simulation_gas_limit: Option<u64>,
+    pub broadcast_gas_limit: Option<u64>,
+    pub gas_safety_bps: Option<u32>,
+    pub gas_check_status: Option<OptionExecutionGasCheckStatus>,
+    pub gas_check_error: Option<String>,
     pub created_at_ms: TimestampMs,
     pub updated_at_ms: TimestampMs,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OptionExecutionGasCheckStatus {
+    Skipped,
+    Ok,
+    EstimateFailed,
+    BroadcastCapTooLow,
+    BelowSafetyMargin,
+    UncappedBroadcastRejected,
+}
+
+impl OptionExecutionGasCheckStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Skipped => "skipped",
+            Self::Ok => "ok",
+            Self::EstimateFailed => "estimate_failed",
+            Self::BroadcastCapTooLow => "broadcast_cap_too_low",
+            Self::BelowSafetyMargin => "below_safety_margin",
+            Self::UncappedBroadcastRejected => "uncapped_broadcast_rejected",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "skipped" => Ok(Self::Skipped),
+            "ok" => Ok(Self::Ok),
+            "estimate_failed" => Ok(Self::EstimateFailed),
+            "broadcast_cap_too_low" => Ok(Self::BroadcastCapTooLow),
+            "below_safety_margin" => Ok(Self::BelowSafetyMargin),
+            "uncapped_broadcast_rejected" => Ok(Self::UncappedBroadcastRejected),
+            other => Err(BackendError::Persistence(format!(
+                "invalid option execution gas check status: {other}"
+            ))),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

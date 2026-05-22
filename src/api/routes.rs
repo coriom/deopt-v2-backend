@@ -469,6 +469,7 @@ async fn admin_config(
             "execution_broadcast_enabled": state.options_config.execution_broadcast_enabled,
             "execution_require_simulation_ok": state.options_config.execution_require_simulation_ok,
             "execution_broadcast_gas_limit": state.options_config.execution_broadcast_gas_limit,
+            "execution_gas_safety_bps": state.options_config.execution_gas_safety_bps,
             "option_nonce_sync_enabled": state.option_nonce_sync_config.enabled,
             "option_nonce_sync_require_rpc": state.option_nonce_sync_config.require_rpc,
             "option_nonce_sync_strict": state.option_nonce_sync_config.strict,
@@ -1796,6 +1797,13 @@ struct OptionExecutionBroadcastResponse {
     submitted: bool,
     duplicate: bool,
     confirmed: bool,
+    estimated_gas: Option<u64>,
+    required_gas: Option<u64>,
+    simulation_gas_limit: Option<u64>,
+    broadcast_gas_limit: Option<u64>,
+    gas_safety_bps: Option<u32>,
+    gas_check_status: Option<crate::options::OptionExecutionGasCheckStatus>,
+    gas_check_error: Option<String>,
 }
 
 impl From<OptionSeries> for OptionSeriesResponse {
@@ -2229,6 +2237,13 @@ async fn broadcast_option_execution_intent(
         submitted: outcome.submitted,
         duplicate: outcome.duplicate,
         confirmed: false,
+        estimated_gas: outcome.transaction.estimated_gas,
+        required_gas: outcome.transaction.required_gas,
+        simulation_gas_limit: outcome.transaction.simulation_gas_limit,
+        broadcast_gas_limit: outcome.transaction.broadcast_gas_limit,
+        gas_safety_bps: outcome.transaction.gas_safety_bps,
+        gas_check_status: outcome.transaction.gas_check_status,
+        gas_check_error: outcome.transaction.gas_check_error,
     }))
 }
 

@@ -323,6 +323,11 @@ impl AppConfig {
                 "OPTION_EXECUTION_BROADCAST_GAS_LIMIT",
                 "0",
             )?,
+            execution_gas_safety_bps: parse_env(
+                &mut lookup,
+                "OPTION_EXECUTION_GAS_SAFETY_BPS",
+                &crate::options::OPTION_EXECUTION_GAS_SAFETY_BPS_DEFAULT.to_string(),
+            )?,
         };
         let perp_nonce_sync = PerpNonceSyncConfig {
             enabled: parse_env(&mut lookup, "PERP_NONCE_SYNC_ENABLED", "false")?,
@@ -590,6 +595,56 @@ mod tests {
         assert!(!config.options.execution_broadcast_enabled);
         assert!(config.options.execution_require_simulation_ok);
         assert_eq!(config.options.execution_broadcast_gas_limit, 0);
+        assert_eq!(
+            config.options.execution_gas_safety_bps,
+            crate::options::OPTION_EXECUTION_GAS_SAFETY_BPS_DEFAULT
+        );
+    }
+
+    #[test]
+    fn option_execution_gas_safety_bps_parses_override() {
+        let config = config_from_pairs([("OPTION_EXECUTION_GAS_SAFETY_BPS", "13000")]).unwrap();
+        assert_eq!(config.options.execution_gas_safety_bps, 13_000);
+    }
+
+    #[test]
+    fn option_execution_gas_safety_bps_rejects_below_no_margin_floor() {
+        let error = config_from_pairs([
+            ("OPTIONS_ENABLED", "true"),
+            ("OPTIONS_REQUIRE_PERSISTENCE", "false"),
+            ("OPTION_EXECUTION_ENABLED", "true"),
+            ("OPTION_EXECUTION_REQUIRE_PERSISTENCE", "false"),
+            (
+                "OPTION_MATCHING_ENGINE_ADDRESS",
+                "0x00000000000000000000000000000000000000ee",
+            ),
+            ("OPTION_EXECUTION_GAS_SAFETY_BPS", "9999"),
+            ("PERSISTENCE_ENABLED", "false"),
+        ])
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("OPTION_EXECUTION_GAS_SAFETY_BPS must be >="));
+    }
+
+    #[test]
+    fn option_execution_gas_safety_bps_rejects_above_ceiling() {
+        let error = config_from_pairs([
+            ("OPTIONS_ENABLED", "true"),
+            ("OPTIONS_REQUIRE_PERSISTENCE", "false"),
+            ("OPTION_EXECUTION_ENABLED", "true"),
+            ("OPTION_EXECUTION_REQUIRE_PERSISTENCE", "false"),
+            (
+                "OPTION_MATCHING_ENGINE_ADDRESS",
+                "0x00000000000000000000000000000000000000ee",
+            ),
+            ("OPTION_EXECUTION_GAS_SAFETY_BPS", "50001"),
+            ("PERSISTENCE_ENABLED", "false"),
+        ])
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("OPTION_EXECUTION_GAS_SAFETY_BPS must be <="));
     }
 
     #[test]
@@ -848,8 +903,8 @@ mod tests {
     }
 
     #[test]
-    fn real_execution_is_rejected() {
-        let error = config_from_pairs([
+    fn real_execution_without_dry_run_is_accepted_for_manual_broadcast_paths() {
+        let config = config_from_pairs([
             ("EXECUTION_ENABLED", "true"),
             ("EXECUTOR_DRY_RUN", "false"),
             ("PERSISTENCE_ENABLED", "true"),
@@ -858,11 +913,10 @@ mod tests {
                 "postgres://deopt:deopt@127.0.0.1:5432/deopt_v2_backend",
             ),
         ])
-        .unwrap_err();
+        .unwrap();
 
-        assert!(error
-            .to_string()
-            .contains("real on-chain execution is not implemented yet"));
+        assert!(config.execution.execution_enabled);
+        assert!(!config.execution.dry_run);
     }
 
     #[test]

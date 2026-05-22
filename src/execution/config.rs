@@ -70,18 +70,10 @@ impl ExecutionConfig {
     }
 
     pub fn validate_startup(&self, persistence_enabled: bool) -> Result<()> {
-        if self.execution_enabled {
-            if !self.dry_run {
-                return Err(BackendError::Config(
-                    "real on-chain execution is not implemented yet; set EXECUTOR_DRY_RUN=true"
-                        .to_string(),
-                ));
-            }
-            if !persistence_enabled {
-                return Err(BackendError::Config(
-                    "executor requires persistence enabled".to_string(),
-                ));
-            }
+        if self.execution_enabled && !persistence_enabled {
+            return Err(BackendError::Config(
+                "executor requires persistence enabled".to_string(),
+            ));
         }
         if self.max_batch_size == 0 {
             return Err(BackendError::Config(

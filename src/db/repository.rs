@@ -16,10 +16,10 @@ use crate::mm::{MmAccountPermissions, MmProductPermission};
 use crate::monitoring::FeeEventLabels;
 use crate::options::store::status_for_remaining;
 use crate::options::{
-    OptionExecutionIntent, OptionExecutionIntentId, OptionExecutionIntentStatus,
-    OptionExecutionSimulationResult, OptionExecutionSimulationStatus, OptionExecutionSourceType,
-    OptionExecutionTransaction, OptionFill, OptionFillId, OptionOrder, OptionOrderId,
-    OptionOrderStatus, OptionRfqFill, OptionRfqFillId, OptionRfqId, OptionRfqQuote,
+    OptionExecutionGasCheckStatus, OptionExecutionIntent, OptionExecutionIntentId,
+    OptionExecutionIntentStatus, OptionExecutionSimulationResult, OptionExecutionSimulationStatus,
+    OptionExecutionSourceType, OptionExecutionTransaction, OptionFill, OptionFillId, OptionOrder,
+    OptionOrderId, OptionOrderStatus, OptionRfqFill, OptionRfqFillId, OptionRfqId, OptionRfqQuote,
     OptionRfqQuoteId, OptionRfqQuoteSignatureStatus, OptionRfqQuoteStatus, OptionRfqRequest,
     OptionRfqStatus, OptionSeries, OptionSeriesSource, OptionSeriesStatus,
 };
@@ -2167,8 +2167,10 @@ impl PgRepository {
         let result = sqlx::query(
             "INSERT INTO option_execution_transactions (
                 transaction_id, intent_id, onchain_intent_id, sender, target, calldata,
-                value_wei, gas_limit, tx_hash, status, error, created_at_ms, updated_at_ms
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+                value_wei, gas_limit, tx_hash, status, error, created_at_ms, updated_at_ms,
+                estimated_gas, required_gas, simulation_gas_limit, broadcast_gas_limit,
+                gas_safety_bps, gas_check_status, gas_check_error
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)",
         )
         .bind(&transaction.transaction_id)
         .bind(transaction.intent_id.to_string())
@@ -2188,6 +2190,38 @@ impl PgRepository {
         .bind(&transaction.error)
         .bind(timestamp_to_i64(transaction.created_at_ms))
         .bind(timestamp_to_i64(transaction.updated_at_ms))
+        .bind(
+            transaction
+                .estimated_gas
+                .map(|value| u64_to_i64("estimated_gas", value))
+                .transpose()?,
+        )
+        .bind(
+            transaction
+                .required_gas
+                .map(|value| u64_to_i64("required_gas", value))
+                .transpose()?,
+        )
+        .bind(
+            transaction
+                .simulation_gas_limit
+                .map(|value| u64_to_i64("simulation_gas_limit", value))
+                .transpose()?,
+        )
+        .bind(
+            transaction
+                .broadcast_gas_limit
+                .map(|value| u64_to_i64("broadcast_gas_limit", value))
+                .transpose()?,
+        )
+        .bind(transaction.gas_safety_bps.map(|value| value as i32))
+        .bind(
+            transaction
+                .gas_check_status
+                .as_ref()
+                .map(|status| status.as_str().to_string()),
+        )
+        .bind(&transaction.gas_check_error)
         .execute(&self.pool)
         .await
         .map_err(|error| BackendError::Persistence(error.to_string()))?;
@@ -2200,7 +2234,9 @@ impl PgRepository {
     ) -> Result<Option<OptionExecutionTransaction>> {
         let row = sqlx::query(
             "SELECT transaction_id, intent_id, onchain_intent_id, sender, target, calldata,
-                    value_wei, gas_limit, tx_hash, status, error, created_at_ms, updated_at_ms
+                    value_wei, gas_limit, tx_hash, status, error, created_at_ms, updated_at_ms,
+                    estimated_gas, required_gas, simulation_gas_limit, broadcast_gas_limit,
+                    gas_safety_bps, gas_check_status, gas_check_error
              FROM option_execution_transactions
              WHERE intent_id = $1 AND status = 'submitted'
              ORDER BY created_at_ms DESC, transaction_id DESC
@@ -2219,7 +2255,9 @@ impl PgRepository {
     ) -> Result<Vec<OptionExecutionTransaction>> {
         let rows = sqlx::query(
             "SELECT transaction_id, intent_id, onchain_intent_id, sender, target, calldata,
-                    value_wei, gas_limit, tx_hash, status, error, created_at_ms, updated_at_ms
+                    value_wei, gas_limit, tx_hash, status, error, created_at_ms, updated_at_ms,
+                    estimated_gas, required_gas, simulation_gas_limit, broadcast_gas_limit,
+                    gas_safety_bps, gas_check_status, gas_check_error
              FROM option_execution_transactions
              WHERE intent_id = $1
              ORDER BY created_at_ms DESC, transaction_id DESC",
@@ -3470,6 +3508,12 @@ fn option_execution_transaction_from_row(row: PgRow) -> Result<OptionExecutionTr
     let intent_id: String = row_get(&row, "intent_id")?;
     let gas_limit: Option<i64> = row_get(&row, "gas_limit")?;
     let status: String = row_get(&row, "status")?;
+    let estimated_gas: Option<i64> = row_get(&row, "estimated_gas")?;
+    let required_gas: Option<i64> = row_get(&row, "required_gas")?;
+    let simulation_gas_limit: Option<i64> = row_get(&row, "simulation_gas_limit")?;
+    let broadcast_gas_limit: Option<i64> = row_get(&row, "broadcast_gas_limit")?;
+    let gas_safety_bps: Option<i32> = row_get(&row, "gas_safety_bps")?;
+    let gas_check_status: Option<String> = row_get(&row, "gas_check_status")?;
     Ok(OptionExecutionTransaction {
         transaction_id: row_get(&row, "transaction_id")?,
         intent_id: intent_id.parse().map_err(|error| {
@@ -3486,6 +3530,32 @@ fn option_execution_transaction_from_row(row: PgRow) -> Result<OptionExecutionTr
         tx_hash: row_get(&row, "tx_hash")?,
         status: ExecutionTransactionStatus::parse(&status)?,
         error: row_get(&row, "error")?,
+        estimated_gas: estimated_gas
+            .map(|value| i64_to_u64_persistence("estimated_gas", value))
+            .transpose()?,
+        required_gas: required_gas
+            .map(|value| i64_to_u64_persistence("required_gas", value))
+            .transpose()?,
+        simulation_gas_limit: simulation_gas_limit
+            .map(|value| i64_to_u64_persistence("simulation_gas_limit", value))
+            .transpose()?,
+        broadcast_gas_limit: broadcast_gas_limit
+            .map(|value| i64_to_u64_persistence("broadcast_gas_limit", value))
+            .transpose()?,
+        gas_safety_bps: gas_safety_bps
+            .map(|value| {
+                u32::try_from(value).map_err(|_| {
+                    BackendError::Persistence(format!(
+                        "invalid option execution gas_safety_bps: {value}"
+                    ))
+                })
+            })
+            .transpose()?,
+        gas_check_status: gas_check_status
+            .as_deref()
+            .map(OptionExecutionGasCheckStatus::parse)
+            .transpose()?,
+        gas_check_error: row_get(&row, "gas_check_error")?,
         created_at_ms: row_get(&row, "created_at_ms")?,
         updated_at_ms: row_get(&row, "updated_at_ms")?,
     })
