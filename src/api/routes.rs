@@ -60,13 +60,16 @@ use crate::options::service::{
     SubmitOptionExecutionSignaturesInput, SubmitOptionOrderInput, SubmitOptionRfqQuoteInput,
 };
 use crate::options::{
+    list_option_execution_events as list_option_execution_events_service,
     option_execution_intent_id_to_hex_bytes32, option_rfq_id_to_hex_bytes32,
-    option_series_id_to_hex_bytes32, OptionExecutionIntent, OptionExecutionIntentId,
-    OptionExecutionIntentStatus, OptionExecutionSimulationResult, OptionExecutionSimulationStatus,
-    OptionFill, OptionFillFilter, OptionFillId, OptionOrder, OptionOrderFilter, OptionOrderStatus,
-    OptionOrderbookSnapshot, OptionRfqFill, OptionRfqId, OptionRfqQuote, OptionRfqQuoteId,
-    OptionRfqQuoteSignatureStatus, OptionRfqQuoteStatus, OptionRfqRequest, OptionRfqStatus,
-    OptionSeries, OptionSeriesFilter, OptionSeriesStatus, OPTION_RFQ_QUOTE_TYPE, OPTION_TRADE_TYPE,
+    option_series_id_to_hex_bytes32,
+    summarize_option_execution_events as summarize_option_execution_events_service,
+    OptionExecutionIntent, OptionExecutionIntentId, OptionExecutionIntentStatus,
+    OptionExecutionSimulationResult, OptionExecutionSimulationStatus, OptionFill, OptionFillFilter,
+    OptionFillId, OptionOrder, OptionOrderFilter, OptionOrderStatus, OptionOrderbookSnapshot,
+    OptionRfqFill, OptionRfqId, OptionRfqQuote, OptionRfqQuoteId, OptionRfqQuoteSignatureStatus,
+    OptionRfqQuoteStatus, OptionRfqRequest, OptionRfqStatus, OptionSeries, OptionSeriesFilter,
+    OptionSeriesStatus, OPTION_EVENT_INDEXER_STATE_ID, OPTION_RFQ_QUOTE_TYPE, OPTION_TRADE_TYPE,
 };
 use crate::orders::service::{
     cancel_order as cancel_order_shared, submit_response_from_events, submit_signed_order,
@@ -256,6 +259,7 @@ pub fn router(state: AppState) -> Router {
             "/admin/options/confirmations",
             get(admin_option_confirmations),
         )
+        .route("/admin/options/events", get(admin_option_events))
         .route("/admin/mm/sessions", get(admin_mm_sessions))
         .route("/admin/mm/permissions", get(admin_mm_permissions))
         .route("/admin/execution/summary", get(admin_execution_summary))
@@ -370,6 +374,7 @@ async fn admin_config(
             "option_execution_enabled": state.options_config.execution_enabled,
             "option_execution_simulation_enabled": state.options_config.execution_simulation_enabled,
             "option_execution_broadcast_enabled": state.options_config.execution_broadcast_enabled,
+            "option_event_indexer_enabled": state.option_event_indexer_config.enabled,
             "option_nonce_sync_enabled": state.option_nonce_sync_config.enabled,
             "fees_enabled": state.fees_config.enabled,
             "rebates_enabled": state.fees_config.rebates_enabled,
@@ -494,6 +499,16 @@ async fn admin_config(
                 "batch_size": state.option_confirmation_config.batch_size,
                 "require_rpc": state.option_confirmation_config.require_rpc,
                 "rpc_configured": state.option_confirmation_config.rpc_url.is_some()
+            },
+            "event_indexer": {
+                "enabled": state.option_event_indexer_config.enabled,
+                "poll_interval_ms": state.option_event_indexer_config.poll_interval_ms,
+                "from_block": state.option_event_indexer_config.from_block,
+                "batch_blocks": state.option_event_indexer_config.batch_blocks,
+                "confirmation_blocks": state.option_event_indexer_config.confirmation_blocks,
+                "require_rpc": state.option_event_indexer_config.require_rpc,
+                "rpc_configured": state.option_event_indexer_config.rpc_url.is_some(),
+                "target_contract": state.option_event_indexer_config.matching_engine_address
             }
         }
     })))
@@ -567,6 +582,62 @@ async fn admin_option_confirmations(
         },
         "counts": serde_json::Value::Object(counts),
         "latest_tick": latest_tick,
+    })))
+}
+
+async fn admin_option_events(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    ensure_admin_access(&state, &headers)?;
+    let counts = summarize_option_execution_events_service(&state).await?;
+    let recent = list_option_execution_events_service(&state, 20).await?;
+    let latest_tick = state
+        .option_event_indexer_last_tick
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone());
+    let cursor_state = if let Some(repository) = state.repository.clone() {
+        repository
+            .get_option_event_indexer_state(OPTION_EVENT_INDEXER_STATE_ID)
+            .await?
+    } else {
+        state
+            .options_store
+            .lock()
+            .map_err(|_| ApiError::internal())?
+            .get_option_event_indexer_state(OPTION_EVENT_INDEXER_STATE_ID)
+    };
+    let last_indexed_block = cursor_state
+        .as_ref()
+        .map(|state| state.last_indexed_block)
+        .unwrap_or(state.option_event_indexer_config.from_block);
+    let last_error = cursor_state.and_then(|state| state.last_error);
+
+    Ok(Json(serde_json::json!({
+        "indexer_enabled": state.option_event_indexer_config.enabled,
+        "from_block": state.option_event_indexer_config.from_block,
+        "poll_interval_ms": state.option_event_indexer_config.poll_interval_ms,
+        "batch_blocks": state.option_event_indexer_config.batch_blocks,
+        "confirmation_blocks": state.option_event_indexer_config.confirmation_blocks,
+        "require_rpc": state.option_event_indexer_config.require_rpc,
+        "rpc_configured": state.option_event_indexer_config.rpc_url.is_some(),
+        "target_contract": state.option_event_indexer_config.matching_engine_address,
+        "last_indexed_block": last_indexed_block,
+        "last_error": last_error,
+        "config": {
+            "enabled": state.option_event_indexer_config.enabled,
+            "from_block": state.option_event_indexer_config.from_block,
+            "poll_interval_ms": state.option_event_indexer_config.poll_interval_ms,
+            "batch_blocks": state.option_event_indexer_config.batch_blocks,
+            "confirmation_blocks": state.option_event_indexer_config.confirmation_blocks,
+            "require_rpc": state.option_event_indexer_config.require_rpc,
+            "rpc_configured": state.option_event_indexer_config.rpc_url.is_some(),
+            "target_contract": state.option_event_indexer_config.matching_engine_address
+        },
+        "latest_tick": latest_tick,
+        "counts": counts,
+        "recent": recent
     })))
 }
 
@@ -4795,6 +4866,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admin_option_events_returns_config_counts_and_latest_tick() {
+        let mut state = admin_state(false);
+        state.option_event_indexer_config = crate::options::OptionEventIndexerConfig {
+            enabled: true,
+            poll_interval_ms: 15_000,
+            from_block: 10,
+            batch_blocks: 25,
+            confirmation_blocks: 3,
+            require_rpc: true,
+            rpc_url: Some("https://rpc.example/redacted-key".to_string()),
+            matching_engine_address: AccountId::new("0x00000000000000000000000000000000000000ee"),
+        };
+        let event = route_option_execution_event();
+        state
+            .options_store
+            .lock()
+            .unwrap()
+            .persist_option_execution_events_and_cursor(
+                OPTION_EVENT_INDEXER_STATE_ID,
+                &[event],
+                25,
+                1_000,
+            );
+        *state.option_event_indexer_last_tick.lock().unwrap() =
+            Some(crate::options::OptionEventIndexerTickResult {
+                enabled: true,
+                chain_id: 84532,
+                current_block_number: Some(30),
+                safe_head: Some(27),
+                from_block: 11,
+                to_block: 25,
+                batch_blocks: 25,
+                confirmation_blocks: 3,
+                logs_found: 1,
+                events_decoded: 1,
+                events_indexed: 1,
+                cursor_updated: true,
+                last_indexed_block: 25,
+            });
+
+        let response = router(state)
+            .oneshot(get_request("/admin/options/events", None))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["indexer_enabled"], true);
+        assert_eq!(json["from_block"], 10);
+        assert_eq!(json["batch_blocks"], 25);
+        assert_eq!(json["confirmation_blocks"], 3);
+        assert_eq!(json["rpc_configured"], true);
+        assert_eq!(json["last_indexed_block"], 25);
+        assert_eq!(json["counts"]["OptionTradeExecuted"], 1);
+        assert_eq!(json["counts"]["OptionPositionUpdated"], 0);
+        assert_eq!(json["latest_tick"]["to_block"], 25);
+        assert_eq!(json["recent"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn admin_recent_respects_limit_cap() {
         let response = router(admin_state(false))
             .oneshot(get_request("/admin/recent?limit=999", None))
@@ -4813,6 +4944,12 @@ mod tests {
         let before_intents = state.engine.lock().unwrap().execution_intents().len();
         let before_rfqs = state.rfq_store.lock().unwrap().list_rfqs().len();
         let before_option_rfqs = state.options_store.lock().unwrap().list_option_rfqs().len();
+        let before_option_events = state
+            .options_store
+            .lock()
+            .unwrap()
+            .list_option_execution_events(100)
+            .len();
         let before_fee_events = state.fees_store.lock().unwrap().list_fee_events(10).len();
 
         for path in [
@@ -4824,6 +4961,7 @@ mod tests {
             "/admin/execution/summary",
             "/admin/rfq/summary",
             "/admin/options/summary",
+            "/admin/options/events",
             "/admin/fees/summary",
             "/admin/fees/events?limit=5",
             "/admin/fees/volumes",
@@ -4845,6 +4983,15 @@ mod tests {
         assert_eq!(
             state.options_store.lock().unwrap().list_option_rfqs().len(),
             before_option_rfqs
+        );
+        assert_eq!(
+            state
+                .options_store
+                .lock()
+                .unwrap()
+                .list_option_execution_events(100)
+                .len(),
+            before_option_events
         );
         assert_eq!(
             state.fees_store.lock().unwrap().list_fee_events(10).len(),
@@ -4917,6 +5064,42 @@ mod tests {
             .lock()
             .unwrap()
             .insert_option_execution_intent(intent)
+    }
+
+    fn route_option_execution_event() -> crate::options::OptionExecutionEvent {
+        crate::options::OptionExecutionEvent {
+            id: Uuid::from_u128(500),
+            chain_id: 84532,
+            contract_address: "0x00000000000000000000000000000000000000ee".to_string(),
+            tx_hash: "0x5964a7b3d2c18d051baaa780413d31c44d419ce530f45263cb4c46f720881125"
+                .to_string(),
+            log_index: 2,
+            block_number: 20,
+            block_hash: Some(
+                "0x2222222222222222222222222222222222222222222222222222222222222222".to_string(),
+            ),
+            event_name: "OptionTradeExecuted".to_string(),
+            event_signature: crate::options::OPTION_TRADE_EXECUTED_SIGNATURE.to_string(),
+            intent_id: Some(Uuid::from_u128(11)),
+            onchain_intent_id: Some(
+                "0x1111111111111111111111111111111111111111111111111111111111111111".to_string(),
+            ),
+            option_execution_transaction_id: Some("option-tx-1".to_string()),
+            buyer: Some("0x0000000000000000000000000000000000000001".to_string()),
+            seller: Some("0x0000000000000000000000000000000000000002".to_string()),
+            account: None,
+            option_id: Some("7".to_string()),
+            quantity_contracts: Some("1".to_string()),
+            premium_per_contract_native: Some("10000".to_string()),
+            raw_topics: serde_json::json!([
+                crate::options::option_trade_executed_topic0(),
+                "0x1111111111111111111111111111111111111111111111111111111111111111"
+            ]),
+            raw_data: "0x".to_string(),
+            decoded: Some(serde_json::json!({"buyerIsMaker": false})),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        }
     }
 
     fn route_calldata_ready_intent() -> OptionExecutionIntent {

@@ -495,6 +495,57 @@ impl OptionExecutionReceiptCost {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OptionExecutionEvent {
+    pub id: Uuid,
+    pub chain_id: u64,
+    pub contract_address: String,
+    pub tx_hash: String,
+    pub log_index: u64,
+    pub block_number: u64,
+    pub block_hash: Option<String>,
+    pub event_name: String,
+    pub event_signature: String,
+    pub intent_id: Option<Uuid>,
+    pub onchain_intent_id: Option<String>,
+    pub option_execution_transaction_id: Option<String>,
+    pub buyer: Option<String>,
+    pub seller: Option<String>,
+    pub account: Option<String>,
+    pub option_id: Option<String>,
+    pub quantity_contracts: Option<String>,
+    pub premium_per_contract_native: Option<String>,
+    pub raw_topics: serde_json::Value,
+    pub raw_data: String,
+    pub decoded: Option<serde_json::Value>,
+    pub created_at_ms: TimestampMs,
+    pub updated_at_ms: TimestampMs,
+}
+
+impl OptionExecutionEvent {
+    pub fn idempotency_key(&self) -> (u64, String, u64) {
+        (
+            self.chain_id,
+            self.tx_hash.to_ascii_lowercase(),
+            self.log_index,
+        )
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OptionEventIndexerState {
+    pub id: String,
+    pub last_indexed_block: u64,
+    pub updated_at_ms: TimestampMs,
+    pub last_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct OptionExecutionEventLink {
+    pub intent_id: Option<Uuid>,
+    pub option_execution_transaction_id: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OptionExecutionConfirmationStatus {

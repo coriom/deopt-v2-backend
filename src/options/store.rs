@@ -1,5 +1,6 @@
 use super::{
-    OptionExecutionConfirmationStatus, OptionExecutionIntent, OptionExecutionIntentId,
+    OptionEventIndexerState, OptionExecutionConfirmationStatus, OptionExecutionEvent,
+    OptionExecutionEventLink, OptionExecutionIntent, OptionExecutionIntentId,
     OptionExecutionIntentStatus, OptionExecutionReceiptCost, OptionExecutionSimulationResult,
     OptionExecutionSourceType, OptionExecutionTransaction, OptionFill, OptionFillFilter,
     OptionFillId, OptionOrder, OptionOrderFilter, OptionOrderId, OptionOrderStatus, OptionRfqFill,
@@ -23,6 +24,8 @@ pub struct OptionSeriesStore {
     option_execution_intents: HashMap<OptionExecutionIntentId, OptionExecutionIntent>,
     option_execution_intents_by_source: HashMap<(String, String), OptionExecutionIntentId>,
     option_execution_transactions: HashMap<String, OptionExecutionTransaction>,
+    option_execution_events: HashMap<(u64, String, u64), OptionExecutionEvent>,
+    option_event_indexer_states: HashMap<String, OptionEventIndexerState>,
 }
 
 impl OptionSeriesStore {
@@ -580,6 +583,149 @@ impl OptionSeriesStore {
             *counts.entry(key).or_default() += 1;
         }
         counts.into_iter().collect()
+    }
+
+    pub fn find_option_execution_event_link(
+        &self,
+        tx_hash: &str,
+        onchain_intent_id: Option<&str>,
+    ) -> OptionExecutionEventLink {
+        if !tx_hash.is_empty() {
+            let mut transactions = self
+                .option_execution_transactions
+                .values()
+                .filter(|transaction| {
+                    transaction
+                        .tx_hash
+                        .as_deref()
+                        .map(|hash| hash.eq_ignore_ascii_case(tx_hash))
+                        .unwrap_or(false)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            transactions.sort_by(|left, right| {
+                right
+                    .created_at_ms
+                    .cmp(&left.created_at_ms)
+                    .then_with(|| right.transaction_id.cmp(&left.transaction_id))
+            });
+            if let Some(transaction) = transactions.into_iter().next() {
+                return OptionExecutionEventLink {
+                    intent_id: Some(transaction.intent_id),
+                    option_execution_transaction_id: Some(transaction.transaction_id),
+                };
+            }
+        }
+
+        if let Some(onchain_intent_id) = onchain_intent_id {
+            let mut transactions = self
+                .option_execution_transactions
+                .values()
+                .filter(|transaction| {
+                    transaction
+                        .onchain_intent_id
+                        .as_deref()
+                        .map(|value| value.eq_ignore_ascii_case(onchain_intent_id))
+                        .unwrap_or(false)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            transactions.sort_by(|left, right| {
+                right
+                    .created_at_ms
+                    .cmp(&left.created_at_ms)
+                    .then_with(|| right.transaction_id.cmp(&left.transaction_id))
+            });
+            if let Some(transaction) = transactions.into_iter().next() {
+                return OptionExecutionEventLink {
+                    intent_id: Some(transaction.intent_id),
+                    option_execution_transaction_id: Some(transaction.transaction_id),
+                };
+            }
+
+            let mut intents = self
+                .option_execution_intents
+                .values()
+                .filter(|intent| {
+                    intent
+                        .onchain_intent_id
+                        .eq_ignore_ascii_case(onchain_intent_id)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            intents.sort_by(|left, right| {
+                right
+                    .created_at_ms
+                    .cmp(&left.created_at_ms)
+                    .then_with(|| right.intent_id.cmp(&left.intent_id))
+            });
+            if let Some(intent) = intents.into_iter().next() {
+                return OptionExecutionEventLink {
+                    intent_id: Some(intent.intent_id),
+                    option_execution_transaction_id: None,
+                };
+            }
+        }
+
+        OptionExecutionEventLink::default()
+    }
+
+    pub fn get_option_event_indexer_state(&self, id: &str) -> Option<OptionEventIndexerState> {
+        self.option_event_indexer_states.get(id).cloned()
+    }
+
+    pub fn persist_option_execution_events_and_cursor(
+        &mut self,
+        state_id: &str,
+        events: &[OptionExecutionEvent],
+        last_indexed_block: u64,
+        updated_at_ms: i64,
+    ) -> u64 {
+        let mut inserted = 0u64;
+        for event in events {
+            let key = event.idempotency_key();
+            if let std::collections::hash_map::Entry::Vacant(entry) =
+                self.option_execution_events.entry(key)
+            {
+                entry.insert(event.clone());
+                inserted += 1;
+            }
+        }
+        self.option_event_indexer_states.insert(
+            state_id.to_string(),
+            OptionEventIndexerState {
+                id: state_id.to_string(),
+                last_indexed_block,
+                updated_at_ms,
+                last_error: None,
+            },
+        );
+        inserted
+    }
+
+    pub fn summarize_option_execution_events(&self) -> Vec<(String, u64)> {
+        let mut counts: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+        for event in self.option_execution_events.values() {
+            *counts.entry(event.event_name.clone()).or_default() += 1;
+        }
+        counts.into_iter().collect()
+    }
+
+    pub fn list_option_execution_events(&self, limit: u32) -> Vec<OptionExecutionEvent> {
+        let mut events = self
+            .option_execution_events
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        events.sort_by(|left, right| {
+            right
+                .block_number
+                .cmp(&left.block_number)
+                .then_with(|| right.log_index.cmp(&left.log_index))
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        events.truncate(limit as usize);
+        events
     }
 
     pub fn option_execution_transactions_for_intent(

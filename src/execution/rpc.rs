@@ -50,6 +50,20 @@ pub trait TransactionReceiptProvider: Clone + Send + Sync {
     fn transaction_receipt(&self, tx_hash: String) -> RpcFuture<'_, Option<ConfirmationReceipt>>;
 }
 
+pub trait EthLogsProvider: Clone + Send + Sync {
+    fn block_number(&self) -> RpcFuture<'_, u64>;
+    fn get_logs(&self, filter: EthGetLogsFilter) -> RpcFuture<'_, Vec<crate::indexer::EthLog>>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EthGetLogsFilter {
+    pub from_block: String,
+    pub to_block: String,
+    pub address: String,
+    pub topics: Vec<String>,
+}
+
 #[derive(Clone)]
 pub struct HttpJsonRpcProvider {
     rpc_url: String,
@@ -289,6 +303,38 @@ impl TransactionReceiptProvider for HttpJsonRpcProvider {
                 .flatten()
                 .map(ConfirmationReceipt::try_from)
                 .transpose()
+        })
+    }
+}
+
+impl EthLogsProvider for HttpJsonRpcProvider {
+    fn block_number(&self) -> RpcFuture<'_, u64> {
+        TransactionReceiptProvider::block_number(self)
+    }
+
+    fn get_logs(&self, filter: EthGetLogsFilter) -> RpcFuture<'_, Vec<crate::indexer::EthLog>> {
+        Box::pin(async move {
+            let response: JsonRpcResponse<Vec<crate::indexer::EthLog>> = self
+                .client
+                .post(&self.rpc_url)
+                .json(&JsonRpcRequest {
+                    jsonrpc: "2.0",
+                    id: 1,
+                    method: "eth_getLogs",
+                    params: [filter],
+                })
+                .send()
+                .await
+                .map_err(|error| BackendError::Indexer(error.to_string()))?
+                .json()
+                .await
+                .map_err(|error| BackendError::Indexer(error.to_string()))?;
+            if let Some(error) = response.error {
+                return Err(BackendError::Indexer(error.message));
+            }
+            response
+                .result
+                .ok_or_else(|| BackendError::Indexer("eth_getLogs returned no result".to_string()))
         })
     }
 }

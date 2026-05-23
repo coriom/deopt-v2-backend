@@ -24,8 +24,9 @@ pub use perp_trade::{
 pub use queue::ExecutionQueue;
 pub use revert::{DecodedRevertError, RevertDiagnostics};
 pub use rpc::{
-    EstimateGasRequest, EthCallProvider, EthCallRequest, EthCallSuccess, GasEstimateProvider,
-    HttpJsonRpcProvider, RpcFuture, TransactionBroadcastProvider, TransactionReceiptProvider,
+    EstimateGasRequest, EthCallProvider, EthCallRequest, EthCallSuccess, EthGetLogsFilter,
+    EthLogsProvider, GasEstimateProvider, HttpJsonRpcProvider, RpcFuture,
+    TransactionBroadcastProvider, TransactionReceiptProvider,
 };
 pub use runner::spawn_executor;
 pub use signer::ExecutorSigner;

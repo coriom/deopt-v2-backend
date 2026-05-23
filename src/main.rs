@@ -5,7 +5,7 @@ use deopt_v2_backend::engine::EngineState;
 use deopt_v2_backend::execution::{spawn_executor, Executor};
 use deopt_v2_backend::indexer::{spawn_indexer, Indexer};
 use deopt_v2_backend::mm::transport::webtransport::spawn_webtransport_gateway;
-use deopt_v2_backend::options::spawn_option_confirmation_worker;
+use deopt_v2_backend::options::{spawn_option_confirmation_worker, spawn_option_event_indexer};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -19,6 +19,9 @@ async fn main() -> deopt_v2_backend::Result<()> {
     config.option_nonce_sync.validate_startup()?;
     config
         .option_confirmation
+        .validate_startup(config.persistence_enabled)?;
+    config
+        .option_event_indexer
         .validate_startup(config.persistence_enabled)?;
     config
         .indexer
@@ -71,6 +74,7 @@ async fn main() -> deopt_v2_backend::Result<()> {
         config.chain_id,
     );
     state.option_confirmation_config = config.option_confirmation.clone();
+    state.option_event_indexer_config = config.option_event_indexer.clone();
     state.network_name = config.network_name.clone();
     state.persistence_enabled = config.persistence_enabled;
     state.database_configured = config.database_url.is_some();
@@ -96,6 +100,7 @@ async fn main() -> deopt_v2_backend::Result<()> {
         }
     }
     spawn_option_confirmation_worker(state.clone());
+    spawn_option_event_indexer(state.clone());
     spawn_webtransport_gateway(config.mm_gateway.clone(), state).await?;
 
     info!(
@@ -106,6 +111,7 @@ async fn main() -> deopt_v2_backend::Result<()> {
         execution_enabled = config.execution.execution_enabled,
         confirmation_enabled = config.confirmation.enabled,
         option_confirmation_worker_enabled = config.option_confirmation.enabled,
+        option_event_indexer_enabled = config.option_event_indexer.enabled,
         rfq_enabled = config.rfq.enabled,
         options_enabled = config.options.enabled,
         fees_enabled = config.fees.enabled,

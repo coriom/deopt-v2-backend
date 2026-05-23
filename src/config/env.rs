@@ -7,7 +7,7 @@ use crate::indexer::IndexerConfig;
 use crate::mm::transport::webtransport::validate_webtransport_startup;
 use crate::mm::{MmGatewayConfig, MmPermissionsConfig};
 use crate::nonce_sync::{OptionNonceSyncConfig, PerpNonceSyncConfig};
-use crate::options::OptionsConfig;
+use crate::options::{OptionEventIndexerConfig, OptionsConfig};
 use crate::reconciliation::ReconciliationConfig;
 use crate::rfq::RfqConfig;
 use crate::signing::signature::SignatureVerificationMode;
@@ -27,6 +27,7 @@ pub struct AppConfig {
     pub perp_nonce_sync: PerpNonceSyncConfig,
     pub option_nonce_sync: OptionNonceSyncConfig,
     pub option_confirmation: crate::options::OptionConfirmationConfig,
+    pub option_event_indexer: OptionEventIndexerConfig,
     pub confirmation: ConfirmationConfig,
     pub indexer: IndexerConfig,
     pub reconciliation: ReconciliationConfig,
@@ -356,6 +357,24 @@ impl AppConfig {
             require_rpc: parse_env(&mut lookup, "OPTION_CONFIRMATION_REQUIRE_RPC", "true")?,
             rpc_url: execution.rpc_url.clone(),
         };
+        let option_event_indexer = OptionEventIndexerConfig {
+            enabled: parse_env(&mut lookup, "OPTION_EVENT_INDEXER_ENABLED", "false")?,
+            poll_interval_ms: parse_env(
+                &mut lookup,
+                "OPTION_EVENT_INDEXER_POLL_INTERVAL_MS",
+                "15000",
+            )?,
+            from_block: parse_env(&mut lookup, "OPTION_EVENT_INDEXER_FROM_BLOCK", "0")?,
+            batch_blocks: parse_env(&mut lookup, "OPTION_EVENT_INDEXER_BATCH_BLOCKS", "1000")?,
+            confirmation_blocks: parse_env(
+                &mut lookup,
+                "OPTION_EVENT_INDEXER_CONFIRMATION_BLOCKS",
+                "3",
+            )?,
+            require_rpc: parse_env(&mut lookup, "OPTION_EVENT_INDEXER_REQUIRE_RPC", "true")?,
+            rpc_url: execution.rpc_url.clone(),
+            matching_engine_address: options.matching_engine_address.clone(),
+        };
         let signature_verification_mode =
             parse_env(&mut lookup, "SIGNATURE_VERIFICATION_MODE", "disabled")?;
         let eip712_domain = Eip712Domain {
@@ -380,6 +399,7 @@ impl AppConfig {
         perp_nonce_sync.validate_startup()?;
         option_nonce_sync.validate_startup()?;
         option_confirmation.validate_startup(persistence_enabled)?;
+        option_event_indexer.validate_startup(persistence_enabled)?;
         indexer.validate_startup(persistence_enabled)?;
         reconciliation.validate_startup(persistence_enabled)?;
         confirmation.validate_startup(persistence_enabled)?;
@@ -402,6 +422,7 @@ impl AppConfig {
             perp_nonce_sync,
             option_nonce_sync,
             option_confirmation,
+            option_event_indexer,
             confirmation,
             indexer,
             reconciliation,
@@ -681,6 +702,82 @@ mod tests {
         assert!(error
             .to_string()
             .contains("RPC_URL is required when OPTION_CONFIRMATION_WORKER_ENABLED=true"));
+    }
+
+    #[test]
+    fn option_event_indexer_uses_safe_defaults() {
+        let config = config_from_pairs([("OPTION_EVENT_INDEXER_ENABLED", "false")]).unwrap();
+
+        assert!(!config.option_event_indexer.enabled);
+        assert_eq!(config.option_event_indexer.poll_interval_ms, 15_000);
+        assert_eq!(config.option_event_indexer.from_block, 0);
+        assert_eq!(config.option_event_indexer.batch_blocks, 1_000);
+        assert_eq!(config.option_event_indexer.confirmation_blocks, 3);
+        assert!(config.option_event_indexer.require_rpc);
+    }
+
+    #[test]
+    fn option_event_indexer_parses_overrides() {
+        let config = config_from_pairs([
+            ("OPTION_EVENT_INDEXER_ENABLED", "true"),
+            ("OPTION_EVENT_INDEXER_POLL_INTERVAL_MS", "5000"),
+            ("OPTION_EVENT_INDEXER_FROM_BLOCK", "41856960"),
+            ("OPTION_EVENT_INDEXER_BATCH_BLOCKS", "25"),
+            ("OPTION_EVENT_INDEXER_CONFIRMATION_BLOCKS", "7"),
+            ("OPTION_EVENT_INDEXER_REQUIRE_RPC", "true"),
+            (
+                "OPTION_MATCHING_ENGINE_ADDRESS",
+                "0x00000000000000000000000000000000000000ee",
+            ),
+            ("RPC_URL", "https://example.invalid"),
+            ("PERSISTENCE_ENABLED", "true"),
+            ("DATABASE_URL", "postgres://example.invalid/db"),
+        ])
+        .unwrap();
+        assert!(config.option_event_indexer.enabled);
+        assert_eq!(config.option_event_indexer.poll_interval_ms, 5_000);
+        assert_eq!(config.option_event_indexer.from_block, 41_856_960);
+        assert_eq!(config.option_event_indexer.batch_blocks, 25);
+        assert_eq!(config.option_event_indexer.confirmation_blocks, 7);
+        assert_eq!(
+            config.option_event_indexer.rpc_url.as_deref(),
+            Some("https://example.invalid")
+        );
+    }
+
+    #[test]
+    fn option_event_indexer_rejects_when_persistence_disabled() {
+        let error = config_from_pairs([
+            ("OPTION_EVENT_INDEXER_ENABLED", "true"),
+            ("OPTION_EVENT_INDEXER_REQUIRE_RPC", "false"),
+            (
+                "OPTION_MATCHING_ENGINE_ADDRESS",
+                "0x00000000000000000000000000000000000000ee",
+            ),
+            ("PERSISTENCE_ENABLED", "false"),
+        ])
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("option event indexer requires persistence"));
+    }
+
+    #[test]
+    fn option_event_indexer_rejects_when_rpc_required_but_missing() {
+        let error = config_from_pairs([
+            ("OPTION_EVENT_INDEXER_ENABLED", "true"),
+            ("OPTION_EVENT_INDEXER_REQUIRE_RPC", "true"),
+            (
+                "OPTION_MATCHING_ENGINE_ADDRESS",
+                "0x00000000000000000000000000000000000000ee",
+            ),
+            ("PERSISTENCE_ENABLED", "true"),
+            ("DATABASE_URL", "postgres://example.invalid/db"),
+        ])
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("RPC_URL is required when OPTION_EVENT_INDEXER_ENABLED=true"));
     }
 
     #[test]

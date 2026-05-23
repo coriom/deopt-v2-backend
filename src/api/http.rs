@@ -8,7 +8,8 @@ use crate::indexer::IndexerConfig;
 use crate::mm::{MmGatewayConfig, MmPermissionsConfig, MmPermissionsStore, MmSessionRegistry};
 use crate::nonce_sync::{OptionNonceSyncConfig, PerpNonceSyncConfig};
 use crate::options::{
-    OptionConfirmationConfig, OptionConfirmationTickResult, OptionSeriesStore, OptionsConfig,
+    OptionConfirmationConfig, OptionConfirmationTickResult, OptionEventIndexerConfig,
+    OptionEventIndexerTickResult, OptionSeriesStore, OptionsConfig,
 };
 use crate::reconciliation::ReconciliationConfig;
 use crate::rfq::{RfqConfig, RfqStore};
@@ -33,6 +34,8 @@ pub struct AppState {
     pub option_nonce_sync_config: OptionNonceSyncConfig,
     pub option_confirmation_config: OptionConfirmationConfig,
     pub option_confirmation_last_tick: Arc<Mutex<Option<OptionConfirmationTickResult>>>,
+    pub option_event_indexer_config: OptionEventIndexerConfig,
+    pub option_event_indexer_last_tick: Arc<Mutex<Option<OptionEventIndexerTickResult>>>,
     pub confirmation_config: ConfirmationConfig,
     pub indexer_config: IndexerConfig,
     pub reconciliation_config: ReconciliationConfig,
@@ -198,6 +201,8 @@ impl AppState {
             option_nonce_sync_config,
             option_confirmation_config: OptionConfirmationConfig::disabled(),
             option_confirmation_last_tick: Arc::new(Mutex::new(None)),
+            option_event_indexer_config: OptionEventIndexerConfig::disabled(),
+            option_event_indexer_last_tick: Arc::new(Mutex::new(None)),
             confirmation_config,
             indexer_config,
             reconciliation_config,

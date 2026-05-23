@@ -1,4 +1,5 @@
 pub mod confirmation_worker;
+pub mod event_indexer;
 pub mod execution;
 pub mod series_id;
 pub mod service;
@@ -9,6 +10,12 @@ pub mod types;
 pub use confirmation_worker::{
     spawn_option_confirmation_worker, OptionConfirmationConfig, OptionConfirmationDecision,
     OptionConfirmationOutcome, OptionConfirmationTickResult,
+};
+pub use event_indexer::{
+    default_option_event_counts, index_option_events_with_provider, list_option_execution_events,
+    option_trade_executed_topic0, spawn_option_event_indexer, summarize_option_execution_events,
+    OptionEventIndexerConfig, OptionEventIndexerTickResult, OPTION_EVENT_INDEXER_STATE_ID,
+    OPTION_TRADE_EXECUTED_SIGNATURE,
 };
 
 pub use execution::{
@@ -30,7 +37,8 @@ pub use signing::{
 };
 pub use store::OptionSeriesStore;
 pub use types::{
-    OptionExecutionConfirmationStatus, OptionExecutionGasCheckStatus, OptionExecutionIntent,
+    OptionEventIndexerState, OptionExecutionConfirmationStatus, OptionExecutionEvent,
+    OptionExecutionEventLink, OptionExecutionGasCheckStatus, OptionExecutionIntent,
     OptionExecutionIntentId, OptionExecutionIntentStatus, OptionExecutionReceiptCost,
     OptionExecutionSignatureMode, OptionExecutionSimulationResult, OptionExecutionSimulationStatus,
     OptionExecutionSourceType, OptionExecutionTransaction, OptionFill, OptionFillFilter,

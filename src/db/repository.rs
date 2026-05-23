@@ -16,7 +16,8 @@ use crate::mm::{MmAccountPermissions, MmProductPermission};
 use crate::monitoring::FeeEventLabels;
 use crate::options::store::status_for_remaining;
 use crate::options::{
-    OptionExecutionConfirmationStatus, OptionExecutionGasCheckStatus, OptionExecutionIntent,
+    OptionEventIndexerState, OptionExecutionConfirmationStatus, OptionExecutionEvent,
+    OptionExecutionEventLink, OptionExecutionGasCheckStatus, OptionExecutionIntent,
     OptionExecutionIntentId, OptionExecutionIntentStatus, OptionExecutionReceiptCost,
     OptionExecutionSimulationResult, OptionExecutionSimulationStatus, OptionExecutionSourceType,
     OptionExecutionTransaction, OptionFill, OptionFillId, OptionOrder, OptionOrderId,
@@ -65,6 +66,8 @@ const ADMIN_TABLE_COUNTS: &[(&str, &str)] = &[
         "option_execution_transactions",
         "option_execution_transactions",
     ),
+    ("option_execution_events", "option_execution_events"),
+    ("option_event_indexer_state", "option_event_indexer_state"),
     ("mm_accounts", "mm_accounts"),
     ("mm_market_permissions", "mm_market_permissions"),
     ("fee_events", "fee_events"),
@@ -2433,6 +2436,183 @@ impl PgRepository {
             .collect()
     }
 
+    pub async fn find_option_execution_event_link(
+        &self,
+        tx_hash: &str,
+        onchain_intent_id: Option<&str>,
+    ) -> Result<OptionExecutionEventLink> {
+        if !tx_hash.is_empty() {
+            if let Some(row) = sqlx::query(
+                "SELECT transaction_id, intent_id
+                 FROM option_execution_transactions
+                 WHERE lower(tx_hash) = lower($1)
+                 ORDER BY created_at_ms DESC, transaction_id DESC
+                 LIMIT 1",
+            )
+            .bind(tx_hash)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|error| BackendError::Persistence(error.to_string()))?
+            {
+                let intent_id: String = row_get(&row, "intent_id")?;
+                return Ok(OptionExecutionEventLink {
+                    intent_id: Some(intent_id.parse().map_err(|error| {
+                        BackendError::Persistence(format!(
+                            "invalid option execution intent id: {error}"
+                        ))
+                    })?),
+                    option_execution_transaction_id: Some(row_get(&row, "transaction_id")?),
+                });
+            }
+        }
+
+        if let Some(onchain_intent_id) = onchain_intent_id {
+            if let Some(row) = sqlx::query(
+                "SELECT transaction_id, intent_id
+                 FROM option_execution_transactions
+                 WHERE lower(onchain_intent_id) = lower($1)
+                 ORDER BY created_at_ms DESC, transaction_id DESC
+                 LIMIT 1",
+            )
+            .bind(onchain_intent_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|error| BackendError::Persistence(error.to_string()))?
+            {
+                let intent_id: String = row_get(&row, "intent_id")?;
+                return Ok(OptionExecutionEventLink {
+                    intent_id: Some(intent_id.parse().map_err(|error| {
+                        BackendError::Persistence(format!(
+                            "invalid option execution intent id: {error}"
+                        ))
+                    })?),
+                    option_execution_transaction_id: Some(row_get(&row, "transaction_id")?),
+                });
+            }
+
+            if let Some(row) = sqlx::query(
+                "SELECT intent_id
+                 FROM option_execution_intents
+                 WHERE lower(onchain_intent_id) = lower($1)
+                 ORDER BY created_at_ms DESC, intent_id DESC
+                 LIMIT 1",
+            )
+            .bind(onchain_intent_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|error| BackendError::Persistence(error.to_string()))?
+            {
+                let intent_id: String = row_get(&row, "intent_id")?;
+                return Ok(OptionExecutionEventLink {
+                    intent_id: Some(intent_id.parse().map_err(|error| {
+                        BackendError::Persistence(format!(
+                            "invalid option execution intent id: {error}"
+                        ))
+                    })?),
+                    option_execution_transaction_id: None,
+                });
+            }
+        }
+
+        Ok(OptionExecutionEventLink::default())
+    }
+
+    pub async fn get_option_event_indexer_state(
+        &self,
+        id: &str,
+    ) -> Result<Option<OptionEventIndexerState>> {
+        if !self
+            .admin_table_exists("option_event_indexer_state")
+            .await?
+        {
+            return Ok(None);
+        }
+        let row = sqlx::query(
+            "SELECT id, last_indexed_block, updated_at_ms, last_error
+             FROM option_event_indexer_state
+             WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        row.map(option_event_indexer_state_from_row).transpose()
+    }
+
+    pub async fn persist_option_execution_events_and_cursor(
+        &self,
+        state_id: &str,
+        events: &[OptionExecutionEvent],
+        last_indexed_block: u64,
+        updated_at_ms: TimestampMs,
+    ) -> Result<u64> {
+        let mut tx = self.begin().await?;
+        let mut inserted = 0u64;
+        for event in events {
+            inserted += insert_option_execution_event(&mut tx, event).await?;
+        }
+        upsert_option_event_indexer_state(
+            &mut tx,
+            state_id,
+            last_indexed_block,
+            updated_at_ms,
+            None,
+        )
+        .await?;
+        tx.commit()
+            .await
+            .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        Ok(inserted)
+    }
+
+    pub async fn summarize_option_execution_events(&self) -> Result<Vec<(String, u64)>> {
+        if !self.admin_table_exists("option_execution_events").await? {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            "SELECT event_name, COUNT(*) AS row_count
+             FROM option_execution_events
+             GROUP BY event_name
+             ORDER BY event_name ASC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let event_name: String = row_get(&row, "event_name")?;
+            let count: i64 = row_get(&row, "row_count")?;
+            out.push((event_name, i64_to_u64_persistence("row_count", count)?));
+        }
+        Ok(out)
+    }
+
+    pub async fn list_option_execution_events(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<OptionExecutionEvent>> {
+        if !self.admin_table_exists("option_execution_events").await? {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            "SELECT id, chain_id, contract_address, tx_hash, log_index, block_number, block_hash,
+                    event_name, event_signature, intent_id, onchain_intent_id,
+                    option_execution_transaction_id, buyer, seller, account, option_id,
+                    quantity_contracts, premium_per_contract_native, raw_topics, raw_data,
+                    decoded, created_at_ms, updated_at_ms
+             FROM option_execution_events
+             ORDER BY block_number DESC, log_index DESC, id DESC
+             LIMIT $1",
+        )
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        rows.into_iter()
+            .map(option_execution_event_from_row)
+            .collect()
+    }
+
     pub async fn insert_option_rfq(&self, rfq: &OptionRfqRequest) -> Result<()> {
         sqlx::query(
             "INSERT INTO option_rfqs (
@@ -3180,6 +3360,78 @@ async fn upsert_indexer_cursor(
     Ok(())
 }
 
+async fn insert_option_execution_event(
+    tx: &mut Transaction<'_, Postgres>,
+    event: &OptionExecutionEvent,
+) -> Result<u64> {
+    let result = sqlx::query(
+        "INSERT INTO option_execution_events (
+            id, chain_id, contract_address, tx_hash, log_index, block_number, block_hash,
+            event_name, event_signature, intent_id, onchain_intent_id,
+            option_execution_transaction_id, buyer, seller, account, option_id,
+            quantity_contracts, premium_per_contract_native, raw_topics, raw_data,
+            decoded, created_at_ms, updated_at_ms
+        ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+            $15, $16, $17, $18, $19, $20, $21, $22, $23
+        )
+        ON CONFLICT (chain_id, tx_hash, log_index) DO NOTHING",
+    )
+    .bind(event.id)
+    .bind(u64_to_i64("chain_id", event.chain_id)?)
+    .bind(&event.contract_address)
+    .bind(&event.tx_hash)
+    .bind(u64_to_i64("log_index", event.log_index)?)
+    .bind(u64_to_i64("block_number", event.block_number)?)
+    .bind(&event.block_hash)
+    .bind(&event.event_name)
+    .bind(&event.event_signature)
+    .bind(event.intent_id.map(|id| id.to_string()))
+    .bind(&event.onchain_intent_id)
+    .bind(&event.option_execution_transaction_id)
+    .bind(&event.buyer)
+    .bind(&event.seller)
+    .bind(&event.account)
+    .bind(&event.option_id)
+    .bind(&event.quantity_contracts)
+    .bind(&event.premium_per_contract_native)
+    .bind(&event.raw_topics)
+    .bind(&event.raw_data)
+    .bind(&event.decoded)
+    .bind(timestamp_to_i64(event.created_at_ms))
+    .bind(timestamp_to_i64(event.updated_at_ms))
+    .execute(&mut **tx)
+    .await
+    .map_err(|error| BackendError::Persistence(error.to_string()))?;
+    Ok(result.rows_affected())
+}
+
+async fn upsert_option_event_indexer_state(
+    tx: &mut Transaction<'_, Postgres>,
+    id: &str,
+    last_indexed_block: u64,
+    updated_at_ms: i64,
+    last_error: Option<&str>,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO option_event_indexer_state (
+            id, last_indexed_block, updated_at_ms, last_error
+        ) VALUES ($1, $2, $3, $4)
+        ON CONFLICT (id) DO UPDATE
+        SET last_indexed_block = EXCLUDED.last_indexed_block,
+            updated_at_ms = EXCLUDED.updated_at_ms,
+            last_error = EXCLUDED.last_error",
+    )
+    .bind(id)
+    .bind(u64_to_i64("last_indexed_block", last_indexed_block)?)
+    .bind(timestamp_to_i64(updated_at_ms))
+    .bind(last_error)
+    .execute(&mut **tx)
+    .await
+    .map_err(|error| BackendError::Persistence(error.to_string()))?;
+    Ok(())
+}
+
 async fn insert_trade(tx: &mut Transaction<'_, Postgres>, trade: &DbTrade) -> Result<()> {
     sqlx::query(
         "INSERT INTO trades (
@@ -3748,6 +4000,56 @@ fn option_execution_transaction_from_row(row: PgRow) -> Result<OptionExecutionTr
             .map(|value| i64_to_u64_persistence("receipt_transaction_index", value))
             .transpose()?,
         receipt_observed_at_ms: row_get(&row, "receipt_observed_at_ms")?,
+        created_at_ms: row_get(&row, "created_at_ms")?,
+        updated_at_ms: row_get(&row, "updated_at_ms")?,
+    })
+}
+
+fn option_event_indexer_state_from_row(row: PgRow) -> Result<OptionEventIndexerState> {
+    let last_indexed_block: i64 = row_get(&row, "last_indexed_block")?;
+    Ok(OptionEventIndexerState {
+        id: row_get(&row, "id")?,
+        last_indexed_block: i64_to_u64_persistence("last_indexed_block", last_indexed_block)?,
+        updated_at_ms: row_get(&row, "updated_at_ms")?,
+        last_error: row_get(&row, "last_error")?,
+    })
+}
+
+fn option_execution_event_from_row(row: PgRow) -> Result<OptionExecutionEvent> {
+    let chain_id: i64 = row_get(&row, "chain_id")?;
+    let log_index: i64 = row_get(&row, "log_index")?;
+    let block_number: i64 = row_get(&row, "block_number")?;
+    let intent_id: Option<String> = row_get(&row, "intent_id")?;
+    Ok(OptionExecutionEvent {
+        id: row_get(&row, "id")?,
+        chain_id: i64_to_u64_persistence("chain_id", chain_id)?,
+        contract_address: row_get(&row, "contract_address")?,
+        tx_hash: row_get(&row, "tx_hash")?,
+        log_index: i64_to_u64_persistence("log_index", log_index)?,
+        block_number: i64_to_u64_persistence("block_number", block_number)?,
+        block_hash: row_get(&row, "block_hash")?,
+        event_name: row_get(&row, "event_name")?,
+        event_signature: row_get(&row, "event_signature")?,
+        intent_id: intent_id
+            .map(|value| {
+                value.parse().map_err(|error| {
+                    BackendError::Persistence(format!(
+                        "invalid option execution event intent_id: {error}"
+                    ))
+                })
+            })
+            .transpose()?,
+        onchain_intent_id: row_get(&row, "onchain_intent_id")?,
+        option_execution_transaction_id: row_get(&row, "option_execution_transaction_id")?,
+        buyer: row_get(&row, "buyer")?,
+        seller: row_get(&row, "seller")?,
+        account: row_get(&row, "account")?,
+        option_id: row_get(&row, "option_id")?,
+        quantity_contracts: row_get(&row, "quantity_contracts")?,
+        premium_per_contract_native: row_get(&row, "premium_per_contract_native")?,
+        raw_topics: row_get(&row, "raw_topics")?,
+        raw_data: row_get(&row, "raw_data")?,
+        decoded: row_get(&row, "decoded")?,
         created_at_ms: row_get(&row, "created_at_ms")?,
         updated_at_ms: row_get(&row, "updated_at_ms")?,
     })
