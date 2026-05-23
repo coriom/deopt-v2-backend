@@ -64,6 +64,7 @@ use crate::options::{
     option_execution_intent_id_to_hex_bytes32, option_rfq_id_to_hex_bytes32,
     option_series_id_to_hex_bytes32,
     summarize_option_execution_events as summarize_option_execution_events_service,
+    summarize_option_execution_events_by_contract_address as summarize_option_execution_events_by_contract_address_service,
     OptionExecutionIntent, OptionExecutionIntentId, OptionExecutionIntentStatus,
     OptionExecutionSimulationResult, OptionExecutionSimulationStatus, OptionFill, OptionFillFilter,
     OptionFillId, OptionOrder, OptionOrderFilter, OptionOrderStatus, OptionOrderbookSnapshot,
@@ -508,7 +509,12 @@ async fn admin_config(
                 "confirmation_blocks": state.option_event_indexer_config.confirmation_blocks,
                 "require_rpc": state.option_event_indexer_config.require_rpc,
                 "rpc_configured": state.option_event_indexer_config.rpc_url.is_some(),
-                "target_contract": state.option_event_indexer_config.matching_engine_address
+                "target_contract": state.option_event_indexer_config.matching_engine_address,
+                "emitter_contracts": state.option_event_indexer_config.emitter_contracts(),
+                "matching_engine_address": state.option_event_indexer_config.matching_engine_address,
+                "margin_engine_address": state.option_event_indexer_config.margin_engine_address,
+                "collateral_vault_address": state.option_event_indexer_config.collateral_vault_address,
+                "fees_manager_address": state.option_event_indexer_config.fees_manager_address
             }
         }
     })))
@@ -590,7 +596,9 @@ async fn admin_option_events(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     ensure_admin_access(&state, &headers)?;
-    let counts = summarize_option_execution_events_service(&state).await?;
+    let counts_by_event_name = summarize_option_execution_events_service(&state).await?;
+    let counts_by_contract_address =
+        summarize_option_execution_events_by_contract_address_service(&state).await?;
     let recent = list_option_execution_events_service(&state, 20).await?;
     let latest_tick = state
         .option_event_indexer_last_tick
@@ -623,6 +631,9 @@ async fn admin_option_events(
         "require_rpc": state.option_event_indexer_config.require_rpc,
         "rpc_configured": state.option_event_indexer_config.rpc_url.is_some(),
         "target_contract": state.option_event_indexer_config.matching_engine_address,
+        "emitter_contracts": state.option_event_indexer_config.emitter_contracts(),
+        "counts_by_event_name": counts_by_event_name.clone(),
+        "counts_by_contract_address": counts_by_contract_address,
         "last_indexed_block": last_indexed_block,
         "last_error": last_error,
         "config": {
@@ -633,10 +644,15 @@ async fn admin_option_events(
             "confirmation_blocks": state.option_event_indexer_config.confirmation_blocks,
             "require_rpc": state.option_event_indexer_config.require_rpc,
             "rpc_configured": state.option_event_indexer_config.rpc_url.is_some(),
-            "target_contract": state.option_event_indexer_config.matching_engine_address
+            "target_contract": state.option_event_indexer_config.matching_engine_address,
+            "emitter_contracts": state.option_event_indexer_config.emitter_contracts(),
+            "matching_engine_address": state.option_event_indexer_config.matching_engine_address,
+            "margin_engine_address": state.option_event_indexer_config.margin_engine_address,
+            "collateral_vault_address": state.option_event_indexer_config.collateral_vault_address,
+            "fees_manager_address": state.option_event_indexer_config.fees_manager_address
         },
         "latest_tick": latest_tick,
-        "counts": counts,
+        "counts": counts_by_event_name,
         "recent": recent
     })))
 }
@@ -4877,6 +4893,11 @@ mod tests {
             require_rpc: true,
             rpc_url: Some("https://rpc.example/redacted-key".to_string()),
             matching_engine_address: AccountId::new("0x00000000000000000000000000000000000000ee"),
+            margin_engine_address: AccountId::new("0x00000000000000000000000000000000000000aa"),
+            collateral_vault_address: AccountId::new("0x00000000000000000000000000000000000000bb"),
+            fees_manager_address: Some(AccountId::new(
+                "0x00000000000000000000000000000000000000cc",
+            )),
         };
         let event = route_option_execution_event();
         state
@@ -4921,6 +4942,16 @@ mod tests {
         assert_eq!(json["last_indexed_block"], 25);
         assert_eq!(json["counts"]["OptionTradeExecuted"], 1);
         assert_eq!(json["counts"]["OptionPositionUpdated"], 0);
+        assert_eq!(json["counts_by_event_name"]["OptionTradeExecuted"], 1);
+        assert_eq!(
+            json["counts_by_contract_address"]["0x00000000000000000000000000000000000000ee"],
+            1
+        );
+        assert_eq!(json["emitter_contracts"].as_array().unwrap().len(), 4);
+        assert_eq!(
+            json["config"]["margin_engine_address"],
+            "0x00000000000000000000000000000000000000aa"
+        );
         assert_eq!(json["latest_tick"]["to_block"], 25);
         assert_eq!(json["recent"].as_array().unwrap().len(), 1);
     }

@@ -14,6 +14,7 @@ pub use confirmation_worker::{
 pub use event_indexer::{
     default_option_event_counts, index_option_events_with_provider, list_option_execution_events,
     option_trade_executed_topic0, spawn_option_event_indexer, summarize_option_execution_events,
+    summarize_option_execution_events_by_contract_address, OptionEventEmitterContract,
     OptionEventIndexerConfig, OptionEventIndexerTickResult, OPTION_EVENT_INDEXER_STATE_ID,
     OPTION_TRADE_EXECUTED_SIGNATURE,
 };

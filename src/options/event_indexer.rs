@@ -21,6 +21,19 @@ pub const MARGIN_TRADE_EXECUTED_SIGNATURE: &str =
 pub const TRADING_FEE_CHARGED_SIGNATURE: &str =
     "TradingFeeCharged(address,address,address,uint256,bool,uint256,uint256,uint256,uint256,uint256,bool)";
 pub const INTERNAL_TRANSFER_SIGNATURE: &str = "InternalTransfer(address,address,address,uint256)";
+pub const COLLATERAL_VAULT_DEPOSITED_SIGNATURE: &str = "Deposited(address,address,uint256)";
+pub const COLLATERAL_VAULT_WITHDRAWN_SIGNATURE: &str = "Withdrawn(address,address,uint256)";
+pub const COLLATERAL_VAULT_SYNCED_SIGNATURE: &str = "Synced(address,address,uint256)";
+pub const MARGIN_COLLATERAL_DEPOSITED_SIGNATURE: &str =
+    "CollateralDeposited(address,address,uint256)";
+pub const MARGIN_COLLATERAL_WITHDRAWN_SIGNATURE: &str =
+    "CollateralWithdrawn(address,address,uint256,uint256)";
+pub const FEE_BPS_CAP_SET_SIGNATURE: &str = "FeeBpsCapSet(uint16,uint16)";
+pub const DEFAULT_FEES_SET_SIGNATURE: &str = "DefaultFeesSet(uint16,uint16,uint16,uint16)";
+pub const MERKLE_ROOT_SET_SIGNATURE: &str = "MerkleRootSet(bytes32,bytes32,uint64)";
+pub const TIER_CLAIMED_SIGNATURE: &str = "TierClaimed(address,uint8,uint64,uint64)";
+pub const OVERRIDE_SET_SIGNATURE: &str =
+    "OverrideSet(address,uint16,uint16,uint16,uint16,uint64,bool)";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OptionEventIndexerConfig {
@@ -32,6 +45,15 @@ pub struct OptionEventIndexerConfig {
     pub require_rpc: bool,
     pub rpc_url: Option<String>,
     pub matching_engine_address: AccountId,
+    pub margin_engine_address: AccountId,
+    pub collateral_vault_address: AccountId,
+    pub fees_manager_address: Option<AccountId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct OptionEventEmitterContract {
+    pub role: String,
+    pub contract_address: AccountId,
 }
 
 impl OptionEventIndexerConfig {
@@ -45,7 +67,29 @@ impl OptionEventIndexerConfig {
             require_rpc: true,
             rpc_url: None,
             matching_engine_address: AccountId::new(""),
+            margin_engine_address: AccountId::new(""),
+            collateral_vault_address: AccountId::new(""),
+            fees_manager_address: None,
         }
+    }
+
+    pub fn emitter_contracts(&self) -> Vec<OptionEventEmitterContract> {
+        let mut contracts = Vec::new();
+        push_emitter_contract(
+            &mut contracts,
+            "matching_engine",
+            &self.matching_engine_address,
+        );
+        push_emitter_contract(&mut contracts, "margin_engine", &self.margin_engine_address);
+        push_emitter_contract(
+            &mut contracts,
+            "collateral_vault",
+            &self.collateral_vault_address,
+        );
+        if let Some(address) = self.fees_manager_address.as_ref() {
+            push_emitter_contract(&mut contracts, "fees_manager", address);
+        }
+        contracts
     }
 
     pub fn validate_startup(&self, persistence_enabled: bool) -> Result<()> {
@@ -72,23 +116,65 @@ impl OptionEventIndexerConfig {
                 "RPC_URL is required when OPTION_EVENT_INDEXER_ENABLED=true and OPTION_EVENT_INDEXER_REQUIRE_RPC=true".to_string(),
             ));
         }
-        parse_evm_address(&self.matching_engine_address).map_err(|_| {
-            BackendError::Config(
-                "OPTION_MATCHING_ENGINE_ADDRESS must be a valid address when OPTION_EVENT_INDEXER_ENABLED=true".to_string(),
-            )
-        })?;
-        if self
-            .matching_engine_address
-            .0
-            .eq_ignore_ascii_case("0x0000000000000000000000000000000000000000")
-        {
-            return Err(BackendError::Config(
-                "OPTION_MATCHING_ENGINE_ADDRESS must be nonzero when OPTION_EVENT_INDEXER_ENABLED=true"
-                    .to_string(),
-            ));
+        validate_required_emitter_address(
+            "OPTION_EVENT_INDEXER_MATCHING_ENGINE_ADDRESS",
+            &self.matching_engine_address,
+        )?;
+        validate_required_emitter_address(
+            "OPTION_EVENT_INDEXER_MARGIN_ENGINE_ADDRESS",
+            &self.margin_engine_address,
+        )?;
+        validate_required_emitter_address(
+            "OPTION_EVENT_INDEXER_COLLATERAL_VAULT_ADDRESS",
+            &self.collateral_vault_address,
+        )?;
+        if let Some(address) = self.fees_manager_address.as_ref() {
+            validate_optional_emitter_address(
+                "OPTION_EVENT_INDEXER_FEES_MANAGER_ADDRESS",
+                address,
+            )?;
         }
         Ok(())
     }
+}
+
+fn push_emitter_contract(
+    contracts: &mut Vec<OptionEventEmitterContract>,
+    role: &str,
+    address: &AccountId,
+) {
+    if !address.0.trim().is_empty() {
+        contracts.push(OptionEventEmitterContract {
+            role: role.to_string(),
+            contract_address: AccountId::new(address.0.to_ascii_lowercase()),
+        });
+    }
+}
+
+fn validate_required_emitter_address(env_key: &str, address: &AccountId) -> Result<()> {
+    if address.0.trim().is_empty() {
+        return Err(BackendError::Config(format!(
+            "{env_key} is required when OPTION_EVENT_INDEXER_ENABLED=true"
+        )));
+    }
+    validate_optional_emitter_address(env_key, address)
+}
+
+fn validate_optional_emitter_address(env_key: &str, address: &AccountId) -> Result<()> {
+    parse_evm_address(address).map_err(|_| {
+        BackendError::Config(format!(
+            "{env_key} must be a valid address when OPTION_EVENT_INDEXER_ENABLED=true"
+        ))
+    })?;
+    if address
+        .0
+        .eq_ignore_ascii_case("0x0000000000000000000000000000000000000000")
+    {
+        return Err(BackendError::Config(format!(
+            "{env_key} must be nonzero when OPTION_EVENT_INDEXER_ENABLED=true"
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -124,11 +210,90 @@ pub fn internal_transfer_topic0() -> String {
     hex_0x(&keccak256(INTERNAL_TRANSFER_SIGNATURE.as_bytes()))
 }
 
+pub fn collateral_vault_deposited_topic0() -> String {
+    hex_0x(&keccak256(COLLATERAL_VAULT_DEPOSITED_SIGNATURE.as_bytes()))
+}
+
+pub fn collateral_vault_withdrawn_topic0() -> String {
+    hex_0x(&keccak256(COLLATERAL_VAULT_WITHDRAWN_SIGNATURE.as_bytes()))
+}
+
+pub fn collateral_vault_synced_topic0() -> String {
+    hex_0x(&keccak256(COLLATERAL_VAULT_SYNCED_SIGNATURE.as_bytes()))
+}
+
+pub fn margin_collateral_deposited_topic0() -> String {
+    hex_0x(&keccak256(MARGIN_COLLATERAL_DEPOSITED_SIGNATURE.as_bytes()))
+}
+
+pub fn margin_collateral_withdrawn_topic0() -> String {
+    hex_0x(&keccak256(MARGIN_COLLATERAL_WITHDRAWN_SIGNATURE.as_bytes()))
+}
+
+pub fn fee_bps_cap_set_topic0() -> String {
+    hex_0x(&keccak256(FEE_BPS_CAP_SET_SIGNATURE.as_bytes()))
+}
+
+pub fn default_fees_set_topic0() -> String {
+    hex_0x(&keccak256(DEFAULT_FEES_SET_SIGNATURE.as_bytes()))
+}
+
+pub fn merkle_root_set_topic0() -> String {
+    hex_0x(&keccak256(MERKLE_ROOT_SET_SIGNATURE.as_bytes()))
+}
+
+pub fn tier_claimed_topic0() -> String {
+    hex_0x(&keccak256(TIER_CLAIMED_SIGNATURE.as_bytes()))
+}
+
+pub fn override_set_topic0() -> String {
+    hex_0x(&keccak256(OVERRIDE_SET_SIGNATURE.as_bytes()))
+}
+
 pub fn default_option_event_counts() -> BTreeMap<String, u64> {
     BTreeMap::from([
+        ("CollateralDeposited".to_string(), 0),
+        ("CollateralWithdrawn".to_string(), 0),
+        ("DefaultFeesSet".to_string(), 0),
+        ("Deposited".to_string(), 0),
+        ("FeeBpsCapSet".to_string(), 0),
+        ("InternalTransfer".to_string(), 0),
+        ("MerkleRootSet".to_string(), 0),
         ("OptionPositionUpdated".to_string(), 0),
         ("OptionTradeExecuted".to_string(), 0),
+        ("OverrideSet".to_string(), 0),
+        ("TierClaimed".to_string(), 0),
+        ("TradeExecuted".to_string(), 0),
+        ("TradingFeeCharged".to_string(), 0),
+        ("Synced".to_string(), 0),
+        ("Withdrawn".to_string(), 0),
     ])
+}
+
+fn event_topics_for_emitter_role(role: &str) -> Vec<String> {
+    match role {
+        "matching_engine" => vec![option_trade_executed_topic0()],
+        "margin_engine" => vec![
+            margin_trade_executed_topic0(),
+            trading_fee_charged_topic0(),
+            margin_collateral_deposited_topic0(),
+            margin_collateral_withdrawn_topic0(),
+        ],
+        "collateral_vault" => vec![
+            internal_transfer_topic0(),
+            collateral_vault_deposited_topic0(),
+            collateral_vault_withdrawn_topic0(),
+            collateral_vault_synced_topic0(),
+        ],
+        "fees_manager" => vec![
+            fee_bps_cap_set_topic0(),
+            default_fees_set_topic0(),
+            merkle_root_set_topic0(),
+            tier_claimed_topic0(),
+            override_set_topic0(),
+        ],
+        _ => Vec::new(),
+    }
 }
 
 pub async fn index_option_events_with_provider<P>(
@@ -191,22 +356,19 @@ where
         .saturating_sub(1);
     let to_block = safe_head.min(range_end);
     let mut logs = Vec::new();
-    for topic0 in [
-        option_trade_executed_topic0(),
-        margin_trade_executed_topic0(),
-        trading_fee_charged_topic0(),
-        internal_transfer_topic0(),
-    ] {
-        logs.extend(
-            provider
-                .get_logs(EthGetLogsFilter {
-                    from_block: hex_quantity(from_block),
-                    to_block: hex_quantity(to_block),
-                    address: config.matching_engine_address.0.clone(),
-                    topics: vec![topic0],
-                })
-                .await?,
-        );
+    for emitter in config.emitter_contracts() {
+        for topic0 in event_topics_for_emitter_role(&emitter.role) {
+            logs.extend(
+                provider
+                    .get_logs(EthGetLogsFilter {
+                        from_block: hex_quantity(from_block),
+                        to_block: hex_quantity(to_block),
+                        address: emitter.contract_address.0.clone(),
+                        topics: vec![topic0],
+                    })
+                    .await?,
+            );
+        }
     }
     let logs_found = logs.len();
     let mut events = Vec::with_capacity(logs.len());
@@ -276,6 +438,26 @@ pub async fn summarize_option_execution_events(state: &AppState) -> Result<BTree
         counts.insert(event_name, count);
     }
     Ok(counts)
+}
+
+pub async fn summarize_option_execution_events_by_contract_address(
+    state: &AppState,
+) -> Result<BTreeMap<String, u64>> {
+    let stored = if let Some(repository) = state.repository.clone() {
+        repository
+            .summarize_option_execution_events_by_contract_address()
+            .await?
+    } else {
+        state
+            .options_store
+            .lock()
+            .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?
+            .summarize_option_execution_events_by_contract_address()
+    };
+    Ok(stored
+        .into_iter()
+        .map(|(address, count)| (address.to_ascii_lowercase(), count))
+        .collect())
 }
 
 pub async fn get_option_event_indexer_state(
@@ -362,6 +544,57 @@ pub fn decode_option_execution_event(
     }
     if topic0.eq_ignore_ascii_case(&internal_transfer_topic0()) {
         return decode_internal_transfer_log(log, chain_id).map(Some);
+    }
+    if topic0.eq_ignore_ascii_case(&collateral_vault_deposited_topic0()) {
+        return decode_vault_balance_log(
+            log,
+            chain_id,
+            "Deposited",
+            COLLATERAL_VAULT_DEPOSITED_SIGNATURE,
+            "amount",
+        )
+        .map(Some);
+    }
+    if topic0.eq_ignore_ascii_case(&collateral_vault_withdrawn_topic0()) {
+        return decode_vault_balance_log(
+            log,
+            chain_id,
+            "Withdrawn",
+            COLLATERAL_VAULT_WITHDRAWN_SIGNATURE,
+            "amount",
+        )
+        .map(Some);
+    }
+    if topic0.eq_ignore_ascii_case(&collateral_vault_synced_topic0()) {
+        return decode_vault_balance_log(
+            log,
+            chain_id,
+            "Synced",
+            COLLATERAL_VAULT_SYNCED_SIGNATURE,
+            "newBalance",
+        )
+        .map(Some);
+    }
+    if topic0.eq_ignore_ascii_case(&margin_collateral_deposited_topic0()) {
+        return decode_margin_collateral_deposited_log(log, chain_id).map(Some);
+    }
+    if topic0.eq_ignore_ascii_case(&margin_collateral_withdrawn_topic0()) {
+        return decode_margin_collateral_withdrawn_log(log, chain_id).map(Some);
+    }
+    if topic0.eq_ignore_ascii_case(&fee_bps_cap_set_topic0()) {
+        return decode_fee_bps_cap_set_log(log, chain_id).map(Some);
+    }
+    if topic0.eq_ignore_ascii_case(&default_fees_set_topic0()) {
+        return decode_default_fees_set_log(log, chain_id).map(Some);
+    }
+    if topic0.eq_ignore_ascii_case(&merkle_root_set_topic0()) {
+        return decode_merkle_root_set_log(log, chain_id).map(Some);
+    }
+    if topic0.eq_ignore_ascii_case(&tier_claimed_topic0()) {
+        return decode_tier_claimed_log(log, chain_id).map(Some);
+    }
+    if topic0.eq_ignore_ascii_case(&override_set_topic0()) {
+        return decode_override_set_log(log, chain_id).map(Some);
     }
     Ok(None)
 }
@@ -618,6 +851,356 @@ fn decode_internal_transfer_log(log: &EthLog, chain_id: u64) -> Result<OptionExe
     })
 }
 
+fn decode_vault_balance_log(
+    log: &EthLog,
+    chain_id: u64,
+    event_name: &str,
+    event_signature: &str,
+    amount_field: &str,
+) -> Result<OptionExecutionEvent> {
+    if log.topics.len() != 3 {
+        return Err(BackendError::Indexer(format!(
+            "{event_name} log must have three topics"
+        )));
+    }
+    let data = decode_hex_bytes(&log.data)?;
+    if data.len() != 32 {
+        return Err(BackendError::Indexer(format!(
+            "{event_name} data must contain one ABI word"
+        )));
+    }
+    let user = decode_topic_address(&log.topics[1])?;
+    let token = decode_topic_address(&log.topics[2])?;
+    let amount = decode_data_u256(&data, 0)?.to_string();
+    let mut decoded = serde_json::json!({
+        "user": user,
+        "token": token
+    });
+    if let Some(object) = decoded.as_object_mut() {
+        object.insert(
+            amount_field.to_string(),
+            serde_json::Value::String(amount.clone()),
+        );
+    }
+    option_event_from_decoded_fields(
+        log,
+        chain_id,
+        event_name,
+        event_signature,
+        None,
+        None,
+        Some(user.clone()),
+        None,
+        None,
+        Some(amount.clone()),
+        decoded,
+    )
+}
+
+fn decode_margin_collateral_deposited_log(
+    log: &EthLog,
+    chain_id: u64,
+) -> Result<OptionExecutionEvent> {
+    if log.topics.len() != 3 {
+        return Err(BackendError::Indexer(
+            "CollateralDeposited log must have three topics".to_string(),
+        ));
+    }
+    let data = decode_hex_bytes(&log.data)?;
+    if data.len() != 32 {
+        return Err(BackendError::Indexer(
+            "CollateralDeposited data must contain one ABI word".to_string(),
+        ));
+    }
+    let trader = decode_topic_address(&log.topics[1])?;
+    let token = decode_topic_address(&log.topics[2])?;
+    let amount = decode_data_u256(&data, 0)?.to_string();
+    option_event_from_decoded_fields(
+        log,
+        chain_id,
+        "CollateralDeposited",
+        MARGIN_COLLATERAL_DEPOSITED_SIGNATURE,
+        None,
+        None,
+        Some(trader.clone()),
+        None,
+        None,
+        Some(amount.clone()),
+        serde_json::json!({
+            "trader": trader,
+            "token": token,
+            "amount": amount
+        }),
+    )
+}
+
+fn decode_margin_collateral_withdrawn_log(
+    log: &EthLog,
+    chain_id: u64,
+) -> Result<OptionExecutionEvent> {
+    if log.topics.len() != 3 {
+        return Err(BackendError::Indexer(
+            "CollateralWithdrawn log must have three topics".to_string(),
+        ));
+    }
+    let data = decode_hex_bytes(&log.data)?;
+    if data.len() != 32 * 2 {
+        return Err(BackendError::Indexer(
+            "CollateralWithdrawn data must contain two ABI words".to_string(),
+        ));
+    }
+    let trader = decode_topic_address(&log.topics[1])?;
+    let token = decode_topic_address(&log.topics[2])?;
+    let amount = decode_data_u256(&data, 0)?.to_string();
+    let margin_ratio_after_bps = decode_data_u256(&data, 1)?.to_string();
+    option_event_from_decoded_fields(
+        log,
+        chain_id,
+        "CollateralWithdrawn",
+        MARGIN_COLLATERAL_WITHDRAWN_SIGNATURE,
+        None,
+        None,
+        Some(trader.clone()),
+        None,
+        None,
+        Some(amount.clone()),
+        serde_json::json!({
+            "trader": trader,
+            "token": token,
+            "amount": amount,
+            "marginRatioAfterBps": margin_ratio_after_bps
+        }),
+    )
+}
+
+fn decode_fee_bps_cap_set_log(log: &EthLog, chain_id: u64) -> Result<OptionExecutionEvent> {
+    if log.topics.len() != 1 {
+        return Err(BackendError::Indexer(
+            "FeeBpsCapSet log must have one topic".to_string(),
+        ));
+    }
+    let data = decode_hex_bytes(&log.data)?;
+    if data.len() != 32 * 2 {
+        return Err(BackendError::Indexer(
+            "FeeBpsCapSet data must contain two ABI words".to_string(),
+        ));
+    }
+    let old_cap = decode_data_u256(&data, 0)?.to_string();
+    let new_cap = decode_data_u256(&data, 1)?.to_string();
+    option_event_from_decoded_fields(
+        log,
+        chain_id,
+        "FeeBpsCapSet",
+        FEE_BPS_CAP_SET_SIGNATURE,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        serde_json::json!({
+            "oldCap": old_cap,
+            "newCap": new_cap
+        }),
+    )
+}
+
+fn decode_default_fees_set_log(log: &EthLog, chain_id: u64) -> Result<OptionExecutionEvent> {
+    if log.topics.len() != 1 {
+        return Err(BackendError::Indexer(
+            "DefaultFeesSet log must have one topic".to_string(),
+        ));
+    }
+    let data = decode_hex_bytes(&log.data)?;
+    if data.len() != 32 * 4 {
+        return Err(BackendError::Indexer(
+            "DefaultFeesSet data must contain four ABI words".to_string(),
+        ));
+    }
+    let maker_notional_fee_bps = decode_data_u256(&data, 0)?.to_string();
+    let maker_premium_cap_bps = decode_data_u256(&data, 1)?.to_string();
+    let taker_notional_fee_bps = decode_data_u256(&data, 2)?.to_string();
+    let taker_premium_cap_bps = decode_data_u256(&data, 3)?.to_string();
+    option_event_from_decoded_fields(
+        log,
+        chain_id,
+        "DefaultFeesSet",
+        DEFAULT_FEES_SET_SIGNATURE,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        serde_json::json!({
+            "makerNotionalFeeBps": maker_notional_fee_bps,
+            "makerPremiumCapBps": maker_premium_cap_bps,
+            "takerNotionalFeeBps": taker_notional_fee_bps,
+            "takerPremiumCapBps": taker_premium_cap_bps
+        }),
+    )
+}
+
+fn decode_merkle_root_set_log(log: &EthLog, chain_id: u64) -> Result<OptionExecutionEvent> {
+    if log.topics.len() != 4 {
+        return Err(BackendError::Indexer(
+            "MerkleRootSet log must have four topics".to_string(),
+        ));
+    }
+    let data = decode_hex_bytes(&log.data)?;
+    if !data.is_empty() {
+        return Err(BackendError::Indexer(
+            "MerkleRootSet data must be empty".to_string(),
+        ));
+    }
+    let old_root = decode_topic_bytes32(&log.topics[1])?;
+    let new_root = decode_topic_bytes32(&log.topics[2])?;
+    let new_epoch = decode_topic_u256(&log.topics[3])?.to_string();
+    option_event_from_decoded_fields(
+        log,
+        chain_id,
+        "MerkleRootSet",
+        MERKLE_ROOT_SET_SIGNATURE,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        serde_json::json!({
+            "oldRoot": old_root,
+            "newRoot": new_root,
+            "newEpoch": new_epoch
+        }),
+    )
+}
+
+fn decode_tier_claimed_log(log: &EthLog, chain_id: u64) -> Result<OptionExecutionEvent> {
+    if log.topics.len() != 2 {
+        return Err(BackendError::Indexer(
+            "TierClaimed log must have two topics".to_string(),
+        ));
+    }
+    let data = decode_hex_bytes(&log.data)?;
+    if data.len() != 32 * 3 {
+        return Err(BackendError::Indexer(
+            "TierClaimed data must contain three ABI words".to_string(),
+        ));
+    }
+    let trader = decode_topic_address(&log.topics[1])?;
+    let tier_class = decode_data_u256(&data, 0)?.to_string();
+    let expiry = decode_data_u256(&data, 1)?.to_string();
+    let epoch = decode_data_u256(&data, 2)?.to_string();
+    option_event_from_decoded_fields(
+        log,
+        chain_id,
+        "TierClaimed",
+        TIER_CLAIMED_SIGNATURE,
+        None,
+        None,
+        Some(trader.clone()),
+        None,
+        None,
+        None,
+        serde_json::json!({
+            "trader": trader,
+            "tierClass": tier_class,
+            "expiry": expiry,
+            "epoch": epoch
+        }),
+    )
+}
+
+fn decode_override_set_log(log: &EthLog, chain_id: u64) -> Result<OptionExecutionEvent> {
+    if log.topics.len() != 2 {
+        return Err(BackendError::Indexer(
+            "OverrideSet log must have two topics".to_string(),
+        ));
+    }
+    let data = decode_hex_bytes(&log.data)?;
+    if data.len() != 32 * 6 {
+        return Err(BackendError::Indexer(
+            "OverrideSet data must contain six ABI words".to_string(),
+        ));
+    }
+    let trader = decode_topic_address(&log.topics[1])?;
+    let maker_notional_fee_bps = decode_data_u256(&data, 0)?.to_string();
+    let maker_premium_cap_bps = decode_data_u256(&data, 1)?.to_string();
+    let taker_notional_fee_bps = decode_data_u256(&data, 2)?.to_string();
+    let taker_premium_cap_bps = decode_data_u256(&data, 3)?.to_string();
+    let expiry = decode_data_u256(&data, 4)?.to_string();
+    let enabled = decode_bool(&data, 5)?;
+    option_event_from_decoded_fields(
+        log,
+        chain_id,
+        "OverrideSet",
+        OVERRIDE_SET_SIGNATURE,
+        None,
+        None,
+        Some(trader.clone()),
+        None,
+        None,
+        None,
+        serde_json::json!({
+            "trader": trader,
+            "makerNotionalFeeBps": maker_notional_fee_bps,
+            "makerPremiumCapBps": maker_premium_cap_bps,
+            "takerNotionalFeeBps": taker_notional_fee_bps,
+            "takerPremiumCapBps": taker_premium_cap_bps,
+            "expiry": expiry,
+            "enabled": enabled
+        }),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn option_event_from_decoded_fields(
+    log: &EthLog,
+    chain_id: u64,
+    event_name: &str,
+    event_signature: &str,
+    buyer: Option<String>,
+    seller: Option<String>,
+    account: Option<String>,
+    option_id: Option<String>,
+    quantity_contracts: Option<String>,
+    premium_per_contract_native: Option<String>,
+    decoded: serde_json::Value,
+) -> Result<OptionExecutionEvent> {
+    let tx_hash =
+        required_field(log.transaction_hash.as_ref(), "transactionHash")?.to_ascii_lowercase();
+    let log_index = parse_hex_quantity(required_field(log.log_index.as_ref(), "logIndex")?)?;
+    let block_number =
+        parse_hex_quantity(required_field(log.block_number.as_ref(), "blockNumber")?)?;
+    let now = now_ms();
+
+    Ok(OptionExecutionEvent {
+        id: Uuid::new_v4(),
+        chain_id,
+        contract_address: log.address.to_ascii_lowercase(),
+        tx_hash,
+        log_index,
+        block_number,
+        block_hash: log.block_hash.clone(),
+        event_name: event_name.to_string(),
+        event_signature: event_signature.to_string(),
+        intent_id: None,
+        onchain_intent_id: None,
+        option_execution_transaction_id: None,
+        buyer,
+        seller,
+        account,
+        option_id,
+        quantity_contracts,
+        premium_per_contract_native,
+        raw_topics: raw_topics_json(log),
+        raw_data: log.data.clone(),
+        decoded: Some(decoded),
+        created_at_ms: now,
+        updated_at_ms: now,
+    })
+}
+
 fn required_field<'a>(value: Option<&'a String>, field: &str) -> Result<&'a String> {
     value.ok_or_else(|| BackendError::Indexer(format!("log missing {field}")))
 }
@@ -661,9 +1244,7 @@ fn decode_bool(data: &[u8], word_index: usize) -> Result<bool> {
     } else if value == U256::from(1u8) {
         Ok(true)
     } else {
-        Err(BackendError::Indexer(
-            "invalid ABI bool in OptionTradeExecuted data".to_string(),
-        ))
+        Err(BackendError::Indexer("invalid ABI bool".to_string()))
     }
 }
 
@@ -775,14 +1356,18 @@ mod tests {
             let logs = self.logs.clone();
             Box::pin(async move {
                 let topic0 = filter.topics.first().cloned();
+                let address = filter.address.to_ascii_lowercase();
                 filters.lock().unwrap().push(filter);
                 Ok(logs
                     .lock()
                     .unwrap()
                     .iter()
-                    .filter(|log| match (log.topics.first(), topic0.as_ref()) {
-                        (Some(left), Some(right)) => left.eq_ignore_ascii_case(right),
-                        _ => false,
+                    .filter(|log| log.address.eq_ignore_ascii_case(&address))
+                    .filter(|log| {
+                        matches!(
+                            (log.topics.first(), topic0.as_ref()),
+                            (Some(left), Some(right)) if left.eq_ignore_ascii_case(right)
+                        )
                     })
                     .cloned()
                     .collect())
@@ -862,7 +1447,7 @@ mod tests {
         assert_eq!(result.from_block, 1);
         assert_eq!(result.to_block, 10);
         let filters = provider.filters();
-        assert_eq!(filters.len(), 4);
+        assert_eq!(filters.len(), 9);
         assert_eq!(filters[0].from_block, "0x1");
         assert_eq!(filters[0].to_block, "0xa");
         assert_no_generic_execution_rows(&state);
@@ -927,6 +1512,123 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn multiple_emitter_contracts_are_supported() {
+        let state = state_with_event_indexer(true, 0, 20, 0);
+        let provider = MockEventLogProvider::new(
+            20,
+            vec![
+                option_trade_log(10, 2),
+                trading_fee_log(10, 3),
+                internal_transfer_log(10, 4),
+            ],
+        );
+
+        let result = index_option_events_with_provider(&state, &provider)
+            .await
+            .unwrap();
+
+        assert_eq!(result.logs_found, 3);
+        assert_eq!(result.events_decoded, 3);
+        assert_eq!(result.events_indexed, 3);
+        let filters = provider.filters();
+        assert!(filters
+            .iter()
+            .any(|filter| filter.address == "0x00000000000000000000000000000000000000ee"));
+        assert!(filters
+            .iter()
+            .any(|filter| filter.address == "0x00000000000000000000000000000000000000aa"));
+        assert!(filters
+            .iter()
+            .any(|filter| filter.address == "0x00000000000000000000000000000000000000bb"));
+        let events = state
+            .options_store
+            .lock()
+            .unwrap()
+            .list_option_execution_events(10);
+        assert_eq!(events.len(), 3);
+        assert!(events
+            .iter()
+            .any(|event| event.event_name == "OptionTradeExecuted"));
+        assert!(events
+            .iter()
+            .any(|event| event.event_name == "TradingFeeCharged"));
+        assert!(events
+            .iter()
+            .any(|event| event.event_name == "InternalTransfer"));
+        assert_no_generic_execution_rows(&state);
+    }
+
+    #[tokio::test]
+    async fn trading_fee_charged_from_margin_engine_decodes_and_persists() {
+        let state = state_with_event_indexer(true, 0, 20, 0);
+        let provider = MockEventLogProvider::new(20, vec![trading_fee_log(10, 3)]);
+
+        let result = index_option_events_with_provider(&state, &provider)
+            .await
+            .unwrap();
+
+        assert_eq!(result.events_indexed, 1);
+        let events = state
+            .options_store
+            .lock()
+            .unwrap()
+            .list_option_execution_events(10);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_name, "TradingFeeCharged");
+        assert_eq!(
+            events[0].contract_address,
+            "0x00000000000000000000000000000000000000aa"
+        );
+        assert_eq!(
+            events[0].account.as_deref(),
+            Some("0x0000000000000000000000000000000000000001")
+        );
+        assert_eq!(events[0].option_id.as_deref(), Some("7"));
+        assert_eq!(
+            events[0].premium_per_contract_native.as_deref(),
+            Some("10000")
+        );
+        assert_eq!(events[0].decoded.as_ref().unwrap()["appliedFee"], "6");
+        assert_no_generic_execution_rows(&state);
+    }
+
+    #[tokio::test]
+    async fn internal_transfer_from_collateral_vault_decodes_and_persists() {
+        let state = state_with_event_indexer(true, 0, 20, 0);
+        let provider = MockEventLogProvider::new(20, vec![internal_transfer_log(10, 4)]);
+
+        let result = index_option_events_with_provider(&state, &provider)
+            .await
+            .unwrap();
+
+        assert_eq!(result.events_indexed, 1);
+        let events = state
+            .options_store
+            .lock()
+            .unwrap()
+            .list_option_execution_events(10);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_name, "InternalTransfer");
+        assert_eq!(
+            events[0].contract_address,
+            "0x00000000000000000000000000000000000000bb"
+        );
+        assert_eq!(
+            events[0].account.as_deref(),
+            Some("0x0000000000000000000000000000000000000001")
+        );
+        assert_eq!(
+            events[0].premium_per_contract_native.as_deref(),
+            Some("10000")
+        );
+        assert_eq!(
+            events[0].decoded.as_ref().unwrap()["to"],
+            "0x0000000000000000000000000000000000000002"
+        );
+        assert_no_generic_execution_rows(&state);
+    }
+
+    #[tokio::test]
     async fn duplicate_log_is_idempotent() {
         let state = state_with_event_indexer(true, 0, 20, 0);
         let log = option_trade_log(10, 2);
@@ -948,6 +1650,40 @@ mod tests {
                 .len(),
             1
         );
+        assert_no_generic_execution_rows(&state);
+    }
+
+    #[tokio::test]
+    async fn same_tx_multi_contract_events_link_to_same_option_transaction() {
+        let state = state_with_event_indexer(true, 0, 20, 0);
+        let tx_hash = tx_hash();
+        let (intent, transaction) = insert_broadcast_submitted_transaction(&state, tx_hash);
+        let provider = MockEventLogProvider::new(
+            20,
+            vec![
+                option_trade_log(10, 2),
+                trading_fee_log(10, 3),
+                internal_transfer_log(10, 4),
+            ],
+        );
+
+        index_option_events_with_provider(&state, &provider)
+            .await
+            .unwrap();
+
+        let events = state
+            .options_store
+            .lock()
+            .unwrap()
+            .list_option_execution_events(10);
+        assert_eq!(events.len(), 3);
+        for event in events {
+            assert_eq!(event.intent_id, Some(intent.intent_id));
+            assert_eq!(
+                event.option_execution_transaction_id.as_deref(),
+                Some(transaction.transaction_id.as_str())
+            );
+        }
         assert_no_generic_execution_rows(&state);
     }
 
@@ -1003,7 +1739,7 @@ mod tests {
 
         assert_eq!(*mock_broadcast_send_count.lock().unwrap(), 0);
         assert_eq!(provider.block_call_count(), 1);
-        assert_eq!(provider.filters().len(), 4);
+        assert_eq!(provider.filters().len(), 9);
         assert_no_generic_execution_rows(&state);
     }
 
@@ -1013,6 +1749,42 @@ mod tests {
             option_trade_executed_topic0(),
             "0xb2387b9f0e4823ecef9a16ea4aaba6598c0703fb5e9d8dba37ef303add4cb808"
         );
+        assert_eq!(
+            margin_trade_executed_topic0(),
+            "0x6f0909c4bf7f20fe8de71b889c29e66311610d5f753a42ae63495e08bbb65f7e"
+        );
+        assert_eq!(
+            trading_fee_charged_topic0(),
+            "0x12cf63383901008103b6e03c39d208d7757a2f9842d9d4e18e58bc13f75f7f7b"
+        );
+        assert_eq!(
+            internal_transfer_topic0(),
+            "0x77178bcf8f3c991d39734824771477a42787fe19b60d5a29c0ec72de167699b3"
+        );
+    }
+
+    #[test]
+    fn disabled_indexer_allows_missing_emitters() {
+        let config = OptionEventIndexerConfig::disabled();
+
+        config.validate_startup(false).unwrap();
+    }
+
+    #[test]
+    fn enabled_indexer_validates_required_emitters() {
+        let mut config = OptionEventIndexerConfig::disabled();
+        config.enabled = true;
+        config.require_rpc = false;
+        config.matching_engine_address =
+            AccountId::new("0x00000000000000000000000000000000000000ee");
+        config.collateral_vault_address =
+            AccountId::new("0x00000000000000000000000000000000000000bb");
+
+        let error = config.validate_startup(true).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("OPTION_EVENT_INDEXER_MARGIN_ENGINE_ADDRESS is required"));
     }
 
     fn state_with_event_indexer(
@@ -1034,6 +1806,9 @@ mod tests {
             require_rpc: true,
             rpc_url: Some("http://127.0.0.1:8545".to_string()),
             matching_engine_address: AccountId::new("0x00000000000000000000000000000000000000ee"),
+            margin_engine_address: AccountId::new("0x00000000000000000000000000000000000000aa"),
+            collateral_vault_address: AccountId::new("0x00000000000000000000000000000000000000bb"),
+            fees_manager_address: None,
         };
         state
     }
@@ -1145,6 +1920,54 @@ mod tests {
                 word_no_prefix(0),
                 word_no_prefix(0),
             ),
+            block_number: Some(hex_quantity(block_number)),
+            block_hash: Some(
+                "0x2222222222222222222222222222222222222222222222222222222222222222".to_string(),
+            ),
+            transaction_hash: Some(tx_hash().to_string()),
+            log_index: Some(hex_quantity(log_index)),
+        }
+    }
+
+    fn trading_fee_log(block_number: u64, log_index: u64) -> EthLog {
+        EthLog {
+            address: "0x00000000000000000000000000000000000000aa".to_string(),
+            topics: vec![
+                trading_fee_charged_topic0(),
+                topic_address("0000000000000000000000000000000000000001"),
+                topic_address("00000000000000000000000000000000000000f0"),
+                topic_address("0000000000000000000000000000000000000020"),
+            ],
+            data: format!(
+                "0x{}{}{}{}{}{}{}{}",
+                word_no_prefix(7),
+                word_no_prefix(0),
+                word_no_prefix(10_000),
+                word_no_prefix(3_000_000),
+                word_no_prefix(6),
+                word_no_prefix(1_000),
+                word_no_prefix(6),
+                word_no_prefix(0),
+            ),
+            block_number: Some(hex_quantity(block_number)),
+            block_hash: Some(
+                "0x2222222222222222222222222222222222222222222222222222222222222222".to_string(),
+            ),
+            transaction_hash: Some(tx_hash().to_string()),
+            log_index: Some(hex_quantity(log_index)),
+        }
+    }
+
+    fn internal_transfer_log(block_number: u64, log_index: u64) -> EthLog {
+        EthLog {
+            address: "0x00000000000000000000000000000000000000bb".to_string(),
+            topics: vec![
+                internal_transfer_topic0(),
+                topic_address("0000000000000000000000000000000000000020"),
+                topic_address("0000000000000000000000000000000000000001"),
+                topic_address("0000000000000000000000000000000000000002"),
+            ],
+            data: format!("0x{}", word_no_prefix(10_000)),
             block_number: Some(hex_quantity(block_number)),
             block_hash: Some(
                 "0x2222222222222222222222222222222222222222222222222222222222222222".to_string(),

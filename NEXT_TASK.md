@@ -1,41 +1,60 @@
-# NEXT_TASK.md — Option Event Indexer V1X
+# NEXT_TASK.md — V1S Option Event Backfill Validation V1X-C
 
 ## Context
 
-V1S successfully executed the first live option trade on Base Sepolia.
+V1X implemented the minimal option event indexer.
 
-Tx:
+V1X-B extended it to multi-emitter coverage.
+
+Supported emitters:
+- OptionMatchingEngine
+- MarginEngine
+- CollateralVault
+- optional FeesManager
+
+Supported events include:
+- OptionTradeExecuted
+- TradeExecuted
+- TradingFeeCharged
+- InternalTransfer
+- Deposited
+- Withdrawn
+- Synced
+- CollateralDeposited
+- CollateralWithdrawn
+- FeesManager config events
+
+V1S successful tx:
 0x5964a7b3d2c18d051baaa780413d31c44d419ce530f45263cb4c46f720881125
+
+V1S block:
+41856964
 
 Intent:
 e6d2941b-65f7-413a-958f-74ab22c53b08
 
-V1T added manual confirmation/reconciliation.
+Transaction row:
+cae8c7e7-ed61-4265-aa7d-75edd94ef03c
 
-V1V added the background confirmation worker.
-
-V1W added:
-- receipt cost persistence
-- admin confirmation summary
-- latest worker tick observability
-- `GET /admin/options/confirmations`
+Known V1T evidence:
+- receipt status = 1
+- buyer position +1
+- seller position -1
+- buyer fee = 6
+- seller fee = 4
+- two TradingFeeCharged events existed
+- premium/vault movements reconciled manually
 
 Remaining gap:
-The backend does not yet index on-chain option events such as:
-- `OptionTradeExecuted`
-- `OptionPositionUpdated`
-- vault/premium transfer events
-- fee events if present
-
-Without event indexing, the backend knows a transaction succeeded, but does not yet have a durable event-level ledger.
+V1X-B was implemented but no live V1S backfill was run.
 
 ## Goal
 
-Implement a minimal backend option event indexer.
+Run a controlled, narrow backfill/indexer validation for the V1S transaction block.
 
-The indexer should read logs from `OptionMatchingEngine` and related contracts, decode relevant events, persist them, and link them to known option execution intents/transactions where possible.
+The goal is to prove that the multi-emitter option event indexer can read, decode, persist, and link the actual V1S on-chain events.
 
-This is backend-only.
+This task may write only option event indexer rows.
 
 ## Hard Rules
 
@@ -45,239 +64,232 @@ Do not submit transactions.
 Do not call `/executor/broadcast`.
 Do not call `POST /options/execution-intents/:id/broadcast`.
 Do not create new option execution intents.
-Do not create option_execution_transactions except in tests.
+Do not create option_execution_transactions.
 Do not create generic execution_transactions.
-Do not cleanup existing evidence rows.
+Do not cleanup evidence rows.
 Do not modify Solidity.
 Do not modify frontend.
 Do not deploy contracts.
 Do not print private keys.
 Do not touch real `.env` secrets.
 
-## Required Config
+Allowed mutation:
+- applying pending backend migrations
+- inserting idempotent rows into `option_execution_events`
+- updating `option_event_indexer_state`
 
-Add safe config flags:
+No other DB mutation is allowed.
+
+## Step 1 — Repo And Migration Check
+
+Work in:
 
 ```text
-OPTION_EVENT_INDEXER_ENABLED=false
-OPTION_EVENT_INDEXER_POLL_INTERVAL_MS=15000
-OPTION_EVENT_INDEXER_FROM_BLOCK=0
-OPTION_EVENT_INDEXER_BATCH_BLOCKS=1000
+~/DEOPT/deopt-v2-backend
+
+Run:
+
+git status -sb
+git log -1 --oneline
+
+Verify V1X-B is committed/pushed or at least present.
+
+Verify migration exists:
+
+migrations/0025_option_execution_events.sql
+
+Apply migrations if needed:
+
+sqlx migrate run
+
+Do not print DATABASE_URL.
+
+Verify tables exist:
+
+select to_regclass('option_execution_events');
+select to_regclass('option_event_indexer_state');
+Step 2 — Env / Config Check
+
+Reload env without printing secrets.
+
+Required config:
+
+OPTION_EVENT_INDEXER_ENABLED=true
+OPTION_EVENT_INDEXER_FROM_BLOCK=41856963
+OPTION_EVENT_INDEXER_BATCH_BLOCKS=5
 OPTION_EVENT_INDEXER_CONFIRMATION_BLOCKS=3
 OPTION_EVENT_INDEXER_REQUIRE_RPC=true
 
-Defaults:
+Required emitter addresses:
 
-disabled by default
-no indexing if RPC missing and require_rpc=true
-conservative batch size
+OPTION_EVENT_INDEXER_MATCHING_ENGINE_ADDRESS=0xf2D1D85cD363Be3bc160d14883C80e7C2c4F420b
+OPTION_EVENT_INDEXER_MARGIN_ENGINE_ADDRESS=0x6C5665De05e7314cB63cD77F82DFa86508A5b5F8
+OPTION_EVENT_INDEXER_COLLATERAL_VAULT_ADDRESS=0x00340c360353a5ab784c5bc5c44322a6af0625d3
 
-Expose sanitized values in /admin/config.
+If FEES_MANAGER / OPTION_EVENT_INDEXER_FEES_MANAGER_ADDRESS is known, include it.
 
-Required DB
+Verify sanitized /admin/config exposes the emitter addresses correctly.
 
-Add migration for indexed option events.
+Abort if emitter config is missing or wrong.
 
-Suggested table:
+Step 3 — DB Baseline
 
-option_execution_events
+Set:
 
-Suggested columns:
+V1X_C_START_MS=$(date +%s%3N)
 
-id UUID primary key
-chain_id BIGINT not null
-contract_address TEXT not null
-tx_hash TEXT not null
-log_index BIGINT not null
-block_number BIGINT not null
-block_hash TEXT
-event_name TEXT not null
-event_signature TEXT not null
-intent_id UUID null
-onchain_intent_id TEXT null
-option_execution_transaction_id UUID null
-buyer TEXT null
-seller TEXT null
-account TEXT null
-option_id TEXT null
-quantity_contracts TEXT null
-premium_per_contract_native TEXT null
-raw_topics JSONB not null
-raw_data TEXT not null
-decoded JSONB null
-created_at_ms BIGINT not null
-updated_at_ms BIGINT not null
+Record baseline:
 
-Add uniqueness:
+select count(*) from option_execution_events;
+select count(*) from option_execution_events
+where tx_hash = '0x5964a7b3d2c18d051baaa780413d31c44d419ce530f45263cb4c46f720881125';
 
-(chain_id, tx_hash, log_index)
+select count(*) from option_execution_transactions
+where created_at_ms >= :V1X_C_START_MS;
 
-Use ADD COLUMN IF NOT EXISTS / safe migration style where applicable.
+select count(*) from execution_transactions
+where created_at_ms >= :V1X_C_START_MS;
 
-Required Indexer Cursor
+Expected:
 
-Add table or config-backed state for indexer cursor.
+no new option execution tx rows
+no generic execution tx rows
+Step 4 — One-shot Indexer Run
 
-Suggested table:
+Run exactly one narrow indexer tick / one-shot indexing pass.
 
-option_event_indexer_state
+Preferred:
 
-Fields:
+use existing indexer tick function if callable from backend/test harness/admin-safe path.
 
-id TEXT primary key
-last_indexed_block BIGINT not null
-updated_at_ms BIGINT not null
-last_error TEXT null
+If no one-shot mechanism exists:
 
-Use one row:
+implement a minimal safe internal one-shot admin/dev command or function for option event indexer validation.
+It must not broadcast.
+It must only call eth_blockNumber and eth_getLogs.
+It must only persist option_execution_events and cursor state.
 
-option_events_base_sepolia
-Required Events
+Do not run an unbounded worker loop.
 
-At minimum decode/persist:
+Index only around V1S block:
 
-OptionTradeExecuted
-OptionPositionUpdated
+from_block = 41856963
+to_block   = 41856967
 
-Also attempt to support if ABI/source contains them:
+or equivalent bounded batch.
 
-TradingFeeCharged
-InternalTransfer
-CollateralTransferred
-PremiumPaid
+Step 5 — Verify Indexed Events
 
-Do not invent event names. Search Solidity sources:
+Query:
 
-rg "event " ../deopt-v2-sol/src
+select
+  chain_id,
+  contract_address,
+  tx_hash,
+  log_index,
+  block_number,
+  event_name,
+  onchain_intent_id,
+  intent_id,
+  option_execution_transaction_id,
+  buyer,
+  seller,
+  account,
+  option_id,
+  quantity_contracts,
+  premium_per_contract_native,
+  decoded
+from option_execution_events
+where tx_hash = '0x5964a7b3d2c18d051baaa780413d31c44d419ce530f45263cb4c46f720881125'
+order by log_index;
 
-Use actual event signatures.
+Expected at minimum:
 
-Required Log Fetching
+one OptionTradeExecuted or equivalent trade execution event
+two TradingFeeCharged events if present in receipt
+one or more vault/internal transfer events if emitted
+events from more than one contract address
+event rows linked by tx_hash to transaction row
+intent_id linked when possible
+onchain_intent_id linked when available
 
-Implement or reuse RPC support for:
+If some expected event is absent:
 
-eth_getLogs
-eth_blockNumber
+inspect raw receipt logs
+verify emitter address
+verify event signature
+verify topic filter
+document exact reason
+Step 6 — Admin Endpoint Check
 
-Indexer behavior:
-
-If disabled, do nothing.
-If enabled:
-get current head block.
-safe_head = head - OPTION_EVENT_INDEXER_CONFIRMATION_BLOCKS.
-read cursor.
-index from cursor+1 to safe_head, bounded by batch size.
-fetch logs for configured contracts/topics.
-decode known events.
-persist idempotently.
-advance cursor only after successful persistence.
-Never broadcast.
-Never mutate execution statuses directly in V1X.
-Do not perform full reconciliation yet.
-Required Linking
-
-When indexing OptionTradeExecuted, try to link event to backend records.
-
-Link by one or more of:
-
-onchain_intent_id
-tx_hash
-option_execution_transaction_id
-intent_id
-
-Expected for V1S:
-
-tx hash:
-0x5964a7b3d2c18d051baaa780413d31c44d419ce530f45263cb4c46f720881125
-onchain intent id:
-0x0a77c7c9570198c969b1fa597ea193cb6fee563e3bfae514e9a3f0c4e01705f5
-
-If linkage fails, persist event unlinked and document why.
-
-Required Admin Endpoint
-
-Add:
+Call:
 
 GET /admin/options/events
 
-Return sanitized summary:
+Verify response includes:
 
-{
-  "indexer_enabled": false,
-  "from_block": 0,
-  "batch_blocks": 1000,
-  "confirmation_blocks": 3,
-  "last_indexed_block": 0,
-  "latest_tick": null,
-  "counts": {
-    "OptionTradeExecuted": 0,
-    "OptionPositionUpdated": 0
-  },
-  "recent": []
-}
+emitter_contracts
+counts_by_event_name
+counts_by_contract_address
+recent events
+latest tick
+cursor state
 
-No secrets.
+Confirm V1S events are visible or countable.
 
-Required Latest Tick
+Step 7 — Idempotency Check
 
-Add in-memory latest tick state:
+Run the same narrow indexer tick a second time.
 
-ran_at_ms
-head_block
-safe_head
-from_block
-to_block
-logs_fetched
-events_decoded
-events_inserted
-events_duplicate
-events_failed
-last_indexed_block
-error
+Expected:
 
-Expose via admin endpoint.
+no duplicate rows
+(chain_id, tx_hash, log_index) uniqueness holds
+counts for V1S tx do not increase incorrectly
+latest tick may update
+cursor behavior remains safe
+Step 8 — No Forbidden Mutation Check
 
-Required Tests
+Verify since V1X_C_START_MS:
 
-Add tests for:
+select count(*) from option_execution_transactions
+where created_at_ms >= :V1X_C_START_MS;
 
-indexer disabled does nothing.
-cursor initializes correctly.
-safe_head applies confirmation blocks.
-batch block limit is respected.
-eth_getLogs no logs advances cursor.
-known OptionTradeExecuted log decodes and persists.
-duplicate log is idempotent.
-event links to transaction by tx_hash.
-admin events endpoint returns config/counts/latest tick.
-no broadcast path touched.
-no generic execution_transactions rows created.
+select count(*) from execution_transactions
+where created_at_ms >= :V1X_C_START_MS;
 
-Use mock RPC/log provider. Do not depend on live Base Sepolia.
+Expected:
+
+option_execution_transactions = 0
+execution_transactions = 0
+
+No broadcast endpoint calls.
 
 Required Docs
 
 Create:
 
-docs/OPTION_EVENT_INDEXER_V1X.md
+docs/OPTION_EVENT_BACKFILL_VALIDATION_V1X_C.md
 
 Include:
 
-why receipt confirmation is not enough
-indexed contracts
-indexed events
-DB schema
-cursor behavior
-finality behavior
-idempotence rule
-admin endpoint
-relation to V1S/V1T/V1V/V1W
-remaining deferred work:
-full reconciliation worker
-event-driven position reconciliation
-alerting
-frontend event display
-settlement/exercise/expiry flows
+V1S tx hash
+V1S block
+emitter config
+migration status
+indexer run range
+logs fetched
+events decoded
+events inserted
+duplicates ignored
+events by contract
+events by name
+V1S event table rows summary
+linkage result to tx/intent/onchain_intent_id
+admin endpoint result
+idempotency result
+no forbidden mutation verification
+remaining blocker before reconciliation worker
 Validation
 
 Run:
@@ -290,30 +302,32 @@ Acceptance Criteria
 
 Complete only if:
 
-event indexer exists
-disabled by default
-cursor exists
-eth_getLogs support exists
-at least OptionTradeExecuted and OptionPositionUpdated are decoded/persisted
-events are idempotent by (chain_id, tx_hash, log_index)
-admin endpoint exists
-tests pass
+V1S block indexed narrowly
+actual V1S events persisted
+multi-emitter coverage proven
+fee events indexed if present
+vault/internal transfer events indexed if present
+events linked to option tx/intent where possible
+admin endpoint shows indexed data
+idempotency verified
+no broadcast
+no new option execution transactions
+no generic execution transactions
 docs created
-no transaction submitted
-no broadcast path touched
+validations pass
 Final Report
 
 Return:
 
 files changed
-migrations added
-config added
-events decoded
-DB schema summary
-cursor behavior
-admin endpoint added
-tests added
-docs created
+migration applied or not
+emitter config used
+indexer run range
+events fetched/decoded/inserted
+V1S events indexed
+linkage summary
+admin endpoint summary
+idempotency result
 validation commands run
 no forbidden mutation verification
 remaining blocker

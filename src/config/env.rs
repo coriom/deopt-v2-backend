@@ -357,6 +357,24 @@ impl AppConfig {
             require_rpc: parse_env(&mut lookup, "OPTION_CONFIRMATION_REQUIRE_RPC", "true")?,
             rpc_url: execution.rpc_url.clone(),
         };
+        let option_event_indexer_matching_engine_address =
+            optional_env(&mut lookup, "OPTION_EVENT_INDEXER_MATCHING_ENGINE_ADDRESS")
+                .map(AccountId::new)
+                .unwrap_or_else(|| options.matching_engine_address.clone());
+        let option_event_indexer_margin_engine_address =
+            optional_env(&mut lookup, "OPTION_EVENT_INDEXER_MARGIN_ENGINE_ADDRESS")
+                .or_else(|| optional_env(&mut lookup, "MARGIN_ENGINE"))
+                .map(AccountId::new)
+                .unwrap_or_else(|| AccountId::new(""));
+        let option_event_indexer_collateral_vault_address =
+            optional_env(&mut lookup, "OPTION_EVENT_INDEXER_COLLATERAL_VAULT_ADDRESS")
+                .or_else(|| optional_env(&mut lookup, "COLLATERAL_VAULT"))
+                .map(AccountId::new)
+                .unwrap_or_else(|| AccountId::new(""));
+        let option_event_indexer_fees_manager_address =
+            optional_env(&mut lookup, "OPTION_EVENT_INDEXER_FEES_MANAGER_ADDRESS")
+                .or_else(|| optional_env(&mut lookup, "FEES_MANAGER"))
+                .map(AccountId::new);
         let option_event_indexer = OptionEventIndexerConfig {
             enabled: parse_env(&mut lookup, "OPTION_EVENT_INDEXER_ENABLED", "false")?,
             poll_interval_ms: parse_env(
@@ -373,7 +391,10 @@ impl AppConfig {
             )?,
             require_rpc: parse_env(&mut lookup, "OPTION_EVENT_INDEXER_REQUIRE_RPC", "true")?,
             rpc_url: execution.rpc_url.clone(),
-            matching_engine_address: options.matching_engine_address.clone(),
+            matching_engine_address: option_event_indexer_matching_engine_address,
+            margin_engine_address: option_event_indexer_margin_engine_address,
+            collateral_vault_address: option_event_indexer_collateral_vault_address,
+            fees_manager_address: option_event_indexer_fees_manager_address,
         };
         let signature_verification_mode =
             parse_env(&mut lookup, "SIGNATURE_VERIFICATION_MODE", "disabled")?;
@@ -449,6 +470,10 @@ impl AppConfig {
 
 fn get_env(lookup: &mut impl FnMut(&str) -> Option<String>, key: &str, default: &str) -> String {
     lookup(key).unwrap_or_else(|| default.to_string())
+}
+
+fn optional_env(lookup: &mut impl FnMut(&str) -> Option<String>, key: &str) -> Option<String> {
+    lookup(key).filter(|value| !value.is_empty())
 }
 
 fn parse_env<T>(
@@ -714,6 +739,10 @@ mod tests {
         assert_eq!(config.option_event_indexer.batch_blocks, 1_000);
         assert_eq!(config.option_event_indexer.confirmation_blocks, 3);
         assert!(config.option_event_indexer.require_rpc);
+        assert_eq!(config.option_event_indexer.matching_engine_address.0, "");
+        assert_eq!(config.option_event_indexer.margin_engine_address.0, "");
+        assert_eq!(config.option_event_indexer.collateral_vault_address.0, "");
+        assert!(config.option_event_indexer.fees_manager_address.is_none());
     }
 
     #[test]
@@ -729,6 +758,18 @@ mod tests {
                 "OPTION_MATCHING_ENGINE_ADDRESS",
                 "0x00000000000000000000000000000000000000ee",
             ),
+            (
+                "OPTION_EVENT_INDEXER_MARGIN_ENGINE_ADDRESS",
+                "0x00000000000000000000000000000000000000aa",
+            ),
+            (
+                "OPTION_EVENT_INDEXER_COLLATERAL_VAULT_ADDRESS",
+                "0x00000000000000000000000000000000000000bb",
+            ),
+            (
+                "OPTION_EVENT_INDEXER_FEES_MANAGER_ADDRESS",
+                "0x00000000000000000000000000000000000000cc",
+            ),
             ("RPC_URL", "https://example.invalid"),
             ("PERSISTENCE_ENABLED", "true"),
             ("DATABASE_URL", "postgres://example.invalid/db"),
@@ -743,6 +784,79 @@ mod tests {
             config.option_event_indexer.rpc_url.as_deref(),
             Some("https://example.invalid")
         );
+        assert_eq!(
+            config.option_event_indexer.matching_engine_address.0,
+            "0x00000000000000000000000000000000000000ee"
+        );
+        assert_eq!(
+            config.option_event_indexer.margin_engine_address.0,
+            "0x00000000000000000000000000000000000000aa"
+        );
+        assert_eq!(
+            config.option_event_indexer.collateral_vault_address.0,
+            "0x00000000000000000000000000000000000000bb"
+        );
+        assert_eq!(
+            config
+                .option_event_indexer
+                .fees_manager_address
+                .as_ref()
+                .map(|address| address.0.as_str()),
+            Some("0x00000000000000000000000000000000000000cc")
+        );
+    }
+
+    #[test]
+    fn option_event_indexer_accepts_generic_core_address_fallbacks() {
+        let config = config_from_pairs([
+            ("OPTION_EVENT_INDEXER_ENABLED", "true"),
+            ("OPTION_EVENT_INDEXER_REQUIRE_RPC", "false"),
+            (
+                "OPTION_EVENT_INDEXER_MATCHING_ENGINE_ADDRESS",
+                "0x00000000000000000000000000000000000000ee",
+            ),
+            (
+                "MARGIN_ENGINE",
+                "0x00000000000000000000000000000000000000aa",
+            ),
+            (
+                "COLLATERAL_VAULT",
+                "0x00000000000000000000000000000000000000bb",
+            ),
+            ("FEES_MANAGER", "0x00000000000000000000000000000000000000cc"),
+            ("PERSISTENCE_ENABLED", "true"),
+            ("DATABASE_URL", "postgres://example.invalid/db"),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            config.option_event_indexer.margin_engine_address.0,
+            "0x00000000000000000000000000000000000000aa"
+        );
+        assert_eq!(
+            config.option_event_indexer.collateral_vault_address.0,
+            "0x00000000000000000000000000000000000000bb"
+        );
+        assert!(config.option_event_indexer.fees_manager_address.is_some());
+    }
+
+    #[test]
+    fn option_event_indexer_enabled_requires_required_emitters() {
+        let error = config_from_pairs([
+            ("OPTION_EVENT_INDEXER_ENABLED", "true"),
+            ("OPTION_EVENT_INDEXER_REQUIRE_RPC", "false"),
+            (
+                "OPTION_EVENT_INDEXER_MATCHING_ENGINE_ADDRESS",
+                "0x00000000000000000000000000000000000000ee",
+            ),
+            ("PERSISTENCE_ENABLED", "true"),
+            ("DATABASE_URL", "postgres://example.invalid/db"),
+        ])
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("OPTION_EVENT_INDEXER_MARGIN_ENGINE_ADDRESS is required"));
     }
 
     #[test]

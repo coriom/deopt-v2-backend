@@ -711,6 +711,16 @@ impl OptionSeriesStore {
         counts.into_iter().collect()
     }
 
+    pub fn summarize_option_execution_events_by_contract_address(&self) -> Vec<(String, u64)> {
+        let mut counts: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+        for event in self.option_execution_events.values() {
+            *counts
+                .entry(event.contract_address.to_ascii_lowercase())
+                .or_default() += 1;
+        }
+        counts.into_iter().collect()
+    }
+
     pub fn list_option_execution_events(&self, limit: u32) -> Vec<OptionExecutionEvent> {
         let mut events = self
             .option_execution_events

@@ -2587,6 +2587,33 @@ impl PgRepository {
         Ok(out)
     }
 
+    pub async fn summarize_option_execution_events_by_contract_address(
+        &self,
+    ) -> Result<Vec<(String, u64)>> {
+        if !self.admin_table_exists("option_execution_events").await? {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            "SELECT lower(contract_address) AS contract_address, COUNT(*) AS row_count
+             FROM option_execution_events
+             GROUP BY lower(contract_address)
+             ORDER BY lower(contract_address) ASC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let contract_address: String = row_get(&row, "contract_address")?;
+            let count: i64 = row_get(&row, "row_count")?;
+            out.push((
+                contract_address,
+                i64_to_u64_persistence("row_count", count)?,
+            ));
+        }
+        Ok(out)
+    }
+
     pub async fn list_option_execution_events(
         &self,
         limit: u32,
