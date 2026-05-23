@@ -1,9 +1,15 @@
+pub mod confirmation_worker;
 pub mod execution;
 pub mod series_id;
 pub mod service;
 pub mod signing;
 pub mod store;
 pub mod types;
+
+pub use confirmation_worker::{
+    spawn_option_confirmation_worker, OptionConfirmationConfig, OptionConfirmationDecision,
+    OptionConfirmationOutcome, OptionConfirmationTickResult,
+};
 
 pub use execution::{
     build_option_execution_transaction_request, compute_required_gas,

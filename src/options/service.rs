@@ -1398,6 +1398,231 @@ where
     })
 }
 
+async fn list_pending_option_execution_transactions(
+    state: &AppState,
+    limit: u32,
+) -> Result<Vec<OptionExecutionTransaction>> {
+    if let Some(repository) = state.repository.clone() {
+        return repository
+            .list_pending_option_execution_transactions(limit)
+            .await;
+    }
+    Ok(state
+        .options_store
+        .lock()
+        .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?
+        .list_pending_option_execution_transactions(limit))
+}
+
+/// Run one tick of the option execution confirmation worker against the supplied receipt
+/// provider. Deterministic and side-effect-isolated to the option store / repository:
+/// it never broadcasts, never touches the generic executor path, never inserts new rows.
+///
+/// For each pending option execution transaction:
+/// - If a receipt is found and `receipt.block_number + finality_blocks <= current_block_number`:
+///   - status=1 → persist `mined_success`, transition intent to `broadcast_confirmed`
+///   - status=0 → persist `mined_failed`, transition intent to `broadcast_failed`
+///   - status=None → record receipt + leave pending (receipt_error)
+/// - If a receipt is found but finality is not yet reached, leave pending. Update the
+///   in-memory `confirmation_status` to `pending` so operators can see the worker observed
+///   the receipt (no terminal state until finalized).
+/// - If `eth_getTransactionReceipt` returns `None`, leave pending (`receipt_missing`).
+/// - If RPC errors, leave pending (`receipt_error`).
+pub async fn confirm_pending_option_execution_transactions<P>(
+    state: &AppState,
+    provider: &P,
+) -> Result<crate::options::OptionConfirmationTickResult>
+where
+    P: TransactionReceiptProvider,
+{
+    let config = state.option_confirmation_config.clone();
+    if !config.enabled {
+        return Ok(crate::options::OptionConfirmationTickResult {
+            enabled: false,
+            batch_size: config.batch_size,
+            finality_blocks: config.finality_blocks,
+            current_block_number: None,
+            decisions: Vec::new(),
+        });
+    }
+
+    let current_block_number = provider.block_number().await.ok();
+    let pending = list_pending_option_execution_transactions(state, config.batch_size).await?;
+    let mut decisions = Vec::with_capacity(pending.len());
+
+    for tx in pending {
+        let now = now_ms();
+        let Some(tx_hash) = tx.tx_hash.clone() else {
+            // Shouldn't happen — list query filters for non-null hash — defensive only.
+            continue;
+        };
+        let receipt_result = provider.transaction_receipt(tx_hash.clone()).await;
+        let decision = compute_worker_decision(
+            &tx.transaction_id,
+            &tx_hash,
+            current_block_number,
+            config.finality_blocks,
+            &receipt_result,
+        );
+        apply_worker_decision(state, &tx, &decision, now).await?;
+        decisions.push(decision);
+    }
+
+    Ok(crate::options::OptionConfirmationTickResult {
+        enabled: true,
+        batch_size: config.batch_size,
+        finality_blocks: config.finality_blocks,
+        current_block_number,
+        decisions,
+    })
+}
+
+fn compute_worker_decision(
+    transaction_id: &str,
+    expected_tx_hash: &str,
+    current_block_number: Option<u64>,
+    finality_blocks: u64,
+    receipt_result: &Result<Option<crate::confirmation::ConfirmationReceipt>>,
+) -> crate::options::OptionConfirmationDecision {
+    use crate::options::{OptionConfirmationDecision, OptionConfirmationOutcome};
+    let base = |outcome: OptionConfirmationOutcome,
+                receipt_status: Option<u64>,
+                block_number: Option<u64>,
+                error: Option<String>|
+     -> OptionConfirmationDecision {
+        OptionConfirmationDecision {
+            transaction_id: transaction_id.to_string(),
+            tx_hash: Some(expected_tx_hash.to_string()),
+            outcome,
+            receipt_status,
+            block_number,
+            current_block_number,
+            finality_blocks,
+            error,
+        }
+    };
+    let receipt = match receipt_result {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return base(
+                OptionConfirmationOutcome::ReceiptMissing,
+                None,
+                None,
+                Some("receipt not yet available".to_string()),
+            )
+        }
+        Err(error) => {
+            return base(
+                OptionConfirmationOutcome::ReceiptError,
+                None,
+                None,
+                Some(error.to_string()),
+            )
+        }
+    };
+    if !receipt.tx_hash.eq_ignore_ascii_case(expected_tx_hash) {
+        return base(
+            OptionConfirmationOutcome::ReceiptMissing,
+            receipt.status,
+            receipt.block_number,
+            Some(format!(
+                "receipt tx hash {} does not match submitted {}",
+                receipt.tx_hash, expected_tx_hash
+            )),
+        );
+    }
+    let Some(receipt_block) = receipt.block_number else {
+        return base(
+            OptionConfirmationOutcome::ReceiptError,
+            receipt.status,
+            None,
+            Some("receipt missing block_number".to_string()),
+        );
+    };
+    let Some(head) = current_block_number else {
+        return base(
+            OptionConfirmationOutcome::NotFinalized,
+            receipt.status,
+            Some(receipt_block),
+            Some("current block number unavailable".to_string()),
+        );
+    };
+    let finalized_at = receipt_block.saturating_add(finality_blocks);
+    if head < finalized_at {
+        return base(
+            OptionConfirmationOutcome::NotFinalized,
+            receipt.status,
+            Some(receipt_block),
+            None,
+        );
+    }
+    match receipt.status {
+        Some(1) => base(
+            OptionConfirmationOutcome::MinedSuccess,
+            Some(1),
+            Some(receipt_block),
+            None,
+        ),
+        Some(other) => base(
+            OptionConfirmationOutcome::MinedFailed,
+            Some(other),
+            Some(receipt_block),
+            None,
+        ),
+        None => base(
+            OptionConfirmationOutcome::ReceiptError,
+            None,
+            Some(receipt_block),
+            Some("receipt missing status field".to_string()),
+        ),
+    }
+}
+
+async fn apply_worker_decision(
+    state: &AppState,
+    transaction: &OptionExecutionTransaction,
+    decision: &crate::options::OptionConfirmationDecision,
+    now: TimestampMs,
+) -> Result<()> {
+    use crate::options::OptionConfirmationOutcome;
+    let (persist_status, intent_status) = match decision.outcome {
+        OptionConfirmationOutcome::MinedSuccess => (
+            OptionExecutionConfirmationStatus::MinedSuccess,
+            Some(OptionExecutionIntentStatus::BroadcastConfirmed),
+        ),
+        OptionConfirmationOutcome::MinedFailed => (
+            OptionExecutionConfirmationStatus::MinedFailed,
+            Some(OptionExecutionIntentStatus::BroadcastFailed),
+        ),
+        OptionConfirmationOutcome::NotFinalized => {
+            (OptionExecutionConfirmationStatus::Pending, None)
+        }
+        OptionConfirmationOutcome::ReceiptMissing => {
+            (OptionExecutionConfirmationStatus::ReceiptMissing, None)
+        }
+        OptionConfirmationOutcome::ReceiptError => {
+            (OptionExecutionConfirmationStatus::ReceiptError, None)
+        }
+        OptionConfirmationOutcome::Disabled | OptionConfirmationOutcome::NoPending => return Ok(()),
+    };
+
+    persist_option_execution_confirmation(
+        state,
+        &transaction.transaction_id,
+        persist_status,
+        now,
+        decision.block_number,
+        decision.receipt_status,
+        decision.error.clone(),
+    )
+    .await?;
+    if let Some(next) = intent_status {
+        update_option_execution_intent_status(state, transaction.intent_id, next, None, now)
+            .await?;
+    }
+    Ok(())
+}
+
 async fn persist_option_execution_confirmation(
     state: &AppState,
     transaction_id: &str,
@@ -3374,6 +3599,7 @@ mod tests {
     struct MockReceiptProvider {
         outcome: MockReceiptOutcome,
         calls: Arc<Mutex<Vec<String>>>,
+        head_block: u64,
     }
 
     impl MockReceiptProvider {
@@ -3385,6 +3611,7 @@ mod tests {
                     block_number: Some(block),
                 }),
                 calls: Arc::new(Mutex::new(Vec::new())),
+                head_block: 0,
             }
         }
 
@@ -3396,6 +3623,7 @@ mod tests {
                     block_number: Some(block),
                 }),
                 calls: Arc::new(Mutex::new(Vec::new())),
+                head_block: 0,
             }
         }
 
@@ -3403,6 +3631,7 @@ mod tests {
             Self {
                 outcome: MockReceiptOutcome::NotFound,
                 calls: Arc::new(Mutex::new(Vec::new())),
+                head_block: 0,
             }
         }
 
@@ -3410,7 +3639,13 @@ mod tests {
             Self {
                 outcome: MockReceiptOutcome::Error(message.to_string()),
                 calls: Arc::new(Mutex::new(Vec::new())),
+                head_block: 0,
             }
+        }
+
+        fn with_head(mut self, head_block: u64) -> Self {
+            self.head_block = head_block;
+            self
         }
 
         fn call_count(&self) -> usize {
@@ -3420,7 +3655,8 @@ mod tests {
 
     impl TransactionReceiptProvider for MockReceiptProvider {
         fn block_number(&self) -> RpcFuture<'_, u64> {
-            Box::pin(async move { Ok(0) })
+            let head = self.head_block;
+            Box::pin(async move { Ok(head) })
         }
 
         fn transaction_receipt(
@@ -3853,5 +4089,244 @@ mod tests {
             signature.push_str(&format!("{byte:02x}"));
         }
         signature
+    }
+
+    // ----------------------------------------------------------------------------
+    // V1V option execution confirmation worker tests
+    // ----------------------------------------------------------------------------
+
+    fn state_with_confirmation_worker(enabled: bool, finality_blocks: u64) -> AppState {
+        let mut state = state_with_broadcast(true);
+        state.option_confirmation_config = crate::options::OptionConfirmationConfig {
+            enabled,
+            poll_interval_ms: 15_000,
+            finality_blocks,
+            batch_size: 25,
+            require_rpc: true,
+            rpc_url: Some("http://127.0.0.1:8545".to_string()),
+        };
+        state
+    }
+
+    fn pending_tx_hash() -> &'static str {
+        "0x5964a7b3d2c18d051baaa780413d31c44d419ce530f45263cb4c46f720881125"
+    }
+
+    #[tokio::test]
+    async fn worker_disabled_returns_disabled_and_does_nothing() {
+        let state = state_with_confirmation_worker(false, 3);
+        let tx_hash = pending_tx_hash();
+        let (intent, tx) = broadcast_submitted_intent_with_tx(&state, tx_hash);
+        let provider = MockReceiptProvider::mined_success(tx_hash, 100).with_head(200);
+
+        let result = confirm_pending_option_execution_transactions(&state, &provider)
+            .await
+            .unwrap();
+
+        assert!(!result.enabled);
+        assert!(result.decisions.is_empty());
+        assert_eq!(provider.call_count(), 0);
+        let intent_after = get_option_execution_intent(&state, intent.intent_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            intent_after.status,
+            OptionExecutionIntentStatus::BroadcastSubmitted
+        );
+        let txs = option_transactions(&state, intent.intent_id);
+        assert_eq!(txs[0].transaction_id, tx.transaction_id);
+        assert!(txs[0].confirmation_status.is_none());
+        assert_no_generic_execution_rows(&state);
+    }
+
+    #[tokio::test]
+    async fn worker_missing_receipt_leaves_pending() {
+        let state = state_with_confirmation_worker(true, 3);
+        let tx_hash = pending_tx_hash();
+        let (intent, _tx) = broadcast_submitted_intent_with_tx(&state, tx_hash);
+        let provider = MockReceiptProvider::missing().with_head(200);
+
+        let result = confirm_pending_option_execution_transactions(&state, &provider)
+            .await
+            .unwrap();
+
+        assert!(result.enabled);
+        assert_eq!(result.decisions.len(), 1);
+        let decision = &result.decisions[0];
+        assert_eq!(
+            decision.outcome,
+            crate::options::OptionConfirmationOutcome::ReceiptMissing
+        );
+        let intent_after = get_option_execution_intent(&state, intent.intent_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            intent_after.status,
+            OptionExecutionIntentStatus::BroadcastSubmitted
+        );
+        let txs = option_transactions(&state, intent.intent_id);
+        assert_eq!(
+            txs[0].confirmation_status,
+            Some(OptionExecutionConfirmationStatus::ReceiptMissing)
+        );
+        assert_no_generic_execution_rows(&state);
+    }
+
+    #[tokio::test]
+    async fn worker_receipt_without_finality_does_not_finalize() {
+        let state = state_with_confirmation_worker(true, 3);
+        let tx_hash = pending_tx_hash();
+        let (intent, _tx) = broadcast_submitted_intent_with_tx(&state, tx_hash);
+        // receipt at block 100, head at 101: head < 100+3 → not finalized
+        let provider = MockReceiptProvider::mined_success(tx_hash, 100).with_head(101);
+
+        let result = confirm_pending_option_execution_transactions(&state, &provider)
+            .await
+            .unwrap();
+
+        assert!(result.enabled);
+        let decision = &result.decisions[0];
+        assert_eq!(
+            decision.outcome,
+            crate::options::OptionConfirmationOutcome::NotFinalized
+        );
+        assert_eq!(decision.receipt_status, Some(1));
+        assert_eq!(decision.block_number, Some(100));
+        assert_eq!(decision.current_block_number, Some(101));
+        let intent_after = get_option_execution_intent(&state, intent.intent_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            intent_after.status,
+            OptionExecutionIntentStatus::BroadcastSubmitted
+        );
+        let txs = option_transactions(&state, intent.intent_id);
+        assert_eq!(
+            txs[0].confirmation_status,
+            Some(OptionExecutionConfirmationStatus::Pending)
+        );
+        assert_no_generic_execution_rows(&state);
+    }
+
+    #[tokio::test]
+    async fn worker_successful_receipt_with_finality_finalizes_mined_success() {
+        let state = state_with_confirmation_worker(true, 3);
+        let tx_hash = pending_tx_hash();
+        let (intent, _tx) = broadcast_submitted_intent_with_tx(&state, tx_hash);
+        let provider = MockReceiptProvider::mined_success(tx_hash, 100).with_head(105);
+
+        let result = confirm_pending_option_execution_transactions(&state, &provider)
+            .await
+            .unwrap();
+
+        let decision = &result.decisions[0];
+        assert_eq!(
+            decision.outcome,
+            crate::options::OptionConfirmationOutcome::MinedSuccess
+        );
+        assert_eq!(decision.receipt_status, Some(1));
+        assert_eq!(decision.block_number, Some(100));
+        let intent_after = get_option_execution_intent(&state, intent.intent_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            intent_after.status,
+            OptionExecutionIntentStatus::BroadcastConfirmed
+        );
+        let txs = option_transactions(&state, intent.intent_id);
+        assert_eq!(
+            txs[0].confirmation_status,
+            Some(OptionExecutionConfirmationStatus::MinedSuccess)
+        );
+        assert_eq!(txs[0].confirmed_block_number, Some(100));
+        assert_eq!(txs[0].receipt_status, Some(1));
+        assert_no_generic_execution_rows(&state);
+    }
+
+    #[tokio::test]
+    async fn worker_failed_receipt_with_finality_finalizes_mined_failed() {
+        let state = state_with_confirmation_worker(true, 3);
+        let tx_hash = pending_tx_hash();
+        let (intent, _tx) = broadcast_submitted_intent_with_tx(&state, tx_hash);
+        let provider = MockReceiptProvider::mined_reverted(tx_hash, 100).with_head(120);
+
+        let result = confirm_pending_option_execution_transactions(&state, &provider)
+            .await
+            .unwrap();
+
+        let decision = &result.decisions[0];
+        assert_eq!(
+            decision.outcome,
+            crate::options::OptionConfirmationOutcome::MinedFailed
+        );
+        assert_eq!(decision.receipt_status, Some(0));
+        assert_eq!(decision.block_number, Some(100));
+        let intent_after = get_option_execution_intent(&state, intent.intent_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            intent_after.status,
+            OptionExecutionIntentStatus::BroadcastFailed
+        );
+        let txs = option_transactions(&state, intent.intent_id);
+        assert_eq!(
+            txs[0].confirmation_status,
+            Some(OptionExecutionConfirmationStatus::MinedFailed)
+        );
+        assert_eq!(txs[0].receipt_status, Some(0));
+        assert_no_generic_execution_rows(&state);
+    }
+
+    #[tokio::test]
+    async fn worker_does_not_use_broadcast_provider() {
+        // Construct a state with both worker enabled and an in-memory broadcast provider
+        // that *would* fail loudly if called. Confirm the worker never touches it.
+        let state = state_with_confirmation_worker(true, 3);
+        let tx_hash = pending_tx_hash();
+        let (_intent, _tx) = broadcast_submitted_intent_with_tx(&state, tx_hash);
+        let receipt_provider = MockReceiptProvider::mined_success(tx_hash, 100).with_head(120);
+        let broadcast_provider = MockBroadcastProvider::success();
+
+        let _ = confirm_pending_option_execution_transactions(&state, &receipt_provider)
+            .await
+            .unwrap();
+
+        assert_eq!(broadcast_provider.send_count(), 0);
+        assert_no_generic_execution_rows(&state);
+    }
+
+    #[tokio::test]
+    async fn worker_never_creates_generic_execution_rows() {
+        let state = state_with_confirmation_worker(true, 3);
+        let tx_hash = pending_tx_hash();
+        let (intent, _tx) = broadcast_submitted_intent_with_tx(&state, tx_hash);
+        let provider = MockReceiptProvider::mined_success(tx_hash, 100).with_head(200);
+
+        for _ in 0..3 {
+            confirm_pending_option_execution_transactions(&state, &provider)
+                .await
+                .unwrap();
+        }
+
+        // The option-side row sees its final mined_success.
+        let txs = option_transactions(&state, intent.intent_id);
+        assert_eq!(txs.len(), 1);
+        assert_eq!(
+            txs[0].confirmation_status,
+            Some(OptionExecutionConfirmationStatus::MinedSuccess)
+        );
+        assert_no_generic_execution_rows(&state);
+    }
+
+    #[test]
+    fn worker_outcome_is_finalized_only_for_mined_states() {
+        use crate::options::OptionConfirmationOutcome::*;
+        assert!(MinedSuccess.is_finalized());
+        assert!(MinedFailed.is_finalized());
+        assert!(!NotFinalized.is_finalized());
+        assert!(!ReceiptMissing.is_finalized());
+        assert!(!ReceiptError.is_finalized());
+        assert!(!Disabled.is_finalized());
+        assert!(!NoPending.is_finalized());
     }
 }

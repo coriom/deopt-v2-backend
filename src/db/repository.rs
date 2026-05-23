@@ -2252,6 +2252,41 @@ impl PgRepository {
         row.map(option_execution_transaction_from_row).transpose()
     }
 
+    /// Pending option execution transactions for the confirmation worker.
+    ///
+    /// A row is "pending" when it has been submitted on-chain (status=submitted), has a
+    /// non-empty tx hash, and has not yet been finalized (`confirmation_status` is NULL,
+    /// `pending`, `receipt_missing`, or `receipt_error`).
+    pub async fn list_pending_option_execution_transactions(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<OptionExecutionTransaction>> {
+        let rows = sqlx::query(
+            "SELECT transaction_id, intent_id, onchain_intent_id, sender, target, calldata,
+                    value_wei, gas_limit, tx_hash, status, error, created_at_ms, updated_at_ms,
+                    estimated_gas, required_gas, simulation_gas_limit, broadcast_gas_limit,
+                    gas_safety_bps, gas_check_status, gas_check_error,
+                    confirmation_status, confirmed_at_ms, confirmed_block_number,
+                    receipt_status, confirmation_error
+             FROM option_execution_transactions
+             WHERE status = 'submitted'
+               AND tx_hash IS NOT NULL
+               AND (
+                   confirmation_status IS NULL
+                   OR confirmation_status IN ('pending', 'receipt_missing', 'receipt_error')
+               )
+             ORDER BY created_at_ms ASC, transaction_id ASC
+             LIMIT $1",
+        )
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        rows.into_iter()
+            .map(option_execution_transaction_from_row)
+            .collect()
+    }
+
     pub async fn get_option_execution_transaction(
         &self,
         transaction_id: &str,

@@ -5,6 +5,7 @@ use deopt_v2_backend::engine::EngineState;
 use deopt_v2_backend::execution::{spawn_executor, Executor};
 use deopt_v2_backend::indexer::{spawn_indexer, Indexer};
 use deopt_v2_backend::mm::transport::webtransport::spawn_webtransport_gateway;
+use deopt_v2_backend::options::spawn_option_confirmation_worker;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -16,6 +17,9 @@ async fn main() -> deopt_v2_backend::Result<()> {
         .validate_startup(config.persistence_enabled)?;
     config.perp_nonce_sync.validate_startup()?;
     config.option_nonce_sync.validate_startup()?;
+    config
+        .option_confirmation
+        .validate_startup(config.persistence_enabled)?;
     config
         .indexer
         .validate_startup(config.persistence_enabled)?;
@@ -66,6 +70,7 @@ async fn main() -> deopt_v2_backend::Result<()> {
         config.fees.clone(),
         config.chain_id,
     );
+    state.option_confirmation_config = config.option_confirmation.clone();
     state.network_name = config.network_name.clone();
     state.persistence_enabled = config.persistence_enabled;
     state.database_configured = config.database_url.is_some();
@@ -90,6 +95,7 @@ async fn main() -> deopt_v2_backend::Result<()> {
             spawn_indexer(indexer, config.indexer.poll_interval_ms);
         }
     }
+    spawn_option_confirmation_worker(state.clone());
     spawn_webtransport_gateway(config.mm_gateway.clone(), state).await?;
 
     info!(
@@ -99,6 +105,7 @@ async fn main() -> deopt_v2_backend::Result<()> {
         network = %config.network_name,
         execution_enabled = config.execution.execution_enabled,
         confirmation_enabled = config.confirmation.enabled,
+        option_confirmation_worker_enabled = config.option_confirmation.enabled,
         rfq_enabled = config.rfq.enabled,
         options_enabled = config.options.enabled,
         fees_enabled = config.fees.enabled,

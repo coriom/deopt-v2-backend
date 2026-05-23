@@ -26,6 +26,7 @@ pub struct AppConfig {
     pub execution: ExecutionConfig,
     pub perp_nonce_sync: PerpNonceSyncConfig,
     pub option_nonce_sync: OptionNonceSyncConfig,
+    pub option_confirmation: crate::options::OptionConfirmationConfig,
     pub confirmation: ConfirmationConfig,
     pub indexer: IndexerConfig,
     pub reconciliation: ReconciliationConfig,
@@ -343,6 +344,18 @@ impl AppConfig {
             rpc_url: execution.rpc_url.clone(),
             option_matching_engine_address: options.matching_engine_address.clone(),
         };
+        let option_confirmation = crate::options::OptionConfirmationConfig {
+            enabled: parse_env(&mut lookup, "OPTION_CONFIRMATION_WORKER_ENABLED", "false")?,
+            poll_interval_ms: parse_env(
+                &mut lookup,
+                "OPTION_CONFIRMATION_POLL_INTERVAL_MS",
+                "15000",
+            )?,
+            finality_blocks: parse_env(&mut lookup, "OPTION_CONFIRMATION_FINALITY_BLOCKS", "3")?,
+            batch_size: parse_env(&mut lookup, "OPTION_CONFIRMATION_BATCH_SIZE", "25")?,
+            require_rpc: parse_env(&mut lookup, "OPTION_CONFIRMATION_REQUIRE_RPC", "true")?,
+            rpc_url: execution.rpc_url.clone(),
+        };
         let signature_verification_mode =
             parse_env(&mut lookup, "SIGNATURE_VERIFICATION_MODE", "disabled")?;
         let eip712_domain = Eip712Domain {
@@ -366,6 +379,7 @@ impl AppConfig {
         execution.validate_startup(persistence_enabled)?;
         perp_nonce_sync.validate_startup()?;
         option_nonce_sync.validate_startup()?;
+        option_confirmation.validate_startup(persistence_enabled)?;
         indexer.validate_startup(persistence_enabled)?;
         reconciliation.validate_startup(persistence_enabled)?;
         confirmation.validate_startup(persistence_enabled)?;
@@ -387,6 +401,7 @@ impl AppConfig {
             execution,
             perp_nonce_sync,
             option_nonce_sync,
+            option_confirmation,
             confirmation,
             indexer,
             reconciliation,
@@ -605,6 +620,67 @@ mod tests {
     fn option_execution_gas_safety_bps_parses_override() {
         let config = config_from_pairs([("OPTION_EXECUTION_GAS_SAFETY_BPS", "13000")]).unwrap();
         assert_eq!(config.options.execution_gas_safety_bps, 13_000);
+    }
+
+    #[test]
+    fn option_confirmation_worker_uses_safe_defaults() {
+        let config = config_from_pairs([("OPTION_CONFIRMATION_WORKER_ENABLED", "false")]).unwrap();
+        assert!(!config.option_confirmation.enabled);
+        assert_eq!(config.option_confirmation.poll_interval_ms, 15_000);
+        assert_eq!(config.option_confirmation.finality_blocks, 3);
+        assert_eq!(config.option_confirmation.batch_size, 25);
+        assert!(config.option_confirmation.require_rpc);
+    }
+
+    #[test]
+    fn option_confirmation_worker_parses_overrides() {
+        let config = config_from_pairs([
+            ("OPTION_CONFIRMATION_WORKER_ENABLED", "true"),
+            ("OPTION_CONFIRMATION_POLL_INTERVAL_MS", "5000"),
+            ("OPTION_CONFIRMATION_FINALITY_BLOCKS", "7"),
+            ("OPTION_CONFIRMATION_BATCH_SIZE", "50"),
+            ("OPTION_CONFIRMATION_REQUIRE_RPC", "true"),
+            ("RPC_URL", "https://example.invalid"),
+            ("PERSISTENCE_ENABLED", "true"),
+            ("DATABASE_URL", "postgres://example.invalid/db"),
+        ])
+        .unwrap();
+        assert!(config.option_confirmation.enabled);
+        assert_eq!(config.option_confirmation.poll_interval_ms, 5_000);
+        assert_eq!(config.option_confirmation.finality_blocks, 7);
+        assert_eq!(config.option_confirmation.batch_size, 50);
+        assert!(config.option_confirmation.require_rpc);
+        assert_eq!(
+            config.option_confirmation.rpc_url.as_deref(),
+            Some("https://example.invalid")
+        );
+    }
+
+    #[test]
+    fn option_confirmation_worker_rejects_when_persistence_disabled() {
+        let error = config_from_pairs([
+            ("OPTION_CONFIRMATION_WORKER_ENABLED", "true"),
+            ("OPTION_CONFIRMATION_REQUIRE_RPC", "false"),
+            ("PERSISTENCE_ENABLED", "false"),
+        ])
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("option confirmation worker requires persistence"));
+    }
+
+    #[test]
+    fn option_confirmation_worker_rejects_when_rpc_required_but_missing() {
+        let error = config_from_pairs([
+            ("OPTION_CONFIRMATION_WORKER_ENABLED", "true"),
+            ("OPTION_CONFIRMATION_REQUIRE_RPC", "true"),
+            ("PERSISTENCE_ENABLED", "true"),
+            ("DATABASE_URL", "postgres://example.invalid/db"),
+        ])
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("RPC_URL is required when OPTION_CONFIRMATION_WORKER_ENABLED=true"));
     }
 
     #[test]

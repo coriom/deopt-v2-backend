@@ -482,7 +482,15 @@ async fn admin_config(
             "option_nonce_sync_rpc_configured": state.option_nonce_sync_config.rpc_url.is_some(),
             "execution_eip712_name": state.options_config.execution_eip712_domain.name,
             "execution_eip712_version": state.options_config.execution_eip712_domain.version,
-            "execution_eip712_chain_id": state.options_config.execution_eip712_domain.chain_id
+            "execution_eip712_chain_id": state.options_config.execution_eip712_domain.chain_id,
+            "confirmation_worker": {
+                "enabled": state.option_confirmation_config.enabled,
+                "poll_interval_ms": state.option_confirmation_config.poll_interval_ms,
+                "finality_blocks": state.option_confirmation_config.finality_blocks,
+                "batch_size": state.option_confirmation_config.batch_size,
+                "require_rpc": state.option_confirmation_config.require_rpc,
+                "rpc_configured": state.option_confirmation_config.rpc_url.is_some()
+            }
         }
     })))
 }

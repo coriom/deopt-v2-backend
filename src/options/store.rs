@@ -491,6 +491,38 @@ impl OptionSeriesStore {
         transactions.into_iter().next()
     }
 
+    pub fn list_pending_option_execution_transactions(
+        &self,
+        limit: u32,
+    ) -> Vec<OptionExecutionTransaction> {
+        let mut transactions = self
+            .option_execution_transactions
+            .values()
+            .filter(|tx| {
+                tx.status == ExecutionTransactionStatus::Submitted
+                    && tx
+                        .tx_hash
+                        .as_deref()
+                        .map(|hash| !hash.is_empty())
+                        .unwrap_or(false)
+                    && matches!(
+                        tx.confirmation_status,
+                        None | Some(OptionExecutionConfirmationStatus::Pending)
+                            | Some(OptionExecutionConfirmationStatus::ReceiptMissing)
+                            | Some(OptionExecutionConfirmationStatus::ReceiptError)
+                    )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        transactions.sort_by(|left, right| {
+            left.created_at_ms
+                .cmp(&right.created_at_ms)
+                .then_with(|| left.transaction_id.cmp(&right.transaction_id))
+        });
+        transactions.truncate(limit as usize);
+        transactions
+    }
+
     pub fn update_option_execution_confirmation(
         &mut self,
         transaction_id: &str,

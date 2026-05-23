@@ -469,7 +469,11 @@ pub struct OptionExecutionTransaction {
 pub enum OptionExecutionConfirmationStatus {
     Pending,
     MinedSuccess,
+    /// V1T legacy status for `eth_getTransactionReceipt.status == 0`.
+    /// New code paths emit `MinedFailed` instead; `MinedReverted` is retained
+    /// for backward compatibility with V1T-era persisted rows.
     MinedReverted,
+    MinedFailed,
     ReceiptMissing,
     ReceiptError,
 }
@@ -480,6 +484,7 @@ impl OptionExecutionConfirmationStatus {
             Self::Pending => "pending",
             Self::MinedSuccess => "mined_success",
             Self::MinedReverted => "mined_reverted",
+            Self::MinedFailed => "mined_failed",
             Self::ReceiptMissing => "receipt_missing",
             Self::ReceiptError => "receipt_error",
         }
@@ -490,6 +495,7 @@ impl OptionExecutionConfirmationStatus {
             "pending" => Ok(Self::Pending),
             "mined_success" => Ok(Self::MinedSuccess),
             "mined_reverted" => Ok(Self::MinedReverted),
+            "mined_failed" => Ok(Self::MinedFailed),
             "receipt_missing" => Ok(Self::ReceiptMissing),
             "receipt_error" => Ok(Self::ReceiptError),
             other => Err(BackendError::Persistence(format!(
