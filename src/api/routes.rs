@@ -261,6 +261,15 @@ pub fn router(state: AppState) -> Router {
             get(admin_option_confirmations),
         )
         .route("/admin/options/events", get(admin_option_events))
+        .route("/admin/options/events/tick", post(admin_option_events_tick))
+        .route(
+            "/admin/options/reconciliations",
+            get(admin_option_reconciliations),
+        )
+        .route(
+            "/admin/options/reconciliations/tick",
+            post(admin_option_reconciliations_tick),
+        )
         .route("/admin/mm/sessions", get(admin_mm_sessions))
         .route("/admin/mm/permissions", get(admin_mm_permissions))
         .route("/admin/execution/summary", get(admin_execution_summary))
@@ -376,6 +385,7 @@ async fn admin_config(
             "option_execution_simulation_enabled": state.options_config.execution_simulation_enabled,
             "option_execution_broadcast_enabled": state.options_config.execution_broadcast_enabled,
             "option_event_indexer_enabled": state.option_event_indexer_config.enabled,
+        "option_reconciliation_worker_enabled": state.option_reconciliation_config.enabled,
             "option_nonce_sync_enabled": state.option_nonce_sync_config.enabled,
             "fees_enabled": state.fees_config.enabled,
             "rebates_enabled": state.fees_config.rebates_enabled,
@@ -515,6 +525,15 @@ async fn admin_config(
                 "margin_engine_address": state.option_event_indexer_config.margin_engine_address,
                 "collateral_vault_address": state.option_event_indexer_config.collateral_vault_address,
                 "fees_manager_address": state.option_event_indexer_config.fees_manager_address
+            },
+            "reconciliation_worker": {
+                "enabled": state.option_reconciliation_config.enabled,
+                "poll_interval_ms": state.option_reconciliation_config.poll_interval_ms,
+                "batch_size": state.option_reconciliation_config.batch_size,
+                "require_events": state.option_reconciliation_config.require_events,
+                "require_rpc": state.option_reconciliation_config.require_rpc,
+                "strict": state.option_reconciliation_config.strict,
+                "rpc_configured": state.option_reconciliation_config.rpc_url.is_some()
             }
         }
     })))
@@ -655,6 +674,83 @@ async fn admin_option_events(
         "counts": counts_by_event_name,
         "recent": recent
     })))
+}
+
+async fn admin_option_events_tick(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<Json<crate::options::OptionEventIndexerTickResult>, ApiError> {
+    ensure_admin_access(&state, &headers)?;
+    if !state.option_event_indexer_config.enabled {
+        return Err(BackendError::Config("option event indexer is disabled".to_string()).into());
+    }
+    let rpc_url = state
+        .option_event_indexer_config
+        .rpc_url
+        .clone()
+        .ok_or_else(|| {
+            BackendError::Config(
+                "option event indexer requires RPC_URL to run a one-shot tick".to_string(),
+            )
+        })?;
+    let provider = HttpJsonRpcProvider::new(rpc_url);
+    let result = crate::options::index_option_events_with_provider(&state, &provider).await?;
+    Ok(Json(result))
+}
+
+async fn admin_option_reconciliations(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    ensure_admin_access(&state, &headers)?;
+    let counts: serde_json::Map<String, serde_json::Value> =
+        crate::options::summarize_option_execution_reconciliations(&state)
+            .await?
+            .into_iter()
+            .map(|(status, count)| (status, serde_json::Value::from(count)))
+            .collect();
+    let recent = if let Some(repository) = state.repository.clone() {
+        repository.list_option_execution_reconciliations(20).await?
+    } else {
+        state
+            .options_store
+            .lock()
+            .map_err(|_| ApiError::internal())?
+            .list_option_execution_reconciliations(20)
+    };
+    let latest_tick = state
+        .option_reconciliation_last_tick
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone());
+    Ok(Json(serde_json::json!({
+        "config": {
+            "enabled": state.option_reconciliation_config.enabled,
+            "poll_interval_ms": state.option_reconciliation_config.poll_interval_ms,
+            "batch_size": state.option_reconciliation_config.batch_size,
+            "require_events": state.option_reconciliation_config.require_events,
+            "require_rpc": state.option_reconciliation_config.require_rpc,
+            "strict": state.option_reconciliation_config.strict,
+            "rpc_configured": state.option_reconciliation_config.rpc_url.is_some()
+        },
+        "counts": serde_json::Value::Object(counts),
+        "latest_tick": latest_tick,
+        "recent": recent,
+    })))
+}
+
+async fn admin_option_reconciliations_tick(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<Json<crate::options::OptionReconciliationTickResult>, ApiError> {
+    ensure_admin_access(&state, &headers)?;
+    if !state.option_reconciliation_config.enabled {
+        return Err(
+            BackendError::Config("option reconciliation worker is disabled".to_string()).into(),
+        );
+    }
+    let result = crate::options::reconcile_option_executions(&state).await?;
+    Ok(Json(result))
 }
 
 async fn admin_mm_sessions(
@@ -4957,6 +5053,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admin_option_events_tick_rejects_when_indexer_disabled() {
+        let state = admin_state(false);
+        let response = router(state)
+            .oneshot(post_request("/admin/options/events/tick"))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let json = response_json(response).await;
+        assert_eq!(
+            json["error"],
+            "configuration error: option event indexer is disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_option_events_tick_rejects_when_rpc_missing() {
+        let mut state = admin_state(false);
+        state.option_event_indexer_config = crate::options::OptionEventIndexerConfig {
+            enabled: true,
+            poll_interval_ms: 15_000,
+            from_block: 41_856_963,
+            batch_blocks: 5,
+            confirmation_blocks: 3,
+            require_rpc: false,
+            rpc_url: None,
+            matching_engine_address: AccountId::new("0x00000000000000000000000000000000000000ee"),
+            margin_engine_address: AccountId::new("0x00000000000000000000000000000000000000aa"),
+            collateral_vault_address: AccountId::new("0x00000000000000000000000000000000000000bb"),
+            fees_manager_address: None,
+        };
+
+        let response = router(state)
+            .oneshot(post_request("/admin/options/events/tick"))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let json = response_json(response).await;
+        assert_eq!(
+            json["error"],
+            "configuration error: option event indexer requires RPC_URL to run a one-shot tick"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_option_events_tick_runs_once_and_is_idempotent() {
+        let logs = vec![route_option_trade_log()];
+        let rpc_url = spawn_logs_rpc(41_856_967, logs).await;
+        let mut state = admin_state(false);
+        state.option_event_indexer_config = crate::options::OptionEventIndexerConfig {
+            enabled: true,
+            poll_interval_ms: 15_000,
+            from_block: 41_856_963,
+            batch_blocks: 5,
+            confirmation_blocks: 3,
+            require_rpc: true,
+            rpc_url: Some(rpc_url),
+            matching_engine_address: AccountId::new("0x00000000000000000000000000000000000000ee"),
+            margin_engine_address: AccountId::new("0x00000000000000000000000000000000000000aa"),
+            collateral_vault_address: AccountId::new("0x00000000000000000000000000000000000000bb"),
+            fees_manager_address: None,
+        };
+        let app = router(state.clone());
+
+        let first = app
+            .clone()
+            .oneshot(post_request("/admin/options/events/tick"))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let json = response_json(first).await;
+        assert_eq!(json["enabled"], true);
+        assert_eq!(json["from_block"], 41_856_964);
+        assert_eq!(json["to_block"], 41_856_964);
+        assert_eq!(json["logs_found"], 1);
+        assert_eq!(json["events_decoded"], 1);
+        assert_eq!(json["events_indexed"], 1);
+        assert_eq!(json["cursor_updated"], true);
+
+        let stored = state
+            .options_store
+            .lock()
+            .unwrap()
+            .list_option_execution_events(10);
+        assert_eq!(stored.len(), 1);
+
+        let second = app
+            .clone()
+            .oneshot(post_request("/admin/options/events/tick"))
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        let json = response_json(second).await;
+        assert_eq!(json["logs_found"], 0);
+        assert_eq!(json["events_indexed"], 0);
+        assert_eq!(
+            state
+                .options_store
+                .lock()
+                .unwrap()
+                .list_option_execution_events(10)
+                .len(),
+            1
+        );
+        assert!(state.repository.is_none());
+        assert!(state.trade_signatures.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn admin_recent_respects_limit_cap() {
         let response = router(admin_state(false))
             .oneshot(get_request("/admin/recent?limit=999", None))
@@ -4966,6 +5172,70 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let json = response_json(response).await;
         assert_eq!(json["limit"], 100);
+    }
+
+    #[tokio::test]
+    async fn admin_option_reconciliations_returns_counts_and_latest_tick() {
+        let mut state = admin_state(false);
+        state.option_reconciliation_config = crate::options::OptionReconciliationConfig {
+            enabled: true,
+            poll_interval_ms: 15_000,
+            batch_size: 25,
+            require_events: true,
+            require_rpc: true,
+            strict: true,
+            rpc_url: Some("https://rpc.example/redacted-key".to_string()),
+        };
+        *state.option_reconciliation_last_tick.lock().unwrap() =
+            Some(crate::options::OptionReconciliationTickResult {
+                enabled: true,
+                batch_size: 25,
+                strict: true,
+                require_events: true,
+                require_rpc: true,
+                considered: 2,
+                reconciled: 1,
+                partially_reconciled: 0,
+                reconciliation_failed: 1,
+                missing_events: 0,
+                skipped: 0,
+                decisions: Vec::new(),
+            });
+
+        let response = router(state)
+            .oneshot(get_request("/admin/options/reconciliations", None))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["config"]["enabled"], true);
+        assert_eq!(json["config"]["strict"], true);
+        assert_eq!(json["config"]["require_events"], true);
+        assert_eq!(json["config"]["rpc_configured"], true);
+        assert_eq!(json["counts"]["reconciled"], 0);
+        assert_eq!(json["counts"]["partially_reconciled"], 0);
+        assert_eq!(json["counts"]["reconciliation_failed"], 0);
+        assert_eq!(json["counts"]["missing_events"], 0);
+        assert_eq!(json["counts"]["skipped"], 0);
+        assert_eq!(json["latest_tick"]["reconciliation_failed"], 1);
+        assert_eq!(json["latest_tick"]["reconciled"], 1);
+        assert!(json["recent"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn admin_option_reconciliations_tick_rejects_when_disabled() {
+        let response = router(admin_state(false))
+            .oneshot(post_request("/admin/options/reconciliations/tick"))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let json = response_json(response).await;
+        assert_eq!(
+            json["error"],
+            "configuration error: option reconciliation worker is disabled"
+        );
     }
 
     #[tokio::test]
@@ -4993,6 +5263,7 @@ mod tests {
             "/admin/rfq/summary",
             "/admin/options/summary",
             "/admin/options/events",
+            "/admin/options/reconciliations",
             "/admin/fees/summary",
             "/admin/fees/events?limit=5",
             "/admin/fees/volumes",
@@ -5186,6 +5457,109 @@ mod tests {
             created_at_ms: 1,
             updated_at_ms: 1,
         }
+    }
+
+    fn eth_log_to_json(log: &crate::indexer::EthLog) -> serde_json::Value {
+        serde_json::json!({
+            "address": log.address,
+            "topics": log.topics,
+            "data": log.data,
+            "blockNumber": log.block_number,
+            "blockHash": log.block_hash,
+            "transactionHash": log.transaction_hash,
+            "logIndex": log.log_index,
+        })
+    }
+
+    fn route_option_trade_log() -> crate::indexer::EthLog {
+        let topic0 = crate::options::option_trade_executed_topic0();
+        let mut data = String::from("0x");
+        for value in [7u128, 1, 10_000, 0, 0, 0] {
+            data.push_str(&format!("{value:064x}"));
+        }
+        crate::indexer::EthLog {
+            address: "0x00000000000000000000000000000000000000ee".to_string(),
+            topics: vec![
+                topic0,
+                "0x1111111111111111111111111111111111111111111111111111111111111111".to_string(),
+                format!("0x{:0>64}", "0000000000000000000000000000000000000001"),
+                format!("0x{:0>64}", "0000000000000000000000000000000000000002"),
+            ],
+            data,
+            block_number: Some(format!("0x{:x}", 41_856_964u64)),
+            block_hash: Some(
+                "0x53d62c21ecbe462e2868e216b4655474de0d2b7b832f15ab6e72b216fb1f3853".to_string(),
+            ),
+            transaction_hash: Some(
+                "0x5964a7b3d2c18d051baaa780413d31c44d419ce530f45263cb4c46f720881125".to_string(),
+            ),
+            log_index: Some(format!("0x{:x}", 2u64)),
+        }
+    }
+
+    async fn spawn_logs_rpc(head: u64, logs: Vec<crate::indexer::EthLog>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let head_hex = format!("0x{head:x}");
+        let logs = std::sync::Arc::new(logs);
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::post(move |Json(payload): Json<serde_json::Value>| {
+                let head_hex = head_hex.clone();
+                let logs = logs.clone();
+                async move {
+                    let method = payload
+                        .get("method")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default();
+                    let id = payload.get("id").cloned().unwrap_or(serde_json::json!(1));
+                    let result = match method {
+                        "eth_blockNumber" => serde_json::Value::String(head_hex),
+                        "eth_getLogs" => {
+                            let filter = payload
+                                .get("params")
+                                .and_then(|params| params.get(0))
+                                .cloned()
+                                .unwrap_or(serde_json::Value::Null);
+                            let address = filter
+                                .get("address")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or_default()
+                                .to_ascii_lowercase();
+                            let topic0 = filter
+                                .get("topics")
+                                .and_then(|value| value.as_array())
+                                .and_then(|values| values.first())
+                                .and_then(|value| value.as_str())
+                                .unwrap_or_default()
+                                .to_ascii_lowercase();
+                            let filtered = logs
+                                .iter()
+                                .filter(|log| log.address.eq_ignore_ascii_case(&address))
+                                .filter(|log| {
+                                    log.topics
+                                        .first()
+                                        .map(|value| value.eq_ignore_ascii_case(&topic0))
+                                        .unwrap_or(false)
+                                })
+                                .map(eth_log_to_json)
+                                .collect::<Vec<_>>();
+                            serde_json::Value::Array(filtered)
+                        }
+                        _ => serde_json::Value::Null,
+                    };
+                    Json(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": result
+                    }))
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
     }
 
     async fn spawn_nonce_rpc(nonce: u128) -> String {

@@ -1,11 +1,12 @@
 use super::{
     OptionEventIndexerState, OptionExecutionConfirmationStatus, OptionExecutionEvent,
     OptionExecutionEventLink, OptionExecutionIntent, OptionExecutionIntentId,
-    OptionExecutionIntentStatus, OptionExecutionReceiptCost, OptionExecutionSimulationResult,
-    OptionExecutionSourceType, OptionExecutionTransaction, OptionFill, OptionFillFilter,
-    OptionFillId, OptionOrder, OptionOrderFilter, OptionOrderId, OptionOrderStatus, OptionRfqFill,
-    OptionRfqId, OptionRfqQuote, OptionRfqQuoteId, OptionRfqQuoteStatus, OptionRfqRequest,
-    OptionRfqStatus, OptionSeries, OptionSeriesFilter, OptionSeriesId, OptionSeriesStatus,
+    OptionExecutionIntentStatus, OptionExecutionReceiptCost, OptionExecutionReconciliation,
+    OptionExecutionSimulationResult, OptionExecutionSourceType, OptionExecutionTransaction,
+    OptionFill, OptionFillFilter, OptionFillId, OptionOrder, OptionOrderFilter, OptionOrderId,
+    OptionOrderStatus, OptionRfqFill, OptionRfqId, OptionRfqQuote, OptionRfqQuoteId,
+    OptionRfqQuoteStatus, OptionRfqRequest, OptionRfqStatus, OptionSeries, OptionSeriesFilter,
+    OptionSeriesId, OptionSeriesStatus,
 };
 use crate::error::{BackendError, Result};
 use crate::execution::ExecutionTransactionStatus;
@@ -26,6 +27,7 @@ pub struct OptionSeriesStore {
     option_execution_transactions: HashMap<String, OptionExecutionTransaction>,
     option_execution_events: HashMap<(u64, String, u64), OptionExecutionEvent>,
     option_event_indexer_states: HashMap<String, OptionEventIndexerState>,
+    option_execution_reconciliations: HashMap<String, OptionExecutionReconciliation>,
 }
 
 impl OptionSeriesStore {
@@ -736,6 +738,122 @@ impl OptionSeriesStore {
         });
         events.truncate(limit as usize);
         events
+    }
+
+    pub fn list_option_execution_events_by_tx_hash(
+        &self,
+        tx_hash: &str,
+    ) -> Vec<OptionExecutionEvent> {
+        let mut events = self
+            .option_execution_events
+            .values()
+            .filter(|event| event.tx_hash.eq_ignore_ascii_case(tx_hash))
+            .cloned()
+            .collect::<Vec<_>>();
+        events.sort_by(|left, right| {
+            left.block_number
+                .cmp(&right.block_number)
+                .then_with(|| left.log_index.cmp(&right.log_index))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        events
+    }
+
+    pub fn list_confirmed_unreconciled_option_execution_transactions(
+        &self,
+        limit: u32,
+    ) -> Vec<OptionExecutionTransaction> {
+        let mut transactions = self
+            .option_execution_transactions
+            .values()
+            .filter(|tx| {
+                tx.tx_hash
+                    .as_deref()
+                    .map(|hash| !hash.is_empty())
+                    .unwrap_or(false)
+                    && matches!(
+                        tx.confirmation_status,
+                        Some(OptionExecutionConfirmationStatus::MinedSuccess)
+                    )
+                    && !self
+                        .option_execution_reconciliations
+                        .contains_key(&tx.transaction_id)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        transactions.sort_by(|left, right| {
+            left.created_at_ms
+                .cmp(&right.created_at_ms)
+                .then_with(|| left.transaction_id.cmp(&right.transaction_id))
+        });
+        transactions.truncate(limit as usize);
+        transactions
+    }
+
+    pub fn upsert_option_execution_reconciliation(
+        &mut self,
+        row: OptionExecutionReconciliation,
+        updated_at_ms: i64,
+    ) {
+        let mut row = row;
+        if let Some(existing) = self
+            .option_execution_reconciliations
+            .get(&row.option_execution_transaction_id)
+        {
+            row.id = existing.id;
+            row.created_at_ms = existing.created_at_ms;
+        }
+        row.updated_at_ms = updated_at_ms;
+        self.option_execution_reconciliations
+            .insert(row.option_execution_transaction_id.clone(), row);
+    }
+
+    pub fn list_option_execution_reconciliations(
+        &self,
+        limit: u32,
+    ) -> Vec<OptionExecutionReconciliation> {
+        let mut rows = self
+            .option_execution_reconciliations
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        rows.sort_by(|left, right| {
+            right
+                .reconciled_at_ms
+                .cmp(&left.reconciled_at_ms)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        rows.truncate(limit as usize);
+        rows
+    }
+
+    pub fn summarize_option_execution_reconciliations(&self) -> Vec<(String, u64)> {
+        let mut counts: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+        for row in self.option_execution_reconciliations.values() {
+            *counts.entry(row.status.as_str().to_string()).or_default() += 1;
+        }
+        counts.into_iter().collect()
+    }
+
+    pub fn get_option_execution_reconciliation_by_transaction_id(
+        &self,
+        transaction_id: &str,
+    ) -> Option<OptionExecutionReconciliation> {
+        self.option_execution_reconciliations
+            .get(transaction_id)
+            .cloned()
+    }
+
+    /// Test-only path that inserts an option execution transaction even when a
+    /// submitted row already exists for the same intent. Production code paths
+    /// continue to use [`insert_option_execution_transaction`].
+    #[cfg(test)]
+    pub fn test_insert_option_execution_transaction(
+        &mut self,
+        transaction: OptionExecutionTransaction,
+    ) {
+        self.option_execution_transactions
+            .insert(transaction.transaction_id.clone(), transaction);
     }
 
     pub fn option_execution_transactions_for_intent(

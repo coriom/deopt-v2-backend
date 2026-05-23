@@ -7,7 +7,7 @@ use crate::indexer::IndexerConfig;
 use crate::mm::transport::webtransport::validate_webtransport_startup;
 use crate::mm::{MmGatewayConfig, MmPermissionsConfig};
 use crate::nonce_sync::{OptionNonceSyncConfig, PerpNonceSyncConfig};
-use crate::options::{OptionEventIndexerConfig, OptionsConfig};
+use crate::options::{OptionEventIndexerConfig, OptionReconciliationConfig, OptionsConfig};
 use crate::reconciliation::ReconciliationConfig;
 use crate::rfq::RfqConfig;
 use crate::signing::signature::SignatureVerificationMode;
@@ -28,6 +28,7 @@ pub struct AppConfig {
     pub option_nonce_sync: OptionNonceSyncConfig,
     pub option_confirmation: crate::options::OptionConfirmationConfig,
     pub option_event_indexer: OptionEventIndexerConfig,
+    pub option_reconciliation: OptionReconciliationConfig,
     pub confirmation: ConfirmationConfig,
     pub indexer: IndexerConfig,
     pub reconciliation: ReconciliationConfig,
@@ -375,6 +376,19 @@ impl AppConfig {
             optional_env(&mut lookup, "OPTION_EVENT_INDEXER_FEES_MANAGER_ADDRESS")
                 .or_else(|| optional_env(&mut lookup, "FEES_MANAGER"))
                 .map(AccountId::new);
+        let option_reconciliation = OptionReconciliationConfig {
+            enabled: parse_env(&mut lookup, "OPTION_RECONCILIATION_WORKER_ENABLED", "false")?,
+            poll_interval_ms: parse_env(
+                &mut lookup,
+                "OPTION_RECONCILIATION_POLL_INTERVAL_MS",
+                "15000",
+            )?,
+            batch_size: parse_env(&mut lookup, "OPTION_RECONCILIATION_BATCH_SIZE", "25")?,
+            require_events: parse_env(&mut lookup, "OPTION_RECONCILIATION_REQUIRE_EVENTS", "true")?,
+            require_rpc: parse_env(&mut lookup, "OPTION_RECONCILIATION_REQUIRE_RPC", "true")?,
+            strict: parse_env(&mut lookup, "OPTION_RECONCILIATION_STRICT", "true")?,
+            rpc_url: execution.rpc_url.clone(),
+        };
         let option_event_indexer = OptionEventIndexerConfig {
             enabled: parse_env(&mut lookup, "OPTION_EVENT_INDEXER_ENABLED", "false")?,
             poll_interval_ms: parse_env(
@@ -421,6 +435,7 @@ impl AppConfig {
         option_nonce_sync.validate_startup()?;
         option_confirmation.validate_startup(persistence_enabled)?;
         option_event_indexer.validate_startup(persistence_enabled)?;
+        option_reconciliation.validate_startup(persistence_enabled)?;
         indexer.validate_startup(persistence_enabled)?;
         reconciliation.validate_startup(persistence_enabled)?;
         confirmation.validate_startup(persistence_enabled)?;
@@ -444,6 +459,7 @@ impl AppConfig {
             option_nonce_sync,
             option_confirmation,
             option_event_indexer,
+            option_reconciliation,
             confirmation,
             indexer,
             reconciliation,

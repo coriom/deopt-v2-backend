@@ -548,6 +548,65 @@ pub struct OptionExecutionEventLink {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum OptionReconciliationStatus {
+    Reconciled,
+    PartiallyReconciled,
+    ReconciliationFailed,
+    MissingEvents,
+    Skipped,
+}
+
+impl OptionReconciliationStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Reconciled => "reconciled",
+            Self::PartiallyReconciled => "partially_reconciled",
+            Self::ReconciliationFailed => "reconciliation_failed",
+            Self::MissingEvents => "missing_events",
+            Self::Skipped => "skipped",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "reconciled" => Ok(Self::Reconciled),
+            "partially_reconciled" => Ok(Self::PartiallyReconciled),
+            "reconciliation_failed" => Ok(Self::ReconciliationFailed),
+            "missing_events" => Ok(Self::MissingEvents),
+            "skipped" => Ok(Self::Skipped),
+            other => Err(BackendError::Persistence(format!(
+                "invalid option reconciliation status: {other}"
+            ))),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OptionExecutionReconciliation {
+    pub id: Uuid,
+    pub intent_id: OptionExecutionIntentId,
+    pub onchain_intent_id: String,
+    pub option_execution_transaction_id: String,
+    pub tx_hash: String,
+    pub chain_id: u64,
+    pub status: OptionReconciliationStatus,
+    pub strict: bool,
+    pub requires_events: bool,
+    pub trade_executed_event_id: Option<Uuid>,
+    pub margin_trade_event_id: Option<Uuid>,
+    pub trading_fee_event_count: u64,
+    pub internal_transfer_event_count: u64,
+    pub decoded_event_count: u64,
+    pub mismatch_reason: Option<String>,
+    pub missing_required: Option<String>,
+    pub details: serde_json::Value,
+    pub reconciled_at_ms: TimestampMs,
+    pub created_at_ms: TimestampMs,
+    pub updated_at_ms: TimestampMs,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum OptionExecutionConfirmationStatus {
     Pending,
     MinedSuccess,

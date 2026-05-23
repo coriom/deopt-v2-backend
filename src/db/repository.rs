@@ -19,9 +19,10 @@ use crate::options::{
     OptionEventIndexerState, OptionExecutionConfirmationStatus, OptionExecutionEvent,
     OptionExecutionEventLink, OptionExecutionGasCheckStatus, OptionExecutionIntent,
     OptionExecutionIntentId, OptionExecutionIntentStatus, OptionExecutionReceiptCost,
-    OptionExecutionSimulationResult, OptionExecutionSimulationStatus, OptionExecutionSourceType,
-    OptionExecutionTransaction, OptionFill, OptionFillId, OptionOrder, OptionOrderId,
-    OptionOrderStatus, OptionRfqFill, OptionRfqFillId, OptionRfqId, OptionRfqQuote,
+    OptionExecutionReconciliation, OptionExecutionSimulationResult,
+    OptionExecutionSimulationStatus, OptionExecutionSourceType, OptionExecutionTransaction,
+    OptionFill, OptionFillId, OptionOrder, OptionOrderId, OptionOrderStatus,
+    OptionReconciliationStatus, OptionRfqFill, OptionRfqFillId, OptionRfqId, OptionRfqQuote,
     OptionRfqQuoteId, OptionRfqQuoteSignatureStatus, OptionRfqQuoteStatus, OptionRfqRequest,
     OptionRfqStatus, OptionSeries, OptionSeriesSource, OptionSeriesStatus,
 };
@@ -68,6 +69,10 @@ const ADMIN_TABLE_COUNTS: &[(&str, &str)] = &[
     ),
     ("option_execution_events", "option_execution_events"),
     ("option_event_indexer_state", "option_event_indexer_state"),
+    (
+        "option_execution_reconciliations",
+        "option_execution_reconciliations",
+    ),
     ("mm_accounts", "mm_accounts"),
     ("mm_market_permissions", "mm_market_permissions"),
     ("fee_events", "fee_events"),
@@ -2640,6 +2645,186 @@ impl PgRepository {
             .collect()
     }
 
+    pub async fn list_option_execution_events_by_tx_hash(
+        &self,
+        tx_hash: &str,
+    ) -> Result<Vec<OptionExecutionEvent>> {
+        if !self.admin_table_exists("option_execution_events").await? {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            "SELECT id, chain_id, contract_address, tx_hash, log_index, block_number, block_hash,
+                    event_name, event_signature, intent_id, onchain_intent_id,
+                    option_execution_transaction_id, buyer, seller, account, option_id,
+                    quantity_contracts, premium_per_contract_native, raw_topics, raw_data,
+                    decoded, created_at_ms, updated_at_ms
+             FROM option_execution_events
+             WHERE lower(tx_hash) = lower($1)
+             ORDER BY block_number ASC, log_index ASC, id ASC",
+        )
+        .bind(tx_hash)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        rows.into_iter()
+            .map(option_execution_event_from_row)
+            .collect()
+    }
+
+    pub async fn list_confirmed_unreconciled_option_execution_transactions(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<OptionExecutionTransaction>> {
+        if !self
+            .admin_table_exists("option_execution_transactions")
+            .await?
+        {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            "SELECT t.transaction_id, t.intent_id, t.onchain_intent_id, t.sender, t.target,
+                    t.calldata, t.value_wei, t.gas_limit, t.tx_hash, t.status, t.error,
+                    t.created_at_ms, t.updated_at_ms,
+                    t.estimated_gas, t.required_gas, t.simulation_gas_limit, t.broadcast_gas_limit,
+                    t.gas_safety_bps, t.gas_check_status, t.gas_check_error,
+                    t.confirmation_status, t.confirmed_at_ms, t.confirmed_block_number,
+                    t.receipt_status, t.confirmation_error,
+                    t.gas_used, t.effective_gas_price, t.cumulative_gas_used,
+                    t.receipt_block_hash, t.receipt_transaction_index, t.receipt_observed_at_ms
+             FROM option_execution_transactions t
+             LEFT JOIN option_execution_reconciliations r
+                    ON r.option_execution_transaction_id = t.transaction_id
+             WHERE t.confirmation_status = 'mined_success'
+               AND t.tx_hash IS NOT NULL
+               AND r.id IS NULL
+             ORDER BY t.created_at_ms ASC, t.transaction_id ASC
+             LIMIT $1",
+        )
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        rows.into_iter()
+            .map(option_execution_transaction_from_row)
+            .collect()
+    }
+
+    pub async fn upsert_option_execution_reconciliation(
+        &self,
+        row: &OptionExecutionReconciliation,
+        updated_at_ms: TimestampMs,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO option_execution_reconciliations (
+                id, intent_id, onchain_intent_id, option_execution_transaction_id, tx_hash,
+                chain_id, status, strict, requires_events,
+                trade_executed_event_id, margin_trade_event_id,
+                trading_fee_event_count, internal_transfer_event_count, decoded_event_count,
+                mismatch_reason, missing_required, details,
+                reconciled_at_ms, created_at_ms, updated_at_ms
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+            ON CONFLICT (option_execution_transaction_id) DO UPDATE SET
+                status = EXCLUDED.status,
+                strict = EXCLUDED.strict,
+                requires_events = EXCLUDED.requires_events,
+                trade_executed_event_id = EXCLUDED.trade_executed_event_id,
+                margin_trade_event_id = EXCLUDED.margin_trade_event_id,
+                trading_fee_event_count = EXCLUDED.trading_fee_event_count,
+                internal_transfer_event_count = EXCLUDED.internal_transfer_event_count,
+                decoded_event_count = EXCLUDED.decoded_event_count,
+                mismatch_reason = EXCLUDED.mismatch_reason,
+                missing_required = EXCLUDED.missing_required,
+                details = EXCLUDED.details,
+                reconciled_at_ms = EXCLUDED.reconciled_at_ms,
+                updated_at_ms = EXCLUDED.updated_at_ms",
+        )
+        .bind(row.id)
+        .bind(row.intent_id)
+        .bind(&row.onchain_intent_id)
+        .bind(&row.option_execution_transaction_id)
+        .bind(&row.tx_hash)
+        .bind(u64_to_i64("chain_id", row.chain_id)?)
+        .bind(row.status.as_str())
+        .bind(row.strict)
+        .bind(row.requires_events)
+        .bind(row.trade_executed_event_id)
+        .bind(row.margin_trade_event_id)
+        .bind(u64_to_i64(
+            "trading_fee_event_count",
+            row.trading_fee_event_count,
+        )?)
+        .bind(u64_to_i64(
+            "internal_transfer_event_count",
+            row.internal_transfer_event_count,
+        )?)
+        .bind(u64_to_i64("decoded_event_count", row.decoded_event_count)?)
+        .bind(row.mismatch_reason.clone())
+        .bind(row.missing_required.clone())
+        .bind(row.details.clone())
+        .bind(timestamp_to_i64(row.reconciled_at_ms))
+        .bind(timestamp_to_i64(row.created_at_ms))
+        .bind(timestamp_to_i64(updated_at_ms))
+        .execute(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        Ok(())
+    }
+
+    pub async fn list_option_execution_reconciliations(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<OptionExecutionReconciliation>> {
+        if !self
+            .admin_table_exists("option_execution_reconciliations")
+            .await?
+        {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            "SELECT id, intent_id, onchain_intent_id, option_execution_transaction_id, tx_hash,
+                    chain_id, status, strict, requires_events,
+                    trade_executed_event_id, margin_trade_event_id,
+                    trading_fee_event_count, internal_transfer_event_count, decoded_event_count,
+                    mismatch_reason, missing_required, details,
+                    reconciled_at_ms, created_at_ms, updated_at_ms
+             FROM option_execution_reconciliations
+             ORDER BY reconciled_at_ms DESC, id DESC
+             LIMIT $1",
+        )
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        rows.into_iter()
+            .map(option_execution_reconciliation_from_row)
+            .collect()
+    }
+
+    pub async fn summarize_option_execution_reconciliations(&self) -> Result<Vec<(String, u64)>> {
+        if !self
+            .admin_table_exists("option_execution_reconciliations")
+            .await?
+        {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            "SELECT status, COUNT(*) AS row_count
+             FROM option_execution_reconciliations
+             GROUP BY status
+             ORDER BY status ASC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let status: String = row_get(&row, "status")?;
+            let count: i64 = row_get(&row, "row_count")?;
+            out.push((status, i64_to_u64_persistence("row_count", count)?));
+        }
+        Ok(out)
+    }
+
     pub async fn insert_option_rfq(&self, rfq: &OptionRfqRequest) -> Result<()> {
         sqlx::query(
             "INSERT INTO option_rfqs (
@@ -4077,6 +4262,42 @@ fn option_execution_event_from_row(row: PgRow) -> Result<OptionExecutionEvent> {
         raw_topics: row_get(&row, "raw_topics")?,
         raw_data: row_get(&row, "raw_data")?,
         decoded: row_get(&row, "decoded")?,
+        created_at_ms: row_get(&row, "created_at_ms")?,
+        updated_at_ms: row_get(&row, "updated_at_ms")?,
+    })
+}
+
+fn option_execution_reconciliation_from_row(row: PgRow) -> Result<OptionExecutionReconciliation> {
+    let status: String = row_get(&row, "status")?;
+    let chain_id: i64 = row_get(&row, "chain_id")?;
+    let trading_fee_event_count: i64 = row_get(&row, "trading_fee_event_count")?;
+    let internal_transfer_event_count: i64 = row_get(&row, "internal_transfer_event_count")?;
+    let decoded_event_count: i64 = row_get(&row, "decoded_event_count")?;
+    Ok(OptionExecutionReconciliation {
+        id: row_get(&row, "id")?,
+        intent_id: row_get(&row, "intent_id")?,
+        onchain_intent_id: row_get(&row, "onchain_intent_id")?,
+        option_execution_transaction_id: row_get(&row, "option_execution_transaction_id")?,
+        tx_hash: row_get(&row, "tx_hash")?,
+        chain_id: i64_to_u64_persistence("chain_id", chain_id)?,
+        status: OptionReconciliationStatus::parse(&status)?,
+        strict: row_get(&row, "strict")?,
+        requires_events: row_get(&row, "requires_events")?,
+        trade_executed_event_id: row_get(&row, "trade_executed_event_id")?,
+        margin_trade_event_id: row_get(&row, "margin_trade_event_id")?,
+        trading_fee_event_count: i64_to_u64_persistence(
+            "trading_fee_event_count",
+            trading_fee_event_count,
+        )?,
+        internal_transfer_event_count: i64_to_u64_persistence(
+            "internal_transfer_event_count",
+            internal_transfer_event_count,
+        )?,
+        decoded_event_count: i64_to_u64_persistence("decoded_event_count", decoded_event_count)?,
+        mismatch_reason: row_get(&row, "mismatch_reason")?,
+        missing_required: row_get(&row, "missing_required")?,
+        details: row_get(&row, "details")?,
+        reconciled_at_ms: row_get(&row, "reconciled_at_ms")?,
         created_at_ms: row_get(&row, "created_at_ms")?,
         updated_at_ms: row_get(&row, "updated_at_ms")?,
     })
