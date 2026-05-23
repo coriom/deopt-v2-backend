@@ -759,6 +759,16 @@ impl OptionSeriesStore {
         events
     }
 
+    /// List confirmed (`mined_success`) option execution transactions whose
+    /// existing reconciliation row (if any) has a non-terminal status. A
+    /// non-terminal status is anything other than
+    /// [`OptionReconciliationStatus::Reconciled`]; specifically
+    /// `missing_events`, `partially_reconciled`, `reconciliation_failed`, and
+    /// `skipped` are all eligible for re-evaluation once new evidence
+    /// (typically backfilled `option_execution_events`) becomes available.
+    ///
+    /// Once a row reaches `reconciled`, it is filtered out and the worker
+    /// will never touch it again.
     pub fn list_confirmed_unreconciled_option_execution_transactions(
         &self,
         limit: u32,
@@ -775,9 +785,13 @@ impl OptionSeriesStore {
                         tx.confirmation_status,
                         Some(OptionExecutionConfirmationStatus::MinedSuccess)
                     )
-                    && !self
+                    && self
                         .option_execution_reconciliations
-                        .contains_key(&tx.transaction_id)
+                        .get(&tx.transaction_id)
+                        .map(|row| {
+                            row.status != crate::options::OptionReconciliationStatus::Reconciled
+                        })
+                        .unwrap_or(true)
             })
             .cloned()
             .collect::<Vec<_>>();

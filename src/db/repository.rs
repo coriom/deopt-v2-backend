@@ -2696,7 +2696,7 @@ impl PgRepository {
                     ON r.option_execution_transaction_id = t.transaction_id
              WHERE t.confirmation_status = 'mined_success'
                AND t.tx_hash IS NOT NULL
-               AND r.id IS NULL
+               AND (r.id IS NULL OR r.status <> 'reconciled')
              ORDER BY t.created_at_ms ASC, t.transaction_id ASC
              LIMIT $1",
         )
@@ -2798,6 +2798,33 @@ impl PgRepository {
         rows.into_iter()
             .map(option_execution_reconciliation_from_row)
             .collect()
+    }
+
+    pub async fn get_option_execution_reconciliation_by_transaction_id(
+        &self,
+        transaction_id: &str,
+    ) -> Result<Option<OptionExecutionReconciliation>> {
+        if !self
+            .admin_table_exists("option_execution_reconciliations")
+            .await?
+        {
+            return Ok(None);
+        }
+        let row = sqlx::query(
+            "SELECT id, intent_id, onchain_intent_id, option_execution_transaction_id, tx_hash,
+                    chain_id, status, strict, requires_events,
+                    trade_executed_event_id, margin_trade_event_id,
+                    trading_fee_event_count, internal_transfer_event_count, decoded_event_count,
+                    mismatch_reason, missing_required, details,
+                    reconciled_at_ms, created_at_ms, updated_at_ms
+             FROM option_execution_reconciliations
+             WHERE option_execution_transaction_id = $1",
+        )
+        .bind(transaction_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        row.map(option_execution_reconciliation_from_row).transpose()
     }
 
     pub async fn summarize_option_execution_reconciliations(&self) -> Result<Vec<(String, u64)>> {

@@ -992,10 +992,11 @@ mod tests {
             .list_option_execution_reconciliations(10);
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].status, OptionReconciliationStatus::Reconciled);
-        // Second tick should consider the same transaction again — confirmed unreconciled
-        // returns it only when no terminal row exists, but a Reconciled row stays terminal.
-        // Our non-strict store filter excludes already-reconciled transactions on the
-        // second pass so the considered counter resets to 0.
+        // A `reconciled` row is terminal: the eligibility filter excludes it,
+        // so the second tick considers nothing. Non-terminal statuses
+        // (`missing_events`, `partially_reconciled`, `reconciliation_failed`,
+        // `skipped`) are revisited as new evidence lands — see
+        // `missing_events_row_is_re_evaluated_when_events_backfilled`.
         let last = state
             .option_reconciliation_last_tick
             .lock()
@@ -1003,6 +1004,66 @@ mod tests {
             .clone()
             .unwrap();
         assert_eq!(last.considered, 0);
+    }
+
+    #[tokio::test]
+    async fn missing_events_row_is_re_evaluated_when_events_backfilled() {
+        let state = state_with_reconciliation(true, true, true);
+        let (intent, tx) = insert_confirmed_intent_and_tx(&state);
+        let tx_hash = tx.tx_hash.clone().unwrap();
+
+        // First pass: no events yet → status = missing_events.
+        let first = reconcile_option_executions(&state).await.unwrap();
+        assert_eq!(first.considered, 1);
+        assert_eq!(first.missing_events, 1);
+        let first_rows = state
+            .options_store
+            .lock()
+            .unwrap()
+            .list_option_execution_reconciliations(10);
+        assert_eq!(first_rows.len(), 1);
+        assert_eq!(
+            first_rows[0].status,
+            OptionReconciliationStatus::MissingEvents
+        );
+        let first_row_id = first_rows[0].id;
+
+        // Backfill the V1S OptionTradeExecuted event.
+        insert_event(&state, option_trade_event(&intent, &tx_hash));
+
+        // Second pass: the worker should re-evaluate the non-terminal row and
+        // transition it from missing_events to reconciled. The reconciliation
+        // row id must stay the same (the upsert keyed by transaction id).
+        let second = reconcile_option_executions(&state).await.unwrap();
+        assert_eq!(second.considered, 1);
+        assert_eq!(second.reconciled, 1);
+        assert_eq!(second.missing_events, 0);
+        let second_rows = state
+            .options_store
+            .lock()
+            .unwrap()
+            .list_option_execution_reconciliations(10);
+        assert_eq!(second_rows.len(), 1);
+        assert_eq!(second_rows[0].id, first_row_id);
+        assert_eq!(
+            second_rows[0].status,
+            OptionReconciliationStatus::Reconciled
+        );
+        assert!(second_rows[0].mismatch_reason.is_none());
+        assert!(second_rows[0].missing_required.is_none());
+        assert!(second_rows[0].trade_executed_event_id.is_some());
+
+        // Third pass: now that the row is reconciled, the eligibility filter
+        // excludes it so no further work is done.
+        let third = reconcile_option_executions(&state).await.unwrap();
+        assert_eq!(third.considered, 0);
+        let third_rows = state
+            .options_store
+            .lock()
+            .unwrap()
+            .list_option_execution_reconciliations(10);
+        assert_eq!(third_rows.len(), 1);
+        assert_eq!(third_rows[0].status, OptionReconciliationStatus::Reconciled);
     }
 
     #[tokio::test]
