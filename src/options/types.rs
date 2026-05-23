@@ -460,8 +460,39 @@ pub struct OptionExecutionTransaction {
     pub confirmed_block_number: Option<u64>,
     pub receipt_status: Option<u64>,
     pub confirmation_error: Option<String>,
+    pub gas_used: Option<u64>,
+    pub effective_gas_price: Option<String>,
+    pub cumulative_gas_used: Option<u64>,
+    pub receipt_block_hash: Option<String>,
+    pub receipt_transaction_index: Option<u64>,
+    pub receipt_observed_at_ms: Option<TimestampMs>,
     pub created_at_ms: TimestampMs,
     pub updated_at_ms: TimestampMs,
+}
+
+/// Receipt-cost bundle persisted on `option_execution_transactions` rows when
+/// `eth_getTransactionReceipt` returns the corresponding fields. All fields
+/// are optional; the worker and manual confirmation paths persist whichever
+/// values the receipt provider actually populates.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct OptionExecutionReceiptCost {
+    pub gas_used: Option<u64>,
+    pub effective_gas_price: Option<String>,
+    pub cumulative_gas_used: Option<u64>,
+    pub block_hash: Option<String>,
+    pub transaction_index: Option<u64>,
+    pub observed_at_ms: Option<TimestampMs>,
+}
+
+impl OptionExecutionReceiptCost {
+    pub fn is_empty(&self) -> bool {
+        self.gas_used.is_none()
+            && self.effective_gas_price.is_none()
+            && self.cumulative_gas_used.is_none()
+            && self.block_hash.is_none()
+            && self.transaction_index.is_none()
+            && self.observed_at_ms.is_none()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

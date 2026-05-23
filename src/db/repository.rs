@@ -17,12 +17,12 @@ use crate::monitoring::FeeEventLabels;
 use crate::options::store::status_for_remaining;
 use crate::options::{
     OptionExecutionConfirmationStatus, OptionExecutionGasCheckStatus, OptionExecutionIntent,
-    OptionExecutionIntentId, OptionExecutionIntentStatus, OptionExecutionSimulationResult,
-    OptionExecutionSimulationStatus, OptionExecutionSourceType, OptionExecutionTransaction,
-    OptionFill, OptionFillId, OptionOrder, OptionOrderId, OptionOrderStatus, OptionRfqFill,
-    OptionRfqFillId, OptionRfqId, OptionRfqQuote, OptionRfqQuoteId, OptionRfqQuoteSignatureStatus,
-    OptionRfqQuoteStatus, OptionRfqRequest, OptionRfqStatus, OptionSeries, OptionSeriesSource,
-    OptionSeriesStatus,
+    OptionExecutionIntentId, OptionExecutionIntentStatus, OptionExecutionReceiptCost,
+    OptionExecutionSimulationResult, OptionExecutionSimulationStatus, OptionExecutionSourceType,
+    OptionExecutionTransaction, OptionFill, OptionFillId, OptionOrder, OptionOrderId,
+    OptionOrderStatus, OptionRfqFill, OptionRfqFillId, OptionRfqId, OptionRfqQuote,
+    OptionRfqQuoteId, OptionRfqQuoteSignatureStatus, OptionRfqQuoteStatus, OptionRfqRequest,
+    OptionRfqStatus, OptionSeries, OptionSeriesSource, OptionSeriesStatus,
 };
 use crate::reconciliation::{
     normalize_onchain_intent_id, ExecutionReconciliation, ReconciliationCounts,
@@ -2239,7 +2239,9 @@ impl PgRepository {
                     estimated_gas, required_gas, simulation_gas_limit, broadcast_gas_limit,
                     gas_safety_bps, gas_check_status, gas_check_error,
                     confirmation_status, confirmed_at_ms, confirmed_block_number,
-                    receipt_status, confirmation_error
+                    receipt_status, confirmation_error,
+                    gas_used, effective_gas_price, cumulative_gas_used,
+                    receipt_block_hash, receipt_transaction_index, receipt_observed_at_ms
              FROM option_execution_transactions
              WHERE intent_id = $1 AND status = 'submitted'
              ORDER BY created_at_ms DESC, transaction_id DESC
@@ -2267,7 +2269,9 @@ impl PgRepository {
                     estimated_gas, required_gas, simulation_gas_limit, broadcast_gas_limit,
                     gas_safety_bps, gas_check_status, gas_check_error,
                     confirmation_status, confirmed_at_ms, confirmed_block_number,
-                    receipt_status, confirmation_error
+                    receipt_status, confirmation_error,
+                    gas_used, effective_gas_price, cumulative_gas_used,
+                    receipt_block_hash, receipt_transaction_index, receipt_observed_at_ms
              FROM option_execution_transactions
              WHERE status = 'submitted'
                AND tx_hash IS NOT NULL
@@ -2297,7 +2301,9 @@ impl PgRepository {
                     estimated_gas, required_gas, simulation_gas_limit, broadcast_gas_limit,
                     gas_safety_bps, gas_check_status, gas_check_error,
                     confirmation_status, confirmed_at_ms, confirmed_block_number,
-                    receipt_status, confirmation_error
+                    receipt_status, confirmation_error,
+                    gas_used, effective_gas_price, cumulative_gas_used,
+                    receipt_block_hash, receipt_transaction_index, receipt_observed_at_ms
              FROM option_execution_transactions
              WHERE transaction_id = $1",
         )
@@ -2308,6 +2314,7 @@ impl PgRepository {
         row.map(option_execution_transaction_from_row).transpose()
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn update_option_execution_confirmation(
         &self,
         transaction_id: &str,
@@ -2316,6 +2323,7 @@ impl PgRepository {
         confirmed_block_number: Option<u64>,
         receipt_status: Option<u64>,
         confirmation_error: Option<String>,
+        receipt_cost: &OptionExecutionReceiptCost,
     ) -> Result<u64> {
         let rows = sqlx::query(
             "UPDATE option_execution_transactions
@@ -2324,6 +2332,12 @@ impl PgRepository {
                  confirmed_block_number = $3,
                  receipt_status = $4,
                  confirmation_error = $5,
+                 gas_used = COALESCE($7, gas_used),
+                 effective_gas_price = COALESCE($8, effective_gas_price),
+                 cumulative_gas_used = COALESCE($9, cumulative_gas_used),
+                 receipt_block_hash = COALESCE($10, receipt_block_hash),
+                 receipt_transaction_index = COALESCE($11, receipt_transaction_index),
+                 receipt_observed_at_ms = COALESCE($12, receipt_observed_at_ms),
                  updated_at_ms = $2
              WHERE transaction_id = $6",
         )
@@ -2341,11 +2355,56 @@ impl PgRepository {
         )
         .bind(confirmation_error)
         .bind(transaction_id)
+        .bind(
+            receipt_cost
+                .gas_used
+                .map(|value| u64_to_i64("gas_used", value))
+                .transpose()?,
+        )
+        .bind(receipt_cost.effective_gas_price.clone())
+        .bind(
+            receipt_cost
+                .cumulative_gas_used
+                .map(|value| u64_to_i64("cumulative_gas_used", value))
+                .transpose()?,
+        )
+        .bind(receipt_cost.block_hash.clone())
+        .bind(
+            receipt_cost
+                .transaction_index
+                .map(|value| u64_to_i64("receipt_transaction_index", value))
+                .transpose()?,
+        )
+        .bind(receipt_cost.observed_at_ms.map(timestamp_to_i64))
         .execute(&self.pool)
         .await
         .map_err(|error| BackendError::Persistence(error.to_string()))?
         .rows_affected();
         Ok(rows)
+    }
+
+    /// Aggregate count of option execution transactions grouped by
+    /// confirmation_status (NULL bucketed as "pending"). Used by the admin
+    /// observability endpoint.
+    pub async fn summarize_option_execution_confirmations(&self) -> Result<Vec<(String, i64)>> {
+        let rows = sqlx::query(
+            "SELECT
+                COALESCE(confirmation_status, 'pending') AS confirmation_status,
+                COUNT(*) AS row_count
+             FROM option_execution_transactions
+             GROUP BY 1
+             ORDER BY 1",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let status: String = row_get(&row, "confirmation_status")?;
+            let count: i64 = row_get(&row, "row_count")?;
+            out.push((status, count));
+        }
+        Ok(out)
     }
 
     pub async fn get_option_execution_transactions_for_intent(
@@ -2358,7 +2417,9 @@ impl PgRepository {
                     estimated_gas, required_gas, simulation_gas_limit, broadcast_gas_limit,
                     gas_safety_bps, gas_check_status, gas_check_error,
                     confirmation_status, confirmed_at_ms, confirmed_block_number,
-                    receipt_status, confirmation_error
+                    receipt_status, confirmation_error,
+                    gas_used, effective_gas_price, cumulative_gas_used,
+                    receipt_block_hash, receipt_transaction_index, receipt_observed_at_ms
              FROM option_execution_transactions
              WHERE intent_id = $1
              ORDER BY created_at_ms DESC, transaction_id DESC",
@@ -3618,6 +3679,9 @@ fn option_execution_transaction_from_row(row: PgRow) -> Result<OptionExecutionTr
     let confirmation_status: Option<String> = row_get(&row, "confirmation_status")?;
     let confirmed_block_number: Option<i64> = row_get(&row, "confirmed_block_number")?;
     let receipt_status: Option<i64> = row_get(&row, "receipt_status")?;
+    let gas_used: Option<i64> = row_get(&row, "gas_used")?;
+    let cumulative_gas_used: Option<i64> = row_get(&row, "cumulative_gas_used")?;
+    let receipt_transaction_index: Option<i64> = row_get(&row, "receipt_transaction_index")?;
     Ok(OptionExecutionTransaction {
         transaction_id: row_get(&row, "transaction_id")?,
         intent_id: intent_id.parse().map_err(|error| {
@@ -3672,6 +3736,18 @@ fn option_execution_transaction_from_row(row: PgRow) -> Result<OptionExecutionTr
             .map(|value| i64_to_u64_persistence("receipt_status", value))
             .transpose()?,
         confirmation_error: row_get(&row, "confirmation_error")?,
+        gas_used: gas_used
+            .map(|value| i64_to_u64_persistence("gas_used", value))
+            .transpose()?,
+        effective_gas_price: row_get(&row, "effective_gas_price")?,
+        cumulative_gas_used: cumulative_gas_used
+            .map(|value| i64_to_u64_persistence("cumulative_gas_used", value))
+            .transpose()?,
+        receipt_block_hash: row_get(&row, "receipt_block_hash")?,
+        receipt_transaction_index: receipt_transaction_index
+            .map(|value| i64_to_u64_persistence("receipt_transaction_index", value))
+            .transpose()?,
+        receipt_observed_at_ms: row_get(&row, "receipt_observed_at_ms")?,
         created_at_ms: row_get(&row, "created_at_ms")?,
         updated_at_ms: row_get(&row, "updated_at_ms")?,
     })

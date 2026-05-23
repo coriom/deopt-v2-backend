@@ -97,6 +97,11 @@ pub struct ConfirmationReceipt {
     pub tx_hash: String,
     pub status: Option<u64>,
     pub block_number: Option<u64>,
+    pub gas_used: Option<u64>,
+    pub effective_gas_price: Option<String>,
+    pub cumulative_gas_used: Option<u64>,
+    pub block_hash: Option<String>,
+    pub transaction_index: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -352,6 +357,11 @@ mod tests {
             tx_hash: format!("0x{:064x}", 1),
             status,
             block_number,
+            gas_used: None,
+            effective_gas_price: None,
+            cumulative_gas_used: None,
+            block_hash: None,
+            transaction_index: None,
         }
     }
 }

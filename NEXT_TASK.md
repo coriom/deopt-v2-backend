@@ -1,31 +1,38 @@
-# NEXT_TASK.md — Option Broadcast Confirmation Worker V1V
+# NEXT_TASK.md — Option Confirmation Worker Observability V1W
 
 ## Context
 
-V1S successfully submitted the first live option execution broadcast.
+V1V implemented the background option confirmation worker.
 
-Tx:
-0x5964a7b3d2c18d051baaa780413d31c44d419ce530f45263cb4c46f720881125
+Current state:
+- Worker disabled by default.
+- Worker can poll pending option execution transactions.
+- Worker reads `eth_blockNumber`.
+- Worker reads `eth_getTransactionReceipt`.
+- Worker applies finality threshold.
+- Worker transitions:
+  - `broadcast_submitted` → `broadcast_confirmed` on `mined_success`
+  - `broadcast_submitted` → `broadcast_failed` on `mined_failed`
+- No broadcast path is touched.
+- No generic execution rows are created.
+- Validation passed with 504 tests.
 
-Intent:
-e6d2941b-65f7-413a-958f-74ab22c53b08
-
-V1T confirmed and reconciled it manually:
-- intent status: broadcast_confirmed
-- option transaction confirmation_status: mined_success
-- buyer position +1
-- seller position -1
-- vault premium/fee movements reconciled
-
-The backend now has a confirmation path, but confirmation is still manual.
+Deferred from V1V:
+1. Persist `gas_used` and `effective_gas_price`.
+2. Add operator/admin visibility for latest worker tick.
+3. Improve observability without building a full indexer.
 
 ## Goal
 
-Implement a background option execution confirmation worker.
+Improve production observability of the option confirmation worker.
 
-The worker should automatically detect submitted option execution transactions, read receipts, apply a configurable finality threshold, and update transaction/intent statuses safely.
+This task must:
+1. persist receipt cost fields;
+2. expose pending/confirmed/failed confirmation summaries in admin endpoints;
+3. expose the latest worker tick result in memory;
+4. document operator usage.
 
-This task must not broadcast or submit any transaction.
+This is backend-only.
 
 ## Hard Rules
 
@@ -35,130 +42,140 @@ Do not submit transactions.
 Do not call `/executor/broadcast`.
 Do not call `POST /options/execution-intents/:id/broadcast`.
 Do not create new option execution intents.
-Do not create new option_execution_transactions except via tests.
+Do not create option_execution_transactions except in tests.
 Do not create generic execution_transactions.
-Do not cleanup existing evidence rows.
+Do not cleanup evidence rows.
 Do not modify Solidity.
 Do not modify frontend.
 Do not deploy contracts.
 Do not print private keys.
 Do not touch real `.env` secrets.
 
-## Required Config
+## Required Migration
 
-Add safe config flags:
+Add a migration if these fields are missing from `option_execution_transactions`:
 
 ```text
-OPTION_CONFIRMATION_WORKER_ENABLED=false
-OPTION_CONFIRMATION_POLL_INTERVAL_MS=15000
-OPTION_CONFIRMATION_FINALITY_BLOCKS=3
-OPTION_CONFIRMATION_BATCH_SIZE=25
-OPTION_CONFIRMATION_REQUIRE_RPC=true
-
-Defaults must be safe:
-
-worker disabled by default
-RPC required if enabled
-no mutation if RPC unavailable
-
-Expose sanitized values in /admin/config.
-
-Required DB/Repository Behavior
-
-Add repository methods to:
-
-list pending option execution transactions:
-status submitted OR confirmation_status NULL/pending
-has tx_hash
-limit by batch size
-update receipt observation:
-receipt_status
-block_number
-block_hash
 gas_used
-effective_gas_price if available
-observed_at_ms
-update final confirmation:
-confirmation_status = mined_success / mined_failed
-confirmed_at_ms
-confirmation_error if failed
-update related intent:
-broadcast_submitted → broadcast_confirmed on success
-broadcast_submitted → broadcast_failed on mined failed tx
-do not overwrite terminal states blindly
+effective_gas_price
+cumulative_gas_used
+receipt_block_hash
+receipt_transaction_index
+receipt_observed_at_ms
 
-If needed, add migration only for missing fields.
+Use nullable columns and ADD COLUMN IF NOT EXISTS.
 
-Required Worker Behavior
+Do not break existing V1S/V1T rows.
 
-Worker loop:
+Required Receipt Persistence
 
-If disabled, do nothing.
-If enabled:
-list pending option execution txs.
-for each tx_hash:
-call eth_getTransactionReceipt.
-if receipt missing:
-leave pending.
-if receipt exists:
-persist receipt fields.
-compare current chain head block.
-if head_block - receipt_block < OPTION_CONFIRMATION_FINALITY_BLOCKS:
-leave as observed/pending_finality.
-if enough finality:
-if receipt status = 1:
-mark tx mined_success.
-mark intent broadcast_confirmed.
-if receipt status = 0:
-mark tx mined_failed.
-mark intent broadcast_failed.
-Never rebroadcast.
-Never create generic execution transaction rows.
-Never retry failed txs.
-Required RPC Support
+Extend receipt parsing and worker update logic to persist, when available:
 
-Implement or reuse provider calls for:
+gas_used
+effective_gas_price
+cumulative_gas_used
+block_hash
+transaction_index
+observed timestamp
 
-eth_getTransactionReceipt
-eth_blockNumber
+Manual confirmation endpoint should also use the same persistence path if practical.
 
-Avoid overbuilding a full indexer.
+Do not duplicate confirmation logic unnecessarily.
 
+Required Admin Summary Endpoint
+
+Add or extend an admin endpoint, preferably:
+
+GET /admin/options/confirmations
+
+Return sanitized summary:
+
+{
+  "worker_enabled": false,
+  "poll_interval_ms": 15000,
+  "finality_blocks": 3,
+  "batch_size": 25,
+  "pending": 0,
+  "pending_finality": 0,
+  "receipt_missing": 0,
+  "receipt_error": 0,
+  "mined_success": 1,
+  "mined_failed": 0,
+  "latest_tick": {
+    "ran_at_ms": 0,
+    "head_block": null,
+    "scanned": 0,
+    "finalized_success": 0,
+    "finalized_failed": 0,
+    "pending_finality": 0,
+    "receipt_missing": 0,
+    "receipt_errors": 0,
+    "error": null
+  }
+}
+
+No secrets.
+
+Required Latest Tick State
+
+Store latest worker tick result in app state.
+
+Requirements:
+
+in-memory only is acceptable
+thread-safe
+readable by admin endpoint
+no DB write needed for tick metadata
+if worker disabled, endpoint should still return config and null/empty latest tick
+Required Repository Summary
+
+Add repository method to count option execution transactions by confirmation status.
+
+Suggested categories:
+
+pending/null
+pending
+pending_finality
+receipt_missing
+receipt_error
+mined_success
+mined_failed
+mined_reverted if still backward compatible
 Required Tests
 
 Add tests for:
 
-worker disabled does nothing.
-submitted tx with no receipt remains pending.
-receipt exists but finality not reached remains pending_finality/observed.
-receipt status 1 + finality marks mined_success and intent broadcast_confirmed.
-receipt status 0 + finality marks mined_failed and intent broadcast_failed.
-worker never calls broadcast provider.
-worker never creates generic execution_transactions rows.
-config parsing defaults and overrides.
+receipt persistence stores gas fields.
+confirmation worker stores gas fields on mined_success.
+admin summary endpoint returns worker config.
+admin summary endpoint returns counts.
+latest tick state updates after worker tick.
+worker disabled still returns safe admin summary.
+no generic execution rows created.
+no broadcast path used.
 
-Use mock RPC provider.
+Use mocks. Do not depend on live RPC.
 
 Required Docs
 
 Create:
 
-docs/OPTION_CONFIRMATION_WORKER_V1V.md
+docs/OPTION_CONFIRMATION_OBSERVABILITY_V1W.md
 
 Include:
 
-why manual confirmation is insufficient
-worker lifecycle
-config variables
-finality behavior
-DB status transitions
-failure behavior
-no retry policy
-how this relates to V1S/V1T
-remaining work:
+what V1V did
+what V1W adds
+migration summary
+receipt cost fields
+admin endpoint shape
+latest tick meaning
+operator checklist
+remaining deferred work:
 event indexer
 full reconciliation worker
 alerting
+settlement/exercise/expiry
 reorg handling beyond simple finality threshold
 Validation
 
@@ -172,12 +189,10 @@ Acceptance Criteria
 
 Complete only if:
 
-confirmation worker exists
-worker disabled by default
-finality threshold implemented
-receipt polling implemented
-submitted txs can become mined_success/mined_failed
-related intent status updates safely
+receipt gas/cost fields are persisted
+admin confirmation summary exists
+latest worker tick is visible
+worker remains disabled by default
 no broadcast path touched
 tests pass
 docs created
@@ -187,10 +202,10 @@ Final Report
 Return:
 
 files changed
-migrations added or not
-config added
-worker behavior summary
-status transition summary
+migration added or not
+receipt fields added
+admin endpoint added
+latest tick behavior
 tests added
 docs created
 validation commands run

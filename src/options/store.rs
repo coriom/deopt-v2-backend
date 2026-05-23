@@ -1,10 +1,10 @@
 use super::{
     OptionExecutionConfirmationStatus, OptionExecutionIntent, OptionExecutionIntentId,
-    OptionExecutionIntentStatus, OptionExecutionSimulationResult, OptionExecutionSourceType,
-    OptionExecutionTransaction, OptionFill, OptionFillFilter, OptionFillId, OptionOrder,
-    OptionOrderFilter, OptionOrderId, OptionOrderStatus, OptionRfqFill, OptionRfqId,
-    OptionRfqQuote, OptionRfqQuoteId, OptionRfqQuoteStatus, OptionRfqRequest, OptionRfqStatus,
-    OptionSeries, OptionSeriesFilter, OptionSeriesId, OptionSeriesStatus,
+    OptionExecutionIntentStatus, OptionExecutionReceiptCost, OptionExecutionSimulationResult,
+    OptionExecutionSourceType, OptionExecutionTransaction, OptionFill, OptionFillFilter,
+    OptionFillId, OptionOrder, OptionOrderFilter, OptionOrderId, OptionOrderStatus, OptionRfqFill,
+    OptionRfqId, OptionRfqQuote, OptionRfqQuoteId, OptionRfqQuoteStatus, OptionRfqRequest,
+    OptionRfqStatus, OptionSeries, OptionSeriesFilter, OptionSeriesId, OptionSeriesStatus,
 };
 use crate::error::{BackendError, Result};
 use crate::execution::ExecutionTransactionStatus;
@@ -523,6 +523,7 @@ impl OptionSeriesStore {
         transactions
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn update_option_execution_confirmation(
         &mut self,
         transaction_id: &str,
@@ -531,6 +532,7 @@ impl OptionSeriesStore {
         confirmed_block_number: Option<u64>,
         receipt_status: Option<u64>,
         confirmation_error: Option<String>,
+        receipt_cost: &OptionExecutionReceiptCost,
     ) -> Result<OptionExecutionTransaction> {
         let transaction = self
             .option_execution_transactions
@@ -545,8 +547,39 @@ impl OptionSeriesStore {
         transaction.confirmed_block_number = confirmed_block_number;
         transaction.receipt_status = receipt_status;
         transaction.confirmation_error = confirmation_error;
+        if let Some(value) = receipt_cost.gas_used {
+            transaction.gas_used = Some(value);
+        }
+        if let Some(value) = receipt_cost.effective_gas_price.clone() {
+            transaction.effective_gas_price = Some(value);
+        }
+        if let Some(value) = receipt_cost.cumulative_gas_used {
+            transaction.cumulative_gas_used = Some(value);
+        }
+        if let Some(value) = receipt_cost.block_hash.clone() {
+            transaction.receipt_block_hash = Some(value);
+        }
+        if let Some(value) = receipt_cost.transaction_index {
+            transaction.receipt_transaction_index = Some(value);
+        }
+        if let Some(value) = receipt_cost.observed_at_ms {
+            transaction.receipt_observed_at_ms = Some(value);
+        }
         transaction.updated_at_ms = confirmed_at_ms;
         Ok(transaction.clone())
+    }
+
+    /// Aggregate counts by `confirmation_status` (NULL bucketed as "pending").
+    pub fn summarize_option_execution_confirmations(&self) -> Vec<(String, u64)> {
+        let mut counts: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+        for tx in self.option_execution_transactions.values() {
+            let key = match tx.confirmation_status {
+                Some(status) => status.as_str().to_string(),
+                None => "pending".to_string(),
+            };
+            *counts.entry(key).or_default() += 1;
+        }
+        counts.into_iter().collect()
     }
 
     pub fn option_execution_transactions_for_intent(

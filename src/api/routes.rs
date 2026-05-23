@@ -252,6 +252,10 @@ pub fn router(state: AppState) -> Router {
         .route("/admin/status", get(admin_status))
         .route("/admin/config", get(admin_config))
         .route("/admin/db", get(admin_db))
+        .route(
+            "/admin/options/confirmations",
+            get(admin_option_confirmations),
+        )
         .route("/admin/mm/sessions", get(admin_mm_sessions))
         .route("/admin/mm/permissions", get(admin_mm_permissions))
         .route("/admin/execution/summary", get(admin_execution_summary))
@@ -521,6 +525,48 @@ async fn admin_db(
         "connected": true,
         "migrations": repository.admin_migration_status().await?,
         "counts": repository.admin_table_counts().await?
+    })))
+}
+
+async fn admin_option_confirmations(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    ensure_admin_access(&state, &headers)?;
+    let counts: serde_json::Map<String, serde_json::Value> =
+        if let Some(repository) = state.repository.clone() {
+            repository
+                .summarize_option_execution_confirmations()
+                .await?
+                .into_iter()
+                .map(|(status, count)| (status, serde_json::Value::from(count)))
+                .collect()
+        } else {
+            state
+                .options_store
+                .lock()
+                .map_err(|_| ApiError::internal())?
+                .summarize_option_execution_confirmations()
+                .into_iter()
+                .map(|(status, count)| (status, serde_json::Value::from(count)))
+                .collect()
+        };
+    let latest_tick = state
+        .option_confirmation_last_tick
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone());
+    Ok(Json(serde_json::json!({
+        "config": {
+            "enabled": state.option_confirmation_config.enabled,
+            "poll_interval_ms": state.option_confirmation_config.poll_interval_ms,
+            "finality_blocks": state.option_confirmation_config.finality_blocks,
+            "batch_size": state.option_confirmation_config.batch_size,
+            "require_rpc": state.option_confirmation_config.require_rpc,
+            "rpc_configured": state.option_confirmation_config.rpc_url.is_some()
+        },
+        "counts": serde_json::Value::Object(counts),
+        "latest_tick": latest_tick,
     })))
 }
 

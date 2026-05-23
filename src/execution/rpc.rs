@@ -339,6 +339,11 @@ struct EthTransactionReceipt {
     transaction_hash: String,
     block_number: Option<String>,
     status: Option<String>,
+    gas_used: Option<String>,
+    effective_gas_price: Option<String>,
+    cumulative_gas_used: Option<String>,
+    block_hash: Option<String>,
+    transaction_index: Option<String>,
 }
 
 impl TryFrom<EthTransactionReceipt> for ConfirmationReceipt {
@@ -355,6 +360,23 @@ impl TryFrom<EthTransactionReceipt> for ConfirmationReceipt {
                 .transpose()?,
             block_number: value
                 .block_number
+                .as_deref()
+                .map(parse_hex_quantity_u64)
+                .transpose()?,
+            gas_used: value
+                .gas_used
+                .as_deref()
+                .map(parse_hex_quantity_u64)
+                .transpose()?,
+            effective_gas_price: value.effective_gas_price,
+            cumulative_gas_used: value
+                .cumulative_gas_used
+                .as_deref()
+                .map(parse_hex_quantity_u64)
+                .transpose()?,
+            block_hash: value.block_hash,
+            transaction_index: value
+                .transaction_index
                 .as_deref()
                 .map(parse_hex_quantity_u64)
                 .transpose()?,

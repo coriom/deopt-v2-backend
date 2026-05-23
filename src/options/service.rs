@@ -1321,6 +1321,7 @@ where
     let receipt_result = provider.transaction_receipt(tx_hash.clone()).await;
     let now = now_ms();
 
+    let mut receipt_cost = crate::options::OptionExecutionReceiptCost::default();
     let (status, receipt_status_value, block_number, error_string) = match receipt_result {
         Ok(Some(receipt)) => {
             if !receipt.tx_hash.eq_ignore_ascii_case(&tx_hash) {
@@ -1344,6 +1345,7 @@ where
                 } else {
                     None
                 };
+                receipt_cost = receipt_cost_from_receipt(&receipt, now);
                 (mapped, receipt.status, receipt.block_number, err)
             }
         }
@@ -1369,6 +1371,7 @@ where
         block_number,
         receipt_status_value,
         error_string.clone(),
+        &receipt_cost,
     )
     .await?;
 
@@ -1464,17 +1467,27 @@ where
             config.finality_blocks,
             &receipt_result,
         );
-        apply_worker_decision(state, &tx, &decision, now).await?;
+        let receipt_cost = match &receipt_result {
+            Ok(Some(receipt)) if receipt.tx_hash.eq_ignore_ascii_case(&tx_hash) => {
+                receipt_cost_from_receipt(receipt, now)
+            }
+            _ => crate::options::OptionExecutionReceiptCost::default(),
+        };
+        apply_worker_decision(state, &tx, &decision, &receipt_cost, now).await?;
         decisions.push(decision);
     }
 
-    Ok(crate::options::OptionConfirmationTickResult {
+    let result = crate::options::OptionConfirmationTickResult {
         enabled: true,
         batch_size: config.batch_size,
         finality_blocks: config.finality_blocks,
         current_block_number,
         decisions,
-    })
+    };
+    if let Ok(mut slot) = state.option_confirmation_last_tick.lock() {
+        *slot = Some(result.clone());
+    }
+    Ok(result)
 }
 
 fn compute_worker_decision(
@@ -1582,6 +1595,7 @@ async fn apply_worker_decision(
     state: &AppState,
     transaction: &OptionExecutionTransaction,
     decision: &crate::options::OptionConfirmationDecision,
+    receipt_cost: &crate::options::OptionExecutionReceiptCost,
     now: TimestampMs,
 ) -> Result<()> {
     use crate::options::OptionConfirmationOutcome;
@@ -1614,6 +1628,7 @@ async fn apply_worker_decision(
         decision.block_number,
         decision.receipt_status,
         decision.error.clone(),
+        receipt_cost,
     )
     .await?;
     if let Some(next) = intent_status {
@@ -1623,6 +1638,25 @@ async fn apply_worker_decision(
     Ok(())
 }
 
+/// Bridge `ConfirmationReceipt` (RPC-shaped) into the persisted
+/// `OptionExecutionReceiptCost` bundle. The bridge is shared by the V1T
+/// manual confirm endpoint and the V1V background worker so both paths emit
+/// identical persistence side effects.
+pub(crate) fn receipt_cost_from_receipt(
+    receipt: &crate::confirmation::ConfirmationReceipt,
+    observed_at_ms: TimestampMs,
+) -> crate::options::OptionExecutionReceiptCost {
+    crate::options::OptionExecutionReceiptCost {
+        gas_used: receipt.gas_used,
+        effective_gas_price: receipt.effective_gas_price.clone(),
+        cumulative_gas_used: receipt.cumulative_gas_used,
+        block_hash: receipt.block_hash.clone(),
+        transaction_index: receipt.transaction_index,
+        observed_at_ms: Some(observed_at_ms),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn persist_option_execution_confirmation(
     state: &AppState,
     transaction_id: &str,
@@ -1631,6 +1665,7 @@ async fn persist_option_execution_confirmation(
     confirmed_block_number: Option<u64>,
     receipt_status: Option<u64>,
     confirmation_error: Option<String>,
+    receipt_cost: &crate::options::OptionExecutionReceiptCost,
 ) -> Result<OptionExecutionTransaction> {
     if let Some(repository) = state.repository.clone() {
         let rows = repository
@@ -1641,6 +1676,7 @@ async fn persist_option_execution_confirmation(
                 confirmed_block_number,
                 receipt_status,
                 confirmation_error.clone(),
+                receipt_cost,
             )
             .await?;
         if rows == 0 {
@@ -1668,6 +1704,7 @@ async fn persist_option_execution_confirmation(
             confirmed_block_number,
             receipt_status,
             confirmation_error,
+            receipt_cost,
         )
 }
 
@@ -1891,6 +1928,12 @@ fn option_execution_transaction_from_request(
         confirmed_block_number: None,
         receipt_status: None,
         confirmation_error: None,
+        gas_used: None,
+        effective_gas_price: None,
+        cumulative_gas_used: None,
+        receipt_block_hash: None,
+        receipt_transaction_index: None,
+        receipt_observed_at_ms: None,
         created_at_ms: now,
         updated_at_ms: now,
     }
@@ -3609,6 +3652,14 @@ mod tests {
                     tx_hash: tx_hash.to_string(),
                     status: Some(1),
                     block_number: Some(block),
+                    gas_used: Some(1_057_772),
+                    effective_gas_price: Some("0x5b8d80".to_string()),
+                    cumulative_gas_used: Some(1_672_948),
+                    block_hash: Some(
+                        "0x53d62c21ecbe462e2868e216b4655474de0d2b7b832f15ab6e72b216fb1f3853"
+                            .to_string(),
+                    ),
+                    transaction_index: Some(5),
                 }),
                 calls: Arc::new(Mutex::new(Vec::new())),
                 head_block: 0,
@@ -3621,6 +3672,14 @@ mod tests {
                     tx_hash: tx_hash.to_string(),
                     status: Some(0),
                     block_number: Some(block),
+                    gas_used: Some(982_941),
+                    effective_gas_price: Some("0x5b8d80".to_string()),
+                    cumulative_gas_used: Some(1_500_000),
+                    block_hash: Some(
+                        "0x21307b4272a3fc0526e2a100c844cd037e81671c48d3f30cf939fefc57bc6b78"
+                            .to_string(),
+                    ),
+                    transaction_index: Some(15),
                 }),
                 calls: Arc::new(Mutex::new(Vec::new())),
                 head_block: 0,
@@ -3719,6 +3778,12 @@ mod tests {
             confirmed_block_number: None,
             receipt_status: None,
             confirmation_error: None,
+            gas_used: None,
+            effective_gas_price: None,
+            cumulative_gas_used: None,
+            receipt_block_hash: None,
+            receipt_transaction_index: None,
+            receipt_observed_at_ms: None,
             created_at_ms: now,
             updated_at_ms: now,
         };
@@ -4328,5 +4393,233 @@ mod tests {
         assert!(!ReceiptError.is_finalized());
         assert!(!Disabled.is_finalized());
         assert!(!NoPending.is_finalized());
+    }
+
+    // ----------------------------------------------------------------------------
+    // V1W observability + receipt cost persistence tests
+    // ----------------------------------------------------------------------------
+
+    fn cost_bundle() -> crate::options::OptionExecutionReceiptCost {
+        crate::options::OptionExecutionReceiptCost {
+            gas_used: Some(1_057_772),
+            effective_gas_price: Some("0x5b8d80".to_string()),
+            cumulative_gas_used: Some(1_672_948),
+            block_hash: Some(
+                "0x53d62c21ecbe462e2868e216b4655474de0d2b7b832f15ab6e72b216fb1f3853".to_string(),
+            ),
+            transaction_index: Some(5),
+            observed_at_ms: Some(123_456_789),
+        }
+    }
+
+    #[tokio::test]
+    async fn receipt_cost_persists_through_manual_confirm() {
+        let state = state_with_broadcast(true);
+        let tx_hash = "0x5964a7b3d2c18d051baaa780413d31c44d419ce530f45263cb4c46f720881125";
+        let (intent, _tx) = broadcast_submitted_intent_with_tx(&state, tx_hash);
+        let provider = MockReceiptProvider::mined_success(tx_hash, 41856964);
+
+        let outcome =
+            confirm_option_execution_intent_with_provider(&state, intent.intent_id, &provider)
+                .await
+                .unwrap();
+
+        assert_eq!(
+            outcome.confirmation_status,
+            OptionExecutionConfirmationStatus::MinedSuccess
+        );
+        let txs = option_transactions(&state, intent.intent_id);
+        assert_eq!(txs[0].gas_used, Some(1_057_772));
+        assert_eq!(txs[0].effective_gas_price.as_deref(), Some("0x5b8d80"));
+        assert_eq!(txs[0].cumulative_gas_used, Some(1_672_948));
+        assert_eq!(
+            txs[0].receipt_block_hash.as_deref(),
+            Some("0x53d62c21ecbe462e2868e216b4655474de0d2b7b832f15ab6e72b216fb1f3853")
+        );
+        assert_eq!(txs[0].receipt_transaction_index, Some(5));
+        assert!(txs[0].receipt_observed_at_ms.is_some());
+        assert_no_generic_execution_rows(&state);
+    }
+
+    #[tokio::test]
+    async fn worker_stores_gas_fields_on_mined_success() {
+        let state = state_with_confirmation_worker(true, 3);
+        let tx_hash = "0x5964a7b3d2c18d051baaa780413d31c44d419ce530f45263cb4c46f720881125";
+        let (intent, _tx) = broadcast_submitted_intent_with_tx(&state, tx_hash);
+        let provider = MockReceiptProvider::mined_success(tx_hash, 100).with_head(105);
+
+        let result = confirm_pending_option_execution_transactions(&state, &provider)
+            .await
+            .unwrap();
+
+        assert_eq!(result.decisions.len(), 1);
+        let txs = option_transactions(&state, intent.intent_id);
+        assert_eq!(txs[0].gas_used, Some(1_057_772));
+        assert_eq!(txs[0].cumulative_gas_used, Some(1_672_948));
+        assert_eq!(txs[0].receipt_transaction_index, Some(5));
+        assert!(txs[0].receipt_observed_at_ms.is_some());
+        assert_no_generic_execution_rows(&state);
+    }
+
+    #[tokio::test]
+    async fn worker_does_not_store_cost_when_receipt_absent() {
+        let state = state_with_confirmation_worker(true, 3);
+        let tx_hash = "0x1111111111111111111111111111111111111111111111111111111111111111";
+        let (intent, _tx) = broadcast_submitted_intent_with_tx(&state, tx_hash);
+        let provider = MockReceiptProvider::missing().with_head(200);
+
+        let _ = confirm_pending_option_execution_transactions(&state, &provider)
+            .await
+            .unwrap();
+
+        let txs = option_transactions(&state, intent.intent_id);
+        assert!(txs[0].gas_used.is_none());
+        assert!(txs[0].effective_gas_price.is_none());
+        assert!(txs[0].receipt_observed_at_ms.is_none());
+        assert_eq!(
+            txs[0].confirmation_status,
+            Some(OptionExecutionConfirmationStatus::ReceiptMissing)
+        );
+        assert_no_generic_execution_rows(&state);
+    }
+
+    #[tokio::test]
+    async fn worker_publishes_latest_tick_after_tick() {
+        let state = state_with_confirmation_worker(true, 3);
+        let tx_hash = "0x5964a7b3d2c18d051baaa780413d31c44d419ce530f45263cb4c46f720881125";
+        let (_intent, _tx) = broadcast_submitted_intent_with_tx(&state, tx_hash);
+        let provider = MockReceiptProvider::mined_success(tx_hash, 100).with_head(105);
+
+        assert!(state
+            .option_confirmation_last_tick
+            .lock()
+            .unwrap()
+            .is_none());
+        let _ = confirm_pending_option_execution_transactions(&state, &provider)
+            .await
+            .unwrap();
+
+        let latest = state
+            .option_confirmation_last_tick
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("latest tick should be set after a worker run");
+        assert!(latest.enabled);
+        assert_eq!(latest.finality_blocks, 3);
+        assert_eq!(latest.current_block_number, Some(105));
+        assert_eq!(latest.decisions.len(), 1);
+        assert_eq!(
+            latest.decisions[0].outcome,
+            crate::options::OptionConfirmationOutcome::MinedSuccess
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_disabled_does_not_publish_latest_tick() {
+        let state = state_with_confirmation_worker(false, 3);
+        let tx_hash = "0x5964a7b3d2c18d051baaa780413d31c44d419ce530f45263cb4c46f720881125";
+        let (_intent, _tx) = broadcast_submitted_intent_with_tx(&state, tx_hash);
+        let provider = MockReceiptProvider::mined_success(tx_hash, 100).with_head(105);
+
+        let _ = confirm_pending_option_execution_transactions(&state, &provider)
+            .await
+            .unwrap();
+        assert!(state
+            .option_confirmation_last_tick
+            .lock()
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn summary_counts_bucket_pending_correctly() {
+        let state = state_with_confirmation_worker(true, 3);
+        let tx_hash = "0x5964a7b3d2c18d051baaa780413d31c44d419ce530f45263cb4c46f720881125";
+        let (_intent, _tx) = broadcast_submitted_intent_with_tx(&state, tx_hash);
+
+        // Before any tick: 1 row, pending (null confirmation_status).
+        let pre = state
+            .options_store
+            .lock()
+            .unwrap()
+            .summarize_option_execution_confirmations();
+        assert_eq!(pre, vec![("pending".to_string(), 1u64)]);
+
+        // After a successful mined tick: 1 row, mined_success.
+        let provider = MockReceiptProvider::mined_success(tx_hash, 100).with_head(120);
+        let _ = confirm_pending_option_execution_transactions(&state, &provider)
+            .await
+            .unwrap();
+        let post = state
+            .options_store
+            .lock()
+            .unwrap()
+            .summarize_option_execution_confirmations();
+        assert_eq!(post, vec![("mined_success".to_string(), 1u64)]);
+    }
+
+    #[test]
+    fn store_update_receipt_cost_persists_independently_of_status_transition() {
+        // Repository-style direct call: the in-memory store update method takes the
+        // cost bundle and persists every non-None field even when the confirmation
+        // status is non-terminal (e.g. NotFinalized → persist_status = Pending).
+        use crate::execution::ExecutionTransactionStatus;
+        let mut store = crate::options::OptionSeriesStore::new();
+        let tx_id = "tx-1".to_string();
+        let tx = OptionExecutionTransaction {
+            transaction_id: tx_id.clone(),
+            intent_id: Uuid::from_u128(1),
+            onchain_intent_id: None,
+            from: AccountId::new("0x0000000000000000000000000000000000000001"),
+            to: AccountId::new("0x0000000000000000000000000000000000000002"),
+            calldata: "0x".to_string(),
+            value_wei: "0".to_string(),
+            gas_limit: Some(1),
+            tx_hash: Some(
+                "0x4444444444444444444444444444444444444444444444444444444444444444".to_string(),
+            ),
+            status: ExecutionTransactionStatus::Submitted,
+            error: None,
+            estimated_gas: None,
+            required_gas: None,
+            simulation_gas_limit: None,
+            broadcast_gas_limit: None,
+            gas_safety_bps: None,
+            gas_check_status: None,
+            gas_check_error: None,
+            confirmation_status: None,
+            confirmed_at_ms: None,
+            confirmed_block_number: None,
+            receipt_status: None,
+            confirmation_error: None,
+            gas_used: None,
+            effective_gas_price: None,
+            cumulative_gas_used: None,
+            receipt_block_hash: None,
+            receipt_transaction_index: None,
+            receipt_observed_at_ms: None,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        };
+        store.insert_option_execution_transaction(tx).unwrap();
+        let cost = cost_bundle();
+        let updated = store
+            .update_option_execution_confirmation(
+                &tx_id,
+                OptionExecutionConfirmationStatus::Pending,
+                42,
+                Some(100),
+                Some(1),
+                None,
+                &cost,
+            )
+            .unwrap();
+        assert_eq!(updated.gas_used, cost.gas_used);
+        assert_eq!(updated.effective_gas_price, cost.effective_gas_price);
+        assert_eq!(updated.cumulative_gas_used, cost.cumulative_gas_used);
+        assert_eq!(updated.receipt_block_hash, cost.block_hash);
+        assert_eq!(updated.receipt_transaction_index, cost.transaction_index);
+        assert_eq!(updated.receipt_observed_at_ms, cost.observed_at_ms);
     }
 }
