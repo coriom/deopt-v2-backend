@@ -1,372 +1,276 @@
-# NEXT_TASK.md — Option Execution Reconciliation Worker V1Y
+# NEXT_TASK.md — V1S Live Reconciliation Worker Validation V1Y-B
 
 ## Context
 
-V1S successfully executed the first live option trade on Base Sepolia.
+V1Y implemented the option execution reconciliation worker.
 
-Tx:
+Implemented:
+- `option_execution_reconciliations` table.
+- `OPTION_RECONCILIATION_WORKER_ENABLED=false` by default.
+- `GET /admin/options/reconciliations`.
+- `POST /admin/options/reconciliations/tick`.
+- Event-based reconciliation checks.
+- Idempotent upsert by `option_execution_transaction_id`.
+
+V1Y was test-covered only. It did not run a live reconciliation tick against V1S.
+
+V1S successful tx:
+
+```text
 0x5964a7b3d2c18d051baaa780413d31c44d419ce530f45263cb4c46f720881125
 
 Intent:
+
 e6d2941b-65f7-413a-958f-74ab22c53b08
 
 Transaction row:
+
 cae8c7e7-ed61-4265-aa7d-75edd94ef03c
 
-V1T manually confirmed and reconciled the trade:
-- receipt status = 1
-- intent status = broadcast_confirmed
-- tx confirmation_status = mined_success
-- buyer nonce advanced
-- seller nonce advanced
-- buyer option position +1
-- seller option position -1
-- buyer fee = 6
-- seller fee = 4
-- premium/vault movements reconciled manually
+Known state:
 
-V1V added background confirmation worker.
+V1T manually confirmed V1S.
+V1X-C indexed V1S events.
+V1Y implemented the reconciliation worker, but did not run it live.
+Goal
 
-V1W added confirmation observability and receipt cost persistence.
+Run one controlled live reconciliation tick for the already confirmed and already indexed V1S option execution.
 
-V1X added option event indexer.
+This task may write only an idempotent reconciliation row for the existing V1S transaction.
 
-V1X-B added multi-emitter event coverage:
-- OptionMatchingEngine
-- MarginEngine
-- CollateralVault
-- optional FeesManager
-
-V1X-C validated live backfill for V1S:
-- OptionTradeExecuted indexed
-- TradeExecuted indexed
-- two TradingFeeCharged events indexed
-- InternalTransfer events indexed
-- Synced events indexed
-- events linked to tx row and intent by tx_hash
-- idempotency verified
-
-Remaining gap:
-The backend has confirmation and event indexing, but no automatic reconciliation worker.
-
-## Goal
-
-Implement an option execution reconciliation worker.
-
-The worker should verify that confirmed option executions match expected backend intent data and observed on-chain events/state.
-
-This is backend-only.
-
-## Hard Rules
+Hard Rules
 
 Do not broadcast.
 Do not retry.
 Do not submit transactions.
-Do not call `/executor/broadcast`.
-Do not call `POST /options/execution-intents/:id/broadcast`.
+Do not call /executor/broadcast.
+Do not call POST /options/execution-intents/:id/broadcast.
 Do not create new option execution intents.
-Do not create new option_execution_transactions except in tests.
+Do not create new option_execution_transactions.
 Do not create generic execution_transactions.
-Do not cleanup existing evidence rows.
+Do not cleanup evidence rows.
 Do not modify Solidity.
 Do not modify frontend.
 Do not deploy contracts.
 Do not print private keys.
-Do not touch real `.env` secrets.
+Do not touch real .env secrets.
 
 Allowed mutations:
-- migrations for reconciliation fields/tables
-- reconciliation status updates for already confirmed option executions
-- tests fixtures only
 
-## Required Config
+apply pending backend migrations.
+insert/update option_execution_reconciliations for the existing V1S transaction.
+update in-memory latest tick state.
 
-Add safe config:
+No other DB mutation is allowed.
 
-```text
-OPTION_RECONCILIATION_WORKER_ENABLED=false
+Step 1 — Repo And Migration Check
+
+Work in:
+
+~/DEOPT/deopt-v2-backend
+
+Run:
+
+git status -sb
+git log -1 --oneline
+
+Verify V1Y code is present.
+
+Verify migration exists:
+
+migrations/0026_option_execution_reconciliations.sql
+
+Apply migrations if needed:
+
+sqlx migrate run
+
+Do not print DATABASE_URL.
+
+Verify table exists:
+
+select to_regclass('option_execution_reconciliations');
+Step 2 — Env / Config Check
+
+Reload env without printing secrets.
+
+Set for this controlled tick:
+
+OPTION_RECONCILIATION_WORKER_ENABLED=true
 OPTION_RECONCILIATION_POLL_INTERVAL_MS=15000
 OPTION_RECONCILIATION_BATCH_SIZE=25
 OPTION_RECONCILIATION_REQUIRE_EVENTS=true
 OPTION_RECONCILIATION_REQUIRE_RPC=true
 OPTION_RECONCILIATION_STRICT=true
 
-Defaults:
+Required supporting config:
 
-disabled by default
-strict by default
-no reconciliation if required events are missing
-no mutation if RPC unavailable and require_rpc=true
+PERSISTENCE_ENABLED=true
+RPC_URL configured
+event indexer tables already populated for V1S
+option tx confirmation fields already present from V1T/V1W
 
-Expose sanitized values in /admin/config.
+Verify sanitized /admin/config exposes:
 
-Required DB
+reconciliation worker enabled
+require_events true
+require_rpc true
+strict true
+batch_size 25
 
-Add reconciliation fields or table.
+Abort on mismatch.
 
-Preferred table:
+Step 3 — DB Baseline
 
-option_execution_reconciliations
+Set:
 
-Suggested columns:
+V1Y_B_START_MS=$(date +%s%3N)
 
-id UUID primary key
-intent_id UUID not null
-option_execution_transaction_id UUID not null
-tx_hash TEXT not null
-chain_id BIGINT not null
-status TEXT not null
-checked_at_ms BIGINT not null
-receipt_status TEXT null
-event_check_status TEXT null
-state_check_status TEXT null
-fee_check_status TEXT null
-premium_check_status TEXT null
-nonce_check_status TEXT null
-position_check_status TEXT null
-error TEXT null
-details JSONB null
-created_at_ms BIGINT not null
-updated_at_ms BIGINT not null
+Record:
 
-Statuses:
+select intent_id, status
+from option_execution_intents
+where intent_id = 'e6d2941b-65f7-413a-958f-74ab22c53b08';
 
-pending
-reconciled
-reconciliation_failed
-missing_events
-state_mismatch
-fee_mismatch
-premium_mismatch
-rpc_error
+select id, tx_hash, confirmation_status, receipt_status, confirmed_block_number
+from option_execution_transactions
+where id = 'cae8c7e7-ed61-4265-aa7d-75edd94ef03c';
 
-Add uniqueness:
+select event_name, count(*)
+from option_execution_events
+where tx_hash = '0x5964a7b3d2c18d051baaa780413d31c44d419ce530f45263cb4c46f720881125'
+group by event_name
+order by event_name;
 
-(chain_id, tx_hash)
+select *
+from option_execution_reconciliations
+where option_execution_transaction_id = 'cae8c7e7-ed61-4265-aa7d-75edd94ef03c';
 
-Do not break existing V1S/V1T rows.
+select count(*) from option_execution_transactions
+where created_at_ms >= :V1Y_B_START_MS;
 
-Required Repository Methods
+select count(*) from execution_transactions
+where created_at_ms >= :V1Y_B_START_MS;
 
-Add methods to:
+Expected:
 
-list confirmed but unreconciled option executions:
-transaction confirmation_status = mined_success
 intent status = broadcast_confirmed
-no reconciliation row with status = reconciled
-batch limited
-fetch expected intent data:
-buyer
-seller
-option_id
-quantity
-premium
-buyer/seller nonces
-onchain_intent_id
-calldata/selector if useful
-fetch indexed events for tx_hash:
+tx confirmation_status = mined_success
+V1S events exist
+no generic execution tx mutations
+
+If V1S already has reconciled, stop and document idempotency instead of forcing a new mutation.
+
+Step 4 — One-shot Reconciliation Tick
+
+Call exactly once:
+
+POST /admin/options/reconciliations/tick
+
+Do not run the unbounded background loop if avoidable.
+
+Expected:
+
+scanned >= 1, or skipped if already reconciled.
+V1S reconciled if unreconciled.
+no broadcast.
+no new option execution transaction.
+no generic execution transaction.
+Step 5 — Verify Reconciliation Result
+
+Query:
+
+select *
+from option_execution_reconciliations
+where option_execution_transaction_id = 'cae8c7e7-ed61-4265-aa7d-75edd94ef03c';
+
+Expected:
+
+status = reconciled or justified partially_reconciled.
+strict = true.
+requires_events = true.
+event counts include:
 OptionTradeExecuted
 TradeExecuted
 TradingFeeCharged
 InternalTransfer
-other relevant indexed events
-insert/update reconciliation result idempotently.
-Required Worker Behavior
+details JSON contains:
+expected intent fields
+observed trade event
+fee events
+transfer events
+event_count_by_name
+no mismatch_reason
 
-Worker tick:
+If result is not reconciled:
 
-If disabled, do nothing.
-Find confirmed unreconciled option executions.
-For each:
-load intent
-load tx row
-load indexed events
-validate required events
-compare event data to expected intent
-optionally read on-chain state for positions/nonces if RPC enabled
-write reconciliation result
+do not patch immediately.
+inspect mismatch reason.
+document root cause.
+no retry.
+Step 6 — Admin Endpoint Check
 
-Never rebroadcast.
-Never mark failed txs as reconciled.
-Never create generic execution rows.
-
-Required Event Checks
-
-For the tx being reconciled, verify:
-
-OptionTradeExecuted
-
-Must match expected:
-
-onchain_intent_id
-buyer
-seller
-option_id
-quantity
-premium
-buyer_is_maker if available
-TradeExecuted / Margin event
-
-Verify if present:
-
-buyer/seller or accounts
-option_id
-quantity direction
-premium
-TradingFeeCharged
-
-Verify:
-
-two fee events expected if both buyer and seller charged
-fee payer addresses
-fee recipient
-fee amounts present
-fee asset if available
-
-Do not hardcode fee amounts globally. For V1S, expected observed amounts are buyer fee 6 and seller fee 4, but generic reconciliation should derive from indexed events / intent / configured fee logic if available.
-
-InternalTransfer / Vault Events
-
-Verify:
-
-premium movement buyer -> seller
-fee movement payer -> recipient
-asset address if available
-amounts if available
-
-If exact event shape is insufficient, mark as partial and document.
-
-Required On-chain State Checks
-
-If RPC enabled, read:
-
-buyer nonce
-seller nonce
-buyer option position
-seller option position
-
-Use existing contract views.
-
-If exact position view names are uncertain, search Solidity sources:
-
-rg "function .*position|positions|getPosition|openInterest|nonces" ../deopt-v2-sol/src
-
-For V1S expected:
-
-buyer nonce >= intent buyer nonce + 1
-seller nonce >= intent seller nonce + 1
-buyer position includes +1
-seller position includes -1
-
-Do not invent state if view unavailable. If view is missing, document and make event-only reconciliation possible under non-strict mode only.
-
-Required Admin Endpoint
-
-Add:
+Call:
 
 GET /admin/options/reconciliations
 
-Return sanitized summary:
+Verify:
 
-{
-  "worker_enabled": false,
-  "strict": true,
-  "require_events": true,
-  "require_rpc": true,
-  "pending": 0,
-  "reconciled": 1,
-  "reconciliation_failed": 0,
-  "latest_tick": {
-    "ran_at_ms": 0,
-    "scanned": 0,
-    "reconciled": 0,
-    "failed": 0,
-    "missing_events": 0,
-    "rpc_errors": 0,
-    "error": null
-  },
-  "recent": []
-}
+counts show reconciled >= 1
+latest_tick is populated
+recent includes V1S or the new reconciliation row
+no secrets exposed
+Step 7 — Idempotency Check
 
-No secrets.
+Call the tick a second time only if the implementation is explicitly designed to skip already reconciled rows.
 
-Required Latest Tick State
+Expected:
 
-Store latest worker tick in memory:
+V1S not duplicated.
+same reconciliation row remains unique.
+scanned may be 0 or skipped.
+counts do not double.
 
-ran_at_ms
-scanned
-reconciled
-failed
-missing_events
-state_mismatches
-fee_mismatches
-premium_mismatches
-rpc_errors
-error
+If unsure, do not call a second tick; verify uniqueness via DB instead.
 
-Expose via admin endpoint.
+Step 8 — No Forbidden Mutation Check
 
-Required Tests
+Verify since V1Y_B_START_MS:
 
-Add tests for:
+select count(*) from option_execution_transactions
+where created_at_ms >= :V1Y_B_START_MS;
 
-worker disabled does nothing.
-confirmed tx with missing events becomes missing_events or remains pending depending config.
-confirmed tx with matching OptionTradeExecuted reconciles.
-mismatched buyer/seller fails.
-mismatched option_id fails.
-mismatched quantity fails.
-fee events are included in reconciliation details.
-same tx reconciliation is idempotent.
-admin endpoint returns counts/latest tick.
-worker never calls broadcast.
-worker never creates generic execution rows.
+select count(*) from execution_transactions
+where created_at_ms >= :V1Y_B_START_MS;
 
-Use mocks. Do not depend on live Base Sepolia.
+Expected:
 
-Required Optional Validation Against V1S
+option_execution_transactions = 0
+execution_transactions = 0
 
-Add a safe one-shot reconciliation path or admin-safe tick if practical.
-
-If live DB contains V1S indexed events, run one reconciliation tick for V1S only.
-
-Allowed:
-
-insert/update reconciliation row for V1S.
-
-Forbidden:
-
-any broadcast
-any new option tx
-any generic execution tx
-
-If live one-shot is not run, document manual command/path.
+No broadcast endpoint calls.
 
 Required Docs
 
 Create:
 
-docs/OPTION_RECONCILIATION_WORKER_V1Y.md
+docs/OPTION_LIVE_RECONCILIATION_VALIDATION_V1Y_B.md
 
 Include:
 
-why confirmation is not enough
-reconciliation inputs
-DB schema
-worker lifecycle
-event checks
-state checks
-fee/premium checks
-strict vs non-strict behavior
-admin endpoint
-relation to V1S/V1T/V1V/V1W/V1X
-remaining deferred work:
-frontend lifecycle display
-advanced fee reconciliation
-settlement/exercise/expiry indexing
-reorg handling
-alerting
+V1S tx hash
+intent id
+transaction id
+migration status
+config used
+DB baseline
+events available before tick
+tick response
+reconciliation row
+details summary
+admin endpoint result
+idempotency result
+no forbidden mutation verification
+remaining blocker
 Validation
 
 Run:
@@ -379,32 +283,30 @@ Acceptance Criteria
 
 Complete only if:
 
-reconciliation worker exists
-disabled by default
-confirmed mined_success option txs can be reconciled
-indexed events are used
-mismatches fail loudly
-reconciliation result is persisted
-admin endpoint exists
-tests pass
+migration 0026 applied
+V1S confirmed tx found
+V1S indexed events found
+one-shot reconciliation tick run or safely skipped if already reconciled
+V1S reconciliation row exists
+admin endpoint reflects reconciliation
+no broadcast
+no new option execution transaction
+no generic execution transaction
 docs created
-no broadcast path touched
-no transaction submitted
+validations pass
 Final Report
 
 Return:
 
 files changed
-migrations added
-config added
-reconciliation worker behavior
-DB schema summary
-event checks implemented
-state checks implemented
-admin endpoint added
-tests added
-docs created
+migration applied or not
+config used
+DB baseline summary
+tick response
+reconciliation status
+reconciliation details summary
+admin endpoint summary
+idempotency result
 validation commands run
 no forbidden mutation verification
-whether V1S was reconciled by the worker or only test-covered
 remaining blocker
