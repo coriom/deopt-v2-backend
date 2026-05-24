@@ -270,6 +270,10 @@ pub fn router(state: AppState) -> Router {
             "/admin/options/reconciliations/tick",
             post(admin_option_reconciliations_tick),
         )
+        .route(
+            "/admin/options/executions/:intent_id/lifecycle",
+            get(admin_option_execution_lifecycle),
+        )
         .route("/admin/mm/sessions", get(admin_mm_sessions))
         .route("/admin/mm/permissions", get(admin_mm_permissions))
         .route("/admin/execution/summary", get(admin_execution_summary))
@@ -751,6 +755,18 @@ async fn admin_option_reconciliations_tick(
     }
     let result = crate::options::reconcile_option_executions(&state).await?;
     Ok(Json(result))
+}
+
+async fn admin_option_execution_lifecycle(
+    headers: HeaderMap,
+    Path(intent_id): Path<String>,
+    State(state): State<AppState>,
+) -> Result<Json<crate::options::OptionExecutionLifecycle>, ApiError> {
+    ensure_admin_access(&state, &headers)?;
+    let parsed_intent_id =
+        Uuid::parse_str(&intent_id).map_err(|_| BackendError::InvalidOptionExecutionIntentId)?;
+    let view = crate::options::get_option_execution_lifecycle(&state, parsed_intent_id).await?;
+    Ok(Json(view))
 }
 
 async fn admin_mm_sessions(
@@ -5236,6 +5252,91 @@ mod tests {
             json["error"],
             "configuration error: option reconciliation worker is disabled"
         );
+    }
+
+    #[tokio::test]
+    async fn admin_option_execution_lifecycle_returns_404_for_unknown_intent() {
+        let state = admin_state(false);
+        let response = router(state)
+            .oneshot(get_request(
+                "/admin/options/executions/e6d2941b-65f7-413a-958f-74ab22c53b08/lifecycle",
+                None,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn admin_option_execution_lifecycle_returns_aggregated_view() {
+        let state = admin_state(false);
+        let intent_id = Uuid::from_u128(7777);
+        let intent = OptionExecutionIntent {
+            intent_id,
+            onchain_intent_id: "0x0a77c7c9570198c969b1fa597ea193cb6fee563e3bfae514e9a3f0c4e01705f5"
+                .to_string(),
+            source_type: crate::options::OptionExecutionSourceType::OptionOrderbookFill,
+            source_id: "fill-route-1".to_string(),
+            option_series_id: "series-route-1".to_string(),
+            onchain_option_id: "7".to_string(),
+            buyer: AccountId::new("0x0000000000000000000000000000000000000001"),
+            seller: AccountId::new("0x0000000000000000000000000000000000000002"),
+            underlying: AccountId::new("0x0000000000000000000000000000000000000010"),
+            settlement_asset: AccountId::new("0x0000000000000000000000000000000000000020"),
+            expiry: 4_102_444_800,
+            strike_1e8: 300_000_000_000,
+            is_call: true,
+            contract_size_1e8: 100_000_000,
+            quantity_contracts: 1,
+            source_size_1e8: 100_000_000,
+            source_price_1e8: 10_000_000,
+            premium_per_contract_native: 10_000,
+            buyer_is_maker: false,
+            buyer_nonce: Some(0),
+            seller_nonce: Some(0),
+            deadline: 0,
+            buyer_signature: Some("0x01".to_string()),
+            seller_signature: Some("0x02".to_string()),
+            calldata: Some("0x031f77b3deadbeef".to_string()),
+            status: OptionExecutionIntentStatus::SimulationOk,
+            error: None,
+            simulation_status: Some(OptionExecutionSimulationStatus::SimulationOk),
+            simulation_error: None,
+            simulation_block_number: Some(41_856_962),
+            simulation_revert_data: None,
+            simulation_revert_selector: None,
+            simulated_at_ms: Some(1),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        };
+        state
+            .options_store
+            .lock()
+            .unwrap()
+            .insert_option_execution_intent(intent);
+
+        let response = router(state)
+            .oneshot(get_request(
+                &format!("/admin/options/executions/{intent_id}/lifecycle"),
+                None,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["intent_id"], intent_id.to_string());
+        assert_eq!(json["status"], "simulation_ok");
+        assert_eq!(json["calldata"]["present"], true);
+        assert_eq!(json["calldata"]["selector"], "0x031f77b3");
+        assert_eq!(json["calldata"]["byte_length"], 8);
+        assert_eq!(json["trade"]["quantity_contracts"], "1");
+        assert_eq!(json["trade"]["premium_per_contract_native"], "10000");
+        assert!(json["broadcast"].is_null());
+        assert_eq!(json["events"]["total"], 0);
+        assert_eq!(json["health"]["stage"], "simulation_ok");
+        assert_eq!(json["health"]["is_terminal_success"], false);
     }
 
     #[tokio::test]

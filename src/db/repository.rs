@@ -2824,7 +2824,8 @@ impl PgRepository {
         .fetch_optional(&self.pool)
         .await
         .map_err(|error| BackendError::Persistence(error.to_string()))?;
-        row.map(option_execution_reconciliation_from_row).transpose()
+        row.map(option_execution_reconciliation_from_row)
+            .transpose()
     }
 
     pub async fn summarize_option_execution_reconciliations(&self) -> Result<Vec<(String, u64)>> {

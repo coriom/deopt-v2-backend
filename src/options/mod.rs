@@ -1,6 +1,7 @@
 pub mod confirmation_worker;
 pub mod event_indexer;
 pub mod execution;
+pub mod lifecycle;
 pub mod reconciliation_worker;
 pub mod series_id;
 pub mod service;
@@ -18,6 +19,12 @@ pub use event_indexer::{
     summarize_option_execution_events_by_contract_address, OptionEventEmitterContract,
     OptionEventIndexerConfig, OptionEventIndexerTickResult, OPTION_EVENT_INDEXER_STATE_ID,
     OPTION_TRADE_EXECUTED_SIGNATURE,
+};
+pub use lifecycle::{
+    get_option_execution_lifecycle, LifecycleBroadcast, LifecycleCalldata, LifecycleConfirmation,
+    LifecycleEvents, LifecycleFees, LifecycleMetadata, LifecycleReconciliation,
+    LifecycleSignatures, LifecycleSimulation, LifecycleSource, LifecycleTrade, LifecycleTransfers,
+    OptionExecutionLifecycle, OptionExecutionLifecycleHealth, OptionExecutionLifecycleStage,
 };
 pub use reconciliation_worker::{
     reconcile_option_executions, spawn_option_reconciliation_worker,
