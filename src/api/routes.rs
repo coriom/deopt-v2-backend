@@ -537,6 +537,9 @@ async fn admin_config(
                 "require_events": state.option_reconciliation_config.require_events,
                 "require_rpc": state.option_reconciliation_config.require_rpc,
                 "strict": state.option_reconciliation_config.strict,
+                "state_checks_enabled": state.option_reconciliation_config.state_checks_enabled,
+                "state_checks_require_rpc": state.option_reconciliation_config.state_checks_require_rpc,
+                "state_checks_strict": state.option_reconciliation_config.state_checks_strict,
                 "rpc_configured": state.option_reconciliation_config.rpc_url.is_some()
             }
         }
@@ -722,6 +725,7 @@ async fn admin_option_reconciliations(
             .map_err(|_| ApiError::internal())?
             .list_option_execution_reconciliations(20)
     };
+    let check_counts = option_reconciliation_check_counts(&recent);
     let latest_tick = state
         .option_reconciliation_last_tick
         .lock()
@@ -735,12 +739,73 @@ async fn admin_option_reconciliations(
             "require_events": state.option_reconciliation_config.require_events,
             "require_rpc": state.option_reconciliation_config.require_rpc,
             "strict": state.option_reconciliation_config.strict,
+            "state_checks_enabled": state.option_reconciliation_config.state_checks_enabled,
+            "state_checks_require_rpc": state.option_reconciliation_config.state_checks_require_rpc,
+            "state_checks_strict": state.option_reconciliation_config.state_checks_strict,
             "rpc_configured": state.option_reconciliation_config.rpc_url.is_some()
         },
         "counts": serde_json::Value::Object(counts),
+        "check_counts": check_counts,
         "latest_tick": latest_tick,
         "recent": recent,
     })))
+}
+
+fn option_reconciliation_check_counts(
+    rows: &[crate::options::OptionExecutionReconciliation],
+) -> serde_json::Value {
+    let mut state_check_status = BTreeMap::<String, u64>::new();
+    let mut nonce_check_status = BTreeMap::<String, u64>::new();
+    let mut position_check_status = BTreeMap::<String, u64>::new();
+    let mut vault_check_status = BTreeMap::<String, u64>::new();
+    let fee_check_status = BTreeMap::<String, u64>::new();
+    let premium_check_status = BTreeMap::<String, u64>::new();
+
+    for row in rows {
+        let state_checks = row.details.get("state_checks");
+        increment_count(
+            &mut state_check_status,
+            state_checks
+                .and_then(|value| value.get("overall_status"))
+                .and_then(|value| value.as_str())
+                .unwrap_or("missing"),
+        );
+        increment_count(
+            &mut nonce_check_status,
+            state_checks
+                .and_then(|value| value.get("nonce_check_status"))
+                .and_then(|value| value.as_str())
+                .unwrap_or("missing"),
+        );
+        increment_count(
+            &mut position_check_status,
+            state_checks
+                .and_then(|value| value.get("position_check_status"))
+                .and_then(|value| value.as_str())
+                .unwrap_or("missing"),
+        );
+        increment_count(
+            &mut vault_check_status,
+            state_checks
+                .and_then(|value| value.get("vault_check_status"))
+                .and_then(|value| value.as_str())
+                .unwrap_or("missing"),
+        );
+    }
+
+    serde_json::json!({
+        "state_check_status": state_check_status,
+        "nonce_check_status": nonce_check_status,
+        "position_check_status": position_check_status,
+        "vault_check_status": vault_check_status,
+        "fee_check_status": fee_check_status,
+        "premium_check_status": premium_check_status,
+        "scope": "recent"
+    })
+}
+
+fn increment_count(counts: &mut BTreeMap<String, u64>, bucket: &str) {
+    *counts.entry(bucket.to_string()).or_default() += 1;
 }
 
 async fn admin_option_reconciliations_tick(
@@ -4614,6 +4679,18 @@ mod tests {
 
         assert_eq!(json["configured"]["rpc"], true);
         assert_eq!(json["admin"]["token_configured"], true);
+        assert_eq!(
+            json["options"]["reconciliation_worker"]["state_checks_enabled"],
+            false
+        );
+        assert_eq!(
+            json["options"]["reconciliation_worker"]["state_checks_require_rpc"],
+            true
+        );
+        assert_eq!(
+            json["options"]["reconciliation_worker"]["state_checks_strict"],
+            false
+        );
         assert!(!body_text.contains("sensitive-provider-key"));
         assert!(!body_text.contains("test-admin-token"));
         assert!(json.get("database_url").is_none());
@@ -5200,6 +5277,9 @@ mod tests {
             require_events: true,
             require_rpc: true,
             strict: true,
+            state_checks_enabled: true,
+            state_checks_require_rpc: true,
+            state_checks_strict: false,
             rpc_url: Some("https://rpc.example/redacted-key".to_string()),
         };
         *state.option_reconciliation_last_tick.lock().unwrap() =
@@ -5209,6 +5289,9 @@ mod tests {
                 strict: true,
                 require_events: true,
                 require_rpc: true,
+                state_checks_enabled: true,
+                state_checks_require_rpc: true,
+                state_checks_strict: false,
                 considered: 2,
                 reconciled: 1,
                 partially_reconciled: 0,
@@ -5228,6 +5311,9 @@ mod tests {
         assert_eq!(json["config"]["enabled"], true);
         assert_eq!(json["config"]["strict"], true);
         assert_eq!(json["config"]["require_events"], true);
+        assert_eq!(json["config"]["state_checks_enabled"], true);
+        assert_eq!(json["config"]["state_checks_require_rpc"], true);
+        assert_eq!(json["config"]["state_checks_strict"], false);
         assert_eq!(json["config"]["rpc_configured"], true);
         assert_eq!(json["counts"]["reconciled"], 0);
         assert_eq!(json["counts"]["partially_reconciled"], 0);
@@ -5236,6 +5322,11 @@ mod tests {
         assert_eq!(json["counts"]["skipped"], 0);
         assert_eq!(json["latest_tick"]["reconciliation_failed"], 1);
         assert_eq!(json["latest_tick"]["reconciled"], 1);
+        assert!(json["check_counts"]["state_check_status"].is_object());
+        assert!(json["check_counts"]["nonce_check_status"].is_object());
+        assert!(json["check_counts"]["position_check_status"].is_object());
+        assert!(json["check_counts"]["fee_check_status"].is_object());
+        assert!(json["check_counts"]["premium_check_status"].is_object());
         assert!(json["recent"].as_array().unwrap().is_empty());
     }
 

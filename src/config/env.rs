@@ -387,6 +387,21 @@ impl AppConfig {
             require_events: parse_env(&mut lookup, "OPTION_RECONCILIATION_REQUIRE_EVENTS", "true")?,
             require_rpc: parse_env(&mut lookup, "OPTION_RECONCILIATION_REQUIRE_RPC", "true")?,
             strict: parse_env(&mut lookup, "OPTION_RECONCILIATION_STRICT", "true")?,
+            state_checks_enabled: parse_env(
+                &mut lookup,
+                "OPTION_RECONCILIATION_STATE_CHECKS_ENABLED",
+                "false",
+            )?,
+            state_checks_require_rpc: parse_env(
+                &mut lookup,
+                "OPTION_RECONCILIATION_STATE_CHECKS_REQUIRE_RPC",
+                "true",
+            )?,
+            state_checks_strict: parse_env(
+                &mut lookup,
+                "OPTION_RECONCILIATION_STATE_CHECKS_STRICT",
+                "false",
+            )?,
             rpc_url: execution.rpc_url.clone(),
         };
         let option_event_indexer = OptionEventIndexerConfig {
@@ -908,6 +923,51 @@ mod tests {
         assert!(error
             .to_string()
             .contains("RPC_URL is required when OPTION_EVENT_INDEXER_ENABLED=true"));
+    }
+
+    #[test]
+    fn option_reconciliation_state_checks_use_safe_defaults() {
+        let config = config_from_pairs([("PERSISTENCE_ENABLED", "false")]).unwrap();
+
+        assert!(!config.option_reconciliation.state_checks_enabled);
+        assert!(config.option_reconciliation.state_checks_require_rpc);
+        assert!(!config.option_reconciliation.state_checks_strict);
+    }
+
+    #[test]
+    fn option_reconciliation_state_checks_parse_overrides() {
+        let config = config_from_pairs([
+            ("OPTION_RECONCILIATION_WORKER_ENABLED", "true"),
+            ("OPTION_RECONCILIATION_REQUIRE_RPC", "false"),
+            ("OPTION_RECONCILIATION_STATE_CHECKS_ENABLED", "true"),
+            ("OPTION_RECONCILIATION_STATE_CHECKS_REQUIRE_RPC", "false"),
+            ("OPTION_RECONCILIATION_STATE_CHECKS_STRICT", "true"),
+            ("PERSISTENCE_ENABLED", "true"),
+            ("DATABASE_URL", "postgres://example.invalid/db"),
+        ])
+        .unwrap();
+
+        assert!(config.option_reconciliation.enabled);
+        assert!(config.option_reconciliation.state_checks_enabled);
+        assert!(!config.option_reconciliation.state_checks_require_rpc);
+        assert!(config.option_reconciliation.state_checks_strict);
+    }
+
+    #[test]
+    fn option_reconciliation_state_checks_require_rpc_when_configured() {
+        let error = config_from_pairs([
+            ("OPTION_RECONCILIATION_WORKER_ENABLED", "true"),
+            ("OPTION_RECONCILIATION_REQUIRE_RPC", "false"),
+            ("OPTION_RECONCILIATION_STATE_CHECKS_ENABLED", "true"),
+            ("OPTION_RECONCILIATION_STATE_CHECKS_REQUIRE_RPC", "true"),
+            ("PERSISTENCE_ENABLED", "true"),
+            ("DATABASE_URL", "postgres://example.invalid/db"),
+        ])
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("RPC_URL is required when OPTION_RECONCILIATION_STATE_CHECKS_ENABLED=true"));
     }
 
     #[test]

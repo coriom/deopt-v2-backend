@@ -6,6 +6,7 @@ pub mod reconciliation_worker;
 pub mod series_id;
 pub mod service;
 pub mod signing;
+pub mod state_checks;
 pub mod store;
 pub mod types;
 
@@ -23,13 +24,19 @@ pub use event_indexer::{
 pub use lifecycle::{
     get_option_execution_lifecycle, LifecycleBroadcast, LifecycleCalldata, LifecycleConfirmation,
     LifecycleEvents, LifecycleFees, LifecycleMetadata, LifecycleReconciliation,
-    LifecycleSignatures, LifecycleSimulation, LifecycleSource, LifecycleTrade, LifecycleTransfers,
-    OptionExecutionLifecycle, OptionExecutionLifecycleHealth, OptionExecutionLifecycleStage,
+    LifecycleSignatures, LifecycleSimulation, LifecycleSource, LifecycleStateChecks,
+    LifecycleTrade, LifecycleTransfers, OptionExecutionLifecycle, OptionExecutionLifecycleHealth,
+    OptionExecutionLifecycleStage,
 };
 pub use reconciliation_worker::{
     reconcile_option_executions, spawn_option_reconciliation_worker,
     summarize_option_execution_reconciliations, OptionReconciliationConfig,
     OptionReconciliationDecision, OptionReconciliationTickResult,
+};
+pub use state_checks::{
+    evaluate_option_state_checks, OptionStateCheckEvaluation, MARGIN_COLLATERAL_VAULT_VIEW,
+    MATCHING_MARGIN_ENGINE_VIEW, NONCES_VIEW, POSITIONS_VIEW, POSITION_QUANTITY_VIEW,
+    SERIES_SHORT_OPEN_INTEREST_VIEW, VAULT_BALANCES_VIEW, VAULT_BALANCE_WITH_YIELD_VIEW,
 };
 
 pub use execution::{

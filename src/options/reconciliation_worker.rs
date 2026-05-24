@@ -1,13 +1,15 @@
 use crate::api::AppState;
 use crate::error::{BackendError, Result};
+use crate::execution::{EthCallProvider, HttpJsonRpcProvider};
 use crate::types::now_ms;
 use serde::Serialize;
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
 use super::{
-    OptionExecutionEvent, OptionExecutionIntent, OptionExecutionReconciliation,
-    OptionExecutionTransaction, OptionReconciliationStatus,
+    evaluate_option_state_checks, OptionExecutionEvent, OptionExecutionIntent,
+    OptionExecutionReconciliation, OptionExecutionTransaction, OptionReconciliationStatus,
+    OptionStateCheckEvaluation,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -18,6 +20,9 @@ pub struct OptionReconciliationConfig {
     pub require_events: bool,
     pub require_rpc: bool,
     pub strict: bool,
+    pub state_checks_enabled: bool,
+    pub state_checks_require_rpc: bool,
+    pub state_checks_strict: bool,
     pub rpc_url: Option<String>,
 }
 
@@ -30,6 +35,9 @@ impl OptionReconciliationConfig {
             require_events: true,
             require_rpc: true,
             strict: true,
+            state_checks_enabled: false,
+            state_checks_require_rpc: true,
+            state_checks_strict: false,
             rpc_url: None,
         }
     }
@@ -58,6 +66,11 @@ impl OptionReconciliationConfig {
                 "RPC_URL is required when OPTION_RECONCILIATION_WORKER_ENABLED=true and OPTION_RECONCILIATION_REQUIRE_RPC=true".to_string(),
             ));
         }
+        if self.state_checks_enabled && self.state_checks_require_rpc && self.rpc_url.is_none() {
+            return Err(BackendError::Config(
+                "RPC_URL is required when OPTION_RECONCILIATION_STATE_CHECKS_ENABLED=true and OPTION_RECONCILIATION_STATE_CHECKS_REQUIRE_RPC=true".to_string(),
+            ));
+        }
         Ok(())
     }
 }
@@ -75,6 +88,10 @@ pub struct OptionReconciliationDecision {
     pub margin_trade_event_id: Option<Uuid>,
     pub trading_fee_event_count: u64,
     pub internal_transfer_event_count: u64,
+    pub state_check_status: Option<String>,
+    pub nonce_check_status: Option<String>,
+    pub position_check_status: Option<String>,
+    pub vault_check_status: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -84,6 +101,9 @@ pub struct OptionReconciliationTickResult {
     pub strict: bool,
     pub require_events: bool,
     pub require_rpc: bool,
+    pub state_checks_enabled: bool,
+    pub state_checks_require_rpc: bool,
+    pub state_checks_strict: bool,
     pub considered: u64,
     pub reconciled: u64,
     pub partially_reconciled: u64,
@@ -123,7 +143,43 @@ pub async fn reconcile_option_executions(
         return Ok(empty_tick_result(&config));
     }
 
-    let pending = list_confirmed_unreconciled_option_transactions(state, config.batch_size).await?;
+    if config.state_checks_enabled
+        && config.state_checks_require_rpc
+        && config.rpc_url.as_deref().unwrap_or_default().is_empty()
+    {
+        return Err(BackendError::Config(
+            "RPC_URL is required when option reconciliation state checks require RPC".to_string(),
+        ));
+    }
+
+    if config.state_checks_enabled {
+        if let Some(rpc_url) = config.rpc_url.as_ref().filter(|value| !value.is_empty()) {
+            let provider = HttpJsonRpcProvider::new(rpc_url.clone());
+            return reconcile_option_executions_with_provider(state, Some(&provider)).await;
+        }
+    }
+
+    reconcile_option_executions_with_provider::<HttpJsonRpcProvider>(state, None).await
+}
+
+async fn reconcile_option_executions_with_provider<P>(
+    state: &AppState,
+    provider: Option<&P>,
+) -> Result<OptionReconciliationTickResult>
+where
+    P: EthCallProvider,
+{
+    let config = state.option_reconciliation_config.clone();
+    if !config.enabled {
+        return Ok(empty_tick_result(&config));
+    }
+
+    let pending = list_confirmed_unreconciled_option_transactions(
+        state,
+        config.batch_size,
+        config.state_checks_enabled,
+    )
+    .await?;
     let mut decisions = Vec::with_capacity(pending.len());
     let mut counts = ReconciliationOutcomeCounts::default();
     let total_considered = pending.len() as u64;
@@ -149,11 +205,16 @@ pub async fn reconcile_option_executions(
         let outcome = evaluate_reconciliation(
             state.chain_id,
             &config,
+            provider,
+            &state.options_config.matching_engine_address,
+            &state.option_event_indexer_config.margin_engine_address,
+            &state.option_event_indexer_config.collateral_vault_address,
             &intent,
             &transaction,
             &tx_hash,
             &events,
-        );
+        )
+        .await;
         match outcome.row.status {
             OptionReconciliationStatus::Reconciled => counts.reconciled += 1,
             OptionReconciliationStatus::PartiallyReconciled => counts.partially_reconciled += 1,
@@ -172,6 +233,9 @@ pub async fn reconcile_option_executions(
         strict: config.strict,
         require_events: config.require_events,
         require_rpc: config.require_rpc,
+        state_checks_enabled: config.state_checks_enabled,
+        state_checks_require_rpc: config.state_checks_require_rpc,
+        state_checks_strict: config.state_checks_strict,
         considered: total_considered,
         reconciled: counts.reconciled,
         partially_reconciled: counts.partially_reconciled,
@@ -207,6 +271,9 @@ fn empty_tick_result(config: &OptionReconciliationConfig) -> OptionReconciliatio
         strict: config.strict,
         require_events: config.require_events,
         require_rpc: config.require_rpc,
+        state_checks_enabled: config.state_checks_enabled,
+        state_checks_require_rpc: config.state_checks_require_rpc,
+        state_checks_strict: config.state_checks_strict,
         considered: 0,
         reconciled: 0,
         partially_reconciled: 0,
@@ -234,17 +301,29 @@ fn build_skip_decision(
         margin_trade_event_id: None,
         trading_fee_event_count: 0,
         internal_transfer_event_count: 0,
+        state_check_status: None,
+        nonce_check_status: None,
+        position_check_status: None,
+        vault_check_status: None,
     }
 }
 
-fn evaluate_reconciliation(
+#[allow(clippy::too_many_arguments)]
+async fn evaluate_reconciliation<P>(
     chain_id: u64,
     config: &OptionReconciliationConfig,
+    provider: Option<&P>,
+    matching_engine_address: &crate::types::AccountId,
+    margin_engine_address: &crate::types::AccountId,
+    collateral_vault_address: &crate::types::AccountId,
     intent: &OptionExecutionIntent,
     transaction: &OptionExecutionTransaction,
     tx_hash: &str,
     events: &[OptionExecutionEvent],
-) -> EvaluatedReconciliation {
+) -> EvaluatedReconciliation
+where
+    P: EthCallProvider,
+{
     let now = now_ms();
     let trade_executed = events
         .iter()
@@ -307,6 +386,36 @@ fn evaluate_reconciliation(
         if let Some(reason) = check_margin_trade_executed(intent, event) {
             mismatch_reasons.push(reason);
         }
+    }
+
+    let mut state_check: Option<OptionStateCheckEvaluation> = None;
+    if config.state_checks_enabled {
+        let check = if let Some(provider) = provider {
+            evaluate_option_state_checks(
+                provider,
+                intent,
+                transaction,
+                matching_engine_address,
+                margin_engine_address,
+                collateral_vault_address,
+                config.state_checks_strict,
+                config.state_checks_require_rpc,
+                now,
+            )
+            .await
+        } else {
+            OptionStateCheckEvaluation::skipped_no_provider(
+                now,
+                config.state_checks_strict,
+                config.state_checks_require_rpc,
+                "rpc_provider_unavailable",
+            )
+        };
+        details.insert("state_checks".to_string(), check.details.clone());
+        if config.state_checks_strict && !check.strict_mismatch_reasons.is_empty() {
+            mismatch_reasons.extend(check.strict_mismatch_reasons.iter().cloned());
+        }
+        state_check = Some(check);
     }
 
     let status = decide_status(
@@ -375,6 +484,18 @@ fn evaluate_reconciliation(
         margin_trade_event_id: margin_trade_id,
         trading_fee_event_count: trading_fee_events.len() as u64,
         internal_transfer_event_count: internal_transfer_events.len() as u64,
+        state_check_status: state_check
+            .as_ref()
+            .map(|check| check.overall_status.clone()),
+        nonce_check_status: state_check
+            .as_ref()
+            .map(|check| check.nonce_check_status.clone()),
+        position_check_status: state_check
+            .as_ref()
+            .map(|check| check.position_check_status.clone()),
+        vault_check_status: state_check
+            .as_ref()
+            .map(|check| check.vault_check_status.clone()),
     };
     EvaluatedReconciliation { row, decision }
 }
@@ -617,17 +738,24 @@ fn intent_evidence(intent: &OptionExecutionIntent) -> serde_json::Value {
 async fn list_confirmed_unreconciled_option_transactions(
     state: &AppState,
     limit: u32,
+    include_reconciled_without_state_checks: bool,
 ) -> Result<Vec<OptionExecutionTransaction>> {
     if let Some(repository) = state.repository.clone() {
         return repository
-            .list_confirmed_unreconciled_option_execution_transactions(limit)
+            .list_confirmed_unreconciled_option_execution_transactions(
+                limit,
+                include_reconciled_without_state_checks,
+            )
             .await;
     }
     Ok(state
         .options_store
         .lock()
         .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?
-        .list_confirmed_unreconciled_option_execution_transactions(limit))
+        .list_confirmed_unreconciled_option_execution_transactions(
+            limit,
+            include_reconciled_without_state_checks,
+        ))
 }
 
 async fn get_option_execution_intent(
@@ -747,13 +875,14 @@ pub fn spawn_option_reconciliation_worker(state: AppState) -> Option<tokio::task
 mod tests {
     use super::*;
     use crate::engine::EngineState;
-    use crate::execution::ExecutionTransactionStatus;
+    use crate::execution::{EthCallRequest, EthCallSuccess, ExecutionTransactionStatus, RpcFuture};
     use crate::options::{
         OptionExecutionConfirmationStatus, OptionExecutionIntent, OptionExecutionIntentStatus,
         OptionExecutionSimulationStatus, OptionExecutionSourceType, OptionExecutionTransaction,
         OptionsConfig,
     };
     use crate::types::AccountId;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn disabled_default_passes_validate() {
@@ -897,6 +1026,149 @@ mod tests {
         assert_eq!(trading_fee_evidence, 2);
         assert!(state.repository.is_none());
         assert!(state.trade_signatures.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn disabled_state_checks_leave_reconciliation_details_unchanged() {
+        let state = state_with_reconciliation(true, true, true);
+        let (intent, tx) = insert_confirmed_intent_and_tx(&state);
+        insert_event(
+            &state,
+            option_trade_event(&intent, &tx.tx_hash.clone().unwrap()),
+        );
+
+        reconcile_option_executions(&state).await.unwrap();
+
+        let stored = state
+            .options_store
+            .lock()
+            .unwrap()
+            .list_option_execution_reconciliations(10);
+        assert_eq!(stored[0].status, OptionReconciliationStatus::Reconciled);
+        assert!(stored[0].details.get("state_checks").is_none());
+    }
+
+    #[tokio::test]
+    async fn state_checks_nonce_and_position_pass() {
+        let state = state_with_state_checks(false);
+        let (intent, tx) = insert_confirmed_intent_and_tx(&state);
+        insert_event(
+            &state,
+            option_trade_event(&intent, &tx.tx_hash.clone().unwrap()),
+        );
+        let provider = MockStateCheckProvider::passing();
+
+        let result = reconcile_option_executions_with_provider(&state, Some(&provider))
+            .await
+            .unwrap();
+
+        assert_eq!(result.reconciled, 1);
+        assert_eq!(
+            result.decisions[0].state_check_status.as_deref(),
+            Some("ok")
+        );
+        assert_eq!(
+            result.decisions[0].nonce_check_status.as_deref(),
+            Some("ok")
+        );
+        assert_eq!(
+            result.decisions[0].position_check_status.as_deref(),
+            Some("ok")
+        );
+        let row = stored_reconciliation(&state);
+        let checks = row.details.get("state_checks").unwrap();
+        assert_eq!(checks["buyer_nonce"]["status"], "ok");
+        assert_eq!(checks["seller_nonce"]["status"], "ok");
+        assert_eq!(checks["buyer_position"]["actual"], "1");
+        assert_eq!(checks["seller_position"]["actual"], "-1");
+        assert!(provider.calls().iter().all(|call| call.value == 0));
+        assert_no_generic_execution_rows(&state);
+    }
+
+    #[tokio::test]
+    async fn state_checks_nonce_mismatch_fails_in_strict_mode() {
+        let state = state_with_state_checks(true);
+        let (intent, tx) = insert_confirmed_intent_and_tx(&state);
+        insert_event(
+            &state,
+            option_trade_event(&intent, &tx.tx_hash.clone().unwrap()),
+        );
+        let provider = MockStateCheckProvider::passing().with_buyer_nonce(0);
+
+        let result = reconcile_option_executions_with_provider(&state, Some(&provider))
+            .await
+            .unwrap();
+
+        assert_eq!(result.reconciliation_failed, 1);
+        let row = stored_reconciliation(&state);
+        assert_eq!(row.status, OptionReconciliationStatus::ReconciliationFailed);
+        assert!(row
+            .mismatch_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("buyer_nonce"));
+        assert_eq!(
+            row.details["state_checks"]["buyer_nonce"]["status"],
+            "failed"
+        );
+        assert_no_generic_execution_rows(&state);
+    }
+
+    #[tokio::test]
+    async fn state_checks_nonce_mismatch_warns_in_non_strict_mode() {
+        let state = state_with_state_checks(false);
+        let (intent, tx) = insert_confirmed_intent_and_tx(&state);
+        insert_event(
+            &state,
+            option_trade_event(&intent, &tx.tx_hash.clone().unwrap()),
+        );
+        let provider = MockStateCheckProvider::passing().with_buyer_nonce(0);
+
+        let result = reconcile_option_executions_with_provider(&state, Some(&provider))
+            .await
+            .unwrap();
+
+        assert_eq!(result.reconciled, 1);
+        assert_eq!(
+            result.decisions[0].state_check_status.as_deref(),
+            Some("failed")
+        );
+        let row = stored_reconciliation(&state);
+        assert_eq!(row.status, OptionReconciliationStatus::Reconciled);
+        assert!(row.mismatch_reason.is_none());
+        assert_eq!(
+            row.details["state_checks"]["buyer_nonce"]["status"],
+            "failed"
+        );
+        assert_no_generic_execution_rows(&state);
+    }
+
+    #[tokio::test]
+    async fn missing_position_view_is_skipped_in_non_strict_mode() {
+        let state = state_with_state_checks(false);
+        let (intent, tx) = insert_confirmed_intent_and_tx(&state);
+        insert_event(
+            &state,
+            option_trade_event(&intent, &tx.tx_hash.clone().unwrap()),
+        );
+        let provider = MockStateCheckProvider::passing().without_position_view();
+
+        let result = reconcile_option_executions_with_provider(&state, Some(&provider))
+            .await
+            .unwrap();
+
+        assert_eq!(result.reconciled, 1);
+        assert_eq!(
+            result.decisions[0].position_check_status.as_deref(),
+            Some("skipped")
+        );
+        let row = stored_reconciliation(&state);
+        assert_eq!(row.status, OptionReconciliationStatus::Reconciled);
+        assert_eq!(
+            row.details["state_checks"]["buyer_position"]["status"],
+            "skipped"
+        );
+        assert_eq!(row.details["state_checks"]["overall_status"], "warning");
     }
 
     #[tokio::test]
@@ -1094,9 +1366,174 @@ mod tests {
             require_events,
             require_rpc: false,
             strict,
+            state_checks_enabled: false,
+            state_checks_require_rpc: true,
+            state_checks_strict: false,
             rpc_url: None,
         };
         state
+    }
+
+    fn state_with_state_checks(state_checks_strict: bool) -> AppState {
+        let mut state = state_with_reconciliation(true, true, true);
+        state.option_reconciliation_config.state_checks_enabled = true;
+        state.option_reconciliation_config.state_checks_require_rpc = false;
+        state.option_reconciliation_config.state_checks_strict = state_checks_strict;
+        state.option_event_indexer_config.margin_engine_address =
+            AccountId::new("0x00000000000000000000000000000000000000aa");
+        state.option_event_indexer_config.collateral_vault_address =
+            AccountId::new("0x00000000000000000000000000000000000000bb");
+        state
+    }
+
+    fn stored_reconciliation(state: &AppState) -> OptionExecutionReconciliation {
+        state
+            .options_store
+            .lock()
+            .unwrap()
+            .list_option_execution_reconciliations(10)
+            .into_iter()
+            .next()
+            .unwrap()
+    }
+
+    fn assert_no_generic_execution_rows(state: &AppState) {
+        assert!(state.repository.is_none());
+        assert!(state.trade_signatures.lock().unwrap().is_empty());
+        assert!(state.engine.lock().unwrap().execution_intents().is_empty());
+    }
+
+    #[derive(Clone)]
+    struct MockStateCheckProvider {
+        buyer_nonce: u128,
+        seller_nonce: u128,
+        buyer_position: i128,
+        seller_position: i128,
+        position_view_available: bool,
+        calls: Arc<Mutex<Vec<EthCallRequest>>>,
+    }
+
+    impl MockStateCheckProvider {
+        fn passing() -> Self {
+            Self {
+                buyer_nonce: 1,
+                seller_nonce: 1,
+                buyer_position: 1,
+                seller_position: -1,
+                position_view_available: true,
+                calls: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn with_buyer_nonce(mut self, nonce: u128) -> Self {
+            self.buyer_nonce = nonce;
+            self
+        }
+
+        fn without_position_view(mut self) -> Self {
+            self.position_view_available = false;
+            self
+        }
+
+        fn calls(&self) -> Vec<EthCallRequest> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl EthCallProvider for MockStateCheckProvider {
+        fn eth_call(&self, request: EthCallRequest) -> RpcFuture<'_, EthCallSuccess> {
+            let this = self.clone();
+            Box::pin(async move {
+                this.calls.lock().unwrap().push(request.clone());
+                let selector = selector_from_data(&request.data);
+                let output = match selector.as_deref() {
+                    Some(value)
+                        if value
+                            == crate::options::state_checks::selector_hex("nonces(address)") =>
+                    {
+                        if request
+                            .data
+                            .ends_with(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1])
+                        {
+                            crate::options::state_checks::encode_test_uint256(this.buyer_nonce)
+                        } else {
+                            crate::options::state_checks::encode_test_uint256(this.seller_nonce)
+                        }
+                    }
+                    Some(value)
+                        if value
+                            == crate::options::state_checks::selector_hex(
+                                "getPositionQuantity(address,uint256)",
+                            ) =>
+                    {
+                        if !this.position_view_available {
+                            return Err(BackendError::Simulation(
+                                "mock position view unavailable".to_string(),
+                            ));
+                        }
+                        if request
+                            .data
+                            .get(24..36)
+                            .is_some_and(|bytes| bytes.ends_with(&[1]))
+                        {
+                            crate::options::state_checks::encode_test_int128(this.buyer_position)
+                        } else {
+                            crate::options::state_checks::encode_test_int128(this.seller_position)
+                        }
+                    }
+                    Some(value)
+                        if value
+                            == crate::options::state_checks::selector_hex(
+                                "seriesShortOpenInterest(uint256)",
+                            ) =>
+                    {
+                        crate::options::state_checks::encode_test_uint256(1)
+                    }
+                    Some(value)
+                        if value
+                            == crate::options::state_checks::selector_hex(
+                                "balances(address,address)",
+                            ) =>
+                    {
+                        crate::options::state_checks::encode_test_uint256(100)
+                    }
+                    Some(value)
+                        if value
+                            == crate::options::state_checks::selector_hex("marginEngine()") =>
+                    {
+                        crate::options::state_checks::encode_test_address(&AccountId::new(
+                            "0x00000000000000000000000000000000000000aa",
+                        ))
+                    }
+                    Some(value)
+                        if value
+                            == crate::options::state_checks::selector_hex("collateralVault()") =>
+                    {
+                        crate::options::state_checks::encode_test_address(&AccountId::new(
+                            "0x00000000000000000000000000000000000000bb",
+                        ))
+                    }
+                    _ => {
+                        return Err(BackendError::Simulation(
+                            "mock state check view not found".to_string(),
+                        ))
+                    }
+                };
+                Ok(EthCallSuccess {
+                    block_number: Some(123),
+                    output,
+                })
+            })
+        }
+    }
+
+    fn selector_from_data(data: &[u8]) -> Option<String> {
+        let selector = data.get(..4)?;
+        let mut out = String::from("0x");
+        for byte in selector {
+            out.push_str(&format!("{byte:02x}"));
+        }
+        Some(out)
     }
 
     fn insert_confirmed_intent_and_tx(

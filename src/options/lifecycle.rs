@@ -75,6 +75,7 @@ pub struct OptionExecutionLifecycle {
     pub fees: LifecycleFees,
     pub transfers: LifecycleTransfers,
     pub reconciliation: Option<LifecycleReconciliation>,
+    pub state_checks: Option<LifecycleStateChecks>,
     pub health: OptionExecutionLifecycleHealth,
 }
 
@@ -204,6 +205,16 @@ pub struct LifecycleReconciliation {
     pub updated_at_ms: i64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct LifecycleStateChecks {
+    pub state_check_status: String,
+    pub nonce_check_status: String,
+    pub position_check_status: String,
+    pub vault_check_status: String,
+    pub strict: bool,
+    pub details: serde_json::Value,
+}
+
 /// Aggregate the persisted lifecycle for a single option execution intent.
 ///
 /// Read-only: queries `option_execution_intents`,
@@ -325,6 +336,7 @@ pub async fn get_option_execution_lifecycle(
         reconciled_at_ms: row.reconciled_at_ms,
         updated_at_ms: row.updated_at_ms,
     });
+    let state_checks_view = reconciliation.as_ref().and_then(build_state_checks_view);
 
     let health = compute_health(
         &intent,
@@ -332,6 +344,7 @@ pub async fn get_option_execution_lifecycle(
         confirmation.as_ref().map(|(_, status)| *status),
         events.len() as u64,
         reconciliation.as_ref(),
+        state_checks_view.as_ref(),
         &calldata,
     );
 
@@ -350,6 +363,7 @@ pub async fn get_option_execution_lifecycle(
         fees: fees_view,
         transfers: transfers_view,
         reconciliation: reconciliation_view,
+        state_checks: state_checks_view,
         health,
     })
 }
@@ -557,12 +571,49 @@ fn build_transfers_view(events: &[OptionExecutionEvent]) -> LifecycleTransfers {
     }
 }
 
+fn build_state_checks_view(row: &OptionExecutionReconciliation) -> Option<LifecycleStateChecks> {
+    let details = row.details.get("state_checks")?.clone();
+    let state_check_status = details
+        .get("overall_status")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let nonce_check_status = details
+        .get("nonce_check_status")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let position_check_status = details
+        .get("position_check_status")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let vault_check_status = details
+        .get("vault_check_status")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let strict = details
+        .get("strict")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(row.strict);
+    Some(LifecycleStateChecks {
+        state_check_status,
+        nonce_check_status,
+        position_check_status,
+        vault_check_status,
+        strict,
+        details,
+    })
+}
+
 fn compute_health(
     intent: &OptionExecutionIntent,
     broadcast: Option<&OptionExecutionTransaction>,
     confirmation_status: Option<OptionExecutionConfirmationStatus>,
     event_count: u64,
     reconciliation: Option<&OptionExecutionReconciliation>,
+    state_checks: Option<&LifecycleStateChecks>,
     calldata: &LifecycleCalldata,
 ) -> OptionExecutionLifecycleHealth {
     let mut warnings: Vec<String> = Vec::new();
@@ -719,6 +770,25 @@ fn compute_health(
             OptionReconciliationStatus::Skipped => {
                 warnings.push("reconciliation_skipped".to_string());
             }
+        }
+    }
+
+    if let Some(checks) = state_checks {
+        match checks.state_check_status.as_str() {
+            "ok" => {}
+            "failed" => {
+                let message = "state_checks_failed".to_string();
+                if checks.strict {
+                    errors.push(message);
+                    stage = OptionExecutionLifecycleStage::Failed;
+                    is_terminal_success = false;
+                } else {
+                    warnings.push(message);
+                }
+            }
+            "skipped" => warnings.push("state_checks_skipped".to_string()),
+            "warning" => warnings.push("state_checks_warning".to_string()),
+            other => warnings.push(format!("state_checks_{other}")),
         }
     }
 
@@ -975,6 +1045,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lifecycle_includes_state_checks() {
+        let state = fresh_state();
+        let (intent, tx) = insert_intent_and_tx(
+            &state,
+            OptionExecutionConfirmationStatus::MinedSuccess,
+            OptionExecutionIntentStatus::BroadcastConfirmed,
+        );
+        insert_event(
+            &state,
+            option_trade_event(&intent, &tx.tx_hash.clone().unwrap()),
+        );
+        let mut row = build_reconciliation(
+            &intent,
+            &tx,
+            OptionReconciliationStatus::Reconciled,
+            Some(Uuid::from_u128(100)),
+            None,
+        );
+        row.details = state_check_details("ok", false);
+        state
+            .options_store
+            .lock()
+            .unwrap()
+            .upsert_option_execution_reconciliation(row, 99);
+
+        let view = get_option_execution_lifecycle(&state, intent.intent_id)
+            .await
+            .unwrap();
+
+        let checks = view.state_checks.unwrap();
+        assert_eq!(checks.state_check_status, "ok");
+        assert_eq!(checks.nonce_check_status, "ok");
+        assert_eq!(checks.position_check_status, "ok");
+        assert!(view.health.warnings.is_empty());
+        assert!(view.health.errors.is_empty());
+        assert_no_generic_execution_rows(&state);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_health_warns_on_non_strict_state_check_mismatch() {
+        let state = fresh_state();
+        let (intent, tx) = insert_intent_and_tx(
+            &state,
+            OptionExecutionConfirmationStatus::MinedSuccess,
+            OptionExecutionIntentStatus::BroadcastConfirmed,
+        );
+        insert_event(
+            &state,
+            option_trade_event(&intent, &tx.tx_hash.clone().unwrap()),
+        );
+        let mut row = build_reconciliation(
+            &intent,
+            &tx,
+            OptionReconciliationStatus::Reconciled,
+            Some(Uuid::from_u128(100)),
+            None,
+        );
+        row.details = state_check_details("failed", false);
+        state
+            .options_store
+            .lock()
+            .unwrap()
+            .upsert_option_execution_reconciliation(row, 99);
+
+        let view = get_option_execution_lifecycle(&state, intent.intent_id)
+            .await
+            .unwrap();
+
+        assert_eq!(view.health.stage, OptionExecutionLifecycleStage::Reconciled);
+        assert!(view.health.is_terminal_success);
+        assert!(view
+            .health
+            .warnings
+            .iter()
+            .any(|warning| warning == "state_checks_failed"));
+        assert!(view.health.errors.is_empty());
+        assert_no_generic_execution_rows(&state);
+    }
+
+    #[tokio::test]
     async fn mined_failed_marks_health_failed() {
         let state = fresh_state();
         let (intent, _) = insert_intent_and_tx(
@@ -1180,6 +1330,27 @@ mod tests {
             created_at_ms: 50,
             updated_at_ms: 50,
         }
+    }
+
+    fn state_check_details(overall_status: &str, strict: bool) -> serde_json::Value {
+        let failed = overall_status != "ok";
+        serde_json::json!({
+            "state_checks": {
+                "enabled": true,
+                "checked_at_ms": 99,
+                "strict": strict,
+                "require_rpc": true,
+                "overall_status": overall_status,
+                "nonce_check_status": if failed { "failed" } else { "ok" },
+                "position_check_status": "ok",
+                "vault_check_status": "skipped",
+                "buyer_nonce": {
+                    "expected_min": "1",
+                    "actual": if failed { "0" } else { "1" },
+                    "status": if failed { "failed" } else { "ok" }
+                }
+            }
+        })
     }
 
     fn signed_calldata_ready_intent() -> OptionExecutionIntent {

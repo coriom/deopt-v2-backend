@@ -2674,6 +2674,7 @@ impl PgRepository {
     pub async fn list_confirmed_unreconciled_option_execution_transactions(
         &self,
         limit: u32,
+        include_reconciled_without_state_checks: bool,
     ) -> Result<Vec<OptionExecutionTransaction>> {
         if !self
             .admin_table_exists("option_execution_transactions")
@@ -2696,11 +2697,16 @@ impl PgRepository {
                     ON r.option_execution_transaction_id = t.transaction_id
              WHERE t.confirmation_status = 'mined_success'
                AND t.tx_hash IS NOT NULL
-               AND (r.id IS NULL OR r.status <> 'reconciled')
+               AND (
+                    r.id IS NULL
+                    OR r.status <> 'reconciled'
+                    OR ($2 AND r.details->'state_checks' IS NULL)
+               )
              ORDER BY t.created_at_ms ASC, t.transaction_id ASC
              LIMIT $1",
         )
         .bind(i64::from(limit))
+        .bind(include_reconciled_without_state_checks)
         .fetch_all(&self.pool)
         .await
         .map_err(|error| BackendError::Persistence(error.to_string()))?;

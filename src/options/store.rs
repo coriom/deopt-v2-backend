@@ -772,6 +772,7 @@ impl OptionSeriesStore {
     pub fn list_confirmed_unreconciled_option_execution_transactions(
         &self,
         limit: u32,
+        include_reconciled_without_state_checks: bool,
     ) -> Vec<OptionExecutionTransaction> {
         let mut transactions = self
             .option_execution_transactions
@@ -790,6 +791,8 @@ impl OptionSeriesStore {
                         .get(&tx.transaction_id)
                         .map(|row| {
                             row.status != crate::options::OptionReconciliationStatus::Reconciled
+                                || (include_reconciled_without_state_checks
+                                    && row.details.get("state_checks").is_none())
                         })
                         .unwrap_or(true)
             })
