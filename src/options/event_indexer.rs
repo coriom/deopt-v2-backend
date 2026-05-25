@@ -35,6 +35,22 @@ pub const TIER_CLAIMED_SIGNATURE: &str = "TierClaimed(address,uint8,uint64,uint6
 pub const OVERRIDE_SET_SIGNATURE: &str =
     "OverrideSet(address,uint16,uint16,uint16,uint16,uint64,bool)";
 
+// V2D-E: FeesManagerV2 emits signed-ppm fee events. These are decoded only
+// when the operator configures `fees_manager_v2_address`; V1 indexing is
+// unchanged when V2 is not wired up.
+pub const FEE_CHARGED_V2_SIGNATURE: &str =
+    "FeeChargedV2(address,address,address,address,uint8,uint8,bool,int32,uint256,uint256)";
+pub const FEE_REBATED_V2_SIGNATURE: &str =
+    "FeeRebatedV2(address,address,address,address,uint8,uint8,int32,uint256,uint256)";
+pub const REBATE_BUDGET_FUNDED_SIGNATURE: &str = "RebateBudgetFunded(address,uint256)";
+pub const REBATE_BUDGET_WITHDRAWN_SIGNATURE: &str =
+    "RebateBudgetWithdrawn(address,address,uint256)";
+pub const REBATE_BUDGET_SPENT_SIGNATURE: &str = "RebateBudgetSpent(address,uint256)";
+pub const FEE_RECIPIENT_SET_V2_SIGNATURE: &str = "FeeRecipientSet(address,address)";
+pub const FEE_CONSUMER_SET_SIGNATURE: &str = "FeeConsumerSet(address,bool)";
+pub const MERKLE_ROOT_SET_V2_SIGNATURE: &str = "MerkleRootSet(bytes32,uint64,uint64)";
+pub const TIER_CLAIMED_V2_SIGNATURE: &str = "TierClaimed(address,uint8,uint64)";
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OptionEventIndexerConfig {
     pub enabled: bool,
@@ -48,6 +64,11 @@ pub struct OptionEventIndexerConfig {
     pub margin_engine_address: AccountId,
     pub collateral_vault_address: AccountId,
     pub fees_manager_address: Option<AccountId>,
+    /// Optional V2 fees manager (FeesManagerV2) address. When set, the
+    /// indexer subscribes to the V2 signed-ppm fee events on this contract
+    /// alongside any V1 events on `fees_manager_address`. V1 behavior is
+    /// fully unchanged when this is `None`.
+    pub fees_manager_v2_address: Option<AccountId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -70,6 +91,7 @@ impl OptionEventIndexerConfig {
             margin_engine_address: AccountId::new(""),
             collateral_vault_address: AccountId::new(""),
             fees_manager_address: None,
+            fees_manager_v2_address: None,
         }
     }
 
@@ -88,6 +110,9 @@ impl OptionEventIndexerConfig {
         );
         if let Some(address) = self.fees_manager_address.as_ref() {
             push_emitter_contract(&mut contracts, "fees_manager", address);
+        }
+        if let Some(address) = self.fees_manager_v2_address.as_ref() {
+            push_emitter_contract(&mut contracts, "fees_manager_v2", address);
         }
         contracts
     }
@@ -131,6 +156,12 @@ impl OptionEventIndexerConfig {
         if let Some(address) = self.fees_manager_address.as_ref() {
             validate_optional_emitter_address(
                 "OPTION_EVENT_INDEXER_FEES_MANAGER_ADDRESS",
+                address,
+            )?;
+        }
+        if let Some(address) = self.fees_manager_v2_address.as_ref() {
+            validate_optional_emitter_address(
+                "OPTION_EVENT_INDEXER_FEES_MANAGER_V2_ADDRESS",
                 address,
             )?;
         }
@@ -250,6 +281,42 @@ pub fn override_set_topic0() -> String {
     hex_0x(&keccak256(OVERRIDE_SET_SIGNATURE.as_bytes()))
 }
 
+pub fn fee_charged_v2_topic0() -> String {
+    hex_0x(&keccak256(FEE_CHARGED_V2_SIGNATURE.as_bytes()))
+}
+
+pub fn fee_rebated_v2_topic0() -> String {
+    hex_0x(&keccak256(FEE_REBATED_V2_SIGNATURE.as_bytes()))
+}
+
+pub fn rebate_budget_funded_topic0() -> String {
+    hex_0x(&keccak256(REBATE_BUDGET_FUNDED_SIGNATURE.as_bytes()))
+}
+
+pub fn rebate_budget_withdrawn_topic0() -> String {
+    hex_0x(&keccak256(REBATE_BUDGET_WITHDRAWN_SIGNATURE.as_bytes()))
+}
+
+pub fn rebate_budget_spent_topic0() -> String {
+    hex_0x(&keccak256(REBATE_BUDGET_SPENT_SIGNATURE.as_bytes()))
+}
+
+pub fn fee_recipient_set_v2_topic0() -> String {
+    hex_0x(&keccak256(FEE_RECIPIENT_SET_V2_SIGNATURE.as_bytes()))
+}
+
+pub fn fee_consumer_set_topic0() -> String {
+    hex_0x(&keccak256(FEE_CONSUMER_SET_SIGNATURE.as_bytes()))
+}
+
+pub fn merkle_root_set_v2_topic0() -> String {
+    hex_0x(&keccak256(MERKLE_ROOT_SET_V2_SIGNATURE.as_bytes()))
+}
+
+pub fn tier_claimed_v2_topic0() -> String {
+    hex_0x(&keccak256(TIER_CLAIMED_V2_SIGNATURE.as_bytes()))
+}
+
 pub fn default_option_event_counts() -> BTreeMap<String, u64> {
     BTreeMap::from([
         ("CollateralDeposited".to_string(), 0),
@@ -257,12 +324,21 @@ pub fn default_option_event_counts() -> BTreeMap<String, u64> {
         ("DefaultFeesSet".to_string(), 0),
         ("Deposited".to_string(), 0),
         ("FeeBpsCapSet".to_string(), 0),
+        ("FeeChargedV2".to_string(), 0),
+        ("FeeConsumerSetV2".to_string(), 0),
+        ("FeeRebatedV2".to_string(), 0),
+        ("FeeRecipientSetV2".to_string(), 0),
         ("InternalTransfer".to_string(), 0),
         ("MerkleRootSet".to_string(), 0),
+        ("MerkleRootSetV2".to_string(), 0),
         ("OptionPositionUpdated".to_string(), 0),
         ("OptionTradeExecuted".to_string(), 0),
         ("OverrideSet".to_string(), 0),
+        ("RebateBudgetFunded".to_string(), 0),
+        ("RebateBudgetSpent".to_string(), 0),
+        ("RebateBudgetWithdrawn".to_string(), 0),
         ("TierClaimed".to_string(), 0),
+        ("TierClaimedV2".to_string(), 0),
         ("TradeExecuted".to_string(), 0),
         ("TradingFeeCharged".to_string(), 0),
         ("Synced".to_string(), 0),
@@ -291,6 +367,17 @@ fn event_topics_for_emitter_role(role: &str) -> Vec<String> {
             merkle_root_set_topic0(),
             tier_claimed_topic0(),
             override_set_topic0(),
+        ],
+        "fees_manager_v2" => vec![
+            fee_charged_v2_topic0(),
+            fee_rebated_v2_topic0(),
+            rebate_budget_funded_topic0(),
+            rebate_budget_withdrawn_topic0(),
+            rebate_budget_spent_topic0(),
+            fee_recipient_set_v2_topic0(),
+            fee_consumer_set_topic0(),
+            merkle_root_set_v2_topic0(),
+            tier_claimed_v2_topic0(),
         ],
         _ => Vec::new(),
     }
@@ -595,6 +682,33 @@ pub fn decode_option_execution_event(
     }
     if topic0.eq_ignore_ascii_case(&override_set_topic0()) {
         return decode_override_set_log(log, chain_id).map(Some);
+    }
+    if topic0.eq_ignore_ascii_case(&fee_charged_v2_topic0()) {
+        return decode_fee_charged_v2_log(log, chain_id).map(Some);
+    }
+    if topic0.eq_ignore_ascii_case(&fee_rebated_v2_topic0()) {
+        return decode_fee_rebated_v2_log(log, chain_id).map(Some);
+    }
+    if topic0.eq_ignore_ascii_case(&rebate_budget_funded_topic0()) {
+        return decode_rebate_budget_funded_log(log, chain_id).map(Some);
+    }
+    if topic0.eq_ignore_ascii_case(&rebate_budget_withdrawn_topic0()) {
+        return decode_rebate_budget_withdrawn_log(log, chain_id).map(Some);
+    }
+    if topic0.eq_ignore_ascii_case(&rebate_budget_spent_topic0()) {
+        return decode_rebate_budget_spent_log(log, chain_id).map(Some);
+    }
+    if topic0.eq_ignore_ascii_case(&fee_recipient_set_v2_topic0()) {
+        return decode_fee_recipient_set_v2_log(log, chain_id).map(Some);
+    }
+    if topic0.eq_ignore_ascii_case(&fee_consumer_set_topic0()) {
+        return decode_fee_consumer_set_log(log, chain_id).map(Some);
+    }
+    if topic0.eq_ignore_ascii_case(&merkle_root_set_v2_topic0()) {
+        return decode_merkle_root_set_v2_log(log, chain_id).map(Some);
+    }
+    if topic0.eq_ignore_ascii_case(&tier_claimed_v2_topic0()) {
+        return decode_tier_claimed_v2_log(log, chain_id).map(Some);
     }
     Ok(None)
 }
@@ -1153,6 +1267,398 @@ fn decode_override_set_log(log: &EthLog, chain_id: u64) -> Result<OptionExecutio
     )
 }
 
+/// Decode `FeeChargedV2(address indexed consumer, address indexed trader,
+/// address indexed recipient, address settlementAsset, uint8 productKind,
+/// uint8 flowKind, bool isMaker, int32 feePpm, uint256 basisAmount,
+/// uint256 feeAmount)`.
+fn decode_fee_charged_v2_log(log: &EthLog, chain_id: u64) -> Result<OptionExecutionEvent> {
+    if log.topics.len() != 4 {
+        return Err(BackendError::Indexer(
+            "FeeChargedV2 log must have four topics".to_string(),
+        ));
+    }
+    let data = decode_hex_bytes(&log.data)?;
+    if data.len() != 32 * 7 {
+        return Err(BackendError::Indexer(
+            "FeeChargedV2 data must contain seven ABI words".to_string(),
+        ));
+    }
+    let consumer = decode_topic_address(&log.topics[1])?;
+    let trader = decode_topic_address(&log.topics[2])?;
+    let recipient = decode_topic_address(&log.topics[3])?;
+    let settlement_asset = decode_data_address(&data, 0)?;
+    let product_kind_raw = decode_data_u256(&data, 1)?.to::<u64>();
+    let flow_kind_raw = decode_data_u256(&data, 2)?.to::<u64>();
+    let is_maker = decode_bool(&data, 3)?;
+    let fee_ppm = decode_data_i32(&data, 4)?;
+    let basis_amount = decode_data_u256(&data, 5)?.to_string();
+    let fee_amount = decode_data_u256(&data, 6)?.to_string();
+    let tx_hash =
+        required_field(log.transaction_hash.as_ref(), "transactionHash")?.to_ascii_lowercase();
+    let log_index = parse_hex_quantity(required_field(log.log_index.as_ref(), "logIndex")?)?;
+    let block_number =
+        parse_hex_quantity(required_field(log.block_number.as_ref(), "blockNumber")?)?;
+    let now = now_ms();
+
+    Ok(OptionExecutionEvent {
+        id: Uuid::new_v4(),
+        chain_id,
+        contract_address: log.address.to_ascii_lowercase(),
+        tx_hash,
+        log_index,
+        block_number,
+        block_hash: log.block_hash.clone(),
+        event_name: "FeeChargedV2".to_string(),
+        event_signature: FEE_CHARGED_V2_SIGNATURE.to_string(),
+        intent_id: None,
+        onchain_intent_id: None,
+        option_execution_transaction_id: None,
+        buyer: None,
+        seller: None,
+        account: Some(trader.clone()),
+        option_id: None,
+        quantity_contracts: None,
+        premium_per_contract_native: Some(fee_amount.clone()),
+        raw_topics: raw_topics_json(log),
+        raw_data: log.data.clone(),
+        decoded: Some(serde_json::json!({
+            "consumer": consumer,
+            "trader": trader,
+            "recipient": recipient,
+            "settlementAsset": settlement_asset,
+            "productKind": product_kind_label(product_kind_raw),
+            "productKindRaw": product_kind_raw,
+            "flowKind": flow_kind_label(flow_kind_raw),
+            "flowKindRaw": flow_kind_raw,
+            "isMaker": is_maker,
+            "feePpm": fee_ppm,
+            "basisAmount": basis_amount,
+            "feeAmount": fee_amount,
+        })),
+        created_at_ms: now,
+        updated_at_ms: now,
+    })
+}
+
+/// Decode `FeeRebatedV2(address indexed consumer, address indexed trader,
+/// address indexed recipient, address settlementAsset, uint8 productKind,
+/// uint8 flowKind, int32 rebatePpm, uint256 basisAmount,
+/// uint256 rebateAmount)`. Rebates are always credited to a maker on the
+/// V2 path, so `isMaker` is implicit (`true`).
+fn decode_fee_rebated_v2_log(log: &EthLog, chain_id: u64) -> Result<OptionExecutionEvent> {
+    if log.topics.len() != 4 {
+        return Err(BackendError::Indexer(
+            "FeeRebatedV2 log must have four topics".to_string(),
+        ));
+    }
+    let data = decode_hex_bytes(&log.data)?;
+    if data.len() != 32 * 6 {
+        return Err(BackendError::Indexer(
+            "FeeRebatedV2 data must contain six ABI words".to_string(),
+        ));
+    }
+    let consumer = decode_topic_address(&log.topics[1])?;
+    let trader = decode_topic_address(&log.topics[2])?;
+    let recipient = decode_topic_address(&log.topics[3])?;
+    let settlement_asset = decode_data_address(&data, 0)?;
+    let product_kind_raw = decode_data_u256(&data, 1)?.to::<u64>();
+    let flow_kind_raw = decode_data_u256(&data, 2)?.to::<u64>();
+    let rebate_ppm = decode_data_i32(&data, 3)?;
+    let basis_amount = decode_data_u256(&data, 4)?.to_string();
+    let rebate_amount = decode_data_u256(&data, 5)?.to_string();
+    let tx_hash =
+        required_field(log.transaction_hash.as_ref(), "transactionHash")?.to_ascii_lowercase();
+    let log_index = parse_hex_quantity(required_field(log.log_index.as_ref(), "logIndex")?)?;
+    let block_number =
+        parse_hex_quantity(required_field(log.block_number.as_ref(), "blockNumber")?)?;
+    let now = now_ms();
+
+    Ok(OptionExecutionEvent {
+        id: Uuid::new_v4(),
+        chain_id,
+        contract_address: log.address.to_ascii_lowercase(),
+        tx_hash,
+        log_index,
+        block_number,
+        block_hash: log.block_hash.clone(),
+        event_name: "FeeRebatedV2".to_string(),
+        event_signature: FEE_REBATED_V2_SIGNATURE.to_string(),
+        intent_id: None,
+        onchain_intent_id: None,
+        option_execution_transaction_id: None,
+        buyer: None,
+        seller: None,
+        account: Some(trader.clone()),
+        option_id: None,
+        quantity_contracts: None,
+        premium_per_contract_native: Some(rebate_amount.clone()),
+        raw_topics: raw_topics_json(log),
+        raw_data: log.data.clone(),
+        decoded: Some(serde_json::json!({
+            "consumer": consumer,
+            "trader": trader,
+            "recipient": recipient,
+            "settlementAsset": settlement_asset,
+            "productKind": product_kind_label(product_kind_raw),
+            "productKindRaw": product_kind_raw,
+            "flowKind": flow_kind_label(flow_kind_raw),
+            "flowKindRaw": flow_kind_raw,
+            "isMaker": true,
+            "rebatePpm": rebate_ppm,
+            "basisAmount": basis_amount,
+            "rebateAmount": rebate_amount,
+        })),
+        created_at_ms: now,
+        updated_at_ms: now,
+    })
+}
+
+fn decode_rebate_budget_funded_log(log: &EthLog, chain_id: u64) -> Result<OptionExecutionEvent> {
+    if log.topics.len() != 2 {
+        return Err(BackendError::Indexer(
+            "RebateBudgetFunded log must have two topics".to_string(),
+        ));
+    }
+    let data = decode_hex_bytes(&log.data)?;
+    if data.len() != 32 {
+        return Err(BackendError::Indexer(
+            "RebateBudgetFunded data must contain one ABI word".to_string(),
+        ));
+    }
+    let settlement_asset = decode_topic_address(&log.topics[1])?;
+    let amount = decode_data_u256(&data, 0)?.to_string();
+    option_event_from_decoded_fields(
+        log,
+        chain_id,
+        "RebateBudgetFunded",
+        REBATE_BUDGET_FUNDED_SIGNATURE,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(amount.clone()),
+        serde_json::json!({
+            "settlementAsset": settlement_asset,
+            "amount": amount,
+        }),
+    )
+}
+
+fn decode_rebate_budget_withdrawn_log(log: &EthLog, chain_id: u64) -> Result<OptionExecutionEvent> {
+    if log.topics.len() != 3 {
+        return Err(BackendError::Indexer(
+            "RebateBudgetWithdrawn log must have three topics".to_string(),
+        ));
+    }
+    let data = decode_hex_bytes(&log.data)?;
+    if data.len() != 32 {
+        return Err(BackendError::Indexer(
+            "RebateBudgetWithdrawn data must contain one ABI word".to_string(),
+        ));
+    }
+    let settlement_asset = decode_topic_address(&log.topics[1])?;
+    let to = decode_topic_address(&log.topics[2])?;
+    let amount = decode_data_u256(&data, 0)?.to_string();
+    option_event_from_decoded_fields(
+        log,
+        chain_id,
+        "RebateBudgetWithdrawn",
+        REBATE_BUDGET_WITHDRAWN_SIGNATURE,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(amount.clone()),
+        serde_json::json!({
+            "settlementAsset": settlement_asset,
+            "to": to,
+            "amount": amount,
+        }),
+    )
+}
+
+fn decode_rebate_budget_spent_log(log: &EthLog, chain_id: u64) -> Result<OptionExecutionEvent> {
+    if log.topics.len() != 2 {
+        return Err(BackendError::Indexer(
+            "RebateBudgetSpent log must have two topics".to_string(),
+        ));
+    }
+    let data = decode_hex_bytes(&log.data)?;
+    if data.len() != 32 {
+        return Err(BackendError::Indexer(
+            "RebateBudgetSpent data must contain one ABI word".to_string(),
+        ));
+    }
+    let settlement_asset = decode_topic_address(&log.topics[1])?;
+    let amount = decode_data_u256(&data, 0)?.to_string();
+    option_event_from_decoded_fields(
+        log,
+        chain_id,
+        "RebateBudgetSpent",
+        REBATE_BUDGET_SPENT_SIGNATURE,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(amount.clone()),
+        serde_json::json!({
+            "settlementAsset": settlement_asset,
+            "amount": amount,
+        }),
+    )
+}
+
+fn decode_fee_recipient_set_v2_log(log: &EthLog, chain_id: u64) -> Result<OptionExecutionEvent> {
+    if log.topics.len() != 3 {
+        return Err(BackendError::Indexer(
+            "FeeRecipientSet (V2) log must have three topics".to_string(),
+        ));
+    }
+    let data = decode_hex_bytes(&log.data)?;
+    if !data.is_empty() {
+        return Err(BackendError::Indexer(
+            "FeeRecipientSet (V2) data must be empty".to_string(),
+        ));
+    }
+    let old_recipient = decode_topic_address(&log.topics[1])?;
+    let new_recipient = decode_topic_address(&log.topics[2])?;
+    option_event_from_decoded_fields(
+        log,
+        chain_id,
+        "FeeRecipientSetV2",
+        FEE_RECIPIENT_SET_V2_SIGNATURE,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        serde_json::json!({
+            "oldRecipient": old_recipient,
+            "newRecipient": new_recipient,
+        }),
+    )
+}
+
+fn decode_fee_consumer_set_log(log: &EthLog, chain_id: u64) -> Result<OptionExecutionEvent> {
+    if log.topics.len() != 2 {
+        return Err(BackendError::Indexer(
+            "FeeConsumerSet log must have two topics".to_string(),
+        ));
+    }
+    let data = decode_hex_bytes(&log.data)?;
+    if data.len() != 32 {
+        return Err(BackendError::Indexer(
+            "FeeConsumerSet data must contain one ABI word".to_string(),
+        ));
+    }
+    let consumer = decode_topic_address(&log.topics[1])?;
+    let allowed = decode_bool(&data, 0)?;
+    option_event_from_decoded_fields(
+        log,
+        chain_id,
+        "FeeConsumerSetV2",
+        FEE_CONSUMER_SET_SIGNATURE,
+        None,
+        None,
+        Some(consumer.clone()),
+        None,
+        None,
+        None,
+        serde_json::json!({
+            "consumer": consumer,
+            "allowed": allowed,
+        }),
+    )
+}
+
+fn decode_merkle_root_set_v2_log(log: &EthLog, chain_id: u64) -> Result<OptionExecutionEvent> {
+    if log.topics.len() != 2 {
+        return Err(BackendError::Indexer(
+            "MerkleRootSet (V2) log must have two topics".to_string(),
+        ));
+    }
+    let data = decode_hex_bytes(&log.data)?;
+    if data.len() != 32 * 2 {
+        return Err(BackendError::Indexer(
+            "MerkleRootSet (V2) data must contain two ABI words".to_string(),
+        ));
+    }
+    let root = decode_topic_bytes32(&log.topics[1])?;
+    let valid_from = decode_data_u256(&data, 0)?.to_string();
+    let valid_until = decode_data_u256(&data, 1)?.to_string();
+    option_event_from_decoded_fields(
+        log,
+        chain_id,
+        "MerkleRootSetV2",
+        MERKLE_ROOT_SET_V2_SIGNATURE,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        serde_json::json!({
+            "root": root,
+            "validFrom": valid_from,
+            "validUntil": valid_until,
+        }),
+    )
+}
+
+fn decode_tier_claimed_v2_log(log: &EthLog, chain_id: u64) -> Result<OptionExecutionEvent> {
+    if log.topics.len() != 2 {
+        return Err(BackendError::Indexer(
+            "TierClaimed (V2) log must have two topics".to_string(),
+        ));
+    }
+    let data = decode_hex_bytes(&log.data)?;
+    if data.len() != 32 * 2 {
+        return Err(BackendError::Indexer(
+            "TierClaimed (V2) data must contain two ABI words".to_string(),
+        ));
+    }
+    let account = decode_topic_address(&log.topics[1])?;
+    let tier = decode_data_u256(&data, 0)?.to::<u64>();
+    let valid_until = decode_data_u256(&data, 1)?.to_string();
+    option_event_from_decoded_fields(
+        log,
+        chain_id,
+        "TierClaimedV2",
+        TIER_CLAIMED_V2_SIGNATURE,
+        None,
+        None,
+        Some(account.clone()),
+        None,
+        None,
+        None,
+        serde_json::json!({
+            "account": account,
+            "tier": tier,
+            "validUntil": valid_until,
+        }),
+    )
+}
+
+fn product_kind_label(raw: u64) -> &'static str {
+    match raw {
+        0 => "option",
+        1 => "perp",
+        _ => "unknown",
+    }
+}
+
+fn flow_kind_label(raw: u64) -> &'static str {
+    match raw {
+        0 => "orderbook",
+        1 => "rfq",
+        _ => "unknown",
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn option_event_from_decoded_fields(
     log: &EthLog,
@@ -1235,6 +1741,40 @@ fn decode_data_u256(data: &[u8], word_index: usize) -> Result<U256> {
         BackendError::Indexer(format!("missing ABI data word at index {word_index}"))
     })?;
     Ok(U256::from_be_slice(word))
+}
+
+fn decode_data_address(data: &[u8], word_index: usize) -> Result<String> {
+    let start = word_index * 32;
+    let end = start + 32;
+    let word = data.get(start..end).ok_or_else(|| {
+        BackendError::Indexer(format!(
+            "missing ABI data word at index {word_index} (address)"
+        ))
+    })?;
+    Ok(format!("0x{}", hex_lower(&word[12..])))
+}
+
+/// Decode a signed `int32` ABI-encoded as a sign-extended 32-byte word.
+fn decode_data_i32(data: &[u8], word_index: usize) -> Result<i32> {
+    let start = word_index * 32;
+    let end = start + 32;
+    let word = data.get(start..end).ok_or_else(|| {
+        BackendError::Indexer(format!(
+            "missing ABI data word at index {word_index} (int32)"
+        ))
+    })?;
+    let is_negative = word[0] & 0x80 != 0;
+    let expected_pad = if is_negative { 0xffu8 } else { 0x00u8 };
+    for byte in &word[..28] {
+        if *byte != expected_pad {
+            return Err(BackendError::Indexer(
+                "int32 ABI word is not sign-extended to 32 bytes".to_string(),
+            ));
+        }
+    }
+    let mut bytes = [0u8; 4];
+    bytes.copy_from_slice(&word[28..32]);
+    Ok(i32::from_be_bytes(bytes))
 }
 
 fn decode_bool(data: &[u8], word_index: usize) -> Result<bool> {
@@ -1787,6 +2327,409 @@ mod tests {
             .contains("OPTION_EVENT_INDEXER_MARGIN_ENGINE_ADDRESS is required"));
     }
 
+    #[test]
+    fn fee_charged_v2_log_decodes_topics_and_signed_ppm() {
+        let log = fee_charged_v2_log(15, 6);
+        let event = decode_option_execution_event(&log, 84532).unwrap().unwrap();
+        assert_eq!(event.event_name, "FeeChargedV2");
+        assert_eq!(event.event_signature, FEE_CHARGED_V2_SIGNATURE);
+        let decoded = event.decoded.expect("decoded");
+        assert_eq!(
+            decoded["consumer"],
+            "0x00000000000000000000000000000000000000aa"
+        );
+        assert_eq!(
+            decoded["trader"],
+            "0x0000000000000000000000000000000000000001"
+        );
+        assert_eq!(
+            decoded["recipient"],
+            "0x00000000000000000000000000000000000000f0"
+        );
+        assert_eq!(
+            decoded["settlementAsset"],
+            "0x0000000000000000000000000000000000000020"
+        );
+        assert_eq!(decoded["productKind"], "option");
+        assert_eq!(decoded["flowKind"], "orderbook");
+        assert_eq!(decoded["isMaker"], false);
+        assert_eq!(decoded["feePpm"], 250);
+        assert_eq!(decoded["basisAmount"], "10000");
+        assert_eq!(decoded["feeAmount"], "25");
+        assert_eq!(
+            event.account.as_deref(),
+            Some("0x0000000000000000000000000000000000000001")
+        );
+        assert_eq!(event.premium_per_contract_native.as_deref(), Some("25"));
+    }
+
+    #[test]
+    fn fee_rebated_v2_log_decodes_negative_ppm_and_amount() {
+        let log = fee_rebated_v2_log(15, 7);
+        let event = decode_option_execution_event(&log, 84532).unwrap().unwrap();
+        assert_eq!(event.event_name, "FeeRebatedV2");
+        assert_eq!(event.event_signature, FEE_REBATED_V2_SIGNATURE);
+        let decoded = event.decoded.expect("decoded");
+        assert_eq!(
+            decoded["trader"],
+            "0x0000000000000000000000000000000000000002"
+        );
+        assert_eq!(
+            decoded["recipient"],
+            "0x0000000000000000000000000000000000000002"
+        );
+        assert_eq!(decoded["productKind"], "option");
+        assert_eq!(decoded["flowKind"], "orderbook");
+        assert_eq!(decoded["rebatePpm"], -50);
+        assert_eq!(decoded["isMaker"], true);
+        assert_eq!(decoded["basisAmount"], "10000");
+        assert_eq!(decoded["rebateAmount"], "5");
+    }
+
+    #[test]
+    fn rebate_budget_funded_decodes_amount() {
+        let log = rebate_budget_funded_log(15, 8);
+        let event = decode_option_execution_event(&log, 84532).unwrap().unwrap();
+        assert_eq!(event.event_name, "RebateBudgetFunded");
+        assert_eq!(event.event_signature, REBATE_BUDGET_FUNDED_SIGNATURE);
+        let decoded = event.decoded.expect("decoded");
+        assert_eq!(
+            decoded["settlementAsset"],
+            "0x0000000000000000000000000000000000000020"
+        );
+        assert_eq!(decoded["amount"], "100000");
+    }
+
+    #[test]
+    fn rebate_budget_withdrawn_decodes_two_addresses() {
+        let log = rebate_budget_withdrawn_log(15, 9);
+        let event = decode_option_execution_event(&log, 84532).unwrap().unwrap();
+        assert_eq!(event.event_name, "RebateBudgetWithdrawn");
+        assert_eq!(event.event_signature, REBATE_BUDGET_WITHDRAWN_SIGNATURE);
+        let decoded = event.decoded.expect("decoded");
+        assert_eq!(
+            decoded["settlementAsset"],
+            "0x0000000000000000000000000000000000000020"
+        );
+        assert_eq!(decoded["to"], "0x00000000000000000000000000000000000000c0");
+        assert_eq!(decoded["amount"], "500");
+    }
+
+    #[test]
+    fn rebate_budget_spent_decodes_amount() {
+        let log = rebate_budget_spent_log(15, 10);
+        let event = decode_option_execution_event(&log, 84532).unwrap().unwrap();
+        assert_eq!(event.event_name, "RebateBudgetSpent");
+        assert_eq!(event.event_signature, REBATE_BUDGET_SPENT_SIGNATURE);
+        let decoded = event.decoded.expect("decoded");
+        assert_eq!(decoded["amount"], "5");
+    }
+
+    #[test]
+    fn fee_recipient_set_v2_decodes_topics() {
+        let log = fee_recipient_set_v2_log(15, 11);
+        let event = decode_option_execution_event(&log, 84532).unwrap().unwrap();
+        assert_eq!(event.event_name, "FeeRecipientSetV2");
+        assert_eq!(event.event_signature, FEE_RECIPIENT_SET_V2_SIGNATURE);
+        let decoded = event.decoded.expect("decoded");
+        assert_eq!(
+            decoded["oldRecipient"],
+            "0x0000000000000000000000000000000000000000"
+        );
+        assert_eq!(
+            decoded["newRecipient"],
+            "0x00000000000000000000000000000000000000f0"
+        );
+    }
+
+    #[test]
+    fn fee_consumer_set_decodes_bool() {
+        let log = fee_consumer_set_log(15, 12);
+        let event = decode_option_execution_event(&log, 84532).unwrap().unwrap();
+        assert_eq!(event.event_name, "FeeConsumerSetV2");
+        let decoded = event.decoded.expect("decoded");
+        assert_eq!(
+            decoded["consumer"],
+            "0x00000000000000000000000000000000000000aa"
+        );
+        assert_eq!(decoded["allowed"], true);
+    }
+
+    #[test]
+    fn merkle_root_set_v2_decodes_window() {
+        let log = merkle_root_set_v2_log(15, 13);
+        let event = decode_option_execution_event(&log, 84532).unwrap().unwrap();
+        assert_eq!(event.event_name, "MerkleRootSetV2");
+        let decoded = event.decoded.expect("decoded");
+        assert_eq!(decoded["validFrom"], "1700000000");
+        assert_eq!(decoded["validUntil"], "1800000000");
+    }
+
+    #[test]
+    fn tier_claimed_v2_decodes_account_and_tier() {
+        let log = tier_claimed_v2_log(15, 14);
+        let event = decode_option_execution_event(&log, 84532).unwrap().unwrap();
+        assert_eq!(event.event_name, "TierClaimedV2");
+        let decoded = event.decoded.expect("decoded");
+        assert_eq!(
+            decoded["account"],
+            "0x0000000000000000000000000000000000000001"
+        );
+        assert_eq!(decoded["tier"], 3);
+        assert_eq!(decoded["validUntil"], "1800000000");
+    }
+
+    #[tokio::test]
+    async fn fees_manager_v2_emitter_role_subscribes_to_v2_topics_and_decodes() {
+        let mut state = state_with_event_indexer(true, 0, 20, 0);
+        state.option_event_indexer_config.fees_manager_v2_address =
+            Some(AccountId::new("0x00000000000000000000000000000000000000dd"));
+        let log = fee_charged_v2_log_on("0x00000000000000000000000000000000000000dd", 15, 6);
+        let provider = MockEventLogProvider::new(20, vec![log]);
+
+        let result = index_option_events_with_provider(&state, &provider)
+            .await
+            .unwrap();
+
+        assert_eq!(result.events_indexed, 1);
+        let events = state
+            .options_store
+            .lock()
+            .unwrap()
+            .list_option_execution_events(10);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_name, "FeeChargedV2");
+        assert_eq!(
+            events[0].contract_address,
+            "0x00000000000000000000000000000000000000dd"
+        );
+        // Ensure the FeesManagerV2 emitter requested all nine V2 topics.
+        let filters = provider.filters();
+        let v2_topic_count = filters
+            .iter()
+            .filter(|filter| filter.address == "0x00000000000000000000000000000000000000dd")
+            .count();
+        assert_eq!(v2_topic_count, 9);
+        assert_no_generic_execution_rows(&state);
+    }
+
+    #[test]
+    fn v1_default_indexer_does_not_subscribe_to_v2_topics() {
+        let config = OptionEventIndexerConfig {
+            enabled: true,
+            poll_interval_ms: 15_000,
+            from_block: 0,
+            batch_blocks: 10,
+            confirmation_blocks: 0,
+            require_rpc: false,
+            rpc_url: None,
+            matching_engine_address: AccountId::new("0x00000000000000000000000000000000000000ee"),
+            margin_engine_address: AccountId::new("0x00000000000000000000000000000000000000aa"),
+            collateral_vault_address: AccountId::new("0x00000000000000000000000000000000000000bb"),
+            fees_manager_address: Some(AccountId::new(
+                "0x00000000000000000000000000000000000000cc",
+            )),
+            fees_manager_v2_address: None,
+        };
+        let roles: Vec<String> = config
+            .emitter_contracts()
+            .into_iter()
+            .map(|contract| contract.role)
+            .collect();
+        assert!(roles.contains(&"fees_manager".to_string()));
+        assert!(!roles.contains(&"fees_manager_v2".to_string()));
+    }
+
+    fn fee_charged_v2_log(block_number: u64, log_index: u64) -> EthLog {
+        fee_charged_v2_log_on(
+            "0x00000000000000000000000000000000000000dd",
+            block_number,
+            log_index,
+        )
+    }
+
+    fn fee_charged_v2_log_on(address: &str, block_number: u64, log_index: u64) -> EthLog {
+        EthLog {
+            address: address.to_string(),
+            topics: vec![
+                fee_charged_v2_topic0(),
+                topic_address("00000000000000000000000000000000000000aa"),
+                topic_address("0000000000000000000000000000000000000001"),
+                topic_address("00000000000000000000000000000000000000f0"),
+            ],
+            data: format!(
+                "0x{}{}{}{}{}{}{}",
+                topic_address_no_prefix("0000000000000000000000000000000000000020"),
+                word_no_prefix(0), // productKind: OPTION
+                word_no_prefix(0), // flowKind: ORDERBOOK
+                word_no_prefix(0), // isMaker: false
+                signed_word(250),  // feePpm
+                word_no_prefix(10_000),
+                word_no_prefix(25),
+            ),
+            block_number: Some(hex_quantity(block_number)),
+            block_hash: Some(
+                "0x2222222222222222222222222222222222222222222222222222222222222222".to_string(),
+            ),
+            transaction_hash: Some(tx_hash().to_string()),
+            log_index: Some(hex_quantity(log_index)),
+        }
+    }
+
+    fn fee_rebated_v2_log(block_number: u64, log_index: u64) -> EthLog {
+        EthLog {
+            address: "0x00000000000000000000000000000000000000dd".to_string(),
+            topics: vec![
+                fee_rebated_v2_topic0(),
+                topic_address("00000000000000000000000000000000000000aa"),
+                topic_address("0000000000000000000000000000000000000002"),
+                topic_address("0000000000000000000000000000000000000002"),
+            ],
+            data: format!(
+                "0x{}{}{}{}{}{}",
+                topic_address_no_prefix("0000000000000000000000000000000000000020"),
+                word_no_prefix(0), // productKind: OPTION
+                word_no_prefix(0), // flowKind: ORDERBOOK
+                signed_word(-50),  // rebatePpm
+                word_no_prefix(10_000),
+                word_no_prefix(5),
+            ),
+            block_number: Some(hex_quantity(block_number)),
+            block_hash: Some(
+                "0x2222222222222222222222222222222222222222222222222222222222222222".to_string(),
+            ),
+            transaction_hash: Some(tx_hash().to_string()),
+            log_index: Some(hex_quantity(log_index)),
+        }
+    }
+
+    fn rebate_budget_funded_log(block_number: u64, log_index: u64) -> EthLog {
+        EthLog {
+            address: "0x00000000000000000000000000000000000000dd".to_string(),
+            topics: vec![
+                rebate_budget_funded_topic0(),
+                topic_address("0000000000000000000000000000000000000020"),
+            ],
+            data: format!("0x{}", word_no_prefix(100_000)),
+            block_number: Some(hex_quantity(block_number)),
+            block_hash: None,
+            transaction_hash: Some(tx_hash().to_string()),
+            log_index: Some(hex_quantity(log_index)),
+        }
+    }
+
+    fn rebate_budget_withdrawn_log(block_number: u64, log_index: u64) -> EthLog {
+        EthLog {
+            address: "0x00000000000000000000000000000000000000dd".to_string(),
+            topics: vec![
+                rebate_budget_withdrawn_topic0(),
+                topic_address("0000000000000000000000000000000000000020"),
+                topic_address("00000000000000000000000000000000000000c0"),
+            ],
+            data: format!("0x{}", word_no_prefix(500)),
+            block_number: Some(hex_quantity(block_number)),
+            block_hash: None,
+            transaction_hash: Some(tx_hash().to_string()),
+            log_index: Some(hex_quantity(log_index)),
+        }
+    }
+
+    fn rebate_budget_spent_log(block_number: u64, log_index: u64) -> EthLog {
+        EthLog {
+            address: "0x00000000000000000000000000000000000000dd".to_string(),
+            topics: vec![
+                rebate_budget_spent_topic0(),
+                topic_address("0000000000000000000000000000000000000020"),
+            ],
+            data: format!("0x{}", word_no_prefix(5)),
+            block_number: Some(hex_quantity(block_number)),
+            block_hash: None,
+            transaction_hash: Some(tx_hash().to_string()),
+            log_index: Some(hex_quantity(log_index)),
+        }
+    }
+
+    fn fee_recipient_set_v2_log(block_number: u64, log_index: u64) -> EthLog {
+        EthLog {
+            address: "0x00000000000000000000000000000000000000dd".to_string(),
+            topics: vec![
+                fee_recipient_set_v2_topic0(),
+                topic_address("0000000000000000000000000000000000000000"),
+                topic_address("00000000000000000000000000000000000000f0"),
+            ],
+            data: "0x".to_string(),
+            block_number: Some(hex_quantity(block_number)),
+            block_hash: None,
+            transaction_hash: Some(tx_hash().to_string()),
+            log_index: Some(hex_quantity(log_index)),
+        }
+    }
+
+    fn fee_consumer_set_log(block_number: u64, log_index: u64) -> EthLog {
+        EthLog {
+            address: "0x00000000000000000000000000000000000000dd".to_string(),
+            topics: vec![
+                fee_consumer_set_topic0(),
+                topic_address("00000000000000000000000000000000000000aa"),
+            ],
+            data: format!("0x{}", word_no_prefix(1)),
+            block_number: Some(hex_quantity(block_number)),
+            block_hash: None,
+            transaction_hash: Some(tx_hash().to_string()),
+            log_index: Some(hex_quantity(log_index)),
+        }
+    }
+
+    fn merkle_root_set_v2_log(block_number: u64, log_index: u64) -> EthLog {
+        EthLog {
+            address: "0x00000000000000000000000000000000000000dd".to_string(),
+            topics: vec![
+                merkle_root_set_v2_topic0(),
+                "0x3333333333333333333333333333333333333333333333333333333333333333".to_string(),
+            ],
+            data: format!(
+                "0x{}{}",
+                word_no_prefix(1_700_000_000),
+                word_no_prefix(1_800_000_000),
+            ),
+            block_number: Some(hex_quantity(block_number)),
+            block_hash: None,
+            transaction_hash: Some(tx_hash().to_string()),
+            log_index: Some(hex_quantity(log_index)),
+        }
+    }
+
+    fn tier_claimed_v2_log(block_number: u64, log_index: u64) -> EthLog {
+        EthLog {
+            address: "0x00000000000000000000000000000000000000dd".to_string(),
+            topics: vec![
+                tier_claimed_v2_topic0(),
+                topic_address("0000000000000000000000000000000000000001"),
+            ],
+            data: format!("0x{}{}", word_no_prefix(3), word_no_prefix(1_800_000_000),),
+            block_number: Some(hex_quantity(block_number)),
+            block_hash: None,
+            transaction_hash: Some(tx_hash().to_string()),
+            log_index: Some(hex_quantity(log_index)),
+        }
+    }
+
+    fn topic_address_no_prefix(address_without_prefix: &str) -> String {
+        format!("{:0>64}", address_without_prefix)
+    }
+
+    /// Encode a signed `int32` as a sign-extended 32-byte ABI word.
+    fn signed_word(value: i32) -> String {
+        let extended_byte = if value < 0 { 0xffu8 } else { 0x00u8 };
+        let mut bytes = [extended_byte; 32];
+        bytes[28..].copy_from_slice(&value.to_be_bytes());
+        let mut out = String::with_capacity(64);
+        for byte in bytes {
+            out.push_str(&format!("{byte:02x}"));
+        }
+        out
+    }
+
     fn state_with_event_indexer(
         enabled: bool,
         from_block: u64,
@@ -1809,6 +2752,7 @@ mod tests {
             margin_engine_address: AccountId::new("0x00000000000000000000000000000000000000aa"),
             collateral_vault_address: AccountId::new("0x00000000000000000000000000000000000000bb"),
             fees_manager_address: None,
+            fees_manager_v2_address: None,
         };
         state
     }

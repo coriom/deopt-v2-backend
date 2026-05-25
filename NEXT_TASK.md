@@ -1,49 +1,37 @@
-# NEXT_TASK.md — Live V1S On-chain Fee Verification V2C-LIVE
+# NEXT_TASK.md — Backend FeesManagerV2 Event Decoding And Lifecycle Support V2D-E
 
 ## Context
 
-V2C implemented backend on-chain fee event reconciliation.
+V2D-D integrated FeesManagerV2 into the option MarginEngine path.
 
-Implemented:
-- lifecycle fee section now exposes:
-  - source_of_truth = onchain
-  - observed_total
-  - by_trader
-  - by_recipient
-  - by_side
-  - backend_ledger_status
-  - reconciliation_status
-- new admin endpoint:
-  GET /admin/fees/onchain
-- docs:
-  docs/FEE_MODEL_TARGET_GAP_ANALYSIS_V2C.md
+Solidity now supports:
+- V1/V2 coexistence
+- V1 default behavior unchanged
+- V2 option fees when enabled
+- option premium basis
+- positive fees trader -> feeRecipient
+- maker rebates rebateFundingAccount -> trader
+- V2 events emitted by FeesManagerV2
+- V1-compatible `TradingFeeCharged` event still emitted for positive fees
 
-V2C was test-covered only. Live V1S fee verification was not run.
-
-Known V1S:
-- intent: `e6d2941b-65f7-413a-958f-74ab22c53b08`
-- tx: `0x5964a7b3d2c18d051baaa780413d31c44d419ce530f45263cb4c46f720881125`
-- indexed events: 19
-- TradingFeeCharged count: 2
-- expected buyer fee: 6
-- expected seller fee: 4
-- expected total observed fee: 10
-- current lifecycle should expose on-chain fee source of truth.
+Remaining gap:
+The backend currently indexes V1-style `TradingFeeCharged` events and lifecycle fees, but does not yet decode or summarize the new FeesManagerV2 events.
 
 ## Goal
 
-Run live verification of V2C fee reconciliation against the operator DB/backend.
+Add backend support for FeesManagerV2 events.
 
-This task must verify that V1S on-chain `TradingFeeCharged` events are visible through:
-1. lifecycle endpoint;
-2. `/admin/fees/onchain`;
-3. fee aggregation by trader, recipient, and side.
+This is backend-only.
+
+Do not deploy.
+Do not broadcast.
+Do not modify Solidity.
+Do not modify frontend.
 
 ## Hard Rules
 
-Do not broadcast.
-Do not retry transactions.
 Do not submit transactions.
+Do not broadcast.
 Do not call `/executor/broadcast`.
 Do not call `POST /options/execution-intents/:id/broadcast`.
 Do not create new option execution intents.
@@ -54,175 +42,190 @@ Do not modify Solidity.
 Do not modify frontend.
 Do not deploy contracts.
 Do not change live fee rates.
-Do not print private keys.
-Do not touch real `.env` secrets.
+Do not touch `.env`.
+Do not print secrets.
 
-No DB mutation is allowed except normal read-only endpoint access.
+Allowed:
+- backend event decoder updates
+- backend admin/lifecycle read model updates
+- tests
+- docs
 
-## Step 1 — Load Env
+## Required Solidity Event Audit
 
-In:
+Read current Solidity events from:
 
-cd ~/DEOPT/deopt-v2-backend
+```text
+../deopt-v2-sol/src/fees/IFeesManagerV2.sol
+../deopt-v2-sol/src/fees/FeesManagerV2.sol
 
-Load env without printing secrets:
+Extract exact event signatures for:
 
-set -a
-source .env
-set +a
+FeeChargedV2
+FeeRebatedV2
+RebateBudgetFunded
+RebateBudgetWithdrawn
+RebateBudgetSpent
+FeeRecipientSet
+FeeConsumerSet
+MerkleRootSet
+TierClaimed
 
-Confirm required vars exist without printing values:
+Do not invent signatures.
 
-test -n "$DATABASE_URL" && echo "DATABASE_URL set"
-test -n "$ADMIN_TOKEN" && echo "ADMIN_TOKEN set"
-Step 2 — Start Backend
+Required Backend Event Indexer Updates
 
-Start or restart backend.
+Update option event indexer to decode V2 events if emitted by configured fees_manager.
 
-Verify health:
+Existing indexer already supports optional FeesManager.
 
-curl -s http://127.0.0.1:8080/health | jq
+Add decoded support for:
 
-Expected:
+FeeChargedV2
+FeeRebatedV2
+RebateBudgetFunded
+RebateBudgetWithdrawn
+RebateBudgetSpent
+FeeRecipientSet
+FeeConsumerSet
+MerkleRootSet
+TierClaimed
 
-{"ok":true}
-Step 3 — Verify V1S Indexed Fee Events In DB
+Persist in option_execution_events with:
 
-Run:
+event_name
+event_signature
+contract_address
+tx_hash
+log_index
+decoded JSON
+account/trader if available
+recipient if available
+fee/rebate amount if available
+settlement asset if available
+product kind
+flow kind
+isMaker
+feePpm / rebatePpm
+basisAmount
 
-psql "$DATABASE_URL" <<'SQL'
-select
-  event_name,
-  count(*)
-from option_execution_events
-where tx_hash = '0x5964a7b3d2c18d051baaa780413d31c44d419ce530f45263cb4c46f720881125'
-group by event_name
-order by event_name;
+Do not break V1 decoding.
 
-select
-  event_name,
-  log_index,
-  contract_address,
-  account,
-  decoded
-from option_execution_events
-where tx_hash = '0x5964a7b3d2c18d051baaa780413d31c44d419ce530f45263cb4c46f720881125'
-  and event_name = 'TradingFeeCharged'
-order by log_index;
-SQL
+Required Fee Read Model Updates
 
-Expected:
+Update lifecycle fee section to support both:
 
-TradingFeeCharged = 2
-decoded fee data includes buyer/seller fee shape.
-total applied fee should sum to 10.
-Step 4 — Verify Lifecycle Fee Section
+V1: TradingFeeCharged
+V2: FeeChargedV2 + FeeRebatedV2
 
-Call:
+Lifecycle fees should expose:
 
-curl -s \
-  -H "X-Admin-Token: $ADMIN_TOKEN" \
-  http://127.0.0.1:8080/admin/options/executions/e6d2941b-65f7-413a-958f-74ab22c53b08/lifecycle \
-  | jq '.fees'
+{
+  "source_of_truth": "onchain",
+  "event_model": "v1" | "v2" | "mixed",
+  "observed_total_charged": "...",
+  "observed_total_rebated": "...",
+  "net_protocol_fee": "...",
+  "trading_fee_event_count": 0,
+  "fee_charged_v2_count": 0,
+  "fee_rebated_v2_count": 0,
+  "by_trader": {},
+  "by_recipient": {},
+  "by_side": {},
+  "backend_ledger_status": "...",
+  "reconciliation_status": "..."
+}
 
-Expected:
+Compatibility:
 
-source_of_truth = "onchain"
-trading_fee_event_count = 2
-observed_total = "10"
-by_side.taker = "6" or equivalent
-by_side.maker = "4" or equivalent
-backend_ledger_status explicit:
-disabled
-missing_or_disabled
-or present
-reconciliation_status explicit.
-
-If fields are missing, document exact mismatch.
-
-Step 5 — Verify Admin On-chain Fees Endpoint
-
-Call by tx hash:
-
-curl -s \
-  -H "X-Admin-Token: $ADMIN_TOKEN" \
-  "http://127.0.0.1:8080/admin/fees/onchain?tx_hash=0x5964a7b3d2c18d051baaa780413d31c44d419ce530f45263cb4c46f720881125" \
-  | jq
-
-Expected:
-
-tx appears.
-observed_total = "10".
-TradingFeeCharged count = 2.
-grouped by trader, recipient, side.
-
-Call recent endpoint:
-
-curl -s \
-  -H "X-Admin-Token: $ADMIN_TOKEN" \
-  "http://127.0.0.1:8080/admin/fees/onchain?limit=10" \
-  | jq
-
-Expected:
-
-recent on-chain fee events include V1S or return a sane list.
-no secrets.
-Step 6 — Verify No Mutation
-
-Set baseline before endpoint calls if not already done, or compare stable counts after.
-
-Run:
-
-psql "$DATABASE_URL" <<'SQL'
-select count(*) as option_execution_intents from option_execution_intents;
-select count(*) as option_execution_transactions from option_execution_transactions;
-select count(*) as execution_transactions from execution_transactions;
-select count(*) as option_execution_events from option_execution_events;
-select count(*) as option_execution_reconciliations from option_execution_reconciliations;
-select count(*) as fee_events from fee_events;
-SQL
-
-Call lifecycle and /admin/fees/onchain again.
-
-Run the same counts.
-
-Expected:
-
-all counts unchanged.
-no write mutation.
-Step 7 — Safety Search
-
-Run:
-
-rg "sendRawTransaction|eth_sendRawTransaction|/executor/broadcast|execution-intents/.*/broadcast|POST" src/fees src/options src/api/routes.rs
-
-Expected:
-
-no new broadcast/send path in fee endpoint.
-POST matches only unrelated existing routes or admin tick routes.
-Step 8 — Docs Update
+keep existing fields if frontend currently uses them.
+do not remove observed_total.
+for V1-only rows, behavior remains unchanged.
+Required Admin Endpoint Updates
 
 Update:
 
-docs/FEE_MODEL_TARGET_GAP_ANALYSIS_V2C.md
+GET /admin/fees/onchain
 
-Add:
+It must support:
 
-## Live V1S Fee Verification Result
+V1 TradingFeeCharged
+V2 FeeChargedV2
+V2 FeeRebatedV2
+
+Return:
+
+total charged
+total rebated
+net fee
+counts by event model
+by trader
+by recipient
+by side
+recent fee/rebate events
+
+Do not break existing response fields.
+
+Required Reconciliation Updates
+
+Extend fee reconciliation details to include V2 events.
+
+If a tx has:
+
+only V1 events -> existing behavior.
+only V2 events -> use V2 events.
+both V1 compatibility and V2 events -> avoid double-counting.
+
+Important:
+If MarginEngine emits V1-compatible TradingFeeCharged and FeesManagerV2 emits FeeChargedV2, backend must not count both as separate protocol fee payments unless design explicitly requires it.
+
+Recommended:
+
+prefer V2 events when present.
+include V1 events as compatibility evidence.
+set event_model = "mixed" and source_priority = "v2".
+Required Tests
+
+Add tests for:
+
+decode FeeChargedV2.
+decode FeeRebatedV2.
+decode rebate budget events.
+lifecycle V1-only fees unchanged.
+lifecycle V2-only positive fee summary.
+lifecycle V2 rebate summary.
+mixed V1+V2 avoids double-counting.
+/admin/fees/onchain returns V2 charged/rebated totals.
+no generic execution rows created.
+no broadcast path touched.
+
+Use fixtures/mocks. Do not depend on live deployment.
+
+Required Docs
+
+Create:
+
+docs/FEES_MANAGER_V2_BACKEND_EVENT_SUPPORT_V2D_E.md
 
 Include:
 
-lifecycle fee section result
-/admin/fees/onchain?tx_hash=... result
-observed total
-by trader/recipient/side
-backend ledger status
-no-mutation verification
-remaining blocker
+V2 events decoded
+source-of-truth rules
+V1/V2 compatibility
+double-count prevention
+lifecycle changes
+admin endpoint changes
+remaining deferred work:
+live Base Sepolia deployment/wiring
+V2 fee drift checks
+perps integration
+RFQ flow support
+frontend fee dashboard update
 Validation
 
 Run:
 
+cd ~/DEOPT/deopt-v2-backend
 cargo fmt --all
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features
@@ -231,23 +234,25 @@ Acceptance Criteria
 
 Complete only if:
 
-live V1S lifecycle fee section verified.
-/admin/fees/onchain verified.
-observed total = 10.
-backend ledger status explicit.
-no DB mutation from read-only endpoints.
-docs updated.
-validations pass.
+backend decodes FeesManagerV2 events.
+lifecycle supports V1 and V2 fee event models.
+admin fee endpoint supports V2 fees and rebates.
+mixed V1/V2 events avoid double-counting.
+tests pass.
+docs created.
+no Solidity/frontend changes.
+no transaction submitted.
 Final Report
 
 Return:
 
-DB fee event baseline
-lifecycle fee result
-admin onchain fee endpoint result
-backend ledger status
-no-mutation verification
-safety search result
+files changed
+V2 events decoded
+lifecycle fee model update
+admin fee endpoint update
+double-counting policy
+tests added
+docs created
 validation commands run
-docs updated
+no forbidden mutation verification
 remaining blocker

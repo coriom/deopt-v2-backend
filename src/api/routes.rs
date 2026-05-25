@@ -529,7 +529,8 @@ async fn admin_config(
                 "matching_engine_address": state.option_event_indexer_config.matching_engine_address,
                 "margin_engine_address": state.option_event_indexer_config.margin_engine_address,
                 "collateral_vault_address": state.option_event_indexer_config.collateral_vault_address,
-                "fees_manager_address": state.option_event_indexer_config.fees_manager_address
+                "fees_manager_address": state.option_event_indexer_config.fees_manager_address,
+                "fees_manager_v2_address": state.option_event_indexer_config.fees_manager_v2_address
             },
             "reconciliation_worker": {
                 "enabled": state.option_reconciliation_config.enabled,
@@ -676,7 +677,8 @@ async fn admin_option_events(
             "matching_engine_address": state.option_event_indexer_config.matching_engine_address,
             "margin_engine_address": state.option_event_indexer_config.margin_engine_address,
             "collateral_vault_address": state.option_event_indexer_config.collateral_vault_address,
-            "fees_manager_address": state.option_event_indexer_config.fees_manager_address
+            "fees_manager_address": state.option_event_indexer_config.fees_manager_address,
+            "fees_manager_v2_address": state.option_event_indexer_config.fees_manager_v2_address
         },
         "latest_tick": latest_tick,
         "counts": counts_by_event_name,
@@ -5111,6 +5113,7 @@ mod tests {
             fees_manager_address: Some(AccountId::new(
                 "0x00000000000000000000000000000000000000cc",
             )),
+            fees_manager_v2_address: None,
         };
         let event = route_option_execution_event();
         state
@@ -5200,6 +5203,7 @@ mod tests {
             margin_engine_address: AccountId::new("0x00000000000000000000000000000000000000aa"),
             collateral_vault_address: AccountId::new("0x00000000000000000000000000000000000000bb"),
             fees_manager_address: None,
+            fees_manager_v2_address: None,
         };
 
         let response = router(state)
@@ -5232,6 +5236,7 @@ mod tests {
             margin_engine_address: AccountId::new("0x00000000000000000000000000000000000000aa"),
             collateral_vault_address: AccountId::new("0x00000000000000000000000000000000000000bb"),
             fees_manager_address: None,
+            fees_manager_v2_address: None,
         };
         let app = router(state.clone());
 
@@ -5541,6 +5546,220 @@ mod tests {
         );
         assert!(state.repository.is_none());
         assert!(state.trade_signatures.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn admin_fees_onchain_exposes_v2_charged_and_rebated_totals() {
+        let state = admin_state(false);
+        let tx_hash =
+            "0x7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e".to_string();
+        let charged = build_fee_charged_v2_log_row(
+            1,
+            tx_hash.as_str(),
+            4,
+            "0xc0a76c2a00000000000000000000000000000000",
+            25,
+            250,
+            false,
+        );
+        let rebated = build_fee_rebated_v2_log_row(
+            2,
+            tx_hash.as_str(),
+            5,
+            "0xbaf0976a00000000000000000000000000000000",
+            5,
+            -50,
+        );
+        state
+            .options_store
+            .lock()
+            .unwrap()
+            .persist_option_execution_events_and_cursor(
+                OPTION_EVENT_INDEXER_STATE_ID,
+                &[charged.clone(), rebated.clone()],
+                charged.block_number,
+                1,
+            );
+
+        let response = router(state.clone())
+            .oneshot(get_request(
+                &format!("/admin/fees/onchain?tx_hash={tx_hash}"),
+                None,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["source_of_truth"], "onchain");
+        assert_eq!(json["event_model"], "v2");
+        assert_eq!(json["fee_charged_v2_count"], 1);
+        assert_eq!(json["fee_rebated_v2_count"], 1);
+        assert_eq!(json["trading_fee_event_count"], 0);
+        assert_eq!(json["observed_total"], "25");
+        assert_eq!(json["observed_total_charged"], "25");
+        assert_eq!(json["observed_total_rebated"], "5");
+        assert_eq!(json["net_protocol_fee"], "20");
+        assert_eq!(json["by_side"]["taker"], "25");
+        assert_eq!(
+            json["rebated_by_trader"]["0xbaf0976a00000000000000000000000000000000"],
+            "5"
+        );
+        let transactions = json["transactions"].as_array().unwrap();
+        assert_eq!(transactions.len(), 1);
+        assert_eq!(transactions[0]["event_model"], "v2");
+        assert_eq!(transactions[0]["observed_total_charged"], "25");
+        assert_eq!(transactions[0]["observed_total_rebated"], "5");
+        assert_eq!(transactions[0]["net_protocol_fee"], "20");
+        assert!(state.repository.is_none());
+        assert!(state.trade_signatures.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn admin_fees_onchain_mixed_v1_v2_uses_v2_priority() {
+        let state = admin_state(false);
+        let tx_hash =
+            "0x8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e".to_string();
+        let v1 = build_trading_fee_log_row(
+            1,
+            tx_hash.as_str(),
+            4,
+            "0xc0a76c2a00000000000000000000000000000000",
+            6,
+            false,
+        );
+        let v2 = build_fee_charged_v2_log_row(
+            2,
+            tx_hash.as_str(),
+            5,
+            "0xc0a76c2a00000000000000000000000000000000",
+            25,
+            250,
+            false,
+        );
+        state
+            .options_store
+            .lock()
+            .unwrap()
+            .persist_option_execution_events_and_cursor(
+                OPTION_EVENT_INDEXER_STATE_ID,
+                &[v1.clone(), v2.clone()],
+                v1.block_number,
+                1,
+            );
+
+        let response = router(state.clone())
+            .oneshot(get_request(
+                &format!("/admin/fees/onchain?tx_hash={tx_hash}"),
+                None,
+            ))
+            .await
+            .unwrap();
+
+        let json = response_json(response).await;
+        assert_eq!(json["event_model"], "mixed");
+        assert_eq!(json["source_priority"], "v2");
+        assert_eq!(json["trading_fee_event_count"], 1);
+        assert_eq!(json["fee_charged_v2_count"], 1);
+        // Must not be 31 (would be V1 + V2 double-counted).
+        assert_eq!(json["observed_total"], "25");
+        assert_eq!(json["observed_total_charged"], "25");
+        assert_eq!(json["observed_total_rebated"], "0");
+        assert_eq!(json["net_protocol_fee"], "25");
+        assert!(state.repository.is_none());
+    }
+
+    fn build_fee_charged_v2_log_row(
+        id_seed: u128,
+        tx_hash: &str,
+        log_index: u64,
+        trader: &str,
+        fee_amount: u128,
+        fee_ppm: i32,
+        is_maker: bool,
+    ) -> crate::options::OptionExecutionEvent {
+        crate::options::OptionExecutionEvent {
+            id: Uuid::from_u128(2_000 + id_seed),
+            chain_id: 84532,
+            contract_address: "0x00000000000000000000000000000000000000dd".to_string(),
+            tx_hash: tx_hash.to_string(),
+            log_index,
+            block_number: 41_856_965,
+            block_hash: None,
+            event_name: "FeeChargedV2".to_string(),
+            event_signature: "FeeChargedV2".to_string(),
+            intent_id: None,
+            onchain_intent_id: None,
+            option_execution_transaction_id: None,
+            buyer: None,
+            seller: None,
+            account: Some(trader.to_string()),
+            option_id: None,
+            quantity_contracts: None,
+            premium_per_contract_native: Some(fee_amount.to_string()),
+            raw_topics: serde_json::Value::Array(Vec::new()),
+            raw_data: "0x".to_string(),
+            decoded: Some(serde_json::json!({
+                "consumer": "0x00000000000000000000000000000000000000aa",
+                "trader": trader,
+                "recipient": "0x009f38440f058d095b61e0e2ee7fabdf05be7500",
+                "settlementAsset": "0x0000000000000000000000000000000000000020",
+                "productKind": "option",
+                "flowKind": "orderbook",
+                "isMaker": is_maker,
+                "feePpm": fee_ppm,
+                "basisAmount": "10000",
+                "feeAmount": fee_amount.to_string(),
+            })),
+            created_at_ms: 6,
+            updated_at_ms: 6,
+        }
+    }
+
+    fn build_fee_rebated_v2_log_row(
+        id_seed: u128,
+        tx_hash: &str,
+        log_index: u64,
+        trader: &str,
+        rebate_amount: u128,
+        rebate_ppm: i32,
+    ) -> crate::options::OptionExecutionEvent {
+        crate::options::OptionExecutionEvent {
+            id: Uuid::from_u128(3_000 + id_seed),
+            chain_id: 84532,
+            contract_address: "0x00000000000000000000000000000000000000dd".to_string(),
+            tx_hash: tx_hash.to_string(),
+            log_index,
+            block_number: 41_856_965,
+            block_hash: None,
+            event_name: "FeeRebatedV2".to_string(),
+            event_signature: "FeeRebatedV2".to_string(),
+            intent_id: None,
+            onchain_intent_id: None,
+            option_execution_transaction_id: None,
+            buyer: None,
+            seller: None,
+            account: Some(trader.to_string()),
+            option_id: None,
+            quantity_contracts: None,
+            premium_per_contract_native: Some(rebate_amount.to_string()),
+            raw_topics: serde_json::Value::Array(Vec::new()),
+            raw_data: "0x".to_string(),
+            decoded: Some(serde_json::json!({
+                "consumer": "0x00000000000000000000000000000000000000aa",
+                "trader": trader,
+                "recipient": trader,
+                "settlementAsset": "0x0000000000000000000000000000000000000020",
+                "productKind": "option",
+                "flowKind": "orderbook",
+                "isMaker": true,
+                "rebatePpm": rebate_ppm,
+                "basisAmount": "10000",
+                "rebateAmount": rebate_amount.to_string(),
+            })),
+            created_at_ms: 6,
+            updated_at_ms: 6,
+        }
     }
 
     fn build_trading_fee_log_row(

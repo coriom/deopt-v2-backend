@@ -376,6 +376,10 @@ impl AppConfig {
             optional_env(&mut lookup, "OPTION_EVENT_INDEXER_FEES_MANAGER_ADDRESS")
                 .or_else(|| optional_env(&mut lookup, "FEES_MANAGER"))
                 .map(AccountId::new);
+        let option_event_indexer_fees_manager_v2_address =
+            optional_env(&mut lookup, "OPTION_EVENT_INDEXER_FEES_MANAGER_V2_ADDRESS")
+                .or_else(|| optional_env(&mut lookup, "FEES_MANAGER_V2"))
+                .map(AccountId::new);
         let option_reconciliation = OptionReconciliationConfig {
             enabled: parse_env(&mut lookup, "OPTION_RECONCILIATION_WORKER_ENABLED", "false")?,
             poll_interval_ms: parse_env(
@@ -424,6 +428,7 @@ impl AppConfig {
             margin_engine_address: option_event_indexer_margin_engine_address,
             collateral_vault_address: option_event_indexer_collateral_vault_address,
             fees_manager_address: option_event_indexer_fees_manager_address,
+            fees_manager_v2_address: option_event_indexer_fees_manager_v2_address,
         };
         let signature_verification_mode =
             parse_env(&mut lookup, "SIGNATURE_VERIFICATION_MODE", "disabled")?;

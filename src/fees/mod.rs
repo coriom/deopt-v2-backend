@@ -1,3 +1,4 @@
+pub mod onchain_summary;
 pub mod schedule;
 pub mod service;
 pub mod store;

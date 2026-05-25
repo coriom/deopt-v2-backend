@@ -177,24 +177,51 @@ pub struct LifecycleEvents {
 
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct LifecycleFees {
-    /// Always `"onchain"` while live trades exist: the `TradingFeeCharged`
-    /// log from `MarginEngine.applyTrade` is the canonical record of what
-    /// the protocol charged. Backend fee ledger entries are informational
-    /// and may legitimately be missing for purely on-chain reconciliation.
+    /// Always `"onchain"` while live trades exist: the indexed fee event
+    /// log is the canonical record of what the protocol charged. Backend
+    /// fee ledger entries are informational and may legitimately be
+    /// missing for purely on-chain reconciliation.
     pub source_of_truth: String,
+    /// Which event model produced the figures in this view:
+    /// `"v1"` (only `TradingFeeCharged`), `"v2"` (only `FeeChargedV2` /
+    /// `FeeRebatedV2`), `"mixed"` (both observed — V2 takes precedence to
+    /// avoid double-counting), or `"none"` (no fee events at all).
+    pub event_model: String,
+    /// When `event_model = "mixed"`, names the model whose totals are
+    /// surfaced in `observed_total_*`. Always `"v2"` per the
+    /// double-counting policy. Empty otherwise.
+    pub source_priority: String,
+    /// Count of V1 `TradingFeeCharged` events observed (informational;
+    /// always tracked even when V2 events take precedence).
     pub trading_fee_event_count: u64,
+    /// Count of `FeeChargedV2` events observed.
+    pub fee_charged_v2_count: u64,
+    /// Count of `FeeRebatedV2` events observed.
+    pub fee_rebated_v2_count: u64,
     pub events: Vec<serde_json::Value>,
-    /// Sum of `appliedFee` across every observed `TradingFeeCharged` log on
-    /// this transaction, as a base-10 string (settlement-asset native units).
+    /// Sum of `appliedFee` (V1) or `feeAmount` (V2) for the selected
+    /// model, base-10 string in settlement-asset native units.
     pub observed_total: String,
-    /// Per-trader sum of `appliedFee` (trader = decoded `trader` field,
-    /// falls back to the event's `account` column for older indexed rows).
+    /// Total positive fees charged from traders, per the selected model.
+    /// Equal to `observed_total` for backward compatibility.
+    pub observed_total_charged: String,
+    /// Total rebate amount credited back to traders (always `"0"` under
+    /// the V1 model — rebates are V2-only).
+    pub observed_total_rebated: String,
+    /// `observed_total_charged - observed_total_rebated`, the protocol
+    /// net revenue per the selected model.
+    pub net_protocol_fee: String,
+    /// Per-trader sum of positive fees charged, keyed by the trader
+    /// address (lowercased). Rebates are tracked separately via
+    /// `rebated_by_trader` so this map stays a count of fees paid into
+    /// the protocol.
     pub by_trader: BTreeMap<String, String>,
-    /// Per-recipient sum of `appliedFee`. Same shape as the legacy
-    /// `total_by_recipient` map and kept in sync with it.
+    /// Per-trader sum of rebates received (V2 only). Empty under V1.
+    pub rebated_by_trader: BTreeMap<String, String>,
+    /// Per-recipient sum of fees. Maker rebates go to the trader; positive
+    /// fees go to the configured fee recipient.
     pub by_recipient: BTreeMap<String, String>,
-    /// Per-side sum of `appliedFee` keyed by `"maker"` / `"taker"`
-    /// (or `"unknown"` when `isMaker` is absent).
+    /// Per-side sum keyed by `"maker"` / `"taker"` (or `"unknown"`).
     pub by_side: BTreeMap<String, String>,
     /// Backward-compatible alias of `by_recipient` retained for clients
     /// still consuming the V1Z field name.
@@ -208,8 +235,8 @@ pub struct LifecycleFees {
     /// on-chain event is the source of truth.
     pub backend_ledger_status: String,
     /// Indicates whether on-chain fee events have been observed:
-    /// `"onchain_observed"` when at least one `TradingFeeCharged` event
-    /// was indexed for this tx, `"no_onchain_events"` otherwise.
+    /// `"onchain_observed"` when at least one fee event was indexed for
+    /// this tx, `"no_onchain_events"` otherwise.
     pub reconciliation_status: String,
 }
 
@@ -532,100 +559,7 @@ fn build_events_view(events: &[OptionExecutionEvent]) -> LifecycleEvents {
 }
 
 fn build_fees_view(events: &[OptionExecutionEvent], backend_ledger_status: &str) -> LifecycleFees {
-    let mut by_recipient: BTreeMap<String, u128> = BTreeMap::new();
-    let mut by_trader: BTreeMap<String, u128> = BTreeMap::new();
-    let mut by_side: BTreeMap<String, u128> = BTreeMap::new();
-    let mut observed_total: u128 = 0;
-    let mut fee_events: Vec<serde_json::Value> = Vec::new();
-    let mut trading_fee_event_count: u64 = 0;
-    for event in events {
-        if event.event_name != "TradingFeeCharged" {
-            continue;
-        }
-        trading_fee_event_count += 1;
-        let decoded = event.decoded.clone().unwrap_or(serde_json::Value::Null);
-        let applied_fee_str = decoded
-            .get("appliedFee")
-            .and_then(|value| value.as_str())
-            .map(str::to_string);
-        let recipient = decoded
-            .get("recipient")
-            .and_then(|value| value.as_str())
-            .map(|value| value.to_ascii_lowercase())
-            .unwrap_or_else(|| "unknown".to_string());
-        let trader = decoded
-            .get("trader")
-            .and_then(|value| value.as_str())
-            .map(|value| value.to_ascii_lowercase())
-            .or_else(|| {
-                event
-                    .account
-                    .as_ref()
-                    .map(|value| value.to_ascii_lowercase())
-            })
-            .unwrap_or_else(|| "unknown".to_string());
-        let is_maker_value = decoded
-            .get("isMaker")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null);
-        let side_key = match is_maker_value.as_bool() {
-            Some(true) => "maker",
-            Some(false) => "taker",
-            None => "unknown",
-        };
-        if let Some(value) = applied_fee_str.as_deref() {
-            if let Ok(parsed) = value.parse::<u128>() {
-                observed_total = observed_total.saturating_add(parsed);
-                let entry = by_recipient.entry(recipient.clone()).or_default();
-                *entry = entry.saturating_add(parsed);
-                let trader_entry = by_trader.entry(trader.clone()).or_default();
-                *trader_entry = trader_entry.saturating_add(parsed);
-                let side_entry = by_side.entry(side_key.to_string()).or_default();
-                *side_entry = side_entry.saturating_add(parsed);
-            }
-        }
-        fee_events.push(serde_json::json!({
-            "event_id": event.id,
-            "log_index": event.log_index,
-            "block_number": event.block_number,
-            "trader": trader,
-            "recipient": recipient,
-            "applied_fee": applied_fee_str,
-            "is_maker": is_maker_value,
-            "side": side_key,
-            "option_id": event.option_id,
-            "settlement_asset": decoded.get("settlementAsset").cloned().unwrap_or(serde_json::Value::Null),
-        }));
-    }
-    let recipient_strings: BTreeMap<String, String> = by_recipient
-        .into_iter()
-        .map(|(key, value)| (key, value.to_string()))
-        .collect();
-    let trader_strings: BTreeMap<String, String> = by_trader
-        .into_iter()
-        .map(|(key, value)| (key, value.to_string()))
-        .collect();
-    let side_strings: BTreeMap<String, String> = by_side
-        .into_iter()
-        .map(|(key, value)| (key, value.to_string()))
-        .collect();
-    let reconciliation_status = if trading_fee_event_count == 0 {
-        "no_onchain_events"
-    } else {
-        "onchain_observed"
-    };
-    LifecycleFees {
-        source_of_truth: "onchain".to_string(),
-        trading_fee_event_count,
-        events: fee_events,
-        observed_total: observed_total.to_string(),
-        by_trader: trader_strings,
-        by_recipient: recipient_strings.clone(),
-        by_side: side_strings,
-        total_by_recipient: recipient_strings,
-        backend_ledger_status: backend_ledger_status.to_string(),
-        reconciliation_status: reconciliation_status.to_string(),
-    }
+    crate::fees::onchain_summary::summarize_fees_for_lifecycle(events, backend_ledger_status)
 }
 
 async fn resolve_backend_ledger_status(
@@ -1758,6 +1692,269 @@ mod tests {
         assert_eq!(view.fees.observed_total, "6");
         assert_eq!(view.fees.backend_ledger_status, "missing_or_disabled");
         assert_eq!(view.fees.reconciliation_status, "onchain_observed");
+        assert_no_generic_execution_rows(&state);
+    }
+
+    fn fee_charged_v2_event(
+        intent: &OptionExecutionIntent,
+        tx_hash: &str,
+        log_index: u64,
+        trader: &str,
+        fee_amount: u128,
+        fee_ppm: i32,
+        is_maker: bool,
+    ) -> OptionExecutionEvent {
+        OptionExecutionEvent {
+            id: Uuid::from_u128(400 + log_index as u128),
+            chain_id: 84532,
+            contract_address: "0x00000000000000000000000000000000000000dd".to_string(),
+            tx_hash: tx_hash.to_string(),
+            log_index,
+            block_number: 41_856_964,
+            block_hash: None,
+            event_name: "FeeChargedV2".to_string(),
+            event_signature: "FeeChargedV2".to_string(),
+            intent_id: Some(intent.intent_id),
+            onchain_intent_id: None,
+            option_execution_transaction_id: None,
+            buyer: None,
+            seller: None,
+            account: Some(trader.to_string()),
+            option_id: None,
+            quantity_contracts: None,
+            premium_per_contract_native: Some(fee_amount.to_string()),
+            raw_topics: serde_json::Value::Array(Vec::new()),
+            raw_data: "0x".to_string(),
+            decoded: Some(serde_json::json!({
+                "consumer": "0x00000000000000000000000000000000000000aa",
+                "trader": trader,
+                "recipient": "0x009f38440f058d095b61e0e2ee7fabdf05be7500",
+                "settlementAsset": "0x0000000000000000000000000000000000000020",
+                "productKind": "option",
+                "flowKind": "orderbook",
+                "isMaker": is_maker,
+                "feePpm": fee_ppm,
+                "basisAmount": "10000",
+                "feeAmount": fee_amount.to_string(),
+            })),
+            created_at_ms: 6,
+            updated_at_ms: 6,
+        }
+    }
+
+    fn fee_rebated_v2_event(
+        intent: &OptionExecutionIntent,
+        tx_hash: &str,
+        log_index: u64,
+        trader: &str,
+        rebate_amount: u128,
+        rebate_ppm: i32,
+    ) -> OptionExecutionEvent {
+        OptionExecutionEvent {
+            id: Uuid::from_u128(500 + log_index as u128),
+            chain_id: 84532,
+            contract_address: "0x00000000000000000000000000000000000000dd".to_string(),
+            tx_hash: tx_hash.to_string(),
+            log_index,
+            block_number: 41_856_964,
+            block_hash: None,
+            event_name: "FeeRebatedV2".to_string(),
+            event_signature: "FeeRebatedV2".to_string(),
+            intent_id: Some(intent.intent_id),
+            onchain_intent_id: None,
+            option_execution_transaction_id: None,
+            buyer: None,
+            seller: None,
+            account: Some(trader.to_string()),
+            option_id: None,
+            quantity_contracts: None,
+            premium_per_contract_native: Some(rebate_amount.to_string()),
+            raw_topics: serde_json::Value::Array(Vec::new()),
+            raw_data: "0x".to_string(),
+            decoded: Some(serde_json::json!({
+                "consumer": "0x00000000000000000000000000000000000000aa",
+                "trader": trader,
+                "recipient": trader,
+                "settlementAsset": "0x0000000000000000000000000000000000000020",
+                "productKind": "option",
+                "flowKind": "orderbook",
+                "isMaker": true,
+                "rebatePpm": rebate_ppm,
+                "basisAmount": "10000",
+                "rebateAmount": rebate_amount.to_string(),
+            })),
+            created_at_ms: 6,
+            updated_at_ms: 6,
+        }
+    }
+
+    #[tokio::test]
+    async fn fees_view_v2_only_summarizes_charged_and_rebated_and_net() {
+        let state = fresh_state();
+        let (intent, tx) = insert_intent_and_tx(
+            &state,
+            OptionExecutionConfirmationStatus::MinedSuccess,
+            OptionExecutionIntentStatus::BroadcastConfirmed,
+        );
+        let tx_hash = tx.tx_hash.clone().unwrap();
+        // Taker pays 25, maker receives a 5 rebate.
+        insert_event(
+            &state,
+            fee_charged_v2_event(
+                &intent,
+                &tx_hash,
+                4,
+                intent.buyer.0.as_str(),
+                25,
+                250,
+                false,
+            ),
+        );
+        insert_event(
+            &state,
+            fee_rebated_v2_event(&intent, &tx_hash, 5, intent.seller.0.as_str(), 5, -50),
+        );
+
+        let view = get_option_execution_lifecycle(&state, intent.intent_id)
+            .await
+            .unwrap();
+
+        assert_eq!(view.fees.event_model, "v2");
+        assert_eq!(view.fees.source_priority, "");
+        assert_eq!(view.fees.fee_charged_v2_count, 1);
+        assert_eq!(view.fees.fee_rebated_v2_count, 1);
+        assert_eq!(view.fees.trading_fee_event_count, 0);
+        assert_eq!(view.fees.observed_total_charged, "25");
+        assert_eq!(view.fees.observed_total_rebated, "5");
+        assert_eq!(view.fees.net_protocol_fee, "20");
+        // Backward-compat alias: observed_total == charged total.
+        assert_eq!(view.fees.observed_total, "25");
+        assert_eq!(view.fees.by_side["taker"], "25");
+        assert_eq!(
+            view.fees.rebated_by_trader[&intent.seller.0.to_ascii_lowercase()],
+            "5"
+        );
+        assert!(!view
+            .fees
+            .by_trader
+            .contains_key(&intent.seller.0.to_ascii_lowercase()));
+        assert_no_generic_execution_rows(&state);
+    }
+
+    #[tokio::test]
+    async fn fees_view_v1_only_unchanged() {
+        let state = fresh_state();
+        let (intent, tx) = insert_intent_and_tx(
+            &state,
+            OptionExecutionConfirmationStatus::MinedSuccess,
+            OptionExecutionIntentStatus::BroadcastConfirmed,
+        );
+        let tx_hash = tx.tx_hash.clone().unwrap();
+        insert_event(
+            &state,
+            trading_fee_event_for(&intent, &tx_hash, 4, intent.buyer.0.as_str(), 6, false),
+        );
+        insert_event(
+            &state,
+            trading_fee_event_for(&intent, &tx_hash, 5, intent.seller.0.as_str(), 4, true),
+        );
+
+        let view = get_option_execution_lifecycle(&state, intent.intent_id)
+            .await
+            .unwrap();
+
+        assert_eq!(view.fees.event_model, "v1");
+        assert_eq!(view.fees.fee_charged_v2_count, 0);
+        assert_eq!(view.fees.fee_rebated_v2_count, 0);
+        assert_eq!(view.fees.trading_fee_event_count, 2);
+        // V1 baseline preserved.
+        assert_eq!(view.fees.observed_total, "10");
+        assert_eq!(view.fees.observed_total_charged, "10");
+        assert_eq!(view.fees.observed_total_rebated, "0");
+        assert_eq!(view.fees.net_protocol_fee, "10");
+        assert_eq!(view.fees.by_side["taker"], "6");
+        assert_eq!(view.fees.by_side["maker"], "4");
+        assert_no_generic_execution_rows(&state);
+    }
+
+    #[tokio::test]
+    async fn fees_view_mixed_v1_and_v2_does_not_double_count() {
+        let state = fresh_state();
+        let (intent, tx) = insert_intent_and_tx(
+            &state,
+            OptionExecutionConfirmationStatus::MinedSuccess,
+            OptionExecutionIntentStatus::BroadcastConfirmed,
+        );
+        let tx_hash = tx.tx_hash.clone().unwrap();
+        // V1 compatibility log for the same fee flow as the V2 event.
+        insert_event(
+            &state,
+            trading_fee_event_for(&intent, &tx_hash, 4, intent.buyer.0.as_str(), 6, false),
+        );
+        insert_event(
+            &state,
+            fee_charged_v2_event(
+                &intent,
+                &tx_hash,
+                5,
+                intent.buyer.0.as_str(),
+                25,
+                250,
+                false,
+            ),
+        );
+
+        let view = get_option_execution_lifecycle(&state, intent.intent_id)
+            .await
+            .unwrap();
+
+        assert_eq!(view.fees.event_model, "mixed");
+        // V2 is authoritative.
+        assert_eq!(view.fees.source_priority, "v2");
+        assert_eq!(view.fees.trading_fee_event_count, 1);
+        assert_eq!(view.fees.fee_charged_v2_count, 1);
+        assert_eq!(view.fees.observed_total_charged, "25");
+        // Not 31 (would be V1 + V2 double-counted).
+        assert_eq!(view.fees.observed_total, "25");
+        assert_eq!(view.fees.net_protocol_fee, "25");
+        assert_no_generic_execution_rows(&state);
+    }
+
+    #[tokio::test]
+    async fn fees_view_v1_compatibility_field_set_total_by_recipient_for_v2() {
+        let state = fresh_state();
+        let (intent, tx) = insert_intent_and_tx(
+            &state,
+            OptionExecutionConfirmationStatus::MinedSuccess,
+            OptionExecutionIntentStatus::BroadcastConfirmed,
+        );
+        let tx_hash = tx.tx_hash.clone().unwrap();
+        insert_event(
+            &state,
+            fee_charged_v2_event(
+                &intent,
+                &tx_hash,
+                4,
+                intent.buyer.0.as_str(),
+                25,
+                250,
+                false,
+            ),
+        );
+
+        let view = get_option_execution_lifecycle(&state, intent.intent_id)
+            .await
+            .unwrap();
+
+        // Backwards-compatible alias retained.
+        assert_eq!(
+            view.fees.total_by_recipient["0x009f38440f058d095b61e0e2ee7fabdf05be7500"],
+            "25"
+        );
+        assert_eq!(
+            view.fees.by_recipient["0x009f38440f058d095b61e0e2ee7fabdf05be7500"],
+            "25"
+        );
         assert_no_generic_execution_rows(&state);
     }
 }

@@ -13,7 +13,6 @@ use crate::options::{
 use crate::types::{AccountId, MarketId, Price1e8, Size1e8, TimestampMs};
 use chrono::{DateTime, Duration, Utc};
 use serde_json::Value;
-use std::collections::BTreeMap;
 
 const ONE_1E8: u128 = 100_000_000;
 const ROLLING_VOLUME_DAYS: i64 = 28;
@@ -340,145 +339,10 @@ pub async fn admin_onchain_fees(
     let limit = limit.clamp(1, 200);
     let events = match tx_hash {
         Some(hash) => load_events_for_tx_hash(state, hash).await?,
-        None => load_recent_trading_fee_events(state, limit).await?,
+        None => load_recent_fee_events(state, limit).await?,
     };
-    let trading_fee_events: Vec<&OptionExecutionEvent> = events
-        .iter()
-        .filter(|event| event.event_name == "TradingFeeCharged")
-        .collect();
-
-    let backend_ledger_enabled = state.fees_config.enabled;
-    let mut by_tx: BTreeMap<String, OnchainFeeTxSummary> = BTreeMap::new();
-    let mut overall_total: u128 = 0;
-    let mut by_recipient: BTreeMap<String, u128> = BTreeMap::new();
-    let mut by_trader: BTreeMap<String, u128> = BTreeMap::new();
-    let mut by_side: BTreeMap<String, u128> = BTreeMap::new();
-    let mut event_payloads: Vec<Value> = Vec::with_capacity(trading_fee_events.len());
-
-    for event in &trading_fee_events {
-        let decoded = event.decoded.clone().unwrap_or(Value::Null);
-        let applied_fee_str = decoded
-            .get("appliedFee")
-            .and_then(|value| value.as_str())
-            .map(str::to_string);
-        let applied_fee = applied_fee_str
-            .as_deref()
-            .and_then(|value| value.parse::<u128>().ok())
-            .unwrap_or(0);
-        let recipient = decoded
-            .get("recipient")
-            .and_then(|value| value.as_str())
-            .map(|value| value.to_ascii_lowercase())
-            .unwrap_or_else(|| "unknown".to_string());
-        let trader = decoded
-            .get("trader")
-            .and_then(|value| value.as_str())
-            .map(|value| value.to_ascii_lowercase())
-            .or_else(|| {
-                event
-                    .account
-                    .as_ref()
-                    .map(|value| value.to_ascii_lowercase())
-            })
-            .unwrap_or_else(|| "unknown".to_string());
-        let is_maker_value = decoded.get("isMaker").cloned().unwrap_or(Value::Null);
-        let side_key = match is_maker_value.as_bool() {
-            Some(true) => "maker",
-            Some(false) => "taker",
-            None => "unknown",
-        }
-        .to_string();
-        let settlement_asset = decoded
-            .get("settlementAsset")
-            .and_then(|value| value.as_str())
-            .map(str::to_string);
-
-        overall_total = overall_total.saturating_add(applied_fee);
-        *by_recipient.entry(recipient.clone()).or_default() += applied_fee;
-        *by_trader.entry(trader.clone()).or_default() += applied_fee;
-        *by_side.entry(side_key.clone()).or_default() += applied_fee;
-
-        let tx_summary = by_tx.entry(event.tx_hash.to_ascii_lowercase()).or_default();
-        tx_summary.trading_fee_event_count += 1;
-        tx_summary.observed_total = tx_summary.observed_total.saturating_add(applied_fee);
-        *tx_summary
-            .by_recipient
-            .entry(recipient.clone())
-            .or_default() += applied_fee;
-        *tx_summary.by_trader.entry(trader.clone()).or_default() += applied_fee;
-        *tx_summary.by_side.entry(side_key.clone()).or_default() += applied_fee;
-
-        event_payloads.push(serde_json::json!({
-            "event_id": event.id,
-            "chain_id": event.chain_id,
-            "tx_hash": event.tx_hash,
-            "log_index": event.log_index,
-            "block_number": event.block_number,
-            "source_contract": event.contract_address,
-            "trader": trader,
-            "recipient": recipient,
-            "applied_fee": applied_fee_str,
-            "is_maker": is_maker_value,
-            "side": side_key,
-            "option_id": event.option_id,
-            "settlement_asset": settlement_asset,
-        }));
-    }
-
-    let txs_view: Vec<Value> = by_tx
-        .into_iter()
-        .map(|(tx, summary)| summary.into_value(tx))
-        .collect();
-
-    Ok(serde_json::json!({
-        "source_of_truth": "onchain",
-        "backend_ledger_enabled": backend_ledger_enabled,
-        "backend_ledger_status": if backend_ledger_enabled { "enabled" } else { "disabled" },
-        "filter": {
-            "tx_hash": tx_hash,
-            "limit": limit,
-        },
-        "trading_fee_event_count": trading_fee_events.len() as u64,
-        "observed_total": overall_total.to_string(),
-        "by_trader": amounts_to_strings(&by_trader),
-        "by_recipient": amounts_to_strings(&by_recipient),
-        "by_side": amounts_to_strings(&by_side),
-        "reconciliation_status": if trading_fee_events.is_empty() {
-            "no_onchain_events"
-        } else {
-            "onchain_observed"
-        },
-        "transactions": txs_view,
-        "events": event_payloads,
-    }))
-}
-
-#[derive(Default)]
-struct OnchainFeeTxSummary {
-    trading_fee_event_count: u64,
-    observed_total: u128,
-    by_recipient: BTreeMap<String, u128>,
-    by_trader: BTreeMap<String, u128>,
-    by_side: BTreeMap<String, u128>,
-}
-
-impl OnchainFeeTxSummary {
-    fn into_value(self, tx_hash: String) -> Value {
-        serde_json::json!({
-            "tx_hash": tx_hash,
-            "trading_fee_event_count": self.trading_fee_event_count,
-            "observed_total": self.observed_total.to_string(),
-            "by_recipient": amounts_to_strings(&self.by_recipient),
-            "by_trader": amounts_to_strings(&self.by_trader),
-            "by_side": amounts_to_strings(&self.by_side),
-        })
-    }
-}
-
-fn amounts_to_strings(map: &BTreeMap<String, u128>) -> BTreeMap<String, String> {
-    map.iter()
-        .map(|(key, value)| (key.clone(), value.to_string()))
-        .collect()
+    let summary = super::onchain_summary::summarize_admin_onchain(&events);
+    Ok(summary.into_admin_json(tx_hash, limit, state.fees_config.enabled))
 }
 
 async fn load_events_for_tx_hash(
@@ -497,10 +361,11 @@ async fn load_events_for_tx_hash(
         .list_option_execution_events_by_tx_hash(tx_hash))
 }
 
-async fn load_recent_trading_fee_events(
-    state: &AppState,
-    limit: u32,
-) -> Result<Vec<OptionExecutionEvent>> {
+/// Load the most recent indexed fee events (V1 `TradingFeeCharged` and the
+/// V2 `FeeChargedV2` / `FeeRebatedV2` families) when no `tx_hash` filter
+/// is supplied. The request limit is amplified to allow for non-fee
+/// events being interleaved in the raw event stream.
+async fn load_recent_fee_events(state: &AppState, limit: u32) -> Result<Vec<OptionExecutionEvent>> {
     let request_limit = limit.saturating_mul(8).min(2_000).max(limit);
     let events = if let Some(repository) = state.repository.clone() {
         repository
@@ -515,7 +380,12 @@ async fn load_recent_trading_fee_events(
     };
     let mut filtered: Vec<OptionExecutionEvent> = events
         .into_iter()
-        .filter(|event| event.event_name == "TradingFeeCharged")
+        .filter(|event| {
+            matches!(
+                event.event_name.as_str(),
+                "TradingFeeCharged" | "FeeChargedV2" | "FeeRebatedV2"
+            )
+        })
         .collect();
     filtered.truncate(limit as usize);
     Ok(filtered)
