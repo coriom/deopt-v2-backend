@@ -800,6 +800,28 @@ impl PgRepository {
         Ok(counts)
     }
 
+    pub async fn admin_count_fee_events_by_source(
+        &self,
+        source_type: &str,
+        source_id: &str,
+    ) -> Result<u64> {
+        if !self.admin_table_exists("fee_events").await? {
+            return Ok(0);
+        }
+        let row = sqlx::query(
+            "SELECT COUNT(*) AS row_count
+             FROM fee_events
+             WHERE source_type = $1 AND source_id = $2",
+        )
+        .bind(source_type)
+        .bind(source_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        let count: i64 = row_get(&row, "row_count")?;
+        i64_to_u64_persistence("row_count", count)
+    }
+
     pub async fn admin_recent_fee_events(&self, limit: u32) -> Result<Vec<serde_json::Value>> {
         if !self.admin_table_exists("fee_events").await? {
             return Ok(Vec::new());

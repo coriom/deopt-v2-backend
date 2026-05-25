@@ -1,41 +1,43 @@
-# NEXT_TASK.md — Live V1S On-chain State Cross-Check Validation V2B-LIVE
+# NEXT_TASK.md — Live V1S On-chain Fee Verification V2C-LIVE
 
 ## Context
 
-V2B implemented backend-only on-chain state cross-checks.
+V2C implemented backend on-chain fee event reconciliation.
 
 Implemented:
-- `src/options/state_checks.rs`
-- read-only `eth_call` helpers
-- buyer/seller nonce checks
-- buyer/seller position checks via `MarginEngine.getPositionQuantity(address,uint256)`
-- observed-only open interest via `seriesShortOpenInterest(uint256)`
-- observed-only vault balances via `CollateralVault.balances(address,address)`
-- lifecycle endpoint now includes `state_checks`
-- admin reconciliation endpoint exposes state-check config and counts
+- lifecycle fee section now exposes:
+  - source_of_truth = onchain
+  - observed_total
+  - by_trader
+  - by_recipient
+  - by_side
+  - backend_ledger_status
+  - reconciliation_status
+- new admin endpoint:
+  GET /admin/fees/onchain
+- docs:
+  docs/FEE_MODEL_TARGET_GAP_ANALYSIS_V2C.md
 
-Config added:
-- `OPTION_RECONCILIATION_STATE_CHECKS_ENABLED=false`
-- `OPTION_RECONCILIATION_STATE_CHECKS_REQUIRE_RPC=true`
-- `OPTION_RECONCILIATION_STATE_CHECKS_STRICT=false`
-
-V2B was test-covered only. It did not run live V1S DB/RPC verification.
+V2C was test-covered only. Live V1S fee verification was not run.
 
 Known V1S:
 - intent: `e6d2941b-65f7-413a-958f-74ab22c53b08`
 - tx: `0x5964a7b3d2c18d051baaa780413d31c44d419ce530f45263cb4c46f720881125`
-- transaction row: `cae8c7e7-ed61-4265-aa7d-75edd94ef03c`
-- current reconciliation status: `reconciled`
 - indexed events: 19
-- buyer position expected: `+1`
-- seller position expected: `-1`
-- buyer/seller nonces expected: at least signed nonce + 1
+- TradingFeeCharged count: 2
+- expected buyer fee: 6
+- expected seller fee: 4
+- expected total observed fee: 10
+- current lifecycle should expose on-chain fee source of truth.
 
 ## Goal
 
-Run live V1S state-check validation with real DB and RPC.
+Run live verification of V2C fee reconciliation against the operator DB/backend.
 
-This task should verify that V1S remains reconciled while adding state-check evidence to reconciliation details and lifecycle output.
+This task must verify that V1S on-chain `TradingFeeCharged` events are visible through:
+1. lifecycle endpoint;
+2. `/admin/fees/onchain`;
+3. fee aggregation by trader, recipient, and side.
 
 ## Hard Rules
 
@@ -51,14 +53,11 @@ Do not cleanup evidence rows.
 Do not modify Solidity.
 Do not modify frontend.
 Do not deploy contracts.
+Do not change live fee rates.
 Do not print private keys.
 Do not touch real `.env` secrets.
 
-Allowed mutations:
-- update existing V1S `option_execution_reconciliations` row details with state-check evidence.
-- update latest reconciliation tick state.
-
-No other DB mutation is allowed.
+No DB mutation is allowed except normal read-only endpoint access.
 
 ## Step 1 — Load Env
 
@@ -75,291 +74,150 @@ set +a
 Confirm required vars exist without printing values:
 
 test -n "$DATABASE_URL" && echo "DATABASE_URL set"
-test -n "$RPC_URL" && echo "RPC_URL set"
 test -n "$ADMIN_TOKEN" && echo "ADMIN_TOKEN set"
-Step 2 — Apply Migrations / Verify DB
+Step 2 — Start Backend
+
+Start or restart backend.
+
+Verify health:
+
+curl -s http://127.0.0.1:8080/health | jq
+
+Expected:
+
+{"ok":true}
+Step 3 — Verify V1S Indexed Fee Events In DB
 
 Run:
 
-sqlx migrate run
-
-Verify V1S records exist:
-
 psql "$DATABASE_URL" <<'SQL'
-select intent_id, status
-from option_execution_intents
-where intent_id = 'e6d2941b-65f7-413a-958f-74ab22c53b08';
-
-select id, tx_hash, confirmation_status, receipt_status, confirmed_block_number
-from option_execution_transactions
-where id = 'cae8c7e7-ed61-4265-aa7d-75edd94ef03c';
-
-select status, event_check_status, nonce_check_status, position_check_status, details
-from option_execution_reconciliations
-where option_execution_transaction_id = 'cae8c7e7-ed61-4265-aa7d-75edd94ef03c';
-
-select event_name, count(*)
+select
+  event_name,
+  count(*)
 from option_execution_events
 where tx_hash = '0x5964a7b3d2c18d051baaa780413d31c44d419ce530f45263cb4c46f720881125'
 group by event_name
 order by event_name;
-SQL
 
-Expected:
-
-intent status = broadcast_confirmed
-tx confirmation_status = mined_success
-reconciliation status = reconciled
-V1S events exist
-
-Abort if V1S is not already event-reconciled.
-
-Step 3 — Start Backend With State Checks Enabled
-
-Use:
-
-export OPTION_RECONCILIATION_WORKER_ENABLED=true
-export OPTION_RECONCILIATION_REQUIRE_EVENTS=true
-export OPTION_RECONCILIATION_REQUIRE_RPC=true
-export OPTION_RECONCILIATION_STRICT=true
-export OPTION_RECONCILIATION_BATCH_SIZE=25
-
-export OPTION_RECONCILIATION_STATE_CHECKS_ENABLED=true
-export OPTION_RECONCILIATION_STATE_CHECKS_REQUIRE_RPC=true
-export OPTION_RECONCILIATION_STATE_CHECKS_STRICT=false
-
-Start or restart backend.
-
-Important:
-
-State checks should be non-strict for this first live run.
-V1S must not regress from reconciled unless there is a real code defect; in non-strict mode mismatches should be recorded as warnings/details.
-Step 4 — Verify Admin Config
-
-Run:
-
-curl -s http://127.0.0.1:8080/admin/config \
-  -H "X-Admin-Token: $ADMIN_TOKEN" | jq '.options.reconciliation_worker'
-
-Expected:
-
-reconciliation worker enabled = true
-require_events = true
-require_rpc = true
-strict = true
-state_checks.enabled = true
-state_checks.require_rpc = true
-state_checks.strict = false
-
-Abort on mismatch.
-
-Step 5 — Read On-chain State Directly
-
-Before tick, perform direct read-only cast call checks.
-
-Check buyer/seller nonces:
-
-cast call 0xf2D1D85cD363Be3bc160d14883C80e7C2c4F420b \
-  "nonces(address)(uint256)" \
-  0xc0A76c2A6c6b70C0B065A05E64417886416cc976 \
-  --rpc-url "$RPC_URL"
-
-cast call 0xf2D1D85cD363Be3bc160d14883C80e7C2c4F420b \
-  "nonces(address)(uint256)" \
-  0xbAf0976a00a0DCc84Df5B15d927695c8b014B1c3 \
-  --rpc-url "$RPC_URL"
-
-Check positions:
-
-cast call 0x6C5665De05e7314cB63cD77F82DFa86508A5b5F8 \
-  "getPositionQuantity(address,uint256)(int128)" \
-  0xc0A76c2A6c6b70C0B065A05E64417886416cc976 \
-  24145907678156652148089862289363692212069910767044828147380657249455352740183 \
-  --rpc-url "$RPC_URL"
-
-cast call 0x6C5665De05e7314cB63cD77F82DFa86508A5b5F8 \
-  "getPositionQuantity(address,uint256)(int128)" \
-  0xbAf0976a00a0DCc84Df5B15d927695c8b014B1c3 \
-  24145907678156652148089862289363692212069910767044828147380657249455352740183 \
-  --rpc-url "$RPC_URL"
-
-Expected:
-
-buyer nonce >= 1
-seller nonce >= 1
-buyer position includes +1
-seller position includes -1
-
-Also optionally read open interest:
-
-cast call 0x6C5665De05e7314cB63cD77F82DFa86508A5b5F8 \
-  "seriesShortOpenInterest(uint256)(uint128)" \
-  24145907678156652148089862289363692212069910767044828147380657249455352740183 \
-  --rpc-url "$RPC_URL"
-
-Record results.
-
-Step 6 — Set Baseline
-
-Set:
-
-V2B_LIVE_START_MS=$(date +%s%3N)
-
-Record counts:
-
-psql "$DATABASE_URL" <<SQL
-select count(*) as option_txs_since_start
-from option_execution_transactions
-where created_at_ms >= ${V2B_LIVE_START_MS};
-
-select count(*) as generic_txs_since_start
-from execution_transactions
-where created_at_ms >= ${V2B_LIVE_START_MS};
-
-select count(*) as intents_since_start
-from option_execution_intents
-where created_at_ms >= ${V2B_LIVE_START_MS};
-SQL
-
-Expected all 0.
-
-Step 7 — Run One Reconciliation Tick
-
-Call exactly once:
-
-curl -s -X POST http://127.0.0.1:8080/admin/options/reconciliations/tick \
-  -H "X-Admin-Token: $ADMIN_TOKEN" | jq
-
-Expected:
-
-V1S is considered if the worker rechecks already reconciled rows when state checks are newly enabled, or otherwise a documented skip.
-If skipped because reconciled is terminal and not eligible for state-check enrichment, patch eligibility minimally to allow rechecking reconciled rows only when state-check evidence is missing.
-Do not manually delete reconciliation row.
-Do not create duplicate reconciliation row.
-Step 8 — Verify Reconciliation Details
-
-Query:
-
-psql "$DATABASE_URL" <<'SQL'
 select
-  id,
-  status,
-  event_check_status,
-  nonce_check_status,
-  position_check_status,
-  error,
-  checked_at_ms,
-  details
-from option_execution_reconciliations
-where option_execution_transaction_id = 'cae8c7e7-ed61-4265-aa7d-75edd94ef03c';
+  event_name,
+  log_index,
+  contract_address,
+  account,
+  decoded
+from option_execution_events
+where tx_hash = '0x5964a7b3d2c18d051baaa780413d31c44d419ce530f45263cb4c46f720881125'
+  and event_name = 'TradingFeeCharged'
+order by log_index;
 SQL
 
 Expected:
 
-status remains reconciled
-details include state_checks
-buyer nonce status ok
-seller nonce status ok
-buyer position status ok
-seller position status ok
-open interest observed if available
-vault balances observed or skipped with reason
-
-If state checks are missing because eligibility skipped the row, patch as described.
-
-Step 9 — Verify Lifecycle Endpoint
+TradingFeeCharged = 2
+decoded fee data includes buyer/seller fee shape.
+total applied fee should sum to 10.
+Step 4 — Verify Lifecycle Fee Section
 
 Call:
 
 curl -s \
   -H "X-Admin-Token: $ADMIN_TOKEN" \
-  http://127.0.0.1:8080/admin/options/executions/e6d2941b-65f7-413a-958f-74ab22c53b08/lifecycle | jq '.state_checks, .health'
+  http://127.0.0.1:8080/admin/options/executions/e6d2941b-65f7-413a-958f-74ab22c53b08/lifecycle \
+  | jq '.fees'
 
 Expected:
 
-lifecycle includes state_checks
-health.stage remains reconciled
-health.is_terminal_success = true
-warnings empty or only documented non-strict skips
-no errors
-Step 10 — Verify Admin Reconciliation Endpoint
+source_of_truth = "onchain"
+trading_fee_event_count = 2
+observed_total = "10"
+by_side.taker = "6" or equivalent
+by_side.maker = "4" or equivalent
+backend_ledger_status explicit:
+disabled
+missing_or_disabled
+or present
+reconciliation_status explicit.
 
-Call:
+If fields are missing, document exact mismatch.
 
-curl -s http://127.0.0.1:8080/admin/options/reconciliations \
-  -H "X-Admin-Token: $ADMIN_TOKEN" | jq
+Step 5 — Verify Admin On-chain Fees Endpoint
 
-Expected:
+Call by tx hash:
 
-state-check config visible
-check_counts includes nonce/position statuses
-recent V1S row includes state-check evidence
-Step 11 — Idempotency Check
-
-Call tick again only if implementation safely skips/enriches idempotently:
-
-curl -s -X POST http://127.0.0.1:8080/admin/options/reconciliations/tick \
-  -H "X-Admin-Token: $ADMIN_TOKEN" | jq
+curl -s \
+  -H "X-Admin-Token: $ADMIN_TOKEN" \
+  "http://127.0.0.1:8080/admin/fees/onchain?tx_hash=0x5964a7b3d2c18d051baaa780413d31c44d419ce530f45263cb4c46f720881125" \
+  | jq
 
 Expected:
 
-no duplicate reconciliation row
-V1S remains reconciled
-state check details stable or updated idempotently
+tx appears.
+observed_total = "10".
+TradingFeeCharged count = 2.
+grouped by trader, recipient, side.
 
-Verify:
+Call recent endpoint:
 
-psql "$DATABASE_URL" -c "
-select count(*)
-from option_execution_reconciliations
-where option_execution_transaction_id = 'cae8c7e7-ed61-4265-aa7d-75edd94ef03c';
-"
+curl -s \
+  -H "X-Admin-Token: $ADMIN_TOKEN" \
+  "http://127.0.0.1:8080/admin/fees/onchain?limit=10" \
+  | jq
 
 Expected:
 
-count = 1
-Step 12 — No Forbidden Mutation Check
+recent on-chain fee events include V1S or return a sane list.
+no secrets.
+Step 6 — Verify No Mutation
+
+Set baseline before endpoint calls if not already done, or compare stable counts after.
 
 Run:
 
-psql "$DATABASE_URL" <<SQL
-select count(*) as option_txs_since_start
-from option_execution_transactions
-where created_at_ms >= ${V2B_LIVE_START_MS};
-
-select count(*) as generic_txs_since_start
-from execution_transactions
-where created_at_ms >= ${V2B_LIVE_START_MS};
-
-select count(*) as intents_since_start
-from option_execution_intents
-where created_at_ms >= ${V2B_LIVE_START_MS};
+psql "$DATABASE_URL" <<'SQL'
+select count(*) as option_execution_intents from option_execution_intents;
+select count(*) as option_execution_transactions from option_execution_transactions;
+select count(*) as execution_transactions from execution_transactions;
+select count(*) as option_execution_events from option_execution_events;
+select count(*) as option_execution_reconciliations from option_execution_reconciliations;
+select count(*) as fee_events from fee_events;
 SQL
+
+Call lifecycle and /admin/fees/onchain again.
+
+Run the same counts.
 
 Expected:
 
-all 0
-Required Doc Update
+all counts unchanged.
+no write mutation.
+Step 7 — Safety Search
+
+Run:
+
+rg "sendRawTransaction|eth_sendRawTransaction|/executor/broadcast|execution-intents/.*/broadcast|POST" src/fees src/options src/api/routes.rs
+
+Expected:
+
+no new broadcast/send path in fee endpoint.
+POST matches only unrelated existing routes or admin tick routes.
+Step 8 — Docs Update
 
 Update:
 
-docs/OPTION_ONCHAIN_STATE_CROSS_CHECKS_V2B.md
+docs/FEE_MODEL_TARGET_GAP_ANALYSIS_V2C.md
 
 Add:
 
-## Live V1S State-Check Result
+## Live V1S Fee Verification Result
 
 Include:
 
-direct cast nonce reads
-direct cast position reads
-open interest read if done
-tick response
-reconciliation details state_checks
-lifecycle state_checks result
-admin reconciliation summary
-idempotency result
-no forbidden mutation verification
+lifecycle fee section result
+/admin/fees/onchain?tx_hash=... result
+observed total
+by trader/recipient/side
+backend ledger status
+no-mutation verification
 remaining blocker
 Validation
 
@@ -373,30 +231,23 @@ Acceptance Criteria
 
 Complete only if:
 
-live nonce reads performed.
-live position reads performed.
-reconciliation details include state_checks or exact blocker documented.
-lifecycle endpoint exposes state_checks.
-V1S remains reconciled.
-no broadcast.
-no new option tx.
-no generic tx.
-no new intent.
+live V1S lifecycle fee section verified.
+/admin/fees/onchain verified.
+observed total = 10.
+backend ledger status explicit.
+no DB mutation from read-only endpoints.
 docs updated.
 validations pass.
 Final Report
 
 Return:
 
-direct on-chain nonce results
-direct on-chain position results
-open interest/vault observations if available
-reconciliation tick response
-final reconciliation state-check details
-lifecycle state-check result
-admin reconciliation summary
-idempotency result
-no forbidden mutation verification
+DB fee event baseline
+lifecycle fee result
+admin onchain fee endpoint result
+backend ledger status
+no-mutation verification
+safety search result
 validation commands run
 docs updated
 remaining blocker

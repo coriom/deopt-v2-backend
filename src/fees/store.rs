@@ -80,6 +80,25 @@ impl FeeLedgerStore {
         Ok(true)
     }
 
+    pub fn count_fee_events_by_source(&self, source_type: &str, source_id: &str) -> u64 {
+        self.fee_events
+            .values()
+            .filter(|event| {
+                event.source_type.as_str() == source_type && event.source_id.as_str() == source_id
+            })
+            .count() as u64
+    }
+
+    pub fn sum_fee_events_by_source_amount_1e8(&self, source_type: &str, source_id: &str) -> u128 {
+        self.fee_events
+            .values()
+            .filter(|event| {
+                event.source_type.as_str() == source_type && event.source_id.as_str() == source_id
+            })
+            .map(|event| event.fee_amount_1e8)
+            .fold(0u128, |acc, value| acc.saturating_add(value))
+    }
+
     pub fn list_fee_events(&self, limit: usize) -> Vec<FeeEvent> {
         let mut events = self.fee_events.values().cloned().collect::<Vec<_>>();
         events.sort_by(|left, right| {

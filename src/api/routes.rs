@@ -18,7 +18,7 @@ use crate::execution::{
 use crate::fees::service::{
     admin_fee_events as admin_fee_events_service, admin_fee_rebates as admin_fee_rebates_service,
     admin_fee_summary as admin_fee_summary_service, admin_fee_volumes as admin_fee_volumes_service,
-    record_indexed_perp_trade_fees,
+    admin_onchain_fees as admin_onchain_fees_service, record_indexed_perp_trade_fees,
 };
 use crate::indexer::{Indexer, IndexerStatus, IndexerTickResult};
 use crate::mm::permissions::{
@@ -281,6 +281,7 @@ pub fn router(state: AppState) -> Router {
         .route("/admin/options/summary", get(admin_options_summary))
         .route("/admin/fees/summary", get(admin_fee_summary))
         .route("/admin/fees/events", get(admin_fee_events))
+        .route("/admin/fees/onchain", get(admin_fee_onchain))
         .route("/admin/fees/volumes", get(admin_fee_volumes))
         .route("/admin/fees/rebates", get(admin_fee_rebates))
         .route("/admin/recent", get(admin_recent))
@@ -1262,6 +1263,29 @@ async fn admin_fee_events(
         "limit": limit,
         "events": admin_fee_events_service(&state, limit).await?
     })))
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct AdminFeeOnchainQuery {
+    tx_hash: Option<String>,
+    limit: Option<u32>,
+}
+
+async fn admin_fee_onchain(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Query(query): Query<AdminFeeOnchainQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    ensure_admin_access(&state, &headers)?;
+    let limit = query.limit.unwrap_or(50);
+    let tx_hash = query
+        .tx_hash
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    Ok(Json(
+        admin_onchain_fees_service(&state, tx_hash, limit).await?,
+    ))
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -5431,6 +5455,136 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admin_fees_onchain_exposes_observed_trading_fee_events() {
+        let state = admin_state(false);
+        let tx_hash =
+            "0x5964a7b3d2c18d051baaa780413d31c44d419ce530f45263cb4c46f720881125".to_string();
+        let buyer_event = build_trading_fee_log_row(
+            1,
+            tx_hash.as_str(),
+            4,
+            "0xc0a76c2a00000000000000000000000000000000",
+            6,
+            false,
+        );
+        let seller_event = build_trading_fee_log_row(
+            2,
+            tx_hash.as_str(),
+            5,
+            "0xbaf0976a00000000000000000000000000000000",
+            4,
+            true,
+        );
+        state
+            .options_store
+            .lock()
+            .unwrap()
+            .persist_option_execution_events_and_cursor(
+                OPTION_EVENT_INDEXER_STATE_ID,
+                &[buyer_event.clone(), seller_event.clone()],
+                buyer_event.block_number,
+                1,
+            );
+        let before_fee_events = state.fees_store.lock().unwrap().list_fee_events(10).len();
+        let before_option_events = state
+            .options_store
+            .lock()
+            .unwrap()
+            .list_option_execution_events(100)
+            .len();
+
+        let response = router(state.clone())
+            .oneshot(get_request(
+                &format!("/admin/fees/onchain?tx_hash={tx_hash}"),
+                None,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["source_of_truth"], "onchain");
+        assert_eq!(json["trading_fee_event_count"], 2);
+        assert_eq!(json["observed_total"], "10");
+        assert_eq!(json["reconciliation_status"], "onchain_observed");
+        assert_eq!(json["backend_ledger_enabled"], false);
+        assert_eq!(json["backend_ledger_status"], "disabled");
+        assert_eq!(
+            json["by_trader"]["0xc0a76c2a00000000000000000000000000000000"],
+            "6"
+        );
+        assert_eq!(
+            json["by_trader"]["0xbaf0976a00000000000000000000000000000000"],
+            "4"
+        );
+        assert_eq!(json["by_side"]["taker"], "6");
+        assert_eq!(json["by_side"]["maker"], "4");
+        let transactions = json["transactions"].as_array().unwrap();
+        assert_eq!(transactions.len(), 1);
+        assert_eq!(transactions[0]["tx_hash"], tx_hash);
+        assert_eq!(transactions[0]["observed_total"], "10");
+
+        // Read-only — the backend fee ledger and the indexed event ledger
+        // must be unchanged by the admin call.
+        assert_eq!(
+            state.fees_store.lock().unwrap().list_fee_events(10).len(),
+            before_fee_events
+        );
+        assert_eq!(
+            state
+                .options_store
+                .lock()
+                .unwrap()
+                .list_option_execution_events(100)
+                .len(),
+            before_option_events
+        );
+        assert!(state.repository.is_none());
+        assert!(state.trade_signatures.lock().unwrap().is_empty());
+    }
+
+    fn build_trading_fee_log_row(
+        id_seed: u128,
+        tx_hash: &str,
+        log_index: u64,
+        trader: &str,
+        applied_fee: u128,
+        is_maker: bool,
+    ) -> crate::options::OptionExecutionEvent {
+        crate::options::OptionExecutionEvent {
+            id: Uuid::from_u128(900 + id_seed),
+            chain_id: 84532,
+            contract_address: "0x00000000000000000000000000000000000000aa".to_string(),
+            tx_hash: tx_hash.to_string(),
+            log_index,
+            block_number: 41_856_964,
+            block_hash: None,
+            event_name: "TradingFeeCharged".to_string(),
+            event_signature: "TradingFeeCharged".to_string(),
+            intent_id: None,
+            onchain_intent_id: None,
+            option_execution_transaction_id: None,
+            buyer: None,
+            seller: None,
+            account: Some(trader.to_string()),
+            option_id: Some("7".to_string()),
+            quantity_contracts: None,
+            premium_per_contract_native: Some(applied_fee.to_string()),
+            raw_topics: serde_json::Value::Array(Vec::new()),
+            raw_data: "0x".to_string(),
+            decoded: Some(serde_json::json!({
+                "trader": trader,
+                "appliedFee": applied_fee.to_string(),
+                "isMaker": is_maker,
+                "recipient": "0x009f3849df0d4f2547cfb72cc3e7500",
+                "settlementAsset": "0x0000000000000000000000000000000000000020"
+            })),
+            created_at_ms: 5,
+            updated_at_ms: 5,
+        }
+    }
+
+    #[tokio::test]
     async fn admin_endpoints_do_not_mutate_state() {
         let state = admin_state(false);
         let app = router(state.clone());
@@ -5458,6 +5612,7 @@ mod tests {
             "/admin/options/reconciliations",
             "/admin/fees/summary",
             "/admin/fees/events?limit=5",
+            "/admin/fees/onchain?limit=5",
             "/admin/fees/volumes",
             "/admin/fees/rebates",
             "/admin/recent?limit=5",
