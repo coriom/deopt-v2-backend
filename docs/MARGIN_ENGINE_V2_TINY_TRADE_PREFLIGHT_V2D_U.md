@@ -320,6 +320,30 @@ See "Validation results" below.
 V2D-U introduces no code changes; only docs and an appended block in
 the gitignored `.env.cutover.v2d_s.local`.
 
+## V2D-V Broadcast Outcome (2026-05-28, same day)
+
+The operator-triggered broadcast for intent
+`a6369dd5-54cd-4407-a4c5-7902bba286f7` succeeded on Base Sepolia.
+Full record in
+[`MARGIN_ENGINE_V2_TINY_TRADE_BROADCAST_RESULT_V2D_V.md`](MARGIN_ENGINE_V2_TINY_TRADE_BROADCAST_RESULT_V2D_V.md).
+
+- Tx hash: `0x07a8e6795e2082ceabaa242543ee424cffd5037c0d918cf1a81bcee1b2d7de10`
+- Block: `42110498`, `status = 1`, `gasUsed = 913_477`
+- Backend `option_execution_transactions.transaction_id =
+  6a3209ad-b14b-46c9-89d6-8c4d15576e0f`, status `submitted`,
+  `confirmation_status = mined_success`
+- Intent state: `broadcast_confirmed`; lifecycle `health.stage =
+  reconciled`; reconciliation row `aa1d0762-…` status `reconciled`;
+  indexed 7 events including one `TradeExecuted` from NEW MarginEngine
+  (`0x287cef…f48cc`) and one `OptionTradeExecuted` from
+  OptionMatchingEngine.
+- Post-broadcast: `useFeesManagerV2 = false`, `feesManagerV2 = 0x0`,
+  `feesManager = V1` — V2 fee path still disabled. Lifecycle
+  `fees.event_model = none`, `fee_charged_v2_count = 0`,
+  `fee_rebated_v2_count = 0`.
+- No `execution_transactions` row created (`Δ = 0` since
+  `V2D_V_START_MS`). V1L / V1S rows preserved.
+
 ## Remaining Blocker Before Human Tiny Broadcast
 
 The preflight is complete and every gate is green for the next human

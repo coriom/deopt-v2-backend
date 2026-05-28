@@ -1,47 +1,45 @@
-# NEXT_TASK.md — Tiny Option Trade Preflight Against NEW MarginEngine V2D-U
+# NEXT_TASK.md — Human Tiny Option Broadcast Against NEW MarginEngine V2D-V
 
 ## Context
 
-MarginEngineV2 deploy, rewire, backend cutover, and indexer catch-up are complete.
+V2D-U completed tiny option trade preflight against NEW MarginEngine.
 
-Current live state:
-- OLD_MARGIN_ENGINE = 0x6C5665De05e7314cB63cD77F82DFa86508A5b5F8
-- NEW_MARGIN_ENGINE = 0x287Cef479be5889eEfCa847F9e73C860898f48Cc
-- backend MARGIN_ENGINE = NEW
-- OPTION_EVENT_INDEXER_MARGIN_ENGINE_ADDRESS = NEW
-- event indexer cursor = 42077113
-- cutover block = 42073772
-- FeesManagerV2 disabled:
-  - NEW.useFeesManagerV2 = false
-  - NEW.feesManagerV2 = address(0)
-- V1 FeesManager remains active:
-  - NEW.feesManager = 0xaef73F10224712E1312963BE11662061481aA0F0
+NEW_MARGIN_ENGINE:
+0x287Cef479be5889eEfCa847F9e73C860898f48Cc
 
-V2D-T2 confirmed:
-- catch-up complete
-- no option intents created
-- no option txs created
-- no generic txs created
-- no new option events
-- backend stopped in safe mode
+OptionMatchingEngine:
+0xf2D1D85cD363Be3bc160d14883C80e7C2c4F420b
 
-Goal:
-Prepare a tiny option execution preflight against NEW_MARGIN_ENGINE.
+FeesManagerV2 remains disabled:
+- NEW.useFeesManagerV2 = false
+- NEW.feesManagerV2 = address(0)
+- NEW.feesManager = V1 FeesManager
 
-This task must:
-1. start backend with required workers/surfaces configured;
-2. verify NEW margin engine live state;
-3. refresh oracle if needed;
-4. create a fresh tiny option execution intent;
-5. collect signatures;
-6. build calldata;
-7. simulate execution against NEW;
-8. verify gas safety;
-9. stop before broadcast.
+Valid tiny intent:
+a6369dd5-54cd-4407-a4c5-7902bba286f7
 
-No live broadcast in this task.
+Invalid/stale intent to ignore:
+563d5884-... with buyer/seller nonces 0/0
 
-## Hard Rules
+Preflight result:
+- signatures accepted
+- calldata ready
+- simulation_ok at block 42100183
+- estimated_gas = 938,846
+- required_gas = 1,173,557
+- broadcast_gas_limit = 1,500,000
+- gas_check_status = ok
+- executor balance = 0.00807 ETH
+- no broadcast called
+
+Important:
+This task involves a real on-chain broadcast. The agent must not perform the broadcast. The human operator performs it manually only after final checks.
+
+## Goal
+
+Run final pre-broadcast checks, stop for human broadcast, then verify and document the tiny trade execution against NEW MarginEngine.
+
+## Hard Rules For Agent
 
 Do not broadcast.
 Do not submit transactions.
@@ -59,21 +57,21 @@ Do not print private keys.
 Do not commit real `.env`.
 
 Allowed:
-- backend runtime env update.
-- backend restart.
-- oracle refresh only if existing testnet mock-feed refresh script is already part of the established workflow.
-- create one fresh tiny option execution intent.
-- sign buyer/seller payloads locally if existing flow requires it.
-- simulate.
-- gas estimate / gas safety preview.
+- backend runtime env setup.
+- read-only preflight checks.
+- oracle refresh only if stale, using existing established testnet mock-feed refresh flow.
+- simulation refresh.
+- gas estimate refresh.
+- stop for human broadcast.
+- parse human broadcast output.
+- post-broadcast verification.
 - docs.
 
-## Required Runtime Env
+## Phase 1 — Pre-Broadcast Refresh
 
 Work in:
 
-```text
-~/DEOPT/deopt-v2-backend
+cd ~/DEOPT/deopt-v2-backend
 
 Load env without printing secrets:
 
@@ -81,7 +79,7 @@ set -a
 source .env.cutover.v2d_s.local 2>/dev/null || source .env
 set +a
 
-Then export runtime values:
+Export runtime values:
 
 export RPC_URL="<paid Base Sepolia RPC already set in shell>"
 
@@ -106,157 +104,175 @@ export EXECUTOR_DRY_RUN=false
 export OPTION_EXECUTION_BROADCAST_GAS_LIMIT=1500000
 export EXECUTION_GAS_SAFETY_BPS=12500
 
-Important:
+The human must provide EXECUTOR_PRIVATE_KEY in the local terminal only:
 
-These flags allow the backend to prepare/simulate/broadcast surfaces.
-This task still must not call the broadcast endpoint.
-Step 1 — Baseline
+read -s EXECUTOR_PRIVATE_KEY
+export EXECUTOR_PRIVATE_KEY
+test -n "$EXECUTOR_PRIVATE_KEY" && echo "EXECUTOR_PRIVATE_KEY set"
 
-Set:
-
-V2D_U_START_MS=$(date +%s%3N)
-
-Record DB counts:
-
-select count(*) as option_execution_intents from option_execution_intents;
-select count(*) as option_execution_transactions from option_execution_transactions;
-select count(*) as execution_transactions from execution_transactions;
-select count(*) as option_execution_events from option_execution_events;
-select count(*) as option_execution_reconciliations from option_execution_reconciliations;
-select count(*) as fee_events from fee_events;
-
-Also record latest event indexer cursor.
-
-Step 2 — Start Backend
+Never paste this key into chat.
 
 Start backend.
 
-Verify:
+Verify /admin/config:
 
-curl -s http://127.0.0.1:8080/health | jq
-curl -s http://127.0.0.1:8080/admin/config -H "X-Admin-Token: $ADMIN_TOKEN" | jq
+margin engine = NEW
+broadcast enabled true
+real broadcast enabled true
+dry_run false
+gas limit = 1,500,000
+gas safety = 12,500
+FeesManagerV2 disabled
+Phase 2 — Final Safety Checks
+
+Before broadcast, verify:
+
+1. Correct intent
+intent_id = a6369dd5-54cd-4407-a4c5-7902bba286f7
+
+Reject stale intent:
+
+563d5884-...
+2. Oracle freshness
+
+Check WETH/USDC oracle freshness.
+
+If stale:
+
+refresh mock feeds using existing established script.
+then re-check.
+
+Abort if oracle cannot be made fresh.
+
+3. Nonces
+
+Read on-chain nonces for buyer/seller.
 
 Expected:
 
-backend healthy.
-margin engine = NEW.
-event indexer margin engine = NEW.
-broadcast surfaces configured but not called.
-FeesManagerV2 absent/disabled.
-Step 3 — On-chain NEW Checks
+buyer nonce = 1
+seller nonce = 1
 
-Run read-only checks:
+If either nonce differs:
 
-cast call 0x287Cef479be5889eEfCa847F9e73C860898f48Cc "feesManager()(address)" --rpc-url "$RPC_URL"
-cast call 0x287Cef479be5889eEfCa847F9e73C860898f48Cc "feesManagerV2()(address)" --rpc-url "$RPC_URL"
-cast call 0x287Cef479be5889eEfCa847F9e73C860898f48Cc "useFeesManagerV2()(bool)" --rpc-url "$RPC_URL"
+abort.
+do not broadcast.
+regenerate fresh intent/signatures in a separate task.
+4. Re-simulate
 
-Expected:
+Call:
 
-feesManager = 0xaef73F10224712E1312963BE11662061481aA0F0
-feesManagerV2 = 0x0000000000000000000000000000000000000000
-useFeesManagerV2 = false
-Step 4 — Oracle Freshness
-
-Check WETH/USDC oracle freshness with existing read-only/preflight method.
-
-If stale, refresh testnet mock feeds using the existing established script only.
+curl -s -X POST \
+  http://127.0.0.1:8080/admin/options/executions/a6369dd5-54cd-4407-a4c5-7902bba286f7/simulate \
+  -H "X-Admin-Token: $ADMIN_TOKEN" | jq
 
 Expected:
 
-getPriceSafe(WETH,USDC) returns ok=true.
-age under feed max delay.
-no option trade attempted if oracle stale.
-Step 5 — Create Fresh Tiny Intent
+simulation_status = simulation_ok
+error = null
+revert_selector = null
+5. Re-estimate gas
 
-Create a fresh tiny option trade intent using the same established option endpoint flow as V1S.
+Expected:
 
-Use conservative tiny size:
+estimated gas around 938,846
+required gas <= 1,500,000
+gas_check_status = ok
+6. Baseline counts
 
-quantity = 1
-premium small
-existing listed/valid option series
-buyer/seller accounts already funded from prior V1S flow if still valid.
+Set:
+
+V2D_V_START_MS=$(date +%s%3N)
 
 Record:
 
-intent_id
-source_id
-buyer
-seller
-option_id
-premium
-quantity
-buyer/seller nonces
-Step 6 — Signatures / Calldata / Simulation
+option_execution_transactions since start = 0
+execution_transactions since start = 0
+Phase 3 — Stop For Human Broadcast
 
-Use existing flow:
+Agent stops and tells human operator to run exactly one command:
 
-fetch EIP-712 payload.
-sign buyer.
-sign seller.
-submit strict signatures.
-fetch calldata.
-simulate.
+curl -s -X POST \
+  http://127.0.0.1:8080/options/execution-intents/a6369dd5-54cd-4407-a4c5-7902bba286f7/broadcast \
+  -H "X-Admin-Token: $ADMIN_TOKEN" | jq
 
-Expected:
+Rules:
 
-calldata selector expected.
-simulation_status = simulation_ok.
-no revert.
-simulated block recorded.
-no broadcast.
-Step 7 — Gas Safety Preview
+run once only.
+no retry.
+do not call /executor/broadcast.
+paste full output back.
+Phase 4 — Post-Broadcast Verification
 
-Estimate gas and compute:
+After operator pastes output:
 
-required_gas = estimated_gas * EXECUTION_GAS_SAFETY_BPS / 10000
+Extract:
 
-Expected:
+tx hash
+option_execution_transaction id
+broadcast status
+gas used if available.
 
-OPTION_EXECUTION_BROADCAST_GAS_LIMIT >= required_gas
-gas safety status = ok
-executor balance enough
-Step 8 — No Forbidden Mutation Check
+Verify chain receipt:
 
-Allowed new rows:
-
-one new option_execution_intent.
-signature/calldata/simulation records associated with the new intent.
-
-Forbidden:
-
-no option_execution_transactions.
-no execution_transactions.
-no broadcast tx hash.
-no confirmed/reconciled row for the new intent.
-
-Query:
-
-select count(*) from option_execution_transactions where created_at_ms >= ${V2D_U_START_MS};
-select count(*) from execution_transactions where created_at_ms >= ${V2D_U_START_MS};
+cast receipt <TX_HASH> --rpc-url "$RPC_URL"
 
 Expected:
 
-both 0.
+status = 1
+to = OptionMatchingEngine
+block number recorded
+
+Verify backend transaction row:
+
+confirmation_status
+receipt_status
+tx_hash
+gas_used
+effective_gas_price
+
+Run confirmation tick if needed.
+
+Run event indexer tick from tx block if needed.
+
+Run reconciliation tick.
+
+Expected final:
+
+intent status = broadcast_confirmed
+tx = mined_success
+event indexer captures NEW MarginEngine events.
+reconciliation status = reconciled.
+lifecycle shows:
+health.stage = reconciled
+confirmation mined_success
+events total > 0
+fees source = onchain
+state_checks ok or explicit non-strict result
+FeesManagerV2 still disabled
+V1 fee events only or V1-compatible events
 Required Docs
 
 Create:
+
+docs/MARGIN_ENGINE_V2_TINY_TRADE_BROADCAST_RESULT_V2D_V.md
+
+Update:
 
 docs/MARGIN_ENGINE_V2_TINY_TRADE_PREFLIGHT_V2D_U.md
 
 Include:
 
-runtime config summary.
-baseline DB counts.
-NEW engine checks.
-oracle freshness.
-new intent id.
-signature/calldata status.
-simulation result.
-gas safety preview.
-no-broadcast proof.
-remaining blocker before human broadcast.
+pre-broadcast refresh.
+human broadcast output.
+tx hash.
+receipt.
+confirmation.
+events indexed.
+reconciliation.
+lifecycle result.
+no forbidden mutation proof.
+remaining blocker before FeesManagerV2 enablement.
 Validation
 
 Run:
@@ -269,31 +285,29 @@ Acceptance Criteria
 
 Complete only if:
 
-backend reports NEW.
-NEW has V2 disabled.
-oracle fresh.
-fresh tiny intent created.
-signatures accepted.
-calldata ready.
-simulation_ok.
-gas safety ok.
-no broadcast endpoint called.
-no option_execution_transactions created.
-no generic execution_transactions created.
+final simulation_ok.
+final gas safety ok.
+human broadcast called exactly once.
+tx mined success.
+backend confirms tx.
+events indexed.
+reconciliation done.
+lifecycle reconciled.
+FeesManagerV2 remains disabled.
 docs created.
 validations pass.
 Final Report
 
 Return:
 
-backend config summary.
-NEW engine checks.
-oracle status.
-tiny intent id.
-signature/calldata status.
-simulation result.
-gas safety preview.
-no-broadcast verification.
+pre-broadcast checks.
+broadcast output summary.
+tx hash.
+receipt summary.
+backend transaction status.
+indexed events.
+reconciliation result.
+lifecycle result.
 docs updated.
 validation commands run.
-remaining blocker before human tiny broadcast.
+remaining blocker before FeesManagerV2 enablement.
