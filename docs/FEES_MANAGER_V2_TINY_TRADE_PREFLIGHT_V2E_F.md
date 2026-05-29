@@ -234,25 +234,36 @@ A 50_000-unit premium + 14-unit fee is dust compared to vault balances.
 
 `FeesManagerV2` Tier0 OPTION profile (from `FeesManagerV2.sol`
 `_setFeeProfile(0, ProductKind.OPTION, makerPpm=50, takerPpm=250)`,
-`productFeeBasis(OPTION) = PREMIUM`):
+`productFeeBasis(OPTION) = PREMIUM`).
+
+**Correction (post-V2E-G broadcast):** original prediction used `floor`
+rounding; the contract uses **`Math.Rounding.Ceil`** for positive rates
+(`FeesManagerV2.sol:401-413`). Corrected expectations:
 
 | Component | Formula | Expected value |
 | --- | --- | ---: |
 | `basisAmount` | `premium_per_contract × quantity` | `50_000` |
-| Taker (buyer) fee | `50_000 × 250 / 1_000_000` | **`12` native units** (`0.000012 mUSDC`) |
-| Maker (seller) fee | `50_000 × 50 / 1_000_000` | **`2` native units** (`0.000002 mUSDC`) |
-| Total | | **`14` native units** |
+| Taker (buyer) fee | `ceil(50_000 × 250 / 1_000_000) = ceil(12.5)` | **`13` native units** |
+| Maker (seller) fee | `ceil(50_000 × 50 / 1_000_000) = ceil(2.5)` | **`3` native units** |
+| Total | | **`16` native units** |
 | Rebate | n/a (Tier0 has no negative ppm) | `0` |
 | Merkle claim | n/a (`merkleRoot = 0x00…00`) | none |
 
-Expected indexer behavior **after eventual broadcast**:
+Original (incorrect) prediction: `taker=12 + maker=2 = 14`. The V2E-G
+broadcast confirmed `13 + 3 = 16`; see
+[`FEES_MANAGER_V2_TINY_TRADE_BROADCAST_RESULT_V2E_G.md`](FEES_MANAGER_V2_TINY_TRADE_BROADCAST_RESULT_V2E_G.md)
+§"Deviation from V2E-F prediction".
+
+Expected indexer behavior **after eventual broadcast** (corrected post-V2E-G):
 
 - two `FeeChargedV2` events from emitter `0x00dA0B9876bcBf0c79CB5BcAcfEBAFb8C7Ad774f`
-  (one per side), totalling `14` charged units
+  (one per side), totalling **`16`** charged units
 - zero `FeeRebatedV2`
-- lifecycle `fees.event_model = "v2"` (or `"mixed"` if a V1
-  compat `TradingFeeCharged` is also emitted)
-- `observed_total_charged = 14`, `observed_total_rebated = 0`
+- lifecycle `fees.event_model = "mixed"` — NEW MarginEngine emits BOTH
+  V1 `TradingFeeCharged` (back-compat) and V2 `FeeChargedV2` when
+  `useFeesManagerV2 = true`; backend tags `source_priority = "v2"` so V2
+  is authoritative
+- `observed_total_charged = 16`, `observed_total_rebated = 0`
 
 This is the **first** trade configured to exercise the V2 fee path; V2D-V
 left V2 disabled and recorded `event_model = none` for a `premium = 100`
@@ -483,16 +494,16 @@ blockers:
    simulation, gas estimate, broadcast, and confirmation all share the
    same RPC budget.
 
-After broadcast, the post-broadcast verification doc should record:
+After broadcast (V2E-G actuals — see
+[`FEES_MANAGER_V2_TINY_TRADE_BROADCAST_RESULT_V2E_G.md`](FEES_MANAGER_V2_TINY_TRADE_BROADCAST_RESULT_V2E_G.md)):
 
 - two `FeeChargedV2` events from `0x00dA0B…774f` for the tx, totalling
-  `14` native settlement units (`12` taker + `2` maker)
+  **`16`** native settlement units (**`13`** taker + **`3`** maker — ceiling rounding)
 - zero `FeeRebatedV2`
-- lifecycle `fees.event_model = "v2"` (or `"mixed"` if a V1 compat
-  `TradingFeeCharged` also fires; current expectation is `v2`-only because
-  `useFeesManagerV2 = true` routes through FeesManagerV2 exclusively per
-  the MarginEngine V2 dispatch)
-- `observed_total_charged = 14`, `observed_total_rebated = 0`
+- lifecycle `fees.event_model = "mixed"` (NEW MarginEngine emits both V1
+  `TradingFeeCharged` for back-compat AND V2 `FeeChargedV2`; backend tags
+  `source_priority = "v2"` so V2 is authoritative for accounting)
+- `observed_total_charged = 16`, `observed_total_rebated = 0`
 - intent state `broadcast_confirmed`, lifecycle `health.stage = reconciled`
 
 ## Note On Missing V2E-E Doc

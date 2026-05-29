@@ -1,327 +1,204 @@
-# NEXT_TASK.md — Tiny Option Trade Preflight With FeesManagerV2 Enabled V2E-F
+# NEXT_TASK.md — Backend basisAmount Exposure And Options V2 Fee Closure V2E-I
 
 ## Context
 
-FeesManagerV2 is now deployed, wired, indexed by backend config, and enabled on NEW MarginEngine.
+V2E-H completed frontend/admin observability for V2 option fees.
 
-Live state:
-- NEW_MARGIN_ENGINE = 0x287Cef479be5889eEfCa847F9e73C860898f48Cc
-- FEES_MANAGER_V2 = 0x00dA0B9876bcBf0c79CB5BcAcfEBAFb8C7Ad774f
-- NEW.feesManagerV2() = FEES_MANAGER_V2
-- NEW.useFeesManagerV2() = true
-- FeesManagerV2.isFeeConsumer(NEW) = true
-- FeesManagerV2.merkleRoot() = bytes32(0)
-- FeesManagerV2.rebateBudget(BASE_COLLATERAL_TOKEN) = 0
-- Launch policy = Tier0 only
-- Negative maker tiers unreachable
-- Rebate probe deferred
+V2E-G validated live FeesManagerV2 option trade:
+- intent = 94897ee5-e855-40b6-a917-1476578fe48b
+- tx = 0xd51ea881cdbc32fe724034c0f7e25ade7359ea3d5b6cadb17b7c345effefc72c
+- event_model = mixed
+- source_priority = v2
+- fee_charged_v2_count = 2
+- fee_rebated_v2_count = 0
+- observed_total_charged = 16
+- net_protocol_fee = 16
+- taker = 13
+- maker = 3
+- recipient = 0xa67f8e8e673ce4bb2fb563b0e6e9fa8f70e3b588
 
-V2E-E enable tx:
-0x10c1acff8c496ee5b056b4cddb890bfdaef195569d7f16d04e12b6b6761a142d
+Known V2E-H remaining gap:
+- `basisAmount` is decoded and persisted in V2 fee events.
+- But `basisAmount` is not surfaced through `collect_event_payloads` in:
+  `deopt-v2-backend/src/fees/onchain_summary.rs`
+- Admin V2 per-event cards therefore render `basisAmount = n/a`.
 
 Goal:
-Prepare a tiny option trade preflight with FeesManagerV2 enabled.
-
-This task must stop before broadcast.
-
-Expected fee behavior:
-- V2 fee path is used.
-- Tier0 positive fee behavior only.
-- FeeChargedV2 should be expected after live broadcast.
-- No FeeRebatedV2 expected.
-- No rebate budget needed.
-- No Merkle claim.
-- No negative maker tier reachable.
+Expose `basisAmount` through backend fee summary payloads, verify admin observability, and close the options V2 Tier0-positive-fee phase before moving to perps.
 
 ## Hard Rules
 
 Do not broadcast.
 Do not submit transactions.
-Do not call `/options/execution-intents/:id/broadcast`.
-Do not call `/executor/broadcast`.
-Do not call `eth_sendRawTransaction`.
 Do not deploy.
 Do not modify Solidity.
-Do not modify frontend.
-Do not disable FeesManagerV2.
-Do not fund rebate budget.
-Do not set Merkle root.
-Do not create more than one fresh valid tiny intent.
-Do not cleanup historical rows.
-Do not print private keys.
+Do not create option execution intents.
+Do not create option execution transactions.
+Do not call option broadcast endpoints.
+Do not modify live DB.
+Do not print secrets.
 Do not commit real `.env`.
 
 Allowed:
-- backend runtime env update.
-- backend restart.
-- read-only cast calls.
-- oracle refresh using established testnet mock feed script only if stale.
-- create one fresh tiny option execution intent.
-- sign buyer/seller payloads using existing flow.
-- calldata generation.
-- simulation.
-- gas estimate/safety preview.
+- backend read-only response shape update.
+- frontend type/UI adjustment if needed.
+- tests.
 - docs.
+- read-only endpoint calls.
 
-## Repo
+## Repos
 
-Work in:
+Primary:
 
 ```text
 ~/DEOPT/deopt-v2-backend
-Step 1 — Runtime Env
 
-Load env without printing secrets:
+Secondary if needed:
 
-cd ~/DEOPT/deopt-v2-backend
-set -a
-source .env.cutover.v2d_s.local 2>/dev/null || source .env
-set +a
+~/DEOPT/deopt-v2-frontend
+Step 1 — Backend basisAmount Exposure
 
-Export:
+Inspect:
 
-export RPC_URL="<paid Base Sepolia RPC already set in shell>"
+src/fees/onchain_summary.rs
+src/options/lifecycle.rs
+src/fees/service.rs
+src/types/admin.ts in frontend if needed
 
-export MARGIN_ENGINE=0x287Cef479be5889eEfCa847F9e73C860898f48Cc
-export OPTION_EVENT_INDEXER_MARGIN_ENGINE_ADDRESS=0x287Cef479be5889eEfCa847F9e73C860898f48Cc
+Required backend change:
 
-export FEES_MANAGER_V2=0x00dA0B9876bcBf0c79CB5BcAcfEBAFb8C7Ad774f
-export OPTION_EVENT_INDEXER_FEES_MANAGER_V2_ADDRESS=0x00dA0B9876bcBf0c79CB5BcAcfEBAFb8C7Ad774f
+Add basis_amount / basisAmount to normalized V2 fee event payloads returned by:
+/admin/fees/onchain
+/admin/options/executions/:intent_id/lifecycle
 
-export OPTION_EVENT_INDEXER_ENABLED=true
-export OPTION_EVENT_INDEXER_REQUIRE_RPC=true
-export OPTION_EVENT_INDEXER_CONFIRMATION_BLOCKS=3
-export OPTION_EVENT_INDEXER_BATCH_BLOCKS=5000
+Implementation expectation:
 
-export OPTION_CONFIRMATION_WORKER_ENABLED=true
-export OPTION_RECONCILIATION_WORKER_ENABLED=true
-export OPTION_NONCE_SYNC_ENABLED=true
-export OPTION_NONCE_SYNC_REQUIRE_RPC=true
-export OPTION_NONCE_SYNC_STRICT=true
+FeeChargedV2 event payload must include:
+basisAmount
+feeAmount
+feePpm
+productKind
+flowKind
+isMaker
+trader
+recipient
+FeeRebatedV2 event payload must include:
+basisAmount
+rebateAmount
+rebatePpm
+same contextual fields if decoded.
 
-export OPTION_EXECUTION_BROADCAST_ENABLED=true
-export EXECUTION_ENABLED=true
-export EXECUTOR_REAL_BROADCAST_ENABLED=true
-export EXECUTOR_DRY_RUN=false
+Use existing decoded JSON field names. Do not re-decode from logs if already available.
 
-export OPTION_EXECUTION_BROADCAST_GAS_LIMIT=1500000
-export OPTION_EXECUTION_GAS_SAFETY_BPS=12500
-export EXECUTOR_MAX_FEE_PER_GAS_WEI=1000000000
-export EXECUTOR_MAX_PRIORITY_FEE_PER_GAS_WEI=1000000
+Step 2 — Backend Tests
 
-For this preflight, if agent cannot access EXECUTOR_PRIVATE_KEY, it must not ask for it in chat. Use preflight mode without broadcast surfaces if needed, or ask operator to launch backend manually with the key in shell.
+Add or update tests for:
 
-Step 2 — Baseline
+V2 FeeChargedV2 onchain summary includes basisAmount.
+lifecycle fees event payload includes basisAmount.
+mixed V1/V2 still uses V2 as source of truth.
+V1 compatibility response remains backward compatible.
 
-Set:
+Expected V2E-G values:
 
-V2E_F_START_MS=$(date +%s%3N)
+basisAmount = 50000
+taker feeAmount = 13
+maker feeAmount = 3
+Step 3 — Frontend Adjustment If Needed
 
-Record DB counts:
+If frontend type expects basisAmount already but backend uses snake_case, normalize.
 
-select count(*) as option_execution_intents from option_execution_intents;
-select count(*) as option_execution_transactions from option_execution_transactions;
-select count(*) as execution_transactions from execution_transactions;
-select count(*) as option_execution_events from option_execution_events;
-select count(*) as option_execution_reconciliations from option_execution_reconciliations;
-select count(*) as fee_events from fee_events;
+Ensure admin cards show a real basis amount for V2E-G:
 
-select last_indexed_block, last_error
-from option_event_indexer_state
-order by updated_at_ms desc
-limit 5;
-Step 3 — Start Backend
+basisAmount = 50000
 
-Start/restart backend.
+Do not add write actions.
 
-Verify:
+Step 4 — Read-only Manual Verification
 
-curl -s http://127.0.0.1:8080/health
+Run backend locally with safe read-only/admin config if needed.
 
-curl -s http://127.0.0.1:8080/admin/config \
+Call:
+
+curl -s \
+  "http://127.0.0.1:8080/admin/fees/onchain?tx_hash=0xd51ea881cdbc32fe724034c0f7e25ade7359ea3d5b6cadb17b7c345effefc72c" \
+  -H "X-Admin-Token: $ADMIN_TOKEN"
+
+And:
+
+curl -s \
+  "http://127.0.0.1:8080/admin/options/executions/94897ee5-e855-40b6-a917-1476578fe48b/lifecycle" \
   -H "X-Admin-Token: $ADMIN_TOKEN"
 
 Expected:
 
-backend healthy.
-margin engine = NEW.
-feesManagerV2/indexer emitter = FEES_MANAGER_V2.
-broadcast surfaces may be enabled for preflight, but must not be called.
-no secrets exposed.
-Step 4 — On-chain V2 Checks
-
-Run read-only checks:
-
-cast call 0x287Cef479be5889eEfCa847F9e73C860898f48Cc "feesManagerV2()(address)" --rpc-url "$RPC_URL"
-cast call 0x287Cef479be5889eEfCa847F9e73C860898f48Cc "useFeesManagerV2()(bool)" --rpc-url "$RPC_URL"
-
-cast call 0x00dA0B9876bcBf0c79CB5BcAcfEBAFb8C7Ad774f "isFeeConsumer(address)(bool)" 0x287Cef479be5889eEfCa847F9e73C860898f48Cc --rpc-url "$RPC_URL"
-cast call 0x00dA0B9876bcBf0c79CB5BcAcfEBAFb8C7Ad774f "merkleRoot()(bytes32)" --rpc-url "$RPC_URL"
-cast call 0x00dA0B9876bcBf0c79CB5BcAcfEBAFb8C7Ad774f "rebateBudget(address)(uint256)" <BASE_COLLATERAL_TOKEN> --rpc-url "$RPC_URL"
-
-Expected:
-
-feesManagerV2 = FEES_MANAGER_V2.
-useFeesManagerV2 = true.
-isFeeConsumer(NEW) = true.
-merkleRoot = bytes32(0).
-rebateBudget = 0.
-Step 5 — Oracle Freshness
-
-Check WETH/USDC oracle freshness with the existing read-only/preflight method.
-
-If stale:
-
-refresh testnet mock feeds using established script.
-re-check immediately.
-
-Abort if oracle cannot be fresh.
-
-Step 6 — Create Fresh Tiny Intent
-
-Create one fresh tiny option execution intent using the established option endpoint flow.
-
-Requirements:
-
-fresh buyer/seller nonces from on-chain sync.
-quantity = 1.
-premium high enough to produce a non-zero positive Tier0 V2 fee if possible.
-no rebate expectation.
-existing listed valid option series.
-buyer/seller funded.
-
-Important:
-If premium is too small and fees round to zero, document it and either:
-
-keep it as a no-fee V2 path preflight, or
-create a replacement intent only if the task explicitly records the first one as stale/invalid and does not exceed one fresh valid broadcast candidate.
-
-Preferred:
-
-one final valid candidate with expected positive FeeChargedV2.
-
-Record:
-
-intent_id.
-buyer/seller.
-buyer/seller nonces.
-option_id.
-quantity.
-premium.
-expected V2 fee behavior.
-Step 7 — Signatures / Calldata / Simulation
-
-Use existing flow:
-
-fetch EIP-712 payload.
-sign buyer.
-sign seller.
-submit strict signatures.
-fetch calldata.
-simulate.
-
-Expected:
-
-signatures accepted.
-calldata ready.
-simulation_status = simulation_ok.
-no revert.
-simulation targets OptionMatchingEngine -> NEW MarginEngine.
-expected V2 fee path.
-Step 8 — Gas Safety Preview
-
-Estimate gas and compute:
-
-required_gas = estimated_gas * EXECUTION_GAS_SAFETY_BPS / 10000
-
-Expected:
-
-OPTION_EXECUTION_BROADCAST_GAS_LIMIT >= required_gas.
-gas safety status = ok.
-executor balance enough.
-Step 9 — No Broadcast / No Forbidden Mutation Check
-
-Allowed:
-
-one new option_execution_intent.
-signature/calldata/simulation records for that intent.
-
-Forbidden:
-
-no option_execution_transactions.
-no execution_transactions.
-no broadcast tx hash.
-no confirmed/reconciled row for new intent.
-
-Query:
-
-select count(*) from option_execution_transactions where created_at_ms >= ${V2E_F_START_MS};
-select count(*) from execution_transactions where created_at_ms >= ${V2E_F_START_MS};
-
-Expected:
-
-both 0.
-Required Docs
+event_model = mixed
+source_priority = v2
+fee_charged_v2_count = 2
+fee_rebated_v2_count = 0
+observed_total_charged = 16
+taker = 13
+maker = 3
+each V2 fee event exposes basisAmount = 50000
+Step 5 — Options V2 Fee Closure Doc
 
 Create:
 
-docs/FEES_MANAGER_V2_TINY_TRADE_PREFLIGHT_V2E_F.md
-
-Update if useful:
-
-docs/FEES_MANAGER_V2_ENABLE_BROADCAST_RESULT_V2E_E.md
+docs/OPTIONS_V2_FEE_TIER0_CLOSURE_V2E_I.md
 
 Include:
 
-runtime config summary.
-baseline DB counts.
-on-chain V2 checks.
-oracle freshness.
-fresh intent id.
-expected fee behavior.
-signature/calldata status.
-simulation result.
-gas safety preview.
-no-broadcast proof.
-remaining blocker before human V2 tiny broadcast.
-Validation
+What is validated:
+FeesManagerV2 deployed
+wired
+enabled
+backend indexer emitter configured
+live option trade succeeded
+FeeChargedV2 indexed
+lifecycle/admin fees expose V2 source of truth
+Tier0 positive option fees validated
+What is intentionally deferred:
+rebates / negative maker tiers
+rebate budget funding
+Merkle tiers
+RFQ discounts
+multi-asset fee campaign
+perps integration
+Criteria for moving to perps:
+passed.
+Required Validation
 
-Run:
+Backend:
 
 cargo fmt --all
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features
 cargo build --all-targets --all-features
+
+Frontend, if touched:
+
+npm run lint
+npx tsc --noEmit
+npm run build
 Acceptance Criteria
 
 Complete only if:
 
-backend reports NEW + FeesManagerV2.
-on-chain useFeesManagerV2 = true.
-oracle fresh.
-one final valid tiny intent exists.
-signatures accepted.
-calldata ready.
-simulation_ok.
-gas safety ok.
-no broadcast endpoint called.
-no option_execution_transactions created.
-no generic execution_transactions created.
-docs created.
-validations pass.
+basisAmount is visible in backend response payloads.
+V2E-G basis amount = 50000 is visible.
+no write/broadcast path added.
+backend validations pass.
+frontend validations pass if touched.
+closure doc exists.
+perps can start next.
 Final Report
 
 Return:
 
-backend config summary.
-on-chain V2 checks.
-oracle status.
-tiny intent id.
-expected V2 fee behavior.
-signature/calldata status.
-simulation result.
-gas safety preview.
-no-broadcast verification.
+files changed.
+basisAmount exposure summary.
+V2E-G manual verification result.
+no-write proof.
 docs updated.
 validation commands run.
-remaining blocker before human V2 tiny broadcast.
+final recommendation: proceed to perps or not.

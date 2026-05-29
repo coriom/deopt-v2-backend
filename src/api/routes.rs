@@ -5611,6 +5611,17 @@ mod tests {
         assert_eq!(transactions[0]["observed_total_charged"], "25");
         assert_eq!(transactions[0]["observed_total_rebated"], "5");
         assert_eq!(transactions[0]["net_protocol_fee"], "20");
+        // V2E-I: both V2 entries surface basis_amount through the
+        // /admin/fees/onchain.events list.
+        let events = json["events"].as_array().unwrap();
+        let v2_with_basis = events
+            .iter()
+            .filter(|payload| {
+                (payload["event_name"] == "FeeChargedV2" || payload["event_name"] == "FeeRebatedV2")
+                    && payload["basis_amount"] == "10000"
+            })
+            .count();
+        assert_eq!(v2_with_basis, 2);
         assert!(state.repository.is_none());
         assert!(state.trade_signatures.lock().unwrap().is_empty());
     }

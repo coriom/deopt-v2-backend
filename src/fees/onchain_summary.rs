@@ -66,6 +66,10 @@ pub struct NormalizedFeeEvent {
     pub product_kind: Option<String>,
     /// For V2 events: V2 flow (`"orderbook"` / `"rfq"`). `None` for V1.
     pub flow_kind: Option<String>,
+    /// For V2 events: the basis amount (premium for OPTION, notional for
+    /// PERP) the ppm rate was applied to. Kept as the decoded uint string
+    /// so callers can choose how to render it. `None` for V1 events.
+    pub basis_amount: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -213,6 +217,7 @@ fn normalize_v1_charged(event: &OptionExecutionEvent) -> Option<NormalizedFeeEve
         ppm: None,
         product_kind: None,
         flow_kind: None,
+        basis_amount: None,
     })
 }
 
@@ -260,6 +265,10 @@ fn normalize_v2_charged(event: &OptionExecutionEvent) -> Option<NormalizedFeeEve
         .get("flowKind")
         .and_then(|value| value.as_str())
         .map(str::to_string);
+    let basis_amount = decoded
+        .get("basisAmount")
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
     Some(NormalizedFeeEvent {
         model: FeeEventModel::V2Charged,
         event_id: event.id,
@@ -278,6 +287,7 @@ fn normalize_v2_charged(event: &OptionExecutionEvent) -> Option<NormalizedFeeEve
         ppm,
         product_kind,
         flow_kind,
+        basis_amount,
     })
 }
 
@@ -320,6 +330,10 @@ fn normalize_v2_rebated(event: &OptionExecutionEvent) -> Option<NormalizedFeeEve
         .get("flowKind")
         .and_then(|value| value.as_str())
         .map(str::to_string);
+    let basis_amount = decoded
+        .get("basisAmount")
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
     Some(NormalizedFeeEvent {
         model: FeeEventModel::V2Rebated,
         event_id: event.id,
@@ -338,6 +352,7 @@ fn normalize_v2_rebated(event: &OptionExecutionEvent) -> Option<NormalizedFeeEve
         ppm,
         product_kind,
         flow_kind,
+        basis_amount,
     })
 }
 
@@ -511,6 +526,7 @@ pub fn collect_event_payloads(normalized: &NormalizedFees) -> Vec<Value> {
             "applied_fee": entry.amount_str,
             "fee_amount": entry.amount_str,
             "rebate_amount": null,
+            "basis_amount": entry.basis_amount,
             "is_maker": maybe_bool(entry.side),
             "side": entry.side.as_str(),
             "fee_ppm": entry.ppm,
@@ -534,6 +550,7 @@ pub fn collect_event_payloads(normalized: &NormalizedFees) -> Vec<Value> {
             "applied_fee": null,
             "fee_amount": null,
             "rebate_amount": entry.amount_str,
+            "basis_amount": entry.basis_amount,
             "is_maker": true,
             "side": entry.side.as_str(),
             "rebate_ppm": entry.ppm,
@@ -900,5 +917,180 @@ mod tests {
         assert_eq!(aggregated.charged_total, 25);
         assert_eq!(aggregated.trading_fee_event_count, 1);
         assert_eq!(aggregated.fee_charged_v2_count, 1);
+    }
+
+    /// V2E-I: `basisAmount` must be normalized off the decoded payload so
+    /// admin and lifecycle JSON can surface it next to `feeAmount`.
+    #[test]
+    fn v2_charged_normalizes_basis_amount() {
+        let events = [v2_charged_event(
+            1,
+            "0xc0a76c2a00000000000000000000000000000000",
+            13,
+            250,
+            false,
+        )];
+        let normalized = normalize_fee_events(&events);
+        assert_eq!(normalized.v2_charged.len(), 1);
+        assert_eq!(
+            normalized.v2_charged[0].basis_amount.as_deref(),
+            Some("10000")
+        );
+    }
+
+    #[test]
+    fn v2_rebated_normalizes_basis_amount() {
+        let events = [v2_rebated_event(
+            1,
+            "0xbaf0976a00000000000000000000000000000000",
+            5,
+            -50,
+        )];
+        let normalized = normalize_fee_events(&events);
+        assert_eq!(normalized.v2_rebated.len(), 1);
+        assert_eq!(
+            normalized.v2_rebated[0].basis_amount.as_deref(),
+            Some("10000")
+        );
+    }
+
+    #[test]
+    fn v1_event_has_no_basis_amount() {
+        let events = [v1_event(
+            1,
+            "0xc0a76c2a00000000000000000000000000000000",
+            6,
+            false,
+        )];
+        let normalized = normalize_fee_events(&events);
+        assert_eq!(normalized.v1_charged.len(), 1);
+        assert!(normalized.v1_charged[0].basis_amount.is_none());
+    }
+
+    /// V2E-I: `collect_event_payloads` must surface `basis_amount` on V2
+    /// entries (charged and rebated) and omit/null it on V1 entries.
+    #[test]
+    fn collect_event_payloads_surfaces_basis_amount_for_v2() {
+        let events = [
+            v1_event(1, "0xc0a76c2a00000000000000000000000000000000", 6, false),
+            v2_charged_event(
+                2,
+                "0xc0a76c2a00000000000000000000000000000000",
+                13,
+                250,
+                false,
+            ),
+            v2_rebated_event(3, "0xbaf0976a00000000000000000000000000000000", 5, -50),
+        ];
+        let normalized = normalize_fee_events(&events);
+        let payloads = collect_event_payloads(&normalized);
+        assert_eq!(payloads.len(), 3);
+
+        let v1 = payloads
+            .iter()
+            .find(|payload| payload["event_name"] == "TradingFeeCharged")
+            .expect("v1 payload");
+        // V1 does not carry a basis amount; the field is null on V1 entries.
+        assert!(v1.get("basis_amount").map(Value::is_null).unwrap_or(true));
+
+        let v2_charged = payloads
+            .iter()
+            .find(|payload| payload["event_name"] == "FeeChargedV2")
+            .expect("v2 charged payload");
+        assert_eq!(v2_charged["basis_amount"], "10000");
+        assert_eq!(v2_charged["fee_amount"], "13");
+        assert_eq!(v2_charged["fee_ppm"], 250);
+
+        let v2_rebated = payloads
+            .iter()
+            .find(|payload| payload["event_name"] == "FeeRebatedV2")
+            .expect("v2 rebated payload");
+        assert_eq!(v2_rebated["basis_amount"], "10000");
+        assert_eq!(v2_rebated["rebate_amount"], "5");
+        assert_eq!(v2_rebated["rebate_ppm"], -50);
+    }
+
+    /// V2E-I regression: reproduces the V2E-G live trade payload shape
+    /// (`premium=50_000`, taker=13, maker=3) and asserts both `FeeChargedV2`
+    /// payloads expose `basis_amount = "50000"`, the mixed model still
+    /// resolves to `source_priority = "v2"`, and per-tx totals match the
+    /// live values (`observed_total_charged = 16`).
+    #[test]
+    fn v2e_g_payloads_expose_basis_amount() {
+        let buyer = "0xc0a76c2a6c6b70c0b065a05e64417886416cc976";
+        let seller = "0xbaf0976a00a0dcc84df5b15d927695c8b014b1c3";
+        let events = [
+            v1_event(117, buyer, 13, false),
+            v1_event(124, seller, 3, true),
+            // Re-shape v2_charged_event with the V2E-G basis (50_000) by
+            // building the JSON directly; the helper hard-codes basis=10_000.
+            make_event(
+                "FeeChargedV2",
+                111,
+                serde_json::json!({
+                    "consumer": "0x287cef479be5889eefca847f9e73c860898f48cc",
+                    "trader": buyer,
+                    "recipient": "0xa67f8e8e673ce4bb2fb563b0e6e9fa8f70e3b588",
+                    "settlementAsset": "0x6eae407f5640b006fac9965182e238582a3b412e",
+                    "productKind": "option",
+                    "flowKind": "orderbook",
+                    "isMaker": false,
+                    "feePpm": 250,
+                    "basisAmount": "50000",
+                    "feeAmount": "13",
+                }),
+            ),
+            make_event(
+                "FeeChargedV2",
+                118,
+                serde_json::json!({
+                    "consumer": "0x287cef479be5889eefca847f9e73c860898f48cc",
+                    "trader": seller,
+                    "recipient": "0xa67f8e8e673ce4bb2fb563b0e6e9fa8f70e3b588",
+                    "settlementAsset": "0x6eae407f5640b006fac9965182e238582a3b412e",
+                    "productKind": "option",
+                    "flowKind": "orderbook",
+                    "isMaker": true,
+                    "feePpm": 50,
+                    "basisAmount": "50000",
+                    "feeAmount": "3",
+                }),
+            ),
+        ];
+
+        let normalized = normalize_fee_events(&events);
+        let aggregated = aggregate(&normalized);
+        assert_eq!(aggregated.event_model, "mixed");
+        assert_eq!(aggregated.source_priority, "v2");
+        assert_eq!(aggregated.charged_total, 16);
+        assert_eq!(aggregated.rebated_total, 0);
+        assert_eq!(aggregated.fee_charged_v2_count, 2);
+        assert_eq!(aggregated.fee_rebated_v2_count, 0);
+        assert_eq!(aggregated.trading_fee_event_count, 2);
+
+        let payloads = collect_event_payloads(&normalized);
+        let v2_payloads: Vec<&Value> = payloads
+            .iter()
+            .filter(|payload| payload["event_name"] == "FeeChargedV2")
+            .collect();
+        assert_eq!(v2_payloads.len(), 2);
+        for payload in v2_payloads {
+            assert_eq!(payload["basis_amount"], "50000");
+        }
+
+        // Lifecycle wrapper still surfaces the V2 totals + carries the
+        // per-event basis_amount through.
+        let lifecycle = summarize_fees_for_lifecycle(&events, "disabled");
+        assert_eq!(lifecycle.event_model, "mixed");
+        assert_eq!(lifecycle.source_priority, "v2");
+        assert_eq!(lifecycle.observed_total_charged, "16");
+        let lifecycle_v2_with_basis = lifecycle
+            .events
+            .iter()
+            .filter(|event| {
+                event["event_name"] == "FeeChargedV2" && event["basis_amount"] == "50000"
+            })
+            .count();
+        assert_eq!(lifecycle_v2_with_basis, 2);
     }
 }
