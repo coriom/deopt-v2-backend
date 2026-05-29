@@ -1,250 +1,327 @@
-# NEXT_TASK.md — FeesManagerV2 Deploy/Wire Preflight Against NEW MarginEngine V2E-A
+# NEXT_TASK.md — Tiny Option Trade Preflight With FeesManagerV2 Enabled V2E-F
 
 ## Context
 
-V2D-V validated the full V1-fee option execution path against NEW MarginEngine.
+FeesManagerV2 is now deployed, wired, indexed by backend config, and enabled on NEW MarginEngine.
 
-Current live state:
-- OLD_MARGIN_ENGINE = 0x6C5665De05e7314cB63cD77F82DFa86508A5b5F8
+Live state:
 - NEW_MARGIN_ENGINE = 0x287Cef479be5889eEfCa847F9e73C860898f48Cc
-- OptionMatchingEngine.marginEngine = NEW
-- CollateralVault.marginEngine = NEW
-- RiskModule.marginEngine = NEW
-- MatchingEngine.marginEngine = NEW
-- InsuranceFund NEW backstop enabled
-- RiskGovernor.marginEngine = NEW
-- backend MARGIN_ENGINE = NEW
-- event indexer cursor past NEW trade block
-- tiny trade against NEW succeeded and reconciled
+- FEES_MANAGER_V2 = 0x00dA0B9876bcBf0c79CB5BcAcfEBAFb8C7Ad774f
+- NEW.feesManagerV2() = FEES_MANAGER_V2
+- NEW.useFeesManagerV2() = true
+- FeesManagerV2.isFeeConsumer(NEW) = true
+- FeesManagerV2.merkleRoot() = bytes32(0)
+- FeesManagerV2.rebateBudget(BASE_COLLATERAL_TOKEN) = 0
+- Launch policy = Tier0 only
+- Negative maker tiers unreachable
+- Rebate probe deferred
 
-V2D-V tx:
-0x07a8e6795e2082ceabaa242543ee424cffd5037c0d918cf1a81bcee1b2d7de10
-
-V2D-V result:
-- receipt status = 1
-- lifecycle = reconciled
-- events indexed = 7
-- NEW MarginEngine event indexed
-- FeesManagerV2 disabled:
-  - NEW.feesManagerV2 = address(0)
-  - NEW.useFeesManagerV2 = false
-- V1 fee branch production-validated against NEW
+V2E-E enable tx:
+0x10c1acff8c496ee5b056b4cddb890bfdaef195569d7f16d04e12b6b6761a142d
 
 Goal:
-Prepare FeesManagerV2 deploy/wire/enable preflight against NEW MarginEngine.
+Prepare a tiny option trade preflight with FeesManagerV2 enabled.
 
-This task must not broadcast.
+This task must stop before broadcast.
+
+Expected fee behavior:
+- V2 fee path is used.
+- Tier0 positive fee behavior only.
+- FeeChargedV2 should be expected after live broadcast.
+- No FeeRebatedV2 expected.
+- No rebate budget needed.
+- No Merkle claim.
+- No negative maker tier reachable.
 
 ## Hard Rules
 
 Do not broadcast.
 Do not submit transactions.
-Do not deploy live.
-Do not call scripts with `--broadcast`.
-Do not enable FeesManagerV2 live.
-Do not call `setUseFeesManagerV2` live.
+Do not call `/options/execution-intents/:id/broadcast`.
+Do not call `/executor/broadcast`.
+Do not call `eth_sendRawTransaction`.
+Do not deploy.
+Do not modify Solidity.
 Do not modify frontend.
-Do not modify deployed contracts.
-Do not create option execution intents.
-Do not create option execution transactions.
-Do not call option broadcast endpoints.
+Do not disable FeesManagerV2.
+Do not fund rebate budget.
+Do not set Merkle root.
+Do not create more than one fresh valid tiny intent.
+Do not cleanup historical rows.
 Do not print private keys.
 Do not commit real `.env`.
 
 Allowed:
-- Solidity script dry-runs.
+- backend runtime env update.
+- backend restart.
 - read-only cast calls.
-- docs/config templates.
-- backend env plan documentation.
+- oracle refresh using established testnet mock feed script only if stale.
+- create one fresh tiny option execution intent.
+- sign buyer/seller payloads using existing flow.
+- calldata generation.
+- simulation.
+- gas estimate/safety preview.
+- docs.
 
 ## Repo
 
 Work in:
 
 ```text
-~/DEOPT/deopt-v2-sol
-Required Existing Files
-
-Read:
-
-src/fees/FeesManagerV2.sol
-src/fees/IFeesManagerV2.sol
-src/margin/MarginEngineAdmin.sol
-script/DeployFeesManagerV2.s.sol
-script/WireFeesManagerV2Option.s.sol
-docs/FEES_MANAGER_V2_DEPLOYMENT_PREFLIGHT_V2D_F.md
-docs/MARGIN_ENGINE_V2_TINY_TRADE_BROADCAST_RESULT_V2D_V.md
-Launch Policy
-
-Use conservative launch policy:
-
-Launch mode = Tier0 only
-Merkle root = bytes32(0)
-Initial rebate budget = 0
-Negative maker tiers unreachable
-Positive-fee probe only
-Rebate probe deferred
-Required Address Decisions
-
-Use:
-
-FEES_MANAGER_V2_FEE_RECIPIENT = ProtocolTimelock if already ratified in V2D-I
-FEES_MANAGER_V2_REBATE_FUNDING_ACCOUNT = same as feeRecipient
-NEW_MARGIN_ENGINE = 0x287Cef479be5889eEfCa847F9e73C860898f48Cc
-
-If ProtocolTimelock address is not present in docs/manifest, audit and record it.
-Do not invent unknowns.
-
-Step 1 — Live Read-only Checks
+~/DEOPT/deopt-v2-backend
+Step 1 — Runtime Env
 
 Load env without printing secrets:
 
-cd ~/DEOPT/deopt-v2-sol
+cd ~/DEOPT/deopt-v2-backend
 set -a
-source .env.base-sepolia
+source .env.cutover.v2d_s.local 2>/dev/null || source .env
 set +a
 
-Verify:
+Export:
 
-cast call 0x287Cef479be5889eEfCa847F9e73C860898f48Cc "owner()(address)" --rpc-url "$RPC_URL"
-cast call 0x287Cef479be5889eEfCa847F9e73C860898f48Cc "feesManagerV2()(address)" --rpc-url "$RPC_URL"
-cast call 0x287Cef479be5889eEfCa847F9e73C860898f48Cc "useFeesManagerV2()(bool)" --rpc-url "$RPC_URL"
-cast call 0x287Cef479be5889eEfCa847F9e73C860898f48Cc "feesManager()(address)" --rpc-url "$RPC_URL"
+export RPC_URL="<paid Base Sepolia RPC already set in shell>"
 
-Expected:
+export MARGIN_ENGINE=0x287Cef479be5889eEfCa847F9e73C860898f48Cc
+export OPTION_EVENT_INDEXER_MARGIN_ENGINE_ADDRESS=0x287Cef479be5889eEfCa847F9e73C860898f48Cc
 
-owner = deployer/governance owner
-feesManagerV2 = address(0)
-useFeesManagerV2 = false
-feesManager = V1 manager
+export FEES_MANAGER_V2=0x00dA0B9876bcBf0c79CB5BcAcfEBAFb8C7Ad774f
+export OPTION_EVENT_INDEXER_FEES_MANAGER_V2_ADDRESS=0x00dA0B9876bcBf0c79CB5BcAcfEBAFb8C7Ad774f
 
-Abort on mismatch.
+export OPTION_EVENT_INDEXER_ENABLED=true
+export OPTION_EVENT_INDEXER_REQUIRE_RPC=true
+export OPTION_EVENT_INDEXER_CONFIRMATION_BLOCKS=3
+export OPTION_EVENT_INDEXER_BATCH_BLOCKS=5000
 
-Step 2 — Deploy FeesManagerV2 Dry-run
+export OPTION_CONFIRMATION_WORKER_ENABLED=true
+export OPTION_RECONCILIATION_WORKER_ENABLED=true
+export OPTION_NONCE_SYNC_ENABLED=true
+export OPTION_NONCE_SYNC_REQUIRE_RPC=true
+export OPTION_NONCE_SYNC_STRICT=true
 
-Set env:
+export OPTION_EXECUTION_BROADCAST_ENABLED=true
+export EXECUTION_ENABLED=true
+export EXECUTOR_REAL_BROADCAST_ENABLED=true
+export EXECUTOR_DRY_RUN=false
 
-export DEPLOY_FEES_MANAGER_V2_CONFIRM=true
-export FUND_REBATE_BUDGET_CONFIRM=false
+export OPTION_EXECUTION_BROADCAST_GAS_LIMIT=1500000
+export OPTION_EXECUTION_GAS_SAFETY_BPS=12500
+export EXECUTOR_MAX_FEE_PER_GAS_WEI=1000000000
+export EXECUTOR_MAX_PRIORITY_FEE_PER_GAS_WEI=1000000
 
-export FEES_MANAGER_V2_FEE_RECIPIENT=<ProtocolTimelock>
-export FEES_MANAGER_V2_REBATE_FUNDING_ACCOUNT=<ProtocolTimelock>
+For this preflight, if agent cannot access EXECUTOR_PRIVATE_KEY, it must not ask for it in chat. Use preflight mode without broadcast surfaces if needed, or ask operator to launch backend manually with the key in shell.
 
-Run without broadcast:
-
-forge script script/DeployFeesManagerV2.s.sol:DeployFeesManagerV2 \
-  --rpc-url "$RPC_URL"
-
-Expected:
-
-deploy simulation complete.
-no broadcast.
-feeRecipient correct.
-rebateFundingAccount correct.
-rebateBudget = 0.
-owner correct.
-no MarginEngine wiring.
-Step 3 — Wire FeesManagerV2 Dry-run
-
-If deploy dry-run predicts a deterministic address, use it. Otherwise use placeholder and document that live deployed address is required after Phase 1 deploy.
-
-Set env:
-
-export FEES_MANAGER_V2_ADDRESS=<predicted-or-placeholder>
-export MARGIN_ENGINE_ADDRESS=0x287Cef479be5889eEfCa847F9e73C860898f48Cc
-export WIRE_FEES_MANAGER_V2_CONFIRM=true
-export ENABLE_FEES_MANAGER_V2_CONFIRM=false
-
-Run without broadcast:
-
-forge script script/WireFeesManagerV2Option.s.sol:WireFeesManagerV2Option \
-  --rpc-url "$RPC_URL"
-
-Expected:
-
-if address exists only in dry-run context, document limitation.
-planned calls:
-FeesManagerV2.setFeeConsumer(NEW_MARGIN_ENGINE,true)
-NEW_MARGIN_ENGINE.setFeesManagerV2(FEES_MANAGER_V2_ADDRESS)
-no setUseFeesManagerV2 when enable confirm=false.
-useFeesManagerV2 remains false.
-Step 4 — Enable Dry-run Separately
-
-Only simulate separate enable phase.
+Step 2 — Baseline
 
 Set:
 
-export ENABLE_FEES_MANAGER_V2_CONFIRM=true
+V2E_F_START_MS=$(date +%s%3N)
 
-Run wire script dry-run again without broadcast.
+Record DB counts:
+
+select count(*) as option_execution_intents from option_execution_intents;
+select count(*) as option_execution_transactions from option_execution_transactions;
+select count(*) as execution_transactions from execution_transactions;
+select count(*) as option_execution_events from option_execution_events;
+select count(*) as option_execution_reconciliations from option_execution_reconciliations;
+select count(*) as fee_events from fee_events;
+
+select last_indexed_block, last_error
+from option_event_indexer_state
+order by updated_at_ms desc
+limit 5;
+Step 3 — Start Backend
+
+Start/restart backend.
+
+Verify:
+
+curl -s http://127.0.0.1:8080/health
+
+curl -s http://127.0.0.1:8080/admin/config \
+  -H "X-Admin-Token: $ADMIN_TOKEN"
 
 Expected:
 
-includes NEW_MARGIN_ENGINE.setUseFeesManagerV2(true)
-no other unexpected calls.
-document as separate future phase.
-Required Backend Env Plan
+backend healthy.
+margin engine = NEW.
+feesManagerV2/indexer emitter = FEES_MANAGER_V2.
+broadcast surfaces may be enabled for preflight, but must not be called.
+no secrets exposed.
+Step 4 — On-chain V2 Checks
 
-After live FeesManagerV2 deploy, backend must set:
+Run read-only checks:
 
-OPTION_EVENT_INDEXER_FEES_MANAGER_V2_ADDRESS=<deployed FeesManagerV2>
-FEES_MANAGER_V2=<deployed FeesManagerV2>
+cast call 0x287Cef479be5889eEfCa847F9e73C860898f48Cc "feesManagerV2()(address)" --rpc-url "$RPC_URL"
+cast call 0x287Cef479be5889eEfCa847F9e73C860898f48Cc "useFeesManagerV2()(bool)" --rpc-url "$RPC_URL"
 
-Do not modify backend code in this task.
+cast call 0x00dA0B9876bcBf0c79CB5BcAcfEBAFb8C7Ad774f "isFeeConsumer(address)(bool)" 0x287Cef479be5889eEfCa847F9e73C860898f48Cc --rpc-url "$RPC_URL"
+cast call 0x00dA0B9876bcBf0c79CB5BcAcfEBAFb8C7Ad774f "merkleRoot()(bytes32)" --rpc-url "$RPC_URL"
+cast call 0x00dA0B9876bcBf0c79CB5BcAcfEBAFb8C7Ad774f "rebateBudget(address)(uint256)" <BASE_COLLATERAL_TOKEN> --rpc-url "$RPC_URL"
 
+Expected:
+
+feesManagerV2 = FEES_MANAGER_V2.
+useFeesManagerV2 = true.
+isFeeConsumer(NEW) = true.
+merkleRoot = bytes32(0).
+rebateBudget = 0.
+Step 5 — Oracle Freshness
+
+Check WETH/USDC oracle freshness with the existing read-only/preflight method.
+
+If stale:
+
+refresh testnet mock feeds using established script.
+re-check immediately.
+
+Abort if oracle cannot be fresh.
+
+Step 6 — Create Fresh Tiny Intent
+
+Create one fresh tiny option execution intent using the established option endpoint flow.
+
+Requirements:
+
+fresh buyer/seller nonces from on-chain sync.
+quantity = 1.
+premium high enough to produce a non-zero positive Tier0 V2 fee if possible.
+no rebate expectation.
+existing listed valid option series.
+buyer/seller funded.
+
+Important:
+If premium is too small and fees round to zero, document it and either:
+
+keep it as a no-fee V2 path preflight, or
+create a replacement intent only if the task explicitly records the first one as stale/invalid and does not exceed one fresh valid broadcast candidate.
+
+Preferred:
+
+one final valid candidate with expected positive FeeChargedV2.
+
+Record:
+
+intent_id.
+buyer/seller.
+buyer/seller nonces.
+option_id.
+quantity.
+premium.
+expected V2 fee behavior.
+Step 7 — Signatures / Calldata / Simulation
+
+Use existing flow:
+
+fetch EIP-712 payload.
+sign buyer.
+sign seller.
+submit strict signatures.
+fetch calldata.
+simulate.
+
+Expected:
+
+signatures accepted.
+calldata ready.
+simulation_status = simulation_ok.
+no revert.
+simulation targets OptionMatchingEngine -> NEW MarginEngine.
+expected V2 fee path.
+Step 8 — Gas Safety Preview
+
+Estimate gas and compute:
+
+required_gas = estimated_gas * EXECUTION_GAS_SAFETY_BPS / 10000
+
+Expected:
+
+OPTION_EXECUTION_BROADCAST_GAS_LIMIT >= required_gas.
+gas safety status = ok.
+executor balance enough.
+Step 9 — No Broadcast / No Forbidden Mutation Check
+
+Allowed:
+
+one new option_execution_intent.
+signature/calldata/simulation records for that intent.
+
+Forbidden:
+
+no option_execution_transactions.
+no execution_transactions.
+no broadcast tx hash.
+no confirmed/reconciled row for new intent.
+
+Query:
+
+select count(*) from option_execution_transactions where created_at_ms >= ${V2E_F_START_MS};
+select count(*) from execution_transactions where created_at_ms >= ${V2E_F_START_MS};
+
+Expected:
+
+both 0.
 Required Docs
 
 Create:
 
-docs/FEES_MANAGER_V2_NEW_MARGIN_ENGINE_PREFLIGHT_V2E_A.md
+docs/FEES_MANAGER_V2_TINY_TRADE_PREFLIGHT_V2E_F.md
 
-Update:
+Update if useful:
 
-docs/FEES_MANAGER_V2_DEPLOYMENT_PREFLIGHT_V2D_F.md
-docs/MARGIN_ENGINE_V2_TINY_TRADE_BROADCAST_RESULT_V2D_V.md if useful
+docs/FEES_MANAGER_V2_ENABLE_BROADCAST_RESULT_V2E_E.md
 
 Include:
 
-live NEW checks.
-deploy dry-run result.
-wire dry-run result.
-enable dry-run result.
-launch policy.
-backend env plan.
-final human approval prompts for:
-deploy FeesManagerV2 only
-wire FeesManagerV2 only
-enable FeesManagerV2 only
+runtime config summary.
+baseline DB counts.
+on-chain V2 checks.
+oracle freshness.
+fresh intent id.
+expected fee behavior.
+signature/calldata status.
+simulation result.
+gas safety preview.
 no-broadcast proof.
+remaining blocker before human V2 tiny broadcast.
 Validation
 
 Run:
 
-forge fmt --check
-forge build
-forge test
+cargo fmt --all
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets --all-features
+cargo build --all-targets --all-features
 Acceptance Criteria
 
 Complete only if:
 
-NEW engine live reads pass.
-FeesManagerV2 deploy dry-run passes.
-wire dry-run prepared.
-enable dry-run prepared as separate phase.
-no live broadcast.
-no live chain mutation.
+backend reports NEW + FeesManagerV2.
+on-chain useFeesManagerV2 = true.
+oracle fresh.
+one final valid tiny intent exists.
+signatures accepted.
+calldata ready.
+simulation_ok.
+gas safety ok.
+no broadcast endpoint called.
+no option_execution_transactions created.
+no generic execution_transactions created.
 docs created.
-validation passes.
+validations pass.
 Final Report
 
 Return:
 
-NEW engine checks.
-feeRecipient / rebateFundingAccount decision.
-deploy dry-run result.
-wire dry-run result.
-enable dry-run result.
-backend env plan.
+backend config summary.
+on-chain V2 checks.
+oracle status.
+tiny intent id.
+expected V2 fee behavior.
+signature/calldata status.
+simulation result.
+gas safety preview.
+no-broadcast verification.
 docs updated.
 validation commands run.
-remaining blocker before FeesManagerV2 deploy.
+remaining blocker before human V2 tiny broadcast.
