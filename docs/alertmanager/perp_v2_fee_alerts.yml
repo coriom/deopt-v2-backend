@@ -1,0 +1,81 @@
+# Prometheus alert rules for the V2F PERP V2 fee observability surface.
+#
+# Source-of-truth: docs/ALERTING_SPEC.md and the per-milestone docs
+# docs/PERP_V2_FEE_METRICS_ALERTING_V2F_P.md and
+# docs/PERP_V2_FEE_REBATE_METRICS_ALERTING_V2F_Q.md.
+#
+# Both metrics referenced below are emitted by the backend `/metrics`
+# endpoint and exercised in tests under `src/api/routes.rs::tests`:
+#
+#   deopt_perp_fee_charged_v2_total{consumer="new"|"old"|"unknown"}
+#   deopt_perp_fee_rebated_v2_total{consumer="new"|"old"|"unknown"}
+#
+# Cardinality contract (enforced by
+# src/fees/perp_consumer.rs::classify_perp_fee_consumer):
+#   - the `consumer` label is exactly one of "new", "old", "unknown".
+#   - no raw addresses, tx hashes, traders, recipients, settlement
+#     assets, intent IDs, or option IDs are promoted to labels.
+#
+# Severity guidance per environment:
+#   - Base Sepolia: keep `severity: high` (current value below).
+#   - mainnet: override to `severity: critical`.
+#
+# Runbook: docs/RUNBOOK_PERP_V2_FEE_ALERTS.md
+groups:
+  - name: deopt_perp_v2_fee_alerts
+    rules:
+      - alert: PerpFeeChargedFromOldEngine
+        expr: increase(deopt_perp_fee_charged_v2_total{consumer="old"}[5m]) > 0
+        for: 0m
+        labels:
+          severity: high
+          subsystem: perp_v2_fees
+          milestone: V2F-O
+        annotations:
+          summary: "PERP FeeChargedV2 emitted from OLD stranded PerpEngine"
+          description: >-
+            OLD PerpEngine should not emit new PERP V2 fee events after the A3
+            fallback cutover. Snapshot FeesManagerV2.feeConsumers() and
+            useFeesManagerV2() on every engine, then verify wiring against the
+            V2F-LM acceptance state. See
+            docs/RUNBOOK_PERP_V2_FEE_ALERTS.md.
+          runbook_url: "docs/RUNBOOK_PERP_V2_FEE_ALERTS.md#perpfeechargedfromoldengine"
+
+      - alert: PerpFeeRebatedFromOldEngine
+        expr: increase(deopt_perp_fee_rebated_v2_total{consumer="old"}[5m]) > 0
+        for: 0m
+        labels:
+          severity: high
+          subsystem: perp_v2_fees
+          milestone: V2F-Q
+        annotations:
+          summary: "PERP FeeRebatedV2 emitted from OLD stranded PerpEngine"
+          description: >-
+            OLD PerpEngine should not emit new PERP V2 rebate events after the
+            A3 fallback cutover. Treat the same as the charged-event alert:
+            snapshot FeesManagerV2 wiring on every engine and compare to the
+            V2F-LM acceptance state. See
+            docs/RUNBOOK_PERP_V2_FEE_ALERTS.md.
+          runbook_url: "docs/RUNBOOK_PERP_V2_FEE_ALERTS.md#perpfeerebatedfromoldengine"
+
+      - alert: PerpFeeConsumerUnknown
+        expr: |
+          increase(deopt_perp_fee_charged_v2_total{consumer="unknown"}[5m])
+          + increase(deopt_perp_fee_rebated_v2_total{consumer="unknown"}[5m])
+          > 0
+        for: 0m
+        labels:
+          severity: medium
+          subsystem: perp_v2_fees
+          milestone: V2F-Q
+        annotations:
+          summary: "PERP V2 fee event emitted from unknown consumer"
+          description: >-
+            FeesManagerV2 fired a PERP fee or rebate whose consumer matches
+            neither the configured NEW (PERP_ENGINE_ADDRESS) nor OLD
+            (OLD_PERP_ENGINE_ADDRESS) engine. Either (a) the env var
+            configuration drifted, or (b) a third engine has been registered as
+            a FeesManagerV2 consumer. Reconcile env vars with the contract
+            state before escalating. See
+            docs/RUNBOOK_PERP_V2_FEE_ALERTS.md.
+          runbook_url: "docs/RUNBOOK_PERP_V2_FEE_ALERTS.md#perpfeeconsumerunknown"

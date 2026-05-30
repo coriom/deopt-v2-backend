@@ -740,6 +740,51 @@ impl OptionSeriesStore {
         events
     }
 
+    /// V2F-P: in-memory mirror of
+    /// `PgRepository::admin_perp_fee_v2_consumer_counts`.
+    ///
+    /// Returns the count of PERP `FeeChargedV2` events grouped by the
+    /// lowercased decoded `consumer` topic. Rebates and OPTION-flavoured
+    /// FeeChargedV2 events are excluded.
+    pub fn perp_fee_v2_consumer_counts(&self) -> std::collections::BTreeMap<String, u64> {
+        self.perp_fee_v2_consumer_counts_for_event("FeeChargedV2")
+    }
+
+    /// V2F-Q: in-memory mirror of
+    /// `PgRepository::admin_perp_fee_v2_rebated_consumer_counts`.
+    ///
+    /// Returns the count of PERP `FeeRebatedV2` events grouped by the
+    /// lowercased decoded `consumer` topic. `FeeChargedV2` rows and
+    /// OPTION-flavoured `FeeRebatedV2` rows are excluded.
+    pub fn perp_fee_v2_rebated_consumer_counts(&self) -> std::collections::BTreeMap<String, u64> {
+        self.perp_fee_v2_consumer_counts_for_event("FeeRebatedV2")
+    }
+
+    fn perp_fee_v2_consumer_counts_for_event(
+        &self,
+        event_name: &str,
+    ) -> std::collections::BTreeMap<String, u64> {
+        let mut counts: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+        for event in self.option_execution_events.values() {
+            if event.event_name != event_name {
+                continue;
+            }
+            let Some(decoded) = event.decoded.as_ref() else {
+                continue;
+            };
+            if decoded.get("productKind").and_then(|value| value.as_str()) != Some("perp") {
+                continue;
+            }
+            let consumer = decoded
+                .get("consumer")
+                .and_then(|value| value.as_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            *counts.entry(consumer).or_default() += 1;
+        }
+        counts
+    }
+
     pub fn list_option_execution_events_by_tx_hash(
         &self,
         tx_hash: &str,

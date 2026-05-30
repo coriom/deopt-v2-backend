@@ -800,6 +800,69 @@ impl PgRepository {
         Ok(counts)
     }
 
+    /// V2F-P: returns the raw `decoded.consumer` strings of every
+    /// indexed PERP `FeeChargedV2` event paired with their occurrence
+    /// counts. Callers (currently `monitoring::append_fee_metrics`)
+    /// classify each consumer address into one of `new`/`old`/
+    /// `unknown` buckets before promoting it to a metric label, so the
+    /// raw address never reaches Prometheus.
+    ///
+    /// Filters in SQL:
+    /// - `event_name = 'FeeChargedV2'`
+    /// - `decoded->>'productKind' = 'perp'`
+    ///
+    /// Rebates (`FeeRebatedV2`) and OPTION-flavoured `FeeChargedV2`
+    /// events are excluded by construction.
+    pub async fn admin_perp_fee_v2_consumer_counts(&self) -> Result<BTreeMap<String, u64>> {
+        self.admin_perp_fee_v2_consumer_counts_for_event("FeeChargedV2")
+            .await
+    }
+
+    /// V2F-Q: mirror of `admin_perp_fee_v2_consumer_counts` but filtered
+    /// on `FeeRebatedV2` PERP events. Feeds the
+    /// `deopt_perp_fee_rebated_v2_total{consumer=...}` metric.
+    pub async fn admin_perp_fee_v2_rebated_consumer_counts(&self) -> Result<BTreeMap<String, u64>> {
+        self.admin_perp_fee_v2_consumer_counts_for_event("FeeRebatedV2")
+            .await
+    }
+
+    /// V2F-Q internal helper: SQL group-by `decoded.consumer` for the
+    /// given `event_name`, filtered to `productKind = 'perp'`. Caller
+    /// picks the event name ("FeeChargedV2" or "FeeRebatedV2"); other
+    /// event names are excluded by construction.
+    async fn admin_perp_fee_v2_consumer_counts_for_event(
+        &self,
+        event_name: &'static str,
+    ) -> Result<BTreeMap<String, u64>> {
+        // Guard the event_name allowlist defensively even though all
+        // call sites pass `&'static str` literals.
+        debug_assert!(matches!(event_name, "FeeChargedV2" | "FeeRebatedV2"));
+        if !self.admin_table_exists("option_execution_events").await? {
+            return Ok(BTreeMap::new());
+        }
+        let rows = sqlx::query(
+            "SELECT lower(COALESCE(decoded->>'consumer', '')) AS consumer, COUNT(*) AS count
+             FROM option_execution_events
+             WHERE event_name = $1
+               AND decoded->>'productKind' = 'perp'
+             GROUP BY consumer",
+        )
+        .bind(event_name)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        let mut counts = BTreeMap::new();
+        for row in rows {
+            let consumer: Option<String> = row_get(&row, "consumer")?;
+            let count: i64 = row_get(&row, "count")?;
+            counts.insert(
+                consumer.unwrap_or_default(),
+                i64_to_u64_persistence("count", count)?,
+            );
+        }
+        Ok(counts)
+    }
+
     pub async fn admin_count_fee_events_by_source(
         &self,
         source_type: &str,

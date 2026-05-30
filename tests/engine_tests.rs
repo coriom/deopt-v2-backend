@@ -1117,6 +1117,7 @@ fn simulation_config_without_persistence_requirement() -> ExecutionConfig {
         executor_from_address: AccountId::new("0x0000000000000000000000000000000000000000"),
         perp_matching_engine_address: AccountId::new("0x0000000000000000000000000000000000000009"),
         perp_engine_address: AccountId::new("0x0000000000000000000000000000000000000000"),
+        old_perp_engine_address: None,
     }
 }
 

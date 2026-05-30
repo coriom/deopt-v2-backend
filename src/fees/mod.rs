@@ -1,7 +1,11 @@
 pub mod onchain_summary;
+pub mod perp_consumer;
 pub mod schedule;
 pub mod service;
 pub mod store;
+pub mod tier_eligibility;
+pub mod tier_merkle;
+pub mod tier_snapshot;
 pub mod types;
 
 pub use schedule::{

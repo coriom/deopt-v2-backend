@@ -2363,6 +2363,26 @@ mod tests {
         assert_eq!(event.premium_per_contract_native.as_deref(), Some("25"));
     }
 
+    /// V2F-N: a PERP FeeChargedV2 log emitted by FeesManagerV2 when
+    /// PerpEngineV2 calls `chargeFee` decodes with `productKind = "perp"`
+    /// and `flowKind = "orderbook"`. Reproduces the V2F-LM live taker leg
+    /// (`feePpm = 300`, `basisAmount = 30`, `feeAmount = 1`).
+    #[test]
+    fn fee_charged_v2_perp_log_decodes_with_perp_product_kind() {
+        let log = fee_charged_v2_perp_log(42_188_599, 0);
+        let event = decode_option_execution_event(&log, 84532).unwrap().unwrap();
+        assert_eq!(event.event_name, "FeeChargedV2");
+        let decoded = event.decoded.expect("decoded");
+        assert_eq!(decoded["productKind"], "perp");
+        assert_eq!(decoded["productKindRaw"], 1);
+        assert_eq!(decoded["flowKind"], "orderbook");
+        assert_eq!(decoded["flowKindRaw"], 0);
+        assert_eq!(decoded["isMaker"], false);
+        assert_eq!(decoded["feePpm"], 300);
+        assert_eq!(decoded["basisAmount"], "30");
+        assert_eq!(decoded["feeAmount"], "1");
+    }
+
     #[test]
     fn fee_rebated_v2_log_decodes_negative_ppm_and_amount() {
         let log = fee_rebated_v2_log(15, 7);
@@ -2572,6 +2592,38 @@ mod tests {
                 "0x2222222222222222222222222222222222222222222222222222222222222222".to_string(),
             ),
             transaction_hash: Some(tx_hash().to_string()),
+            log_index: Some(hex_quantity(log_index)),
+        }
+    }
+
+    /// V2F-N: a PERP-flavoured FeeChargedV2 log mirroring the V2F-LM smoke
+    /// transaction's taker leg on Base Sepolia.
+    fn fee_charged_v2_perp_log(block_number: u64, log_index: u64) -> EthLog {
+        EthLog {
+            address: "0x00da0b9876bcbf0c79cb5bcacfebafb8c7ad774f".to_string(),
+            topics: vec![
+                fee_charged_v2_topic0(),
+                topic_address("c6c592100723fe0c66343a16e95ec34cc0c2141c"),
+                topic_address("8b94a83d1ad3bd2337b1886e7962ca8e0bba9a34"),
+                topic_address("009f38440f058d095b61e0e2ee7fabdf05be7500"),
+            ],
+            data: format!(
+                "0x{}{}{}{}{}{}{}",
+                topic_address_no_prefix("6eae407f5640b006fac9965182e238582a3b412e"),
+                word_no_prefix(1), // productKind: PERP
+                word_no_prefix(0), // flowKind: ORDERBOOK
+                word_no_prefix(0), // isMaker: false
+                signed_word(300),  // feePpm
+                word_no_prefix(30),
+                word_no_prefix(1),
+            ),
+            block_number: Some(hex_quantity(block_number)),
+            block_hash: Some(
+                "0x3333333333333333333333333333333333333333333333333333333333333333".to_string(),
+            ),
+            transaction_hash: Some(
+                "0x400acedf36381034ae37c983cc50e80d11a81587ca8065fbaef40293ff63a79a".to_string(),
+            ),
             log_index: Some(hex_quantity(log_index)),
         }
     }

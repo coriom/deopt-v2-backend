@@ -400,10 +400,16 @@ async fn append_option_metrics(state: &AppState, metrics: &mut MetricsText) -> R
 async fn append_fee_metrics(state: &AppState, metrics: &mut MetricsText) -> Result<()> {
     let fee_counts;
     let rebate_status_counts;
+    let perp_charged_raw_counts: BTreeMap<String, u64>;
+    let perp_rebated_raw_counts: BTreeMap<String, u64>;
     if let Some(repository) = metrics_repository(state).await {
         fee_counts = repository.admin_fee_event_label_counts().await?;
         rebate_status_counts = repository
             .admin_count_by_column("rebate_accruals", "status")
+            .await?;
+        perp_charged_raw_counts = repository.admin_perp_fee_v2_consumer_counts().await?;
+        perp_rebated_raw_counts = repository
+            .admin_perp_fee_v2_rebated_consumer_counts()
             .await?;
     } else {
         let store = state
@@ -420,6 +426,13 @@ async fn append_fee_metrics(state: &AppState, metrics: &mut MetricsText) -> Resu
         }
         fee_counts = counts;
         rebate_status_counts = rebate_counts;
+        drop(store);
+        let options_store = state
+            .options_store
+            .lock()
+            .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?;
+        perp_charged_raw_counts = options_store.perp_fee_v2_consumer_counts();
+        perp_rebated_raw_counts = options_store.perp_fee_v2_rebated_consumer_counts();
     }
 
     metrics.fee_event_gauges(&fee_counts);
@@ -428,7 +441,82 @@ async fn append_fee_metrics(state: &AppState, metrics: &mut MetricsText) -> Resu
         "Rebate accruals by status.",
         &[("status", &rebate_status_counts)],
     );
+    append_perp_fee_v2_consumer_metric(
+        state,
+        metrics,
+        "deopt_perp_fee_charged_v2_total",
+        "PERP FeeChargedV2 events bucketed by consumer engine (new=current, old=stranded, unknown=neither).",
+        &perp_charged_raw_counts,
+    );
+    append_perp_fee_v2_consumer_metric(
+        state,
+        metrics,
+        "deopt_perp_fee_rebated_v2_total",
+        "PERP FeeRebatedV2 events bucketed by consumer engine (new=current, old=stranded, unknown=neither).",
+        &perp_rebated_raw_counts,
+    );
     Ok(())
+}
+
+/// V2F-P / V2F-Q: collapse the raw `decoded.consumer` strings returned
+/// by the repository / store into the three low-cardinality buckets
+/// (`"new"`, `"old"`, `"unknown"`) and emit a gauge named `metric_name`.
+///
+/// Always emits all three label values (even when their count is zero)
+/// so Prometheus alert rules of the shape
+/// `increase(<metric>{consumer="old"}[5m]) > 0` have a stable time
+/// series from the first scrape. Raw addresses are never promoted to a
+/// label value.
+///
+/// Used for both the V2F-P PERP `FeeChargedV2` metric
+/// (`deopt_perp_fee_charged_v2_total`) and the V2F-Q PERP
+/// `FeeRebatedV2` metric (`deopt_perp_fee_rebated_v2_total`); the only
+/// thing that differs between the two is which event family the
+/// `raw_counts` map reflects.
+fn append_perp_fee_v2_consumer_metric(
+    state: &AppState,
+    metrics: &mut MetricsText,
+    metric_name: &'static str,
+    metric_help: &'static str,
+    raw_counts: &BTreeMap<String, u64>,
+) {
+    use crate::fees::perp_consumer::{
+        classify_perp_fee_consumer, CONSUMER_NEW, CONSUMER_OLD, CONSUMER_UNKNOWN,
+    };
+
+    let new_addr = non_zero_address(&state.execution_config.perp_engine_address.0);
+    let old_addr = state
+        .execution_config
+        .old_perp_engine_address
+        .as_ref()
+        .and_then(|addr| non_zero_address(&addr.0));
+
+    let mut bucketed: BTreeMap<String, u64> = BTreeMap::new();
+    bucketed.insert(CONSUMER_NEW.to_string(), 0);
+    bucketed.insert(CONSUMER_OLD.to_string(), 0);
+    bucketed.insert(CONSUMER_UNKNOWN.to_string(), 0);
+    for (consumer, count) in raw_counts {
+        let bucket = classify_perp_fee_consumer(consumer, new_addr, old_addr);
+        let entry = bucketed.entry(bucket.to_string()).or_default();
+        *entry = entry.saturating_add(*count);
+    }
+
+    metrics.labeled_gauges(metric_name, metric_help, &[("consumer", &bucketed)]);
+}
+
+fn non_zero_address(address: &str) -> Option<&str> {
+    let trimmed = address.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let stripped = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+        .unwrap_or(trimmed);
+    if !stripped.is_empty() && stripped.bytes().all(|byte| byte == b'0') {
+        return None;
+    }
+    Some(trimmed)
 }
 
 fn append_mm_metrics(state: &AppState, metrics: &mut MetricsText) -> Result<()> {

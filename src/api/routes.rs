@@ -4598,6 +4598,372 @@ mod tests {
         assert!(!body.contains(uuid));
     }
 
+    /// V2F-P: the `deopt_perp_fee_charged_v2_total{consumer=...}` metric
+    /// is always emitted with the three low-cardinality bucket labels
+    /// (`new`, `old`, `unknown`) — even when no PERP fee events have
+    /// been indexed yet — so the
+    /// `increase(...{consumer="old"}[5m]) > 0` Prometheus rule has a
+    /// stable time series to alert on from the first scrape.
+    #[tokio::test]
+    async fn perp_fee_charged_v2_metric_emits_three_buckets_at_zero() {
+        let state = admin_state(false);
+        let response = router(state)
+            .oneshot(get_request("/metrics", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_text(response).await;
+        assert!(body
+            .contains("# HELP deopt_perp_fee_charged_v2_total PERP FeeChargedV2 events bucketed"));
+        assert!(body.contains("# TYPE deopt_perp_fee_charged_v2_total gauge"));
+        assert!(body.contains("deopt_perp_fee_charged_v2_total{consumer=\"new\"} 0"));
+        assert!(body.contains("deopt_perp_fee_charged_v2_total{consumer=\"old\"} 0"));
+        assert!(body.contains("deopt_perp_fee_charged_v2_total{consumer=\"unknown\"} 0"));
+    }
+
+    /// V2F-P: a NEW-emitted PERP `FeeChargedV2` lands in the `new`
+    /// bucket. An OPTION-flavoured FeeChargedV2 must not contribute to
+    /// this counter, and a `FeeRebatedV2` must not contribute either.
+    #[tokio::test]
+    async fn perp_fee_charged_v2_metric_classifies_new_and_excludes_option_and_rebate() {
+        let new_perp_engine = "0xc6c592100723fe0c66343a16e95ec34cc0c2141c";
+        let old_perp_engine = "0xb36395b67d0798ada981731c9fa5239f4362b53b";
+        let mut state = admin_state(false);
+        state.execution_config.perp_engine_address = AccountId::new(new_perp_engine);
+        state.execution_config.old_perp_engine_address = Some(AccountId::new(old_perp_engine));
+
+        let tx_hash =
+            "0x400acedf36381034ae37c983cc50e80d11a81587ca8065fbaef40293ff63a79a".to_string();
+        let perp_new = build_fee_charged_v2_perp_log_row(
+            1,
+            tx_hash.as_str(),
+            183,
+            "0x8b94a83d1ad3bd2337b1886e7962ca8e0bba9a34",
+            1,
+            300,
+            false,
+        );
+        let option_v2 = build_fee_charged_v2_log_row(
+            5,
+            "0x1100000000000000000000000000000000000000000000000000000000000000",
+            7,
+            "0xc0a76c2a00000000000000000000000000000000",
+            25,
+            250,
+            false,
+        );
+        let rebate = build_fee_rebated_v2_log_row(
+            8,
+            "0x2200000000000000000000000000000000000000000000000000000000000000",
+            9,
+            "0xbaf0976a00000000000000000000000000000000",
+            5,
+            -50,
+        );
+        state
+            .options_store
+            .lock()
+            .unwrap()
+            .persist_option_execution_events_and_cursor(
+                OPTION_EVENT_INDEXER_STATE_ID,
+                &[perp_new, option_v2, rebate],
+                42_188_599,
+                1,
+            );
+
+        let response = router(state)
+            .oneshot(get_request("/metrics", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_text(response).await;
+        // PERP NEW FeeChargedV2 is counted once.
+        assert!(body.contains("deopt_perp_fee_charged_v2_total{consumer=\"new\"} 1"));
+        // No PERP event was emitted by OLD; `old` stays at zero.
+        assert!(body.contains("deopt_perp_fee_charged_v2_total{consumer=\"old\"} 0"));
+        assert!(body.contains("deopt_perp_fee_charged_v2_total{consumer=\"unknown\"} 0"));
+        // Raw consumer/trader addresses must NOT appear anywhere in
+        // the rendered metric output — labels must stay low-cardinality.
+        assert!(!body.contains(new_perp_engine));
+        assert!(!body.contains(old_perp_engine));
+        assert!(!body.contains("0x8b94a83d1ad3bd2337b1886e7962ca8e0bba9a34"));
+        assert!(!body.contains("0xbaf0976a00000000000000000000000000000000"));
+    }
+
+    /// V2F-P: an OLD-emitted PERP `FeeChargedV2` lands in the `old`
+    /// bucket. This is the scenario the
+    /// `perp_fee_charged_from_old_engine` Prometheus alert must fire
+    /// on.
+    #[tokio::test]
+    async fn perp_fee_charged_v2_metric_classifies_old_consumer() {
+        let new_perp_engine = "0xc6c592100723fe0c66343a16e95ec34cc0c2141c";
+        let old_perp_engine = "0xb36395b67d0798ada981731c9fa5239f4362b53b";
+        let mut state = admin_state(false);
+        state.execution_config.perp_engine_address = AccountId::new(new_perp_engine);
+        state.execution_config.old_perp_engine_address = Some(AccountId::new(old_perp_engine));
+
+        let perp_old_event = build_fee_charged_v2_perp_log_row_for_consumer(
+            7,
+            "0x9999999999999999999999999999999999999999999999999999999999999999",
+            42,
+            old_perp_engine,
+            "0x8b94a83d1ad3bd2337b1886e7962ca8e0bba9a34",
+            1,
+            300,
+            false,
+        );
+        state
+            .options_store
+            .lock()
+            .unwrap()
+            .persist_option_execution_events_and_cursor(
+                OPTION_EVENT_INDEXER_STATE_ID,
+                &[perp_old_event],
+                42_200_000,
+                1,
+            );
+
+        let response = router(state)
+            .oneshot(get_request("/metrics", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_text(response).await;
+        assert!(body.contains("deopt_perp_fee_charged_v2_total{consumer=\"new\"} 0"));
+        assert!(body.contains("deopt_perp_fee_charged_v2_total{consumer=\"old\"} 1"));
+        assert!(body.contains("deopt_perp_fee_charged_v2_total{consumer=\"unknown\"} 0"));
+        // Raw OLD address must not leak into the rendered metric.
+        assert!(!body.contains(old_perp_engine));
+    }
+
+    /// V2F-P: a PERP `FeeChargedV2` whose consumer matches neither the
+    /// configured NEW nor OLD engine lands in the `unknown` bucket.
+    #[tokio::test]
+    async fn perp_fee_charged_v2_metric_classifies_unknown_consumer() {
+        let new_perp_engine = "0xc6c592100723fe0c66343a16e95ec34cc0c2141c";
+        let old_perp_engine = "0xb36395b67d0798ada981731c9fa5239f4362b53b";
+        let stray_consumer = "0xdeadbeef00000000000000000000000000000001";
+        let mut state = admin_state(false);
+        state.execution_config.perp_engine_address = AccountId::new(new_perp_engine);
+        state.execution_config.old_perp_engine_address = Some(AccountId::new(old_perp_engine));
+
+        let perp_unknown = build_fee_charged_v2_perp_log_row_for_consumer(
+            11,
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            13,
+            stray_consumer,
+            "0x8b94a83d1ad3bd2337b1886e7962ca8e0bba9a34",
+            1,
+            300,
+            false,
+        );
+        state
+            .options_store
+            .lock()
+            .unwrap()
+            .persist_option_execution_events_and_cursor(
+                OPTION_EVENT_INDEXER_STATE_ID,
+                &[perp_unknown],
+                42_200_001,
+                1,
+            );
+
+        let response = router(state)
+            .oneshot(get_request("/metrics", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_text(response).await;
+        assert!(body.contains("deopt_perp_fee_charged_v2_total{consumer=\"new\"} 0"));
+        assert!(body.contains("deopt_perp_fee_charged_v2_total{consumer=\"old\"} 0"));
+        assert!(body.contains("deopt_perp_fee_charged_v2_total{consumer=\"unknown\"} 1"));
+        // Neither the configured nor the stray address leaks as a
+        // label value.
+        assert!(!body.contains(new_perp_engine));
+        assert!(!body.contains(old_perp_engine));
+        assert!(!body.contains(stray_consumer));
+    }
+
+    /// V2F-Q: the `deopt_perp_fee_rebated_v2_total{consumer=...}`
+    /// metric is always emitted with the three low-cardinality bucket
+    /// labels (`new`, `old`, `unknown`) — even on an empty backend —
+    /// so the `PerpFeeRebatedFromOldEngine` Prometheus rule has a
+    /// stable time series to alert on from the first scrape.
+    #[tokio::test]
+    async fn perp_fee_rebated_v2_metric_emits_three_buckets_at_zero() {
+        let state = admin_state(false);
+        let response = router(state)
+            .oneshot(get_request("/metrics", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_text(response).await;
+        assert!(body
+            .contains("# HELP deopt_perp_fee_rebated_v2_total PERP FeeRebatedV2 events bucketed"));
+        assert!(body.contains("# TYPE deopt_perp_fee_rebated_v2_total gauge"));
+        assert!(body.contains("deopt_perp_fee_rebated_v2_total{consumer=\"new\"} 0"));
+        assert!(body.contains("deopt_perp_fee_rebated_v2_total{consumer=\"old\"} 0"));
+        assert!(body.contains("deopt_perp_fee_rebated_v2_total{consumer=\"unknown\"} 0"));
+    }
+
+    /// V2F-Q: a NEW-emitted PERP `FeeRebatedV2` lands in the `new`
+    /// bucket; an OPTION-flavoured `FeeRebatedV2` and a PERP
+    /// `FeeChargedV2` both stay excluded from the rebate counter.
+    #[tokio::test]
+    async fn perp_fee_rebated_v2_metric_classifies_new_and_excludes_option_and_charged() {
+        let new_perp_engine = "0xc6c592100723fe0c66343a16e95ec34cc0c2141c";
+        let old_perp_engine = "0xb36395b67d0798ada981731c9fa5239f4362b53b";
+        let mut state = admin_state(false);
+        state.execution_config.perp_engine_address = AccountId::new(new_perp_engine);
+        state.execution_config.old_perp_engine_address = Some(AccountId::new(old_perp_engine));
+
+        let tx_hash =
+            "0x9123000000000000000000000000000000000000000000000000000000000001".to_string();
+        let perp_rebate_new = build_fee_rebated_v2_perp_log_row(
+            1,
+            tx_hash.as_str(),
+            190,
+            "0x475fe397fa56884952d350aa9ee1c3946964bc0c",
+            5,
+            -50,
+        );
+        let option_rebate = build_fee_rebated_v2_log_row(
+            2,
+            "0x9123000000000000000000000000000000000000000000000000000000000002",
+            5,
+            "0xbaf0976a00000000000000000000000000000000",
+            5,
+            -50,
+        );
+        let perp_charged = build_fee_charged_v2_perp_log_row(
+            3,
+            "0x9123000000000000000000000000000000000000000000000000000000000003",
+            4,
+            "0x8b94a83d1ad3bd2337b1886e7962ca8e0bba9a34",
+            1,
+            300,
+            false,
+        );
+        state
+            .options_store
+            .lock()
+            .unwrap()
+            .persist_option_execution_events_and_cursor(
+                OPTION_EVENT_INDEXER_STATE_ID,
+                &[perp_rebate_new, option_rebate, perp_charged],
+                42_188_700,
+                1,
+            );
+
+        let response = router(state)
+            .oneshot(get_request("/metrics", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_text(response).await;
+        // PERP rebate from NEW: counted once.
+        assert!(body.contains("deopt_perp_fee_rebated_v2_total{consumer=\"new\"} 1"));
+        assert!(body.contains("deopt_perp_fee_rebated_v2_total{consumer=\"old\"} 0"));
+        assert!(body.contains("deopt_perp_fee_rebated_v2_total{consumer=\"unknown\"} 0"));
+        // The PERP FeeChargedV2 must NOT inflate the rebate counter,
+        // but it must still inflate the charged counter.
+        assert!(body.contains("deopt_perp_fee_charged_v2_total{consumer=\"new\"} 1"));
+        // Raw addresses must not appear anywhere in the rendered body.
+        assert!(!body.contains(new_perp_engine));
+        assert!(!body.contains(old_perp_engine));
+        assert!(!body.contains("0x475fe397fa56884952d350aa9ee1c3946964bc0c"));
+        assert!(!body.contains("0xbaf0976a00000000000000000000000000000000"));
+        assert!(!body.contains("0x8b94a83d1ad3bd2337b1886e7962ca8e0bba9a34"));
+    }
+
+    /// V2F-Q: a PERP `FeeRebatedV2` emitted by OLD lands in the `old`
+    /// bucket — this is what `PerpFeeRebatedFromOldEngine` must fire on.
+    #[tokio::test]
+    async fn perp_fee_rebated_v2_metric_classifies_old_consumer() {
+        let new_perp_engine = "0xc6c592100723fe0c66343a16e95ec34cc0c2141c";
+        let old_perp_engine = "0xb36395b67d0798ada981731c9fa5239f4362b53b";
+        let mut state = admin_state(false);
+        state.execution_config.perp_engine_address = AccountId::new(new_perp_engine);
+        state.execution_config.old_perp_engine_address = Some(AccountId::new(old_perp_engine));
+
+        let perp_rebate_old = build_fee_rebated_v2_perp_log_row_for_consumer(
+            9,
+            "0x9123000000000000000000000000000000000000000000000000000000000004",
+            44,
+            old_perp_engine,
+            "0x475fe397fa56884952d350aa9ee1c3946964bc0c",
+            5,
+            -50,
+        );
+        state
+            .options_store
+            .lock()
+            .unwrap()
+            .persist_option_execution_events_and_cursor(
+                OPTION_EVENT_INDEXER_STATE_ID,
+                &[perp_rebate_old],
+                42_200_000,
+                1,
+            );
+
+        let response = router(state)
+            .oneshot(get_request("/metrics", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_text(response).await;
+        assert!(body.contains("deopt_perp_fee_rebated_v2_total{consumer=\"new\"} 0"));
+        assert!(body.contains("deopt_perp_fee_rebated_v2_total{consumer=\"old\"} 1"));
+        assert!(body.contains("deopt_perp_fee_rebated_v2_total{consumer=\"unknown\"} 0"));
+        // Raw OLD address must not appear anywhere in the rendered metric.
+        assert!(!body.contains(old_perp_engine));
+    }
+
+    /// V2F-Q: a PERP `FeeRebatedV2` whose consumer matches neither the
+    /// configured NEW nor OLD engine lands in the `unknown` bucket.
+    #[tokio::test]
+    async fn perp_fee_rebated_v2_metric_classifies_unknown_consumer() {
+        let new_perp_engine = "0xc6c592100723fe0c66343a16e95ec34cc0c2141c";
+        let old_perp_engine = "0xb36395b67d0798ada981731c9fa5239f4362b53b";
+        let stray_consumer = "0xdeadbeef00000000000000000000000000000002";
+        let mut state = admin_state(false);
+        state.execution_config.perp_engine_address = AccountId::new(new_perp_engine);
+        state.execution_config.old_perp_engine_address = Some(AccountId::new(old_perp_engine));
+
+        let perp_rebate_unknown = build_fee_rebated_v2_perp_log_row_for_consumer(
+            13,
+            "0x9123000000000000000000000000000000000000000000000000000000000005",
+            17,
+            stray_consumer,
+            "0x475fe397fa56884952d350aa9ee1c3946964bc0c",
+            5,
+            -50,
+        );
+        state
+            .options_store
+            .lock()
+            .unwrap()
+            .persist_option_execution_events_and_cursor(
+                OPTION_EVENT_INDEXER_STATE_ID,
+                &[perp_rebate_unknown],
+                42_200_001,
+                1,
+            );
+
+        let response = router(state)
+            .oneshot(get_request("/metrics", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_text(response).await;
+        assert!(body.contains("deopt_perp_fee_rebated_v2_total{consumer=\"new\"} 0"));
+        assert!(body.contains("deopt_perp_fee_rebated_v2_total{consumer=\"old\"} 0"));
+        assert!(body.contains("deopt_perp_fee_rebated_v2_total{consumer=\"unknown\"} 1"));
+        assert!(!body.contains(new_perp_engine));
+        assert!(!body.contains(old_perp_engine));
+        assert!(!body.contains(stray_consumer));
+    }
+
     #[tokio::test]
     async fn metrics_persistence_disabled_empty_state_renders() {
         let response = router(AppState::new(EngineState::with_default_markets()))
@@ -5626,6 +5992,158 @@ mod tests {
         assert!(state.trade_signatures.lock().unwrap().is_empty());
     }
 
+    /// V2F-N: the V2F-LM PERP fee smoke transaction
+    /// (`0x400acedf…ff63a79a`, block 42188599) emitted two `FeeChargedV2`
+    /// events with `productKind = PERP`, `flowKind = ORDERBOOK`,
+    /// `basisAmount = 30`, and `feeAmount = 1` each (taker `feePpm = 300`,
+    /// maker `feePpm = 50`). `/admin/fees/onchain?tx_hash=…` must summarize
+    /// the PERP economics without any option lifecycle, and the per-event
+    /// payloads must surface `product_kind = "perp"` so the admin UI can
+    /// label the row correctly.
+    #[tokio::test]
+    async fn admin_fees_onchain_summarizes_v2f_lm_perp_fee_tx() {
+        let state = admin_state(false);
+        let tx_hash =
+            "0x400acedf36381034ae37c983cc50e80d11a81587ca8065fbaef40293ff63a79a".to_string();
+        let buyer_taker = "0x8b94a83d1ad3bd2337b1886e7962ca8e0bba9a34";
+        let seller_maker = "0x475fe397fa56884952d350aa9ee1c3946964bc0c";
+        let taker_leg =
+            build_fee_charged_v2_perp_log_row(1, tx_hash.as_str(), 117, buyer_taker, 1, 300, false);
+        let maker_leg =
+            build_fee_charged_v2_perp_log_row(2, tx_hash.as_str(), 118, seller_maker, 1, 50, true);
+        state
+            .options_store
+            .lock()
+            .unwrap()
+            .persist_option_execution_events_and_cursor(
+                OPTION_EVENT_INDEXER_STATE_ID,
+                &[taker_leg.clone(), maker_leg.clone()],
+                taker_leg.block_number,
+                1,
+            );
+
+        let response = router(state.clone())
+            .oneshot(get_request(
+                &format!("/admin/fees/onchain?tx_hash={tx_hash}"),
+                None,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["source_of_truth"], "onchain");
+        assert_eq!(json["event_model"], "v2");
+        assert_eq!(json["fee_charged_v2_count"], 2);
+        assert_eq!(json["fee_rebated_v2_count"], 0);
+        assert_eq!(json["trading_fee_event_count"], 0);
+        assert_eq!(json["observed_total"], "2");
+        assert_eq!(json["observed_total_charged"], "2");
+        assert_eq!(json["observed_total_rebated"], "0");
+        assert_eq!(json["net_protocol_fee"], "2");
+        assert_eq!(json["by_side"]["taker"], "1");
+        assert_eq!(json["by_side"]["maker"], "1");
+        assert_eq!(json["by_trader"][buyer_taker], "1");
+        assert_eq!(json["by_trader"][seller_maker], "1");
+        let transactions = json["transactions"].as_array().unwrap();
+        assert_eq!(transactions.len(), 1);
+        assert_eq!(transactions[0]["tx_hash"], tx_hash);
+        assert_eq!(transactions[0]["event_model"], "v2");
+        assert_eq!(transactions[0]["observed_total_charged"], "2");
+        assert_eq!(transactions[0]["fee_charged_v2_count"], 2);
+
+        let events = json["events"].as_array().unwrap();
+        let perp_events: Vec<&serde_json::Value> = events
+            .iter()
+            .filter(|payload| {
+                payload["event_name"] == "FeeChargedV2"
+                    && payload["product_kind"] == "perp"
+                    && payload["flow_kind"] == "orderbook"
+                    && payload["basis_amount"] == "30"
+            })
+            .collect();
+        assert_eq!(perp_events.len(), 2);
+        let taker_payload = perp_events
+            .iter()
+            .find(|payload| payload["trader"] == buyer_taker)
+            .unwrap();
+        assert_eq!(taker_payload["fee_ppm"], 300);
+        assert_eq!(taker_payload["fee_amount"], "1");
+        assert_eq!(taker_payload["is_maker"], false);
+        let maker_payload = perp_events
+            .iter()
+            .find(|payload| payload["trader"] == seller_maker)
+            .unwrap();
+        assert_eq!(maker_payload["fee_ppm"], 50);
+        assert_eq!(maker_payload["fee_amount"], "1");
+        assert_eq!(maker_payload["is_maker"], true);
+
+        assert!(state.repository.is_none());
+        assert!(state.trade_signatures.lock().unwrap().is_empty());
+    }
+
+    /// V2F-N: even when PerpEngineV2 still emits a V1 `TradingFeeCharged`
+    /// breadcrumb alongside the V2 events during the bridging window, the
+    /// admin endpoint must report `source_priority = "v2"` and keep
+    /// `observed_total = 2` rather than double-counting (1 + 1 + 1 = 3).
+    #[tokio::test]
+    async fn admin_fees_onchain_v2f_lm_perp_mixed_does_not_double_count() {
+        let state = admin_state(false);
+        let tx_hash =
+            "0x400acedf36381034ae37c983cc50e80d11a81587ca8065fbaef40293ff63a79b".to_string();
+        let buyer_taker = "0x8b94a83d1ad3bd2337b1886e7962ca8e0bba9a34";
+        let v1_breadcrumb =
+            build_trading_fee_log_row(11, tx_hash.as_str(), 116, buyer_taker, 1, false);
+        let taker_leg = build_fee_charged_v2_perp_log_row(
+            12,
+            tx_hash.as_str(),
+            117,
+            buyer_taker,
+            1,
+            300,
+            false,
+        );
+        let maker_leg = build_fee_charged_v2_perp_log_row(
+            13,
+            tx_hash.as_str(),
+            118,
+            "0x475fe397fa56884952d350aa9ee1c3946964bc0c",
+            1,
+            50,
+            true,
+        );
+        state
+            .options_store
+            .lock()
+            .unwrap()
+            .persist_option_execution_events_and_cursor(
+                OPTION_EVENT_INDEXER_STATE_ID,
+                &[v1_breadcrumb.clone(), taker_leg.clone(), maker_leg.clone()],
+                taker_leg.block_number,
+                1,
+            );
+
+        let response = router(state.clone())
+            .oneshot(get_request(
+                &format!("/admin/fees/onchain?tx_hash={tx_hash}"),
+                None,
+            ))
+            .await
+            .unwrap();
+
+        let json = response_json(response).await;
+        assert_eq!(json["event_model"], "mixed");
+        assert_eq!(json["source_priority"], "v2");
+        assert_eq!(json["fee_charged_v2_count"], 2);
+        assert_eq!(json["trading_fee_event_count"], 1);
+        // V2 wins: 1 + 1 = 2, not 1 + 1 + 1 = 3.
+        assert_eq!(json["observed_total"], "2");
+        assert_eq!(json["observed_total_charged"], "2");
+        assert_eq!(json["observed_total_rebated"], "0");
+        assert_eq!(json["net_protocol_fee"], "2");
+        assert!(state.repository.is_none());
+    }
+
     #[tokio::test]
     async fn admin_fees_onchain_mixed_v1_v2_uses_v2_priority() {
         let state = admin_state(false);
@@ -5725,6 +6243,171 @@ mod tests {
             created_at_ms: 6,
             updated_at_ms: 6,
         }
+    }
+
+    /// V2F-P: PERP-flavoured `FeeChargedV2` log row with a caller-chosen
+    /// `consumer` address. Used by the metric-classification tests so
+    /// they can exercise the `new` / `old` / `unknown` buckets without
+    /// editing the default V2F-LM helper.
+    #[allow(clippy::too_many_arguments)]
+    fn build_fee_charged_v2_perp_log_row_for_consumer(
+        id_seed: u128,
+        tx_hash: &str,
+        log_index: u64,
+        consumer: &str,
+        trader: &str,
+        fee_amount: u128,
+        fee_ppm: i32,
+        is_maker: bool,
+    ) -> crate::options::OptionExecutionEvent {
+        let mut event = build_fee_charged_v2_perp_log_row(
+            id_seed, tx_hash, log_index, trader, fee_amount, fee_ppm, is_maker,
+        );
+        if let Some(decoded) = event.decoded.as_mut() {
+            if let Some(map) = decoded.as_object_mut() {
+                map.insert(
+                    "consumer".to_string(),
+                    serde_json::Value::String(consumer.to_ascii_lowercase()),
+                );
+            }
+        }
+        event
+    }
+
+    /// V2F-N: a PERP-flavoured `FeeChargedV2` log row mirroring an event
+    /// emitted by FeesManagerV2 when PerpEngineV2 calls `chargeFee`.
+    /// Reproduces the V2F-LM live event shape (`productKind = perp`,
+    /// `flowKind = orderbook`, `basisAmount = 30`).
+    fn build_fee_charged_v2_perp_log_row(
+        id_seed: u128,
+        tx_hash: &str,
+        log_index: u64,
+        trader: &str,
+        fee_amount: u128,
+        fee_ppm: i32,
+        is_maker: bool,
+    ) -> crate::options::OptionExecutionEvent {
+        crate::options::OptionExecutionEvent {
+            id: Uuid::from_u128(4_000 + id_seed),
+            chain_id: 84532,
+            contract_address: "0x00da0b9876bcbf0c79cb5bcacfebafb8c7ad774f".to_string(),
+            tx_hash: tx_hash.to_string(),
+            log_index,
+            block_number: 42_188_599,
+            block_hash: None,
+            event_name: "FeeChargedV2".to_string(),
+            event_signature: "FeeChargedV2".to_string(),
+            intent_id: None,
+            onchain_intent_id: None,
+            option_execution_transaction_id: None,
+            buyer: None,
+            seller: None,
+            account: Some(trader.to_string()),
+            option_id: None,
+            quantity_contracts: None,
+            premium_per_contract_native: Some(fee_amount.to_string()),
+            raw_topics: serde_json::Value::Array(Vec::new()),
+            raw_data: "0x".to_string(),
+            decoded: Some(serde_json::json!({
+                "consumer": "0xc6c592100723fe0c66343a16e95ec34cc0c2141c",
+                "trader": trader,
+                "recipient": "0x009f38440f058d095b61e0e2ee7fabdf05be7500",
+                "settlementAsset": "0x6eae407f5640b006fac9965182e238582a3b412e",
+                "productKind": "perp",
+                "productKindRaw": 1,
+                "flowKind": "orderbook",
+                "flowKindRaw": 0,
+                "isMaker": is_maker,
+                "feePpm": fee_ppm,
+                "basisAmount": "30",
+                "feeAmount": fee_amount.to_string(),
+            })),
+            created_at_ms: 6,
+            updated_at_ms: 6,
+        }
+    }
+
+    /// V2F-Q: PERP-flavoured `FeeRebatedV2` log row.
+    /// `consumer` defaults to NEW PerpEngine; `productKind = "perp"`.
+    /// Mirrors `build_fee_charged_v2_perp_log_row` for symmetry.
+    fn build_fee_rebated_v2_perp_log_row(
+        id_seed: u128,
+        tx_hash: &str,
+        log_index: u64,
+        trader: &str,
+        rebate_amount: u128,
+        rebate_ppm: i32,
+    ) -> crate::options::OptionExecutionEvent {
+        crate::options::OptionExecutionEvent {
+            id: Uuid::from_u128(5_000 + id_seed),
+            chain_id: 84532,
+            contract_address: "0x00da0b9876bcbf0c79cb5bcacfebafb8c7ad774f".to_string(),
+            tx_hash: tx_hash.to_string(),
+            log_index,
+            block_number: 42_188_600,
+            block_hash: None,
+            event_name: "FeeRebatedV2".to_string(),
+            event_signature: "FeeRebatedV2".to_string(),
+            intent_id: None,
+            onchain_intent_id: None,
+            option_execution_transaction_id: None,
+            buyer: None,
+            seller: None,
+            account: Some(trader.to_string()),
+            option_id: None,
+            quantity_contracts: None,
+            premium_per_contract_native: Some(rebate_amount.to_string()),
+            raw_topics: serde_json::Value::Array(Vec::new()),
+            raw_data: "0x".to_string(),
+            decoded: Some(serde_json::json!({
+                "consumer": "0xc6c592100723fe0c66343a16e95ec34cc0c2141c",
+                "trader": trader,
+                "recipient": trader,
+                "settlementAsset": "0x6eae407f5640b006fac9965182e238582a3b412e",
+                "productKind": "perp",
+                "productKindRaw": 1,
+                "flowKind": "orderbook",
+                "flowKindRaw": 0,
+                "isMaker": true,
+                "rebatePpm": rebate_ppm,
+                "basisAmount": "30",
+                "rebateAmount": rebate_amount.to_string(),
+            })),
+            created_at_ms: 6,
+            updated_at_ms: 6,
+        }
+    }
+
+    /// V2F-Q: PERP-flavoured `FeeRebatedV2` log row with a caller-chosen
+    /// `consumer` address. Used by the rebate-metric classification
+    /// tests to exercise the `new` / `old` / `unknown` buckets.
+    #[allow(clippy::too_many_arguments)]
+    fn build_fee_rebated_v2_perp_log_row_for_consumer(
+        id_seed: u128,
+        tx_hash: &str,
+        log_index: u64,
+        consumer: &str,
+        trader: &str,
+        rebate_amount: u128,
+        rebate_ppm: i32,
+    ) -> crate::options::OptionExecutionEvent {
+        let mut event = build_fee_rebated_v2_perp_log_row(
+            id_seed,
+            tx_hash,
+            log_index,
+            trader,
+            rebate_amount,
+            rebate_ppm,
+        );
+        if let Some(decoded) = event.decoded.as_mut() {
+            if let Some(map) = decoded.as_object_mut() {
+                map.insert(
+                    "consumer".to_string(),
+                    serde_json::Value::String(consumer.to_ascii_lowercase()),
+                );
+            }
+        }
+        event
     }
 
     fn build_fee_rebated_v2_log_row(

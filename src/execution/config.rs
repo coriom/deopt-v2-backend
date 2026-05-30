@@ -42,6 +42,12 @@ pub struct ExecutionConfig {
     pub executor_from_address: AccountId,
     pub perp_matching_engine_address: AccountId,
     pub perp_engine_address: AccountId,
+    /// V2F-P: optional address of the OLD (stranded) PerpEngine.
+    /// Used solely by the `deopt_perp_fee_charged_v2_total{consumer="old"}`
+    /// observability metric and the related alert; never used to route
+    /// broadcast traffic. `None` means "OLD address not configured" and
+    /// any unmatched consumer is bucketed as `"unknown"`.
+    pub old_perp_engine_address: Option<AccountId>,
 }
 
 impl ExecutionConfig {
@@ -66,6 +72,7 @@ impl ExecutionConfig {
                 "0x0000000000000000000000000000000000000000",
             ),
             perp_engine_address: AccountId::new("0x0000000000000000000000000000000000000000"),
+            old_perp_engine_address: None,
         }
     }
 

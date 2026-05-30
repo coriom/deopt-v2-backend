@@ -116,6 +116,150 @@ Operational logs should keep the same safety policy. When adding new logs around
 - Intent: rebate accounting may be disabled or not recording eligible flow.
 - Suggested action: verify `FEES_REBATES_ENABLED`, MM permissions, and fee configuration.
 
+### PERP FeeChargedV2 From OLD PerpEngine (V2F-O / V2F-P)
+
+- Name: `perp_fee_charged_from_old_engine`
+- Metric (V2F-P): `deopt_perp_fee_charged_v2_total{consumer="new"|"old"|"unknown"}`
+- Prometheus rule (deployable):
+
+  ```yaml
+  - alert: PerpFeeChargedFromOldEngine
+    expr: increase(deopt_perp_fee_charged_v2_total{consumer="old"}[5m]) > 0
+    for: 0m
+    labels:
+      severity: high
+    annotations:
+      summary: "PERP FeeChargedV2 emitted from OLD stranded PerpEngine"
+      description: "OLD PerpEngine should not emit new PERP V2 fee events after A3 fallback. Snapshot FeesManagerV2.feeConsumers() and verify engine wiring against the V2F-LM acceptance state."
+  ```
+
+- Severity: high on Base Sepolia, critical on mainnet (override the
+  rule's `severity: high` label in production).
+- Signal (under the metric): any indexed `FeeChargedV2` event where
+  - `decoded.productKind == "perp"` (or `productKindRaw == 1`), **and**
+  - `decoded.consumer` matches the configured `OLD_PERP_ENGINE_ADDRESS`
+    (currently `0xB36395b67D0798ADA981731c9Fa5239F4362b53B` on Base
+    Sepolia — confirm per environment before deploying the rule).
+
+  The backend computes this in
+  `src/monitoring.rs::append_perp_fee_v2_consumer_metric` using the
+  pure classifier
+  `src/fees/perp_consumer.rs::classify_perp_fee_consumer`. Raw
+  addresses are **never** promoted to a metric label.
+- Intent: after the V2F cutover, `NEW_PERP_ENGINE`
+  (`0xc6C592100723Fe0C66343A16e95eC34cC0c2141c`) is the only PERP fee
+  consumer registered with FeesManagerV2
+  (`FeesManagerV2.isFeeConsumer(NEW) == true`). The OLD engine is
+  stranded under the A3 Base Sepolia fallback and is **expected to
+  emit zero new PERP fees**. Any nonzero occurrence indicates one of:
+  (a) FeesManagerV2 was re-pointed at OLD; (b) OLD was re-allowed as a
+  fee consumer; (c) operator runbooks routed an executor at OLD; or
+  (d) a contract-level regression.
+- Expected current value: zero (verified live for tx
+  `0x400acedf36381034ae37c983cc50e80d11a81587ca8065fbaef40293ff63a79a`
+  at block `42188599`, where `consumer == NEW_PERP_ENGINE`).
+- Companion checks (forensics, after the alert fires):
+  - `GET /admin/fees/onchain?tx_hash=…` then look at
+    `events[*].source_contract == FEES_MANAGER_V2` and the decoded
+    `consumer` topic on the raw row
+    (`option_execution_events.decoded->>'consumer'`).
+  - Snapshot `FeesManagerV2.feeConsumers()` and `useFeesManagerV2()`
+    on every engine; compare to the V2F-LM acceptance state.
+- Suggested action: halt PerpEngine writes, snapshot
+  `FeesManagerV2.feeConsumers()` and `useFeesManagerV2()` on every
+  engine, and verify wiring against the V2F-LM acceptance state.
+- Cardinality guarantees: the metric emits exactly three series
+  (`consumer="new"|"old"|"unknown"`) per scrape. Raw addresses,
+  trader addresses, tx hashes, log indices, intent IDs, and option
+  series IDs are **not** promoted to labels. Tests
+  `perp_fee_charged_v2_metric_classifies_*` and
+  `classifier_never_emits_raw_address` pin this.
+- Status: **instrumented** (V2F-P). The metric is always emitted (all
+  three labels surface at zero by default so the
+  `increase(...)[5m]` query has a stable time series from the first
+  scrape). Alert delivery wiring (Alertmanager / PagerDuty / Slack)
+  is still environment-specific and out of scope of this repo.
+
+### PERP FeeRebatedV2 From OLD PerpEngine (V2F-Q)
+
+- Name: `perp_fee_rebated_from_old_engine`
+- Metric (V2F-Q): `deopt_perp_fee_rebated_v2_total{consumer="new"|"old"|"unknown"}`
+- Prometheus rule (deployable; also in
+  `docs/alertmanager/perp_v2_fee_alerts.yml`):
+
+  ```yaml
+  - alert: PerpFeeRebatedFromOldEngine
+    expr: increase(deopt_perp_fee_rebated_v2_total{consumer="old"}[5m]) > 0
+    for: 0m
+    labels:
+      severity: high
+    annotations:
+      summary: "PERP FeeRebatedV2 emitted from OLD stranded PerpEngine"
+      description: "OLD PerpEngine should not emit new PERP V2 rebate events after A3 fallback. Snapshot FeesManagerV2 wiring and compare to V2F-LM acceptance state."
+  ```
+
+- Severity: high on Base Sepolia, critical on mainnet.
+- Signal: any indexed `FeeRebatedV2` event where
+  `decoded.productKind == "perp"` and `decoded.consumer ==
+  OLD_PERP_ENGINE_ADDRESS`. Backend filters at SQL/store layer; the
+  same `classify_perp_fee_consumer` classifier as the charged alert
+  promotes the result to a low-cardinality `consumer` bucket.
+- Intent: same A3-stranded reasoning as the charged-event alert —
+  OLD should not emit new PERP V2 rebate logs. A nonzero result
+  indicates a contract-level regression (consumer re-allowlisting,
+  FeesManagerV2 pointed back at OLD) or a configuration error.
+- Expected current value: zero (no PERP rebate event has been live on
+  Base Sepolia yet; V2F-LM PERP smoke emitted 2× FeeChargedV2 and 0×
+  FeeRebatedV2).
+- Cardinality guarantees: exactly three series per scrape
+  (`consumer="new"|"old"|"unknown"`). Same `classifier_never_emits_raw_address`
+  invariant as the V2F-P metric.
+- Tests: `perp_fee_rebated_v2_metric_*` in `src/api/routes.rs::tests`.
+- Runbook: `docs/RUNBOOK_PERP_V2_FEE_ALERTS.md#perpfeerebatedfromoldengine`.
+- Status: **instrumented** (V2F-Q).
+
+### PERP V2 Fee Event From Unknown Consumer (V2F-Q)
+
+- Name: `perp_fee_consumer_unknown`
+- Metric (V2F-Q): combined increase across the V2F-P + V2F-Q
+  `unknown` buckets:
+  `deopt_perp_fee_charged_v2_total{consumer="unknown"}` and
+  `deopt_perp_fee_rebated_v2_total{consumer="unknown"}`.
+- Prometheus rule (deployable; also in
+  `docs/alertmanager/perp_v2_fee_alerts.yml`):
+
+  ```yaml
+  - alert: PerpFeeConsumerUnknown
+    expr: |
+      increase(deopt_perp_fee_charged_v2_total{consumer="unknown"}[5m])
+      + increase(deopt_perp_fee_rebated_v2_total{consumer="unknown"}[5m])
+      > 0
+    for: 0m
+    labels:
+      severity: medium
+    annotations:
+      summary: "PERP V2 fee event emitted from unknown consumer"
+      description: "FeesManagerV2 fired a PERP fee or rebate whose consumer matches neither the configured NEW (PERP_ENGINE_ADDRESS) nor OLD (OLD_PERP_ENGINE_ADDRESS) engine. Reconcile env vars with the contract state before escalating."
+  ```
+
+- Severity: medium (anomaly, not a hard regression).
+- Intent: the metric pipeline classifies any PERP `FeeChargedV2` /
+  `FeeRebatedV2` whose `decoded.consumer` does not match the
+  configured NEW or OLD as `consumer = "unknown"`. Possible causes:
+  - env-var drift (`PERP_ENGINE_ADDRESS` / `OLD_PERP_ENGINE_ADDRESS`
+    have not been updated after a redeploy);
+  - a third engine was registered as a FeesManagerV2 fee consumer;
+  - a stray contract address ended up in the log topic (decoder
+    regression).
+- Suggested first action: diff the env vars against
+  `FeesManagerV2.feeConsumers()` on-chain. If the env is stale, roll
+  the config; if a new consumer is legitimate, file a milestone to
+  add it to the classifier vocabulary (e.g.
+  `consumer="next_gen"`) — never widen the existing buckets to
+  swallow it silently.
+- Runbook: `docs/RUNBOOK_PERP_V2_FEE_ALERTS.md#perpfeeconsumerunknown`.
+- Status: **instrumented** (V2F-Q).
+
 ## Deferred Alert Families
 
 - Oracle stale alerts are deferred until oracle metrics exist.

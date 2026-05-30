@@ -103,6 +103,9 @@ impl AppConfig {
                 "PERP_ENGINE_ADDRESS",
                 "0x0000000000000000000000000000000000000000",
             )),
+            old_perp_engine_address: optional_env(&mut lookup, "OLD_PERP_ENGINE_ADDRESS")
+                .filter(|value| !value.is_empty())
+                .map(AccountId::new),
         };
         let indexer = IndexerConfig {
             enabled: parse_env(&mut lookup, "INDEXER_ENABLED", "false")?,

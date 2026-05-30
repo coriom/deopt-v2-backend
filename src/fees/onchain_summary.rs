@@ -1010,6 +1010,136 @@ mod tests {
         assert_eq!(v2_rebated["rebate_ppm"], -50);
     }
 
+    /// V2F-N: reproduces the V2F-LM PERP fee smoke transaction
+    /// (`0x400acedf…ff63a79a`, block 42188599) — two `FeeChargedV2` events
+    /// emitted by `FeesManagerV2` when `PerpEngineV2` called `chargeFee`.
+    /// Asserts that:
+    ///
+    /// - both PERP events carry `productKind = "perp"` and `flowKind =
+    ///   "orderbook"` through to the per-event payloads.
+    /// - the per-event `basisAmount = "30"` (native notional, not premium)
+    ///   is preserved next to `feeAmount` and `feePpm`.
+    /// - the aggregator buckets 1 + 1 native mUSDC into `charged_total = 2`,
+    ///   no rebate, no double-counting, no V1 fallback.
+    /// - per-trader and per-side totals split the V2F-LM taker leg
+    ///   (`0x8B94…9A34`, fee=1) from the maker leg (`0x475F…BC0C`, fee=1).
+    #[test]
+    fn v2f_lm_perp_payloads_expose_perp_product_kind_and_totals() {
+        let buyer_taker = "0x8b94a83d1ad3bd2337b1886e7962ca8e0bba9a34";
+        let seller_maker = "0x475fe397fa56884952d350aa9ee1c3946964bc0c";
+        let recipient = "0x009f38440f058d095b61e0e2ee7fabdf05be7500";
+        let settlement_asset = "0x6eae407f5640b006fac9965182e238582a3b412e";
+
+        let events = [
+            make_event(
+                "FeeChargedV2",
+                117,
+                serde_json::json!({
+                    "consumer": "0xc6c592100723fe0c66343a16e95ec34cc0c2141c",
+                    "trader": buyer_taker,
+                    "recipient": recipient,
+                    "settlementAsset": settlement_asset,
+                    "productKind": "perp",
+                    "productKindRaw": 1,
+                    "flowKind": "orderbook",
+                    "flowKindRaw": 0,
+                    "isMaker": false,
+                    "feePpm": 300,
+                    "basisAmount": "30",
+                    "feeAmount": "1",
+                }),
+            ),
+            make_event(
+                "FeeChargedV2",
+                118,
+                serde_json::json!({
+                    "consumer": "0xc6c592100723fe0c66343a16e95ec34cc0c2141c",
+                    "trader": seller_maker,
+                    "recipient": recipient,
+                    "settlementAsset": settlement_asset,
+                    "productKind": "perp",
+                    "productKindRaw": 1,
+                    "flowKind": "orderbook",
+                    "flowKindRaw": 0,
+                    "isMaker": true,
+                    "feePpm": 50,
+                    "basisAmount": "30",
+                    "feeAmount": "1",
+                }),
+            ),
+        ];
+
+        let normalized = normalize_fee_events(&events);
+        let aggregated = aggregate(&normalized);
+
+        assert_eq!(aggregated.event_model, "v2");
+        assert_eq!(aggregated.source_priority, "");
+        assert_eq!(aggregated.fee_charged_v2_count, 2);
+        assert_eq!(aggregated.fee_rebated_v2_count, 0);
+        assert_eq!(aggregated.trading_fee_event_count, 0);
+        assert_eq!(aggregated.charged_total, 2);
+        assert_eq!(aggregated.rebated_total, 0);
+        assert_eq!(aggregated.net_protocol_fee(), 2);
+        assert_eq!(aggregated.by_side.get("taker").copied(), Some(1));
+        assert_eq!(aggregated.by_side.get("maker").copied(), Some(1));
+        assert_eq!(aggregated.by_trader.get(buyer_taker).copied(), Some(1));
+        assert_eq!(aggregated.by_trader.get(seller_maker).copied(), Some(1));
+
+        // Per-event payloads must preserve productKind=perp and
+        // basisAmount=30 so admin/observability surfaces the V2F-LM economics.
+        let payloads = collect_event_payloads(&normalized);
+        assert_eq!(payloads.len(), 2);
+        for payload in &payloads {
+            assert_eq!(payload["event_model"], "v2");
+            assert_eq!(payload["event_name"], "FeeChargedV2");
+            assert_eq!(payload["product_kind"], "perp");
+            assert_eq!(payload["flow_kind"], "orderbook");
+            assert_eq!(payload["basis_amount"], "30");
+            assert_eq!(payload["fee_amount"], "1");
+        }
+    }
+
+    /// V2F-N: a mixed V1+V2 PERP transaction must resolve to
+    /// `source_priority = "v2"` and only count V2 totals, even though a V1
+    /// `TradingFeeCharged` compatibility log appears alongside. Guards
+    /// against double-counting when PerpEngineV2 still emits the V1
+    /// breadcrumb during the bridging window.
+    #[test]
+    fn v2f_lm_mixed_v1_v2_perp_does_not_double_count() {
+        let buyer_taker = "0x8b94a83d1ad3bd2337b1886e7962ca8e0bba9a34";
+        let events = [
+            v1_event(115, buyer_taker, 1, false),
+            make_event(
+                "FeeChargedV2",
+                117,
+                serde_json::json!({
+                    "consumer": "0xc6c592100723fe0c66343a16e95ec34cc0c2141c",
+                    "trader": buyer_taker,
+                    "recipient": "0x009f38440f058d095b61e0e2ee7fabdf05be7500",
+                    "settlementAsset": "0x6eae407f5640b006fac9965182e238582a3b412e",
+                    "productKind": "perp",
+                    "productKindRaw": 1,
+                    "flowKind": "orderbook",
+                    "flowKindRaw": 0,
+                    "isMaker": false,
+                    "feePpm": 300,
+                    "basisAmount": "30",
+                    "feeAmount": "1",
+                }),
+            ),
+        ];
+
+        let normalized = normalize_fee_events(&events);
+        let aggregated = aggregate(&normalized);
+
+        assert_eq!(aggregated.event_model, "mixed");
+        assert_eq!(aggregated.source_priority, "v2");
+        // Must be 1 (V2 wins), not 2 (V1 + V2 double-counted).
+        assert_eq!(aggregated.charged_total, 1);
+        assert_eq!(aggregated.fee_charged_v2_count, 1);
+        assert_eq!(aggregated.trading_fee_event_count, 1);
+    }
+
     /// V2E-I regression: reproduces the V2E-G live trade payload shape
     /// (`premium=50_000`, taker=13, maker=3) and asserts both `FeeChargedV2`
     /// payloads expose `basis_amount = "50000"`, the mixed model still

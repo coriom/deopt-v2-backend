@@ -238,6 +238,7 @@ mod tests {
                 "0x0000000000000000000000000000000000000009",
             ),
             perp_engine_address: AccountId::new("0x0000000000000000000000000000000000000000"),
+            old_perp_engine_address: None,
         };
 
         let result = Executor::new(config, repository.clone())
