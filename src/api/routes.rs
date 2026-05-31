@@ -20,6 +20,7 @@ use crate::fees::service::{
     admin_fee_summary as admin_fee_summary_service, admin_fee_volumes as admin_fee_volumes_service,
     admin_onchain_fees as admin_onchain_fees_service, record_indexed_perp_trade_fees,
 };
+use crate::fees::smoke_readiness::admin_v2_smoke_readiness as admin_v2_smoke_readiness_service;
 use crate::fees::v2_observability::admin_v2_observability as admin_v2_observability_service;
 use crate::indexer::{Indexer, IndexerStatus, IndexerTickResult};
 use crate::mm::permissions::{
@@ -288,6 +289,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/admin/fees/v2/observability",
             get(admin_fees_v2_observability),
+        )
+        .route(
+            "/admin/fees/v2/smoke/readiness",
+            get(admin_fees_v2_smoke_readiness),
         )
         .route("/admin/recent", get(admin_recent))
         .layer(TraceLayer::new_for_http())
@@ -1342,6 +1347,24 @@ async fn admin_fees_v2_observability(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     ensure_admin_access(&state, &headers)?;
     Ok(Json(admin_v2_observability_service(&state).await?))
+}
+
+/// V2G-M: read-only V2 fee smoke readiness snapshot. Surfaces the
+/// V2G-D2 EOA registry, the per-tier fee profile snapshot, the
+/// canonical dry-run packet templates, and the broadcast-gate state
+/// (with `safe_to_broadcast_today=false` during the soak window).
+///
+/// Never embeds a private key. The env-var NAMES (`PERP_SMOKE_BUYER_PRIVATE_KEY`
+/// etc.) are surfaced so the operator can wire signing flows; whether
+/// each name resolves to a non-empty value is reported as a boolean.
+///
+/// See `docs/V2_FEE_BACKEND_EXECUTOR_READINESS_V2G_M.md`.
+async fn admin_fees_v2_smoke_readiness(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    ensure_admin_access(&state, &headers)?;
+    Ok(Json(admin_v2_smoke_readiness_service(&state).await?))
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -5542,6 +5565,178 @@ mod tests {
                 "metrics leaked raw value {forbidden}: {serialized}"
             );
         }
+    }
+
+    /// V2G-M: `/admin/fees/v2/smoke/readiness` returns the dry-run
+    /// packet skeleton with the V2G-D2 EOAs hard-pinned, the
+    /// broadcast-gate snapshot, and `safe_to_broadcast_today=false`
+    /// during the soak window. Never embeds a private-key-shaped
+    /// string.
+    // V2G-M: holding the std::sync::Mutex guard across .await is
+    // intentional — the guard serialises process-env mutation against
+    // the sibling smoke-readiness tests that share the same env-var
+    // names. Test-only.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn admin_v2_smoke_readiness_returns_packet_with_default_eoas() {
+        let perp_new = "0xc6c592100723fe0c66343a16e95ec34cc0c2141c";
+        let perp_old = "0xb36395b67d0798ada981731c9fa5239f4362b53b";
+        let margin_new = "0x287cef479be5889eefca847f9e73c860898f48cc";
+        let fmv2 = "0x00da0b9876bcbf0c79cb5bcacfebafb8c7ad774f";
+
+        let mut state = admin_state(false);
+        state.execution_config.perp_engine_address = AccountId::new(perp_new);
+        state.execution_config.old_perp_engine_address = Some(AccountId::new(perp_old));
+        state.option_event_indexer_config.margin_engine_address = AccountId::new(margin_new);
+        state.option_event_indexer_config.fees_manager_v2_address = Some(AccountId::new(fmv2));
+
+        // V2G-M: serialise env-var manipulation with the other smoke-
+        // readiness tests so cargo's parallel runner doesn't race.
+        let _guard = crate::fees::smoke_readiness::TEST_ENV_GUARD
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var(crate::fees::smoke_readiness::MAKER_KEY_ENV);
+        std::env::remove_var(crate::fees::smoke_readiness::TAKER_KEY_ENV);
+
+        let response = router(state)
+            .oneshot(get_request("/admin/fees/v2/smoke/readiness", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["milestone"], "V2G-M");
+
+        // V2G-D2 EOAs surface as addresses-only, lowercased.
+        let eoas = &json["smoke_eoas"];
+        assert_eq!(
+            eoas["tier4_maker_address"],
+            "0x290bd12c93e467bf51c51f5273d35bddb19e9274"
+        );
+        assert_eq!(
+            eoas["tier2_taker_address"],
+            "0x77ca9dd6ccce2d692fb23877a2db7178807b0020"
+        );
+        // Env-var NAMES are surfaced; values never read.
+        assert_eq!(
+            eoas["key_env_vars"]["maker"],
+            "PERP_SMOKE_BUYER_PRIVATE_KEY"
+        );
+        assert_eq!(
+            eoas["key_env_vars"]["taker"],
+            "PERP_SMOKE_SELLER_PRIVATE_KEY"
+        );
+
+        // Dry-run packet skeletons for both products.
+        let perp_packet = &json["dry_run_packets"]["perp"];
+        assert_eq!(perp_packet["product"], "PERP");
+        assert_eq!(perp_packet["fee_consumer_address"], perp_new);
+        assert!(perp_packet["basis_amount_native"].is_null());
+        assert!(perp_packet["expected_fee_amount_native"].is_null());
+
+        let option_packet = &json["dry_run_packets"]["option"];
+        assert_eq!(option_packet["product"], "OPTION");
+        assert_eq!(option_packet["fee_consumer_address"], margin_new);
+
+        // Broadcast gates: every safety toggle is false / dry-run by
+        // default; no maker/taker key visible.
+        let gates = &json["broadcast_gates"];
+        assert_eq!(gates["execution_enabled"], false);
+        assert_eq!(gates["executor_dry_run"], true);
+        assert_eq!(gates["executor_real_broadcast_enabled"], false);
+        assert_eq!(gates["option_execution_broadcast_enabled"], false);
+        assert_eq!(gates["maker_key_env_set"], false);
+        assert_eq!(gates["taker_key_env_set"], false);
+
+        // No private-key-shaped strings in the response body.
+        let body = serde_json::to_string(&json).unwrap();
+        assert!(!body.contains("4c0883"));
+        assert!(!body.contains("private_key\":\"0x"));
+        assert!(!body.contains("PRIVATE_KEY=0x"));
+    }
+
+    #[tokio::test]
+    async fn admin_v2_smoke_readiness_requires_admin_token_when_configured() {
+        let response = router(admin_state(true))
+            .oneshot(get_request("/admin/fees/v2/smoke/readiness", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let response = router(admin_state(true))
+            .oneshot(get_request(
+                "/admin/fees/v2/smoke/readiness",
+                Some("test-admin-token"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// V2G-M hard-rule pin: if the active PERP address equals the OLD
+    /// stranded one (operator misconfiguration), the readiness packet
+    /// refuses to mark safe. This is the "OLD_PERP_ENGINE never
+    /// active" invariant surfaced at the readiness layer.
+    #[tokio::test]
+    async fn admin_v2_smoke_readiness_refuses_when_active_equals_old() {
+        let old = "0xb36395b67d0798ada981731c9fa5239f4362b53b";
+        let mut state = admin_state(false);
+        state.execution_config.perp_engine_address = AccountId::new(old);
+        state.execution_config.old_perp_engine_address = Some(AccountId::new(old));
+
+        let response = router(state)
+            .oneshot(get_request("/admin/fees/v2/smoke/readiness", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["active_perp_is_old_engine"], true);
+        assert_eq!(json["soak_safe_for_local_compose"], false);
+    }
+
+    /// V2G-M: confirm no key-shaped value leaks into the response even
+    /// when the operator's env carries one. The endpoint reads only
+    /// the boolean presence of the env vars.
+    #[allow(clippy::await_holding_lock)] // same rationale as the sibling test
+    #[tokio::test]
+    async fn admin_v2_smoke_readiness_never_leaks_env_key_value() {
+        use crate::fees::smoke_readiness::{MAKER_KEY_ENV, TAKER_KEY_ENV};
+
+        let perp_new = "0xc6c592100723fe0c66343a16e95ec34cc0c2141c";
+        let mut state = admin_state(false);
+        state.execution_config.perp_engine_address = AccountId::new(perp_new);
+        state.execution_config.old_perp_engine_address =
+            Some(AccountId::new("0xb36395b67d0798ada981731c9fa5239f4362b53b"));
+
+        // V2G-M: serialise env-var manipulation with the other smoke-
+        // readiness tests; cargo's default parallel runner shares the
+        // process env across threads.
+        let _guard = crate::fees::smoke_readiness::TEST_ENV_GUARD
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+
+        // Set the env var values to a recognisable secret-shaped token.
+        // The endpoint must NOT echo them anywhere.
+        let secret = "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+        std::env::set_var(MAKER_KEY_ENV, secret);
+        std::env::set_var(TAKER_KEY_ENV, secret);
+
+        let response = router(state)
+            .oneshot(get_request("/admin/fees/v2/smoke/readiness", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        let body = serde_json::to_string(&json).unwrap();
+
+        // Boolean presence is reported.
+        assert_eq!(json["broadcast_gates"]["maker_key_env_set"], true);
+        assert_eq!(json["broadcast_gates"]["taker_key_env_set"], true);
+        // The raw key value MUST NOT appear anywhere in the body.
+        assert!(!body.contains(secret), "secret leaked into response");
+        assert!(!body.contains("deadbeef"));
+
+        std::env::remove_var(MAKER_KEY_ENV);
+        std::env::remove_var(TAKER_KEY_ENV);
     }
 
     #[tokio::test]

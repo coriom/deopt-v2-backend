@@ -1258,6 +1258,30 @@ deopt_fees_manager_v2_rebate_budget_native{
 
 Test suite: 661 → 675 passed (+14 V2G-F tests).
 
+## V2G-M closure note (appended 2026-05-31)
+
+V2G-M turned the ad-hoc V2G-E broadcast packets into a
+backend-tested, frontend-renderable shape:
+
+- `src/fees/smoke_readiness.rs::SmokeDryRunPacket` codifies the V2G-E
+  PERP + OPTION trades (with the V2G-D2 Tier 4 maker / Tier 2 taker
+  EOAs pinned as address-only constants).
+- `validate_numeric_invariants` re-derives `feeAmount` / `rebateAmount`
+  / `budget delta` and pins the V2G-E reference values
+  (`basis=30 000, fee=6, rebate=3` for PERP and
+  `basis=200 000, fee=25, rebate=10` for OPTION) as passing tests.
+- The new `GET /admin/fees/v2/smoke/readiness` endpoint surfaces the
+  packet skeletons + engine wiring + broadcast-gate snapshot
+  read-only. Private keys NEVER appear in the response; only the
+  boolean presence of the `PERP_SMOKE_{BUYER,SELLER}_PRIVATE_KEY`
+  env vars is reported.
+- Frontend admin gains a "V2 Fee Smoke Readiness (V2G-M)" tile
+  rendering the same data.
+
+Test suite: 679 → 694 passed (+15 V2G-M tests).
+
+Full record: `docs/V2_FEE_BACKEND_EXECUTOR_READINESS_V2G_M.md`.
+
 ## Next recommended milestone
 
 **V2G-F — close the V2G band.**

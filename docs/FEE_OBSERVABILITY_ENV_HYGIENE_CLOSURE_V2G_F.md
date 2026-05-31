@@ -536,3 +536,33 @@ The merkle-root continuous-probe + multi-asset rollout remain
 explicit V2G-G follow-ups (matrix in
 `docs/V2_FEE_PRODUCTION_OBSERVABILITY_V2G_G.md`); they need a
 mainnet manifest first.
+
+## V2G-M backend executor readiness (appended 2026-05-31)
+
+V2G-M extends V2G-F's env-hygiene work with a backend-tested
+readiness endpoint:
+
+- `GET /admin/fees/v2/smoke/readiness` consolidates the
+  V2G-F-configured engines, the V2G-D2 EOA registry (addresses
+  only), the per-tier fee profile snapshot, the broadcast-gate
+  state, and the dry-run packet skeletons for PERP + OPTION.
+- The endpoint refuses to mark a smoke ready if
+  `active_perp_address == old_perp_address` (the V2G hard-rule
+  "do not use OLD_PERP_ENGINE as active" surfaced at the readiness
+  layer).
+- Frontend admin gains a "V2 Fee Smoke Readiness (V2G-M)" tile that
+  mirrors the same data — read-only, no write buttons, no wallet
+  signing, no private-key input.
+
+Secret hygiene contracts preserved:
+
+- `PERP_SMOKE_BUYER_PRIVATE_KEY` / `PERP_SMOKE_SELLER_PRIVATE_KEY`
+  env-var **names** are surfaced; **values are never read** by the
+  endpoint, only their boolean presence.
+- The standalone signing CLIs (`sign_perp_trade`,
+  `sign_option_execution_intent`) remain the canonical signing
+  path; both still refuse on payload-vs-signer-address mismatch
+  unless explicitly opted out.
+
+Full record: `docs/V2_FEE_BACKEND_EXECUTOR_READINESS_V2G_M.md`.
+Test suite: 679 → 694 passed (+15 V2G-M tests).

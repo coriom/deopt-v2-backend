@@ -3,6 +3,7 @@ pub mod option_consumer;
 pub mod perp_consumer;
 pub mod schedule;
 pub mod service;
+pub mod smoke_readiness;
 pub mod store;
 pub mod tier_artifact;
 pub mod tier_eligibility;
