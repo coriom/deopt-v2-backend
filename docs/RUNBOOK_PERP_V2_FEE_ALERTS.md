@@ -1,17 +1,34 @@
-# Runbook — PERP V2 Fee Alerts
+# Runbook — PERP + OPTION V2 Fee Alerts
 
-This runbook covers the three Prometheus alerts emitted from the V2F
-PERP V2 fee observability surface:
+This runbook covers the Prometheus alerts emitted from the FeesManagerV2
+observability surface. Despite the historical name, the runbook now
+spans both PERP (V2F) and OPTION (V2G-F) alerts — the diagnostic
+procedure is identical, only the addresses change.
+
+PERP alerts (V2F):
 
 - `PerpFeeChargedFromOldEngine` (V2F-O / V2F-P)
 - `PerpFeeRebatedFromOldEngine` (V2F-Q)
 - `PerpFeeConsumerUnknown` (V2F-Q)
 
-All three are derived from the gauges:
+OPTION alerts (V2G-F, mirrors of the PERP set):
+
+- `OptionFeeChargedFromOldMarginEngine`
+- `OptionFeeRebatedFromOldMarginEngine`
+- `OptionFeeConsumerUnknown`
+
+Cross-cutting alert (V2G-F):
+
+- `FeesManagerV2RebateBudgetLow`
+
+All consumer-bucket alerts are derived from the gauges:
 
 ```
 deopt_perp_fee_charged_v2_total{consumer="new"|"old"|"unknown"}
 deopt_perp_fee_rebated_v2_total{consumer="new"|"old"|"unknown"}
+deopt_option_fee_charged_v2_total{consumer="new"|"old"|"unknown"}
+deopt_option_fee_rebated_v2_total{consumer="new"|"old"|"unknown"}
+deopt_fees_manager_v2_rebate_budget_native{asset="<lowercased address>"}
 ```
 
 Source-of-truth metric definitions: `docs/ALERTING_SPEC.md`.
@@ -214,6 +231,100 @@ enough to start an investigation.
 - Do **not** widen the classifier buckets to swallow an unknown
   consumer. If a new engine is legitimate, extend the vocabulary;
   if it is not, fix the source.
+
+### OptionFeeChargedFromOldMarginEngine
+<a id="optionfeechargedfromoldmarginengine"></a>
+
+- **Meaning.** An indexed OPTION `FeeChargedV2` event was emitted
+  with `decoded.consumer == OLD_MARGIN_ENGINE_ADDRESS`. Since V2E-E
+  the legacy MarginEngine (`0x6C5665De…b5F8`) is superseded by the
+  V2 MarginEngine (`0x287Cef…48Cc`); the OLD address is observability-
+  only and is expected to emit zero V2 OPTION fees.
+- **Expected current value.** Zero.
+- **First action.** Run forensics check 1 (substitute the OPTION
+  metric name) to confirm the metric is real (not a label-leak
+  regression).
+- **Investigation.** Mirror checks 2–5 with the OPTION analogues:
+  - SQL filter: `decoded->>'productKind' = 'option'`.
+  - `cast call $MARGIN_ENGINE 'useFeesManagerV2()(bool)'` (NEW) and
+    `cast call $OLD_MARGIN_ENGINE_ADDRESS 'useFeesManagerV2()(bool)'`
+    (legacy — should be `false` if the env var is even set).
+  - `cast call $FEES_MANAGER_V2 'isFeeConsumer(address)(bool)'
+     $MARGIN_ENGINE` (expect `true`) and the same for the OLD
+    address (expect `false`).
+- **Remediation.**
+  1. If `FeesManagerV2.isFeeConsumer(OLD_MARGIN)` is now `true`,
+     freeze the OptionMatchingEngine writes pointing at the legacy
+     MarginEngine until on-call decides how to revert.
+  2. If `OLD_MARGIN.useFeesManagerV2()` is `true`, disable it.
+  3. **Do not** delete the offending DB rows — forensics record.
+- **Severity.** Base Sepolia: high. Mainnet: critical.
+
+### OptionFeeRebatedFromOldMarginEngine
+<a id="optionfeerebatedfromoldmarginengine"></a>
+
+- **Meaning.** Mirror of `OptionFeeChargedFromOldMarginEngine` for
+  the rebate path. Implies the legacy MarginEngine is paying out
+  OPTION rebates from the FeesManagerV2 rebate budget.
+- **Expected current value.** Zero (V2G-E is the only live OPTION
+  rebate event so far, emitted from NEW).
+- **First action / investigation.** Identical to the charged
+  variant; add the `rebateBudget(<asset>)` snapshot check from the
+  PERP rebate runbook so the before/after budget delta is captured.
+- **Severity.** Base Sepolia: high. Mainnet: critical.
+
+### OptionFeeConsumerUnknown
+<a id="optionfeeconsumerunknown"></a>
+
+- **Meaning.** An OPTION `FeeChargedV2` or `FeeRebatedV2` event was
+  indexed whose `decoded.consumer` matches neither `MARGIN_ENGINE`
+  (NEW) nor `OLD_MARGIN_ENGINE_ADDRESS`. The
+  `classify_option_fee_consumer` classifier put it in `unknown`.
+- **Expected current value.** Zero.
+- **Most common causes** (rank-ordered, parallel to the PERP cases):
+  1. Env-var drift on `MARGIN_ENGINE` /
+     `OPTION_EVENT_INDEXER_MARGIN_ENGINE_ADDRESS`.
+  2. `OLD_MARGIN_ENGINE_ADDRESS` unset but the event genuinely came
+     from the legacy address.
+  3. A third MarginEngine was deployed and added as a FeesManagerV2
+     consumer without updating the classifier.
+  4. Decoder regression — `decoded.consumer` is null or zero.
+- **Remediation.** Same as `PerpFeeConsumerUnknown`. Never widen
+  `new` / `old` to silently absorb the address.
+- **Severity.** Base Sepolia: medium. Mainnet: high.
+
+### FeesManagerV2RebateBudgetLow
+<a id="feesmanagerv2rebatebudgetlow"></a>
+
+- **Meaning.** The derived
+  `deopt_fees_manager_v2_rebate_budget_native{asset="<addr>"}` gauge
+  for the canonical settlement asset (mUSDC on Base Sepolia) has
+  fallen below `1000` native units (`0.001 mUSDC` at 6 decimals).
+- **Derivation.** Sum of indexed `RebateBudgetFunded.amount` minus
+  `RebateBudgetSpent.amount` minus `RebateBudgetWithdrawn.amount`,
+  per `decoded.settlementAsset`, clamped at `0`. If the indexer is
+  briefly behind a withdraw the gauge floors at zero rather than
+  wrap-underflowing.
+- **Expected current value.** Greater than the threshold; on V2G-D2
+  the on-chain budget is `1 000 000` native and V2G-E spent only
+  `13`.
+- **First action (under 5 min).** Read the on-chain ground truth:
+
+  ```
+  cast call $FEES_MANAGER_V2 'rebateBudget(address)(uint256)' $MUSDC
+  ```
+
+  - If on-chain matches the metric (low), proceed to remediation.
+  - If on-chain is healthy but the metric is low, suspect indexer
+    lag or a missed `RebateBudgetFunded` event. Catch the indexer
+    up via the existing admin tick and recompute.
+- **Remediation.** Top up via `FeesManagerV2.fundRebateBudget(mUSDC,
+  amount)` from the operator workstation. Document the operator
+  packet in the incident channel before broadcast.
+- **Do-not.** Do not silence the alert by raising the threshold
+  inline; if the alert is too noisy for testnet, override at the
+  Alertmanager rules layer per the severity matrix.
+- **Severity.** Base Sepolia: medium. Mainnet: high.
 
 ## Verifying the all-clear
 

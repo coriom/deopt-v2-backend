@@ -1,352 +1,335 @@
-# NEXT_TASK.md — Tier Merkle Rebate Mega-Milestone V2G-A
+# NEXT_TASK.md — Fee Observability, Env Hygiene And Executor Readiness Closure V2G-F
 
 ## Context
 
-Options and perps Tier0 V2 positive fees are validated end-to-end.
+V2G-E completed the live PERP + OPTION rebate smoke campaign.
 
 Validated:
-- Option FeeChargedV2 live.
-- Perp FeeChargedV2 live.
-- Backend/admin decoding works for OPTION and PERP.
-- PERP FeeChargedV2/FeeRebatedV2 metrics exist.
-- Alerts for OLD stranded PerpEngine exist.
-- Rebates have NOT been live-tested.
-- Tier/Merkle eligibility has NOT been implemented end-to-end.
 
-Current live:
-- FEES_MANAGER_V2 = 0x00dA0B9876bcBf0c79CB5BcAcfEBAFb8C7Ad774f
-- NEW_PERP_ENGINE = 0xc6C592100723Fe0C66343A16e95eC34cC0c2141c
-- NEW_MARGIN_ENGINE = 0x287Cef479be5889eEfCa847F9e73C860898f48Cc
-- OLD_PERP_ENGINE = 0xB36395b67D0798ADA981731c9Fa5239F4362b53B stranded under A3 Base Sepolia.
+* PERP FeeChargedV2 + FeeRebatedV2 live.
+* OPTION FeeChargedV2 + FeeRebatedV2 live.
+* Tier4 maker and Tier2 taker claims live.
+* Merkle root and claim path live.
+* Rebate budget path live.
+* Backend `/admin/fees/onchain` decodes both PERP and OPTION live rebate txs.
+* PERP metrics expose charged/rebated counters for `consumer="new"`.
+* OLD stranded PerpEngine alert stays green.
+
+Known remaining blockers:
+
+1. Env hygiene:
+
+   * committed/backend env still has `PERP_ENGINE_ADDRESS=OLD_PERP_ENGINE`.
+   * missing explicit `OLD_PERP_ENGINE_ADDRESS`.
+   * V2G-E used shell-only `PERP_ENGINE_ADDRESS=NEW` override.
+2. OPTION metrics:
+
+   * no `deopt_option_fee_charged_v2_total`.
+   * no `deopt_option_fee_rebated_v2_total`.
+   * OPTION is visible through `/admin/fees/onchain`, but not metrics.
+3. Alerting:
+
+   * V2F-Q rules exist, but live alert delivery / final rules cleanup still needs closure.
+   * merkle-root-unset operational notice is obsolete now that root is live.
+4. Backend executor:
+
+   * backend `.env` BUYER/SELLER are not the V2G-D2 EOAs.
+   * V2G-E used Solidity-script signing path.
+   * future real-trader smokes need a clean non-secret signing-key surface or explicit operator-run packet.
 
 Goal:
-Build the Tier/Merkle/Rebate system as one accelerated module.
+Close observability, env hygiene, alerting, and executor-readiness gaps after V2G-E.
 
-This is not a microtask. Complete all safe backend/tests/docs/scripts/dry-runs. Stop only before human broadcasts.
+This is an accelerated module. Do not split into microtasks. Complete all safe backend/docs/tests/config-example changes in one pass.
 
 ## Hard Rules
 
 Do not broadcast.
-Do not submit live transactions.
+Do not submit transactions.
 Do not mutate live chain.
+Do not print private keys.
+Do not edit real secret `.env` files unless the file is explicitly a committed non-secret example/template.
 Do not delete DB rows.
-Do not print secrets.
-Do not edit real `.env`.
-Do not weaken existing Tier0 option/perp behavior.
 Do not hide OLD_PERP_ENGINE stranded state.
-Do not silently change the fee schedule below.
+Do not weaken V2G-E results.
+Do not alter Merkle root, rebate budget, fee schedules, or deployed contracts.
 
-## Canonical Tier Eligibility
+Allowed:
 
-Eligibility is OR-based.
+* backend code changes.
+* metrics code.
+* alert rule/docs.
+* `.env.example` / `.env.*.example` / template files.
+* docs.
+* tests.
+* read-only live checks.
+* local backend/admin smoke if no secrets printed.
 
-A user qualifies for a tier if ANY of the following is true:
-- 28D volume threshold is met, OR
-- 28D venue volume share threshold is met, OR
-- staked DEOPT threshold is met.
+## Live References
 
-The highest qualifying tier wins.
+Contracts:
 
-Eligibility must be computed off-chain by backend snapshot/Merkle process.
+* FEES_MANAGER_V2 = `0x00dA0B9876bcBf0c79CB5BcAcfEBAFb8C7Ad774f`
+* NEW_PERP_ENGINE = `0xc6C592100723Fe0C66343A16e95eC34cC0c2141c`
+* OLD_PERP_ENGINE = `0xB36395b67D0798ADA981731c9Fa5239F4362b53B`
+* NEW_MARGIN_ENGINE = `0x287Cef479be5889eEfCa847F9e73C860898f48Cc`
+* mUSDC = `0x6eAe407f5640B006faC9965182e238582A3B412E`
 
-Do NOT compute 28D volume, 28D share, or staked DEOPT directly inside PerpEngine or MarginEngine.
+Live rebate txs:
 
-## Canonical Option Fee Schedule
+* PERP rebate tx = `0x5c15e9233d49729cf21058a89f49bc6fdf0f7295cda5a7f313c96556728aa394`
+* OPTION rebate tx = `0x9a85cbced2216bf3c18049111cce68883cb0b035e194b3dcbaaf4fe7d5293149`
 
-Use this table as the canonical source of truth.
+Expected V2G-E accounting:
 
-| Tier | 28D Volume | 28D Vol Share | Staked DEOPT | Option Maker | Option Taker | RFQ Maker Fee Discount | RFQ Taker Fee Discount |
-| ---: | ---------: | ------------: | -----------: | -----------: | -----------: | ---------------------: | ---------------------: |
-| 4 | >= $25M | >= 5% | >= 250,000 | -0.005% | 0.0075% | 100% | 75% |
-| 3 | >= $10M | >= 2.5% | >= 100,000 | -0.0025% | 0.010% | 75% | 50% |
-| 2 | >= $2.5M | >= 1% | >= 50,000 | -0.001% | 0.0125% | 50% | 25% |
-| 1 | >= $500k | >= 0.25% | >= 10,000 | 0.000% | 0.015% | 25% | 10% |
-| 0 | below Tier1 | below Tier1 | below Tier1 | 0.005% | 0.025% | 0% | 0% |
+* PERP:
 
-Canonical ppm conversion:
+  * FeeChargedV2 fee = `6`
+  * FeeRebatedV2 rebate = `3`
+  * rebateBudget `1_000_000 -> 999_997`
+* OPTION:
+
+  * FeeChargedV2 fee = `25`
+  * FeeRebatedV2 rebate = `10`
+  * rebateBudget `999_997 -> 999_987`
+
+## Phase 1 — Audit Current Env + Config Hygiene
+
+Audit backend env/config references:
+
+```bash
+rg -n "PERP_ENGINE_ADDRESS|OLD_PERP_ENGINE|perp_engine|fees_manager_v2|OPTION.*ENGINE|BUYER|SELLER" . src docs
+```
+
+Determine:
+
+* where `PERP_ENGINE_ADDRESS` is read.
+* whether runtime uses OLD or NEW by default.
+* whether `.env.example` points to OLD.
+* whether docs instruct shell-only override.
+* whether `OLD_PERP_ENGINE_ADDRESS` is already supported.
+* whether option/margin engine config has equivalent explicit current/old split.
+
+Required outcome:
+
+* NEW_PERP_ENGINE must be the canonical current engine in examples/templates.
+* OLD_PERP_ENGINE must be explicitly represented as stranded metadata.
+* real secret `.env` must not be edited by the agent unless explicitly safe and non-secret.
+* provide exact operator diff/instruction if real `.env` must be changed manually.
+
+## Phase 2 — Env Template Cleanup
+
+Update committed examples/templates only.
+
+Required:
+
+* `PERP_ENGINE_ADDRESS=0xc6C592100723Fe0C66343A16e95eC34cC0c2141c`
+* add `OLD_PERP_ENGINE_ADDRESS=0xB36395b67D0798ADA981731c9Fa5239F4362b53B`
+* ensure `FEES_MANAGER_V2=0x00dA0B9876bcBf0c79CB5BcAcfEBAFb8C7Ad774f`
+* ensure `MARGIN_ENGINE=0x287Cef479be5889eEfCa847F9e73C860898f48Cc`
+* document OLD as stranded, not active.
+
+If the only file containing these is real `.env`, do not edit it. Create:
+
+* `.env.base-sepolia.v2g_f.example`
+  or update existing `.env.example`.
+
+Add docs explaining the manual operator patch for local `.env`.
+
+## Phase 3 — OPTION V2 Metrics
+
+Mirror PERP V2 metrics for OPTION.
+
+Add metrics:
 
 ```text
-Tier4 OPTION:
-- maker = -50 ppm
-- taker = 75 ppm
-- RFQ maker discount = 10000 bps
-- RFQ taker discount = 7500 bps
+deopt_option_fee_charged_v2_total{consumer="new"|"old"|"unknown"}
+deopt_option_fee_rebated_v2_total{consumer="new"|"old"|"unknown"}
+```
 
-Tier3 OPTION:
-- maker = -25 ppm
-- taker = 100 ppm
-- RFQ maker discount = 7500 bps
-- RFQ taker discount = 5000 bps
+Classification:
 
-Tier2 OPTION:
-- maker = -10 ppm
-- taker = 125 ppm
-- RFQ maker discount = 5000 bps
-- RFQ taker discount = 2500 bps
+* productKind must be OPTION.
+* FeeChargedV2 increments charged metric.
+* FeeRebatedV2 increments rebated metric.
+* consumer classification:
 
-Tier1 OPTION:
-- maker = 0 ppm
-- taker = 150 ppm
-- RFQ maker discount = 2500 bps
-- RFQ taker discount = 1000 bps
+  * NEW_MARGIN_ENGINE => `new`
+  * known old margin engine if configured => `old`
+  * otherwise => `unknown`
+* no raw address labels.
+* pre-seed new/old/unknown buckets.
+* preserve PERP metrics behavior.
 
-Tier0 OPTION:
-- maker = 50 ppm
-- taker = 250 ppm
-- RFQ maker discount = 0 bps
-- RFQ taker discount = 0 bps
-Canonical Perp Fee Schedule
+If no old margin engine exists:
 
-Use this table as the canonical source of truth.
+* support optional `OLD_MARGIN_ENGINE_ADDRESS`.
+* if unset and consumer != NEW, classify unknown.
 
-Tier	28D Volume	28D Vol Share	Staked DEOPT	Perp Maker	Perp Taker
-4	>= $25M	>= 5%	>= 250,000	-0.010%	0.015%
-3	>= $10M	>= 2.5%	>= 100,000	-0.0075%	0.0175%
-2	>= $2.5M	>= 1%	>= 50,000	-0.005%	0.020%
-1	>= $500k	>= 0.25%	>= 10,000	0.000%	0.025%
-0	below Tier1	below Tier1	below Tier1	0.005%	0.030%
+Tests required:
 
-Canonical ppm conversion:
+1. OPTION FeeChargedV2 from NEW_MARGIN increments `consumer="new"`.
+2. OPTION FeeRebatedV2 from NEW_MARGIN increments `consumer="new"`.
+3. OPTION events from unknown consumer increment `unknown`.
+4. OPTION events do not affect PERP metrics.
+5. PERP events do not affect OPTION metrics.
+6. raw addresses do not appear in metric labels.
+7. empty metrics expose zero buckets if current PERP implementation does that.
 
-Tier4 PERP:
-- maker = -100 ppm
-- taker = 150 ppm
+## Phase 4 — Alert Rules Cleanup
 
-Tier3 PERP:
-- maker = -75 ppm
-- taker = 175 ppm
+Update alert rules/docs:
 
-Tier2 PERP:
-- maker = -50 ppm
-- taker = 200 ppm
+* PERP old-consumer charged alert remains.
+* PERP old-consumer rebated alert remains.
+* add OPTION unknown-consumer alert.
+* add OPTION old-consumer alert only if old margin config exists; otherwise document unknown only.
+* retire or downgrade merkle-root-unset operational notice because root is now live.
+* add rebate-budget-low alert if not already present:
 
-Tier1 PERP:
-- maker = 0 ppm
-- taker = 250 ppm
+```yaml
+alert: FeesManagerV2RebateBudgetLow
+expr: deopt_fees_manager_v2_rebate_budget_native{asset="mUSDC"} < 1000
+for: 0m
+labels:
+  severity: medium
+annotations:
+  summary: "FeesManagerV2 rebate budget is low"
+```
 
-Tier0 PERP:
-- maker = 50 ppm
-- taker = 300 ppm
-Module Scope
-Part 1 — Metrics Hardening
+If that budget metric does not exist:
 
-Audit V2F-Q metrics.
+* either implement it from existing on-chain summary path, or document as future if implementation would be too large.
+* do not fake it.
 
-Decide whether to:
+## Phase 5 — Backend Executor Readiness For V2G-D2 EOAs
 
-promote deopt_perp_fee_charged_v2_total and deopt_perp_fee_rebated_v2_total to true monotonic counters, or
-keep ledger-derived gauges and document/rename cleanly if true counters would be misleading.
+Audit backend signing/executor config:
 
-Do not fake true counter semantics.
+* buyer key env name.
+* seller key env name.
+* option executor signing path.
+* perp executor signing path.
+* whether it can load arbitrary operator-provided keys without writing them to `.env`.
 
-Part 2 — Tier Schedule Canonicalization
+Goal:
+Produce a safe readiness pattern for future smoke:
 
-Define canonical fee schedule in backend config/types for OPTION and PERP using the exact tables above.
+* keys loaded only from shell.
+* no printing.
+* no committed secret.
+* explicit addresses derived and checked.
+* admin endpoint or CLI can sign with supplied shell keys if already supported.
 
-Required:
+If backend does not support this safely:
 
-exact ppm values.
-exact RFQ discount bps values for options.
-all tiers 0 through 4.
-tests for every tier and product.
-tests for boundary thresholds.
-Part 3 — OR Eligibility Logic
+* document exact blocker.
+* propose minimal future task.
+* do not implement invasive secret handling unless small and safe.
 
-Implement or scaffold tier eligibility logic:
+## Phase 6 — Live Read-Only Verification
 
-Inputs:
+Run read-only verification if backend can be started safely without secrets.
 
-28D volume in USD/native normalized value.
-28D venue volume share.
-staked DEOPT.
-product kind.
+Verify:
 
-Rules:
+* `/admin/fees/onchain?tx_hash=<PERP_TX>`
+* `/admin/fees/onchain?tx_hash=<OPTION_TX>`
+* `/metrics` includes:
 
-OR logic across volume/share/stake.
-highest qualifying tier wins.
-Tier0 fallback when no threshold is met.
+  * PERP charged/rebated new.
+  * OPTION charged/rebated new.
+  * old/unknown zero unless justified.
+* OLD stranded alert green.
+* no double counting.
 
-Required boundary tests:
+Do not mutate DB destructively.
+If indexer catch-up is needed:
 
-exactly $500k qualifies Tier1.
-exactly $2.5M qualifies Tier2.
-exactly $10M qualifies Tier3.
-exactly $25M qualifies Tier4.
-exactly 0.25% qualifies Tier1.
-exactly 1% qualifies Tier2.
-exactly 2.5% qualifies Tier3.
-exactly 5% qualifies Tier4.
-exactly 10,000 DEOPT qualifies Tier1.
-exactly 50,000 DEOPT qualifies Tier2.
-exactly 100,000 DEOPT qualifies Tier3.
-exactly 250,000 DEOPT qualifies Tier4.
-highest tier wins if multiple thresholds match.
-Part 4 — Tier Snapshot Backend
+* only use existing safe admin tick if it is read-only/idempotent.
+* document exact command and result.
 
-Implement or scaffold backend tier snapshot generation.
-
-Snapshot row must include:
-
-trader address.
-option 28D volume.
-perp 28D volume.
-total 28D venue volume.
-volume share.
-staked DEOPT.
-computed option tier.
-computed perp tier.
-option maker ppm.
-option taker ppm.
-option RFQ maker discount bps.
-option RFQ taker discount bps.
-perp maker ppm.
-perp taker ppm.
-validFrom.
-validUntil.
-
-If real data tables are missing:
-
-create clean interfaces and deterministic test fixtures.
-do not invent production data.
-Part 5 — Merkle Tree Generation
-
-Implement CLI/tool or backend command to generate:
-
-Merkle leaves.
-Merkle root.
-proof per trader/product/tier.
-JSON artifact.
-
-Required:
-
-deterministic sorting.
-stable schema.
-tests for root/proof reproducibility.
-invalid proof tests.
-expired proof tests if supported by contract.
-Part 6 — Solidity Compatibility Check
-
-Inspect FeesManagerV2:
-
-claimTier format.
-Merkle leaf format.
-root setter.
-rebate budget functions.
-FeeRebatedV2 behavior.
-signed ppm behavior.
-RFQ discount handling if present.
-
-If backend leaf format does not match Solidity:
-
-fix backend.
-add cross-test vectors.
-
-Do not deploy.
-
-Part 7 — Rebate Budget + Live Smoke Plan
-
-Prepare scripts/dry-runs for:
-
-setMerkleRoot on FeesManagerV2.
-fundRebateBudget for mUSDC.
-claim Tier2/Tier3/Tier4 for test accounts.
-option rebate smoke.
-perp rebate smoke.
-option RFQ discount smoke if supported.
-perp RFQ discount smoke if supported.
-
-No broadcast.
-
-Expected live rebate smoke target:
-
-force maker negative ppm tier.
-small notional.
-FeeChargedV2 for taker.
-FeeRebatedV2 for maker.
-rebateBudget decreases.
-feeRecipient increases by taker fee.
-maker vault balance increases by rebate.
-Part 8 — Tests
-
-Add tests for:
-
-OR eligibility.
-all tiers.
-boundary values.
-volume/share/stake precedence.
-option fee schedule exact ppm.
-option RFQ discount exact bps.
-perp fee schedule exact ppm.
-Merkle root/proof generation.
-claim payload compatibility.
-negative maker rebate.
-insufficient rebate budget.
-expired/invalid claims.
-no OPTION/PERP Tier0 regression.
-Part 9 — Docs
+## Phase 7 — Docs
 
 Create:
 
-docs/TIER_MERKLE_REBATE_SYSTEM_V2G_A.md
-docs/TIER_SNAPSHOT_SCHEMA_V2G_A.md
-docs/REBATE_LIVE_SMOKE_PLAN_V2G_A.md
+```text
+docs/FEE_OBSERVABILITY_ENV_HYGIENE_CLOSURE_V2G_F.md
+```
 
 Update:
 
-docs/ALERTING_SPEC.md
-V2F-Q docs if metrics semantics changed.
-Validation
+* `docs/FEES_MANAGER_V2_LIVE_REBATE_SMOKE_RESULT_V2G_E.md`
+* `docs/ALERTING_SPEC.md`
+* `docs/RUNBOOK_PERP_V2_FEE_ALERTS.md`
+* add or update option fee alert runbook if needed.
+
+Include:
+
+* env hygiene diff.
+* active vs stranded engines.
+* OPTION metrics.
+* alert status.
+* executor-readiness status.
+* live read-only verification.
+* remaining blockers.
+
+## Phase 8 — Validation
 
 Backend:
 
+```bash
 cargo fmt --all
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features --no-fail-fast
 cargo build --all-targets --all-features
-
-Solidity if touched:
-
-forge fmt
-forge fmt --check
-forge build
-forge test
+```
 
 Frontend if touched:
 
+```bash
 npm run lint
 npx tsc --noEmit
 npm run build
-Acceptance Criteria
+```
+
+Solidity if touched:
+
+```bash
+forge fmt
+forge fmt --check
+forge build
+forge test --no-match-path 'test/fork/*'
+```
+
+## Acceptance Criteria
 
 Complete if:
 
-exact canonical option table is implemented or documented with blockers.
-exact canonical perp table is implemented or documented with blockers.
-OR eligibility logic exists.
-tier snapshot logic exists or cleanly scaffolded.
-Merkle artifact generation exists.
-Solidity leaf compatibility is proven or blocker documented.
-rebate live smoke scripts/plans are prepared.
-tests pass.
-docs created.
-no live mutation happened.
-Final Report
+* env examples/templates point to NEW_PERP_ENGINE.
+* OLD_PERP_ENGINE is explicit stranded metadata.
+* real `.env` untouched or operator-only patch documented.
+* OPTION charged/rebated V2 metrics exist.
+* OPTION metrics tests pass.
+* PERP metrics remain passing.
+* alert docs/rules updated.
+* merkle-root-unset notice retired/downgraded.
+* backend executor signing readiness documented.
+* live read-only admin/metrics verification attempted or exact blocker documented.
+* validations pass.
+
+## Final Report
 
 Return:
 
-metrics hardening decision.
-option fee schedule implementation.
-perp fee schedule implementation.
-RFQ discount handling.
-OR eligibility implementation.
-snapshot implementation.
-Merkle implementation.
-Solidity compatibility result.
-rebate smoke preparation.
-files changed.
-tests added.
-docs updated.
-validation commands run.
-exact blockers.
-next human broadcast gates if any.
+* env hygiene changes.
+* option metrics implementation.
+* alerting changes.
+* executor-readiness result.
+* live verification result.
+* files changed.
+* tests added.
+* docs updated.
+* validation commands run.
+* remaining blockers.
+* next recommended milestone.

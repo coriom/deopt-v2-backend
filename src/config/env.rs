@@ -383,6 +383,14 @@ impl AppConfig {
             optional_env(&mut lookup, "OPTION_EVENT_INDEXER_FEES_MANAGER_V2_ADDRESS")
                 .or_else(|| optional_env(&mut lookup, "FEES_MANAGER_V2"))
                 .map(AccountId::new);
+        // V2G-F: optional legacy MarginEngine address. Used solely by
+        // the `deopt_option_fee_*_v2_total{consumer="old"}` metrics;
+        // never used to route broadcast or execution traffic. Unset by
+        // default — non-NEW consumers bucket as `"unknown"`.
+        let option_event_indexer_old_margin_engine_address =
+            optional_env(&mut lookup, "OLD_MARGIN_ENGINE_ADDRESS")
+                .filter(|value| !value.is_empty())
+                .map(AccountId::new);
         let option_reconciliation = OptionReconciliationConfig {
             enabled: parse_env(&mut lookup, "OPTION_RECONCILIATION_WORKER_ENABLED", "false")?,
             poll_interval_ms: parse_env(
@@ -432,6 +440,7 @@ impl AppConfig {
             collateral_vault_address: option_event_indexer_collateral_vault_address,
             fees_manager_address: option_event_indexer_fees_manager_address,
             fees_manager_v2_address: option_event_indexer_fees_manager_v2_address,
+            old_margin_engine_address: option_event_indexer_old_margin_engine_address,
         };
         let signature_verification_mode =
             parse_env(&mut lookup, "SIGNATURE_VERIFICATION_MODE", "disabled")?;

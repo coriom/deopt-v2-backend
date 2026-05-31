@@ -345,6 +345,34 @@ plan" above):
 Each of those is gated on operator credentials this milestone
 deliberately does not handle.
 
+## V2G-B follow-up (2026-05-30)
+
+The V2G-B milestone landed:
+
+- `src/fees/tier_artifact.rs` + 10 regression tests (determinism,
+  proof verification, schedule embedding, tampered-leaf rejection).
+- `src/bin/generate_tier_artifact.rs` CLI producing the
+  `chain_id`/`fees_manager_v2`/`leaf_encoding_version`/`merkle_root`/
+  `option_schedule`/`perp_schedule`/`rows[]` artifact JSON.
+- Deterministic Base Sepolia artifact at
+  `artifacts/tier_merkle/base_sepolia_v2g_b.json` (root
+  `0xef08543c…`, 3 rows: Tier 4 / Tier 2 / Tier 0).
+- Three Solidity dry-run scripts (`SetFeesManagerV2MerkleRoot`,
+  `FundFeesManagerV2RebateBudget`, `ClaimFeesManagerV2Tier`) —
+  all default to preflight-only with a single `*_CONFIRM` gate.
+- Two smoke preflight scripts (`SmokePerpV2Rebate`,
+  `SmokeOptionV2Rebate`) — read-only, verified live on Base
+  Sepolia: `PerpEngine.useFeesManagerV2() == true`,
+  `OLD.useFeesManagerV2() == false`,
+  `FeesManagerV2.isFeeConsumer(NEW) == true`,
+  `FeesManagerV2.isFeeConsumer(OLD) == false`.
+- Human broadcast gate packet:
+  `docs/FEES_MANAGER_V2_REBATE_BROADCAST_PREFLIGHT_V2G_B.md`.
+- Pipeline doc:
+  `docs/TIER_MERKLE_ARTIFACT_PIPELINE_V2G_B.md`.
+
+See those two docs for the full V2G-B record.
+
 ## Next recommended milestone
 
 **V2G-B — Snapshot Source Pipeline + Rebate Smoke Dry-Run**

@@ -1,0 +1,193 @@
+{
+  "chain_id": 84532,
+  "fees_manager_v2": "0x00da0b9876bcbf0c79cb5bcacfebafb8c7ad774f",
+  "leaf_encoding_version": "v2g-a-1",
+  "generated_at_ms": 1780154565359,
+  "valid_from": 1780099200,
+  "valid_until": 1781308800,
+  "merkle_root": "0xa29d5b1de46fb2e498999093400fd65c1240a6e8abeb106504e8bc4edb1e2553",
+  "option_schedule": [
+    {
+      "tier": 4,
+      "min_28d_volume_1e8": 2500000000000000,
+      "min_volume_share_micro_bps": 5000000,
+      "min_staked_deopt_1e8": 25000000000000,
+      "maker_fee_micro_bps": 0,
+      "maker_rebate_micro_bps": 5000,
+      "taker_fee_micro_bps": 7500,
+      "rfq_maker_discount_pct": 100,
+      "rfq_taker_discount_pct": 75
+    },
+    {
+      "tier": 3,
+      "min_28d_volume_1e8": 1000000000000000,
+      "min_volume_share_micro_bps": 2500000,
+      "min_staked_deopt_1e8": 10000000000000,
+      "maker_fee_micro_bps": 0,
+      "maker_rebate_micro_bps": 2500,
+      "taker_fee_micro_bps": 10000,
+      "rfq_maker_discount_pct": 75,
+      "rfq_taker_discount_pct": 50
+    },
+    {
+      "tier": 2,
+      "min_28d_volume_1e8": 250000000000000,
+      "min_volume_share_micro_bps": 1000000,
+      "min_staked_deopt_1e8": 5000000000000,
+      "maker_fee_micro_bps": 0,
+      "maker_rebate_micro_bps": 1000,
+      "taker_fee_micro_bps": 12500,
+      "rfq_maker_discount_pct": 50,
+      "rfq_taker_discount_pct": 25
+    },
+    {
+      "tier": 1,
+      "min_28d_volume_1e8": 50000000000000,
+      "min_volume_share_micro_bps": 250000,
+      "min_staked_deopt_1e8": 1000000000000,
+      "maker_fee_micro_bps": 0,
+      "maker_rebate_micro_bps": 0,
+      "taker_fee_micro_bps": 15000,
+      "rfq_maker_discount_pct": 25,
+      "rfq_taker_discount_pct": 10
+    },
+    {
+      "tier": 0,
+      "min_28d_volume_1e8": 0,
+      "min_volume_share_micro_bps": 0,
+      "min_staked_deopt_1e8": 0,
+      "maker_fee_micro_bps": 5000,
+      "maker_rebate_micro_bps": 0,
+      "taker_fee_micro_bps": 25000,
+      "rfq_maker_discount_pct": 0,
+      "rfq_taker_discount_pct": 0
+    }
+  ],
+  "perp_schedule": [
+    {
+      "tier": 4,
+      "min_28d_volume_1e8": 2500000000000000,
+      "min_volume_share_micro_bps": 5000000,
+      "min_staked_deopt_1e8": 25000000000000,
+      "maker_fee_micro_bps": 0,
+      "maker_rebate_micro_bps": 10000,
+      "taker_fee_micro_bps": 15000,
+      "rfq_maker_discount_pct": 0,
+      "rfq_taker_discount_pct": 0
+    },
+    {
+      "tier": 3,
+      "min_28d_volume_1e8": 1000000000000000,
+      "min_volume_share_micro_bps": 2500000,
+      "min_staked_deopt_1e8": 10000000000000,
+      "maker_fee_micro_bps": 0,
+      "maker_rebate_micro_bps": 7500,
+      "taker_fee_micro_bps": 17500,
+      "rfq_maker_discount_pct": 0,
+      "rfq_taker_discount_pct": 0
+    },
+    {
+      "tier": 2,
+      "min_28d_volume_1e8": 250000000000000,
+      "min_volume_share_micro_bps": 1000000,
+      "min_staked_deopt_1e8": 5000000000000,
+      "maker_fee_micro_bps": 0,
+      "maker_rebate_micro_bps": 5000,
+      "taker_fee_micro_bps": 20000,
+      "rfq_maker_discount_pct": 0,
+      "rfq_taker_discount_pct": 0
+    },
+    {
+      "tier": 1,
+      "min_28d_volume_1e8": 50000000000000,
+      "min_volume_share_micro_bps": 250000,
+      "min_staked_deopt_1e8": 1000000000000,
+      "maker_fee_micro_bps": 0,
+      "maker_rebate_micro_bps": 0,
+      "taker_fee_micro_bps": 25000,
+      "rfq_maker_discount_pct": 0,
+      "rfq_taker_discount_pct": 0
+    },
+    {
+      "tier": 0,
+      "min_28d_volume_1e8": 0,
+      "min_volume_share_micro_bps": 0,
+      "min_staked_deopt_1e8": 0,
+      "maker_fee_micro_bps": 5000,
+      "maker_rebate_micro_bps": 0,
+      "taker_fee_micro_bps": 30000,
+      "rfq_maker_discount_pct": 0,
+      "rfq_taker_discount_pct": 0
+    }
+  ],
+  "rows": [
+    {
+      "trader": "0x475fe397fa56884952d350aa9ee1c3946964bc0c",
+      "option_28d_volume_1e8": "1250000000000000",
+      "perp_28d_volume_1e8": "1250000000000000",
+      "total_28d_volume_1e8": "2500000000000000",
+      "volume_share_ppm": 0,
+      "staked_deopt_1e8": "0",
+      "option_tier": 4,
+      "perp_tier": 4,
+      "perp_maker_ppm": -100,
+      "perp_taker_ppm": 150,
+      "option_maker_ppm": -50,
+      "option_taker_ppm": 75,
+      "option_rfq_maker_discount_bps": 10000,
+      "option_rfq_taker_discount_bps": 7500,
+      "valid_from": 1780099200,
+      "valid_until": 1781308800,
+      "leaf": "0x2078bcf317385ce697d0937ee8cd8fa0487dc3c44a444e1f5736fe4d8e51e9ba",
+      "proof": [
+        "0xbb17b10b233ad3c0dd572f5cdcca943c381f55dea714baad49975c2934f46fd7",
+        "0xad655d05de4b1bd43c685b5bfbdac99bd9d80c687c8e8b88861791246378ce09"
+      ]
+    },
+    {
+      "trader": "0x8b94a83d1ad3bd2337b1886e7962ca8e0bba9a34",
+      "option_28d_volume_1e8": "150000000000000",
+      "perp_28d_volume_1e8": "100000000000000",
+      "total_28d_volume_1e8": "250000000000000",
+      "volume_share_ppm": 0,
+      "staked_deopt_1e8": "0",
+      "option_tier": 2,
+      "perp_tier": 2,
+      "perp_maker_ppm": -50,
+      "perp_taker_ppm": 200,
+      "option_maker_ppm": -10,
+      "option_taker_ppm": 125,
+      "option_rfq_maker_discount_bps": 5000,
+      "option_rfq_taker_discount_bps": 2500,
+      "valid_from": 1780099200,
+      "valid_until": 1781308800,
+      "leaf": "0xbb17b10b233ad3c0dd572f5cdcca943c381f55dea714baad49975c2934f46fd7",
+      "proof": [
+        "0x2078bcf317385ce697d0937ee8cd8fa0487dc3c44a444e1f5736fe4d8e51e9ba",
+        "0xad655d05de4b1bd43c685b5bfbdac99bd9d80c687c8e8b88861791246378ce09"
+      ]
+    },
+    {
+      "trader": "0xbaf0976a00a0dcc84df5b15d927695c8b014b1c3",
+      "option_28d_volume_1e8": "10000000000",
+      "perp_28d_volume_1e8": "0",
+      "total_28d_volume_1e8": "10000000000",
+      "volume_share_ppm": 0,
+      "staked_deopt_1e8": "0",
+      "option_tier": 0,
+      "perp_tier": 0,
+      "perp_maker_ppm": 50,
+      "perp_taker_ppm": 300,
+      "option_maker_ppm": 50,
+      "option_taker_ppm": 250,
+      "option_rfq_maker_discount_bps": 0,
+      "option_rfq_taker_discount_bps": 0,
+      "valid_from": 1780099200,
+      "valid_until": 1781308800,
+      "leaf": "0xad655d05de4b1bd43c685b5bfbdac99bd9d80c687c8e8b88861791246378ce09",
+      "proof": [
+        "0xefcb9048156e523ee939f94a1be1d7357fe70b6bd0ac773739e848742d1f4fb7"
+      ]
+    }
+  ]
+}

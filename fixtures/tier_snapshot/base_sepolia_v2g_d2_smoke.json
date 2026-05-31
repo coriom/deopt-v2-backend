@@ -1,0 +1,27 @@
+{
+  "_comment_chain": "Base Sepolia (84532) tier-snapshot smoke fixture for V2G-D2. Supersedes V2G-B/V2G-C: the V2G-C root committed to two EOAs (0x475f…bc0c, 0x8b94…9a34) whose private keys are unrecoverable, so claimTier could not be broadcast. V2G-D2 replaces those rows with two operator-controlled fresh EOAs at the same Tier 4 / Tier 2 volume bands.",
+  "_comment_window": "validFrom = 2026-05-30 00:00 UTC, validUntil = 2026-06-20 00:00 UTC. 21-day window — absorbs the V2G-C window and extends to give V2G-E/F headroom.",
+  "_comment_volumes": "Same volume bands as V2G-C so the Tier 4 / Tier 2 schedule maps unchanged: Tier 4 total = 2.5e15 (1.25e15 option + 1.25e15 perp), Tier 2 total = 2.5e14 (1.5e14 option + 1.0e14 perp).",
+  "chain_id": 84532,
+  "fees_manager_v2": "0x00dA0B9876bcBf0c79CB5BcAcfEBAFb8C7Ad774f",
+  "valid_from": 1780099200,
+  "valid_until": 1781913600,
+  "accounts": [
+    {
+      "label": "v2g_d2_maker_tier4_rebate_candidate",
+      "trader": "0x290bd12c93e467bf51c51f5273d35bddb19e9274",
+      "option_volume_28d_1e8": "1250000000000000",
+      "perp_volume_28d_1e8":   "1250000000000000",
+      "volume_share_ppm": 0,
+      "staked_deopt_1e8": "0"
+    },
+    {
+      "label": "v2g_d2_taker_tier2",
+      "trader": "0x77ca9dd6ccce2d692fb23877a2db7178807b0020",
+      "option_volume_28d_1e8": "150000000000000",
+      "perp_volume_28d_1e8":   "100000000000000",
+      "volume_share_ppm": 0,
+      "staked_deopt_1e8": "0"
+    }
+  ]
+}

@@ -271,6 +271,40 @@ Same admin / metrics / rebateBudget assertions.
 | Indexer doesn't pick up the rebate | Indexer cursor behind | Run admin tick (`POST /admin/options/events/tick`); see V2F-O for the catch-up pattern. |
 | `consumer=="unknown"` counter increments | OLD or third-party engine emitted the event | Stop. Follow `docs/RUNBOOK_PERP_V2_FEE_ALERTS.md` → `PerpFeeConsumerUnknown`. |
 
+## V2G-C result (2026-05-30)
+
+Steps 2 (`setMerkleRoot`), 3-pre (mUSDC top-up), and 3
+(`fundRebateBudget`) of this plan were executed under the V2G-C
+milestone with a fresh artifact (V2G-B's window had drifted into
+2025). Tx hashes and full post-state verification:
+`docs/FEES_MANAGER_V2_ROOT_BUDGET_SETUP_V2G_C.md`.
+
+After gate 3 the PERP / OPTION smoke preflights advance to
+`MakerHasNoNegativeRebateTier(0, 50)`; steps 4 (`claimTier`) and
+5-7 (rebate trades) become the V2G-D / V2G-E human gates.
+
+## V2G-B follow-up (2026-05-30)
+
+The V2G-B milestone formalised every step above with deployable
+Solidity dry-run scripts and a concrete artifact:
+
+- Artifact:
+  `artifacts/tier_merkle/base_sepolia_v2g_b.json`
+  (root `0xef08543c…`, 3 rows).
+- Operator scripts:
+  `~/DEOPT/deopt-v2-sol/script/SetFeesManagerV2MerkleRoot.s.sol`,
+  `FundFeesManagerV2RebateBudget.s.sol`,
+  `ClaimFeesManagerV2Tier.s.sol`,
+  `SmokePerpV2Rebate.s.sol`,
+  `SmokeOptionV2Rebate.s.sol`.
+- Human broadcast packet:
+  `docs/FEES_MANAGER_V2_REBATE_BROADCAST_PREFLIGHT_V2G_B.md`.
+
+Use that packet (rather than the per-step instructions in this
+V2G-A plan) for the actual broadcast: it carries the verified
+live state, the pinned artifact root, exact `forge script`
+invocations, and the failure-mode table.
+
 ## After-action
 
 Once all four legs (PERP charge + PERP rebate + OPTION charge +
@@ -285,3 +319,54 @@ These land in `docs/REBATE_LIVE_SMOKE_RESULT_V2G_*.md` (one file
 per smoke run); name them with the milestone that ran the smoke
 (e.g. V2G-B for the first dry-run, V2G-C for the broadcast).
 Carry the OLD-stranded alert state forward in every result doc.
+
+## V2G-E result (appended 2026-05-31)
+
+V2G-E ran both rebate trades live on Base Sepolia. Result doc:
+`docs/FEES_MANAGER_V2_LIVE_REBATE_SMOKE_RESULT_V2G_E.md`.
+
+| Leg | Tx | Block | basis | fee/rebate amounts |
+|---|---|---|---:|---|
+| PERP rebate | `0x5c15e923…aa394` | 42196090 | `30 000` native | `FeeChargedV2 feePpm=200 fee=6` + `FeeRebatedV2 rebatePpm=-100 rebate=3` |
+| OPTION rebate | `0x9a85cbce…3149` | 42206003 | `200 000` native | `FeeChargedV2 feePpm=125 fee=25` + `FeeRebatedV2 rebatePpm=-50 rebate=10` |
+
+`FMv2.rebateBudget(mUSDC)`: `1 000 000 → 999 997 → 999 987` (−13 across
+both legs). The V2G-D3 SmokePerpV2Rebate / SmokeOptionV2Rebate
+preflights remain `PASSED`; this campaign added the broadcast
+sibling scripts `SmokePerpV2RebateExecute.s.sol` and
+`SmokeOptionV2RebateExecute.s.sol` (Solidity-side; the backend
+`.env` BUYER/SELLER are not the V2G-D2 Tier 4 / Tier 2 EOAs, so the
+preferred backend-executor path was unavailable without `.env`
+mutation, which the hard rules forbid).
+
+V2G-E also surfaced and recovered a vault-IM gap on the OPTION side
+(ETH-$3000 short call needs ~1080 mUSDC IM; the V2G-E Phase-2
+funding of 2 mUSDC per EOA was sufficient for PERP notional but not
+for OPTION strike-notional risk). The Phase-2b top-up
+(`PERP_SMOKE_FUND_USDC_AMOUNT_NATIVE=1_500_000_000` per EOA via the
+same `PrepareSmokeV1Accounts.s.sol` script) unblocked the OPTION
+trade with zero contract / governance / Merkle / budget mutation.
+
+OLD-stranded alert remains **green**. V2F-Q PERP V2 metrics report
+`deopt_perp_fee_*_v2_total{consumer="new"} = 3 / 1` and zero on
+both `old` and `unknown` arms.
+
+After V2G-E:
+- V2G-F should cut the alerts live, retire the merkle-root-unset
+  operational notice, add OPTION-side V2 metric counters, and fix
+  the V2F-O env-hygiene gap (`PERP_ENGINE_ADDRESS=OLD` in committed
+  `.env`).
+
+## V2G-D2 supersession (appended 2026-05-30)
+
+V2G-D was paused after `setMerkleRoot` and `fundRebateBudget`
+landed (V2G-C) because the Tier 4 maker private key for
+`0x475Fe397…BC0C` is unrecoverable. **V2G-D2** rotates the
+committed addresses by publishing a new root keyed to fresh
+operator-controlled EOAs (`0x290bD12C…9274` Tier 4,
+`0x77cA9DD6…0020` Tier 2); root
+`0xd8a627d7a9b600370e6f490fdd789150d7f9c4ea2f09752c88121d1f758fc2df`,
+window `1780099200 → 1781913600` (21 days). See
+`docs/FEES_MANAGER_V2_RECOVERY_V2G_D2.md`. The V2G-C-set
+`rebateBudget(mUSDC) = 1_000_000` is preserved across the rotation;
+only the merkle root + window are mutated.

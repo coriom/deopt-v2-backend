@@ -260,6 +260,125 @@ Operational logs should keep the same safety policy. When adding new logs around
 - Runbook: `docs/RUNBOOK_PERP_V2_FEE_ALERTS.md#perpfeeconsumerunknown`.
 - Status: **instrumented** (V2F-Q).
 
+### OPTION V2 Fee + Rebate From OLD MarginEngine (V2G-F)
+
+- Names: `option_fee_charged_from_old_margin_engine`,
+  `option_fee_rebated_from_old_margin_engine`.
+- Metrics (V2G-F):
+  `deopt_option_fee_charged_v2_total{consumer="new"|"old"|"unknown"}`
+  and
+  `deopt_option_fee_rebated_v2_total{consumer="new"|"old"|"unknown"}`.
+- Prometheus rules: see
+  `docs/alertmanager/option_v2_fee_alerts.yml`.
+- Severity: high on Base Sepolia, critical on mainnet (mirrors the
+  PERP severity matrix).
+- Signal: any indexed `FeeChargedV2` / `FeeRebatedV2` event where
+  `decoded.productKind == "option"` and `decoded.consumer ==
+  OLD_MARGIN_ENGINE_ADDRESS`. Classification is shared with the PERP
+  path via the thin
+  `src/fees/option_consumer.rs::classify_option_fee_consumer`
+  wrapper around the PERP classifier — same case-insensitive match,
+  same three-bucket vocabulary, same raw-address suppression.
+- Intent: the NEW MarginEngine
+  (`0x287Cef479be5889eEfCa847F9e73C860898f48Cc`, V2-fees enabled
+  since V2E-E) is the only OPTION fee consumer registered with
+  FeesManagerV2 today. The legacy MarginEngine
+  (`0x6C5665De05e7314cB63cD77F82DFa86508A5b5F8`, V2D-R) is
+  superseded and is expected to emit zero new OPTION V2 fees. Any
+  nonzero occurrence indicates the same class of regression as the
+  PERP-side alert.
+- Expected current value: zero. V2G-E is the only OPTION rebate
+  event on chain so far (tx
+  `0x9a85cbced2216bf3c18049111cce68883cb0b035e194b3dcbaaf4fe7d5293149`,
+  block `42206003`), emitted from NEW.
+- Cardinality guarantees: exactly three series per metric per scrape
+  (`consumer="new"|"old"|"unknown"`). Tests
+  `option_fee_charged_v2_metric_*` /
+  `option_fee_rebated_v2_metric_*` in `src/api/routes.rs::tests`
+  enforce both the bucket count and the no-raw-address invariant.
+- Runbook entries:
+  `docs/RUNBOOK_PERP_V2_FEE_ALERTS.md#optionfeechargedfromoldmarginengine`,
+  `docs/RUNBOOK_PERP_V2_FEE_ALERTS.md#optionfeerebatedfromoldmarginengine`.
+- Status: **instrumented** (V2G-F).
+
+### OPTION V2 Fee Event From Unknown Consumer (V2G-F)
+
+- Name: `option_fee_consumer_unknown`.
+- Metric (V2G-F): combined increase across the OPTION `unknown`
+  buckets — same shape as `perp_fee_consumer_unknown`.
+- Prometheus rule: see
+  `docs/alertmanager/option_v2_fee_alerts.yml`.
+- Severity: medium (anomaly, not a hard regression).
+- Cause taxonomy: env-var drift on `MARGIN_ENGINE` /
+  `OPTION_EVENT_INDEXER_MARGIN_ENGINE_ADDRESS`,
+  `OLD_MARGIN_ENGINE_ADDRESS` unset, or a third MarginEngine
+  registered with FeesManagerV2.
+- Runbook:
+  `docs/RUNBOOK_PERP_V2_FEE_ALERTS.md#optionfeeconsumerunknown`.
+- Status: **instrumented** (V2G-F).
+
+### FeesManagerV2 Rebate Budget Low (V2G-F)
+
+- Name: `fees_manager_v2_rebate_budget_low`.
+- Metric (V2G-F):
+  `deopt_fees_manager_v2_rebate_budget_native{asset="<lowercased address>"}`.
+  Derived from indexed events as `SUM(RebateBudgetFunded.amount) −
+  SUM(RebateBudgetSpent.amount) − SUM(RebateBudgetWithdrawn.amount)`,
+  per `decoded.settlementAsset`, clamped at zero (floors at 0 if
+  the indexer is briefly behind a withdraw rather than
+  wrap-underflowing). Backed by
+  `OptionSeriesStore::fees_manager_v2_rebate_budget_by_asset` and
+  `PgRepository::admin_fees_manager_v2_rebate_budget_by_asset`.
+- Prometheus rule (deployable; also in
+  `docs/alertmanager/option_v2_fee_alerts.yml`):
+
+  ```yaml
+  - alert: FeesManagerV2RebateBudgetLow
+    expr: |
+      deopt_fees_manager_v2_rebate_budget_native{
+        asset="0x6eae407f5640b006fac9965182e238582a3b412e"
+      } < 1000
+    for: 0m
+    labels:
+      severity: medium
+    annotations:
+      summary: "FeesManagerV2 rebate budget is low"
+      description: "Derived rebate budget for the canonical settlement asset (mUSDC on Base Sepolia) has fallen below 1 000 native units. Top up via FeesManagerV2.fundRebateBudget. Also read the on-chain rebateBudget(token) as ground truth."
+  ```
+
+- Severity: medium on Base Sepolia, high on mainnet.
+- Cardinality contract: the `asset` label is the lowercased
+  settlement-asset address (never a symbol). On Base Sepolia we use
+  only mUSDC, so the alert is keyed on a single canonical address;
+  multi-asset environments need one rule per supported asset.
+- Ground truth: the on-chain
+  `FeesManagerV2.rebateBudget(token)(uint256)` view; the derived
+  metric will match it once the indexer has caught up.
+- Runbook:
+  `docs/RUNBOOK_PERP_V2_FEE_ALERTS.md#feesmanagerv2rebatebudgetlow`.
+- Status: **instrumented** (V2G-F).
+
+## Retired / Downgraded Operational Notices
+
+### Merkle Root Unset (retired 2026-05-31, V2G-F)
+
+The "FeesManagerV2 merkle root unset" operational notice that the
+V2G-A plan flagged is now **retired**. The root has been live since
+V2G-C and was rotated under V2G-D2 to
+`0xd8a627d7a9b600370e6f490fdd789150d7f9c4ea2f09752c88121d1f758fc2df`
+with window `1780099200 → 1781913600` (2026-05-30 → 2026-06-20 UTC).
+V2G-D3 claims for the Tier 4 maker / Tier 2 taker, and V2G-E's
+first live `FeeRebatedV2` events, both depend on the root being
+non-zero; if a future incident sees `merkleRoot() == bytes32(0)`
+it is a fresh contract-level regression, not an unfinished
+deployment.
+
+Operators who want a continuous safety check can keep a
+read-only `cast call $FEES_MANAGER_V2 'merkleRoot()(bytes32)'`
+probe in a Grafana dashboard; no Prometheus alert is shipped for it
+because the on-chain state already prevents `claimTier` from
+succeeding against `bytes32(0)`.
+
 ## Deferred Alert Families
 
 - Oracle stale alerts are deferred until oracle metrics exist.

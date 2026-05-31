@@ -1,0 +1,123 @@
+# Prometheus alert rules for the V2G-F OPTION V2 fee observability surface.
+#
+# Mirrors docs/alertmanager/perp_v2_fee_alerts.yml for the OPTION side
+# of FeesManagerV2 (the V2 fee path on the MarginEngine since V2E-E).
+#
+# Source-of-truth: docs/ALERTING_SPEC.md and
+# docs/FEE_OBSERVABILITY_ENV_HYGIENE_CLOSURE_V2G_F.md.
+#
+# Metrics referenced below are emitted by the backend `/metrics`
+# endpoint and exercised in tests under `src/api/routes.rs::tests`:
+#
+#   deopt_option_fee_charged_v2_total{consumer="new"|"old"|"unknown"}
+#   deopt_option_fee_rebated_v2_total{consumer="new"|"old"|"unknown"}
+#   deopt_fees_manager_v2_rebate_budget_native{asset="<lowercased address>"}
+#
+# Cardinality contract (enforced by
+# src/fees/option_consumer.rs::classify_option_fee_consumer):
+#   - the `consumer` label is exactly one of "new", "old", "unknown".
+#   - no raw addresses, tx hashes, traders, recipients, or settlement
+#     assets are promoted to the `consumer` label.
+#   - the rebate-budget gauge's `asset` label IS an address; the alert
+#     rule pins the canonical settlement asset (mUSDC on Base Sepolia)
+#     and operators must update the address to point at the right
+#     asset on other networks.
+#
+# Severity guidance per environment:
+#   - Base Sepolia: keep `severity: high` (current value below).
+#   - mainnet: override to `severity: critical`.
+#
+# Runbook: docs/RUNBOOK_PERP_V2_FEE_ALERTS.md (the PERP runbook covers
+# both products' procedures — the diagnostic queries differ only by the
+# metric / contract addresses, which the runbook documents).
+groups:
+  - name: deopt_option_v2_fee_alerts
+    rules:
+      - alert: OptionFeeChargedFromOldMarginEngine
+        expr: increase(deopt_option_fee_charged_v2_total{consumer="old"}[5m]) > 0
+        for: 0m
+        labels:
+          severity: high
+          subsystem: option_v2_fees
+          milestone: V2G-F
+        annotations:
+          summary: "OPTION FeeChargedV2 emitted from OLD stranded MarginEngine"
+          description: >-
+            The configured OLD MarginEngine address (see
+            OLD_MARGIN_ENGINE_ADDRESS env var) emitted a V2 OPTION fee
+            event. This is the OPTION analogue of
+            PerpFeeChargedFromOldEngine; treat it the same way. Snapshot
+            FeesManagerV2.isFeeConsumer() on every MarginEngine, verify
+            useFeesManagerV2() on the V2 MarginEngine, and compare
+            against the V2E-E acceptance state.
+          runbook_url: "docs/RUNBOOK_PERP_V2_FEE_ALERTS.md#optionfeechargedfromoldmarginengine"
+
+      - alert: OptionFeeRebatedFromOldMarginEngine
+        expr: increase(deopt_option_fee_rebated_v2_total{consumer="old"}[5m]) > 0
+        for: 0m
+        labels:
+          severity: high
+          subsystem: option_v2_fees
+          milestone: V2G-F
+        annotations:
+          summary: "OPTION FeeRebatedV2 emitted from OLD stranded MarginEngine"
+          description: >-
+            Mirror of OptionFeeChargedFromOldMarginEngine but for the
+            rebate path. Same diagnostic procedure.
+          runbook_url: "docs/RUNBOOK_PERP_V2_FEE_ALERTS.md#optionfeerebatedfromoldmarginengine"
+
+      - alert: OptionFeeConsumerUnknown
+        expr: |
+          increase(deopt_option_fee_charged_v2_total{consumer="unknown"}[5m])
+          + increase(deopt_option_fee_rebated_v2_total{consumer="unknown"}[5m])
+          > 0
+        for: 0m
+        labels:
+          severity: medium
+          subsystem: option_v2_fees
+          milestone: V2G-F
+        annotations:
+          summary: "OPTION V2 fee event emitted from unknown consumer"
+          description: >-
+            FeesManagerV2 fired an OPTION fee or rebate whose consumer
+            matches neither the configured NEW MarginEngine
+            (MARGIN_ENGINE / OPTION_EVENT_INDEXER_MARGIN_ENGINE_ADDRESS)
+            nor the optional OLD MarginEngine
+            (OLD_MARGIN_ENGINE_ADDRESS). Either (a) the env var
+            configuration drifted, or (b) a third MarginEngine has been
+            registered as a FeesManagerV2 consumer. Reconcile env vars
+            with the contract state before escalating.
+          runbook_url: "docs/RUNBOOK_PERP_V2_FEE_ALERTS.md#optionfeeconsumerunknown"
+
+  # V2G-F: derived budget alert. The gauge is computed from indexed
+  # RebateBudgetFunded / Spent / Withdrawn events; it floors at 0 if
+  # the indexer is briefly behind a withdraw. Pin the `asset` label to
+  # the canonical settlement-asset address per network.
+  - name: deopt_fees_manager_v2_budget_alerts
+    rules:
+      - alert: FeesManagerV2RebateBudgetLow
+        # Base Sepolia mUSDC = 0x6eae407f5640b006fac9965182e238582a3b412e.
+        # On other networks, replace the address with the canonical
+        # mUSDC / USDC settlement-asset address.
+        expr: |
+          deopt_fees_manager_v2_rebate_budget_native{
+            asset="0x6eae407f5640b006fac9965182e238582a3b412e"
+          } < 1000
+        for: 0m
+        labels:
+          severity: medium
+          subsystem: fees_manager_v2
+          milestone: V2G-F
+        annotations:
+          summary: "FeesManagerV2 rebate budget is low"
+          description: >-
+            Derived rebate budget for the canonical settlement asset
+            (mUSDC on Base Sepolia) has fallen below 1 000 native units
+            (i.e. < 0.001 mUSDC at 6 decimals). Top up via
+            `FeesManagerV2.fundRebateBudget(mUSDC, amount)` to avoid
+            future rebate-eligible trades reverting with
+            `InsufficientRebateBudget`. The gauge is derived from
+            indexed RebateBudgetFunded/Spent/Withdrawn events; for the
+            ground-truth on-chain value also read
+            `FeesManagerV2.rebateBudget(mUSDC)` via cast.
+          runbook_url: "docs/RUNBOOK_PERP_V2_FEE_ALERTS.md#feesmanagerv2rebatebudgetlow"

@@ -1,0 +1,34 @@
+{
+  "_comment_chain": "Base Sepolia (84532) tier-snapshot smoke fixture for V2G-C. Same three accounts as the V2G-B fixture; only the validFrom/validUntil window is refreshed (the V2G-B window was 2025-05-30 → 2025-06-06 and is now in the past, so all its proofs would revert with TierExpired on the live contract).",
+  "_comment_window": "validFrom = 2026-05-30 00:00 UTC, validUntil = 2026-06-13 00:00 UTC. 14-day window.",
+  "chain_id": 84532,
+  "fees_manager_v2": "0x00dA0B9876bcBf0c79CB5BcAcfEBAFb8C7Ad774f",
+  "valid_from": 1780099200,
+  "valid_until": 1781308800,
+  "accounts": [
+    {
+      "label": "v2f_lm_maker_tier4_rebate_candidate",
+      "trader": "0x475fe397fa56884952d350aa9ee1c3946964bc0c",
+      "option_volume_28d_1e8": "1250000000000000",
+      "perp_volume_28d_1e8":   "1250000000000000",
+      "volume_share_ppm": 0,
+      "staked_deopt_1e8": "0"
+    },
+    {
+      "label": "v2f_lm_taker_tier2",
+      "trader": "0x8b94a83d1ad3bd2337b1886e7962ca8e0bba9a34",
+      "option_volume_28d_1e8": "150000000000000",
+      "perp_volume_28d_1e8":   "100000000000000",
+      "volume_share_ppm": 0,
+      "staked_deopt_1e8": "0"
+    },
+    {
+      "label": "smoke_seller_tier0_control",
+      "trader": "0xbaf0976a00a0dcc84df5b15d927695c8b014b1c3",
+      "option_volume_28d_1e8": "10000000000",
+      "perp_volume_28d_1e8":   "0",
+      "volume_share_ppm": 0,
+      "staked_deopt_1e8": "0"
+    }
+  ]
+}

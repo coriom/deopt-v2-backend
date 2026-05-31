@@ -69,6 +69,13 @@ pub struct OptionEventIndexerConfig {
     /// alongside any V1 events on `fees_manager_address`. V1 behavior is
     /// fully unchanged when this is `None`.
     pub fees_manager_v2_address: Option<AccountId>,
+    /// V2G-F observability metadata: optional address of the legacy /
+    /// stranded MarginEngine. Used solely by the
+    /// `deopt_option_fee_charged_v2_total{consumer="old"}` metric and
+    /// its rebated sibling — never used to route broadcast or
+    /// execution traffic. `None` means "OLD address not configured"
+    /// and any unmatched OPTION consumer is bucketed as `"unknown"`.
+    pub old_margin_engine_address: Option<AccountId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -92,6 +99,7 @@ impl OptionEventIndexerConfig {
             collateral_vault_address: AccountId::new(""),
             fees_manager_address: None,
             fees_manager_v2_address: None,
+            old_margin_engine_address: None,
         }
     }
 
@@ -2550,6 +2558,7 @@ mod tests {
                 "0x00000000000000000000000000000000000000cc",
             )),
             fees_manager_v2_address: None,
+            old_margin_engine_address: None,
         };
         let roles: Vec<String> = config
             .emitter_contracts()
@@ -2805,6 +2814,7 @@ mod tests {
             collateral_vault_address: AccountId::new("0x00000000000000000000000000000000000000bb"),
             fees_manager_address: None,
             fees_manager_v2_address: None,
+            old_margin_engine_address: None,
         };
         state
     }

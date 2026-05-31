@@ -402,6 +402,9 @@ async fn append_fee_metrics(state: &AppState, metrics: &mut MetricsText) -> Resu
     let rebate_status_counts;
     let perp_charged_raw_counts: BTreeMap<String, u64>;
     let perp_rebated_raw_counts: BTreeMap<String, u64>;
+    let option_charged_raw_counts: BTreeMap<String, u64>;
+    let option_rebated_raw_counts: BTreeMap<String, u64>;
+    let rebate_budget_by_asset: BTreeMap<String, u64>;
     if let Some(repository) = metrics_repository(state).await {
         fee_counts = repository.admin_fee_event_label_counts().await?;
         rebate_status_counts = repository
@@ -410,6 +413,13 @@ async fn append_fee_metrics(state: &AppState, metrics: &mut MetricsText) -> Resu
         perp_charged_raw_counts = repository.admin_perp_fee_v2_consumer_counts().await?;
         perp_rebated_raw_counts = repository
             .admin_perp_fee_v2_rebated_consumer_counts()
+            .await?;
+        option_charged_raw_counts = repository.admin_option_fee_v2_consumer_counts().await?;
+        option_rebated_raw_counts = repository
+            .admin_option_fee_v2_rebated_consumer_counts()
+            .await?;
+        rebate_budget_by_asset = repository
+            .admin_fees_manager_v2_rebate_budget_by_asset()
             .await?;
     } else {
         let store = state
@@ -433,6 +443,9 @@ async fn append_fee_metrics(state: &AppState, metrics: &mut MetricsText) -> Resu
             .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?;
         perp_charged_raw_counts = options_store.perp_fee_v2_consumer_counts();
         perp_rebated_raw_counts = options_store.perp_fee_v2_rebated_consumer_counts();
+        option_charged_raw_counts = options_store.option_fee_v2_consumer_counts();
+        option_rebated_raw_counts = options_store.option_fee_v2_rebated_consumer_counts();
+        rebate_budget_by_asset = options_store.fees_manager_v2_rebate_budget_by_asset();
     }
 
     metrics.fee_event_gauges(&fee_counts);
@@ -454,6 +467,30 @@ async fn append_fee_metrics(state: &AppState, metrics: &mut MetricsText) -> Resu
         "deopt_perp_fee_rebated_v2_total",
         "PERP FeeRebatedV2 events bucketed by consumer engine (new=current, old=stranded, unknown=neither).",
         &perp_rebated_raw_counts,
+    );
+    append_option_fee_v2_consumer_metric(
+        state,
+        metrics,
+        "deopt_option_fee_charged_v2_total",
+        "OPTION FeeChargedV2 events bucketed by MarginEngine consumer (new=current, old=stranded, unknown=neither).",
+        &option_charged_raw_counts,
+    );
+    append_option_fee_v2_consumer_metric(
+        state,
+        metrics,
+        "deopt_option_fee_rebated_v2_total",
+        "OPTION FeeRebatedV2 events bucketed by MarginEngine consumer (new=current, old=stranded, unknown=neither).",
+        &option_rebated_raw_counts,
+    );
+    // V2G-F: derived FeesManagerV2 rebate budget per settlement asset.
+    // Empty map => no event yet; we emit nothing (no zero baseline)
+    // because the asset label is unknown until at least one RebateBudget
+    // event has been indexed. The `FeesManagerV2RebateBudgetLow` alert
+    // is keyed on a specific lowercased address (e.g. mUSDC).
+    metrics.labeled_gauges(
+        "deopt_fees_manager_v2_rebate_budget_native",
+        "Derived FeesManagerV2 rebate budget per settlement asset (sum of indexed RebateBudgetFunded minus Spent and Withdrawn; clamped at 0). Labelled by the lowercased settlement-asset address.",
+        &[("asset", &rebate_budget_by_asset)],
     );
     Ok(())
 }
@@ -497,6 +534,45 @@ fn append_perp_fee_v2_consumer_metric(
     bucketed.insert(CONSUMER_UNKNOWN.to_string(), 0);
     for (consumer, count) in raw_counts {
         let bucket = classify_perp_fee_consumer(consumer, new_addr, old_addr);
+        let entry = bucketed.entry(bucket.to_string()).or_default();
+        *entry = entry.saturating_add(*count);
+    }
+
+    metrics.labeled_gauges(metric_name, metric_help, &[("consumer", &bucketed)]);
+}
+
+/// V2G-F: OPTION analogue of [`append_perp_fee_v2_consumer_metric`].
+/// Reads the NEW MarginEngine address from `option_event_indexer_config`
+/// and the optional OLD MarginEngine address from the same struct
+/// (`OLD_MARGIN_ENGINE_ADDRESS` env var). Pre-seeds all three label
+/// values to zero so Prometheus alert rules of the shape
+/// `increase(<metric>{consumer="old"}[5m]) > 0` have a stable time
+/// series from the first scrape. Raw addresses are never promoted to a
+/// label value.
+fn append_option_fee_v2_consumer_metric(
+    state: &AppState,
+    metrics: &mut MetricsText,
+    metric_name: &'static str,
+    metric_help: &'static str,
+    raw_counts: &BTreeMap<String, u64>,
+) {
+    use crate::fees::option_consumer::{
+        classify_option_fee_consumer, CONSUMER_NEW, CONSUMER_OLD, CONSUMER_UNKNOWN,
+    };
+
+    let new_addr = non_zero_address(&state.option_event_indexer_config.margin_engine_address.0);
+    let old_addr = state
+        .option_event_indexer_config
+        .old_margin_engine_address
+        .as_ref()
+        .and_then(|addr| non_zero_address(&addr.0));
+
+    let mut bucketed: BTreeMap<String, u64> = BTreeMap::new();
+    bucketed.insert(CONSUMER_NEW.to_string(), 0);
+    bucketed.insert(CONSUMER_OLD.to_string(), 0);
+    bucketed.insert(CONSUMER_UNKNOWN.to_string(), 0);
+    for (consumer, count) in raw_counts {
+        let bucket = classify_option_fee_consumer(consumer, new_addr, old_addr);
         let entry = bucketed.entry(bucket.to_string()).or_default();
         *entry = entry.saturating_add(*count);
     }

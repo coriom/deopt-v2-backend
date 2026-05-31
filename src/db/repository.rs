@@ -834,9 +834,107 @@ impl PgRepository {
         &self,
         event_name: &'static str,
     ) -> Result<BTreeMap<String, u64>> {
-        // Guard the event_name allowlist defensively even though all
-        // call sites pass `&'static str` literals.
+        self.admin_fee_v2_consumer_counts_for_event_and_product(event_name, "perp")
+            .await
+    }
+
+    /// V2G-F: OPTION analogue of `admin_perp_fee_v2_consumer_counts`.
+    /// Feeds `deopt_option_fee_charged_v2_total{consumer=...}`. Filters
+    /// in SQL on `event_name = 'FeeChargedV2'` and `productKind = 'option'`;
+    /// PERP-flavoured rows and `FeeRebatedV2` rows are excluded by
+    /// construction.
+    pub async fn admin_option_fee_v2_consumer_counts(&self) -> Result<BTreeMap<String, u64>> {
+        self.admin_fee_v2_consumer_counts_for_event_and_product("FeeChargedV2", "option")
+            .await
+    }
+
+    /// V2G-F: mirror of `admin_option_fee_v2_consumer_counts` but
+    /// filtered on `FeeRebatedV2` OPTION events. Feeds
+    /// `deopt_option_fee_rebated_v2_total{consumer=...}`.
+    pub async fn admin_option_fee_v2_rebated_consumer_counts(
+        &self,
+    ) -> Result<BTreeMap<String, u64>> {
+        self.admin_fee_v2_consumer_counts_for_event_and_product("FeeRebatedV2", "option")
+            .await
+    }
+
+    /// V2G-F: derived FeesManagerV2 rebate budget per settlement asset,
+    /// computed in SQL as `SUM(Funded.amount) - SUM(Spent.amount) -
+    /// SUM(Withdrawn.amount)`. Asset addresses are lowercased; values
+    /// are clamped to a non-negative `u64` (the on-chain contract
+    /// prevents net-negative; if the indexer is briefly behind a
+    /// withdraw the gauge floors at 0 rather than wrap-underflowing).
+    ///
+    /// Mirrors `OptionSeriesStore::fees_manager_v2_rebate_budget_by_asset`.
+    /// Feeds the `deopt_fees_manager_v2_rebate_budget_native{asset=...}`
+    /// gauge.
+    pub async fn admin_fees_manager_v2_rebate_budget_by_asset(
+        &self,
+    ) -> Result<BTreeMap<String, u64>> {
+        if !self.admin_table_exists("option_execution_events").await? {
+            return Ok(BTreeMap::new());
+        }
+        let rows = sqlx::query(
+            "SELECT lower(COALESCE(decoded->>'settlementAsset', '')) AS asset,
+                    SUM(CASE
+                        WHEN event_name = 'RebateBudgetFunded'
+                            THEN (decoded->>'amount')::NUMERIC
+                        WHEN event_name IN ('RebateBudgetSpent', 'RebateBudgetWithdrawn')
+                            THEN -1 * (decoded->>'amount')::NUMERIC
+                        ELSE 0
+                    END)::TEXT AS net_amount_text
+             FROM option_execution_events
+             WHERE event_name IN ('RebateBudgetFunded', 'RebateBudgetSpent', 'RebateBudgetWithdrawn')
+               AND decoded->>'settlementAsset' IS NOT NULL
+               AND decoded->>'amount' IS NOT NULL
+             GROUP BY asset",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        let mut budgets = BTreeMap::new();
+        for row in rows {
+            let asset: Option<String> = row_get(&row, "asset")?;
+            let asset = asset.unwrap_or_default();
+            if asset.is_empty() {
+                continue;
+            }
+            // NUMERIC summed in SQL, cast to TEXT in the query so sqlx
+            // returns a plain String. Negative net (indexer briefly
+            // behind a withdraw) clamps to 0; non-numeric is skipped.
+            let net_amount_text: Option<String> = row_get(&row, "net_amount_text")?;
+            let Some(net_amount_text) = net_amount_text else {
+                continue;
+            };
+            // Drop any fractional part defensively; on-chain amounts are
+            // always integer wei in their settlement-asset decimals.
+            let integer_part = net_amount_text
+                .split('.')
+                .next()
+                .unwrap_or(net_amount_text.as_str());
+            let net_int: i128 = match integer_part.parse::<i128>() {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            let clamped = if net_int < 0 { 0u64 } else { net_int as u64 };
+            budgets.insert(asset, clamped);
+        }
+        Ok(budgets)
+    }
+
+    /// V2G-F internal helper: SQL group-by `decoded.consumer` for the
+    /// given (`event_name`, `product_kind`) pair. Both inputs come from
+    /// `&'static str` literals at call sites; the allowlists are
+    /// defensively asserted in debug builds.
+    async fn admin_fee_v2_consumer_counts_for_event_and_product(
+        &self,
+        event_name: &'static str,
+        product_kind: &'static str,
+    ) -> Result<BTreeMap<String, u64>> {
+        // Guard the allowlists defensively even though all call sites
+        // pass `&'static str` literals.
         debug_assert!(matches!(event_name, "FeeChargedV2" | "FeeRebatedV2"));
+        debug_assert!(matches!(product_kind, "perp" | "option"));
         if !self.admin_table_exists("option_execution_events").await? {
             return Ok(BTreeMap::new());
         }
@@ -844,10 +942,11 @@ impl PgRepository {
             "SELECT lower(COALESCE(decoded->>'consumer', '')) AS consumer, COUNT(*) AS count
              FROM option_execution_events
              WHERE event_name = $1
-               AND decoded->>'productKind' = 'perp'
+               AND decoded->>'productKind' = $2
              GROUP BY consumer",
         )
         .bind(event_name)
+        .bind(product_kind)
         .fetch_all(&self.pool)
         .await
         .map_err(|error| BackendError::Persistence(error.to_string()))?;

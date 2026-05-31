@@ -747,7 +747,7 @@ impl OptionSeriesStore {
     /// lowercased decoded `consumer` topic. Rebates and OPTION-flavoured
     /// FeeChargedV2 events are excluded.
     pub fn perp_fee_v2_consumer_counts(&self) -> std::collections::BTreeMap<String, u64> {
-        self.perp_fee_v2_consumer_counts_for_event("FeeChargedV2")
+        self.fee_v2_consumer_counts_for_product("FeeChargedV2", "perp")
     }
 
     /// V2F-Q: in-memory mirror of
@@ -757,12 +757,33 @@ impl OptionSeriesStore {
     /// lowercased decoded `consumer` topic. `FeeChargedV2` rows and
     /// OPTION-flavoured `FeeRebatedV2` rows are excluded.
     pub fn perp_fee_v2_rebated_consumer_counts(&self) -> std::collections::BTreeMap<String, u64> {
-        self.perp_fee_v2_consumer_counts_for_event("FeeRebatedV2")
+        self.fee_v2_consumer_counts_for_product("FeeRebatedV2", "perp")
     }
 
-    fn perp_fee_v2_consumer_counts_for_event(
+    /// V2G-F: in-memory mirror of
+    /// `PgRepository::admin_option_fee_v2_consumer_counts`.
+    ///
+    /// Returns the count of OPTION `FeeChargedV2` events grouped by the
+    /// lowercased decoded `consumer` topic. Rebates and PERP-flavoured
+    /// `FeeChargedV2` events are excluded.
+    pub fn option_fee_v2_consumer_counts(&self) -> std::collections::BTreeMap<String, u64> {
+        self.fee_v2_consumer_counts_for_product("FeeChargedV2", "option")
+    }
+
+    /// V2G-F: in-memory mirror of
+    /// `PgRepository::admin_option_fee_v2_rebated_consumer_counts`.
+    ///
+    /// Returns the count of OPTION `FeeRebatedV2` events grouped by the
+    /// lowercased decoded `consumer` topic. `FeeChargedV2` rows and
+    /// PERP-flavoured `FeeRebatedV2` rows are excluded.
+    pub fn option_fee_v2_rebated_consumer_counts(&self) -> std::collections::BTreeMap<String, u64> {
+        self.fee_v2_consumer_counts_for_product("FeeRebatedV2", "option")
+    }
+
+    fn fee_v2_consumer_counts_for_product(
         &self,
         event_name: &str,
+        product_kind: &str,
     ) -> std::collections::BTreeMap<String, u64> {
         let mut counts: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
         for event in self.option_execution_events.values() {
@@ -772,7 +793,7 @@ impl OptionSeriesStore {
             let Some(decoded) = event.decoded.as_ref() else {
                 continue;
             };
-            if decoded.get("productKind").and_then(|value| value.as_str()) != Some("perp") {
+            if decoded.get("productKind").and_then(|value| value.as_str()) != Some(product_kind) {
                 continue;
             }
             let consumer = decoded
@@ -783,6 +804,52 @@ impl OptionSeriesStore {
             *counts.entry(consumer).or_default() += 1;
         }
         counts
+    }
+
+    /// V2G-F: derived FeesManagerV2 rebate budget per settlement asset,
+    /// computed by summing indexed `RebateBudgetFunded` (credit) minus
+    /// `RebateBudgetSpent` and `RebateBudgetWithdrawn` (debits). Asset
+    /// addresses are lowercased; amounts are clamped to a non-negative
+    /// `u64` (the on-chain contract prevents net-negative; if the
+    /// indexer is briefly behind a withdraw the gauge floors at 0
+    /// rather than wrap-underflowing).
+    ///
+    /// Mirrors `PgRepository::admin_fees_manager_v2_rebate_budget_by_asset`.
+    /// Feeds the `deopt_fees_manager_v2_rebate_budget_native{asset=...}`
+    /// gauge and the `FeesManagerV2RebateBudgetLow` Prometheus alert.
+    pub fn fees_manager_v2_rebate_budget_by_asset(
+        &self,
+    ) -> std::collections::BTreeMap<String, u64> {
+        let mut net: std::collections::BTreeMap<String, i128> = std::collections::BTreeMap::new();
+        for event in self.option_execution_events.values() {
+            let Some(decoded) = event.decoded.as_ref() else {
+                continue;
+            };
+            let Some(asset) = decoded.get("settlementAsset").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Some(amount_str) = decoded.get("amount").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Ok(amount) = amount_str.parse::<i128>() else {
+                continue;
+            };
+            let asset_lc = asset.to_ascii_lowercase();
+            let entry = net.entry(asset_lc).or_default();
+            match event.event_name.as_str() {
+                "RebateBudgetFunded" => *entry = entry.saturating_add(amount),
+                "RebateBudgetSpent" | "RebateBudgetWithdrawn" => {
+                    *entry = entry.saturating_sub(amount)
+                }
+                _ => {}
+            }
+        }
+        net.into_iter()
+            .map(|(asset, value)| {
+                let clamped = if value < 0 { 0u64 } else { value as u64 };
+                (asset, clamped)
+            })
+            .collect()
     }
 
     pub fn list_option_execution_events_by_tx_hash(

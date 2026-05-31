@@ -1,0 +1,35 @@
+{
+  "_comment_chain": "Base Sepolia (84532) tier-snapshot smoke fixture for V2G-B. The accounts below qualify Tier 4 / Tier 2 / Tier 0 via the volume axis only so the operator can drive the smoke entirely off-chain (no DEOPT stake snapshot, no venue share computation).",
+  "_comment_traders": "v2f_lm_taker / v2f_lm_maker are the live V2F-LM PERP fee-smoke addresses; smoke_buyer / smoke_seller are the .env-resident smoke EOAs reused from V2D-V/V2E-G. Replace with operator-controlled keys before broadcast if these are not the intended signers. No private keys are stored in this repo.",
+  "_comment_window": "valid_from / valid_until correspond to 2026-05-30 00:00:00 UTC and 2026-06-06 00:00:00 UTC. Operator must rewrite to the actual smoke window before signing setMerkleRoot.",
+  "chain_id": 84532,
+  "fees_manager_v2": "0x00dA0B9876bcBf0c79CB5BcAcfEBAFb8C7Ad774f",
+  "valid_from": 1748563200,
+  "valid_until": 1749168000,
+  "accounts": [
+    {
+      "label": "v2f_lm_maker_tier4_rebate_candidate",
+      "trader": "0x475fe397fa56884952d350aa9ee1c3946964bc0c",
+      "option_volume_28d_1e8": "1250000000000000",
+      "perp_volume_28d_1e8":   "1250000000000000",
+      "volume_share_ppm": 0,
+      "staked_deopt_1e8": "0"
+    },
+    {
+      "label": "v2f_lm_taker_tier2",
+      "trader": "0x8b94a83d1ad3bd2337b1886e7962ca8e0bba9a34",
+      "option_volume_28d_1e8": "150000000000000",
+      "perp_volume_28d_1e8":   "100000000000000",
+      "volume_share_ppm": 0,
+      "staked_deopt_1e8": "0"
+    },
+    {
+      "label": "smoke_seller_tier0_control",
+      "trader": "0xbaf0976a00a0dcc84df5b15d927695c8b014b1c3",
+      "option_volume_28d_1e8": "10000000000",
+      "perp_volume_28d_1e8":   "0",
+      "volume_share_ppm": 0,
+      "staked_deopt_1e8": "0"
+    }
+  ]
+}

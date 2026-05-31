@@ -4964,6 +4964,384 @@ mod tests {
         assert!(!body.contains(stray_consumer));
     }
 
+    /// V2G-F: the `deopt_option_fee_charged_v2_total{consumer=...}`
+    /// metric is always emitted with the three low-cardinality bucket
+    /// labels (`new`, `old`, `unknown`) — even when no OPTION fee
+    /// events have been indexed yet — so the
+    /// `increase(...{consumer="old"}[5m]) > 0` Prometheus rule has a
+    /// stable time series to alert on from the first scrape.
+    #[tokio::test]
+    async fn option_fee_charged_v2_metric_emits_three_buckets_at_zero() {
+        let state = admin_state(false);
+        let response = router(state)
+            .oneshot(get_request("/metrics", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_text(response).await;
+        assert!(body.contains(
+            "# HELP deopt_option_fee_charged_v2_total OPTION FeeChargedV2 events bucketed"
+        ));
+        assert!(body.contains("# TYPE deopt_option_fee_charged_v2_total gauge"));
+        assert!(body.contains("deopt_option_fee_charged_v2_total{consumer=\"new\"} 0"));
+        assert!(body.contains("deopt_option_fee_charged_v2_total{consumer=\"old\"} 0"));
+        assert!(body.contains("deopt_option_fee_charged_v2_total{consumer=\"unknown\"} 0"));
+        // Sibling rebated metric is also pre-seeded at zero.
+        assert!(body.contains("deopt_option_fee_rebated_v2_total{consumer=\"new\"} 0"));
+        assert!(body.contains("deopt_option_fee_rebated_v2_total{consumer=\"old\"} 0"));
+        assert!(body.contains("deopt_option_fee_rebated_v2_total{consumer=\"unknown\"} 0"));
+    }
+
+    /// V2G-F: a NEW-emitted OPTION `FeeChargedV2` lands in the `new`
+    /// bucket. A PERP-flavoured `FeeChargedV2` must not contribute to
+    /// the OPTION counter, and a `FeeRebatedV2` must not either.
+    #[tokio::test]
+    async fn option_fee_charged_v2_metric_classifies_new_and_excludes_perp_and_rebate() {
+        let new_margin_engine = "0x287cef479be5889eefca847f9e73c860898f48cc";
+        let old_margin_engine = "0x6c5665de05e7314cb63cd77f82dfa86508a5b5f8";
+        let new_perp_engine = "0xc6c592100723fe0c66343a16e95ec34cc0c2141c";
+        let mut state = admin_state(false);
+        state.option_event_indexer_config.margin_engine_address = AccountId::new(new_margin_engine);
+        state.option_event_indexer_config.old_margin_engine_address =
+            Some(AccountId::new(old_margin_engine));
+        // PERP NEW so the cross-PERP charged event falls into `new`
+        // (and we can assert PERP/OPTION separation in both directions).
+        state.execution_config.perp_engine_address = AccountId::new(new_perp_engine);
+
+        let option_new = build_fee_charged_v2_option_log_row(
+            21,
+            "0x9a85cbced2216bf3c18049111cce68883cb0b035e194b3dcbaaf4fe7d5293149",
+            125,
+            "0x77ca9dd6ccce2d692fb23877a2db7178807b0020",
+            25,
+            125,
+            false,
+        );
+        // PERP `FeeChargedV2` MUST NOT contribute to the OPTION counter.
+        let perp_charged = build_fee_charged_v2_perp_log_row(
+            22,
+            "0x5c15e9233d49729cf21058a89f49bc6fdf0f7295cda5a7f313c96556728aa394",
+            153,
+            "0x77ca9dd6ccce2d692fb23877a2db7178807b0020",
+            6,
+            200,
+            false,
+        );
+        // OPTION `FeeRebatedV2` MUST NOT contribute to the OPTION charged counter.
+        let option_rebate = build_fee_rebated_v2_option_log_row(
+            23,
+            "0x9a85cbced2216bf3c18049111cce68883cb0b035e194b3dcbaaf4fe7d5293149",
+            133,
+            "0x290bd12c93e467bf51c51f5273d35bddb19e9274",
+            10,
+            -50,
+        );
+        state
+            .options_store
+            .lock()
+            .unwrap()
+            .persist_option_execution_events_and_cursor(
+                OPTION_EVENT_INDEXER_STATE_ID,
+                &[option_new, perp_charged, option_rebate],
+                42_206_003,
+                1,
+            );
+
+        let response = router(state)
+            .oneshot(get_request("/metrics", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_text(response).await;
+        // OPTION NEW FeeChargedV2 counted once; PERP and rebate excluded.
+        assert!(body.contains("deopt_option_fee_charged_v2_total{consumer=\"new\"} 1"));
+        assert!(body.contains("deopt_option_fee_charged_v2_total{consumer=\"old\"} 0"));
+        assert!(body.contains("deopt_option_fee_charged_v2_total{consumer=\"unknown\"} 0"));
+        // PERP metric still sees its own NEW event (no cross-contamination).
+        assert!(body.contains("deopt_perp_fee_charged_v2_total{consumer=\"new\"} 1"));
+        // OPTION rebated metric sees the rebate.
+        assert!(body.contains("deopt_option_fee_rebated_v2_total{consumer=\"new\"} 1"));
+        // No raw address (consumer or trader) leaks as a label value.
+        assert!(!body.contains(new_margin_engine));
+        assert!(!body.contains(old_margin_engine));
+        assert!(!body.contains("0x77ca9dd6ccce2d692fb23877a2db7178807b0020"));
+        assert!(!body.contains("0x290bd12c93e467bf51c51f5273d35bddb19e9274"));
+    }
+
+    /// V2G-F: an OLD-emitted OPTION `FeeChargedV2` lands in the `old`
+    /// bucket when `OLD_MARGIN_ENGINE_ADDRESS` is configured.
+    #[tokio::test]
+    async fn option_fee_charged_v2_metric_classifies_old_consumer() {
+        let new_margin_engine = "0x287cef479be5889eefca847f9e73c860898f48cc";
+        let old_margin_engine = "0x6c5665de05e7314cb63cd77f82dfa86508a5b5f8";
+        let mut state = admin_state(false);
+        state.option_event_indexer_config.margin_engine_address = AccountId::new(new_margin_engine);
+        state.option_event_indexer_config.old_margin_engine_address =
+            Some(AccountId::new(old_margin_engine));
+
+        let option_old = build_fee_charged_v2_option_log_row_for_consumer(
+            31,
+            "0x8888888888888888888888888888888888888888888888888888888888888888",
+            44,
+            old_margin_engine,
+            "0x77ca9dd6ccce2d692fb23877a2db7178807b0020",
+            25,
+            125,
+            false,
+        );
+        state
+            .options_store
+            .lock()
+            .unwrap()
+            .persist_option_execution_events_and_cursor(
+                OPTION_EVENT_INDEXER_STATE_ID,
+                &[option_old],
+                42_300_000,
+                1,
+            );
+
+        let response = router(state)
+            .oneshot(get_request("/metrics", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_text(response).await;
+        assert!(body.contains("deopt_option_fee_charged_v2_total{consumer=\"new\"} 0"));
+        assert!(body.contains("deopt_option_fee_charged_v2_total{consumer=\"old\"} 1"));
+        assert!(body.contains("deopt_option_fee_charged_v2_total{consumer=\"unknown\"} 0"));
+        assert!(!body.contains(old_margin_engine));
+    }
+
+    /// V2G-F: an OPTION `FeeChargedV2` from a consumer that matches
+    /// neither NEW nor OLD lands in `unknown`. Also covers the case
+    /// where `OLD_MARGIN_ENGINE_ADDRESS` is unset.
+    #[tokio::test]
+    async fn option_fee_charged_v2_metric_classifies_unknown_consumer() {
+        let new_margin_engine = "0x287cef479be5889eefca847f9e73c860898f48cc";
+        let stray_consumer = "0xdeadbeef00000000000000000000000000000003";
+        let mut state = admin_state(false);
+        state.option_event_indexer_config.margin_engine_address = AccountId::new(new_margin_engine);
+        // OLD intentionally unset — non-NEW consumers must fall through
+        // to `unknown` (never silently become `old`).
+        state.option_event_indexer_config.old_margin_engine_address = None;
+
+        let option_unknown = build_fee_charged_v2_option_log_row_for_consumer(
+            33,
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
+            15,
+            stray_consumer,
+            "0x77ca9dd6ccce2d692fb23877a2db7178807b0020",
+            25,
+            125,
+            false,
+        );
+        state
+            .options_store
+            .lock()
+            .unwrap()
+            .persist_option_execution_events_and_cursor(
+                OPTION_EVENT_INDEXER_STATE_ID,
+                &[option_unknown],
+                42_300_001,
+                1,
+            );
+
+        let response = router(state)
+            .oneshot(get_request("/metrics", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_text(response).await;
+        assert!(body.contains("deopt_option_fee_charged_v2_total{consumer=\"new\"} 0"));
+        assert!(body.contains("deopt_option_fee_charged_v2_total{consumer=\"old\"} 0"));
+        assert!(body.contains("deopt_option_fee_charged_v2_total{consumer=\"unknown\"} 1"));
+        assert!(!body.contains(new_margin_engine));
+        assert!(!body.contains(stray_consumer));
+    }
+
+    /// V2G-F: OPTION `FeeRebatedV2` from NEW lands in `new`; a
+    /// PERP-flavoured `FeeRebatedV2` must not contribute to the OPTION
+    /// rebated counter (PERP/OPTION separation in the other direction).
+    #[tokio::test]
+    async fn option_fee_rebated_v2_metric_classifies_new_and_excludes_perp() {
+        let new_margin_engine = "0x287cef479be5889eefca847f9e73c860898f48cc";
+        let new_perp_engine = "0xc6c592100723fe0c66343a16e95ec34cc0c2141c";
+        let mut state = admin_state(false);
+        state.option_event_indexer_config.margin_engine_address = AccountId::new(new_margin_engine);
+        state.execution_config.perp_engine_address = AccountId::new(new_perp_engine);
+
+        let option_rebate_new = build_fee_rebated_v2_option_log_row(
+            41,
+            "0x9a85cbced2216bf3c18049111cce68883cb0b035e194b3dcbaaf4fe7d5293149",
+            133,
+            "0x290bd12c93e467bf51c51f5273d35bddb19e9274",
+            10,
+            -50,
+        );
+        let perp_rebate_new = build_fee_rebated_v2_perp_log_row(
+            42,
+            "0x5c15e9233d49729cf21058a89f49bc6fdf0f7295cda5a7f313c96556728aa394",
+            147,
+            "0x290bd12c93e467bf51c51f5273d35bddb19e9274",
+            3,
+            -100,
+        );
+        state
+            .options_store
+            .lock()
+            .unwrap()
+            .persist_option_execution_events_and_cursor(
+                OPTION_EVENT_INDEXER_STATE_ID,
+                &[option_rebate_new, perp_rebate_new],
+                42_300_002,
+                1,
+            );
+
+        let response = router(state)
+            .oneshot(get_request("/metrics", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_text(response).await;
+        // OPTION rebate: NEW = 1, PERP rebate excluded.
+        assert!(body.contains("deopt_option_fee_rebated_v2_total{consumer=\"new\"} 1"));
+        assert!(body.contains("deopt_option_fee_rebated_v2_total{consumer=\"old\"} 0"));
+        assert!(body.contains("deopt_option_fee_rebated_v2_total{consumer=\"unknown\"} 0"));
+        // PERP rebate metric still sees its own event.
+        assert!(body.contains("deopt_perp_fee_rebated_v2_total{consumer=\"new\"} 1"));
+    }
+
+    /// V2G-F: the derived
+    /// `deopt_fees_manager_v2_rebate_budget_native{asset=...}` gauge
+    /// reflects `SUM(RebateBudgetFunded.amount) −
+    /// SUM(RebateBudgetSpent.amount) − SUM(RebateBudgetWithdrawn.amount)`
+    /// per settlement asset, computed from indexed events. With no
+    /// events the gauge emits nothing; once events land the gauge
+    /// exposes one series per (lowercased) asset address.
+    #[tokio::test]
+    async fn fees_manager_v2_rebate_budget_metric_reflects_funded_minus_spent_and_withdrawn() {
+        use super::tests::OPTION_EVENT_INDEXER_STATE_ID;
+        let m_usdc = "0x6eae407f5640b006fac9965182e238582a3b412e";
+        let other_asset = "0x0000000000000000000000000000000000001234";
+        let state = admin_state(false);
+
+        // Initial scrape — no RebateBudget events yet → no asset
+        // series should be emitted (we never emit a fake zero baseline
+        // for an unknown asset).
+        let response = router(state.clone())
+            .oneshot(get_request("/metrics", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_text(response).await;
+        assert!(body.contains("# HELP deopt_fees_manager_v2_rebate_budget_native"));
+        assert!(body.contains("# TYPE deopt_fees_manager_v2_rebate_budget_native gauge"));
+        assert!(!body.contains("deopt_fees_manager_v2_rebate_budget_native{asset=\""));
+
+        let funded = build_rebate_budget_event(
+            61,
+            "0xc11c0000000000000000000000000000000000000000000000000000000000c1",
+            1,
+            "RebateBudgetFunded",
+            m_usdc,
+            1_000_000,
+        );
+        let spent_perp = build_rebate_budget_event(
+            62,
+            "0x5c15e9233d49729cf21058a89f49bc6fdf0f7295cda5a7f313c96556728aa394",
+            148,
+            "RebateBudgetSpent",
+            m_usdc,
+            3,
+        );
+        let spent_option = build_rebate_budget_event(
+            63,
+            "0x9a85cbced2216bf3c18049111cce68883cb0b035e194b3dcbaaf4fe7d5293149",
+            134,
+            "RebateBudgetSpent",
+            m_usdc,
+            10,
+        );
+        // A separate (smaller) asset to verify the gauge produces one
+        // series per (lowercased) asset address — no cross-leak.
+        let funded_other = build_rebate_budget_event(
+            64,
+            "0xc11c0000000000000000000000000000000000000000000000000000000000c2",
+            2,
+            "RebateBudgetFunded",
+            other_asset,
+            42,
+        );
+        state
+            .options_store
+            .lock()
+            .unwrap()
+            .persist_option_execution_events_and_cursor(
+                OPTION_EVENT_INDEXER_STATE_ID,
+                &[funded, spent_perp, spent_option, funded_other],
+                42_206_010,
+                1,
+            );
+
+        let response = router(state)
+            .oneshot(get_request("/metrics", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_text(response).await;
+        // mUSDC: 1_000_000 funded − 3 PERP spent − 10 OPTION spent = 999_987.
+        assert!(body.contains(
+            "deopt_fees_manager_v2_rebate_budget_native{asset=\"0x6eae407f5640b006fac9965182e238582a3b412e\"} 999987"
+        ));
+        // Other asset only had a funded event → 42.
+        assert!(body.contains(
+            "deopt_fees_manager_v2_rebate_budget_native{asset=\"0x0000000000000000000000000000000000001234\"} 42"
+        ));
+    }
+
+    /// V2G-F: OPTION `FeeRebatedV2` from a stray consumer lands in
+    /// `unknown` and never silently becomes `old`.
+    #[tokio::test]
+    async fn option_fee_rebated_v2_metric_classifies_unknown_consumer() {
+        let new_margin_engine = "0x287cef479be5889eefca847f9e73c860898f48cc";
+        let stray_consumer = "0xdeadbeef00000000000000000000000000000004";
+        let mut state = admin_state(false);
+        state.option_event_indexer_config.margin_engine_address = AccountId::new(new_margin_engine);
+        state.option_event_indexer_config.old_margin_engine_address = None;
+
+        let option_rebate_unknown = build_fee_rebated_v2_option_log_row_for_consumer(
+            44,
+            "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            19,
+            stray_consumer,
+            "0x290bd12c93e467bf51c51f5273d35bddb19e9274",
+            10,
+            -50,
+        );
+        state
+            .options_store
+            .lock()
+            .unwrap()
+            .persist_option_execution_events_and_cursor(
+                OPTION_EVENT_INDEXER_STATE_ID,
+                &[option_rebate_unknown],
+                42_300_003,
+                1,
+            );
+
+        let response = router(state)
+            .oneshot(get_request("/metrics", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_text(response).await;
+        assert!(body.contains("deopt_option_fee_rebated_v2_total{consumer=\"new\"} 0"));
+        assert!(body.contains("deopt_option_fee_rebated_v2_total{consumer=\"old\"} 0"));
+        assert!(body.contains("deopt_option_fee_rebated_v2_total{consumer=\"unknown\"} 1"));
+        assert!(!body.contains(new_margin_engine));
+        assert!(!body.contains(stray_consumer));
+    }
+
     #[tokio::test]
     async fn metrics_persistence_disabled_empty_state_renders() {
         let response = router(AppState::new(EngineState::with_default_markets()))
@@ -5480,6 +5858,7 @@ mod tests {
                 "0x00000000000000000000000000000000000000cc",
             )),
             fees_manager_v2_address: None,
+            old_margin_engine_address: None,
         };
         let event = route_option_execution_event();
         state
@@ -5570,6 +5949,7 @@ mod tests {
             collateral_vault_address: AccountId::new("0x00000000000000000000000000000000000000bb"),
             fees_manager_address: None,
             fees_manager_v2_address: None,
+            old_margin_engine_address: None,
         };
 
         let response = router(state)
@@ -5603,6 +5983,7 @@ mod tests {
             collateral_vault_address: AccountId::new("0x00000000000000000000000000000000000000bb"),
             fees_manager_address: None,
             fees_manager_v2_address: None,
+            old_margin_engine_address: None,
         };
         let app = router(state.clone());
 
@@ -6450,6 +6831,210 @@ mod tests {
                 "rebatePpm": rebate_ppm,
                 "basisAmount": "10000",
                 "rebateAmount": rebate_amount.to_string(),
+            })),
+            created_at_ms: 6,
+            updated_at_ms: 6,
+        }
+    }
+
+    /// V2G-F: OPTION-flavoured `FeeChargedV2` log row with NEW MarginEngine
+    /// as the consumer by default. Mirrors `build_fee_charged_v2_perp_log_row`
+    /// but with `productKind = "option"` and contract_address pointing at
+    /// FeesManagerV2. Used by the OPTION metric tests and the
+    /// PERP/OPTION-separation test.
+    fn build_fee_charged_v2_option_log_row(
+        id_seed: u128,
+        tx_hash: &str,
+        log_index: u64,
+        trader: &str,
+        fee_amount: u128,
+        fee_ppm: i32,
+        is_maker: bool,
+    ) -> crate::options::OptionExecutionEvent {
+        crate::options::OptionExecutionEvent {
+            id: Uuid::from_u128(6_000 + id_seed),
+            chain_id: 84532,
+            contract_address: "0x00da0b9876bcbf0c79cb5bcacfebafb8c7ad774f".to_string(),
+            tx_hash: tx_hash.to_string(),
+            log_index,
+            block_number: 42_206_003,
+            block_hash: None,
+            event_name: "FeeChargedV2".to_string(),
+            event_signature: "FeeChargedV2".to_string(),
+            intent_id: None,
+            onchain_intent_id: None,
+            option_execution_transaction_id: None,
+            buyer: None,
+            seller: None,
+            account: Some(trader.to_string()),
+            option_id: None,
+            quantity_contracts: None,
+            premium_per_contract_native: Some(fee_amount.to_string()),
+            raw_topics: serde_json::Value::Array(Vec::new()),
+            raw_data: "0x".to_string(),
+            decoded: Some(serde_json::json!({
+                "consumer": "0x287cef479be5889eefca847f9e73c860898f48cc",
+                "trader": trader,
+                "recipient": "0xa67f8e8e673ce4bb2fb563b0e6e9fa8f70e3b588",
+                "settlementAsset": "0x6eae407f5640b006fac9965182e238582a3b412e",
+                "productKind": "option",
+                "productKindRaw": 0,
+                "flowKind": "orderbook",
+                "flowKindRaw": 0,
+                "isMaker": is_maker,
+                "feePpm": fee_ppm,
+                "basisAmount": "200000",
+                "feeAmount": fee_amount.to_string(),
+            })),
+            created_at_ms: 6,
+            updated_at_ms: 6,
+        }
+    }
+
+    /// V2G-F: OPTION-flavoured `FeeChargedV2` log row with a caller-chosen
+    /// `consumer` address. Used by the OPTION metric tests to exercise
+    /// the `new` / `old` / `unknown` buckets.
+    #[allow(clippy::too_many_arguments)]
+    fn build_fee_charged_v2_option_log_row_for_consumer(
+        id_seed: u128,
+        tx_hash: &str,
+        log_index: u64,
+        consumer: &str,
+        trader: &str,
+        fee_amount: u128,
+        fee_ppm: i32,
+        is_maker: bool,
+    ) -> crate::options::OptionExecutionEvent {
+        let mut event = build_fee_charged_v2_option_log_row(
+            id_seed, tx_hash, log_index, trader, fee_amount, fee_ppm, is_maker,
+        );
+        if let Some(decoded) = event.decoded.as_mut() {
+            if let Some(map) = decoded.as_object_mut() {
+                map.insert(
+                    "consumer".to_string(),
+                    serde_json::Value::String(consumer.to_ascii_lowercase()),
+                );
+            }
+        }
+        event
+    }
+
+    /// V2G-F: OPTION-flavoured `FeeRebatedV2` log row with NEW MarginEngine
+    /// as the consumer by default. Mirrors `build_fee_rebated_v2_perp_log_row`
+    /// but with `productKind = "option"`.
+    fn build_fee_rebated_v2_option_log_row(
+        id_seed: u128,
+        tx_hash: &str,
+        log_index: u64,
+        trader: &str,
+        rebate_amount: u128,
+        rebate_ppm: i32,
+    ) -> crate::options::OptionExecutionEvent {
+        crate::options::OptionExecutionEvent {
+            id: Uuid::from_u128(7_000 + id_seed),
+            chain_id: 84532,
+            contract_address: "0x00da0b9876bcbf0c79cb5bcacfebafb8c7ad774f".to_string(),
+            tx_hash: tx_hash.to_string(),
+            log_index,
+            block_number: 42_206_003,
+            block_hash: None,
+            event_name: "FeeRebatedV2".to_string(),
+            event_signature: "FeeRebatedV2".to_string(),
+            intent_id: None,
+            onchain_intent_id: None,
+            option_execution_transaction_id: None,
+            buyer: None,
+            seller: None,
+            account: Some(trader.to_string()),
+            option_id: None,
+            quantity_contracts: None,
+            premium_per_contract_native: Some(rebate_amount.to_string()),
+            raw_topics: serde_json::Value::Array(Vec::new()),
+            raw_data: "0x".to_string(),
+            decoded: Some(serde_json::json!({
+                "consumer": "0x287cef479be5889eefca847f9e73c860898f48cc",
+                "trader": trader,
+                "recipient": trader,
+                "settlementAsset": "0x6eae407f5640b006fac9965182e238582a3b412e",
+                "productKind": "option",
+                "productKindRaw": 0,
+                "flowKind": "orderbook",
+                "flowKindRaw": 0,
+                "isMaker": true,
+                "rebatePpm": rebate_ppm,
+                "basisAmount": "200000",
+                "rebateAmount": rebate_amount.to_string(),
+            })),
+            created_at_ms: 6,
+            updated_at_ms: 6,
+        }
+    }
+
+    /// V2G-F: OPTION-flavoured `FeeRebatedV2` log row with a caller-chosen
+    /// `consumer` address.
+    fn build_fee_rebated_v2_option_log_row_for_consumer(
+        id_seed: u128,
+        tx_hash: &str,
+        log_index: u64,
+        consumer: &str,
+        trader: &str,
+        rebate_amount: u128,
+        rebate_ppm: i32,
+    ) -> crate::options::OptionExecutionEvent {
+        let mut event = build_fee_rebated_v2_option_log_row(
+            id_seed,
+            tx_hash,
+            log_index,
+            trader,
+            rebate_amount,
+            rebate_ppm,
+        );
+        if let Some(decoded) = event.decoded.as_mut() {
+            if let Some(map) = decoded.as_object_mut() {
+                map.insert(
+                    "consumer".to_string(),
+                    serde_json::Value::String(consumer.to_ascii_lowercase()),
+                );
+            }
+        }
+        event
+    }
+
+    /// V2G-F: a minimal RebateBudgetFunded / Spent / Withdrawn event
+    /// row with caller-chosen `settlementAsset` (lowercased) and
+    /// `amount` (native units). Used by the budget gauge test.
+    fn build_rebate_budget_event(
+        id_seed: u128,
+        tx_hash: &str,
+        log_index: u64,
+        event_name: &str,
+        settlement_asset: &str,
+        amount: u128,
+    ) -> crate::options::OptionExecutionEvent {
+        crate::options::OptionExecutionEvent {
+            id: Uuid::from_u128(8_000 + id_seed),
+            chain_id: 84532,
+            contract_address: "0x00da0b9876bcbf0c79cb5bcacfebafb8c7ad774f".to_string(),
+            tx_hash: tx_hash.to_string(),
+            log_index,
+            block_number: 42_206_000,
+            block_hash: None,
+            event_name: event_name.to_string(),
+            event_signature: event_name.to_string(),
+            intent_id: None,
+            onchain_intent_id: None,
+            option_execution_transaction_id: None,
+            buyer: None,
+            seller: None,
+            account: None,
+            option_id: None,
+            quantity_contracts: None,
+            premium_per_contract_native: Some(amount.to_string()),
+            raw_topics: serde_json::Value::Array(Vec::new()),
+            raw_data: "0x".to_string(),
+            decoded: Some(serde_json::json!({
+                "settlementAsset": settlement_asset.to_ascii_lowercase(),
+                "amount": amount.to_string(),
             })),
             created_at_ms: 6,
             updated_at_ms: 6,
