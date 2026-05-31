@@ -1273,3 +1273,25 @@ Test suite: 661 → 675 passed (+14 V2G-F tests).
 - Land the `.env` env-hygiene cleanup (`PERP_ENGINE_ADDRESS=NEW` +
   `OLD_PERP_ENGINE_ADDRESS=OLD`).
 
+## V2G-G closure (appended 2026-05-31)
+
+V2G-G productionised the observability surface that V2G-E exercised
+and V2G-F instrumented. See
+`docs/V2_FEE_PRODUCTION_OBSERVABILITY_V2G_G.md` for the full record.
+
+In one paragraph: the V2G-E PERP tx
+`0x5c15e923…aa394` and OPTION tx `0x9a85cbce…3149` were re-resolved
+through the new `GET /admin/fees/v2/observability` endpoint (the
+V2G-G admin snapshot route) under the same shell-only override stack
+V2G-F used, and the four V2 fee gauges + budget gauge reproduced the
+exact V2G-F closure values (PERP charged{new}=3, rebated{new}=1,
+OPTION charged{new}=3, rebated{new}=1, all OLD/unknown=0, mUSDC
+rebate budget = 999 987). The seven Prometheus alerts (3 PERP + 3
+OPTION + budget low) plus the V2G-G additions
+(`FeesManagerV2RebateBudgetStale`, `DeoptV2FeeMetricsAbsent`) were
+all evaluated logically against the current `/metrics` shape and
+none would fire. The deployable rules + Grafana dashboard + frontend
+admin section + operator `.env` patch are now committed.
+
+Test suite: 675 → 679 (+4 V2G-G HTTP tests on the new admin endpoint).
+

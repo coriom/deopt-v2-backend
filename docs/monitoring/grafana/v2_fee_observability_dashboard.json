@@ -1,0 +1,480 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "description": "Prometheus datasource scraping deopt-v2-backend /metrics",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
+    }
+  ],
+  "__requires": [
+    {"type": "grafana", "id": "grafana", "name": "Grafana", "version": "9.0.0"},
+    {"type": "datasource", "id": "prometheus", "name": "Prometheus", "version": "1.0.0"},
+    {"type": "panel", "id": "timeseries", "name": "Time series", "version": ""},
+    {"type": "panel", "id": "stat", "name": "Stat", "version": ""},
+    {"type": "panel", "id": "table", "name": "Table", "version": ""}
+  ],
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": "-- Grafana --",
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "V2G-G — V2 fee observability dashboard for FeesManagerV2 (PERP + OPTION + rebate budget). Panels are fed by the deopt-v2-backend /metrics endpoint. See docs/V2_FEE_PRODUCTION_OBSERVABILITY_V2G_G.md and docs/RUNBOOK_PERP_V2_FEE_ALERTS.md.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "iteration": 1748736000000,
+  "links": [
+    {
+      "asDropdown": false,
+      "icon": "doc",
+      "includeVars": false,
+      "keepTime": false,
+      "tags": [],
+      "targetBlank": true,
+      "title": "Runbook",
+      "tooltip": "PERP + OPTION V2 fee runbook",
+      "type": "link",
+      "url": "../docs/RUNBOOK_PERP_V2_FEE_ALERTS.md"
+    },
+    {
+      "asDropdown": false,
+      "icon": "doc",
+      "includeVars": false,
+      "keepTime": false,
+      "tags": [],
+      "targetBlank": true,
+      "title": "Alerting spec",
+      "tooltip": "ALERTING_SPEC (PERP + OPTION + budget alerts)",
+      "type": "link",
+      "url": "../docs/ALERTING_SPEC.md"
+    }
+  ],
+  "panels": [
+    {
+      "type": "row",
+      "id": 100,
+      "title": "PERP — FeesManagerV2 V2 fee flow",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 0},
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "id": 1,
+      "title": "PERP FeeChargedV2 by consumer",
+      "description": "PERP FeeChargedV2 events bucketed by consumer (new = current PerpEngine, old = stranded under A3 fallback, unknown = unconfigured). Source metric: deopt_perp_fee_charged_v2_total.",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 1},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "deopt_perp_fee_charged_v2_total{consumer=~\"$consumer\"}",
+          "legendFormat": "{{consumer}}",
+          "interval": ""
+        }
+      ],
+      "options": {
+        "legend": {"displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max"]},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10},
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}
+        },
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "old"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "red"}}]},
+          {"matcher": {"id": "byName", "options": "unknown"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "orange"}}]}
+        ]
+      }
+    },
+    {
+      "type": "timeseries",
+      "id": 2,
+      "title": "PERP FeeRebatedV2 by consumer",
+      "description": "PERP FeeRebatedV2 events bucketed by consumer. Source metric: deopt_perp_fee_rebated_v2_total.",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 1},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "deopt_perp_fee_rebated_v2_total{consumer=~\"$consumer\"}",
+          "legendFormat": "{{consumer}}"
+        }
+      ],
+      "options": {
+        "legend": {"displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max"]},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10}
+        },
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "old"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "red"}}]},
+          {"matcher": {"id": "byName", "options": "unknown"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "orange"}}]}
+        ]
+      }
+    },
+    {
+      "type": "row",
+      "id": 101,
+      "title": "OPTION — FeesManagerV2 V2 fee flow",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 9},
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "id": 3,
+      "title": "OPTION FeeChargedV2 by consumer",
+      "description": "OPTION FeeChargedV2 events bucketed by MarginEngine consumer (new = current NEW MarginEngine, old = stranded legacy MarginEngine, unknown = unconfigured). Source metric: deopt_option_fee_charged_v2_total.",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 10},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "deopt_option_fee_charged_v2_total{consumer=~\"$consumer\"}",
+          "legendFormat": "{{consumer}}"
+        }
+      ],
+      "options": {
+        "legend": {"displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max"]},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10}
+        },
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "old"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "red"}}]},
+          {"matcher": {"id": "byName", "options": "unknown"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "orange"}}]}
+        ]
+      }
+    },
+    {
+      "type": "timeseries",
+      "id": 4,
+      "title": "OPTION FeeRebatedV2 by consumer",
+      "description": "OPTION FeeRebatedV2 events bucketed by MarginEngine consumer. Source metric: deopt_option_fee_rebated_v2_total.",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 10},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "deopt_option_fee_rebated_v2_total{consumer=~\"$consumer\"}",
+          "legendFormat": "{{consumer}}"
+        }
+      ],
+      "options": {
+        "legend": {"displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max"]},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10}
+        },
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "old"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "red"}}]},
+          {"matcher": {"id": "byName", "options": "unknown"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "orange"}}]}
+        ]
+      }
+    },
+    {
+      "type": "row",
+      "id": 102,
+      "title": "FeesManagerV2 — rebate budget by asset",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 18},
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "id": 5,
+      "title": "Rebate budget (native units) by settlement asset",
+      "description": "Derived FeesManagerV2 rebate budget per settlement asset. Computed as SUM(Funded) − SUM(Spent) − SUM(Withdrawn) from the indexed events; clamps at zero. The asset label is the lowercased settlement-asset address — e.g. 0x6eae407f… is mUSDC on Base Sepolia. The on-chain ground truth is FeesManagerV2.rebateBudget(token). Source metric: deopt_fees_manager_v2_rebate_budget_native.",
+      "gridPos": {"h": 8, "w": 16, "x": 0, "y": 19},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "deopt_fees_manager_v2_rebate_budget_native",
+          "legendFormat": "{{asset}}"
+        }
+      ],
+      "options": {
+        "legend": {"displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "min"]},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "red", "value": null},
+              {"color": "orange", "value": 1000},
+              {"color": "green", "value": 100000}
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "id": 6,
+      "title": "Base Sepolia mUSDC rebate budget (latest)",
+      "description": "Latest derived rebate budget for the Base Sepolia mUSDC settlement asset (0x6eae407f…). Alert threshold: < 1000 native (= 0.001 mUSDC at 6dp).",
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 19},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "deopt_fees_manager_v2_rebate_budget_native{asset=\"0x6eae407f5640b006fac9965182e238582a3b412e\"}",
+          "legendFormat": "mUSDC"
+        }
+      ],
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "orientation": "horizontal",
+        "textMode": "value_and_name",
+        "colorMode": "background",
+        "graphMode": "area",
+        "justifyMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "red", "value": null},
+              {"color": "orange", "value": 1000},
+              {"color": "green", "value": 100000}
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "row",
+      "id": 103,
+      "title": "Anomalies — OLD / unknown consumer events",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 27},
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "stat",
+      "id": 7,
+      "title": "OLD consumer events (PERP)",
+      "description": "Total PERP V2 fee/rebate events bucketed to the OLD stranded PerpEngine. Should remain exactly zero after V2F-LM. Any nonzero value is the PerpFeeChargedFromOldEngine / PerpFeeRebatedFromOldEngine alert state.",
+      "gridPos": {"h": 6, "w": 6, "x": 0, "y": 28},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "deopt_perp_fee_charged_v2_total{consumer=\"old\"} + deopt_perp_fee_rebated_v2_total{consumer=\"old\"}",
+          "legendFormat": "PERP old"
+        }
+      ],
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value_and_name"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "red", "value": 1}
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "id": 8,
+      "title": "OLD consumer events (OPTION)",
+      "description": "Total OPTION V2 fee/rebate events bucketed to the OLD stranded MarginEngine. Should remain exactly zero after V2E-E. Any nonzero value is the OptionFeeChargedFromOldMarginEngine / OptionFeeRebatedFromOldMarginEngine alert state.",
+      "gridPos": {"h": 6, "w": 6, "x": 6, "y": 28},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "deopt_option_fee_charged_v2_total{consumer=\"old\"} + deopt_option_fee_rebated_v2_total{consumer=\"old\"}",
+          "legendFormat": "OPTION old"
+        }
+      ],
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value_and_name"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "red", "value": 1}
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "id": 9,
+      "title": "Unknown consumer events (PERP + OPTION)",
+      "description": "Total V2 fee/rebate events whose consumer matches neither the configured NEW nor the optional OLD engine. Drives PerpFeeConsumerUnknown / OptionFeeConsumerUnknown alerts. Common causes: env-var drift on PERP_ENGINE_ADDRESS / MARGIN_ENGINE / OLD_*_ADDRESS, or a third engine registered as a FeesManagerV2 consumer.",
+      "gridPos": {"h": 6, "w": 12, "x": 12, "y": 28},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "deopt_perp_fee_charged_v2_total{consumer=\"unknown\"} + deopt_perp_fee_rebated_v2_total{consumer=\"unknown\"} + deopt_option_fee_charged_v2_total{consumer=\"unknown\"} + deopt_option_fee_rebated_v2_total{consumer=\"unknown\"}",
+          "legendFormat": "unknown total"
+        }
+      ],
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value_and_name"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "orange", "value": 1}
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "row",
+      "id": 104,
+      "title": "Engine wiring & runtime config",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 34},
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "table",
+      "id": 10,
+      "title": "Active engine addresses (reference)",
+      "description": "Source-of-truth engine addresses for the Base Sepolia V2G deployment. These are static reference cards; the actual runtime config can be confirmed via the backend's GET /admin/config endpoint or by hitting the new GET /admin/fees/v2/observability endpoint (V2G-G). Not a live metric — Grafana only renders this card as a textual reference.",
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 35},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "vector(1)",
+          "legendFormat": "placeholder",
+          "format": "table"
+        }
+      ],
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm"
+      },
+      "transformations": [
+        {
+          "id": "filterFieldsByName",
+          "options": {"include": {"names": []}}
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "links": []
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": ["deopt", "v2-fees", "feesmanagerv2", "observability", "V2G-G"],
+  "templating": {
+    "list": [
+      {
+        "name": "DS_PROMETHEUS",
+        "label": "Datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {"text": "Prometheus", "value": "Prometheus"},
+        "hide": 0,
+        "includeAll": false,
+        "multi": false,
+        "refresh": 1
+      },
+      {
+        "name": "consumer",
+        "label": "Consumer filter",
+        "type": "custom",
+        "query": "new,old,unknown",
+        "current": {"text": ["All"], "value": ["$__all"]},
+        "options": [
+          {"text": "All", "value": "$__all", "selected": true},
+          {"text": "new", "value": "new", "selected": false},
+          {"text": "old", "value": "old", "selected": false},
+          {"text": "unknown", "value": "unknown", "selected": false}
+        ],
+        "includeAll": true,
+        "multi": true,
+        "hide": 0
+      }
+    ]
+  },
+  "time": {"from": "now-6h", "to": "now"},
+  "timepicker": {},
+  "timezone": "",
+  "title": "DeOpt — V2 fee observability (V2G-G)",
+  "uid": "deopt-v2g-g-v2-fees",
+  "version": 1,
+  "weekStart": ""
+}

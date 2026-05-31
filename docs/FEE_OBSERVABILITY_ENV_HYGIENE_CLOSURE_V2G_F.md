@@ -493,3 +493,46 @@ Docs:
   retired the operational notice; V2G-G can make it visible).
 - Optional: extend the metric pipeline to mainnet's settlement
   asset(s) once V2G band ships beyond Base Sepolia.
+
+## V2G-G closure (appended 2026-05-31)
+
+V2G-G completed every "next recommended milestone" item above
+**except** the live Alertmanager / Grafana wire-up, which is
+inherently a deployment-side action. Specifically:
+
+- Deployable Prometheus rules bundle:
+  `docs/monitoring/prometheus/v2_fee_alerts.bundle.yml` (V2G-F PERP +
+  OPTION + budget alerts unified + two V2G-G additions —
+  `FeesManagerV2RebateBudgetStale` and `DeoptV2FeeMetricsAbsent`).
+- Grafana dashboard artefact:
+  `docs/monitoring/grafana/v2_fee_observability_dashboard.json` plus a
+  spec markdown sibling. UID `deopt-v2g-g-v2-fees`; 10 panels
+  spanning every V2 fee gauge plus the OLD/unknown stat tiles.
+- Alertmanager routing example:
+  `docs/monitoring/alertmanager/v2_fee_routing.example.yml` with an
+  inhibit rule so `DeoptV2FeeMetricsAbsent` suppresses downstream
+  alerts.
+- Backend admin endpoint `GET /admin/fees/v2/observability`
+  (`src/fees/v2_observability.rs`) — read-only snapshot of the same
+  data the Grafana dashboard surfaces, plus the configured engine
+  addresses. 4 new HTTP tests; test suite 675 → 679.
+- Frontend admin "V2 Fee Observability (V2G-G)" section
+  (`deopt-v2-frontend/src/app/admin/admin-dashboard.tsx`) reading the
+  new endpoint, with anomaly tiles, four bucket cards, rebate budget
+  table, and engine-wiring reference tiles.
+- Operator `.env` patch documentation:
+  `docs/operator/v2g_g_env_patch.example.env` plus verification
+  command blocks. Real `.env` left untouched per hard rules.
+- Mainnet / multi-asset readiness matrix in
+  `docs/V2_FEE_PRODUCTION_OBSERVABILITY_V2G_G.md`.
+
+Live read-only verification under V2G-G reproduced V2G-F closure
+1:1 against both V2G-E txs and the four V2 fee gauges. All seven
+V2G-F alerts plus the two V2G-G additions evaluated **green**. No
+chain mutation, no DB destructive action, no real `.env` edit, no
+private-key handling.
+
+The merkle-root continuous-probe + multi-asset rollout remain
+explicit V2G-G follow-ups (matrix in
+`docs/V2_FEE_PRODUCTION_OBSERVABILITY_V2G_G.md`); they need a
+mainnet manifest first.

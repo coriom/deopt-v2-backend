@@ -17,9 +17,41 @@ OPTION alerts (V2G-F, mirrors of the PERP set):
 - `OptionFeeRebatedFromOldMarginEngine`
 - `OptionFeeConsumerUnknown`
 
-Cross-cutting alert (V2G-F):
+Cross-cutting alerts (V2G-F + V2G-G):
 
-- `FeesManagerV2RebateBudgetLow`
+- `FeesManagerV2RebateBudgetLow` (V2G-F)
+- `FeesManagerV2RebateBudgetStale` (V2G-G — budget unchanged while
+  rebates fire)
+- `DeoptV2FeeMetricsAbsent` (V2G-G — metric pipeline down)
+
+## Quick admin probe (V2G-G)
+
+Before going deep into any alert below, hit the backend's read-only
+V2 fee observability snapshot — it returns the same data the four V2
+fee gauges expose plus the configured engine addresses, in a single
+JSON:
+
+```sh
+curl -sH "x-admin-token: $ADMIN_API_TOKEN" \
+  http://<backend>/admin/fees/v2/observability | jq '
+    .contracts,
+    .anomaly_totals,
+    .metrics.perp_fee_charged_v2_by_consumer,
+    .metrics.perp_fee_rebated_v2_by_consumer,
+    .metrics.option_fee_charged_v2_by_consumer,
+    .metrics.option_fee_rebated_v2_by_consumer,
+    .metrics.fees_manager_v2_rebate_budget_native'
+```
+
+The contracts block lets you confirm the metric classifier is using
+the right NEW / OLD engines (alert misclassification — e.g. the
+classifier was reset to the OLD address — is otherwise invisible).
+The anomaly totals roll up `{old, unknown}` across PERP + OPTION
+charged + rebated and mirror exactly what the alert preconditions
+compute.
+
+The frontend admin dashboard also renders this snapshot under the
+"V2 Fee Observability (V2G-G)" section.
 
 All consumer-bucket alerts are derived from the gauges:
 
@@ -325,6 +357,80 @@ enough to start an investigation.
   inline; if the alert is too noisy for testnet, override at the
   Alertmanager rules layer per the severity matrix.
 - **Severity.** Base Sepolia: medium. Mainnet: high.
+
+### FeesManagerV2RebateBudgetStale (V2G-G)
+<a id="feesmanagerv2rebatebudgetstale"></a>
+
+- **Meaning.** The derived
+  `deopt_fees_manager_v2_rebate_budget_native{asset="<addr>"}` gauge
+  has not moved in 30 m, but the OPTION or PERP
+  `FeeRebatedV2{consumer="new"}` counter has incremented inside the
+  same window. The metric pipeline expects every rebate event to
+  produce a `RebateBudgetSpent` event in the same tx; if the budget
+  gauge does not move, the indexer is most likely lagging behind
+  those `RebateBudgetSpent` events.
+- **Expected current value.** No firing — every V2G-E rebate event
+  was paired with a `RebateBudgetSpent` in the same block.
+- **First action (under 5 min).** Cross-check the on-chain ground
+  truth and the running gauge:
+
+  ```sh
+  cast call $FEES_MANAGER_V2 'rebateBudget(address)(uint256)' $MUSDC --rpc-url $RPC_URL
+  curl -sH "x-admin-token: $ADMIN_API_TOKEN" \
+    http://<backend>/admin/fees/v2/observability \
+    | jq '.metrics.fees_manager_v2_rebate_budget_native'
+  ```
+
+  - If on-chain and gauge agree, the alert is a false positive —
+    likely the cadence assumption (one PERP rebate every 24 h on
+    testnet) is wrong; downgrade severity at the Alertmanager layer
+    or relax the rule window.
+  - If on-chain and gauge disagree, the indexer has fallen behind.
+- **Investigation.** Tail the indexer cursor and the most-recent
+  `RebateBudget*` event row:
+
+  ```
+  GET /admin/options/events                # event tail
+  POST /admin/options/events/tick          # idempotent catch-up
+  ```
+
+  After ticking, recompute the gauge from `/admin/fees/v2/observability`
+  and confirm the delta clears.
+- **Remediation.** Bring the indexer cursor up; if `RebateBudgetSpent`
+  rows are missing for known rebate txs, re-index the affected block
+  range via the admin tick. Do **not** delete rows.
+- **Severity.** Base Sepolia: medium. Mainnet: high.
+
+### DeoptV2FeeMetricsAbsent (V2G-G)
+<a id="deoptv2feemetricsabsent"></a>
+
+- **Meaning.** One of the four V2 fee consumer-bucket gauges has
+  been absent from `/metrics` for 5 m. The backend pre-seeds every
+  bucket at zero on boot (see
+  `src/monitoring.rs::append_perp_fee_v2_consumer_metric` /
+  `append_option_fee_v2_consumer_metric`), so absence is a backend
+  regression, not a quiet-period side effect.
+- **Likely causes.**
+  1. `METRICS_ENABLED=false` on the running backend.
+  2. The scrape target is unreachable (process down, container
+     restart loop, networking issue).
+  3. The metric pipeline panicked or returned an error between
+     scrapes (look at backend logs for `render_metrics` errors).
+  4. Someone removed the V2 fee metric emission code (regression in
+     `append_fee_metrics`).
+- **First action.** Hit `/admin/fees/v2/observability` with the
+  admin token. If the snapshot endpoint also fails, the backend is
+  unreachable / not serving admin traffic — page the backend on-call,
+  not the contract on-call. If the snapshot endpoint works but
+  `/metrics` does not, check `METRICS_ENABLED`.
+- **Remediation.** Restart the backend with `METRICS_ENABLED=true`
+  and confirm `/metrics` is serving the four V2 fee gauges. If the
+  metric code is missing, revert the regressing commit; the V2G-G
+  / V2G-F test suite covers the metric emission contract.
+- **Severity.** Base Sepolia: high. Mainnet: high. This alert
+  should NEVER auto-resolve at lower severity — by construction the
+  downstream OLD / unknown alerts cannot fire while the gauge is
+  absent, so this alert is the safety net.
 
 ## Verifying the all-clear
 

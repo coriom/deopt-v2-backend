@@ -1,0 +1,93 @@
+# V2G-G — example Alertmanager route fragment for the V2 fee alerts.
+#
+# This is documentation, not a deployable Alertmanager config. It shows
+# the minimum routing tree an operator needs to layer on top of the
+# Prometheus rules in `docs/monitoring/prometheus/v2_fee_alerts.bundle.yml`
+# so that:
+#
+#  - PERP / OPTION OLD-engine alerts page on-call immediately;
+#  - unknown-consumer alerts go to a ticket queue (anomaly, not
+#    regression);
+#  - rebate-budget low/stale alerts go to ops chat with a top-up
+#    runbook link;
+#  - the metric-pipeline absence alert (V2G-G) pages the backend
+#    on-call, not the smart-contract on-call.
+#
+# Replace the receiver names with whatever exists in your Alertmanager
+# deployment. The route uses standard Alertmanager grouping; per-network
+# severity overrides happen at the route level so that the alert rules
+# themselves do not need to be edited per environment.
+#
+# See `docs/RUNBOOK_PERP_V2_FEE_ALERTS.md` for response procedures.
+route:
+  receiver: default
+  group_by: [alertname, subsystem]
+  routes:
+    # Severity escalation per network (override Base Sepolia defaults).
+    - matchers:
+        - severity = high
+        - chain = base-mainnet
+      receiver: deopt_oncall_critical
+      continue: true
+    - matchers:
+        - severity = medium
+        - chain = base-mainnet
+      receiver: deopt_oncall_high
+      continue: true
+
+    # PERP OLD/regression alerts → smart-contract on-call.
+    - matchers:
+        - subsystem = perp_v2_fees
+        - severity =~ "high|critical"
+      receiver: deopt_oncall_critical
+
+    # OPTION OLD/regression alerts → smart-contract on-call.
+    - matchers:
+        - subsystem = option_v2_fees
+        - severity =~ "high|critical"
+      receiver: deopt_oncall_critical
+
+    # Unknown-consumer anomalies → ticket queue (not paging).
+    - matchers:
+        - alertname =~ "PerpFeeConsumerUnknown|OptionFeeConsumerUnknown"
+      receiver: deopt_anomaly_tickets
+      group_wait: 1m
+      repeat_interval: 24h
+
+    # Rebate budget alerts → ops chat + runbook link.
+    - matchers:
+        - subsystem = fees_manager_v2
+      receiver: deopt_ops_chat
+      group_wait: 1m
+      repeat_interval: 6h
+
+    # Metric pipeline absent (V2G-G) → backend on-call, not contract
+    # on-call. The metric pipeline itself is a backend concern.
+    - matchers:
+        - alertname = DeoptV2FeeMetricsAbsent
+      receiver: deopt_backend_oncall
+
+receivers:
+  - name: default
+    # ...your default receiver config...
+  - name: deopt_oncall_critical
+    # PagerDuty / Opsgenie / whatever your critical paging path is.
+  - name: deopt_oncall_high
+    # Same path, lower severity routing.
+  - name: deopt_anomaly_tickets
+    # Linear / Jira / GitHub Issues.
+  - name: deopt_ops_chat
+    # Slack channel with `top up budget` runbook quick-action.
+  - name: deopt_backend_oncall
+    # Backend team's pager rotation.
+
+inhibit_rules:
+  # If the metric pipeline is absent, suppress the downstream
+  # consumer-bucket alerts (they can't fire while the gauge is missing,
+  # but a partial scrape could). Once `DeoptV2FeeMetricsAbsent` clears,
+  # the downstream alerts will re-evaluate cleanly.
+  - source_matchers:
+      - alertname = DeoptV2FeeMetricsAbsent
+    target_matchers:
+      - subsystem =~ "perp_v2_fees|option_v2_fees|fees_manager_v2"
+    equal: [subsystem]

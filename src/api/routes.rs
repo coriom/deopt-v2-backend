@@ -20,6 +20,7 @@ use crate::fees::service::{
     admin_fee_summary as admin_fee_summary_service, admin_fee_volumes as admin_fee_volumes_service,
     admin_onchain_fees as admin_onchain_fees_service, record_indexed_perp_trade_fees,
 };
+use crate::fees::v2_observability::admin_v2_observability as admin_v2_observability_service;
 use crate::indexer::{Indexer, IndexerStatus, IndexerTickResult};
 use crate::mm::permissions::{
     list_permission_accounts, list_product_permissions, MmProductPermission,
@@ -284,6 +285,10 @@ pub fn router(state: AppState) -> Router {
         .route("/admin/fees/onchain", get(admin_fee_onchain))
         .route("/admin/fees/volumes", get(admin_fee_volumes))
         .route("/admin/fees/rebates", get(admin_fee_rebates))
+        .route(
+            "/admin/fees/v2/observability",
+            get(admin_fees_v2_observability),
+        )
         .route("/admin/recent", get(admin_recent))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -1321,6 +1326,22 @@ async fn admin_fee_rebates(
         "account": account,
         "rebates": rebates
     })))
+}
+
+/// V2G-G: read-only V2 fee observability snapshot. Surfaces the same
+/// data the `/metrics` endpoint exposes (PERP + OPTION FeeChargedV2 /
+/// FeeRebatedV2 by consumer bucket, FeesManagerV2 rebate budget per
+/// settlement asset) plus the configured NEW / OLD engine addresses
+/// the classifier is using. Useful for a quick one-shot operator
+/// check without needing to scrape Prometheus.
+///
+/// See `docs/V2_FEE_PRODUCTION_OBSERVABILITY_V2G_G.md`.
+async fn admin_fees_v2_observability(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    ensure_admin_access(&state, &headers)?;
+    Ok(Json(admin_v2_observability_service(&state).await?))
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -5297,6 +5318,261 @@ mod tests {
         assert!(body.contains(
             "deopt_fees_manager_v2_rebate_budget_native{asset=\"0x0000000000000000000000000000000000001234\"} 42"
         ));
+    }
+
+    /// V2G-G: `/admin/fees/v2/observability` returns a JSON snapshot
+    /// of the V2 fee surface. It must:
+    ///   - require the admin token when one is configured;
+    ///   - pre-seed every consumer bucket at zero on an empty backend;
+    ///   - reuse the same classifier as `/metrics` so a NEW PERP event
+    ///     lands in `new` and an OLD PERP event lands in `old`;
+    ///   - mirror the rebate budget gauge under the same lowercased
+    ///     asset key;
+    ///   - never leak raw NEW / OLD / trader / tx-hash strings into the
+    ///     bucket labels or top-level `notes`.
+    #[tokio::test]
+    async fn admin_v2_observability_snapshot_emits_three_buckets_at_zero() {
+        let response = router(admin_state(false))
+            .oneshot(get_request("/admin/fees/v2/observability", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["milestone"], "V2G-G");
+        for metric in [
+            "perp_fee_charged_v2_by_consumer",
+            "perp_fee_rebated_v2_by_consumer",
+            "option_fee_charged_v2_by_consumer",
+            "option_fee_rebated_v2_by_consumer",
+        ] {
+            let buckets = &json["metrics"][metric];
+            assert_eq!(buckets["new"], 0, "{metric}.new should default to 0");
+            assert_eq!(buckets["old"], 0, "{metric}.old should default to 0");
+            assert_eq!(
+                buckets["unknown"], 0,
+                "{metric}.unknown should default to 0"
+            );
+        }
+        assert_eq!(json["anomaly_totals"]["old_consumer_events"], 0);
+        assert_eq!(json["anomaly_totals"]["unknown_consumer_events"], 0);
+        // No events yet → no per-asset rebate budget series.
+        assert!(json["metrics"]["fees_manager_v2_rebate_budget_native"]
+            .as_object()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn admin_v2_observability_requires_admin_token_when_configured() {
+        let response = router(admin_state(true))
+            .oneshot(get_request("/admin/fees/v2/observability", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let response = router(admin_state(true))
+            .oneshot(get_request(
+                "/admin/fees/v2/observability",
+                Some("test-admin-token"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn admin_v2_observability_classifies_new_old_and_unknown_buckets() {
+        let new_perp_engine = "0xc6c592100723fe0c66343a16e95ec34cc0c2141c";
+        let old_perp_engine = "0xb36395b67d0798ada981731c9fa5239f4362b53b";
+        let new_margin_engine = "0x287cef479be5889eefca847f9e73c860898f48cc";
+        let fees_manager_v2 = "0x00da0b9876bcbf0c79cb5bcacfebafb8c7ad774f";
+        let stray_consumer = "0xdeadbeef00000000000000000000000000000099";
+        let trader = "0x290bd12c93e467bf51c51f5273d35bddb19e9274";
+        let m_usdc = "0x6eae407f5640b006fac9965182e238582a3b412e";
+
+        let mut state = admin_state(false);
+        state.execution_config.perp_engine_address = AccountId::new(new_perp_engine);
+        state.execution_config.old_perp_engine_address = Some(AccountId::new(old_perp_engine));
+        state.option_event_indexer_config.margin_engine_address = AccountId::new(new_margin_engine);
+        state.option_event_indexer_config.fees_manager_v2_address =
+            Some(AccountId::new(fees_manager_v2));
+
+        let perp_new = build_fee_charged_v2_perp_log_row(
+            201,
+            "0x5c15e9233d49729cf21058a89f49bc6fdf0f7295cda5a7f313c96556728aa394",
+            153,
+            trader,
+            6,
+            200,
+            false,
+        );
+        let perp_old = build_fee_charged_v2_perp_log_row_for_consumer(
+            202,
+            "0x4444444444444444444444444444444444444444444444444444444444444444",
+            42,
+            old_perp_engine,
+            trader,
+            1,
+            300,
+            false,
+        );
+        let option_new = build_fee_charged_v2_option_log_row(
+            203,
+            "0x9a85cbced2216bf3c18049111cce68883cb0b035e194b3dcbaaf4fe7d5293149",
+            125,
+            trader,
+            25,
+            125,
+            false,
+        );
+        let option_rebate_new = build_fee_rebated_v2_option_log_row(
+            204,
+            "0x9a85cbced2216bf3c18049111cce68883cb0b035e194b3dcbaaf4fe7d5293149",
+            133,
+            trader,
+            10,
+            -50,
+        );
+        let option_unknown = build_fee_charged_v2_option_log_row_for_consumer(
+            205,
+            "0x5555555555555555555555555555555555555555555555555555555555555555",
+            7,
+            stray_consumer,
+            trader,
+            25,
+            125,
+            false,
+        );
+        let funded = build_rebate_budget_event(
+            206,
+            "0xc11c0000000000000000000000000000000000000000000000000000000000c1",
+            1,
+            "RebateBudgetFunded",
+            m_usdc,
+            1_000_000,
+        );
+        let spent = build_rebate_budget_event(
+            207,
+            "0x9a85cbced2216bf3c18049111cce68883cb0b035e194b3dcbaaf4fe7d5293149",
+            134,
+            "RebateBudgetSpent",
+            m_usdc,
+            13,
+        );
+
+        state
+            .options_store
+            .lock()
+            .unwrap()
+            .persist_option_execution_events_and_cursor(
+                OPTION_EVENT_INDEXER_STATE_ID,
+                &[
+                    perp_new,
+                    perp_old,
+                    option_new,
+                    option_rebate_new,
+                    option_unknown,
+                    funded,
+                    spent,
+                ],
+                42_300_010,
+                1,
+            );
+
+        let response = router(state)
+            .oneshot(get_request("/admin/fees/v2/observability", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+
+        let perp_charged = &json["metrics"]["perp_fee_charged_v2_by_consumer"];
+        assert_eq!(perp_charged["new"], 1);
+        assert_eq!(perp_charged["old"], 1);
+        assert_eq!(perp_charged["unknown"], 0);
+
+        let option_charged = &json["metrics"]["option_fee_charged_v2_by_consumer"];
+        assert_eq!(option_charged["new"], 1);
+        assert_eq!(option_charged["old"], 0);
+        assert_eq!(option_charged["unknown"], 1);
+
+        let option_rebated = &json["metrics"]["option_fee_rebated_v2_by_consumer"];
+        assert_eq!(option_rebated["new"], 1);
+        assert_eq!(option_rebated["old"], 0);
+        assert_eq!(option_rebated["unknown"], 0);
+
+        // Budget gauge mirrors the metric pipeline: 1_000_000 − 13 = 999_987.
+        assert_eq!(
+            json["metrics"]["fees_manager_v2_rebate_budget_native"][m_usdc],
+            999_987
+        );
+
+        // Anomaly totals roll up across all four consumer-bucket metrics.
+        assert_eq!(json["anomaly_totals"]["old_consumer_events"], 1);
+        assert_eq!(json["anomaly_totals"]["unknown_consumer_events"], 1);
+
+        // Configured contract addresses surface as opaque strings so the
+        // operator can confirm the classifier is using the right NEW /
+        // OLD engines.
+        assert_eq!(json["contracts"]["perp_engine_new"], new_perp_engine);
+        assert_eq!(json["contracts"]["perp_engine_old"], old_perp_engine);
+        assert_eq!(json["contracts"]["margin_engine_new"], new_margin_engine);
+        assert!(json["contracts"]["margin_engine_old"].is_null());
+        assert_eq!(json["contracts"]["fees_manager_v2"], fees_manager_v2);
+
+        // Cardinality contract: raw event-level addresses (trader, stray
+        // consumer, tx hash) must NOT appear in the JSON bucket keys
+        // or counts. The classifier only emits one of three labels.
+        let metrics_obj = json["metrics"].as_object().unwrap();
+        for (_, buckets) in metrics_obj
+            .iter()
+            .filter(|(k, _)| k.as_str() != "fees_manager_v2_rebate_budget_native")
+        {
+            let map = buckets.as_object().unwrap();
+            assert_eq!(map.len(), 3, "metric {buckets:?} must have 3 buckets");
+            for bucket in ["new", "old", "unknown"] {
+                assert!(map.contains_key(bucket));
+            }
+        }
+        let serialized = serde_json::to_string(&json["metrics"]).unwrap();
+        // The 'metrics' subtree must not leak any of these raw strings.
+        for forbidden in [trader, stray_consumer] {
+            assert!(
+                !serialized.contains(forbidden),
+                "metrics leaked raw value {forbidden}: {serialized}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_v2_observability_omits_zero_address_contracts() {
+        let mut state = admin_state(false);
+        state.execution_config.perp_engine_address =
+            AccountId::new("0x0000000000000000000000000000000000000000");
+        state.execution_config.old_perp_engine_address = None;
+        state.option_event_indexer_config.margin_engine_address =
+            AccountId::new("0x0000000000000000000000000000000000000000");
+        state.option_event_indexer_config.fees_manager_v2_address = None;
+
+        let response = router(state)
+            .oneshot(get_request("/admin/fees/v2/observability", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        for key in [
+            "perp_engine_new",
+            "perp_engine_old",
+            "margin_engine_new",
+            "margin_engine_old",
+            "fees_manager_v2",
+        ] {
+            assert!(
+                json["contracts"][key].is_null(),
+                "{key} should be null when unset / zero, got {:?}",
+                json["contracts"][key]
+            );
+        }
     }
 
     /// V2G-F: OPTION `FeeRebatedV2` from a stray consumer lands in

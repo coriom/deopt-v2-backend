@@ -358,6 +358,82 @@ Operational logs should keep the same safety policy. When adding new logs around
   `docs/RUNBOOK_PERP_V2_FEE_ALERTS.md#feesmanagerv2rebatebudgetlow`.
 - Status: **instrumented** (V2G-F).
 
+### V2G-G — production observability bundle
+
+V2G-G consolidates the V2F-Q + V2G-F alert rules into a single
+deployable Prometheus bundle and adds two new alerts. Source-of-truth
+file:
+
+```
+docs/monitoring/prometheus/v2_fee_alerts.bundle.yml
+```
+
+The bundle contains four rule groups:
+
+1. `deopt_perp_v2_fee_alerts` — `PerpFeeChargedFromOldEngine`,
+   `PerpFeeRebatedFromOldEngine`, `PerpFeeConsumerUnknown` (unchanged
+   from V2F-Q; mirrored from `docs/alertmanager/perp_v2_fee_alerts.yml`).
+2. `deopt_option_v2_fee_alerts` — `OptionFeeChargedFromOldMarginEngine`,
+   `OptionFeeRebatedFromOldMarginEngine`, `OptionFeeConsumerUnknown`
+   (unchanged from V2G-F; mirrored from
+   `docs/alertmanager/option_v2_fee_alerts.yml`).
+3. `deopt_fees_manager_v2_budget_alerts` —
+   `FeesManagerV2RebateBudgetLow` (V2G-F, mUSDC threshold `< 1000`),
+   plus **new in V2G-G** `FeesManagerV2RebateBudgetStale` which fires
+   if the rebate-budget gauge is unchanged for 30 m while
+   `FeeRebatedV2{consumer="new"}` is still incrementing (indexer-lag /
+   stalled-event-pipeline detector). Severity `medium` on Base
+   Sepolia, `high` on mainnet.
+4. `deopt_v2_fee_metrics_liveness` — **new in V2G-G**
+   `DeoptV2FeeMetricsAbsent` fires if any of the four V2 fee
+   consumer-bucket gauges is absent from `/metrics` for 5 m. The
+   metric pipeline pre-seeds every bucket at zero on boot, so absence
+   means either the scrape target is down or `METRICS_ENABLED=false`.
+   Severity `high` on Base Sepolia, escalates per the routing table.
+
+The bundle is meant to be the single file the operator points
+Prometheus at; the per-product `docs/alertmanager/*.yml` files are
+retained for backwards-link stability.
+
+Companion artefacts:
+
+- `docs/monitoring/alertmanager/v2_fee_routing.example.yml` — example
+  routing tree (PERP/OPTION OLD → contract on-call; unknown → ticket
+  queue; budget → ops chat; metrics absent → backend on-call). Ships
+  an inhibit rule so a dead metric pipeline does not cascade into
+  noise.
+- `docs/monitoring/grafana/v2_fee_observability_dashboard.json` +
+  `…spec.md` — Grafana dashboard rendering every V2 fee gauge plus
+  anomaly stat cards.
+
+#### Multi-asset extension
+
+The `FeesManagerV2RebateBudgetLow` rule is keyed on a specific
+lowercased settlement-asset address (Base Sepolia mUSDC today). On a
+multi-asset deployment, add one rule per asset (template at the
+bottom of the bundle file). The metric pipeline already supports
+multiple `asset=...` series — see
+`fees_manager_v2_rebate_budget_metric_reflects_funded_minus_spent_and_withdrawn`
+in `src/api/routes.rs::tests` and the readiness matrix in
+`docs/V2_FEE_PRODUCTION_OBSERVABILITY_V2G_G.md`.
+
+#### Backend admin probe (V2G-G)
+
+For a one-shot operator check without leaving the admin token's blast
+radius, hit:
+
+```
+GET /admin/fees/v2/observability
+```
+
+Returns the same data the four V2 fee gauges + budget gauge surface,
+plus the configured NEW / OLD engine addresses the classifier is
+using. Implementation:
+`src/fees/v2_observability.rs::admin_v2_observability`.
+
+The frontend admin page also renders this as a dedicated "V2 Fee
+Observability (V2G-G)" section.
+
 ## Retired / Downgraded Operational Notices
 
 ### Merkle Root Unset (retired 2026-05-31, V2G-F)
