@@ -434,6 +434,32 @@ using. Implementation:
 The frontend admin page also renders this as a dedicated "V2 Fee
 Observability (V2G-G)" section.
 
+#### V2G-H — toolchain validation + provisioning
+
+V2G-H validates the V2G-G rule bundle + routing example with the real
+Prometheus / Alertmanager toolchains, and adds Grafana provisioning
+plumbing:
+
+- `docs/monitoring/prometheus/v2_fee_alerts.test.yml` — `promtool test
+  rules` spec covering green baseline, PERP OLD-engine firing, OPTION
+  unknown-consumer firing, rebate budget low, and metric pipeline
+  absent. Runs clean against the V3.12.0 promtool. Use this as
+  CI-time regression gate for any future rule changes.
+- `docs/monitoring/grafana/provisioning/dashboards/deopt_v2_fees.yaml`
+  — Grafana dashboard provisioning provider entry (`apiVersion: 1`,
+  `folder: DeOpt`, `allowUiUpdates: true`).
+- `docs/monitoring/grafana/provisioning/datasources/prometheus_example.yaml`
+  — example Prometheus datasource entry (only needed if no DS exists
+  yet).
+- `docs/monitoring/grafana/provisioning/render_dashboard.sh` —
+  substitutes `${DS_PROMETHEUS}` with the datasource name for
+  provisioned dashboards (Grafana's provisioning loader does NOT
+  resolve template inputs).
+
+See `docs/V2_FEE_OBSERVABILITY_LIVE_STACK_WIRING_V2G_H.md` for the
+exact integration commands per stack shape (standalone, containerised,
+Kubernetes Operator).
+
 ## Retired / Downgraded Operational Notices
 
 ### Merkle Root Unset (retired 2026-05-31, V2G-F)

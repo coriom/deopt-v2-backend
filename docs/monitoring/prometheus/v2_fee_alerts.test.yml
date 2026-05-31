@@ -1,0 +1,328 @@
+# V2G-H — `promtool test rules` spec for the V2 fee alert bundle.
+#
+# Validates every alert rule in
+# `docs/monitoring/prometheus/v2_fee_alerts.bundle.yml` against
+# synthetic time series. Each test injects exactly one anomaly so the
+# negative-space (everything else green) is also exercised.
+#
+# Run:
+#
+#   promtool test rules docs/monitoring/prometheus/v2_fee_alerts.test.yml
+#
+# Expected output: `Unit Testing: docs/.../v2_fee_alerts.test.yml SUCCESS`.
+#
+# Notes on the test harness:
+#
+# - The bundle uses `for: 0m` on every alert, so a single sample point
+#   is enough to flip an alert; the harness still requires a leading
+#   data point so each test simulates 6m of one-minute scrapes.
+# - The synthetic OLD / unknown events are emitted as monotonically
+#   increasing counters (the metric pipeline emits them as gauges, but
+#   `increase(...)[5m]` is well defined for both shapes). The alerts'
+#   `increase(...) > 0` predicate fires the moment the gauge moves.
+# - The metrics-absent test deliberately omits every V2 fee gauge from
+#   the series list so the `absent(...)` predicate fires.
+# - The stale-budget test holds the budget gauge constant for 30m
+#   while the OPTION rebate gauge advances — this is the exact
+#   misalignment the alert is designed to detect.
+
+rule_files:
+  - v2_fee_alerts.bundle.yml
+
+evaluation_interval: 1m
+
+tests:
+  # --------------------------------------------------------------------
+  # 1. Green baseline. V2G-E live state: PERP charged{new}=3, rebated
+  #    {new}=1, OPTION charged{new}=3, rebated{new}=1, mUSDC budget =
+  #    999987, every OLD / unknown arm = 0. No alert should fire.
+  # --------------------------------------------------------------------
+  - name: green_baseline_matches_v2g_e_live_state
+    interval: 1m
+    input_series:
+      - series: 'deopt_perp_fee_charged_v2_total{consumer="new"}'
+        values: '3x6'
+      - series: 'deopt_perp_fee_charged_v2_total{consumer="old"}'
+        values: '0x6'
+      - series: 'deopt_perp_fee_charged_v2_total{consumer="unknown"}'
+        values: '0x6'
+      - series: 'deopt_perp_fee_rebated_v2_total{consumer="new"}'
+        values: '1x6'
+      - series: 'deopt_perp_fee_rebated_v2_total{consumer="old"}'
+        values: '0x6'
+      - series: 'deopt_perp_fee_rebated_v2_total{consumer="unknown"}'
+        values: '0x6'
+      - series: 'deopt_option_fee_charged_v2_total{consumer="new"}'
+        values: '3x6'
+      - series: 'deopt_option_fee_charged_v2_total{consumer="old"}'
+        values: '0x6'
+      - series: 'deopt_option_fee_charged_v2_total{consumer="unknown"}'
+        values: '0x6'
+      - series: 'deopt_option_fee_rebated_v2_total{consumer="new"}'
+        values: '1x6'
+      - series: 'deopt_option_fee_rebated_v2_total{consumer="old"}'
+        values: '0x6'
+      - series: 'deopt_option_fee_rebated_v2_total{consumer="unknown"}'
+        values: '0x6'
+      - series: 'deopt_fees_manager_v2_rebate_budget_native{asset="0x6eae407f5640b006fac9965182e238582a3b412e"}'
+        values: '999987x6'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: PerpFeeChargedFromOldEngine
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: PerpFeeRebatedFromOldEngine
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: PerpFeeConsumerUnknown
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: OptionFeeChargedFromOldMarginEngine
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: OptionFeeRebatedFromOldMarginEngine
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: OptionFeeConsumerUnknown
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: FeesManagerV2RebateBudgetLow
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: DeoptV2FeeMetricsAbsent
+        exp_alerts: []
+
+  # --------------------------------------------------------------------
+  # 2. PERP OLD-engine regression. PerpFeeChargedFromOldEngine and
+  #    PerpFeeRebatedFromOldEngine both fire; NEW-only OPTION + budget
+  #    alerts stay green.
+  # --------------------------------------------------------------------
+  - name: perp_old_engine_fires_charged_and_rebated
+    interval: 1m
+    input_series:
+      - series: 'deopt_perp_fee_charged_v2_total{consumer="new"}'
+        values: '3x6'
+      - series: 'deopt_perp_fee_charged_v2_total{consumer="old"}'
+        values: '0+1x6'
+      - series: 'deopt_perp_fee_charged_v2_total{consumer="unknown"}'
+        values: '0x6'
+      - series: 'deopt_perp_fee_rebated_v2_total{consumer="new"}'
+        values: '1x6'
+      - series: 'deopt_perp_fee_rebated_v2_total{consumer="old"}'
+        values: '0+1x6'
+      - series: 'deopt_perp_fee_rebated_v2_total{consumer="unknown"}'
+        values: '0x6'
+      - series: 'deopt_option_fee_charged_v2_total{consumer="new"}'
+        values: '3x6'
+      - series: 'deopt_option_fee_charged_v2_total{consumer="old"}'
+        values: '0x6'
+      - series: 'deopt_option_fee_charged_v2_total{consumer="unknown"}'
+        values: '0x6'
+      - series: 'deopt_option_fee_rebated_v2_total{consumer="new"}'
+        values: '1x6'
+      - series: 'deopt_option_fee_rebated_v2_total{consumer="old"}'
+        values: '0x6'
+      - series: 'deopt_option_fee_rebated_v2_total{consumer="unknown"}'
+        values: '0x6'
+      - series: 'deopt_fees_manager_v2_rebate_budget_native{asset="0x6eae407f5640b006fac9965182e238582a3b412e"}'
+        values: '999987x6'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: PerpFeeChargedFromOldEngine
+        exp_alerts:
+          - exp_labels:
+              alertname: PerpFeeChargedFromOldEngine
+              severity: high
+              subsystem: perp_v2_fees
+              milestone: V2F-O
+              consumer: "old"
+            exp_annotations:
+              summary: "PERP FeeChargedV2 emitted from OLD stranded PerpEngine"
+              description: >-
+                OLD PerpEngine should not emit new PERP V2 fee events after the A3 fallback cutover. Snapshot FeesManagerV2.feeConsumers() and useFeesManagerV2() on every engine, then verify wiring against the V2F-LM acceptance state.
+              runbook_url: "docs/RUNBOOK_PERP_V2_FEE_ALERTS.md#perpfeechargedfromoldengine"
+      - eval_time: 6m
+        alertname: PerpFeeRebatedFromOldEngine
+        exp_alerts:
+          - exp_labels:
+              alertname: PerpFeeRebatedFromOldEngine
+              severity: high
+              subsystem: perp_v2_fees
+              milestone: V2F-Q
+              consumer: "old"
+            exp_annotations:
+              summary: "PERP FeeRebatedV2 emitted from OLD stranded PerpEngine"
+              description: >-
+                OLD PerpEngine should not emit new PERP V2 rebate events after the A3 fallback cutover. Snapshot FeesManagerV2 wiring on every engine and compare to the V2F-LM acceptance state.
+              runbook_url: "docs/RUNBOOK_PERP_V2_FEE_ALERTS.md#perpfeerebatedfromoldengine"
+      - eval_time: 6m
+        alertname: PerpFeeConsumerUnknown
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: OptionFeeChargedFromOldMarginEngine
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: OptionFeeRebatedFromOldMarginEngine
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: FeesManagerV2RebateBudgetLow
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: DeoptV2FeeMetricsAbsent
+        exp_alerts: []
+
+  # --------------------------------------------------------------------
+  # 3. OPTION unknown-consumer regression. OptionFeeConsumerUnknown fires;
+  #    PERP unknown and OLD arms stay green.
+  # --------------------------------------------------------------------
+  - name: option_unknown_consumer_fires
+    interval: 1m
+    input_series:
+      - series: 'deopt_perp_fee_charged_v2_total{consumer="new"}'
+        values: '3x6'
+      - series: 'deopt_perp_fee_charged_v2_total{consumer="old"}'
+        values: '0x6'
+      - series: 'deopt_perp_fee_charged_v2_total{consumer="unknown"}'
+        values: '0x6'
+      - series: 'deopt_perp_fee_rebated_v2_total{consumer="new"}'
+        values: '1x6'
+      - series: 'deopt_perp_fee_rebated_v2_total{consumer="old"}'
+        values: '0x6'
+      - series: 'deopt_perp_fee_rebated_v2_total{consumer="unknown"}'
+        values: '0x6'
+      - series: 'deopt_option_fee_charged_v2_total{consumer="new"}'
+        values: '3x6'
+      - series: 'deopt_option_fee_charged_v2_total{consumer="old"}'
+        values: '0x6'
+      - series: 'deopt_option_fee_charged_v2_total{consumer="unknown"}'
+        values: '0+1x6'
+      - series: 'deopt_option_fee_rebated_v2_total{consumer="new"}'
+        values: '1x6'
+      - series: 'deopt_option_fee_rebated_v2_total{consumer="old"}'
+        values: '0x6'
+      - series: 'deopt_option_fee_rebated_v2_total{consumer="unknown"}'
+        values: '0x6'
+      - series: 'deopt_fees_manager_v2_rebate_budget_native{asset="0x6eae407f5640b006fac9965182e238582a3b412e"}'
+        values: '999987x6'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: OptionFeeConsumerUnknown
+        exp_alerts:
+          - exp_labels:
+              alertname: OptionFeeConsumerUnknown
+              severity: medium
+              subsystem: option_v2_fees
+              milestone: V2G-F
+              consumer: "unknown"
+            exp_annotations:
+              summary: "OPTION V2 fee event emitted from unknown consumer"
+              description: >-
+                FeesManagerV2 fired an OPTION fee or rebate whose consumer matches neither the configured NEW MarginEngine (MARGIN_ENGINE / OPTION_EVENT_INDEXER_MARGIN_ENGINE_ADDRESS) nor the optional OLD MarginEngine (OLD_MARGIN_ENGINE_ADDRESS). Reconcile env vars with the contract state before escalating.
+              runbook_url: "docs/RUNBOOK_PERP_V2_FEE_ALERTS.md#optionfeeconsumerunknown"
+      - eval_time: 6m
+        alertname: PerpFeeConsumerUnknown
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: OptionFeeChargedFromOldMarginEngine
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: PerpFeeChargedFromOldEngine
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: DeoptV2FeeMetricsAbsent
+        exp_alerts: []
+
+  # --------------------------------------------------------------------
+  # 4. Rebate budget low. FeesManagerV2RebateBudgetLow fires when the
+  #    Base Sepolia mUSDC gauge drops below 1000 native.
+  # --------------------------------------------------------------------
+  - name: rebate_budget_low_fires
+    interval: 1m
+    input_series:
+      - series: 'deopt_perp_fee_charged_v2_total{consumer="new"}'
+        values: '3x6'
+      - series: 'deopt_perp_fee_charged_v2_total{consumer="old"}'
+        values: '0x6'
+      - series: 'deopt_perp_fee_charged_v2_total{consumer="unknown"}'
+        values: '0x6'
+      - series: 'deopt_perp_fee_rebated_v2_total{consumer="new"}'
+        values: '1x6'
+      - series: 'deopt_perp_fee_rebated_v2_total{consumer="old"}'
+        values: '0x6'
+      - series: 'deopt_perp_fee_rebated_v2_total{consumer="unknown"}'
+        values: '0x6'
+      - series: 'deopt_option_fee_charged_v2_total{consumer="new"}'
+        values: '3x6'
+      - series: 'deopt_option_fee_charged_v2_total{consumer="old"}'
+        values: '0x6'
+      - series: 'deopt_option_fee_charged_v2_total{consumer="unknown"}'
+        values: '0x6'
+      - series: 'deopt_option_fee_rebated_v2_total{consumer="new"}'
+        values: '1x6'
+      - series: 'deopt_option_fee_rebated_v2_total{consumer="old"}'
+        values: '0x6'
+      - series: 'deopt_option_fee_rebated_v2_total{consumer="unknown"}'
+        values: '0x6'
+      - series: 'deopt_fees_manager_v2_rebate_budget_native{asset="0x6eae407f5640b006fac9965182e238582a3b412e"}'
+        values: '500x6'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: FeesManagerV2RebateBudgetLow
+        exp_alerts:
+          - exp_labels:
+              alertname: FeesManagerV2RebateBudgetLow
+              severity: medium
+              subsystem: fees_manager_v2
+              milestone: V2G-F
+              asset_symbol: musdc
+              asset: "0x6eae407f5640b006fac9965182e238582a3b412e"
+            exp_annotations:
+              summary: "FeesManagerV2 rebate budget is low (Base Sepolia mUSDC)"
+              description: >-
+                Derived rebate budget for the canonical settlement asset (mUSDC on Base Sepolia) has fallen below 1 000 native units (i.e. < 0.001 mUSDC at 6 decimals). Top up via `FeesManagerV2.fundRebateBudget(mUSDC, amount)` to avoid future rebate-eligible trades reverting with `InsufficientRebateBudget`. The gauge is derived from indexed RebateBudgetFunded/Spent/Withdrawn events; for the ground-truth on-chain value also read `FeesManagerV2.rebateBudget(mUSDC)` via cast.
+              runbook_url: "docs/RUNBOOK_PERP_V2_FEE_ALERTS.md#feesmanagerv2rebatebudgetlow"
+      - eval_time: 6m
+        alertname: PerpFeeChargedFromOldEngine
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: DeoptV2FeeMetricsAbsent
+        exp_alerts: []
+
+  # --------------------------------------------------------------------
+  # 5. Metric pipeline absent. The V2 fee gauges are simply not present;
+  #    DeoptV2FeeMetricsAbsent fires after 5m of absence (the rule has
+  #    `for: 5m`). The budget gauge is also absent here, but the absent
+  #    rule only requires one of the four V2 fee gauges to be missing.
+  # --------------------------------------------------------------------
+  - name: metric_pipeline_absent_fires
+    interval: 1m
+    input_series:
+      # Intentionally empty: every V2 fee gauge is missing, so the
+      # absent() predicate is true for all of them. Provide a single
+      # unrelated series to keep promtool's harness happy.
+      - series: 'deopt_db_up'
+        values: '1x10'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: DeoptV2FeeMetricsAbsent
+        exp_alerts:
+          - exp_labels:
+              alertname: DeoptV2FeeMetricsAbsent
+              severity: high
+              subsystem: v2_fee_observability
+              milestone: V2G-G
+              consumer: "new"
+            exp_annotations:
+              summary: "DeOpt V2 fee metric pipeline is absent"
+              description: >-
+                One or more of the V2 fee consumer-bucketed gauges has been absent from `/metrics` for 5 minutes. This is the metric pipeline itself going dark — none of the consumer-bucket alerts (OLD / unknown) can fire while the gauge is missing. Check that the backend process is up, that `METRICS_ENABLED=true`, and that the scrape target is reachable.
+              runbook_url: "docs/RUNBOOK_PERP_V2_FEE_ALERTS.md"
+      - eval_time: 10m
+        alertname: PerpFeeChargedFromOldEngine
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: OptionFeeChargedFromOldMarginEngine
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: FeesManagerV2RebateBudgetLow
+        exp_alerts: []

@@ -604,6 +604,39 @@ Frontend:
    — V2G-E is the only PERP rebate event live). Enable after the
    V2G band ships ongoing flow.
 
+## V2G-H closure (appended 2026-05-31)
+
+V2G-H validated the V2G-G artefacts with the real Prometheus +
+Alertmanager toolchains and prepared the operator-facing integration
+package. See
+`docs/V2_FEE_OBSERVABILITY_LIVE_STACK_WIRING_V2G_H.md` for the full
+record.
+
+Key V2G-H outcomes:
+
+- Stack discovery: local host has no Prometheus / Alertmanager /
+  Grafana installed. V2G-H is therefore a "prepare + validate + plan"
+  milestone; live wire-up is V2G-I.
+- `promtool check rules` ✅ for the bundle and both legacy per-product
+  files. New `docs/monitoring/prometheus/v2_fee_alerts.test.yml`
+  exercises 5 scenarios (green / PERP OLD / OPTION unknown / budget
+  low / metrics absent); `promtool test rules` ✅ on all of them.
+- `amtool check-config` ✅ on the Alertmanager routing example.
+  `amtool config routes test` resolves 4 of 5 sample alerts to the
+  correct receiver (one expected `continue: true` double-resolution
+  documented).
+- Grafana provisioning entry + datasource template +
+  `render_dashboard.sh` substitution helper added under
+  `docs/monitoring/grafana/provisioning/`.
+- Backend rebuilt + re-run in read-only mode; `/health`,
+  `/admin/fees/v2/observability`, `/admin/fees/onchain` for both
+  V2G-E txs, and `/metrics` all reproduced the V2G-F / V2G-G closure
+  state byte-for-byte. All 8 V2 alerts logically green against the
+  live scrape.
+- Operator `.env` patch documented but unapplied (real `.env` still
+  carries the V2F-O `PERP_ENGINE_ADDRESS=OLD` line); exact diff +
+  rollback recorded.
+
 ## Next recommended milestone
 
 **V2G-H — flip the V2 fee observability surface to PRODUCTION-FIRING

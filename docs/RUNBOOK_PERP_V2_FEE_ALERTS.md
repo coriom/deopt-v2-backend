@@ -24,6 +24,35 @@ Cross-cutting alerts (V2G-F + V2G-G):
   rebates fire)
 - `DeoptV2FeeMetricsAbsent` (V2G-G — metric pipeline down)
 
+## Operator integration commands (V2G-H)
+
+When standing the V2 fee observability surface up in a new operator
+environment, refer to
+`docs/V2_FEE_OBSERVABILITY_LIVE_STACK_WIRING_V2G_H.md` for the full
+playbook. The short form:
+
+1. **Prometheus** — drop
+   `docs/monitoring/prometheus/v2_fee_alerts.bundle.yml` into the
+   rules directory, reference it from `prometheus.yml`, validate via
+   `promtool check rules` + `promtool test rules
+   docs/monitoring/prometheus/v2_fee_alerts.test.yml`, graceful
+   reload (`curl -X POST .../-/reload`). Expect 9 rules in 4 groups.
+2. **Alertmanager** — merge
+   `docs/monitoring/alertmanager/v2_fee_routing.example.yml` into
+   the deployed `alertmanager.yml`, validate via `amtool
+   check-config`, optionally `amtool config routes test` each of the
+   four sample alerts, graceful reload.
+3. **Grafana** — run
+   `docs/monitoring/grafana/provisioning/render_dashboard.sh
+   <prometheus_ds_name>` to materialise the dashboard JSON, drop it
+   into the dashboards directory, copy the provisioning entry from
+   `docs/monitoring/grafana/provisioning/dashboards/deopt_v2_fees.yaml`,
+   reload Grafana.
+4. **Operator `.env`** — apply
+   `docs/operator/v2g_g_env_patch.example.env` to the gitignored
+   local `.env`. Verify with the snippets at the bottom of that
+   file.
+
 ## Quick admin probe (V2G-G)
 
 Before going deep into any alert below, hit the backend's read-only

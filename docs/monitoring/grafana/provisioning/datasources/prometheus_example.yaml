@@ -1,0 +1,20 @@
+# V2G-H — example Prometheus datasource provisioning entry. Only
+# needed if Grafana does not already have a Prometheus datasource.
+# Copy into `/etc/grafana/provisioning/datasources/` only after
+# replacing the `url` with the operator's actual Prometheus URL.
+
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    orgId: 1
+    uid: prometheus
+    url: http://127.0.0.1:9090
+    isDefault: true
+    editable: true
+    jsonData:
+      httpMethod: POST
+      timeInterval: 15s
+      manageAlerts: false

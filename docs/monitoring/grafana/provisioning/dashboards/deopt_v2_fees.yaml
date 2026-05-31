@@ -1,0 +1,50 @@
+# V2G-H — Grafana dashboard provisioning entry for the V2 fee
+# observability dashboard.
+#
+# Drop this file into the Grafana dashboards provisioning directory
+# (default `/etc/grafana/provisioning/dashboards/`), then drop the
+# companion dashboard JSON into the `path` below. The default Grafana
+# provisioning loader will pick the dashboard up on next service
+# start; `allowUiUpdates` lets operators tweak in the UI while the
+# JSON remains the source of truth.
+#
+# Operator commands (adjust paths if your Grafana install is not under
+# `/etc/grafana`):
+#
+#   # 1. Copy the provisioning entry into the Grafana config directory.
+#   sudo install -m 0644 \
+#     ~/DEOPT/deopt-v2-backend/docs/monitoring/grafana/provisioning/dashboards/deopt_v2_fees.yaml \
+#     /etc/grafana/provisioning/dashboards/deopt_v2_fees.yaml
+#
+#   # 2. Copy the dashboard JSON into the path referenced below.
+#   sudo install -d -m 0755 /var/lib/grafana/dashboards/deopt
+#   sudo install -m 0644 \
+#     ~/DEOPT/deopt-v2-backend/docs/monitoring/grafana/v2_fee_observability_dashboard.json \
+#     /var/lib/grafana/dashboards/deopt/v2_fee_observability_dashboard.json
+#
+#   # 3. Reload Grafana (graceful — the dashboard provisioner re-reads
+#   #    the path every `updateIntervalSeconds`; SIGHUP also works).
+#   sudo systemctl reload grafana-server
+#
+# Datasource: the dashboard JSON uses `${DS_PROMETHEUS}` as a template
+# variable; in a provisioned dashboard you must replace
+# `${DS_PROMETHEUS}` with the actual Prometheus datasource name when
+# the dashboard is committed to disk (Grafana's provisioning loader
+# does NOT substitute template inputs). The companion script at
+# `docs/monitoring/grafana/provisioning/render_dashboard.sh` produces
+# the substituted JSON for a given datasource name.
+
+apiVersion: 1
+
+providers:
+  - name: 'deopt-v2-fees'
+    orgId: 1
+    folder: 'DeOpt'
+    folderUid: 'deopt'
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards/deopt
+      foldersFromFilesStructure: false
