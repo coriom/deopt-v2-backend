@@ -297,6 +297,30 @@ single-line git revert in the doc repo, not a target-stack operation.
 The agent will not execute any of the above without explicit
 written authorisation per gate.
 
+## V2G-L0 local-stack pointer (appended 2026-05-31)
+
+For operators who want to rehearse the V2G-J cutover end-to-end on
+a single host before touching the real target stack, V2G-L0 ships
+a complete localhost docker-compose stack at
+`docs/monitoring/local-stack/`. Layout:
+
+- `compose.yml` — Prometheus 3.12.0 + Alertmanager 0.32.1 + Grafana
+  11.4.0 + webhook sink, all 127.0.0.1-bound.
+- `prometheus/rules/` — symlinks into the canonical
+  `docs/monitoring/prometheus/v2_fee_alerts.bundle.yml`. No drift.
+- `alertmanager/alertmanager.yml` — the V2G-J routing example pointed
+  at the local webhook sink.
+- `grafana/...` — provisioning entries + a dashboard JSON rendered
+  with DS=`Prometheus`.
+- `webhook-sink/webhook_sink.py` — single-file Python sink that
+  receives every dispatch on six receiver paths.
+
+Bring up with `docker compose up -d` after granting docker socket
+access. See
+`docs/V2_FEE_OBSERVABILITY_LOCAL_STACK_BOOTSTRAP_V2G_L0.md` for the
+full rehearsal record, including the bare-binary fallback the agent
+used when docker socket access was blocked.
+
 ## V2G-K soak record pointer (appended 2026-05-31)
 
 V2G-K opened the 7-day soak record at

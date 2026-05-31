@@ -1,0 +1,93 @@
+# V2G-L0 local Alertmanager config. Mirrors the receiver names from
+# the V2G-G routing example
+# (docs/monitoring/alertmanager/v2_fee_routing.example.yml) but points
+# every receiver at the local webhook sink so the synthetic drill can
+# verify end-to-end delivery without external paging.
+
+global:
+  resolve_timeout: 5m
+
+templates: []
+
+route:
+  receiver: default
+  group_by: [alertname, subsystem]
+  group_wait: 10s
+  group_interval: 30s
+  repeat_interval: 1h
+  routes:
+    # Severity escalation per network (override Base Sepolia defaults).
+    - matchers:
+        - severity = high
+        - chain = base-mainnet
+      receiver: deopt_oncall_critical
+      continue: true
+    - matchers:
+        - severity = medium
+        - chain = base-mainnet
+      receiver: deopt_oncall_high
+      continue: true
+
+    # PERP OLD/regression alerts → smart-contract on-call.
+    - matchers:
+        - subsystem = perp_v2_fees
+        - severity =~ "high|critical"
+      receiver: deopt_oncall_critical
+
+    # OPTION OLD/regression alerts → smart-contract on-call.
+    - matchers:
+        - subsystem = option_v2_fees
+        - severity =~ "high|critical"
+      receiver: deopt_oncall_critical
+
+    # Unknown-consumer anomalies → ticket queue (not paging).
+    - matchers:
+        - alertname =~ "PerpFeeConsumerUnknown|OptionFeeConsumerUnknown"
+      receiver: deopt_anomaly_tickets
+      group_wait: 1m
+      repeat_interval: 24h
+
+    # Rebate budget alerts → ops chat + runbook link.
+    - matchers:
+        - subsystem = fees_manager_v2
+      receiver: deopt_ops_chat
+      group_wait: 1m
+      repeat_interval: 6h
+
+    # Metric pipeline absent (V2G-G) → backend on-call.
+    - matchers:
+        - alertname = DeoptV2FeeMetricsAbsent
+      receiver: deopt_backend_oncall
+
+receivers:
+  - name: default
+    webhook_configs:
+      - url: http://webhook-sink:9095/default
+        send_resolved: true
+  - name: deopt_oncall_critical
+    webhook_configs:
+      - url: http://webhook-sink:9095/critical
+        send_resolved: true
+  - name: deopt_oncall_high
+    webhook_configs:
+      - url: http://webhook-sink:9095/high
+        send_resolved: true
+  - name: deopt_anomaly_tickets
+    webhook_configs:
+      - url: http://webhook-sink:9095/tickets
+        send_resolved: true
+  - name: deopt_ops_chat
+    webhook_configs:
+      - url: http://webhook-sink:9095/ops
+        send_resolved: true
+  - name: deopt_backend_oncall
+    webhook_configs:
+      - url: http://webhook-sink:9095/backend
+        send_resolved: true
+
+inhibit_rules:
+  - source_matchers:
+      - alertname = DeoptV2FeeMetricsAbsent
+    target_matchers:
+      - subsystem =~ "perp_v2_fees|option_v2_fees|fees_manager_v2"
+    equal: [subsystem]

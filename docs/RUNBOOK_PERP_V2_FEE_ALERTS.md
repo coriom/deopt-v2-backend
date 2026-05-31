@@ -55,6 +55,70 @@ is gated by the corresponding `F`-row authorisation in
 Top-level cutover record:
 `docs/V2_FEE_OBSERVABILITY_TARGET_CUTOVER_V2G_J.md`.
 
+## V2G-L2 — local compose stack live
+
+V2G-L2 brought the local compose stack up after the operator
+unblocked Docker access. Quick-start commands (once `docker ps`
+works under your user):
+
+```sh
+cd ~/DEOPT/deopt-v2-backend/docs/monitoring/local-stack
+docker compose up -d                    # 4 containers
+docker compose ps                       # confirm all running/healthy
+
+# Backend startup (HOST=0.0.0.0 so compose Prometheus can reach in):
+cd ~/DEOPT/deopt-v2-backend
+HOST=0.0.0.0 PORT=8080 ./target/release/deopt-v2-backend
+# (Plus the V2G-K classifier env vars — see Phase 3 of
+# `docs/V2_FEE_OBSERVABILITY_LOCAL_COMPOSE_LIVE_V2G_L2.md`.)
+```
+
+After every canonical Prometheus rule change, re-sync the local
+stack:
+
+```sh
+~/DEOPT/deopt-v2-backend/docs/monitoring/local-stack/prometheus/rules/sync_from_canonical.sh
+docker compose -f ~/DEOPT/deopt-v2-backend/docs/monitoring/local-stack/compose.yml \
+  exec prometheus wget -qO- http://127.0.0.1:9090/-/reload >/dev/null
+```
+
+Full record:
+`docs/V2_FEE_OBSERVABILITY_LOCAL_COMPOSE_LIVE_V2G_L2.md`.
+
+## V2G-L1 — pre-cutover Docker unblock
+
+If `docker ps` from your local user returns "permission denied",
+run the standard group fix before bringing up the local stack:
+
+```sh
+sudo usermod -aG docker "$USER" && newgrp docker
+docker ps      # verify
+```
+
+V2G-L1's full Docker-gate analysis and per-shell verification
+commands live at
+`docs/V2_FEE_OBSERVABILITY_LOCAL_COMPOSE_SOAK_V2G_L1.md`. Once
+`docker ps` works, follow the V2G-L0 quick-start below.
+
+## V2G-L0 local rehearsal stack (quick-start)
+
+Before applying the V2G-J cutover on the real target, rehearse it
+locally:
+
+```sh
+cd ~/DEOPT/deopt-v2-backend/docs/monitoring/local-stack
+docker compose up -d
+# then:
+#   http://localhost:9090/targets   -- backend job should be UP
+#   http://localhost:9090/alerts    -- 9 deopt_* alerts inactive
+#   http://localhost:9093/          -- Alertmanager up
+#   http://localhost:3000/d/deopt-v2g-g-v2-fees  -- dashboard
+```
+
+Backend startup snippet + drill commands are in
+`docs/monitoring/local-stack/README.md`. Full bootstrap record:
+`docs/V2_FEE_OBSERVABILITY_LOCAL_STACK_BOOTSTRAP_V2G_L0.md`.
+
 ## V2G-K soak record (daily checklist)
 
 After the V2G-J cutover lands on the target host, work the daily

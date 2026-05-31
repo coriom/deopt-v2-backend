@@ -1,0 +1,350 @@
+# V2G-G — deployable Prometheus rules bundle for the V2 fee
+# observability surface (PERP + OPTION + FeesManagerV2 rebate budget +
+# scrape liveness).
+#
+# This is the single file an operator points Prometheus at to roll out
+# the V2 fee observability surface end-to-end. It bundles the per-product
+# rule files that have shipped since V2F-Q / V2G-F:
+#
+#   - docs/alertmanager/perp_v2_fee_alerts.yml   (V2F-O / V2F-P / V2F-Q)
+#   - docs/alertmanager/option_v2_fee_alerts.yml (V2G-F)
+#
+# plus two cross-cutting groups added in V2G-G:
+#
+#   - `deopt_v2_fee_metrics_liveness` — fires if the V2 fee metric
+#     pipeline is missing (scrape down, metrics endpoint disabled, or
+#     the consumer-bucket gauges never seeded).
+#   - `deopt_fees_manager_v2_budget_alerts_multi_asset` — guidance
+#     entry only (commented). Add one rule per supported settlement
+#     asset when V2G band expands beyond Base Sepolia mUSDC; see
+#     `docs/V2_FEE_PRODUCTION_OBSERVABILITY_V2G_G.md` §"Multi-asset
+#     readiness matrix".
+#
+# ## Deployment (Prometheus + Alertmanager)
+#
+# 1. Drop this file into the Prometheus rules directory and reference
+#    it from `prometheus.yml`:
+#
+#    ```yaml
+#    rule_files:
+#      - /etc/prometheus/rules/v2_fee_alerts.bundle.yml
+#    ```
+#
+# 2. Validate locally (no network call required):
+#
+#    ```sh
+#    promtool check rules \
+#      docs/monitoring/prometheus/v2_fee_alerts.bundle.yml
+#    ```
+#
+#    If `promtool` is unavailable in the local toolchain, a Python YAML
+#    parse check is good enough as a smoke gate (V2G-G validation
+#    step recorded in the milestone doc):
+#
+#    ```sh
+#    python3 -c "import yaml,sys; yaml.safe_load(open(sys.argv[1]))" \
+#      docs/monitoring/prometheus/v2_fee_alerts.bundle.yml
+#    ```
+#
+# 3. Reload Prometheus (`SIGHUP` or `POST /-/reload`) and confirm the
+#    alert rules show up in `/alerts` with no syntax errors.
+#
+# 4. Wire each `severity` label into your Alertmanager routing tree.
+#    The shipped defaults are Base Sepolia values; override per network
+#    via Alertmanager rules:
+#
+#    | Environment   | charged/rebated from OLD | unknown consumer | budget low |
+#    | ------------- | ------------------------ | ---------------- | ---------- |
+#    | Base Sepolia  | `high`                   | `medium`         | `medium`   |
+#    | Mainnet       | `critical`               | `high`           | `high`     |
+#
+# ## Cardinality contract
+#
+# - Every `consumer` label is one of `"new" | "old" | "unknown"` —
+#   enforced in `src/fees/perp_consumer.rs::classify_perp_fee_consumer`
+#   and `src/fees/option_consumer.rs::classify_option_fee_consumer`.
+# - The `asset` label on the rebate-budget gauge is the lowercased
+#   settlement-asset address; one series per asset. Pin alert rules to
+#   exact lowercased addresses — never to symbols.
+# - `severity`, `subsystem`, `milestone` are the only alert-rule labels;
+#   no addresses, tx hashes, traders, or recipients are ever promoted
+#   to labels.
+#
+# ## Runbook
+#
+# Every alert below has a `runbook_url` annotation pointing at
+# `docs/RUNBOOK_PERP_V2_FEE_ALERTS.md` (filename retained from V2F-Q
+# for stable inbound link IDs; covers PERP + OPTION + budget).
+groups:
+  # ---------------------------------------------------------------------
+  # PERP — mirror of docs/alertmanager/perp_v2_fee_alerts.yml.
+  # Source: V2F-O / V2F-P / V2F-Q.
+  # ---------------------------------------------------------------------
+  - name: deopt_perp_v2_fee_alerts
+    rules:
+      - alert: PerpFeeChargedFromOldEngine
+        expr: increase(deopt_perp_fee_charged_v2_total{consumer="old"}[5m]) > 0
+        for: 0m
+        labels:
+          severity: high
+          subsystem: perp_v2_fees
+          milestone: V2F-O
+        annotations:
+          summary: "PERP FeeChargedV2 emitted from OLD stranded PerpEngine"
+          description: >-
+            OLD PerpEngine should not emit new PERP V2 fee events after the A3
+            fallback cutover. Snapshot FeesManagerV2.feeConsumers() and
+            useFeesManagerV2() on every engine, then verify wiring against the
+            V2F-LM acceptance state.
+          runbook_url: "docs/RUNBOOK_PERP_V2_FEE_ALERTS.md#perpfeechargedfromoldengine"
+
+      - alert: PerpFeeRebatedFromOldEngine
+        expr: increase(deopt_perp_fee_rebated_v2_total{consumer="old"}[5m]) > 0
+        for: 0m
+        labels:
+          severity: high
+          subsystem: perp_v2_fees
+          milestone: V2F-Q
+        annotations:
+          summary: "PERP FeeRebatedV2 emitted from OLD stranded PerpEngine"
+          description: >-
+            OLD PerpEngine should not emit new PERP V2 rebate events after the
+            A3 fallback cutover. Snapshot FeesManagerV2 wiring on every engine
+            and compare to the V2F-LM acceptance state.
+          runbook_url: "docs/RUNBOOK_PERP_V2_FEE_ALERTS.md#perpfeerebatedfromoldengine"
+
+      - alert: PerpFeeConsumerUnknown
+        expr: |
+          increase(deopt_perp_fee_charged_v2_total{consumer="unknown"}[5m])
+          + increase(deopt_perp_fee_rebated_v2_total{consumer="unknown"}[5m])
+          > 0
+        for: 0m
+        labels:
+          severity: medium
+          subsystem: perp_v2_fees
+          milestone: V2F-Q
+        annotations:
+          summary: "PERP V2 fee event emitted from unknown consumer"
+          description: >-
+            FeesManagerV2 fired a PERP fee or rebate whose consumer matches
+            neither the configured NEW (PERP_ENGINE_ADDRESS) nor OLD
+            (OLD_PERP_ENGINE_ADDRESS) engine. Reconcile env vars with the
+            on-chain FeesManagerV2.isFeeConsumer state before escalating.
+          runbook_url: "docs/RUNBOOK_PERP_V2_FEE_ALERTS.md#perpfeeconsumerunknown"
+
+  # ---------------------------------------------------------------------
+  # OPTION — mirror of docs/alertmanager/option_v2_fee_alerts.yml.
+  # Source: V2G-F.
+  # ---------------------------------------------------------------------
+  - name: deopt_option_v2_fee_alerts
+    rules:
+      - alert: OptionFeeChargedFromOldMarginEngine
+        expr: increase(deopt_option_fee_charged_v2_total{consumer="old"}[5m]) > 0
+        for: 0m
+        labels:
+          severity: high
+          subsystem: option_v2_fees
+          milestone: V2G-F
+        annotations:
+          summary: "OPTION FeeChargedV2 emitted from OLD stranded MarginEngine"
+          description: >-
+            OLD MarginEngine should not emit new V2 OPTION fee events after
+            the V2E-E cutover. Snapshot FeesManagerV2.isFeeConsumer() on
+            every MarginEngine and compare to the V2E-E acceptance state.
+          runbook_url: "docs/RUNBOOK_PERP_V2_FEE_ALERTS.md#optionfeechargedfromoldmarginengine"
+
+      - alert: OptionFeeRebatedFromOldMarginEngine
+        expr: increase(deopt_option_fee_rebated_v2_total{consumer="old"}[5m]) > 0
+        for: 0m
+        labels:
+          severity: high
+          subsystem: option_v2_fees
+          milestone: V2G-F
+        annotations:
+          summary: "OPTION FeeRebatedV2 emitted from OLD stranded MarginEngine"
+          description: >-
+            Mirror of OptionFeeChargedFromOldMarginEngine for the rebate
+            path. Same diagnostic procedure; add a budget delta snapshot.
+          runbook_url: "docs/RUNBOOK_PERP_V2_FEE_ALERTS.md#optionfeerebatedfromoldmarginengine"
+
+      - alert: OptionFeeConsumerUnknown
+        expr: |
+          increase(deopt_option_fee_charged_v2_total{consumer="unknown"}[5m])
+          + increase(deopt_option_fee_rebated_v2_total{consumer="unknown"}[5m])
+          > 0
+        for: 0m
+        labels:
+          severity: medium
+          subsystem: option_v2_fees
+          milestone: V2G-F
+        annotations:
+          summary: "OPTION V2 fee event emitted from unknown consumer"
+          description: >-
+            FeesManagerV2 fired an OPTION fee or rebate whose consumer matches
+            neither the configured NEW MarginEngine (MARGIN_ENGINE /
+            OPTION_EVENT_INDEXER_MARGIN_ENGINE_ADDRESS) nor the optional OLD
+            MarginEngine (OLD_MARGIN_ENGINE_ADDRESS). Reconcile env vars with
+            the contract state before escalating.
+          runbook_url: "docs/RUNBOOK_PERP_V2_FEE_ALERTS.md#optionfeeconsumerunknown"
+
+  # ---------------------------------------------------------------------
+  # FeesManagerV2 rebate budget — Base Sepolia canonical mUSDC.
+  # Source: V2G-F (the gauge), V2G-G (this packaged form).
+  # ---------------------------------------------------------------------
+  - name: deopt_fees_manager_v2_budget_alerts
+    rules:
+      - alert: FeesManagerV2RebateBudgetLow
+        # Base Sepolia mUSDC = 0x6eae407f5640b006fac9965182e238582a3b412e.
+        # On other networks, replace the address with the canonical
+        # mUSDC / USDC settlement-asset address.
+        expr: |
+          deopt_fees_manager_v2_rebate_budget_native{
+            asset="0x6eae407f5640b006fac9965182e238582a3b412e"
+          } < 1000
+        for: 0m
+        labels:
+          severity: medium
+          subsystem: fees_manager_v2
+          milestone: V2G-F
+          asset_symbol: musdc
+        annotations:
+          summary: "FeesManagerV2 rebate budget is low (Base Sepolia mUSDC)"
+          description: >-
+            Derived rebate budget for the canonical settlement asset
+            (mUSDC on Base Sepolia) has fallen below 1 000 native units
+            (i.e. < 0.001 mUSDC at 6 decimals). Top up via
+            `FeesManagerV2.fundRebateBudget(mUSDC, amount)` to avoid
+            future rebate-eligible trades reverting with
+            `InsufficientRebateBudget`. The gauge is derived from indexed
+            RebateBudgetFunded/Spent/Withdrawn events; for the
+            ground-truth on-chain value also read
+            `FeesManagerV2.rebateBudget(mUSDC)` via cast.
+          runbook_url: "docs/RUNBOOK_PERP_V2_FEE_ALERTS.md#feesmanagerv2rebatebudgetlow"
+
+      # V2G-G (label-fix V2G-I): stale-budget detector. The rebate-budget
+      # gauge is derived from indexed events; if the indexer stalls the
+      # value will freeze. This alert catches a frozen budget alongside
+      # ongoing rebate activity, which would otherwise sneak past the
+      # `< 1000` rule.
+      #
+      # PromQL note: the left side is the budget gauge (carries the
+      # `asset` label), the right side is the rebate counters (carry the
+      # `consumer` label). `and on()` is required because the two sides
+      # have NO common labels — without `on()`, the default vector
+      # matching returns the empty set and the alert silently never
+      # fires. The on() form keeps the budget gauge's `asset` label on
+      # the output, which is the natural per-asset alert payload.
+      # V2G-I added the `v2_fee_alerts.test.yml::rebate_budget_stale_fires`
+      # unit test that pins this contract.
+      - alert: FeesManagerV2RebateBudgetStale
+        expr: |
+          delta(
+            deopt_fees_manager_v2_rebate_budget_native{
+              asset="0x6eae407f5640b006fac9965182e238582a3b412e"
+            }[30m]
+          ) == 0
+          and on() (
+            increase(deopt_option_fee_rebated_v2_total{consumer="new"}[30m]) > 0
+            or
+            increase(deopt_perp_fee_rebated_v2_total{consumer="new"}[30m]) > 0
+          )
+        for: 15m
+        labels:
+          severity: medium
+          subsystem: fees_manager_v2
+          milestone: V2G-G
+          asset_symbol: musdc
+        annotations:
+          summary: "FeesManagerV2 rebate budget unchanged while V2 rebates are firing"
+          description: >-
+            The derived rebate-budget gauge has not moved in 30 minutes,
+            but `FeeRebatedV2` events are still being scraped. The most
+            likely cause is that the event indexer has stopped picking
+            up `RebateBudgetSpent` / `RebateBudgetFunded` events.
+            Cross-check `FeesManagerV2.rebateBudget(mUSDC)` on-chain via
+            cast and run `/admin/options/events/tick` (idempotent admin
+            endpoint, not destructive) to advance the indexer cursor.
+          runbook_url: "docs/RUNBOOK_PERP_V2_FEE_ALERTS.md#feesmanagerv2rebatebudgetlow"
+
+  # ---------------------------------------------------------------------
+  # V2G-G: V2 fee metric pipeline liveness.
+  # ---------------------------------------------------------------------
+  - name: deopt_v2_fee_metrics_liveness
+    rules:
+      # The four consumer-bucketed gauges are pre-seeded to zero in
+      # `monitoring::append_perp_fee_v2_consumer_metric` /
+      # `append_option_fee_v2_consumer_metric`, so the metric is
+      # present from the first scrape after backend startup. If it is
+      # ever absent, either the metrics endpoint is disabled, the scrape
+      # target is down, or the metric pipeline regressed.
+      - alert: DeoptV2FeeMetricsAbsent
+        expr: |
+          absent(deopt_perp_fee_charged_v2_total{consumer="new"})
+          or absent(deopt_perp_fee_rebated_v2_total{consumer="new"})
+          or absent(deopt_option_fee_charged_v2_total{consumer="new"})
+          or absent(deopt_option_fee_rebated_v2_total{consumer="new"})
+        for: 5m
+        labels:
+          severity: high
+          subsystem: v2_fee_observability
+          milestone: V2G-G
+        annotations:
+          summary: "DeOpt V2 fee metric pipeline is absent"
+          description: >-
+            One or more of the V2 fee consumer-bucketed gauges has been
+            absent from `/metrics` for 5 minutes. This is the metric
+            pipeline itself going dark — none of the consumer-bucket
+            alerts (OLD / unknown) can fire while the gauge is missing.
+            Check that the backend process is up, that
+            `METRICS_ENABLED=true`, and that the scrape target is
+            reachable.
+          runbook_url: "docs/RUNBOOK_PERP_V2_FEE_ALERTS.md"
+
+      # The PERP rebate-event metric is the canonical signal that the
+      # rebate broadcast path is healthy. Once the V2G-band shifts beyond
+      # smoke trades (i.e. > 1 PERP rebate per day is expected), wire a
+      # "no rebates in N hours" alert here. Left commented for V2G-G —
+      # the per-day rebate cadence is not yet established.
+      #
+      # - alert: DeoptV2PerpRebateStalled
+      #   expr: increase(deopt_perp_fee_rebated_v2_total{consumer="new"}[24h]) == 0
+      #   for: 24h
+      #   labels:
+      #     severity: medium
+      #     subsystem: perp_v2_fees
+      #     milestone: V2G-G
+      #   annotations:
+      #     summary: "No PERP V2 rebates in 24h"
+      #     description: >-
+      #       No `FeeRebatedV2{consumer="new"}` increment in 24 h. If
+      #       trade volume is healthy, the rebate path may be silently
+      #       broken (e.g. classifier put events into `unknown`, or
+      #       maker is on a non-rebate tier).
+      #     runbook_url: "docs/RUNBOOK_PERP_V2_FEE_ALERTS.md"
+
+# ----- Multi-asset future-rule template ----------------------------------
+# When the V2G band ships to mainnet or to a chain with multiple
+# settlement assets, add one of the following per asset. Keep each
+# `asset_symbol` label distinct so Alertmanager grouping fans out the
+# alerts cleanly:
+#
+#   - alert: FeesManagerV2RebateBudgetLow_MainnetUSDC
+#     expr: |
+#       deopt_fees_manager_v2_rebate_budget_native{
+#         asset="0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
+#       } < 100000   # 0.1 USDC at 6dp
+#     for: 0m
+#     labels:
+#       severity: critical
+#       subsystem: fees_manager_v2
+#       milestone: V2G-G
+#       asset_symbol: usdc
+#       chain: base-mainnet
+#     annotations:
+#       summary: "FeesManagerV2 USDC rebate budget low (Base mainnet)"
+#       description: >-
+#         Top up via FeesManagerV2.fundRebateBudget(USDC, amount).
+#       runbook_url: "docs/RUNBOOK_PERP_V2_FEE_ALERTS.md#feesmanagerv2rebatebudgetlow"
+#
+# Multi-asset readiness matrix in
+# `docs/V2_FEE_PRODUCTION_OBSERVABILITY_V2G_G.md`.

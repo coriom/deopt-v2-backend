@@ -1,0 +1,57 @@
+# V2G-I — optional opt-in rule: PERP V2 rebate cadence stalled.
+#
+# This file ships the `DeoptV2PerpRebateStalled` rule as a SEPARATE,
+# operator-controlled bundle so that adding it to a Prometheus
+# deployment is an explicit decision tied to the operator's known
+# rebate cadence. It is INTENTIONALLY not part of
+# `v2_fee_alerts.bundle.yml` until the V2G-band cadence baseline is
+# established on the target network.
+#
+# Rationale:
+# - On Base Sepolia today, V2G-E is the only live PERP rebate event.
+#   Activating `increase(...[24h]) == 0` against that baseline would
+#   fire continuously until the next live trade lands.
+# - On a network with regular rebate flow (e.g. mainnet post-launch),
+#   the rule becomes meaningful: a 24-hour drought means makers
+#   stopped redeeming or the FeesManagerV2 rebate path regressed.
+#
+# To activate, drop this file into the Prometheus rules directory
+# alongside `v2_fee_alerts.bundle.yml` and reference both from
+# `prometheus.yml`. The bundle and this file declare DISTINCT group
+# names, so they merge cleanly.
+#
+# Validation:
+#
+#   promtool check rules docs/monitoring/prometheus/v2_fee_alerts.stalled.yml
+#
+# Unit test coverage:
+#
+#   docs/monitoring/prometheus/v2_fee_alerts.test.yml
+#     → group `perp_rebate_stalled_fires_after_24h_silence`
+#
+# Cardinality: low — one alert series; same {severity, subsystem,
+# milestone} labels as the rest of the V2G band.
+groups:
+  - name: deopt_v2_perp_rebate_cadence
+    rules:
+      - alert: DeoptV2PerpRebateStalled
+        expr: increase(deopt_perp_fee_rebated_v2_total{consumer="new"}[24h]) == 0
+        for: 24h
+        labels:
+          severity: medium
+          subsystem: perp_v2_fees
+          milestone: V2G-I
+        annotations:
+          summary: "No PERP V2 rebates in 24h"
+          description: >-
+            `deopt_perp_fee_rebated_v2_total{consumer="new"}` did not
+            increment in the last 24 hours. If trade volume is healthy
+            this indicates the rebate path is silently broken (e.g.
+            classifier put rebate events into `unknown`, or every
+            maker happens to be on a non-rebate tier). Cross-check
+            `/admin/fees/v2/observability` for unknown-bucket
+            contamination and `FeesManagerV2.rebateBudget(mUSDC)` on
+            chain. If the network truly has no rebate activity
+            (e.g. test / pre-launch), this rule should be removed or
+            its window widened.
+          runbook_url: "docs/RUNBOOK_PERP_V2_FEE_ALERTS.md#deoptv2perprebatestalled"

@@ -259,6 +259,9 @@ plus a one-line note for any non-OK row. Day 0 is the soak open record
 | Day | Date / time (UTC) | Step 1 | Step 2 | Step 3 | Step 4 | Step 5 | Step 6 | Step 7 | Step 8 | Step 9 | Stalled rule | Notes |
 |-----|-------------------|--------|--------|--------|--------|--------|--------|--------|--------|--------|--------------|-------|
 | 0   | 2026-05-31T16:14Z | ok (local) | ok (local baseline) | ok (local) | n/a | n/a | n/a | n/a | n/a | n/a | deferred | Local baseline capture only. Target host pending operator gates. |
+| 0+  | 2026-05-31T16:48Z | ok (local stack) | ok (via Prom) | ok (via Prom) | ok | ok | n/a (bare-binary) | ok | ok | ok | deferred | V2G-L0 bootstrap: bare-binary stack (backend + Prometheus + Alertmanager + sink) ran end-to-end on `127.0.0.1`. 9 alerts loaded, all `state=inactive`; 5/5 synthetic drills routed correctly (PERP OLD → critical, OPTION unknown → tickets, budget low → ops, metrics absent → backend, mainnet escalation → high). Compose stack files committed at `docs/monitoring/local-stack/` — operator-gated on docker group membership. See `docs/V2_FEE_OBSERVABILITY_LOCAL_STACK_BOOTSTRAP_V2G_L0.md`. |
+| 0++ | 2026-05-31T17:14Z | ok (bare-binary stack) | ok (via Prom) | ok (via Prom) | ok | ok | gated (docker `up -d` blocked by sudo/group gate; Grafana ships only as a container) | ok | ok | ok | deferred | V2G-L1 second attempt at compose `up -d`. Docker access still gated; agent stopped at the sudo gate per hard rule and surfaced `sudo usermod -aG docker "$USER" && newgrp docker` for the operator. Bare-binary stand-in re-ran end-to-end; 5 drills firing + 5 drills resolved through the sink. See `docs/V2_FEE_OBSERVABILITY_LOCAL_COMPOSE_SOAK_V2G_L1.md`. |
+| 0+++ | 2026-05-31T17:38Z | ok (compose stack live) | ok (via Prom) | ok (via Prom) | ok | ok | ok (Grafana up, 10 panels resolved via DS proxy) | ok | ok | ok | deferred | **V2G-L2: full compose stack live.** Operator unblocked Docker (`usermod -aG docker $USER && newgrp docker`); agent fixed two stack issues (rule files copy-not-symlink so the container bind resolves; webhook-sink user override dropped so the named volume is writable) and brought up all 4 containers. Prometheus scrapes `deopt-v2-backend@host.docker.internal:8080` UP; 9 alerts loaded inactive; 5/5 synthetic drills routed to expected receivers, sink volume captured every dispatch; Grafana `DeOpt — V2 fee observability (V2G-G)` dashboard provisioned with `Prometheus` DS; proxy queries through Grafana confirm the V2 fee gauge baseline. See `docs/V2_FEE_OBSERVABILITY_LOCAL_COMPOSE_LIVE_V2G_L2.md`. |
 | 1   |                   |        |        |        |        |        |        |        |        |        | deferred     |       |
 | 2   |                   |        |        |        |        |        |        |        |        |        | deferred     |       |
 | 3   |                   |        |        |        |        |        |        |        |        |        | deferred     |       |
@@ -266,6 +269,57 @@ plus a one-line note for any non-OK row. Day 0 is the soak open record
 | 5   |                   |        |        |        |        |        |        |        |        |        | decide       |       |
 | 6   |                   |        |        |        |        |        |        |        |        |        | follow day-5 |       |
 | 7   |                   |        |        |        |        |        |        |        |        |        | follow day-5 |       |
+
+### V2G-L0 — local-stack bootstrap (appended 2026-05-31)
+
+V2G-L0 turned the V2G-K "soak-start-pending" baseline into a real
+local-stack rehearsal. Headlines:
+
+- Compose stack committed at `docs/monitoring/local-stack/` covering
+  Prometheus 3.12.0 + Alertmanager 0.32.1 + Grafana 11.4.0 + webhook
+  sink, all `127.0.0.1`-bound.
+- Docker daemon discovered active but operator-gated (user not in
+  `docker` group, sudo password-required). Compose `up` step deferred
+  to operator.
+- Bare-binary stand-in (Prometheus + Alertmanager binaries from
+  `/tmp` + backend + sink) ran end-to-end on the agent: 3/3
+  scrape targets `up`, 9 alerts loaded `inactive`, 5/5 synthetic
+  drills delivered to the expected receivers (including the V2G-J
+  mainnet escalation drill that V2G-I had not exercised).
+- V2G-K day-0 row now reads `local-stack-running` with a real
+  Prometheus-side baseline.
+- Stalled-rule decision: **defer.** Local Prometheus has zero
+  history; activation policy gate (≥3 PERP rebates / 24h × 48h)
+  cannot be evaluated. Re-evaluation marker stays on soak day 5.
+
+Full record: `docs/V2_FEE_OBSERVABILITY_LOCAL_STACK_BOOTSTRAP_V2G_L0.md`.
+
+### V2G-L2 — compose stack live (appended 2026-05-31)
+
+Operator unblocked Docker. Agent brought the V2G-L0 compose stack up
+after two small fixes (rule symlink → literal copy; sink user
+override removed). All 4 containers running, Prometheus scraping
+backend through `host.docker.internal`, 5/5 synthetic drills
+delivered through the sink, Grafana dashboard provisioned at
+`/d/deopt-v2g-g-v2-fees`. The V2G-K soak is now in
+**local-compose-live** mode; day-1 starts T+24h after
+`2026-05-31T17:38Z`.
+
+Full record: `docs/V2_FEE_OBSERVABILITY_LOCAL_COMPOSE_LIVE_V2G_L2.md`.
+
+### V2G-L1 — local-compose attempt (appended 2026-05-31)
+
+V2G-L1 retried the V2G-L0 compose start. Same Docker socket gate.
+Agent stopped at sudo per hard rule and reran the bare-binary
+stand-in to keep the soak warm; 5/5 drills firing + 5/5 resolved.
+
+Operator unblock command (single line):
+
+```sh
+sudo usermod -aG docker "$USER" && newgrp docker && cd ~/DEOPT/deopt-v2-backend/docs/monitoring/local-stack && docker compose up -d && docker compose ps
+```
+
+Full record: `docs/V2_FEE_OBSERVABILITY_LOCAL_COMPOSE_SOAK_V2G_L1.md`.
 
 ### What "warn" vs "fail" means
 

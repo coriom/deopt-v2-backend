@@ -1,0 +1,132 @@
+# V2G-L0 — local non-production monitoring stack for DeOpt V2 fee
+# observability. Boots a single-node Prometheus + Alertmanager +
+# Grafana + webhook-sink on localhost, scrapes the dev backend at
+# `host.docker.internal:8080/metrics`, ships the V2G-G rule bundle +
+# routing example + dashboard provisioning verbatim from
+# docs/monitoring/.
+#
+# NOT FOR PRODUCTION USE. No TLS, no auth, all data on tmpfs-style
+# volumes that survive container restart but are wiped by
+# `docker compose down -v`.
+#
+# Usage:
+#
+#   # On Linux without /etc/hosts → host.docker.internal:
+#   # The `extra_hosts: host.docker.internal:host-gateway` mapping below
+#   # works on Docker Engine 20.10+ and Docker Desktop. WSL2 + Docker
+#   # Desktop also works out of the box.
+#
+#   cd deopt-v2-backend/docs/monitoring/local-stack
+#   docker compose up -d
+#
+#   # then visit:
+#   #   http://localhost:9090/  -- Prometheus
+#   #   http://localhost:9093/  -- Alertmanager
+#   #   http://localhost:3000/  -- Grafana (admin / admin on first login)
+#
+# Backend prerequisite: the dev backend must already be running on the
+# HOST (not inside compose) at 0.0.0.0:8080 with METRICS_ENABLED=true.
+# See `docs/monitoring/local-stack/README.md` §"Backend startup".
+#
+# Shutdown: `docker compose down` keeps the named volumes;
+# `docker compose down -v` wipes them.
+services:
+  prometheus:
+    image: prom/prometheus:v3.12.0
+    container_name: deopt-v2g-l0-prometheus
+    restart: unless-stopped
+    user: "65534:65534"
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=14d
+      - --web.enable-lifecycle
+      - --web.listen-address=0.0.0.0:9090
+    ports:
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - ./prometheus:/etc/prometheus:ro
+      - prometheus-data:/prometheus
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:9090/-/healthy"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    depends_on:
+      - alertmanager
+
+  alertmanager:
+    image: prom/alertmanager:v0.32.1
+    container_name: deopt-v2g-l0-alertmanager
+    restart: unless-stopped
+    user: "65534:65534"
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+      - --web.listen-address=0.0.0.0:9093
+      - --log.level=warn
+    ports:
+      - "127.0.0.1:9093:9093"
+    volumes:
+      - ./alertmanager:/etc/alertmanager:ro
+      - alertmanager-data:/alertmanager
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      webhook-sink:
+        condition: service_started
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    container_name: deopt-v2g-l0-grafana
+    restart: unless-stopped
+    user: "472:472"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_LOG_LEVEL: warn
+      # The dashboard JSON ships with ${DS_PROMETHEUS} as the datasource
+      # variable; the provisioning datasource below names itself
+      # "Prometheus" so the import resolves on first load.
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      prometheus:
+        condition: service_healthy
+
+  # Localhost-only webhook sink for the V2G-J/K synthetic alert drill.
+  # Receives Alertmanager dispatches on /default, /critical, /high,
+  # /tickets, /ops, /backend and appends every payload to a log file
+  # mounted on the host for after-the-fact inspection.
+  webhook-sink:
+    image: python:3.13-slim
+    container_name: deopt-v2g-l0-webhook-sink
+    restart: unless-stopped
+    # Run as root inside the container so the python sink can write to
+    # the named-volume mountpoint (`webhook-sink-data` defaults to
+    # root:root and a non-root container user has no write access).
+    # The container only binds to 127.0.0.1 via the compose port
+    # mapping below, so there is no external exposure.
+    working_dir: /app
+    command: ["python3", "/app/webhook_sink.py"]
+    ports:
+      - "127.0.0.1:9095:9095"
+    volumes:
+      - ./webhook-sink:/app:ro
+      - webhook-sink-data:/var/log/sink
+
+volumes:
+  prometheus-data:
+  alertmanager-data:
+  grafana-data:
+  webhook-sink-data:

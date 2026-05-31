@@ -1,0 +1,56 @@
+# V2G-L0 local Prometheus config. Scrapes the dev backend running on
+# the host at host.docker.internal:8080, the local Alertmanager, and
+# Prometheus itself. Loads the V2G-G rule bundle from
+# /etc/prometheus/rules/.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: deopt-v2g-l0
+    env: local-dev
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
+rule_files:
+  - /etc/prometheus/rules/v2_fee_alerts.bundle.yml
+  # The opt-in DeoptV2PerpRebateStalled rule is intentionally NOT
+  # referenced here. Activate it only after the cadence gate in
+  # docs/operator/V2G_J_STALLED_RULE_ACTIVATION_POLICY.md is met.
+  # - /etc/prometheus/rules/v2_fee_alerts.stalled.yml
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  - job_name: alertmanager
+    static_configs:
+      - targets: ["alertmanager:9093"]
+
+  # The DeOpt backend lives OUTSIDE the compose network. `host-gateway`
+  # extra_hosts mapping in compose.yml makes `host.docker.internal`
+  # resolve to the Docker host's IP from inside the Prometheus
+  # container.
+  - job_name: deopt-v2-backend
+    metrics_path: /metrics
+    scheme: http
+    static_configs:
+      - targets: ["host.docker.internal:8080"]
+        labels:
+          service: deopt-v2-backend
+          instance: dev-local
+    # If the backend is started with ADMIN_API_REQUIRE_TOKEN=true and
+    # METRICS_REQUIRE_ADMIN_TOKEN=true, the scrape needs the admin
+    # token. Uncomment + set ADMIN_TOKEN_FILE via a secret if needed:
+    # authorization:
+    #   type: ""
+    #   credentials_file: /etc/prometheus/secrets/admin_token
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __address__
+        regex: (.+)
+        replacement: ${1}

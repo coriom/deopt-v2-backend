@@ -509,6 +509,47 @@ under `docs/operator/`:
 See `docs/V2_FEE_OBSERVABILITY_TARGET_CUTOVER_V2G_J.md` for the
 top-level cutover record.
 
+#### V2G-L0 — local non-production stack
+
+V2G-L0 ships a complete localhost docker-compose stack at
+`docs/monitoring/local-stack/` (Prometheus 3.12.0 + Alertmanager
+0.32.1 + Grafana 11.4.0 + webhook sink). Rule files are symlinked
+from the canonical `docs/monitoring/prometheus/` so the local stack
+always loads the same V2G-G bundle the production cutover ships. The
+Alertmanager routing example is wired to a localhost webhook sink so
+the V2G-J synthetic drill can be replayed locally end-to-end.
+
+The agent ran a bare-binary fallback of the same stack
+(Prometheus + Alertmanager binaries from `/tmp`) when the docker
+daemon was inaccessible; 5/5 synthetic drills landed at the expected
+receivers under the bare-binary run. Full record at
+`docs/V2_FEE_OBSERVABILITY_LOCAL_STACK_BOOTSTRAP_V2G_L0.md`.
+
+V2G-L1 retried the compose start, hit the same docker socket gate,
+stopped at sudo per hard rule, and re-ran the bare-binary stand-in to
+keep the V2G-K soak warm (5/5 firing + 5/5 resolved through the sink
+this time). Full record at
+`docs/V2_FEE_OBSERVABILITY_LOCAL_COMPOSE_SOAK_V2G_L1.md`. Operator
+unblock command in the same file's Phase 1.
+
+#### V2G-L2 — compose stack live
+
+Operator ran `sudo usermod -aG docker $USER && newgrp docker` and
+the agent brought the V2G-L0 compose stack up after two small fixes:
+the V2G-L0 Prometheus rule symlinks pointed outside the bind-mounted
+tree (replaced with literal copies + ship
+`prometheus/rules/sync_from_canonical.sh`), and the webhook-sink
+container's `user: "65534:65534"` override prevented writes to the
+named-volume log path (dropped). All 4 containers come up healthy;
+Prometheus scrapes the dev backend through `host.docker.internal`,
+9 alerts load `inactive`, 5/5 synthetic drills route to the expected
+receivers, sink volume captures every dispatch, Grafana exposes the
+"DeOpt — V2 fee observability (V2G-G)" dashboard with the
+`Prometheus` datasource resolving against the same backend.
+
+Full record at
+`docs/V2_FEE_OBSERVABILITY_LOCAL_COMPOSE_LIVE_V2G_L2.md`.
+
 #### V2G-K — 7-day soak record
 
 V2G-K opens the 7-day soak record at
