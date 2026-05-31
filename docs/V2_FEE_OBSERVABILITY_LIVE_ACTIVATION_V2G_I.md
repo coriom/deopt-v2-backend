@@ -612,6 +612,15 @@ Key additions:
 The full record is at
 `docs/V2_FEE_OBSERVABILITY_TARGET_CUTOVER_V2G_J.md`.
 
+## V2G-K soak start (appended 2026-05-31)
+
+V2G-K opened the 7-day soak record at
+`docs/V2_FEE_OBSERVABILITY_7_DAY_SOAK_V2G_K.md`. The baseline metric
+snapshot (`/health`, `/admin/fees/v2/observability`, both V2G-E
+`/admin/fees/onchain` payloads, `/metrics`) was archived locally;
+the daily checklist + per-layer rollback table are in the V2G-K doc.
+F1-F11 gates remain at default = NO until operator authorisation.
+
 ## Next recommended milestone
 
 **V2G-J — operator cutover on the target stack.**

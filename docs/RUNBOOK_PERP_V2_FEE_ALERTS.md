@@ -55,6 +55,18 @@ is gated by the corresponding `F`-row authorisation in
 Top-level cutover record:
 `docs/V2_FEE_OBSERVABILITY_TARGET_CUTOVER_V2G_J.md`.
 
+## V2G-K soak record (daily checklist)
+
+After the V2G-J cutover lands on the target host, work the daily
+checklist in `docs/V2_FEE_OBSERVABILITY_7_DAY_SOAK_V2G_K.md` for
+seven consecutive calendar days. Carry any anomaly into the V2G-L
+closure note. The stalled-rule activation gate re-evaluation lives
+on day 5 of the soak; do not enable
+`docs/monitoring/prometheus/v2_fee_alerts.stalled.yml` before the
+five activation conditions in
+`docs/operator/V2G_J_STALLED_RULE_ACTIVATION_POLICY.md` simultaneously
+hold.
+
 ## Operator integration commands (V2G-H)
 
 When standing the V2 fee observability surface up in a new operator

@@ -509,6 +509,16 @@ under `docs/operator/`:
 See `docs/V2_FEE_OBSERVABILITY_TARGET_CUTOVER_V2G_J.md` for the
 top-level cutover record.
 
+#### V2G-K — 7-day soak record
+
+V2G-K opens the 7-day soak record at
+`docs/V2_FEE_OBSERVABILITY_7_DAY_SOAK_V2G_K.md`. The soak record
+ships a starting metric snapshot (the baseline the target host's
+first post-cutover scrape is compared against), a 7-day daily
+checklist, the day-5 stalled-rule re-evaluation marker, and a
+per-layer rollback table. The opt-in `v2_fee_alerts.stalled.yml`
+stays disabled until the activation policy gate is satisfied.
+
 ## Retired / Downgraded Operational Notices
 
 ### Merkle Root Unset (retired 2026-05-31, V2G-F)

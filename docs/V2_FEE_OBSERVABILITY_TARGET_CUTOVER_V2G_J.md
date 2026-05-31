@@ -297,6 +297,27 @@ single-line git revert in the doc repo, not a target-stack operation.
 The agent will not execute any of the above without explicit
 written authorisation per gate.
 
+## V2G-K soak record pointer (appended 2026-05-31)
+
+V2G-K opened the 7-day soak record at
+`docs/V2_FEE_OBSERVABILITY_7_DAY_SOAK_V2G_K.md`. The soak record
+includes:
+
+- Baseline metric snapshot captured against the local backend (will
+  be compared against the target host's first post-cutover scrape).
+- Local synthetic drill stand-in transcript: all 5 V2G-J drills,
+  including the mainnet escalation route that V2G-I did not exercise,
+  routed cleanly to the expected receivers.
+- Per-layer rollback table.
+- 7-day daily checklist with the day-5 stalled-rule re-evaluation
+  marker.
+- Stalled-rule decision: **defer** until the activation policy gate
+  (≥3 PERP rebates per 24h × 48h sustained) can be evaluated.
+
+Cutover status: **pending operator authorisation.** F1-F11 all
+default = NO; the operator answer template is at
+`docs/operator/V2G_K_OPERATOR_ANSWER_TEMPLATE.md`.
+
 ## Next recommended milestone
 
 **V2G-K — production live-fire and 7-day soak.**
