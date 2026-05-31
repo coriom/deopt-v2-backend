@@ -262,7 +262,9 @@ plus a one-line note for any non-OK row. Day 0 is the soak open record
 | 0+  | 2026-05-31T16:48Z | ok (local stack) | ok (via Prom) | ok (via Prom) | ok | ok | n/a (bare-binary) | ok | ok | ok | deferred | V2G-L0 bootstrap: bare-binary stack (backend + Prometheus + Alertmanager + sink) ran end-to-end on `127.0.0.1`. 9 alerts loaded, all `state=inactive`; 5/5 synthetic drills routed correctly (PERP OLD → critical, OPTION unknown → tickets, budget low → ops, metrics absent → backend, mainnet escalation → high). Compose stack files committed at `docs/monitoring/local-stack/` — operator-gated on docker group membership. See `docs/V2_FEE_OBSERVABILITY_LOCAL_STACK_BOOTSTRAP_V2G_L0.md`. |
 | 0++ | 2026-05-31T17:14Z | ok (bare-binary stack) | ok (via Prom) | ok (via Prom) | ok | ok | gated (docker `up -d` blocked by sudo/group gate; Grafana ships only as a container) | ok | ok | ok | deferred | V2G-L1 second attempt at compose `up -d`. Docker access still gated; agent stopped at the sudo gate per hard rule and surfaced `sudo usermod -aG docker "$USER" && newgrp docker` for the operator. Bare-binary stand-in re-ran end-to-end; 5 drills firing + 5 drills resolved through the sink. See `docs/V2_FEE_OBSERVABILITY_LOCAL_COMPOSE_SOAK_V2G_L1.md`. |
 | 0+++ | 2026-05-31T17:38Z | ok (compose stack live) | ok (via Prom) | ok (via Prom) | ok | ok | ok (Grafana up, 10 panels resolved via DS proxy) | ok | ok | ok | deferred | **V2G-L2: full compose stack live.** Operator unblocked Docker (`usermod -aG docker $USER && newgrp docker`); agent fixed two stack issues (rule files copy-not-symlink so the container bind resolves; webhook-sink user override dropped so the named volume is writable) and brought up all 4 containers. Prometheus scrapes `deopt-v2-backend@host.docker.internal:8080` UP; 9 alerts loaded inactive; 5/5 synthetic drills routed to expected receivers, sink volume captured every dispatch; Grafana `DeOpt — V2 fee observability (V2G-G)` dashboard provisioned with `Prometheus` DS; proxy queries through Grafana confirm the V2 fee gauge baseline. See `docs/V2_FEE_OBSERVABILITY_LOCAL_COMPOSE_LIVE_V2G_L2.md`. |
-| 1   |                   |        |        |        |        |        |        |        |        |        | deferred     |       |
+| 1-early | 2026-05-31T18:03Z (T+25m) | ok | ok | ok | ok | ok | ok | ok | ok | ok | deferred | V2G-L3 early progress probe (NOT the canonical day-1 24h checkpoint). All 9 daily-check steps green; 3/3 Prom targets up; 9 alerts inactive; AM /api/v2/alerts empty; Grafana dashboard renders against the same baseline; container resource use < 0.25% CPU / < 60MB mem each; only log warning is a benign `datetime.utcnow()` deprecation in webhook_sink.py (non-blocking). See `docs/V2_FEE_OBSERVABILITY_LOCAL_COMPOSE_DAY1_V2G_L3.md`. |
+| 1-polish | 2026-05-31T18:14Z (T+36m) | ok | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | deferred | **Canonical T+24h day-1 GATE BLOCKED — too early by 23h 23m.** Agent stopped the canonical day-1 check; did not tick canonical day-1 row. Two polish items applied per NEXT_TASK.md step 9: (a) replaced `datetime.utcnow()` with `datetime.now(datetime.UTC)` in `docs/monitoring/local-stack/webhook-sink/webhook_sink.py` (timestamp shape unchanged); (b) added `docs/monitoring/local-stack/grafana/provisioning/{alerting,plugins}/.keep.yaml` no-op stubs so Grafana startup no longer emits `level=error` for missing alerting/plugins dirs. Containers restarted in-place via `docker compose restart {webhook-sink,grafana}` — non-destructive, volumes preserved, all 4 containers up after. Stack remains healthy: 3/3 targets up, 9 alerts inactive, AM empty, dashboard renders baseline (budget = 999987). Rerun canonical day-1 at 2026-06-01T17:38Z (UTC). |
+| 1   |                   |        |        |        |        |        |        |        |        |        | deferred     | Canonical day-1 24h checkpoint — fill at T+24h after 2026-05-31T17:38Z. |
 | 2   |                   |        |        |        |        |        |        |        |        |        | deferred     |       |
 | 3   |                   |        |        |        |        |        |        |        |        |        | deferred     |       |
 | 4   |                   |        |        |        |        |        |        |        |        |        | re-evaluate? |       |
@@ -293,6 +295,39 @@ local-stack rehearsal. Headlines:
   cannot be evaluated. Re-evaluation marker stays on soak day 5.
 
 Full record: `docs/V2_FEE_OBSERVABILITY_LOCAL_STACK_BOOTSTRAP_V2G_L0.md`.
+
+### V2G-L4 polish — gate-blocked stop + minor cleanups (appended 2026-05-31)
+
+Operator triggered a canonical-day-1 attempt at `2026-05-31T18:14Z`,
+only 36 minutes after the V2G-L2 stack open. Hard gate "current time
+≥ 2026-06-01T17:38Z" failed by 23h 23m, so the canonical day-1 row
+in the daily-check table stays reserved.
+
+Polish that's safe regardless of the gate (NEXT_TASK.md step 9) was
+applied:
+
+- `docs/monitoring/local-stack/webhook-sink/webhook_sink.py` —
+  `datetime.utcnow()` → `datetime.now(datetime.UTC)` with the
+  trailing `Z` preserved so dispatch timestamps stay byte-identical
+  to V2G-L0..L3.
+- `docs/monitoring/local-stack/grafana/provisioning/alerting/.keep.yaml`
+  + `provisioning/plugins/.keep.yaml` — no-op `apiVersion: 1`
+  files (`groups: []` and `apps: []` respectively) so the Grafana
+  startup `level=error` lines about missing dirs are gone.
+
+Restart pattern was non-destructive: `docker compose restart
+{webhook-sink,grafana}`. No volume reset, no `down -v`, no Prometheus
+data reset. Stack remained healthy throughout.
+
+### V2G-L3 — day-1 early progress probe (appended 2026-05-31)
+
+V2G-L3 ran the daily checklist 25 minutes into the V2G-L2 stack
+soak as a sanity-check / progress probe (operator request, not the
+canonical day-1 24h marker). All 9 daily-check steps green; no
+synthetic drill replayed; baseline metric values unchanged. The
+canonical day-1 row stays reserved for T+24h.
+
+Full record: `docs/V2_FEE_OBSERVABILITY_LOCAL_COMPOSE_DAY1_V2G_L3.md`.
 
 ### V2G-L2 — compose stack live (appended 2026-05-31)
 

@@ -30,8 +30,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             data = {"raw": body}
 
         receiver_path = self.path.lstrip("/")
+        # V2G-L4 polish: `utcnow()` is deprecated on Python 3.12+. Use the
+        # timezone-aware now(UTC) and strip the explicit `+00:00` offset
+        # so the resulting timestamp is the same shape V2G-L0..L3 emitted
+        # (`2026-05-31T17:38:00.123456Z`).
+        ts = datetime.datetime.now(datetime.UTC).isoformat()
+        if ts.endswith("+00:00"):
+            ts = ts[: -len("+00:00")] + "Z"
         entry = {
-            "ts": datetime.datetime.utcnow().isoformat() + "Z",
+            "ts": ts,
             "receiver_path": receiver_path,
             "data_receiver": data.get("receiver"),
             "status": data.get("status"),

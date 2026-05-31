@@ -550,6 +550,15 @@ receivers, sink volume captures every dispatch, Grafana exposes the
 Full record at
 `docs/V2_FEE_OBSERVABILITY_LOCAL_COMPOSE_LIVE_V2G_L2.md`.
 
+#### V2G-L3 — day-1 early progress probe
+
+V2G-L3 ran the V2G-K daily checklist at T+25min after the V2G-L2
+stack came up. All 9 daily-check steps green; container resource
+use < 0.25% CPU / < 60MB mem each; no synthetic drill replayed; no
+log regressions since the V2G-L2 fix. The canonical day-1 24h
+checkpoint is reserved for T+24h. Full record at
+`docs/V2_FEE_OBSERVABILITY_LOCAL_COMPOSE_DAY1_V2G_L3.md`.
+
 #### V2G-K — 7-day soak record
 
 V2G-K opens the 7-day soak record at

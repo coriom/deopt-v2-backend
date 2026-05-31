@@ -1,0 +1,4 @@
+# V2G-L4 — empty plugins provisioning file (no-op). Same rationale as
+# the sibling alerting/.keep.yaml.
+apiVersion: 1
+apps: []

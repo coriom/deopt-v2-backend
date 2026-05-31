@@ -55,6 +55,48 @@ is gated by the corresponding `F`-row authorisation in
 Top-level cutover record:
 `docs/V2_FEE_OBSERVABILITY_TARGET_CUTOVER_V2G_J.md`.
 
+## V2G-L3 — day-1 early-probe checklist (read-only)
+
+For an in-soak health check that doesn't fire synthetic alerts, the
+V2G-L3 read-only matrix is:
+
+```sh
+# Runtime
+cd ~/DEOPT/deopt-v2-backend/docs/monitoring/local-stack
+docker compose ps
+curl -sf http://127.0.0.1:8080/health
+
+# Prometheus
+curl -sf http://127.0.0.1:9090/-/ready
+curl -s  http://127.0.0.1:9090/api/v1/targets   # 3/3 up
+curl -s  http://127.0.0.1:9090/api/v1/rules     # 9 alerts inactive
+
+# Day-1 metric baseline (5 V2 gauges + up + db_up)
+for q in \
+  deopt_perp_fee_charged_v2_total \
+  deopt_perp_fee_rebated_v2_total \
+  deopt_option_fee_charged_v2_total \
+  deopt_option_fee_rebated_v2_total \
+  deopt_fees_manager_v2_rebate_budget_native \
+  up deopt_db_up; do
+  curl -sG http://127.0.0.1:9090/api/v1/query \
+    --data-urlencode "query=$q" | jq -c '.data.result'
+done
+
+# Alertmanager
+curl -sf http://127.0.0.1:9093/-/ready
+curl -s  http://127.0.0.1:9093/api/v2/alerts   # expect empty
+
+# Grafana
+curl -sf http://127.0.0.1:3000/api/health
+curl -sf -u admin:admin \
+  http://127.0.0.1:3000/api/dashboards/uid/deopt-v2g-g-v2-fees \
+  | jq '.dashboard.title, .meta.folderTitle, ([.dashboard.panels[]|select(.type!="row")] | length)'
+```
+
+Full V2G-L3 record at
+`docs/V2_FEE_OBSERVABILITY_LOCAL_COMPOSE_DAY1_V2G_L3.md`.
+
 ## V2G-L2 — local compose stack live
 
 V2G-L2 brought the local compose stack up after the operator

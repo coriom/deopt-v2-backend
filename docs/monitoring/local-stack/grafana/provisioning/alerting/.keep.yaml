@@ -1,0 +1,6 @@
+# V2G-L4 — empty alerting provisioning file. Exists so the Grafana
+# container's `provisioning/alerting/` scan finds at least one
+# .yaml/.yml/.json file and does not warn. The V2G band ships
+# Prometheus rules, not Grafana-managed alerts.
+apiVersion: 1
+groups: []
