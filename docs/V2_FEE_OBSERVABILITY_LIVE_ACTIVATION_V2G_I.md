@@ -588,6 +588,30 @@ Frontend / Sol: untouched in V2G-I scope.
    DeOpt metrics; non-blocking for alert evaluation (`increase()` on
    gauges works the same way). Renaming would be a wider refactor.
 
+## V2G-J cutover packet (appended 2026-05-31)
+
+V2G-J built the operator-runnable cutover packet on top of V2G-I.
+Key additions:
+
+- `docs/operator/V2G_J_TARGET_STACK_QUESTIONNAIRE.md` —
+  structured intake form for the target stack shape, paths,
+  receiver names, and authorisation gates.
+- `docs/operator/V2G_J_TARGET_STACK_DEPLOYMENT_PACKET.md` —
+  exact commands for standalone / docker compose / Kubernetes
+  (vanilla + Operator).
+- `docs/operator/V2G_J_BACKEND_ENV_PATCH_PACKET.md` —
+  idempotent apply + verify + rollback for the five-var
+  observability patch.
+- `docs/operator/V2G_J_SYNTHETIC_ALERT_DRILL_PACKET.md` — six
+  drills covering all five receivers including the mainnet
+  escalation route V2G-I did not exercise.
+- `docs/operator/V2G_J_STALLED_RULE_ACTIVATION_POLICY.md` —
+  explicit five-condition gate before `v2_fee_alerts.stalled.yml`
+  is permitted on the target.
+
+The full record is at
+`docs/V2_FEE_OBSERVABILITY_TARGET_CUTOVER_V2G_J.md`.
+
 ## Next recommended milestone
 
 **V2G-J — operator cutover on the target stack.**

@@ -24,6 +24,37 @@ Cross-cutting alerts (V2G-F + V2G-G):
   rebates fire)
 - `DeoptV2FeeMetricsAbsent` (V2G-G — metric pipeline down)
 
+## Cutover-day workflow (V2G-J)
+
+When standing the V2 fee observability surface up on a real target
+stack, use the V2G-J operator packets in the order below. Each step
+is gated by the corresponding `F`-row authorisation in
+`docs/operator/V2G_J_TARGET_STACK_QUESTIONNAIRE.md`.
+
+1. Answer Sections A–G of
+   `docs/operator/V2G_J_TARGET_STACK_QUESTIONNAIRE.md`. The default
+   policy is "no remote mutation" until each gate is explicitly
+   `yes`.
+2. Apply the backend `.env` patch:
+   `docs/operator/V2G_J_BACKEND_ENV_PATCH_PACKET.md`. Restart the
+   backend. Confirm `/admin/fees/v2/observability` returns the green
+   snapshot.
+3. Run the matching Mode block in
+   `docs/operator/V2G_J_TARGET_STACK_DEPLOYMENT_PACKET.md` —
+   Prometheus, Alertmanager, Grafana, each with paired rollback.
+4. Run the synthetic drill packet:
+   `docs/operator/V2G_J_SYNTHETIC_ALERT_DRILL_PACKET.md`. All six
+   drills must reach the expected receiver before the cutover is
+   considered green. Fill in the receiver-outcome matrix at the
+   bottom of the packet.
+5. **Do NOT enable** `v2_fee_alerts.stalled.yml` until the gate in
+   `docs/operator/V2G_J_STALLED_RULE_ACTIVATION_POLICY.md` is met
+   (≥3 PERP rebates per 24h sustained for 48h, anomaly totals zero,
+   dashboard confirms monotonic rise, on-call ACK).
+
+Top-level cutover record:
+`docs/V2_FEE_OBSERVABILITY_TARGET_CUTOVER_V2G_J.md`.
+
 ## Operator integration commands (V2G-H)
 
 When standing the V2 fee observability surface up in a new operator

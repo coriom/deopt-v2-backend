@@ -604,6 +604,14 @@ Frontend:
    — V2G-E is the only PERP rebate event live). Enable after the
    V2G band ships ongoing flow.
 
+## V2G-J cutover packet pointer (appended 2026-05-31)
+
+V2G-J extends V2G-G/H/I with operator-runnable cutover packets. See
+`docs/V2_FEE_OBSERVABILITY_TARGET_CUTOVER_V2G_J.md` plus the five
+operator-only sub-packets under `docs/operator/V2G_J_*.md`. The
+agent did not perform remote mutation; the packets are
+operator-runnable text only.
+
 ## V2G-H closure (appended 2026-05-31)
 
 V2G-H validated the V2G-G artefacts with the real Prometheus +

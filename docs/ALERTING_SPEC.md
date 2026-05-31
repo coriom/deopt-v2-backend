@@ -487,6 +487,28 @@ rule:
   drill on any host. See `docs/V2_FEE_OBSERVABILITY_LIVE_ACTIVATION_V2G_I.md`
   §Phase 6.
 
+#### V2G-J — operator cutover packets
+
+V2G-J turns the V2G-G artefacts into operator-runnable cutover
+packets without performing any remote mutation. Five sub-packets
+under `docs/operator/`:
+
+- `V2G_J_TARGET_STACK_QUESTIONNAIRE.md` — pre-cutover intake.
+- `V2G_J_TARGET_STACK_DEPLOYMENT_PACKET.md` — exact commands for
+  standalone Linux/systemd, docker/podman compose, and Kubernetes
+  (vanilla + Prometheus Operator).
+- `V2G_J_BACKEND_ENV_PATCH_PACKET.md` — idempotent `.env` apply +
+  verify + rollback for the five-var observability classifier patch.
+- `V2G_J_SYNTHETIC_ALERT_DRILL_PACKET.md` — six drills covering all
+  five receivers, including the mainnet escalation route
+  (`severity=medium, chain=base-mainnet`) that V2G-I left unexercised.
+- `V2G_J_STALLED_RULE_ACTIVATION_POLICY.md` — explicit
+  five-condition gate before `v2_fee_alerts.stalled.yml` lands on
+  the target stack.
+
+See `docs/V2_FEE_OBSERVABILITY_TARGET_CUTOVER_V2G_J.md` for the
+top-level cutover record.
+
 ## Retired / Downgraded Operational Notices
 
 ### Merkle Root Unset (retired 2026-05-31, V2G-F)
