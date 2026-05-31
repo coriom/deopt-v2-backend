@@ -221,23 +221,33 @@ groups:
             `FeesManagerV2.rebateBudget(mUSDC)` via cast.
           runbook_url: "docs/RUNBOOK_PERP_V2_FEE_ALERTS.md#feesmanagerv2rebatebudgetlow"
 
-      # V2G-G: stale-budget detector. The rebate-budget gauge is derived
-      # from indexed events; if the indexer stalls the value will freeze.
-      # This alert catches a frozen budget alongside ongoing rebate
-      # activity, which would otherwise sneak past the `< 1000` rule.
+      # V2G-G (label-fix V2G-I): stale-budget detector. The rebate-budget
+      # gauge is derived from indexed events; if the indexer stalls the
+      # value will freeze. This alert catches a frozen budget alongside
+      # ongoing rebate activity, which would otherwise sneak past the
+      # `< 1000` rule.
+      #
+      # PromQL note: the left side is the budget gauge (carries the
+      # `asset` label), the right side is the rebate counters (carry the
+      # `consumer` label). `and on()` is required because the two sides
+      # have NO common labels — without `on()`, the default vector
+      # matching returns the empty set and the alert silently never
+      # fires. The on() form keeps the budget gauge's `asset` label on
+      # the output, which is the natural per-asset alert payload.
+      # V2G-I added the `v2_fee_alerts.test.yml::rebate_budget_stale_fires`
+      # unit test that pins this contract.
       - alert: FeesManagerV2RebateBudgetStale
         expr: |
-          (
-            increase(deopt_option_fee_rebated_v2_total{consumer="new"}[30m]) > 0
-            or
-            increase(deopt_perp_fee_rebated_v2_total{consumer="new"}[30m]) > 0
-          )
-          and
           delta(
             deopt_fees_manager_v2_rebate_budget_native{
               asset="0x6eae407f5640b006fac9965182e238582a3b412e"
             }[30m]
           ) == 0
+          and on() (
+            increase(deopt_option_fee_rebated_v2_total{consumer="new"}[30m]) > 0
+            or
+            increase(deopt_perp_fee_rebated_v2_total{consumer="new"}[30m]) > 0
+          )
         for: 15m
         labels:
           severity: medium

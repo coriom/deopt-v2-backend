@@ -430,6 +430,43 @@ enough to start an investigation.
   range via the admin tick. Do **not** delete rows.
 - **Severity.** Base Sepolia: medium. Mainnet: high.
 
+### DeoptV2PerpRebateStalled (V2G-I, opt-in)
+<a id="deoptv2perprebatestalled"></a>
+
+- **Meaning.** `deopt_perp_fee_rebated_v2_total{consumer="new"}` has
+  not incremented for 24 hours. Either the rebate path is silently
+  broken (classifier put events in `unknown`, every maker landed on
+  a non-rebate tier, fee consumer rewired) or the network has no
+  rebate-eligible trade activity in the period.
+- **Source-of-truth file.** This rule is **not** in the default
+  `v2_fee_alerts.bundle.yml`. It ships as an opt-in file at
+  `docs/monitoring/prometheus/v2_fee_alerts.stalled.yml`. Activation
+  is operator-controlled — only enable once the target network has
+  a stable rebate cadence (e.g. mainnet post-launch).
+- **Expected current value.** N/A — Base Sepolia today has only V2G-E
+  worth of PERP rebate flow. Activating the rule there would fire
+  continuously until the next live trade.
+- **First action.** Hit `/admin/fees/v2/observability` (the V2G-G
+  admin probe) and read `perp_fee_rebated_v2_by_consumer`. If
+  `unknown > 0` or `old > 0`, the classifier bucketed rebate events
+  away from `new` — this is the silent-breakage scenario, not a
+  cadence drop. Drive a forensics check via the
+  `PerpFeeConsumerUnknown` / `PerpFeeRebatedFromOldEngine` runbook
+  entries above.
+- **If `unknown == old == 0`**, no rebate event was emitted at all in
+  the 24h window. Compare PERP trade volume (via the
+  `deopt_perp_*` counters or admin endpoints) to the rebate count:
+  if volume is healthy but rebates are zero, every maker in the
+  period landed on a non-rebate tier — investigate the tier
+  classifier (`/admin/fees/v2/observability` doesn't surface tier
+  state directly; query the FeesManagerV2 tier merkle leaves
+  on chain).
+- **Remediation.** Restore the rebate path or widen the alert
+  window. The rule defaults to 24h; widen to 7d if the operator
+  expects sparse rebate flow.
+- **Severity.** Base Sepolia: not enabled. Mainnet: medium
+  (anomaly, not regression).
+
 ### DeoptV2FeeMetricsAbsent (V2G-G)
 <a id="deoptv2feemetricsabsent"></a>
 

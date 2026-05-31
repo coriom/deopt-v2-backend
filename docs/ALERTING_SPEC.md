@@ -460,6 +460,33 @@ See `docs/V2_FEE_OBSERVABILITY_LIVE_STACK_WIRING_V2G_H.md` for the
 exact integration commands per stack shape (standalone, containerised,
 Kubernetes Operator).
 
+#### V2G-I — drill + stale rule bugfix + opt-in stalled rule
+
+V2G-I activated the V2G-H artefacts against a real local Alertmanager
+process and discovered a substantive bug in the V2G-G stale-budget
+rule:
+
+- **`FeesManagerV2RebateBudgetStale` PromQL bugfix.** The original
+  expression used `vector and vector` with **disjoint** label sets
+  (`{asset=...}` on the budget gauge vs `{consumer="new"}` on the
+  rebate counters). PromQL default vector matching returns the empty
+  set under those conditions, so the alert silently never fired. The
+  fixed expression uses `delta(budget[30m]) == 0 and on() (rebate
+  counters)` and keeps the budget gauge's `asset` label on the output
+  for a natural per-asset alert payload. The fix is recorded inline
+  in `docs/monitoring/prometheus/v2_fee_alerts.bundle.yml` with a
+  comment block pointing at the V2G-I test.
+- **`DeoptV2PerpRebateStalled` shipped as a separate opt-in bundle.**
+  `docs/monitoring/prometheus/v2_fee_alerts.stalled.yml` contains
+  just this one rule. Activation is operator-controlled because the
+  rule's 24h `for` window only makes sense once the network has
+  steady rebate cadence — Base Sepolia today has too few rebate
+  events (V2G-E only).
+- **Synthetic drill artefacts.** V2G-I documents how to spin up a
+  scratch Alertmanager + webhook sink on localhost to replay the
+  drill on any host. See `docs/V2_FEE_OBSERVABILITY_LIVE_ACTIVATION_V2G_I.md`
+  §Phase 6.
+
 ## Retired / Downgraded Operational Notices
 
 ### Merkle Root Unset (retired 2026-05-31, V2G-F)

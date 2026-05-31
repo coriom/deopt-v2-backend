@@ -28,6 +28,7 @@
 
 rule_files:
   - v2_fee_alerts.bundle.yml
+  - v2_fee_alerts.stalled.yml
 
 evaluation_interval: 1m
 
@@ -325,4 +326,182 @@ tests:
         exp_alerts: []
       - eval_time: 10m
         alertname: FeesManagerV2RebateBudgetLow
+        exp_alerts: []
+
+  # --------------------------------------------------------------------
+  # 6. (V2G-I) Stale-budget detection.
+  #
+  # `FeesManagerV2RebateBudgetStale` fires when the rebate-budget gauge
+  # has been unchanged for 30m AND a V2 rebate event (PERP or OPTION,
+  # consumer=new) incremented within the same window. `for: 15m` means
+  # the condition must hold for 15m before the alert moves from
+  # pending → firing.
+  #
+  # Test horizon: 60m at 1m sampling.
+  #   - rebate budget gauge is frozen at 999_987 the whole time
+  #     (indexer stalled).
+  #   - OPTION rebated{consumer="new"} counter starts at 1 and ticks up
+  #     by 1 every 5 minutes (steady rebate activity).
+  #
+  # Expected:
+  #   - at t=30m the inner predicate is true (delta(budget[30m])==0 AND
+  #     increase(option_rebated[30m])>0), alert becomes pending.
+  #   - at t=30m + 15m = 45m the alert transitions to firing.
+  #   - at t=60m the alert is still firing.
+  # --------------------------------------------------------------------
+  - name: rebate_budget_stale_fires
+    interval: 1m
+    input_series:
+      - series: 'deopt_perp_fee_charged_v2_total{consumer="new"}'
+        values: '3x60'
+      - series: 'deopt_perp_fee_charged_v2_total{consumer="old"}'
+        values: '0x60'
+      - series: 'deopt_perp_fee_charged_v2_total{consumer="unknown"}'
+        values: '0x60'
+      - series: 'deopt_perp_fee_rebated_v2_total{consumer="new"}'
+        values: '1x60'
+      - series: 'deopt_perp_fee_rebated_v2_total{consumer="old"}'
+        values: '0x60'
+      - series: 'deopt_perp_fee_rebated_v2_total{consumer="unknown"}'
+        values: '0x60'
+      - series: 'deopt_option_fee_charged_v2_total{consumer="new"}'
+        values: '3x60'
+      - series: 'deopt_option_fee_charged_v2_total{consumer="old"}'
+        values: '0x60'
+      - series: 'deopt_option_fee_charged_v2_total{consumer="unknown"}'
+        values: '0x60'
+      # OPTION rebated counter rises +1 every 5m, simulating steady
+      # maker rebate flow while the budget gauge has frozen.
+      - series: 'deopt_option_fee_rebated_v2_total{consumer="new"}'
+        values: '1 1 1 1 1 2 2 2 2 2 3 3 3 3 3 4 4 4 4 4 5 5 5 5 5 6 6 6 6 6 7 7 7 7 7 8 8 8 8 8 9 9 9 9 9 10 10 10 10 10 11 11 11 11 11 12 12 12 12 12'
+      - series: 'deopt_option_fee_rebated_v2_total{consumer="old"}'
+        values: '0x60'
+      - series: 'deopt_option_fee_rebated_v2_total{consumer="unknown"}'
+        values: '0x60'
+      - series: 'deopt_fees_manager_v2_rebate_budget_native{asset="0x6eae407f5640b006fac9965182e238582a3b412e"}'
+        values: '999987x60'
+    alert_rule_test:
+      # At t=4m the OPTION rebated counter hasn't yet ticked from 1 to
+      # 2 (first tick happens at t=5m per the values series); the
+      # `increase(...)>0` side of the `and on()` is false, alert stays
+      # silent.
+      - eval_time: 4m
+        alertname: FeesManagerV2RebateBudgetStale
+        exp_alerts: []
+      # At t=20m the condition has been true for ~15m (since the first
+      # rebate tick at t=5m) — the `for: 15m` threshold is just being
+      # crossed. The alert transitions to firing at or shortly after
+      # this point. Use t=30m as a safe firing checkpoint.
+      - eval_time: 30m
+        alertname: FeesManagerV2RebateBudgetStale
+        exp_alerts:
+          - exp_labels:
+              alertname: FeesManagerV2RebateBudgetStale
+              severity: medium
+              subsystem: fees_manager_v2
+              milestone: V2G-G
+              asset_symbol: musdc
+              asset: "0x6eae407f5640b006fac9965182e238582a3b412e"
+            exp_annotations:
+              summary: "FeesManagerV2 rebate budget unchanged while V2 rebates are firing"
+              description: >-
+                The derived rebate-budget gauge has not moved in 30 minutes, but `FeeRebatedV2` events are still being scraped. The most likely cause is that the event indexer has stopped picking up `RebateBudgetSpent` / `RebateBudgetFunded` events. Cross-check `FeesManagerV2.rebateBudget(mUSDC)` on-chain via cast and run `/admin/options/events/tick` (idempotent admin endpoint, not destructive) to advance the indexer cursor.
+              runbook_url: "docs/RUNBOOK_PERP_V2_FEE_ALERTS.md#feesmanagerv2rebatebudgetlow"
+      - eval_time: 60m
+        alertname: FeesManagerV2RebateBudgetStale
+        exp_alerts:
+          - exp_labels:
+              alertname: FeesManagerV2RebateBudgetStale
+              severity: medium
+              subsystem: fees_manager_v2
+              milestone: V2G-G
+              asset_symbol: musdc
+              asset: "0x6eae407f5640b006fac9965182e238582a3b412e"
+            exp_annotations:
+              summary: "FeesManagerV2 rebate budget unchanged while V2 rebates are firing"
+              description: >-
+                The derived rebate-budget gauge has not moved in 30 minutes, but `FeeRebatedV2` events are still being scraped. The most likely cause is that the event indexer has stopped picking up `RebateBudgetSpent` / `RebateBudgetFunded` events. Cross-check `FeesManagerV2.rebateBudget(mUSDC)` on-chain via cast and run `/admin/options/events/tick` (idempotent admin endpoint, not destructive) to advance the indexer cursor.
+              runbook_url: "docs/RUNBOOK_PERP_V2_FEE_ALERTS.md#feesmanagerv2rebatebudgetlow"
+      - eval_time: 60m
+        alertname: PerpFeeChargedFromOldEngine
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: FeesManagerV2RebateBudgetLow
+        exp_alerts: []
+
+  # --------------------------------------------------------------------
+  # 7. (V2G-I) Stalled PERP rebate cadence detection.
+  #
+  # `DeoptV2PerpRebateStalled` is shipped in
+  # `v2_fee_alerts.stalled.yml` as an opt-in rule. It fires when
+  # `increase(deopt_perp_fee_rebated_v2_total{consumer="new"}[24h])` is
+  # zero for 24h. This test simulates a 48h window where the PERP
+  # rebate counter never moves (sustained drought).
+  #
+  # Sampling cadence is 5 minutes to keep the synthetic series small
+  # (48h / 5min = 576 samples per series) while still satisfying
+  # promtool's window evaluations.
+  #
+  # Expected:
+  #   - at t=24h the predicate is true (no rebate increment in
+  #     [0, 24h]), alert state becomes pending.
+  #   - at t=24h + 24h = 48h the alert transitions to firing (24h `for`).
+  # --------------------------------------------------------------------
+  - name: perp_rebate_stalled_fires_after_24h_silence
+    interval: 5m
+    input_series:
+      # 48h at 5m sampling = 576 samples.
+      - series: 'deopt_perp_fee_charged_v2_total{consumer="new"}'
+        values: '3x576'
+      - series: 'deopt_perp_fee_charged_v2_total{consumer="old"}'
+        values: '0x576'
+      - series: 'deopt_perp_fee_charged_v2_total{consumer="unknown"}'
+        values: '0x576'
+      - series: 'deopt_perp_fee_rebated_v2_total{consumer="new"}'
+        values: '1x576'
+      - series: 'deopt_perp_fee_rebated_v2_total{consumer="old"}'
+        values: '0x576'
+      - series: 'deopt_perp_fee_rebated_v2_total{consumer="unknown"}'
+        values: '0x576'
+      - series: 'deopt_option_fee_charged_v2_total{consumer="new"}'
+        values: '3x576'
+      - series: 'deopt_option_fee_charged_v2_total{consumer="old"}'
+        values: '0x576'
+      - series: 'deopt_option_fee_charged_v2_total{consumer="unknown"}'
+        values: '0x576'
+      - series: 'deopt_option_fee_rebated_v2_total{consumer="new"}'
+        values: '1x576'
+      - series: 'deopt_option_fee_rebated_v2_total{consumer="old"}'
+        values: '0x576'
+      - series: 'deopt_option_fee_rebated_v2_total{consumer="unknown"}'
+        values: '0x576'
+      - series: 'deopt_fees_manager_v2_rebate_budget_native{asset="0x6eae407f5640b006fac9965182e238582a3b412e"}'
+        values: '999987x576'
+    alert_rule_test:
+      # At t=24h the predicate becomes true but the alert is still
+      # pending (needs 24h of sustained truth before firing).
+      - eval_time: 24h
+        alertname: DeoptV2PerpRebateStalled
+        exp_alerts: []
+      # At t=48h the alert has been pending for 24h and fires.
+      - eval_time: 48h
+        alertname: DeoptV2PerpRebateStalled
+        exp_alerts:
+          - exp_labels:
+              alertname: DeoptV2PerpRebateStalled
+              severity: medium
+              subsystem: perp_v2_fees
+              milestone: V2G-I
+              consumer: "new"
+            exp_annotations:
+              summary: "No PERP V2 rebates in 24h"
+              description: >-
+                `deopt_perp_fee_rebated_v2_total{consumer="new"}` did not increment in the last 24 hours. If trade volume is healthy this indicates the rebate path is silently broken (e.g. classifier put rebate events into `unknown`, or every maker happens to be on a non-rebate tier). Cross-check `/admin/fees/v2/observability` for unknown-bucket contamination and `FeesManagerV2.rebateBudget(mUSDC)` on chain. If the network truly has no rebate activity (e.g. test / pre-launch), this rule should be removed or its window widened.
+              runbook_url: "docs/RUNBOOK_PERP_V2_FEE_ALERTS.md#deoptv2perprebatestalled"
+      # OPTION-side and budget alerts stay green throughout.
+      - eval_time: 48h
+        alertname: FeesManagerV2RebateBudgetLow
+        exp_alerts: []
+      - eval_time: 48h
+        alertname: DeoptV2FeeMetricsAbsent
         exp_alerts: []

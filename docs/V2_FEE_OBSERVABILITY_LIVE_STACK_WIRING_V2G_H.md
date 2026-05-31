@@ -618,6 +618,31 @@ Frontend / Sol:
    spec is left at 5 scenarios for clarity. Add when the live cadence
    is known.
 
+## V2G-I closure (appended 2026-05-31)
+
+V2G-I ran the synthetic drill V2G-H deferred and caught a real
+rule-level regression in the process. Headlines:
+
+- **`FeesManagerV2RebateBudgetStale` PromQL bugfix.** The original
+  expression used `vector AND vector` with disjoint label sets — PromQL
+  default matching collapses to the empty set so the alert silently
+  never fired. Fixed to `delta(budget[30m]) == 0 and on() (rebate
+  counters)` and pinned with a new `promtool test rules` scenario.
+- **Local Alertmanager + webhook sink drill.** Started a real
+  `alertmanager v0.32.1` server on 127.0.0.1:9093 + a single-file
+  Python webhook sink on 127.0.0.1:9095. Six synthetic alerts via
+  `amtool alert add` (PERP OLD, OPTION unknown, budget low, metrics
+  absent, resolve, inhibit) all reached the correct receivers; inhibit
+  rule suppressed the downstream as designed.
+- **Opt-in stalled bundle.** Shipped
+  `docs/monitoring/prometheus/v2_fee_alerts.stalled.yml` carrying
+  `DeoptV2PerpRebateStalled` as a separate file; the prod bundle is
+  unchanged. Test coverage exercises a 48h drought window.
+- **Backend live verification.** Reproduced V2G-H state 1:1.
+
+See `docs/V2_FEE_OBSERVABILITY_LIVE_ACTIVATION_V2G_I.md` for the
+full record.
+
 ## Next recommended milestone
 
 **V2G-I — flip V2 fee observability to live-firing in the operator's
