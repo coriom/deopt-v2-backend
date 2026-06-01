@@ -302,3 +302,29 @@ in sections 3 and 4 of that pack.
 
 V2G-T can run before, during, or after V2G-P; it is orthogonal
 to the OPTION RFQ broadcast.
+
+---
+
+## V2G-M2 pickup (appended 2026-06-01T17:51Z)
+
+The V2G-S fields are now **live** in `/admin/fees/onchain` after
+the V2G-M2 controlled backend restart. Probed against the two
+V2G-E live tx hashes:
+
+- **PERP** `0x5c15…aa394`: `event_model=v2`,
+  `observed_total_charged=6`, `observed_total_rebated=3`,
+  `net_protocol_fee=3`, `by_product={perp:6}`,
+  `by_flow={orderbook:6}`, `rebated_by_product={perp:3}`,
+  `rebated_by_flow={orderbook:3}`.
+- **OPTION** `0x9a85…3149`: `event_model=mixed`,
+  `source_priority=v2`, `trading_fee_event_count=1` (V1
+  compat log; contributes 0), `observed_total_charged=25`,
+  `observed_total_rebated=10`, `net_protocol_fee=15`,
+  `by_product={option:25}`, `by_flow={orderbook:25}`,
+  `rebated_by_product={option:10}`,
+  `rebated_by_flow={orderbook:10}`.
+
+No double-counting in the OPTION mixed case (V1 log present but
+zero contribution to totals — V2 source-priority policy upheld
+end-to-end). Full record:
+`docs/V2_BACKEND_RESTART_PICKUP_V2G_M2.md`.

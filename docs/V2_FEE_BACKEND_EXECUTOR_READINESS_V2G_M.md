@@ -369,3 +369,17 @@ the live local-compose stack.**
   pattern and confirm the endpoint flips
   `maker_key_env_set=true` / `taker_key_env_set=true` without
   echoing the key.
+
+---
+
+## V2G-M2 pickup (appended 2026-06-01T17:51Z)
+
+`/admin/fees/v2/smoke/readiness` went **live** with the V2G-M2
+backend restart (PID 56199 → PID 231297) right after the V2G-L4
+canonical day-1 24h gate cleared. Endpoint returns
+`milestone="V2G-M"` with the V2G-D2 EOA registry surfaced
+**addresses only**, `key_env_vars` carrying env-var NAMES only,
+and all `broadcast_gates=false`. No private key surfaced to
+output. Probed under the new X-Admin-Token enforcement
+(V2G-W0 constant-time compare). Full record:
+`docs/V2_BACKEND_RESTART_PICKUP_V2G_M2.md`.

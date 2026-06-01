@@ -216,3 +216,24 @@ radius. Smallest-slice ordering inside V2G-W1:
 
 V2G-W1 can ship in two PRs: (a) JWT verifier + tests, (b) per-route
 role table + integration tests. Each is independently reviewable.
+
+---
+
+## V2G-M2 pickup (appended 2026-06-01T17:51Z)
+
+The constant-time `token_matches` code path is now **live** in
+the running backend after the V2G-M2 controlled restart (PID
+56199 → PID 231297, release binary rebuilt 17:50Z). Behavioural
+probes against the live `/admin/fees/v2/observability` endpoint:
+
+| Probe | Result |
+|---|---|
+| Missing `X-Admin-Token` | **403 Forbidden** |
+| Wrong token | **403 Forbidden** |
+| Same-length wrong token (byte-pattern-mismatch) | **403 Forbidden** |
+| Valid token | **200 OK** |
+
+The token value was read once from `/proc/231297/environ` into a
+shell variable and never echoed to the chat output. The
+diagnostic env-grep redacted everything beyond the first 8 chars.
+Full record: `docs/V2_BACKEND_RESTART_PICKUP_V2G_M2.md`.
