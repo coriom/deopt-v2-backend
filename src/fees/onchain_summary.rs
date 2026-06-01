@@ -31,7 +31,7 @@
 //! No transactions are submitted, no broadcast is invoked, no rows are
 //! mutated by this module — it is pure read-only aggregation.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 
@@ -72,7 +72,7 @@ pub struct NormalizedFeeEvent {
     pub basis_amount: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub enum FeeEventModel {
     V1Charged,
     V2Charged,
@@ -129,7 +129,20 @@ pub struct AggregatedFees {
     pub by_trader: BTreeMap<String, u128>,
     pub by_recipient: BTreeMap<String, u128>,
     pub by_side: BTreeMap<String, u128>,
+    /// V2G-S — per-product breakdown (`"option"` / `"perp"`). V1
+    /// events carry no productKind and are bucketed under `"unknown"`.
+    /// Tracks positive fees only; rebates flow through
+    /// {rebated_by_product}.
+    pub by_product: BTreeMap<String, u128>,
+    /// V2G-S — per-flow breakdown (`"orderbook"` / `"rfq"`). V1 events
+    /// are bucketed under `"unknown"`. Tracks positive fees only;
+    /// rebates flow through {rebated_by_flow}.
+    pub by_flow: BTreeMap<String, u128>,
     pub rebated_by_trader: BTreeMap<String, u128>,
+    /// V2G-S — per-product breakdown of rebate amounts.
+    pub rebated_by_product: BTreeMap<String, u128>,
+    /// V2G-S — per-flow breakdown of rebate amounts.
+    pub rebated_by_flow: BTreeMap<String, u128>,
 }
 
 impl AggregatedFees {
@@ -138,30 +151,62 @@ impl AggregatedFees {
     }
 }
 
-/// Walk a slice of indexed events and bucket them by fee model.
+/// V2G-S — dedup key used by {normalize_fee_events} as a defense-in-depth
+/// layer above the DB's `UNIQUE (chain_id, tx_hash, log_index)` index on
+/// `option_execution_events`. If a caller hands us a slice that contains
+/// the same physical log twice, the second occurrence is dropped at this
+/// boundary so aggregation never double-counts.
+///
+/// Distinct `source_contract` values are kept separate intentionally — two
+/// FeesManagerV2 instances (e.g. legacy + new during a cutover) can
+/// legitimately emit overlapping `tx_hash:log_index` values for different
+/// fee flows. Distinct `model` values are kept separate by construction
+/// (V1 and V2 logs are different event signatures, hence different
+/// `log_index`).
+type DedupKey = (FeeEventModel, String, u64, String);
+
+/// Walk a slice of indexed events, bucket them by fee model, and drop
+/// in-slice duplicates of the same physical log.
 pub fn normalize_fee_events(events: &[OptionExecutionEvent]) -> NormalizedFees {
     let mut out = NormalizedFees::default();
+    let mut seen: BTreeSet<DedupKey> = BTreeSet::new();
+
     for event in events {
         match event.event_name.as_str() {
             "TradingFeeCharged" => {
                 if let Some(normalized) = normalize_v1_charged(event) {
-                    out.v1_charged.push(normalized);
+                    if seen.insert(dedup_key(&normalized)) {
+                        out.v1_charged.push(normalized);
+                    }
                 }
             }
             "FeeChargedV2" => {
                 if let Some(normalized) = normalize_v2_charged(event) {
-                    out.v2_charged.push(normalized);
+                    if seen.insert(dedup_key(&normalized)) {
+                        out.v2_charged.push(normalized);
+                    }
                 }
             }
             "FeeRebatedV2" => {
                 if let Some(normalized) = normalize_v2_rebated(event) {
-                    out.v2_rebated.push(normalized);
+                    if seen.insert(dedup_key(&normalized)) {
+                        out.v2_rebated.push(normalized);
+                    }
                 }
             }
             _ => {}
         }
     }
     out
+}
+
+fn dedup_key(event: &NormalizedFeeEvent) -> DedupKey {
+    (
+        event.model,
+        event.tx_hash.clone(),
+        event.log_index,
+        event.contract_address.clone(),
+    )
 }
 
 fn normalize_v1_charged(event: &OptionExecutionEvent) -> Option<NormalizedFeeEvent> {
@@ -432,6 +477,16 @@ fn accumulate_charge(aggregated: &mut AggregatedFees, entry: &NormalizedFeeEvent
         .entry(entry.side.as_str().to_string())
         .or_default();
     *side = side.saturating_add(amount);
+    let product = aggregated
+        .by_product
+        .entry(product_or_unknown(entry))
+        .or_default();
+    *product = product.saturating_add(amount);
+    let flow = aggregated
+        .by_flow
+        .entry(flow_or_unknown(entry))
+        .or_default();
+    *flow = flow.saturating_add(amount);
 }
 
 fn accumulate_rebate(aggregated: &mut AggregatedFees, entry: &NormalizedFeeEvent) {
@@ -444,6 +499,30 @@ fn accumulate_rebate(aggregated: &mut AggregatedFees, entry: &NormalizedFeeEvent
         .entry(entry.trader.clone())
         .or_default();
     *rebated = rebated.saturating_add(amount);
+    let product = aggregated
+        .rebated_by_product
+        .entry(product_or_unknown(entry))
+        .or_default();
+    *product = product.saturating_add(amount);
+    let flow = aggregated
+        .rebated_by_flow
+        .entry(flow_or_unknown(entry))
+        .or_default();
+    *flow = flow.saturating_add(amount);
+}
+
+fn product_or_unknown(entry: &NormalizedFeeEvent) -> String {
+    entry
+        .product_kind
+        .clone()
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn flow_or_unknown(entry: &NormalizedFeeEvent) -> String {
+    entry
+        .flow_kind
+        .clone()
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 fn amounts_to_strings(map: &BTreeMap<String, u128>) -> BTreeMap<String, String> {
@@ -482,6 +561,10 @@ pub fn summarize_fees_for_lifecycle(
         rebated_by_trader: amounts_to_strings(&aggregated.rebated_by_trader),
         by_recipient: by_recipient_strings.clone(),
         by_side: amounts_to_strings(&aggregated.by_side),
+        by_product: amounts_to_strings(&aggregated.by_product),
+        by_flow: amounts_to_strings(&aggregated.by_flow),
+        rebated_by_product: amounts_to_strings(&aggregated.rebated_by_product),
+        rebated_by_flow: amounts_to_strings(&aggregated.rebated_by_flow),
         total_by_recipient: by_recipient_strings,
         backend_ledger_status: backend_ledger_status.to_string(),
         reconciliation_status: reconciliation_status.to_string(),
@@ -586,7 +669,11 @@ pub struct OnchainFeeTxSummary {
     pub by_recipient: BTreeMap<String, u128>,
     pub by_trader: BTreeMap<String, u128>,
     pub by_side: BTreeMap<String, u128>,
+    pub by_product: BTreeMap<String, u128>,
+    pub by_flow: BTreeMap<String, u128>,
     pub rebated_by_trader: BTreeMap<String, u128>,
+    pub rebated_by_product: BTreeMap<String, u128>,
+    pub rebated_by_flow: BTreeMap<String, u128>,
 }
 
 impl OnchainFeeTxSummary {
@@ -602,7 +689,11 @@ impl OnchainFeeTxSummary {
             by_recipient: aggregated.by_recipient,
             by_trader: aggregated.by_trader,
             by_side: aggregated.by_side,
+            by_product: aggregated.by_product,
+            by_flow: aggregated.by_flow,
             rebated_by_trader: aggregated.rebated_by_trader,
+            rebated_by_product: aggregated.rebated_by_product,
+            rebated_by_flow: aggregated.rebated_by_flow,
         }
     }
 
@@ -626,7 +717,11 @@ impl OnchainFeeTxSummary {
             "by_recipient": amounts_to_strings(&self.by_recipient),
             "by_trader": amounts_to_strings(&self.by_trader),
             "by_side": amounts_to_strings(&self.by_side),
+            "by_product": amounts_to_strings(&self.by_product),
+            "by_flow": amounts_to_strings(&self.by_flow),
             "rebated_by_trader": amounts_to_strings(&self.rebated_by_trader),
+            "rebated_by_product": amounts_to_strings(&self.rebated_by_product),
+            "rebated_by_flow": amounts_to_strings(&self.rebated_by_flow),
         })
     }
 }
@@ -1308,5 +1403,338 @@ mod tests {
             assert_eq!(payload["product_kind"], "option");
             assert_eq!(payload["flow_kind"], "rfq");
         }
+    }
+
+    // -------- V2G-S: idempotency + product/flow breakdown coverage --------
+
+    fn v2_perp_charged_event(
+        log_index: u64,
+        trader: &str,
+        fee_amount: u128,
+        fee_ppm: i64,
+        flow: &str,
+    ) -> OptionExecutionEvent {
+        make_event(
+            "FeeChargedV2",
+            log_index,
+            serde_json::json!({
+                "consumer": "0x00000000000000000000000000000000000000aa",
+                "trader": trader,
+                "recipient": "0x009f38440f058d095b61e0e2ee7fabdf05be7500",
+                "settlementAsset": "0x0000000000000000000000000000000000000020",
+                "productKind": "perp",
+                "flowKind": flow,
+                "isMaker": false,
+                "feePpm": fee_ppm,
+                "basisAmount": "1000000",
+                "feeAmount": fee_amount.to_string(),
+            }),
+        )
+    }
+
+    fn v2_perp_rebated_event(
+        log_index: u64,
+        trader: &str,
+        rebate_amount: u128,
+        rebate_ppm: i64,
+        flow: &str,
+    ) -> OptionExecutionEvent {
+        make_event(
+            "FeeRebatedV2",
+            log_index,
+            serde_json::json!({
+                "consumer": "0x00000000000000000000000000000000000000aa",
+                "trader": trader,
+                "recipient": trader,
+                "settlementAsset": "0x0000000000000000000000000000000000000020",
+                "productKind": "perp",
+                "flowKind": flow,
+                "rebatePpm": rebate_ppm,
+                "basisAmount": "1000000",
+                "rebateAmount": rebate_amount.to_string(),
+            }),
+        )
+    }
+
+    #[test]
+    fn v2gs_replay_same_tx_twice_does_not_double_count_perp() {
+        // PERP V2G-E shape: one charged taker + one rebated maker on
+        // the same tx. Replaying the same vec twice (e.g. an indexer
+        // re-scans the block range, or a caller doubles the input)
+        // must produce identical totals.
+        let taker = "0x77ca9dd6ccce2d692fb23877a2db7178807b0020";
+        let maker = "0x290bd12c93e467bf51c51f5273d35bddb19e9274";
+
+        let single = [
+            v2_perp_charged_event(7, taker, 300, 300, "orderbook"),
+            v2_perp_rebated_event(8, maker, 100, -100, "orderbook"),
+        ];
+        let doubled: Vec<OptionExecutionEvent> =
+            single.iter().chain(single.iter()).cloned().collect();
+
+        let single_agg = aggregate(&normalize_fee_events(&single));
+        let doubled_agg = aggregate(&normalize_fee_events(&doubled));
+
+        assert_eq!(single_agg.charged_total, 300);
+        assert_eq!(single_agg.rebated_total, 100);
+        assert_eq!(single_agg.fee_charged_v2_count, 1);
+        assert_eq!(single_agg.fee_rebated_v2_count, 1);
+
+        // Dedup at normalize_fee_events boundary keeps totals identical.
+        assert_eq!(doubled_agg.charged_total, single_agg.charged_total);
+        assert_eq!(doubled_agg.rebated_total, single_agg.rebated_total);
+        assert_eq!(
+            doubled_agg.fee_charged_v2_count,
+            single_agg.fee_charged_v2_count
+        );
+        assert_eq!(
+            doubled_agg.fee_rebated_v2_count,
+            single_agg.fee_rebated_v2_count
+        );
+        assert_eq!(doubled_agg.by_product.get("perp").copied(), Some(300));
+        assert_eq!(doubled_agg.by_flow.get("orderbook").copied(), Some(300));
+        assert_eq!(
+            doubled_agg.rebated_by_product.get("perp").copied(),
+            Some(100)
+        );
+    }
+
+    #[test]
+    fn v2gs_replay_three_times_perp_idempotent() {
+        let taker = "0x77ca9dd6ccce2d692fb23877a2db7178807b0020";
+        let single = [v2_perp_charged_event(7, taker, 300, 300, "orderbook")];
+        let tripled: Vec<OptionExecutionEvent> = single
+            .iter()
+            .chain(single.iter())
+            .chain(single.iter())
+            .cloned()
+            .collect();
+
+        let agg = aggregate(&normalize_fee_events(&tripled));
+        assert_eq!(agg.charged_total, 300, "replay-thrice must equal single");
+        assert_eq!(agg.fee_charged_v2_count, 1);
+    }
+
+    #[test]
+    fn v2gs_replay_mixed_option_v1_v2_does_not_double_count() {
+        let buyer = "0xc0a76c2a6c6b70c0b065a05e64417886416cc976";
+        let single = [
+            v1_event(117, buyer, 13, false), // V1 compatibility breadcrumb
+            v2_charged_event(118, buyer, 13, 250, false), // V2 source of truth
+        ];
+        let doubled: Vec<OptionExecutionEvent> =
+            single.iter().chain(single.iter()).cloned().collect();
+
+        let agg = aggregate(&normalize_fee_events(&doubled));
+        assert_eq!(agg.event_model, "mixed");
+        assert_eq!(agg.source_priority, "v2");
+        // V2 wins; V1 contributes zero; dedup keeps total = 13 (not 26).
+        assert_eq!(agg.charged_total, 13);
+        assert_eq!(agg.trading_fee_event_count, 1);
+        assert_eq!(agg.fee_charged_v2_count, 1);
+        assert_eq!(agg.by_product.get("option").copied(), Some(13));
+        assert_eq!(agg.by_flow.get("orderbook").copied(), Some(13));
+    }
+
+    #[test]
+    fn v2gs_dup_log_index_within_same_family_is_deduped() {
+        // Two distinct events that share (model, tx_hash, log_index,
+        // contract_address) — physical-log clash. Aggregator must
+        // keep only the first.
+        let trader = "0xc0a76c2a00000000000000000000000000000000";
+        let events = vec![
+            v2_charged_event(5, trader, 100, 250, false),
+            v2_charged_event(5, trader, 999, 250, false), // duplicate key, different amount
+        ];
+
+        let normalized = normalize_fee_events(&events);
+        assert_eq!(normalized.v2_charged.len(), 1, "dup must be dropped");
+        assert_eq!(normalized.v2_charged[0].charged_amount, 100, "first wins");
+    }
+
+    #[test]
+    fn v2gs_distinct_log_index_same_tx_counted_separately() {
+        let trader = "0xc0a76c2a00000000000000000000000000000000";
+        let events = vec![
+            v2_charged_event(5, trader, 100, 250, false),
+            v2_charged_event(6, trader, 200, 250, false),
+        ];
+
+        let agg = aggregate(&normalize_fee_events(&events));
+        assert_eq!(agg.fee_charged_v2_count, 2);
+        assert_eq!(agg.charged_total, 300);
+    }
+
+    #[test]
+    fn v2gs_same_log_index_different_source_contracts_counted_separately() {
+        // Two FeesManagerV2 instances (e.g. a legacy + new during a
+        // cutover) can each emit logs at the same (tx_hash, log_index)
+        // slot in different scopes. The dedup key includes
+        // source_contract so these stay distinct.
+        let trader = "0xc0a76c2a00000000000000000000000000000000";
+        let mut a = v2_charged_event(5, trader, 100, 250, false);
+        let mut b = v2_charged_event(5, trader, 200, 250, false);
+        a.contract_address = "0x00000000000000000000000000000000000000aa".to_string();
+        b.contract_address = "0x00000000000000000000000000000000000000bb".to_string();
+
+        let agg = aggregate(&normalize_fee_events(&[a, b]));
+        assert_eq!(agg.fee_charged_v2_count, 2);
+        assert_eq!(agg.charged_total, 300);
+    }
+
+    #[test]
+    fn v2gs_by_product_and_by_flow_split_correctly() {
+        // OPTION orderbook taker + PERP orderbook taker + OPTION RFQ
+        // taker — gross-fees breakdown should split by_product and
+        // by_flow without overlap.
+        let trader = "0xc0a76c2a00000000000000000000000000000000";
+        let events = vec![
+            v2_charged_event(1, trader, 50, 250, false), // OPTION orderbook
+            v2_perp_charged_event(2, trader, 30, 300, "orderbook"),
+            make_event(
+                "FeeChargedV2",
+                3,
+                serde_json::json!({
+                    "consumer": "0x00000000000000000000000000000000000000aa",
+                    "trader": trader,
+                    "recipient": "0x009f38440f058d095b61e0e2ee7fabdf05be7500",
+                    "settlementAsset": "0x0000000000000000000000000000000000000020",
+                    "productKind": "option",
+                    "flowKind": "rfq",
+                    "isMaker": false,
+                    "feePpm": 94,
+                    "basisAmount": "1000000",
+                    "feeAmount": "94",
+                }),
+            ),
+        ];
+
+        let agg = aggregate(&normalize_fee_events(&events));
+        assert_eq!(agg.charged_total, 174);
+        assert_eq!(agg.by_product.get("option").copied(), Some(144));
+        assert_eq!(agg.by_product.get("perp").copied(), Some(30));
+        assert_eq!(agg.by_flow.get("orderbook").copied(), Some(80));
+        assert_eq!(agg.by_flow.get("rfq").copied(), Some(94));
+        // Net = gross since no rebates.
+        assert_eq!(agg.net_protocol_fee(), 174);
+    }
+
+    #[test]
+    fn v2gs_rebated_by_product_and_flow_split_correctly() {
+        let opt_maker = "0xa1";
+        let perp_maker = "0xa2";
+        let events = vec![
+            v2_rebated_event(1, opt_maker, 25, -50), // option orderbook rebate
+            v2_perp_rebated_event(2, perp_maker, 50, -100, "orderbook"),
+            make_event(
+                "FeeRebatedV2",
+                3,
+                serde_json::json!({
+                    "consumer": "0x00000000000000000000000000000000000000aa",
+                    "trader": opt_maker,
+                    "recipient": opt_maker,
+                    "settlementAsset": "0x0000000000000000000000000000000000000020",
+                    "productKind": "option",
+                    "flowKind": "rfq",
+                    "rebatePpm": -10,
+                    "basisAmount": "1000000",
+                    "rebateAmount": "10",
+                }),
+            ),
+        ];
+
+        let agg = aggregate(&normalize_fee_events(&events));
+        assert_eq!(agg.rebated_total, 85);
+        assert_eq!(agg.rebated_by_product.get("option").copied(), Some(35));
+        assert_eq!(agg.rebated_by_product.get("perp").copied(), Some(50));
+        assert_eq!(agg.rebated_by_flow.get("orderbook").copied(), Some(75));
+        assert_eq!(agg.rebated_by_flow.get("rfq").copied(), Some(10));
+    }
+
+    #[test]
+    fn v2gs_admin_summary_per_tx_deterministic_under_replay() {
+        // Two distinct txs in one window. Each appears twice in the
+        // input — the per-tx admin summary must be identical to the
+        // single-input case.
+        let trader = "0xc0a76c2a00000000000000000000000000000000";
+        let mut tx_a_charge = v2_charged_event(1, trader, 50, 250, false);
+        tx_a_charge.tx_hash = "0xaa".to_string();
+        let mut tx_b_charge = v2_charged_event(1, trader, 75, 250, false);
+        tx_b_charge.tx_hash = "0xbb".to_string();
+        // Re-derive the tx hash on the normalize side too — our helper
+        // already lowercases.
+        for event in [&tx_a_charge, &tx_b_charge] {
+            assert!(!event.tx_hash.is_empty());
+        }
+
+        let single = vec![tx_a_charge.clone(), tx_b_charge.clone()];
+        let doubled = vec![
+            tx_a_charge.clone(),
+            tx_b_charge.clone(),
+            tx_a_charge,
+            tx_b_charge,
+        ];
+
+        let summary_single = summarize_admin_onchain(&single);
+        let summary_doubled = summarize_admin_onchain(&doubled);
+
+        // The per-tx slice surfaces 2 entries in both cases (one per
+        // tx hash); the totals match.
+        assert_eq!(
+            summary_single.overall.charged_total, summary_doubled.overall.charged_total,
+            "doubled input must not change the overall charged total"
+        );
+        assert_eq!(
+            summary_single.per_tx.len(),
+            summary_doubled.per_tx.len(),
+            "doubled input must produce the same per-tx count"
+        );
+    }
+
+    #[test]
+    fn v2gs_overlapping_block_range_replay_safe() {
+        // Models the indexer scanning blocks 100..120 once, then
+        // 110..130 (overlapping range). Logs in 110..120 should not
+        // be double-counted.
+        let trader = "0xc0a76c2a00000000000000000000000000000000";
+
+        let mut log_in_overlap = v2_charged_event(5, trader, 100, 250, false);
+        log_in_overlap.tx_hash = "0xabc".to_string();
+        log_in_overlap.block_number = 115;
+
+        let first_scan = [log_in_overlap.clone()];
+        let second_scan = [log_in_overlap.clone()];
+        let union: Vec<OptionExecutionEvent> = first_scan
+            .iter()
+            .chain(second_scan.iter())
+            .cloned()
+            .collect();
+
+        let agg = aggregate(&normalize_fee_events(&union));
+        assert_eq!(agg.charged_total, 100, "overlap must not double-count");
+        assert_eq!(agg.fee_charged_v2_count, 1);
+    }
+
+    #[test]
+    fn v2gs_lifecycle_view_exposes_by_product_and_by_flow() {
+        let buyer = "0xc0a76c2a6c6b70c0b065a05e64417886416cc976";
+        let events = vec![
+            v2_charged_event(1, buyer, 50, 250, false),
+            v2_perp_charged_event(2, buyer, 30, 300, "orderbook"),
+        ];
+
+        let lifecycle = summarize_fees_for_lifecycle(&events, "disabled");
+        assert_eq!(
+            lifecycle.by_product.get("option").map(String::as_str),
+            Some("50")
+        );
+        assert_eq!(
+            lifecycle.by_product.get("perp").map(String::as_str),
+            Some("30")
+        );
+        assert_eq!(
+            lifecycle.by_flow.get("orderbook").map(String::as_str),
+            Some("80")
+        );
     }
 }

@@ -118,8 +118,7 @@ pub fn build_option_rfq_operator_packet(
 
     let calldata_hex = match inputs.signatures {
         Some(signatures) => {
-            let bytes =
-                encode_option_execute_rfq_trade_calldata(inputs.payload, signatures)?;
+            let bytes = encode_option_execute_rfq_trade_calldata(inputs.payload, signatures)?;
             Some(format!("0x{}", hex_encode(&bytes)))
         }
         None => None,
@@ -256,7 +255,10 @@ mod tests {
         assert!(packet.digest_hex.starts_with("0x"));
         assert_eq!(packet.digest_hex.len(), 66, "digest must be 32-byte hex");
         assert!(!packet.broadcast_ready);
-        assert!(packet.calldata_hex.is_none(), "must not produce calldata without sigs");
+        assert!(
+            packet.calldata_hex.is_none(),
+            "must not produce calldata without sigs"
+        );
         assert!(
             packet.payload_summary.contains("buyer="),
             "summary must include buyer field"

@@ -223,6 +223,22 @@ pub struct LifecycleFees {
     pub by_recipient: BTreeMap<String, String>,
     /// Per-side sum keyed by `"maker"` / `"taker"` (or `"unknown"`).
     pub by_side: BTreeMap<String, String>,
+    /// V2G-S — per-product sum of positive fees, keyed by
+    /// `"option"` / `"perp"` (or `"unknown"` for V1). Empty when no
+    /// V2 events were observed.
+    #[serde(default)]
+    pub by_product: BTreeMap<String, String>,
+    /// V2G-S — per-flow sum of positive fees, keyed by
+    /// `"orderbook"` / `"rfq"` (or `"unknown"` for V1). Empty when no
+    /// V2 events were observed.
+    #[serde(default)]
+    pub by_flow: BTreeMap<String, String>,
+    /// V2G-S — per-product sum of rebate amounts.
+    #[serde(default)]
+    pub rebated_by_product: BTreeMap<String, String>,
+    /// V2G-S — per-flow sum of rebate amounts.
+    #[serde(default)]
+    pub rebated_by_flow: BTreeMap<String, String>,
     /// Backward-compatible alias of `by_recipient` retained for clients
     /// still consuming the V1Z field name.
     pub total_by_recipient: BTreeMap<String, String>,
