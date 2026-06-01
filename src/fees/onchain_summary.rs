@@ -1223,4 +1223,90 @@ mod tests {
             .count();
         assert_eq!(lifecycle_v2_with_basis, 2);
     }
+
+    /// V2G-N — backend decode readiness pin for the RFQ flow.
+    ///
+    /// The `flow_kind` field is parsed as a free-form `Option<String>`
+    /// from the indexer-decoded `flowKind` topic, with no enum
+    /// constraint. The instant the first real `FeeChargedV2{flowKind=1}`
+    /// (RFQ) event lands, the backend already surfaces it correctly:
+    /// per-event payloads carry `flow_kind = "rfq"` and the aggregator
+    /// counts the leg under the right rebate/charge bucket. This test
+    /// pins both invariants against a synthetic OPTION RFQ trade
+    /// (Tier 2 taker @ basis 1_000_000, applied 94 ppm — the V2G-N
+    /// canonical Tier 2 taker discount).
+    ///
+    /// Cardinality contract: even after this test runs, the
+    /// `consumer="rfq"` label NEVER appears on any of the V2 fee
+    /// metrics — that bucket carries the `consumer` (engine) label,
+    /// not the flow. RFQ shows up only in admin payloads.
+    #[test]
+    fn v2g_n_indexer_decodes_option_rfq_flow_kind_verbatim() {
+        let taker = "0x77ca9dd6ccce2d692fb23877a2db7178807b0020";
+        let maker = "0x290bd12c93e467bf51c51f5273d35bddb19e9274";
+        let recipient = "0xa67f8e8e673ce4bb2fb563b0e6e9fa8f70e3b588";
+        let settlement_asset = "0x6eae407f5640b006fac9965182e238582a3b412e";
+        let consumer = "0x287cef479be5889eefca847f9e73c860898f48cc";
+
+        // Synthetic OPTION RFQ taker (Tier 2): basis = 1_000_000,
+        // takerPpm = 125 with a 25% RFQ taker discount applied at the
+        // contract layer → 94 ppm → feeAmount = ceil(1_000_000 * 94 / 1e6) = 94.
+        let charged = make_event(
+            "FeeChargedV2",
+            7,
+            serde_json::json!({
+                "consumer": consumer,
+                "trader": taker,
+                "recipient": recipient,
+                "settlementAsset": settlement_asset,
+                "productKind": "option",
+                "productKindRaw": 0,
+                "flowKind": "rfq",
+                "flowKindRaw": 1,
+                "isMaker": false,
+                "feePpm": 94,
+                "basisAmount": "1000000",
+                "feeAmount": "94",
+            }),
+        );
+        // Synthetic OPTION RFQ maker rebate (Tier 2): makerPpm = -10
+        // (unchanged by Design-Option-A — RFQ discount never amplifies
+        // negative ppm). rebateAmount = floor(1_000_000 * 10 / 1e6) = 10.
+        let rebated = make_event(
+            "FeeRebatedV2",
+            8,
+            serde_json::json!({
+                "consumer": consumer,
+                "trader": maker,
+                "recipient": maker,
+                "settlementAsset": settlement_asset,
+                "productKind": "option",
+                "productKindRaw": 0,
+                "flowKind": "rfq",
+                "flowKindRaw": 1,
+                "rebatePpm": -10,
+                "basisAmount": "1000000",
+                "rebateAmount": "10",
+            }),
+        );
+
+        let normalized = normalize_fee_events(&[charged, rebated]);
+        let aggregated = aggregate(&normalized);
+
+        assert_eq!(aggregated.event_model, "v2");
+        assert_eq!(aggregated.fee_charged_v2_count, 1);
+        assert_eq!(aggregated.fee_rebated_v2_count, 1);
+        assert_eq!(aggregated.charged_total, 94);
+        assert_eq!(aggregated.rebated_total, 10);
+        assert_eq!(aggregated.net_protocol_fee(), 84);
+
+        // Per-event payloads carry `flow_kind = "rfq"` verbatim. No
+        // enum filtering — the backend is RFQ-ready out of the box.
+        let payloads = collect_event_payloads(&normalized);
+        assert_eq!(payloads.len(), 2);
+        for payload in &payloads {
+            assert_eq!(payload["product_kind"], "option");
+            assert_eq!(payload["flow_kind"], "rfq");
+        }
+    }
 }

@@ -231,7 +231,7 @@ Files audited:
 | Negative maker rebates (-0.005%, -0.0025%, -0.001%, -0.005%, -0.0075%, -0.01%) | Backend ⚠️ (positive rebate accruals exist; signed maker fee does not), Solidity ❌ (unsigned `uint16` cannot encode negative) |
 | Options maker/taker fees | Both ✅ |
 | Perps maker/taker fees | Both ✅ |
-| RFQ maker/taker discounts (100%/75%/50%/25%/10%/0%) | Backend ✅ (preview-only), Solidity ❌ |
+| RFQ maker/taker discounts (100%/75%/50%/25%/10%/0%) | Backend ✅ (preview + decode), Solidity ✅ math/state/default schedule per V2G-N; **MarginEngine integration ❌** (hardcodes `FlowKind.ORDERBOOK`, queued for V2G-O). See `docs/OPTION_RFQ_FEE_DISCOUNTS_V2G_N.md`. |
 | Fee recipient (margin engine) | Both ✅ (`setFeeRecipient` + `FeeRecipientSet`) |
 | Fee recipient (perp engine) | Storage ✅ but admin setter ❌ — see "Perps gaps" |
 | Backend preview ↔ on-chain alignment | Documented in V2C; preview can differ from on-chain when off-chain rates are sub-bps |
