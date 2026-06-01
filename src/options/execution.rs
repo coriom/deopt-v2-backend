@@ -21,6 +21,14 @@ pub const OPTION_TRADE_TYPE: &str = "OptionTrade(bytes32 intentId,address buyer,
 pub const OPTION_EXECUTE_TRADE_SIGNATURE: &str =
     "executeTrade((bytes32,address,address,uint256,address,address,uint64,uint64,bool,uint128,uint128,uint128,bool,uint256,uint256,uint256),bytes,bytes)";
 
+// V2G-P0 — RFQ flow has identical field layout but a dedicated EIP-712 type
+// name so digests cannot replay between the two paths. Maker/taker must
+// explicitly opt in to the RFQ fee schedule.
+pub const OPTION_RFQ_TRADE_TYPE: &str = "OptionRfqTrade(bytes32 intentId,address buyer,address seller,uint256 optionId,address underlying,address settlementAsset,uint64 expiry,uint64 strike1e8,bool isCall,uint128 contractSize1e8,uint128 quantity,uint128 premiumPerContract,bool buyerIsMaker,uint256 buyerNonce,uint256 sellerNonce,uint256 deadline)";
+
+pub const OPTION_EXECUTE_RFQ_TRADE_SIGNATURE: &str =
+    "executeRfqTrade((bytes32,address,address,uint256,address,address,uint64,uint64,bool,uint128,uint128,uint128,bool,uint256,uint256,uint256),bytes,bytes)";
+
 sol! {
     struct OptionTrade {
         bytes32 intentId;
@@ -42,6 +50,27 @@ sol! {
     }
 
     function executeTrade(OptionTrade t, bytes buyerSig, bytes sellerSig);
+
+    struct OptionRfqTrade {
+        bytes32 intentId;
+        address buyer;
+        address seller;
+        uint256 optionId;
+        address underlying;
+        address settlementAsset;
+        uint64 expiry;
+        uint64 strike1e8;
+        bool isCall;
+        uint128 contractSize1e8;
+        uint128 quantity;
+        uint128 premiumPerContract;
+        bool buyerIsMaker;
+        uint256 buyerNonce;
+        uint256 sellerNonce;
+        uint256 deadline;
+    }
+
+    function executeRfqTrade(OptionRfqTrade t, bytes buyerSig, bytes sellerSig);
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -211,6 +240,43 @@ pub fn expected_option_execute_trade_selector() -> [u8; 4] {
     [hash[0], hash[1], hash[2], hash[3]]
 }
 
+// V2G-P0 — RFQ-flavoured digest / selector helpers. The payload shape is
+// identical to {OptionTradePayload}; only the EIP-712 type name differs
+// so a maker who signed an ORDERBOOK intent cannot have that signature
+// replayed against {executeRfqTrade}.
+pub fn option_rfq_trade_typehash() -> [u8; 32] {
+    keccak256(OPTION_RFQ_TRADE_TYPE.as_bytes())
+}
+
+pub fn option_rfq_trade_digest(
+    payload: &OptionTradePayload,
+    domain: &Eip712Domain,
+) -> Result<String> {
+    Ok(hex_0x(&option_rfq_trade_digest_bytes(payload, domain)?))
+}
+
+pub fn option_rfq_trade_digest_bytes(
+    payload: &OptionTradePayload,
+    domain: &Eip712Domain,
+) -> Result<[u8; 32]> {
+    let domain_separator = domain_separator(domain)?;
+    let trade_hash = option_rfq_trade_hash(payload)?;
+    let mut encoded = Vec::with_capacity(66);
+    encoded.extend_from_slice(b"\x19\x01");
+    encoded.extend_from_slice(&domain_separator);
+    encoded.extend_from_slice(&trade_hash);
+    Ok(keccak256(&encoded))
+}
+
+pub fn option_execute_rfq_trade_selector() -> [u8; 4] {
+    executeRfqTradeCall::SELECTOR
+}
+
+pub fn expected_option_execute_rfq_trade_selector() -> [u8; 4] {
+    let hash = keccak256(OPTION_EXECUTE_RFQ_TRADE_SIGNATURE.as_bytes());
+    [hash[0], hash[1], hash[2], hash[3]]
+}
+
 pub fn option_product_registry_option_id(
     underlying: &AccountId,
     settlement_asset: &AccountId,
@@ -240,6 +306,40 @@ pub fn encode_option_execute_trade_calldata(
     payload.validate()?;
     let call = executeTradeCall {
         t: OptionTrade {
+            intentId: payload.intent_id,
+            buyer: Address::from(parse_evm_address(&payload.buyer)?),
+            seller: Address::from(parse_evm_address(&payload.seller)?),
+            optionId: payload.option_id,
+            underlying: Address::from(parse_evm_address(&payload.underlying)?),
+            settlementAsset: Address::from(parse_evm_address(&payload.settlement_asset)?),
+            expiry: payload.expiry,
+            strike1e8: payload.strike_1e8,
+            isCall: payload.is_call,
+            contractSize1e8: payload.contract_size_1e8,
+            quantity: payload.quantity,
+            premiumPerContract: payload.premium_per_contract,
+            buyerIsMaker: payload.buyer_is_maker,
+            buyerNonce: U256::from(payload.buyer_nonce),
+            sellerNonce: U256::from(payload.seller_nonce),
+            deadline: U256::from(payload.deadline),
+        },
+        buyerSig: Bytes::from(signatures.buyer_signature.clone()),
+        sellerSig: Bytes::from(signatures.seller_signature.clone()),
+    };
+    Ok(call.abi_encode())
+}
+
+/// V2G-P0 — sibling calldata encoder for the RFQ-flow entry. Same payload
+/// shape as {encode_option_execute_trade_calldata}; the selector and the
+/// signatures must have been produced against {OPTION_RFQ_TRADE_TYPE},
+/// not {OPTION_TRADE_TYPE}.
+pub fn encode_option_execute_rfq_trade_calldata(
+    payload: &OptionTradePayload,
+    signatures: &OptionTradeSignatureBundle,
+) -> Result<Vec<u8>> {
+    payload.validate()?;
+    let call = executeRfqTradeCall {
+        t: OptionRfqTrade {
             intentId: payload.intent_id,
             buyer: Address::from(parse_evm_address(&payload.buyer)?),
             seller: Address::from(parse_evm_address(&payload.seller)?),
@@ -645,6 +745,17 @@ fn domain_separator(domain: &Eip712Domain) -> Result<[u8; 32]> {
 }
 
 fn option_trade_hash(payload: &OptionTradePayload) -> Result<[u8; 32]> {
+    option_trade_hash_with_typehash(payload, &option_trade_typehash())
+}
+
+fn option_rfq_trade_hash(payload: &OptionTradePayload) -> Result<[u8; 32]> {
+    option_trade_hash_with_typehash(payload, &option_rfq_trade_typehash())
+}
+
+fn option_trade_hash_with_typehash(
+    payload: &OptionTradePayload,
+    typehash: &[u8; 32],
+) -> Result<[u8; 32]> {
     payload.validate()?;
     let buyer = parse_evm_address(&payload.buyer)?;
     let seller = parse_evm_address(&payload.seller)?;
@@ -652,7 +763,7 @@ fn option_trade_hash(payload: &OptionTradePayload) -> Result<[u8; 32]> {
     let settlement_asset = parse_evm_address(&payload.settlement_asset)?;
 
     let mut encoded = Vec::with_capacity(544);
-    encoded.extend_from_slice(&option_trade_typehash());
+    encoded.extend_from_slice(typehash);
     encoded.extend_from_slice(payload.intent_id.as_slice());
     encoded.extend_from_slice(&encode_address(&buyer));
     encoded.extend_from_slice(&encode_address(&seller));
@@ -930,6 +1041,116 @@ mod tests {
             BackendError::InvalidOptionExecutionIntentState(message)
                 if message.contains("optionId does not match option metadata")
         ));
+    }
+
+    // -------------------- V2G-P0: OPTION RFQ signing surface --------------------
+
+    #[test]
+    fn option_rfq_trade_typehash_matches_contract() {
+        // Pinned against the on-chain {RFQ_TRADE_TYPEHASH} derived from
+        // src/matching/OptionMatchingEngine.sol. If this changes the
+        // contract has drifted from the backend; both sides must update
+        // together.
+        assert_eq!(
+            hex_0x(&option_rfq_trade_typehash()),
+            "0x6c660d979559d8526032a642d665ecefe15ca18cf062c24b6cd36058f98a123b"
+        );
+    }
+
+    #[test]
+    fn option_rfq_typehash_differs_from_orderbook_typehash() {
+        assert_ne!(option_trade_typehash(), option_rfq_trade_typehash());
+    }
+
+    #[test]
+    fn option_rfq_trade_digest_differs_from_orderbook_for_identical_payload() {
+        let domain = Eip712Domain {
+            name: "DeOptV2-OptionMatchingEngine".to_string(),
+            version: "1".to_string(),
+            chain_id: 84532,
+            verifying_contract: AccountId::new("0x00000000000000000000000000000000000000ee"),
+        };
+        let payload = payload();
+
+        let orderbook = option_trade_digest(&payload, &domain).unwrap();
+        let rfq = option_rfq_trade_digest(&payload, &domain).unwrap();
+        assert_ne!(
+            orderbook, rfq,
+            "RFQ digest must differ from ORDERBOOK digest to prevent cross-flow replay"
+        );
+    }
+
+    #[test]
+    fn option_rfq_trade_digest_is_deterministic() {
+        let domain = Eip712Domain {
+            name: "DeOptV2-OptionMatchingEngine".to_string(),
+            version: "1".to_string(),
+            chain_id: 84532,
+            verifying_contract: AccountId::new("0x00000000000000000000000000000000000000ee"),
+        };
+        let payload = payload();
+
+        assert_eq!(
+            option_rfq_trade_digest(&payload, &domain).unwrap(),
+            option_rfq_trade_digest(&payload, &domain).unwrap()
+        );
+    }
+
+    #[test]
+    fn option_execute_rfq_trade_selector_matches_signature() {
+        assert_eq!(
+            option_execute_rfq_trade_selector(),
+            expected_option_execute_rfq_trade_selector()
+        );
+    }
+
+    #[test]
+    fn option_execute_rfq_trade_selector_differs_from_orderbook() {
+        assert_ne!(
+            option_execute_trade_selector(),
+            option_execute_rfq_trade_selector(),
+            "executeTrade and executeRfqTrade selectors must differ on the matching-engine ABI"
+        );
+    }
+
+    #[test]
+    fn option_execute_rfq_trade_calldata_has_rfq_selector() {
+        let calldata =
+            encode_option_execute_rfq_trade_calldata(&payload(), &signature_bundle()).unwrap();
+
+        assert!(!calldata.is_empty());
+        assert_eq!(
+            &calldata[..4],
+            option_execute_rfq_trade_selector().as_slice()
+        );
+        // Negative invariant — must NOT collide with ORDERBOOK selector.
+        assert_ne!(&calldata[..4], option_execute_trade_selector().as_slice());
+    }
+
+    #[test]
+    fn option_execute_rfq_trade_calldata_decodes_expected_trade_fields() {
+        let payload = payload();
+        let calldata =
+            encode_option_execute_rfq_trade_calldata(&payload, &signature_bundle()).unwrap();
+        let decoded = executeRfqTradeCall::abi_decode(&calldata, true).unwrap();
+
+        assert_eq!(decoded.t.intentId, payload.intent_id);
+        assert_eq!(
+            decoded.t.buyer,
+            Address::from(parse_evm_address(&payload.buyer).unwrap())
+        );
+        assert_eq!(
+            decoded.t.seller,
+            Address::from(parse_evm_address(&payload.seller).unwrap())
+        );
+        assert_eq!(decoded.t.optionId, payload.option_id);
+        assert_eq!(decoded.t.expiry, payload.expiry);
+        assert_eq!(decoded.t.strike1e8, payload.strike_1e8);
+        assert_eq!(decoded.t.isCall, payload.is_call);
+        assert_eq!(decoded.t.quantity, payload.quantity);
+        assert_eq!(decoded.t.premiumPerContract, payload.premium_per_contract);
+        assert_eq!(decoded.t.buyerIsMaker, payload.buyer_is_maker);
+        assert_eq!(decoded.t.deadline, U256::from(payload.deadline));
     }
 
     #[test]

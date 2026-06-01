@@ -25,6 +25,26 @@
   - **Integration gap** documented but not closed (MarginEngine
     currently hardcodes `FlowKind.ORDERBOOK`; rewiring that is a
     deployed-contract concern and is queued as the V2G-O follow-up).
+  - **V2G-O update (2026-05-31).** The MarginEngine integration gap
+    is now closed at the source level — `MarginEngineTrading`
+    threads `FlowKind` through a shared `_applyTradeWithFlow`
+    helper, a new sibling interface `IMarginEngineRfqTrade.applyRfqTrade`
+    + a new `OptionMatchingEngine.executeRfqTrade` entry expose the
+    RFQ path with a dedicated EIP-712 typehash, and 6 new tests in
+    `test/unit/margin/MarginEngine.t.sol` pin the V2G-N canonical
+    table values end-to-end through the MarginEngine path. The
+    live-chain redeploy itself is queued as V2G-P. See
+    `docs/OPTION_RFQ_FLOW_WIRING_V2G_O.md`.
+  - **V2G-P0 update (2026-06-01).** Backend signing-library RFQ
+    surface implemented (`OPTION_RFQ_TRADE_TYPE`,
+    `option_rfq_trade_digest`,
+    `encode_option_execute_rfq_trade_calldata`, function selectors,
+    8 unit tests pinning typehash and cross-flow-replay guard).
+    Live-state audit confirmed: `OptionMatchingEngine` is **not
+    deployed** on Base Sepolia, so V2G-P is greenfield for OPTION
+    (no state migration). Strategy A selected: redeploy MarginEngine
+    + first-deploy OptionMatchingEngine + rewire in one operator
+    window. See `docs/OPTION_RFQ_LIVE_DEPLOYMENT_PREFLIGHT_V2G_P0.md`.
 - Hard gates respected: no broadcast, no chain mutation, no DB
   writes, no real `.env` edit, no private-key handling, no
   governance/timelock action, no `docker compose down -v`, no
@@ -205,14 +225,18 @@ was not stopped or restarted.
 
 ## Remaining blockers
 
-1. **MarginEngine integration gap.** `MarginEngineTrading.sol`
-   hardcodes `IFeesManagerV2.FlowKind.ORDERBOOK`. Even though the
-   discount math is wired and tested, OPTION RFQ trades that flow
-   through the MarginEngine today still bill the ORDERBOOK ppm. To
-   actually deliver RFQ discounts on chain, `MarginEngineTrading`
-   needs an `isRfq` bool plumbed through `applyTrade` → `consumeFees`.
-   This is a **contract redeploy + governance touch** and is queued
-   as V2G-O.
+1. **MarginEngine integration gap. — CLOSED at source by V2G-O.**
+   `MarginEngineTrading.sol` no longer hardcodes
+   `IFeesManagerV2.FlowKind.ORDERBOOK`: `applyTrade` and the new
+   `applyRfqTrade` (from sibling interface `IMarginEngineRfqTrade`)
+   both call into a shared `_applyTradeWithFlow(t, flow)` helper that
+   threads the FlowKind to `consumeFees`. The
+   `OptionMatchingEngine.executeRfqTrade` entry point exposes this
+   path with a dedicated EIP-712 typehash so maker/taker explicitly
+   consent to the RFQ schedule. **The live on-chain redeploy
+   itself is queued as V2G-P** — until then, the deployed bytecode
+   continues to bill ORDERBOOK ppm regardless of the matching-engine
+   selector. Details: `docs/OPTION_RFQ_FLOW_WIRING_V2G_O.md`.
 2. **PerpEngine integration gap.** Same shape as MarginEngine.
    PERP RFQ default discount is 0% so the on-chain billing is
    unchanged, but the structural plumbing is missing for any future
@@ -225,7 +249,13 @@ was not stopped or restarted.
 
 ## Next recommended milestone
 
-**V2G-O — wire `FlowKind.RFQ` through the MarginEngine + OptionMatchingEngine path so OPTION RFQ discounts take effect on chain.**
+**V2G-P — broadcast the V2G-O redeploy and exercise the RFQ path
+live.** V2G-O ships the source-level wiring (sibling interface,
+shared internal helper, dedicated EIP-712 typehash, 6 new tests
+covering the V2G-N canonical table through the MarginEngine path);
+V2G-P is the governance-broadcast + signing-CLI-extension step that
+makes the discounts visible on the indexer Grafana dashboard. See
+`docs/OPTION_RFQ_FLOW_WIRING_V2G_O.md` for the broadcast checklist.
 
 - Add an `isRfq` bool to `OptionMatchingEngine.executeTrade` (or
   reuse `OptionTrade.flowKind`).
