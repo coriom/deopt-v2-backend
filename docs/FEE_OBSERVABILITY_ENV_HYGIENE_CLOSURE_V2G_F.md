@@ -566,3 +566,12 @@ Secret hygiene contracts preserved:
 
 Full record: `docs/V2_FEE_BACKEND_EXECUTOR_READINESS_V2G_M.md`.
 Test suite: 679 → 694 passed (+15 V2G-M tests).
+
+---
+
+## V2G-T canonical reference
+
+V2G-F's observability env-hygiene closure is reflected in
+Section 6 (Metrics) and Section 7 (Admin Endpoints) of the
+canonical V2 fee audit pack at
+`docs/DEOPT_V2_CANONICAL_FEE_AUDIT_PACK_V2G_T.md`.

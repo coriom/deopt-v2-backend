@@ -1317,5 +1317,14 @@ all evaluated logically against the current `/metrics` shape and
 none would fire. The deployable rules + Grafana dashboard + frontend
 admin section + operator `.env` patch are now committed.
 
+---
+
+## V2G-T canonical reference
+
+The V2G-E live tx hashes (PERP `0x5c15…aa394`, OPTION
+`0x9a85…93149`) and the post-V2G-E `rebateBudget(mUSDC) = 999987`
+value are reproduced in Section 5 of the canonical V2 fee audit
+pack at `docs/DEOPT_V2_CANONICAL_FEE_AUDIT_PACK_V2G_T.md`.
+
 Test suite: 675 → 679 (+4 V2G-G HTTP tests on the new admin endpoint).
 

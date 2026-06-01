@@ -254,6 +254,14 @@ was not stopped or restarted.
 4. **Canonical V2G-K day-1 24h gate** still reserved for
    `2026-06-01T17:38Z`.
 
+## V2G-T canonical reference
+
+The canonical V2 fee audit pack at
+`docs/DEOPT_V2_CANONICAL_FEE_AUDIT_PACK_V2G_T.md` consolidates
+V2G-N's OPTION RFQ discount math (Section 1.2), source-of-truth
+policy (Section 3.3), and live-state references (Section 5) into
+the single audit reference doc.
+
 ## Next recommended milestone
 
 **V2G-P — broadcast the V2G-O redeploy and exercise the RFQ path

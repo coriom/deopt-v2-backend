@@ -200,6 +200,13 @@ work before V2G-R5 broadcast is the FM-V2 ↔ ProtocolFeeVault
 hook ABI extension (V2G-R3) plus the CollateralVault
 `transferFromInternalAccount` extension.
 
+## V2G-T canonical reference
+
+V2G-Q's tier + root matrix is consolidated into Section 2 of the
+canonical V2 fee audit pack at
+`docs/DEOPT_V2_CANONICAL_FEE_AUDIT_PACK_V2G_T.md`. The audit pack
+is the single reference doc operators / auditors should read first.
+
 ## Next recommended milestone
 
 **V2G-R — close the FeesManagerV2 setter / consumer / budget

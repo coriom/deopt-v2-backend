@@ -666,3 +666,14 @@ no docker, no `.env`, no live state touched.
   policy, PERP scope.
 - **Soak preservation**: ✅ PID 56199 alive 16h22m+, Prometheus
   healthy, all 4 compose containers Up 16h+, no live touch.
+
+---
+
+## V2G-T canonical reference
+
+The ProtocolFeeVault design is consolidated alongside the rest of
+the V2 fee surface in
+`docs/DEOPT_V2_CANONICAL_FEE_AUDIT_PACK_V2G_T.md` — Section 8
+(Current Deployment Status), Section 9 (Production Gaps), and
+Section 15 (Next Recommended Milestone) reference the vault's
+offline-ready status and the V2G-R3 / R5 broadcast prerequisites.

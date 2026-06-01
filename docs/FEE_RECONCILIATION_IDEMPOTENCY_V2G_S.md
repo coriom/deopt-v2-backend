@@ -260,6 +260,14 @@ never override on-chain totals.
 | No `.env` edit | ✅ |
 | No DB writes (incl. no migrations) | ✅ |
 
+## V2G-T canonical reference
+
+The canonical V2 fee audit pack that consolidates V2G-A through V2G-S
+into a single reference doc lives at
+`docs/DEOPT_V2_CANONICAL_FEE_AUDIT_PACK_V2G_T.md`. V2G-S's
+dedup / source-of-truth / aggregation policies are reflected verbatim
+in sections 3 and 4 of that pack.
+
 ## Remaining blockers
 
 1. **Reorg-aware aggregation.** Aggregator does not filter

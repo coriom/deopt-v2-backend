@@ -223,6 +223,13 @@ V2G-R2 implementation work — see V2G-R0/R1 design / impl docs.
    broadcast pending.
 5. **V2G-M endpoint pickup** still queued for backend restart.
 
+## V2G-T canonical reference
+
+V2G-R2's admin / setter / budget matrix is consolidated into
+Section 10 (Audit Checklist) and Section 4 (Accounting Rules) of
+the canonical V2 fee audit pack at
+`docs/DEOPT_V2_CANONICAL_FEE_AUDIT_PACK_V2G_T.md`.
+
 ## Next recommended milestone
 
 **V2G-R3 — wire FeesManagerV2 ↔ ProtocolFeeVault hooks + add the
