@@ -1,4 +1,5 @@
 use super::AppState;
+use crate::admin::{authenticate, require_role, required_role_for, AdminAuthError, AdminIdentity};
 use crate::api::dto::{
     parse_fixed_u128, ApiEngineEvent, ApiExecutionIntent, SubmitOrderRequest, SubmitOrderResponse,
 };
@@ -106,7 +107,128 @@ use std::str::FromStr;
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
+/// V2G-W2 — admin route gate middleware.
+///
+/// Runs for every incoming request. For non-`/admin/*` paths, passes
+/// through untouched. For `/admin/*` paths:
+///
+/// 1. Resolve the required role via `required_role_for(method, path)`
+///    (V2G-W1 mapping).
+/// 2. Call `authenticate(&state.admin_config, …)` to derive the
+///    caller's identity under the configured `AuthMode`.
+/// 3. Call `require_role(identity, required)` to enforce the
+///    minimum-authority gate.
+/// 4. Emit a single audit-log line via `tracing::info!` with
+///    `target: "deopt.admin.audit"` — method, path, required role,
+///    granted role (on allow), identity name, decision, deny reason
+///    (on deny), and the configured auth_mode. The audit log NEVER
+///    contains the candidate token, the configured token, the
+///    `Authorization` header value, or any private-key material.
+/// 5. On deny: short-circuit with HTTP 403 + `{"error":"…"}` JSON,
+///    matching today's `ensure_admin_access` error payload shape.
+/// 6. On allow: pass through to the route handler. Handler-side
+///    `ensure_admin_access` continues to run as a defense-in-depth
+///    layer; both gates accept the same token + run the same V2G-W0
+///    constant-time compare, so the second check is a no-op in the
+///    happy path. This dual-check is intentional during the V2G-W2
+///    cutover window; V2G-W3 removes the handler-side check after a
+///    soak window confirms the middleware is the only authoritative
+///    gate.
+async fn admin_route_gate(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let path = request.uri().path().to_string();
+    if !path.starts_with("/admin/") {
+        return next.run(request).await;
+    }
+
+    let method = request.method().clone();
+    let method_str = method.as_str();
+    let required = required_role_for(method_str, &path);
+    let auth_mode = state.admin_config.auth_mode();
+
+    // Build a header lookup closure that doesn't keep references to
+    // header values past the borrow scope.
+    let headers = request.headers().clone();
+    let header_lookup = |name: &str| -> Option<String> {
+        headers
+            .iter()
+            .find(|(k, _)| k.as_str().eq_ignore_ascii_case(name))
+            .and_then(|(_, v)| v.to_str().ok())
+            .map(|s| s.to_string())
+    };
+
+    match authenticate(&state.admin_config, header_lookup) {
+        Ok(identity) => match require_role(&identity, required) {
+            Ok(()) => {
+                tracing::info!(
+                    target: "deopt.admin.audit",
+                    method = %method_str,
+                    path = %path,
+                    required_role = %required.as_str(),
+                    granted_role = %identity.role().as_str(),
+                    identity = %identity.name(),
+                    decision = %"allow",
+                    auth_mode = %auth_mode.as_str(),
+                    "admin request allowed"
+                );
+                next.run(request).await
+            }
+            Err(err) => admin_audit_deny(&method, &path, required, Some(&identity), auth_mode, err),
+        },
+        Err(err) => admin_audit_deny(&method, &path, required, None, auth_mode, err),
+    }
+}
+
+/// V2G-W2 — emit a `deny` audit-log line and build the HTTP 403
+/// response in the same shape as `ApiError::forbidden`. Never logs
+/// secret material; the `AdminAuthError::Display` impl was hardened
+/// in V2G-W1 to redact tokens / JWTs / configured-token bytes.
+fn admin_audit_deny(
+    method: &axum::http::Method,
+    path: &str,
+    required: crate::admin::AdminRole,
+    identity: Option<&AdminIdentity>,
+    auth_mode: crate::admin::AuthMode,
+    err: AdminAuthError,
+) -> Response {
+    let reason = err.to_string();
+    if let Some(identity) = identity {
+        tracing::warn!(
+            target: "deopt.admin.audit",
+            method = %method.as_str(),
+            path = %path,
+            required_role = %required.as_str(),
+            granted_role = %identity.role().as_str(),
+            identity = %identity.name(),
+            decision = %"deny",
+            reason = %reason,
+            auth_mode = %auth_mode.as_str(),
+            "admin request denied (insufficient role)"
+        );
+    } else {
+        tracing::warn!(
+            target: "deopt.admin.audit",
+            method = %method.as_str(),
+            path = %path,
+            required_role = %required.as_str(),
+            decision = %"deny",
+            reason = %reason,
+            auth_mode = %auth_mode.as_str(),
+            "admin request denied (auth failure)"
+        );
+    }
+    (
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({ "error": reason })),
+    )
+        .into_response()
+}
+
 pub fn router(state: AppState) -> Router {
+    let gate_state = state.clone();
     Router::new()
         .route("/health", get(health))
         .route("/ready", get(ready))
@@ -295,6 +417,10 @@ pub fn router(state: AppState) -> Router {
             get(admin_fees_v2_smoke_readiness),
         )
         .route("/admin/recent", get(admin_recent))
+        .layer(axum::middleware::from_fn_with_state(
+            gate_state,
+            admin_route_gate,
+        ))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -5902,6 +6028,146 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    // ============================================================
+    //   V2G-W2 — middleware route-gate integration tests
+    // ============================================================
+
+    // The SharedToken auth mode (today's production posture) returns
+    // an `Operator` identity, so every currently-routed admin
+    // endpoint passes the role gate. These tests pin behavioural
+    // parity for the new middleware on top of the existing
+    // ensure_admin_access handler check.
+
+    #[tokio::test]
+    async fn v2gw2_middleware_lets_valid_token_reach_viewer_route() {
+        let response = router(admin_state(true))
+            .oneshot(get_request("/admin/status", Some("test-admin-token")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn v2gw2_middleware_lets_valid_token_reach_operator_route() {
+        // /admin/fees/v2/smoke/readiness is the only operator-class
+        // GET route today. SharedToken => Operator identity => allow.
+        let response = router(admin_state(true))
+            .oneshot(get_request(
+                "/admin/fees/v2/smoke/readiness",
+                Some("test-admin-token"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn v2gw2_middleware_blocks_missing_token_on_viewer_route() {
+        let response = router(admin_state(true))
+            .oneshot(get_request("/admin/status", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let json = response_json(response).await;
+        assert_eq!(json["error"], "admin token is required");
+    }
+
+    #[tokio::test]
+    async fn v2gw2_middleware_blocks_wrong_token_on_viewer_route() {
+        let response = router(admin_state(true))
+            .oneshot(get_request("/admin/status", Some("not-the-token")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let json = response_json(response).await;
+        assert_eq!(json["error"], "invalid admin token");
+    }
+
+    #[tokio::test]
+    async fn v2gw2_middleware_blocks_operator_route_under_jwt_fail_closed() {
+        // AuthMode::Jwt is intentionally NOT implemented in V2G-W1.
+        // The middleware must fail-closed: even a "Bearer …" header
+        // never authenticates while the verifier is a stub.
+        let mut state = admin_state(true);
+        state
+            .admin_config
+            .set_auth_mode(crate::admin::AuthMode::Jwt);
+        let response = router(state)
+            .oneshot(get_request(
+                "/admin/fees/v2/smoke/readiness",
+                Some("test-admin-token"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let json = response_json(response).await;
+        assert_eq!(json["error"], "admin JWT auth mode is not implemented");
+    }
+
+    #[tokio::test]
+    async fn v2gw2_middleware_disabled_mode_lets_request_through_without_token() {
+        // AuthMode::Disabled is the explicit local-dev escape hatch.
+        // Middleware grants Breakglass identity → every role passes.
+        // NOTE: validate_startup blocks Disabled + require_token=true
+        // for boot-time misconfig; this test sets the mode at runtime
+        // to verify the *middleware* behaves as documented.
+        let mut state = admin_state(false); // require_token=false to match disabled posture
+        state
+            .admin_config
+            .set_auth_mode(crate::admin::AuthMode::Disabled);
+        let response = router(state)
+            .oneshot(get_request("/admin/status", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn v2gw2_middleware_passes_through_non_admin_paths() {
+        // `/health` must remain reachable without any admin
+        // authentication, even when require_token=true. The
+        // middleware short-circuits on non-/admin/* paths.
+        let response = router(admin_state(true))
+            .oneshot(get_request("/health", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn v2gw2_middleware_403_body_never_contains_token_material() {
+        let mut state = admin_state(true);
+        // Set a recognisable token-looking string so the negative
+        // assertions are meaningful.
+        state.admin_config = crate::admin::AdminConfig::new(
+            true,
+            true,
+            Some("very-secret-admin-token-canary".to_string()),
+        );
+        let response = router(state)
+            .oneshot(get_request(
+                "/admin/status",
+                Some("attacker-supplied-token-canary"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body_text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            !body_text.contains("very-secret-admin-token-canary"),
+            "403 body leaks configured token: {body_text}"
+        );
+        assert!(
+            !body_text.contains("attacker-supplied-token-canary"),
+            "403 body leaks candidate token: {body_text}"
+        );
+        assert!(
+            !body_text.contains("eyJ"),
+            "403 body contains base64-flavoured JWT material: {body_text}"
+        );
     }
 
     #[tokio::test]

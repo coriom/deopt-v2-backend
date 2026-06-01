@@ -451,6 +451,22 @@ beyond identity, no path parameters that could carry a secret.
 
 ---
 
+## V2G-W2 progress note (appended 2026-06-01)
+
+V2G-W2 wires the V2G-W1 primitives into the live `/admin/*` route
+gate via an `axum::middleware::from_fn_with_state` layer. Audit
+logging is emitted as `tracing::info!` / `tracing::warn!` with
+`target: "deopt.admin.audit"`, capturing method / path / required
+role / granted role / identity / decision / auth_mode. The
+audit-log line never carries token bytes / JWT bytes / private
+keys. JWT mode remains fail-closed; SharedToken stays
+bit-for-bit compatible. 8 new V2G-W2 integration tests pin the
+middleware behaviour (viewer/operator routes, missing/wrong token,
+JWT fail-closed, Disabled mode, non-admin pass-through, 403 body
+token-leakage smoke). T1 / T2 / T7 from §7 of this doc are
+materially mitigated (per-identity JWT remains the V2G-W3 step).
+Full record: `docs/ADMIN_RBAC_ROUTE_ENFORCEMENT_V2G_W2.md`.
+
 ## V2G-W1 progress note (appended 2026-06-01)
 
 The **role model + identity + auth-mode primitives** from §2 and §3

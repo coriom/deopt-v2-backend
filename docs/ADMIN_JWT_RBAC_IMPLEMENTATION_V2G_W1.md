@@ -238,3 +238,24 @@ V2G-W2 is independently shippable from the actual JWT verifier
 because the V2G-W1 model already returns useful identities
 under `SharedToken` mode. JWT lands as V2G-W3 alongside the
 Next.js SSR proxy.
+
+---
+
+## V2G-W2 follow-up (appended 2026-06-01)
+
+V2G-W2 wired the V2G-W1 `authenticate` / `require_role` primitives
+into the live `/admin/*` route gate via a single
+`axum::middleware::from_fn_with_state` layer. The
+`ensure_admin_access` handler-side check stays in place as
+defence-in-depth for the cutover window. Audit logging is now
+emitted on every admin request (allow + deny lines via
+`tracing::info!` / `tracing::warn!` with
+`target: "deopt.admin.audit"`). SharedToken compatibility is
+bit-for-bit preserved; pre-V2G-W2 admin-token tests remain green.
+
+JWT mode (`AuthMode::Jwt`) is still fail-closed — middleware
+returns 403 `"admin JWT auth mode is not implemented"`.
+V2G-W3 implements the real verifier.
+
+Full record:
+`docs/ADMIN_RBAC_ROUTE_ENFORCEMENT_V2G_W2.md`.

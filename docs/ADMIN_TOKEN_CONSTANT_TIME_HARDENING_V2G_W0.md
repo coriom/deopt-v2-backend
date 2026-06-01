@@ -219,6 +219,19 @@ role table + integration tests. Each is independently reviewable.
 
 ---
 
+## V2G-W2 follow-up (appended 2026-06-01)
+
+V2G-W2 wired the V2G-W0 constant-time `token_matches` path into a
+new `axum::middleware::from_fn_with_state` route gate that also
+emits a structured audit-log line per admin request. The V2G-W0
+constant-time guarantee continues to hold — the middleware
+ultimately delegates to `AdminConfig::token_matches` for the
+SharedToken accept/reject decision. 8 new V2G-W2 middleware
+integration tests pin the end-to-end behaviour (incl. a
+403-body-never-leaks-token assertion).
+
+Full record: `docs/ADMIN_RBAC_ROUTE_ENFORCEMENT_V2G_W2.md`.
+
 ## V2G-W1 follow-up (appended 2026-06-01)
 
 The V2G-W0 constant-time path is now reused by the V2G-W1 role

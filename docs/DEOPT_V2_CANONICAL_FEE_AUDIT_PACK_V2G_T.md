@@ -374,7 +374,7 @@ will surface on both `/admin/fees/onchain` and the lifecycle view.
 - ✅ `/health` exposes liveness — confirmed by 18 h+ soak.
 - ✅ Prometheus scrape exposes all V2 fee counters/gauges — V2G-G.
 - ✅ Local L0 compose stack runs Prometheus + Alertmanager + Grafana + webhook-sink — V2G-L0/L1/L2/L3.
-- ✅ Day-1 24 h soak gate elapsed at `2026-06-01T17:38Z` (PID 56199 uptime 18 h+ at the time of writing).
+- ✅ Day-1 24 h soak gate elapsed at wall-clock UTC `2026-06-01T17:38Z` and was canonically validated by the V2G-L4 checkpoint run (`docs/V2_FEE_OBSERVABILITY_LOCAL_COMPOSE_DAY1_CANONICAL_V2G_L4.md`). The gate is wall-clock UTC, NOT backend-process / container uptime.
 - ⏳ Target-host monitoring cutover (canonical Grafana/Prometheus) — queued for V2G-J close.
 
 ---
@@ -432,7 +432,7 @@ will surface on both `/admin/fees/onchain` and the lifecycle view.
 | `/health` | ✅ `{"ok":true,"service":"deopt-v2-backend"}` |
 | Prometheus `/-/healthy` | ✅ |
 | Compose containers up | ✅ 4/4 (grafana, prometheus, alertmanager, webhook-sink) Up 18 h+ |
-| Day-1 24 h soak gate `2026-06-01T17:38Z` | ✅ **elapsed** at the time of V2G-T close |
+| Day-1 24 h soak gate `2026-06-01T17:38Z` (wall-clock UTC) | reserved at the time of V2G-T close; canonically validated later by V2G-L4. Gate is wall-clock UTC, NOT backend-process or container uptime. |
 | No `docker compose down` | ✅ |
 | No backend restart | ✅ |
 | No Prometheus reset | ✅ |
