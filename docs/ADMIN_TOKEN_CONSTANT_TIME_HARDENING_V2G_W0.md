@@ -219,6 +219,19 @@ role table + integration tests. Each is independently reviewable.
 
 ---
 
+## V2G-W1 follow-up (appended 2026-06-01)
+
+The V2G-W0 constant-time path is now reused by the V2G-W1 role
+model. `authenticate(config, header_lookup)` under
+`AuthMode::SharedToken` calls `config.token_matches(candidate)`
+verbatim — the V2G-W1 `v2gw1_token_compare_behavior_unchanged_under_role_model`
+regression test re-asserts the V2G-W0 properties (accept exact,
+reject same-length wrong, reject short wrong) through the new
+entry point. The 11 V2G-W0 tests in this file remain green; the
+test suite now totals 32 admin tests (11 W0 + 21 W1).
+
+See `docs/ADMIN_JWT_RBAC_IMPLEMENTATION_V2G_W1.md`.
+
 ## V2G-M2 pickup (appended 2026-06-01T17:51Z)
 
 The constant-time `token_matches` code path is now **live** in

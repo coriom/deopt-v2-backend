@@ -451,6 +451,32 @@ beyond identity, no path parameters that could carry a secret.
 
 ---
 
+## V2G-W1 progress note (appended 2026-06-01)
+
+The **role model + identity + auth-mode primitives** from §2 and §3
+are now implemented in `src/admin.rs` and pinned by 21 unit tests
+(`v2gw1_*`). Specifically:
+
+- `AdminRole` enum with `Viewer < Operator < GovernanceAdmin <
+  Breakglass` ordering + `implies()` helper.
+- `AdminIdentity { name, role }` with `Debug` that redacts the
+  principal name.
+- `AuthMode { SharedToken, Jwt, Disabled }`; default `SharedToken`
+  for backwards compatibility with V2G-W0.
+- `required_role_for(method, path)` lookup pinned by tests
+  against every route in §1.
+- `authenticate(config, header_lookup)` entry point that returns
+  an identity under the configured mode.
+- `require_role(identity, required)` helper.
+
+JWT mode is intentionally stubbed (`AdminAuthError::JwtNotImplemented`)
+— fail-closed. Real JWT verifier + route handler migration are
+the V2G-W2 / V2G-W3 milestones. The live backend (V2G-M2 PID
+231297) is not affected; existing `ensure_admin_access`
+shared-token gate is untouched.
+
+Full record: `docs/ADMIN_JWT_RBAC_IMPLEMENTATION_V2G_W1.md`.
+
 ## Constant-time compare finding (C) — CLOSED by V2G-W0
 
 **Original finding (V2G-V close):** `src/admin.rs:50` used
