@@ -579,7 +579,7 @@ V2G-R-backend (separate milestone).
 | Milestone | Deliverable |
 |---|---|
 | **V2G-R0** (this doc) | Design spec only. **DONE.** |
-| **V2G-R1** | Implement `ProtocolFeeVault.sol` + unit + invariant tests offline, no deploy. |
+| **V2G-R1** | Implement `ProtocolFeeVault.sol` + unit + invariant tests offline, no deploy. **DONE — see `deopt-v2-sol/docs/PROTOCOL_FEE_VAULT_IMPLEMENTATION_V2G_R1.md`.** |
 | **V2G-R2** | Add `onFeeCharged` / `onRebatePaid` hooks to FM-V2 (or pick Option α). |
 | **V2G-R3** | Operator scripts (`Preflight…`, `Rewire…`) + integration tests. |
 | **V2G-R4** | Backend metrics + Grafana panels + alerts. |

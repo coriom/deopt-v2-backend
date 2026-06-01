@@ -187,6 +187,19 @@ governance.
    (V2G-O bytecode broadcast) still pending.
 4. **V2G-M endpoint pickup requires backend restart.**
 
+## V2G-R2 follow-up (2026-06-01)
+
+V2G-R2 has closed the orthogonal admin / setter / consumer /
+budget axis with 34 new tests (`testV2GR2_*`) covering every
+owner-facing surface on FeesManagerV2. See
+`docs/FEES_MANAGER_V2_ADMIN_BUDGET_MATRIX_V2G_R2.md`.
+
+**Together V2G-Q + V2G-R2 cover the entire offline behavior
+surface of FeesManagerV2.** The only remaining contract-side
+work before V2G-R5 broadcast is the FM-V2 ↔ ProtocolFeeVault
+hook ABI extension (V2G-R3) plus the CollateralVault
+`transferFromInternalAccount` extension.
+
 ## Next recommended milestone
 
 **V2G-R — close the FeesManagerV2 setter / consumer / budget
