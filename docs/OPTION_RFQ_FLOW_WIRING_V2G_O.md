@@ -138,6 +138,13 @@ is pinned by a backend unit test so a future contract-side change
 breaks the test immediately. See
 `docs/OPTION_RFQ_LIVE_DEPLOYMENT_PREFLIGHT_V2G_P0.md`.
 
+**V2G-P1 follow-up (2026-06-01).** Operator-facing artifacts now shipped:
+- `script/PreflightOptionRfqEntryPoints.s.sol` — read-only bytecode-scan selector probe.
+- `script/SmokeOptionRfqV2Fees.s.sol` — read-only RFQ-fee preflight asserting `FlowKind.RFQ` on both quote legs.
+- `script/SmokeOptionRfqV2FeesExecute.s.sol` — scaffold producing an offline-signable EIP-712 digest under a confirm gate; does NOT broadcast.
+- `src/options/rfq_operator_packet.rs` — safe-by-default packet generator with explicit `OPTION_RFQ_OPERATOR_BROADCAST_CONFIRM` gate.
+See `docs/OPTION_RFQ_OPERATOR_PACKET_V2G_P1.md`.
+
 ## Validation
 
 Solidity:

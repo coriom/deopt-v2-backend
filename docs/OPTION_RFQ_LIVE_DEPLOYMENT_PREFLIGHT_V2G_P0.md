@@ -126,7 +126,7 @@ ORDERBOOK path remains intact:
 | `SmokeOptionV2Rebate.s.sol` | Read-only preflight checker for the OPTION rebate path | **Re-usable as-is for ORDERBOOK smoke**. Does NOT cover RFQ. |
 | `SmokeOptionV2RebateExecute.s.sol` | Broadcast smoke ORDERBOOK rebate trade | **Re-usable for ORDERBOOK**. Does NOT cover RFQ. |
 
-### Script gaps (queued, not implemented in V2G-P0)
+### Script gaps (V2G-P0 left these queued; V2G-P1 ships them)
 
 | New script | Purpose | Hard rule | Owner |
 |---|---|---|---|
@@ -233,6 +233,17 @@ Frontend: untouched in V2G-P0 scope.
 
 ### Solidity
 - None — V2G-O source remains the single ABI delivery.
+
+## V2G-P1 status update (2026-06-01)
+
+V2G-P1 has now closed every queued item in this doc:
+
+- `script/PreflightOptionRfqEntryPoints.s.sol` — **shipped** (bytecode-scan probe; 4 Sol unit tests in `test/unit/scripts/PreflightOptionRfqEntryPoints.t.sol`).
+- `script/SmokeOptionRfqV2Fees.s.sol` — **shipped** (read-only RFQ-fee preflight; flow + fee + rebate-budget assertions).
+- `script/SmokeOptionRfqV2FeesExecute.s.sol` — **shipped as scaffold** (refuses without `SMOKE_OPTION_RFQ_V2_FEES_EXECUTE_CONFIRM=true`; even when confirmed, prepares the EIP-712 digest but does NOT broadcast — that lands in V2G-P2).
+- Backend RFQ operator packet — **shipped** as `src/options/rfq_operator_packet.rs` (10 unit tests; broadcast-confirm gate uses literal `"true"`; `payload_summary` excludes signatures).
+
+See `docs/OPTION_RFQ_OPERATOR_PACKET_V2G_P1.md` for the full V2G-P1 surface.
 
 ## Remaining blockers
 

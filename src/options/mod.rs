@@ -3,6 +3,7 @@ pub mod event_indexer;
 pub mod execution;
 pub mod lifecycle;
 pub mod reconciliation_worker;
+pub mod rfq_operator_packet;
 pub mod series_id;
 pub mod service;
 pub mod signing;
@@ -41,14 +42,22 @@ pub use state_checks::{
 
 pub use execution::{
     build_option_execution_transaction_request, compute_required_gas,
-    encode_option_execute_trade_calldata, expected_option_execute_trade_selector,
-    normalize_u256_string, option_execute_trade_selector, option_execution_broadcast_gas_limit,
-    option_execution_intent_id_to_b256, option_execution_intent_id_to_hex_bytes32,
-    option_execution_simulation_pending, option_execution_simulation_unavailable,
-    option_product_registry_option_id, option_trade_digest, option_trade_digest_bytes,
+    encode_option_execute_rfq_trade_calldata, encode_option_execute_trade_calldata,
+    expected_option_execute_rfq_trade_selector, expected_option_execute_trade_selector,
+    normalize_u256_string, option_execute_rfq_trade_selector, option_execute_trade_selector,
+    option_execution_broadcast_gas_limit, option_execution_intent_id_to_b256,
+    option_execution_intent_id_to_hex_bytes32, option_execution_simulation_pending,
+    option_execution_simulation_unavailable, option_product_registry_option_id,
+    option_rfq_trade_digest, option_rfq_trade_digest_bytes, option_rfq_trade_typehash,
+    option_trade_digest, option_trade_digest_bytes, option_trade_typehash,
     perform_option_broadcast_gas_safety_check, simulate_option_execution_intent,
     validate_simulation_intent, validate_simulation_target, OptionExecutionGasSafetyCheck,
-    OptionTradePayload, OptionTradeSignatureBundle, OPTION_TRADE_TYPE,
+    OptionTradePayload, OptionTradeSignatureBundle, OPTION_EXECUTE_RFQ_TRADE_SIGNATURE,
+    OPTION_EXECUTE_TRADE_SIGNATURE, OPTION_RFQ_TRADE_TYPE, OPTION_TRADE_TYPE,
+};
+pub use rfq_operator_packet::{
+    build_option_rfq_operator_packet, OptionRfqOperatorBroadcastError, OptionRfqOperatorPacket,
+    OptionRfqOperatorPacketInputs, OPTION_RFQ_OPERATOR_BROADCAST_CONFIRM_ENV,
 };
 pub use series_id::{option_series_id, OptionSeriesIdInput};
 pub use signing::{

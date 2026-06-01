@@ -45,6 +45,13 @@
     (no state migration). Strategy A selected: redeploy MarginEngine
     + first-deploy OptionMatchingEngine + rewire in one operator
     window. See `docs/OPTION_RFQ_LIVE_DEPLOYMENT_PREFLIGHT_V2G_P0.md`.
+  - **V2G-P1 update (2026-06-01).** Forge operator scripts shipped
+    (`PreflightOptionRfqEntryPoints`, `SmokeOptionRfqV2Fees`,
+    `SmokeOptionRfqV2FeesExecute` scaffold — all safe-by-default,
+    none broadcasts) plus the backend `rfq_operator_packet` module
+    with an explicit `OPTION_RFQ_OPERATOR_BROADCAST_CONFIRM` gate
+    that only accepts the literal `"true"`. See
+    `docs/OPTION_RFQ_OPERATOR_PACKET_V2G_P1.md`.
 - Hard gates respected: no broadcast, no chain mutation, no DB
   writes, no real `.env` edit, no private-key handling, no
   governance/timelock action, no `docker compose down -v`, no
