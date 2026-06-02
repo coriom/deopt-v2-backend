@@ -89,16 +89,25 @@ Audited via `grep` on the live V2 contracts in `~/DEOPT/deopt-v2-sol/src`.
 | `setEngine(addr)` (MarginEngine) | owner | critical |
 | `setRegistry(addr)` | owner | high |
 
-### 1.6 `ProtocolFeeVault` (V2G-R1)
+### 1.6 `ProtocolFeeVault` (V2G-R1 + V2G-RX.1)
 
 | Function | Authority | Risk |
 |---|---|---|
 | `transferOwnership(newOwner)` | owner | critical |
 | `setRevenueReceiver(addr)` | owner | high |
-| `pauseRebates / unpauseRebates` | owner | high (V2G-R0 design suggests guardian for pause; impl uses owner only) |
+| `setGuardian(addr)` | owner | high (V2G-RX.1) |
+| `pauseRebates` | **guardian or owner** (V2G-RX.1) | medium (fast-pause) |
+| `unpauseRebates` | owner | high |
 | `allocateToRebateReserve(asset, amount)` | owner | medium |
 | `withdrawRevenue(asset, to, amount)` | owner | high |
 | `bootstrap(asset, gross, rebates, feeBalance, reserve)` | owner | high (one-shot per asset) |
+
+> **V2G-RX.1 update:** the V2G-R0 design intent (guardian for fast
+> pause, owner-only for unpause and heavy admin) is now implemented.
+> `setGuardian` is owner-only and accepts `address(0)` to explicitly
+> disable the fast-pause posture. Deployments shipping with
+> `guardian == address(0)` must record
+> `ALLOW_ZERO_GUARDIAN_CONFIRM=true` in the broadcast window log.
 
 ### 1.7 Cross-contract summary
 
