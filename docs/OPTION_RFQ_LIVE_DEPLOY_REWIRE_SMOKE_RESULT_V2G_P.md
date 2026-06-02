@@ -186,9 +186,26 @@ GET /admin/fees/onchain?tx_hash=0x0509d4a49d5c243c0506bd1988526cb841c1f4da40dad0
 | PERP counters `{consumer="new"}` 3/1, `{old}` 0, `{unknown}` 0 | unchanged | unchanged |
 | Alertmanager `OptionFeeConsumerUnknown` | not firing | not firing ✓ |
 
-### Residual hygiene note (not a V2G-P blocker)
+### Residual hygiene — closed by V2G-P-CLEAN1 (`2026-06-02 16:25Z`)
 
-The current backend process is bound to `HOST=127.0.0.1` rather than the V2G-M3 standard `HOST=0.0.0.0`. As a result, the Prometheus container's `host.docker.internal` scrape target cannot reach the backend `/metrics` endpoint and `DeoptV2FeeMetricsAbsent` is firing in Prom. **The backend `/metrics` itself is correct** (numbers above are read directly from `127.0.0.1:8080/metrics`); this is purely a scrape-bind issue. Fix at the next backend restart by sourcing `/tmp/restart_backend_v2gp_pickup.sh` (which sets `HOST=0.0.0.0`). Not in scope for V2G-P close per operator's hard gate "Restart backend only after code/config fix and explicit report."
+The post-V2G-P backend process was bound to `HOST=127.0.0.1`, preventing Prometheus from scraping via `host.docker.internal`. Backend `/metrics` itself was correct; this was a scrape-bind issue only.
+
+V2G-P-CLEAN1 resolved it by:
+- SIGTERM-ing PID 65050 (debug build at `target/debug/`).
+- Launching the release binary via the updated `/tmp/restart_backend_v2gp_pickup.sh` with `HOST=0.0.0.0`.
+- Setting `OPTION_EVENT_INDEXER_POLL_INTERVAL_MS=30000` (was `86400000` = 24h) so future V2 fee events surface within one Prom scrape window without operator intervention.
+- New backend **PID 71706** on `0.0.0.0:8080`.
+- All V2G-P env overrides preserved (NEW_ME / NEW_OME / OLD_MARGIN_ENGINE_ADDRESS = V2G-P-previous / FM-V2 / observability OLD_PERP_ENGINE_ADDRESS).
+- All broadcast / execution surfaces remain disabled.
+- `/admin/fees/onchain` decode unchanged (indexer cursor persisted in DB across the restart): `event_model=mixed`, `fee_charged_v2_count=1`, `fee_rebated_v2_count=1`, `observed_total_charged=19`, `observed_total_rebated=10`, `by_flow.rfq=19`, `rebated_by_flow.rfq=10`.
+- `/metrics` unchanged: option charged{new=1,old=3,unknown=0}; option rebated{new=1,old=1,unknown=0}; rebateBudget(mUSDC)=999977.
+- Prom: 3/3 targets UP; 9/9 alert rules inactive; `DeoptV2FeeMetricsAbsent` cleared.
+- Alertmanager: 0 active alerts.
+- Grafana: healthy.
+
+**No chain mutation. No `.env` edit. No monitoring reset. No private key printed.**
+
+Lesson learned added to the V2G-P-backend pickup runbook: future restarts must use `HOST=0.0.0.0` (so the Prom container can scrape via `host.docker.internal` → `172.17.0.1`) and `OPTION_EVENT_INDEXER_POLL_INTERVAL_MS ≤ 60_000` (so newly indexed events surface in metrics within one scrape window).
 
 ### Lesson learned
 
