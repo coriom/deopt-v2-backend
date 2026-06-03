@@ -23,7 +23,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC_DIR="${HERE}/../../../prometheus"
 
-for f in v2_fee_alerts.bundle.yml v2_fee_alerts.stalled.yml; do
+for f in v2_fee_alerts.bundle.yml v2_fee_alerts.stalled.yml protocol_fee_vault_alerts.yml; do
   cp -v "${SRC_DIR}/${f}" "${HERE}/${f}"
 done
 

@@ -17,6 +17,9 @@ alerting:
 
 rule_files:
   - /etc/prometheus/rules/v2_fee_alerts.bundle.yml
+  # V2G-R5-OPS-P0 — ProtocolFeeVault observability alerts. Activated
+  # post-V2G-R5-LIVE-P1 once the vault is the live fee/rebate target.
+  - /etc/prometheus/rules/protocol_fee_vault_alerts.yml
   # The opt-in DeoptV2PerpRebateStalled rule is intentionally NOT
   # referenced here. Activate it only after the cadence gate in
   # docs/operator/V2G_J_STALLED_RULE_ACTIVATION_POLICY.md is met.
