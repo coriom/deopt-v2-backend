@@ -1,0 +1,117 @@
+# V2G-R5-OBS-P0 — ProtocolFeeVault observability alerts.
+#
+# Companion rule file to docs/monitoring/prometheus/v2_fee_alerts.bundle.yml.
+# Drop this file into the Prometheus rules directory alongside the V2G-G
+# bundle and reference it from prometheus.yml:
+#
+#   rule_files:
+#     - /etc/prometheus/rules/v2_fee_alerts.bundle.yml
+#     - /etc/prometheus/rules/protocol_fee_vault_alerts.yml
+#
+# Validate before deploying:
+#
+#   promtool check rules \
+#     docs/monitoring/prometheus/protocol_fee_vault_alerts.yml
+#
+# All four alerts are no-ops while
+# `deopt_protocol_fee_vault_configured == 0` (the pre-cutover state):
+# the per-asset gauges they reference simply do not exist yet, so the
+# alert expressions evaluate to the empty vector. Once the V2G-R5
+# ProtocolFeeVault deploy + cutover lands, `deopt_protocol_fee_vault_*`
+# series begin appearing and the alerts start firing on real data.
+#
+# Source for each alert: the PFV invariants documented in
+# `deopt-v2-sol/src/fees/ProtocolFeeVault.sol` §"Invariants" and the
+# V2G-RX backend observability spec
+# (`docs/PROTOCOL_FEE_VAULT_OBSERVABILITY_SPEC_V2G_RX.md`).
+
+groups:
+  # ---------------------------------------------------------------------
+  # ProtocolFeeVault — invariant + posture alerts.
+  # Source: V2G-R5-OBS-P0 (backend impl), V2G-RX (spec).
+  # ---------------------------------------------------------------------
+  - name: deopt_protocol_fee_vault_alerts
+    rules:
+      - alert: ProtocolFeeVaultDrift
+        # Magnitude gauge; non-zero ⇒ invariant 2 violated.
+        expr: deopt_protocol_fee_vault_drift_native > 0
+        for: 2m
+        labels:
+          severity: critical
+          subsystem: protocol_fee_vault
+          milestone: V2G-R5-OBS-P0
+        annotations:
+          summary: "ProtocolFeeVault accounting drift detected"
+          description: >-
+            asset {{ $labels.asset }} has
+            feeBalance + rebateReserve != CollateralVault.balances(vault, asset).
+            V2G-R1 invariant 2 is violated. Pause rebates immediately via
+            ProtocolFeeVault.pauseRebates() (guardian or owner) and
+            investigate using /admin/fees/vault/reconciliation. Do NOT
+            withdraw revenue until the drift is reconciled.
+          runbook_url: "docs/PROTOCOL_FEE_VAULT_OBSERVABILITY_V2G_R5_OBS_P0.md#protocolfeevaultdrift"
+
+      - alert: ProtocolFeeVaultRawErc20Dust
+        # Raw ERC-20 dust outside the CV ledger — vault is not supposed
+        # to hold tokens directly. Non-zero almost certainly means
+        # something transferred tokens to the vault address bypassing
+        # the FM-V2 hook path. Operator must reconcile or rescue.
+        expr: deopt_protocol_fee_vault_raw_erc20_balance_native > 0
+        for: 5m
+        labels:
+          severity: high
+          subsystem: protocol_fee_vault
+          milestone: V2G-R5-OBS-P0
+        annotations:
+          summary: "ProtocolFeeVault holds raw ERC-20 dust"
+          description: >-
+            IERC20({{ $labels.asset }}).balanceOf(ProtocolFeeVault) > 0.
+            The vault accounts via the CollateralVault ledger; raw token
+            balance bypasses the accounting layer. Possible causes:
+            misrouted transfer, leftover bootstrap residual, or
+            third-party donation. Inspect via
+            /admin/fees/vault/reconciliation and decide whether to
+            rescue via a one-off CollateralVault deposit or leave it
+            quarantined.
+          runbook_url: "docs/PROTOCOL_FEE_VAULT_OBSERVABILITY_V2G_R5_OBS_P0.md#protocolfeevaultrawerc20dust"
+
+      - alert: ProtocolFeeVaultReserveShortfall
+        # rebateReserve < FM-V2 rebateBudget cap ⇒ future rebate trades
+        # will revert at the vault hook (InsufficientRebateReserve).
+        # Top up via allocateToRebateReserve or wait for organic fees.
+        expr: deopt_protocol_fee_vault_reserve_shortfall_native > 0
+        for: 5m
+        labels:
+          severity: high
+          subsystem: protocol_fee_vault
+          milestone: V2G-R5-OBS-P0
+        annotations:
+          summary: "ProtocolFeeVault rebateReserve below FM-V2 rebateBudget"
+          description: >-
+            asset {{ $labels.asset }} has vault rebateReserve
+            ({{ with query (printf "deopt_protocol_fee_vault_rebate_reserve_native{asset=\"%s\"}" $labels.asset) }}{{ . | first | value }}{{ end }})
+            below the FM-V2 rebateBudget cap. Future rebate trades will
+            revert at the vault hook with InsufficientRebateReserve.
+            Refill via vault.allocateToRebateReserve(asset, amount) or
+            wait for organic fee inflow to top up.
+          runbook_url: "docs/PROTOCOL_FEE_VAULT_OBSERVABILITY_V2G_R5_OBS_P0.md#protocolfeevaultreserveshortfall"
+
+      - alert: ProtocolFeeVaultRebatesPaused
+        # Operator-side circuit breaker — fires immediately when set.
+        # The unpause is owner-only, so this alert stays active until
+        # explicit operator action clears it.
+        expr: deopt_protocol_fee_vault_rebates_paused == 1
+        for: 0m
+        labels:
+          severity: critical
+          subsystem: protocol_fee_vault
+          milestone: V2G-R5-OBS-P0
+        annotations:
+          summary: "ProtocolFeeVault rebate hook is paused"
+          description: >-
+            ProtocolFeeVault.rebatesPaused() is true. Every FM-V2 rebate
+            consumeFees call will revert at the vault hook with
+            RebatesPausedError. Operator intervention required: confirm
+            the pause is intentional, run the on-chain investigation,
+            then call ProtocolFeeVault.unpauseRebates() (owner-only).
+          runbook_url: "docs/PROTOCOL_FEE_VAULT_OBSERVABILITY_V2G_R5_OBS_P0.md#protocolfeevaultrebatespaused"

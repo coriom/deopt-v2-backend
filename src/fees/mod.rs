@@ -11,6 +11,7 @@ pub mod tier_merkle;
 pub mod tier_snapshot;
 pub mod types;
 pub mod v2_observability;
+pub mod vault_observability;
 
 pub use schedule::{
     launch_fee_schedule, FeeProduct, FeeTier, ResolvedFeeRates, MICRO_BPS_PER_BPS, RATE_DENOMINATOR,

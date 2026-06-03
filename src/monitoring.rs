@@ -492,7 +492,134 @@ async fn append_fee_metrics(state: &AppState, metrics: &mut MetricsText) -> Resu
         "Derived FeesManagerV2 rebate budget per settlement asset (sum of indexed RebateBudgetFunded minus Spent and Withdrawn; clamped at 0). Labelled by the lowercased settlement-asset address.",
         &[("asset", &rebate_budget_by_asset)],
     );
+
+    // V2G-R5-OBS-P0 — ProtocolFeeVault observability. Emits nothing
+    // when the vault address is unset (the pre-deploy posture). Best
+    // effort: any RPC failure means no rows for that asset are emitted
+    // rather than a metrics-render error.
+    append_protocol_fee_vault_metrics(state, metrics, &rebate_budget_by_asset).await;
+
     Ok(())
+}
+
+async fn append_protocol_fee_vault_metrics(
+    state: &AppState,
+    metrics: &mut MetricsText,
+    rebate_budget_by_asset: &BTreeMap<String, u64>,
+) {
+    use crate::fees::vault_observability as vault_obs;
+
+    let fallback_assets: Vec<String> = rebate_budget_by_asset.keys().cloned().collect();
+    let cfg = vault_obs::build_config(
+        state.execution_config.rpc_url.clone(),
+        Some(
+            state
+                .option_event_indexer_config
+                .collateral_vault_address
+                .clone(),
+        ),
+        state
+            .option_event_indexer_config
+            .fees_manager_v2_address
+            .clone(),
+        fallback_assets,
+    );
+    if !cfg.is_configured() {
+        // Emit the single global "configured" gauge so the operator
+        // can tell from /metrics alone whether the vault env is set.
+        metrics.gauge(
+            "deopt_protocol_fee_vault_configured",
+            "Set to 1 once PROTOCOL_FEE_VAULT_ADDRESS is configured. 0 means the V2G-R5 cutover has not happened yet.",
+            0,
+        );
+        return;
+    }
+    let Ok(snapshot) = vault_obs::read_snapshot(&cfg, rebate_budget_by_asset).await else {
+        metrics.gauge(
+            "deopt_protocol_fee_vault_configured",
+            "Set to 1 once PROTOCOL_FEE_VAULT_ADDRESS is configured. 0 means the V2G-R5 cutover has not happened yet.",
+            1,
+        );
+        return;
+    };
+    metrics.gauge(
+        "deopt_protocol_fee_vault_configured",
+        "Set to 1 once PROTOCOL_FEE_VAULT_ADDRESS is configured. 0 means the V2G-R5 cutover has not happened yet.",
+        1,
+    );
+    metrics.gauge(
+        "deopt_protocol_fee_vault_rebates_paused",
+        "Set to 1 when ProtocolFeeVault.rebatesPaused() is true.",
+        if vault_obs::rebates_paused(&snapshot) {
+            1
+        } else {
+            0
+        },
+    );
+    metrics.gauge(
+        "deopt_protocol_fee_vault_drift_present",
+        "Set to 1 when at least one configured asset has non-zero feeBalance+rebateReserve vs CV.balances drift.",
+        if vault_obs::any_drift_present(&snapshot) { 1 } else { 0 },
+    );
+
+    // Per-asset gauges. Each metric is described once via labeled_gauges
+    // with a fresh BTreeMap so the help/type header is emitted exactly
+    // once per metric name even when multiple assets are configured.
+    let rows = vault_obs::metric_rows(&snapshot);
+    let mut by_metric: BTreeMap<&'static str, BTreeMap<String, u64>> = BTreeMap::new();
+    for r in &rows {
+        // Saturating parse: U256 values that exceed u64 are clamped so
+        // the metric remains numeric. Operators inspecting the JSON
+        // endpoint get the full uint string.
+        let value: u64 = r
+            .value
+            .parse::<u128>()
+            .map(|v| v.min(u64::MAX as u128) as u64)
+            .unwrap_or(0);
+        by_metric
+            .entry(r.metric)
+            .or_default()
+            .entry(r.asset.clone())
+            .and_modify(|v| *v = v.saturating_add(value))
+            .or_insert(value);
+    }
+    for (metric, by_asset) in by_metric {
+        let help: &'static str = vault_metric_help(metric);
+        metrics.labeled_gauges(metric, help, &[("asset", &by_asset)]);
+    }
+}
+
+fn vault_metric_help(metric: &str) -> &'static str {
+    match metric {
+        "deopt_protocol_fee_vault_fee_balance_native" => {
+            "ProtocolFeeVault.feeBalance(asset). Spendable positive-fee balance per settlement asset."
+        }
+        "deopt_protocol_fee_vault_rebate_reserve_native" => {
+            "ProtocolFeeVault.rebateReserve(asset). Spendable rebate-reserve balance per settlement asset."
+        }
+        "deopt_protocol_fee_vault_gross_fees_collected_native" => {
+            "ProtocolFeeVault.grossFeesCollected(asset). Monotonic cumulative positive-fee inflow per settlement asset."
+        }
+        "deopt_protocol_fee_vault_rebates_paid_native" => {
+            "ProtocolFeeVault.rebatesPaid(asset). Monotonic cumulative rebate outflow per settlement asset."
+        }
+        "deopt_protocol_fee_vault_net_revenue_native" => {
+            "ProtocolFeeVault.netRevenue(asset). Cached grossFeesCollected − rebatesPaid per settlement asset."
+        }
+        "deopt_protocol_fee_vault_internal_collateral_vault_balance_native" => {
+            "CollateralVault.balances(vault, asset). Internal-account funds the vault controls in the CV ledger."
+        }
+        "deopt_protocol_fee_vault_raw_erc20_balance_native" => {
+            "IERC20(asset).balanceOf(vault). Raw ERC-20 dust the vault holds outside its CV ledger account; expected to be 0."
+        }
+        "deopt_protocol_fee_vault_drift_native" => {
+            "abs(CV.balances(vault, asset) − feeBalance(asset) − rebateReserve(asset)). Invariant 2 demands 0; non-zero triggers ProtocolFeeVaultDrift."
+        }
+        "deopt_protocol_fee_vault_reserve_shortfall_native" => {
+            "max(0, deopt_fees_manager_v2_rebate_budget_native − rebateReserve). Non-zero predicts future rebate trades will revert at the vault hook."
+        }
+        _ => "ProtocolFeeVault observability metric (V2G-R5-OBS-P0).",
+    }
 }
 
 /// V2F-P / V2F-Q: collapse the raw `decoded.consumer` strings returned

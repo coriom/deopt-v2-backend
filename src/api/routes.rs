@@ -23,6 +23,7 @@ use crate::fees::service::{
 };
 use crate::fees::smoke_readiness::admin_v2_smoke_readiness as admin_v2_smoke_readiness_service;
 use crate::fees::v2_observability::admin_v2_observability as admin_v2_observability_service;
+use crate::fees::vault_observability as vault_obs;
 use crate::indexer::{Indexer, IndexerStatus, IndexerTickResult};
 use crate::mm::permissions::{
     list_permission_accounts, list_product_permissions, MmProductPermission,
@@ -415,6 +416,12 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/admin/fees/v2/smoke/readiness",
             get(admin_fees_v2_smoke_readiness),
+        )
+        .route("/admin/fees/vault/summary", get(admin_fees_vault_summary))
+        .route("/admin/fees/vault/balances", get(admin_fees_vault_balances))
+        .route(
+            "/admin/fees/vault/reconciliation",
+            get(admin_fees_vault_reconciliation),
         )
         .route("/admin/recent", get(admin_recent))
         .layer(axum::middleware::from_fn_with_state(
@@ -1491,6 +1498,106 @@ async fn admin_fees_v2_smoke_readiness(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     ensure_admin_access(&state, &headers)?;
     Ok(Json(admin_v2_smoke_readiness_service(&state).await?))
+}
+
+/// V2G-R5-OBS-P0 — build the per-request `VaultObservabilityConfig`
+/// from existing backend config + env. Centralised so the three vault
+/// handlers + the monitoring exporter agree on configuration source.
+async fn vault_observability_config(state: &AppState) -> vault_obs::VaultObservabilityConfig {
+    let rebate_budget_assets = load_rebate_budget_assets(state).await;
+    vault_obs::build_config(
+        state.execution_config.rpc_url.clone(),
+        Some(
+            state
+                .option_event_indexer_config
+                .collateral_vault_address
+                .clone(),
+        ),
+        state
+            .option_event_indexer_config
+            .fees_manager_v2_address
+            .clone(),
+        rebate_budget_assets,
+    )
+}
+
+async fn load_rebate_budget_assets(state: &AppState) -> Vec<String> {
+    if let Some(repository) = state.repository.clone() {
+        if repository.admin_ping().await.is_ok() {
+            if let Ok(map) = repository
+                .admin_fees_manager_v2_rebate_budget_by_asset()
+                .await
+            {
+                return map.into_keys().collect();
+            }
+        }
+    }
+    state
+        .options_store
+        .lock()
+        .map(|s| {
+            s.fees_manager_v2_rebate_budget_by_asset()
+                .into_keys()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+async fn load_rebate_budget_map(state: &AppState) -> std::collections::BTreeMap<String, u64> {
+    if let Some(repository) = state.repository.clone() {
+        if repository.admin_ping().await.is_ok() {
+            if let Ok(map) = repository
+                .admin_fees_manager_v2_rebate_budget_by_asset()
+                .await
+            {
+                return map;
+            }
+        }
+    }
+    state
+        .options_store
+        .lock()
+        .map(|s| s.fees_manager_v2_rebate_budget_by_asset())
+        .unwrap_or_default()
+}
+
+/// V2G-R5-OBS-P0: read-only summary endpoint. Safe to call when the
+/// vault is not yet deployed — returns `configured=false` + a reason.
+async fn admin_fees_vault_summary(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    ensure_admin_access(&state, &headers)?;
+    let cfg = vault_observability_config(&state).await;
+    let budget = load_rebate_budget_map(&state).await;
+    let snapshot = vault_obs::read_snapshot(&cfg, &budget).await?;
+    Ok(Json(vault_obs::summary_view(&snapshot)))
+}
+
+/// V2G-R5-OBS-P0: read-only per-asset bucket breakdown.
+async fn admin_fees_vault_balances(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    ensure_admin_access(&state, &headers)?;
+    let cfg = vault_observability_config(&state).await;
+    let budget = load_rebate_budget_map(&state).await;
+    let snapshot = vault_obs::read_snapshot(&cfg, &budget).await?;
+    Ok(Json(vault_obs::balances_view(&snapshot)))
+}
+
+/// V2G-R5-OBS-P0: drift-focused reconciliation view. Surfaces
+/// `feeBalance + rebateReserve` vs `CV.balances(vault, asset)` plus
+/// raw ERC-20 dust per asset.
+async fn admin_fees_vault_reconciliation(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    ensure_admin_access(&state, &headers)?;
+    let cfg = vault_observability_config(&state).await;
+    let budget = load_rebate_budget_map(&state).await;
+    let snapshot = vault_obs::read_snapshot(&cfg, &budget).await?;
+    Ok(Json(vault_obs::reconciliation_view(&snapshot)))
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
