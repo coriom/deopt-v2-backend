@@ -1,0 +1,12 @@
+{
+  "option_series_id": "<OPTION_SERIES_ID>",
+  "account": "<SELLER_ADDRESS>",
+  "side": "sell",
+  "price_1e8": "1000000000",
+  "size_1e8": "100000000",
+  "time_in_force": "gtc",
+  "client_order_id": "fx-q1-b3-orderbook-sell",
+  "nonce": 1,
+  "deadline_ms": <DEADLINE_MS>,
+  "signature": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+}

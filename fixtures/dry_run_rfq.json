@@ -1,0 +1,8 @@
+{
+  "taker": "<BUYER_ADDRESS>",
+  "option_series_id": "<OPTION_SERIES_ID>",
+  "side": "buy",
+  "size_1e8": "100000000",
+  "limit_price_1e8": "1100000000",
+  "ttl_ms": 60000
+}

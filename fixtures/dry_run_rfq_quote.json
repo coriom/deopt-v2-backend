@@ -1,0 +1,8 @@
+{
+  "mm_account": "<SELLER_ADDRESS>",
+  "session_id": "fx-q1-b3-rfq-session",
+  "client_quote_id": "fx-q1-b3-rfq-quote",
+  "price_1e8": "1000000000",
+  "size_1e8": "100000000",
+  "quote_ttl_ms": 30000
+}
