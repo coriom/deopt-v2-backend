@@ -255,3 +255,28 @@ Per scope, the agent did NOT flip live-broadcast flags, did NOT authorise smoke,
 - **Pre-broadcast gas-cap remediation:** `OPTION_EXECUTION_BROADCAST_GAS_LIMIT=1_500_000` added per `FIRST_LIVE_SMOKE-GAS-CAP-REMEDIATION-PACKET`
 - **Result document:** `FIRST_LIVE_OPTION_EXECUTION_SMOKE_RESULT_V2_SEPOLIA.md`
 - **Independent re-verify:** GREEN via `FIRST_LIVE_SMOKE-V2-POST-CLOSE-VERIFY`
+
+---
+
+## 11. Closure row — FIRST LIVE OPTION-EXECUTION SMOKE — RFQ PATH (Base Sepolia)
+
+- **Date:** 2026-06-08
+- **Milestone:** FIRST_LIVE_SMOKE-EXEC-RFQ-SEPOLIA-FEE-ONLY (and CLOSEOUT-VERIFY)
+- **tx_hash:** `0x8538066ce0a10ede63f9e4c66161be8efdcd0edf6a63d176af0967b4bde95326`
+- **block:** `42 581 402`
+- **receipt.status:** `1` (success)
+- **from / to:** `BACKEND_EXECUTOR` (`0x295005fd…4518`) → `NEW_OME` (`0x5a5EBF9A…70f6`)
+- **INTENT_ID:** `95516dbd-a68c-41eb-869f-e6790d9091f2`
+- **RFQ_ID / QUOTE_ID / FILL_ID:** `2492cc2f-…` / `6721538a-…` / `27b89001-…`
+- **gasUsed / cap:** `695 618` / `1 500 000`
+- **R5 drift:** `0` pre / `0` post (cumulative since baseline preserved)
+- **PFV.feeBalance(mUSDC) delta (this trade):** `+3 000`
+- **PFV.feeBalance(mUSDC) cumulative since baseline:** `+6 000` (= `28 → 6 028`; matches 2 trades × 300 ppm of $10)
+- **BUYER / SELLER CV delta (this trade):** `−10 002 500` / `+9 999 500` (zero-sum with PFV)
+- **NEW_OME.nonces(BUYER) / (SELLER) delta:** `1 → 2 / 1 → 2`
+- **BE.nonce delta:** `1 → 2` (cumulative since baseline: `0 → 2`)
+- **Rebate path:** not fired (`PFV.rebateReserve(mUSDC) = 0` preserved)
+- **Backend confirmation worker:** auto-transitioned intent to `broadcast_confirmed` in ≤2 s (Phase B of POST_GOV_G_OPS_CLEANUP)
+- **Nonce sync:** load-bearing (intent created with `(1, 1)` from chain; without `OPTION_NONCE_SYNC_ENABLED=true` would have reverted `BadNonce()` as in two prior attempts)
+- **Result document:** `FIRST_LIVE_RFQ_OPTION_EXECUTION_SMOKE_RESULT_SEPOLIA.md`
+- **Independent re-verify:** GREEN via `FIRST_LIVE_SMOKE-RFQ-CLOSEOUT-VERIFY`
