@@ -235,3 +235,23 @@ Operator may now:
 Either order is acceptable per the dependency graph.
 
 Per scope, the agent did NOT flip live-broadcast flags, did NOT authorise smoke, did NOT touch governance, did NOT mutate fee routing. All such actions remain operator decisions.
+
+---
+
+## 10. Closure row — FIRST LIVE OPTION-EXECUTION SMOKE V2 (Base Sepolia)
+
+- **Date:** 2026-06-08
+- **Milestone:** FIRST_LIVE_SMOKE-EXEC-V2-SEPOLIA-FEE-ONLY (chain-side fee-only, orderbook path)
+- **tx_hash:** `0xb2379a462e5aa82ea1d7e62cf4ae38c7143a41e8ea42d6c54b7ba298c061e800`
+- **block:** `42_571_249`
+- **receipt.status:** `1` (success)
+- **from / to:** `BACKEND_EXECUTOR` (`0x295005fd…4518`) → `NEW_OME` (`0x5a5EBF9A…70f6`)
+- **INTENT_ID:** `f9e765c2-cc9b-4863-918c-a4db04867d46`
+- **gasUsed / cap:** `907_100` / `1_500_000`
+- **R5 drift:** `0` pre / `0` post
+- **PFV.feeBalance(mUSDC) delta:** `+3_000` (50 ppm maker + 250 ppm taker × 10_000_000 premium)
+- **BUYER / SELLER CV delta (mUSDC):** `−10_002_500` / `+9_999_500` (zero-sum with PFV)
+- **Rebate path:** not fired (`PFV.rebateReserve(mUSDC) = 0` preserved)
+- **Pre-broadcast gas-cap remediation:** `OPTION_EXECUTION_BROADCAST_GAS_LIMIT=1_500_000` added per `FIRST_LIVE_SMOKE-GAS-CAP-REMEDIATION-PACKET`
+- **Result document:** `FIRST_LIVE_OPTION_EXECUTION_SMOKE_RESULT_V2_SEPOLIA.md`
+- **Independent re-verify:** GREEN via `FIRST_LIVE_SMOKE-V2-POST-CLOSE-VERIFY`
