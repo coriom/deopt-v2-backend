@@ -55,6 +55,12 @@ pub trait EthLogsProvider: Clone + Send + Sync {
     fn get_logs(&self, filter: EthGetLogsFilter) -> RpcFuture<'_, Vec<crate::indexer::EthLog>>;
 }
 
+/// Minimal `eth_getBalance` surface for the broadcast policy data provider.
+/// Returns the native (wei) balance of `address` at the latest block.
+pub trait EthBalanceProvider: Clone + Send + Sync {
+    fn eth_get_balance(&self, address: AccountId) -> RpcFuture<'_, u128>;
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EthGetLogsFilter {
@@ -307,6 +313,35 @@ impl TransactionReceiptProvider for HttpJsonRpcProvider {
     }
 }
 
+impl EthBalanceProvider for HttpJsonRpcProvider {
+    fn eth_get_balance(&self, address: AccountId) -> RpcFuture<'_, u128> {
+        Box::pin(async move {
+            let response: JsonRpcResponse<String> = self
+                .client
+                .post(&self.rpc_url)
+                .json(&JsonRpcRequest {
+                    jsonrpc: "2.0",
+                    id: 1,
+                    method: "eth_getBalance",
+                    params: (address.0, "latest"),
+                })
+                .send()
+                .await
+                .map_err(|error| BackendError::Simulation(error.to_string()))?
+                .json()
+                .await
+                .map_err(|error| BackendError::Simulation(error.to_string()))?;
+            if let Some(error) = response.error {
+                return Err(BackendError::Simulation(error.message));
+            }
+            let result = response.result.ok_or_else(|| {
+                BackendError::Simulation("eth_getBalance returned no result".to_string())
+            })?;
+            parse_hex_quantity_u128(&result)
+        })
+    }
+}
+
 impl EthLogsProvider for HttpJsonRpcProvider {
     fn block_number(&self) -> RpcFuture<'_, u64> {
         TransactionReceiptProvider::block_number(self)
@@ -454,6 +489,14 @@ fn parse_hex_quantity_u64(value: &str) -> Result<u64> {
         .strip_prefix("0x")
         .ok_or_else(|| BackendError::Simulation("invalid hex quantity".to_string()))?;
     u64::from_str_radix(hex, 16)
+        .map_err(|error| BackendError::Simulation(format!("invalid hex quantity: {error}")))
+}
+
+fn parse_hex_quantity_u128(value: &str) -> Result<u128> {
+    let hex = value
+        .strip_prefix("0x")
+        .ok_or_else(|| BackendError::Simulation("invalid hex quantity".to_string()))?;
+    u128::from_str_radix(hex, 16)
         .map_err(|error| BackendError::Simulation(format!("invalid hex quantity: {error}")))
 }
 

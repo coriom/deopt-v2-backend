@@ -106,18 +106,21 @@ Source: `deopt-v2-sol/docs/MAINNET_AUDIT_EXT_ENGAGEMENT_PACKAGE.md` §7 / §11.
 
 Source: gap-list D-1 / `MAINNET-BE-KMS-SIGNER-INTERFACE-IMPL` milestone (custody-policy §7.4 + backend source survey in §6.1).
 
-| Q-CD | KMS / backend impact |
-|---|---|
-| **Q-CD-5** | **HARD GATE.** Backend KMS interface implementation cannot start until vendor + Pattern A/B/C is chosen. Drives the `RemoteSigner` adapter (`from_kms_handle(handle)` impl). |
-| **Q-CD-14** | **HARD GATE.** Region failover design drives the backend KMS adapter's retry / failover semantics. Cannot ship without region pair locked. |
-| **Q-CD-15** | Required for IAM policy provisioning (custody-policy §6.5); not a code-path gate, but a deployment-time gate. |
-| **Q-CD-6** | Drives KMS key-count: 1 (shared BE for option + perp) vs 2 (distinct). Affects IAM policy structure and warm-spare provisioning. |
-| **Q-CD-16** | Drives backend rotation runbook + warm-spare provisioning cadence. Not a code-path gate. |
-| **Q-CD-13** | Drives Sepolia integration test prior to mainnet code path activation. Not a code-path gate, but a gate on "can we trust the new code in production". |
+**Cluster 2 closure update (2026-06-09):**
 
-KMS code work cannot complete without Q-CD-5 AND Q-CD-14 AND Q-CD-15
-resolved. Q-CD-6 + Q-CD-16 + Q-CD-13 inform the operational runbook
-but do not gate the code.
+| Q-CD | Status | KMS / backend impact |
+|---|---|---|
+| **Q-CD-5** | **ARCH-PATTERN-DECIDED: Pattern C** (dedicated backend signer microservice backed by HSM/MPC or KMS) | Architecture layer of backend impl can now START. `RemoteSigner` trait + `KmsRemoteSigner::from_service_endpoint(endpoint)` impl path is decided. Vendor sub-decision (`MAINNET-KMS-VENDOR-SELECTION`) still gates KMS key generation, but `BACKEND-SIGNER-INTERFACE-KMS-HSM-ADAPTER` PR can begin against the abstract interface. |
+| **Q-CD-14** | **STRUCTURE-DECIDED: EU primary + EU/nearby secondary** | Region pair shape locked; backend adapter can model failover semantics. Exact regions follow vendor; not a code-path gate at the trait layer. |
+| **Q-CD-15** | **POLICY-DECIDED-PROVIDER-DETAIL-PENDING** | Custody runbook can be drafted at policy layer (disable ≠ delete; ≥ 2 approvals + governance for permanent deletion; emergency IAM revoke faster than disable). Exact IAM JSON pending vendor. Not a code-path gate. |
+| **Q-CD-6** | **DECIDED: distinct EOAs** | Drives KMS key-count = 2 (OPTION at launch + warm spare; PERP deferred). Affects IAM policy structure and warm-spare provisioning. |
+| **Q-CD-16** | **PRE-RESOLVED in custody policy §9.1: ≤ 30 days** | Drives backend rotation runbook + warm-spare provisioning cadence. Not a code-path gate. |
+| **Q-CD-13** | **POLICY: TRUE (per Cluster 1 closure)** | Applies to signer-service Sepolia rehearsal too — backend impl PR must include a Sepolia integration test that exercises the new `RemoteSigner` path before mainnet activation. |
+
+Pre-Cluster-2 state was "code work cannot start". Post-Cluster-2 state
+is: **backend impl can begin at the abstract-trait layer**; KMS key
+generation + signer-service deployment still depends on vendor + region
+sub-decisions.
 
 ---
 
@@ -156,12 +159,14 @@ Source: custody-policy §8 + `MAINNET_MANIFEST_TODO_INVENTORY.md` Groups E + K +
 
 | Q-CD | Funding / rebate / insurance task |
 |---|---|
-| **Q-CD-7** | TREASURY Safe deployment → unblocks every BE refresh + PFV revenue cycle + rebate allocation + insurance funding. **Critical for any post-V2G-Y operational tx.** |
-| **Q-CD-9** | BE FUND_FLOOR / TARGET / CEILING → unblocks BE first refresh + monitoring alert thresholds + bounded loss limit. **Critical for first-live-smoke.** |
-| **Q-CD-10** | PFV.revenueReceiver → unblocks the design of the PFV revenue cycle (Timelock-queued vs TREASURY-direct). Post-launch task. |
-| **Q-CD-11** | Rebate program at launch → if YES, drives `feesConfiguration.merkleRoot` fill + reserve allocation milestone + wash-detection deadlines. If DEFER (recommended), no immediate downstream task. |
-| **Q-CD-12** | Insurance seeding amount → unblocks `MAINNET-INSURANCE-FUND-FUNDING` milestone (gap-list I-5). |
-| **Q-CD-17** | Insurance operator form → unblocks `MAINNET-INSURANCE-OPERATOR-PROVISION` operational task. |
+| **Q-CD-7** | **POLICY-DECIDED (Cluster 3, 2026-06-09)**: Safe v1.4.1 ≥ 3-of-5; hard disjoint OPS; default partial separation GOV; no DEPLOYER. Treasury Safe deployment via `MAINNET-TREASURY-SAFE-CREATION-PACKET`. Unblocks BE refresh path + PFV revenue cycle + rebate allocation + insurance funding planning. |
+| **Q-CD-8** | **POLICY-DECIDED (Cluster 3)** post-migration policy: DEPLOYER = provenance only; V2G-Y per-phase HARD STOPS added (Y-G-5a/5b verifier; post-Y-G-6 sweep). Pre-migration DEPLOYER form Q-CD-8a still OPEN. |
+| **Q-CD-9** | **FORMULA-DECIDED (Cluster 3)**: `FUND_FLOOR = max(7d gas, emergency rotation)`; `FUND_TARGET = 3× FLOOR`; `FUND_CEILING = min(10× FLOOR, op cap)`; monthly recompute. Numeric parameter fill via `MAINNET-BE-FUNDING-POLICY-PARAMETER-FILL`. Unblocks BE alert threshold ladder + Treasury refresh cadence + bounded loss limit. |
+| **Q-CD-10** | **POLICY-DECIDED (Cluster 4, 2026-06-09)**: PFV revenue stays in PFV until Timelock-governed withdrawal → TREASURY_SAFE_MAINNET. Hot-wallet destination unacceptable. Future milestone `MAINNET-PFV-REVENUE-WITHDRAWAL-SOP`. |
+| **Q-CD-11** | **POLICY-DECIDED (Cluster 4): DEFERRED at launch.** `rebateReserve = 0`; all active profiles effective non-negative. Launch invariant verifier sweep added to POST-Y-G-6 audit. Re-evaluation via `MAINNET-REBATE-PROGRAM-DESIGN` (post-soak, if enabled). |
+| **Q-CD-12** | **FORMULA-DECIDED (Cluster 4)**: `initial_insurance_seed = OI_cap × stress_loss × coverage_ratio`. Numeric fill via `MAINNET-INSURANCE-SEEDING-PARAMETER-FILL` co-decided with launch caps. Treasury-funded; R-6 bright line preserved. |
+| **Q-CD-17** | **POLICY-DECIDED (Cluster 4)**: dedicated insurance-operator Safe (≥ 2-of-3 / 3-of-5 recommended), disjoint from OPS/GOV/TREASURY rosters, Timelock owns the Fund. Fallback OPS_MULTISIG (waiver + AUDIT-EXT sign-off; upgrade ≤ 6 months). DEPLOYER unacceptable post-migration. Future milestone `MAINNET-INSURANCE-OPERATOR-POLICY-PACKET`. |
+| **Q-CD-18** | **POLICY-DECIDED (Cluster 4)**: SemVer MAJOR.MINOR.PATCH; freeze v1.0.0 at first-live-smoke; quarterly review during beta + semi-annual after stable + emergency on incident; tiered approval matrix. Future milestone `MAINNET-CUSTODY-POLICY-VERSIONING-SOP`. |
 
 ---
 

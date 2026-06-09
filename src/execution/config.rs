@@ -1,4 +1,7 @@
 use crate::error::{BackendError, Result};
+use crate::execution::remote_signer::{
+    SignerBackendKind, ANVIL_CHAIN_ID, BASE_SEPOLIA_CHAIN_ID, MAINNET_CHAIN_ID,
+};
 use crate::execution::signer::ExecutorSigner;
 use crate::types::AccountId;
 use serde::Serialize;
@@ -48,6 +51,18 @@ pub struct ExecutionConfig {
     /// broadcast traffic. `None` means "OLD address not configured" and
     /// any unmatched consumer is bucketed as `"unknown"`.
     pub old_perp_engine_address: Option<AccountId>,
+    /// Selected signer backend. `LocalDev` wraps the in-process
+    /// `ExecutorSigner::from_private_key`; `Remote` routes through the
+    /// signer microservice mTLS client. Mainnet (`chain_id == 8453`)
+    /// REFUSES `LocalDev` at startup per
+    /// `MAINNET_BE_SIGNER_SERVICE_DESIGN.md §5.4`.
+    pub backend_signer_mode: SignerBackendKind,
+    /// Endpoint URL of the signer microservice. REQUIRED on mainnet.
+    pub backend_signer_endpoint: Option<String>,
+    /// Explicit operator opt-in to allow the `LocalDev` signer on
+    /// testnets (`chain_id ∈ {84532, …}`). `chain_id == 31337` (anvil)
+    /// is granted implicit local-dev privilege independent of this flag.
+    pub executor_allow_local_signer: bool,
 }
 
 impl ExecutionConfig {
@@ -73,6 +88,9 @@ impl ExecutionConfig {
             ),
             perp_engine_address: AccountId::new("0x0000000000000000000000000000000000000000"),
             old_perp_engine_address: None,
+            backend_signer_mode: SignerBackendKind::LocalDev,
+            backend_signer_endpoint: None,
+            executor_allow_local_signer: false,
         }
     }
 
@@ -113,13 +131,42 @@ impl ExecutionConfig {
                     "real broadcast requires persistence enabled".to_string(),
                 ));
             }
-            let Some(private_key) = self.executor_private_key.as_ref() else {
+            // Mainnet hard refusal: env-keyed signing is forbidden by custody
+            // policy §6 BE-5; the canonical check sits here so the process
+            // refuses to start before any code path can dereference the key.
+            if self.executor_chain_id == MAINNET_CHAIN_ID && self.executor_private_key.is_some() {
                 return Err(BackendError::Config(
-                    "EXECUTOR_PRIVATE_KEY is required when EXECUTOR_REAL_BROADCAST_ENABLED=true"
-                        .to_string(),
+                    "EXECUTOR_PRIVATE_KEY must NOT be set on mainnet (chain_id=8453); use BACKEND_SIGNER_MODE=remote per MAINNET_BE_SIGNER_SERVICE_DESIGN §5.4".to_string(),
                 ));
-            };
-            ExecutorSigner::from_private_key(private_key)?;
+            }
+            // Validate the signer backend choice for this chain id.
+            self.validate_signer_backend()?;
+
+            match self.backend_signer_mode {
+                SignerBackendKind::LocalDev => {
+                    let Some(private_key) = self.executor_private_key.as_ref() else {
+                        return Err(BackendError::Config(
+                            "EXECUTOR_PRIVATE_KEY is required when BACKEND_SIGNER_MODE=local_dev"
+                                .to_string(),
+                        ));
+                    };
+                    ExecutorSigner::from_private_key(private_key)?;
+                }
+                SignerBackendKind::Remote => {
+                    if self
+                        .backend_signer_endpoint
+                        .as_deref()
+                        .unwrap_or("")
+                        .is_empty()
+                    {
+                        return Err(BackendError::Config(
+                            "BACKEND_SIGNER_ENDPOINT is required when BACKEND_SIGNER_MODE=remote"
+                                .to_string(),
+                        ));
+                    }
+                }
+            }
+
             if self.rpc_url.is_none() {
                 return Err(BackendError::Config(
                     "RPC_URL is required when EXECUTOR_REAL_BROADCAST_ENABLED=true".to_string(),
@@ -130,6 +177,53 @@ impl ExecutionConfig {
                     "EXECUTOR_MAX_FEE_PER_GAS_WEI and EXECUTOR_MAX_PRIORITY_FEE_PER_GAS_WEI are required when EXECUTOR_REAL_BROADCAST_ENABLED=true"
                         .to_string(),
                 ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Enforce the signer-mode ↔ chain-id matrix from
+    /// `MAINNET_BE_SIGNER_SERVICE_DESIGN.md §5.3 + §5.4`:
+    ///
+    /// | chain_id           | LocalDev                                                       | Remote                                  |
+    /// |--------------------|----------------------------------------------------------------|-----------------------------------------|
+    /// | 8453 (mainnet)     | REFUSED                                                        | required; endpoint MUST be set          |
+    /// | 84532 (sepolia) etc| allowed only with `EXECUTOR_ALLOW_LOCAL_SIGNER=true`           | allowed; endpoint MUST be set if chosen |
+    /// | 31337 (anvil)      | allowed unconditionally                                        | allowed; endpoint MUST be set if chosen |
+    ///
+    /// No fallback to LocalDev is granted in any code path — the broadcast
+    /// site additionally refuses a `LocalDev` signer at runtime on chain id
+    /// 8453 as defence-in-depth.
+    pub fn validate_signer_backend(&self) -> Result<()> {
+        match self.backend_signer_mode {
+            SignerBackendKind::LocalDev => {
+                if self.executor_chain_id == MAINNET_CHAIN_ID {
+                    return Err(BackendError::Config(
+                        "BACKEND_SIGNER_MODE=local_dev is REFUSED on mainnet (chain_id=8453); use BACKEND_SIGNER_MODE=remote".to_string(),
+                    ));
+                }
+                let testnet_allowed =
+                    self.executor_chain_id == ANVIL_CHAIN_ID || self.executor_allow_local_signer;
+                if !testnet_allowed {
+                    return Err(BackendError::Config(format!(
+                        "BACKEND_SIGNER_MODE=local_dev on chain_id={} requires EXECUTOR_ALLOW_LOCAL_SIGNER=true (anvil chain_id={} is exempt)",
+                        self.executor_chain_id, ANVIL_CHAIN_ID
+                    )));
+                }
+                let _ = BASE_SEPOLIA_CHAIN_ID; // referenced by docs; suppress unused warning
+            }
+            SignerBackendKind::Remote => {
+                if self
+                    .backend_signer_endpoint
+                    .as_deref()
+                    .unwrap_or("")
+                    .is_empty()
+                {
+                    return Err(BackendError::Config(
+                        "BACKEND_SIGNER_ENDPOINT is required when BACKEND_SIGNER_MODE=remote"
+                            .to_string(),
+                    ));
+                }
             }
         }
         Ok(())
@@ -167,4 +261,111 @@ pub struct ExecutionStatus {
     pub rpc_configured: bool,
     #[serde(rename = "broadcastEnabled")]
     pub broadcast_enabled: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TEST_KEY: &str = "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318";
+
+    fn mainnet_remote_base() -> ExecutionConfig {
+        ExecutionConfig {
+            execution_enabled: true,
+            dry_run: false,
+            real_broadcast_enabled: true,
+            executor_chain_id: MAINNET_CHAIN_ID,
+            rpc_url: Some("https://example.invalid".to_string()),
+            max_fee_per_gas_wei: Some("1000000000".to_string()),
+            max_priority_fee_per_gas_wei: Some("100000000".to_string()),
+            backend_signer_mode: SignerBackendKind::Remote,
+            backend_signer_endpoint: Some("https://signer.invalid".to_string()),
+            ..ExecutionConfig::disabled()
+        }
+    }
+
+    fn sepolia_local_base() -> ExecutionConfig {
+        ExecutionConfig {
+            execution_enabled: true,
+            dry_run: false,
+            real_broadcast_enabled: true,
+            executor_chain_id: BASE_SEPOLIA_CHAIN_ID,
+            executor_private_key: Some(PrivateKeySecret::new(TEST_KEY.to_string())),
+            rpc_url: Some("https://example.invalid".to_string()),
+            max_fee_per_gas_wei: Some("1000000000".to_string()),
+            max_priority_fee_per_gas_wei: Some("100000000".to_string()),
+            backend_signer_mode: SignerBackendKind::LocalDev,
+            executor_allow_local_signer: true,
+            ..ExecutionConfig::disabled()
+        }
+    }
+
+    #[test]
+    fn mainnet_with_executor_private_key_refuses_startup() {
+        let mut cfg = mainnet_remote_base();
+        cfg.executor_private_key = Some(PrivateKeySecret::new(TEST_KEY.to_string()));
+        let err = cfg
+            .validate_startup(true)
+            .expect_err("mainnet env-key must refuse startup");
+        let msg = err.to_string();
+        assert!(msg.contains("EXECUTOR_PRIVATE_KEY must NOT be set on mainnet"));
+        // never echo the secret in the error string.
+        assert!(!msg.contains("4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318"));
+    }
+
+    #[test]
+    fn mainnet_with_local_signer_mode_refuses_startup() {
+        let mut cfg = mainnet_remote_base();
+        cfg.executor_private_key = None;
+        cfg.backend_signer_mode = SignerBackendKind::LocalDev;
+        let err = cfg
+            .validate_startup(true)
+            .expect_err("local-dev on mainnet must refuse");
+        assert!(err.to_string().contains("local_dev is REFUSED on mainnet"));
+    }
+
+    #[test]
+    fn mainnet_with_remote_signer_endpoint_allowed() {
+        let cfg = mainnet_remote_base();
+        cfg.validate_startup(true)
+            .expect("mainnet remote-signer config must start");
+    }
+
+    #[test]
+    fn mainnet_remote_mode_without_endpoint_refuses_startup() {
+        let mut cfg = mainnet_remote_base();
+        cfg.backend_signer_endpoint = None;
+        let err = cfg
+            .validate_startup(true)
+            .expect_err("remote mode requires endpoint");
+        assert!(err
+            .to_string()
+            .contains("BACKEND_SIGNER_ENDPOINT is required"));
+    }
+
+    #[test]
+    fn sepolia_local_signer_without_allow_flag_refuses_startup() {
+        let mut cfg = sepolia_local_base();
+        cfg.executor_allow_local_signer = false;
+        let err = cfg
+            .validate_startup(true)
+            .expect_err("sepolia local-signer without explicit allow must refuse");
+        assert!(err.to_string().contains("EXECUTOR_ALLOW_LOCAL_SIGNER=true"));
+    }
+
+    #[test]
+    fn sepolia_local_signer_with_allow_flag_allowed() {
+        let cfg = sepolia_local_base();
+        cfg.validate_startup(true)
+            .expect("sepolia + allow + local signer must start");
+    }
+
+    #[test]
+    fn anvil_local_signer_allowed_unconditionally() {
+        let mut cfg = sepolia_local_base();
+        cfg.executor_chain_id = ANVIL_CHAIN_ID;
+        cfg.executor_allow_local_signer = false;
+        cfg.validate_startup(true)
+            .expect("anvil chain-id must allow local-signer by default");
+    }
 }

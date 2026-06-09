@@ -81,11 +81,13 @@ impl ExecutionTransactionRequest {
     }
 }
 
-pub fn sign_eip1559_transaction(
+/// Compute the EIP-1559 transaction prehash (32 bytes) for a given
+/// request + nonce, suitable for any signer implementing the
+/// `RemoteSigner::sign_option_execution_tx` surface.
+pub fn eip1559_transaction_prehash(
     request: &ExecutionTransactionRequest,
     nonce: u64,
-    signer: &ExecutorSigner,
-) -> Result<String> {
+) -> Result<[u8; 32]> {
     let max_fee_per_gas =
         required_wei("EXECUTOR_MAX_FEE_PER_GAS_WEI", &request.max_fee_per_gas_wei)?;
     let max_priority_fee_per_gas = required_wei(
@@ -93,7 +95,6 @@ pub fn sign_eip1559_transaction(
         &request.max_priority_fee_per_gas_wei,
     )?;
     let to = parse_evm_address(&request.to)?;
-
     let signing_payload = eip1559_payload(
         request.chain_id,
         nonce,
@@ -107,9 +108,29 @@ pub fn sign_eip1559_transaction(
     let mut signing_bytes = Vec::with_capacity(1 + signing_payload.len());
     signing_bytes.push(0x02);
     signing_bytes.extend_from_slice(&signing_payload);
-    let hash = keccak256(&signing_bytes);
-    let signature = signer.sign_prehash(&hash)?;
+    Ok(keccak256(&signing_bytes))
+}
 
+/// Assemble the raw EIP-1559 signed transaction hex from a request + nonce
+/// + recoverable signature components.
+///
+/// Used by both the local in-process signing path
+/// (`sign_eip1559_transaction`) and the remote-signer path in
+/// `options::service::broadcast_option_execution_intent_with_provider`.
+pub fn assemble_eip1559_signed_transaction(
+    request: &ExecutionTransactionRequest,
+    nonce: u64,
+    y_parity: u8,
+    r: &[u8; 32],
+    s: &[u8; 32],
+) -> Result<String> {
+    let max_fee_per_gas =
+        required_wei("EXECUTOR_MAX_FEE_PER_GAS_WEI", &request.max_fee_per_gas_wei)?;
+    let max_priority_fee_per_gas = required_wei(
+        "EXECUTOR_MAX_PRIORITY_FEE_PER_GAS_WEI",
+        &request.max_priority_fee_per_gas_wei,
+    )?;
+    let to = parse_evm_address(&request.to)?;
     let signed_payload = eip1559_signed_payload(
         request.chain_id,
         nonce,
@@ -119,14 +140,30 @@ pub fn sign_eip1559_transaction(
         &to,
         request.value_wei,
         &request.calldata,
-        signature.y_parity,
-        &signature.r,
-        &signature.s,
+        y_parity,
+        r,
+        s,
     );
     let mut raw = Vec::with_capacity(1 + signed_payload.len());
     raw.push(0x02);
     raw.extend_from_slice(&signed_payload);
     Ok(hex_0x(&raw))
+}
+
+pub fn sign_eip1559_transaction(
+    request: &ExecutionTransactionRequest,
+    nonce: u64,
+    signer: &ExecutorSigner,
+) -> Result<String> {
+    let prehash = eip1559_transaction_prehash(request, nonce)?;
+    let signature = signer.sign_prehash(&prehash)?;
+    assemble_eip1559_signed_transaction(
+        request,
+        nonce,
+        signature.y_parity,
+        &signature.r,
+        &signature.s,
+    )
 }
 
 pub fn build_execution_transaction_request(
@@ -451,6 +488,9 @@ mod tests {
             ),
             perp_engine_address: AccountId::new("0x0000000000000000000000000000000000000000"),
             old_perp_engine_address: None,
+            backend_signer_mode: crate::execution::SignerBackendKind::LocalDev,
+            backend_signer_endpoint: None,
+            executor_allow_local_signer: false,
         }
     }
 

@@ -55,6 +55,11 @@ pub struct AppState {
     pub mm_permissions: Arc<Mutex<MmPermissionsStore>>,
     pub mm_sessions: MmSessionRegistry,
     pub trade_signatures: Arc<Mutex<HashMap<Uuid, StoredTradeSignatures>>>,
+    /// In-process observability for the option execution broadcast
+    /// pipeline. Shared via `Arc`; counters increment at the broadcast
+    /// call site; rendered into Prometheus text by
+    /// `crate::monitoring::render_metrics` and into the readiness JSON.
+    pub broadcast_observability: Arc<crate::options::BroadcastObservability>,
 }
 
 impl AppState {
@@ -224,6 +229,7 @@ impl AppState {
             mm_permissions: Arc::new(Mutex::new(MmPermissionsStore::new())),
             mm_sessions: MmSessionRegistry::new(),
             trade_signatures: Arc::new(Mutex::new(HashMap::new())),
+            broadcast_observability: Arc::new(crate::options::BroadcastObservability::new()),
         }
     }
 

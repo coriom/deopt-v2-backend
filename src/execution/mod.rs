@@ -4,6 +4,7 @@ pub mod executor;
 pub mod intent;
 pub mod perp_trade;
 pub mod queue;
+pub mod remote_signer;
 pub mod revert;
 pub mod rpc;
 pub mod runner;
@@ -22,17 +23,23 @@ pub use perp_trade::{
     TradeSignatureStatus, PERP_TRADE_TYPE,
 };
 pub use queue::ExecutionQueue;
+pub use remote_signer::{
+    policy_fingerprint, signer_error_into_backend, LocalDevSigner, RemoteSigner,
+    RemoteSignerClient, SignerBackendKind, SignerError, SignerFuture, SignerHealth, SignerRequest,
+    SignerResponse, SignerTransport, ANVIL_CHAIN_ID, BASE_SEPOLIA_CHAIN_ID, MAINNET_CHAIN_ID,
+};
 pub use revert::{DecodedRevertError, RevertDiagnostics};
 pub use rpc::{
-    EstimateGasRequest, EthCallProvider, EthCallRequest, EthCallSuccess, EthGetLogsFilter,
-    EthLogsProvider, GasEstimateProvider, HttpJsonRpcProvider, RpcFuture,
+    EstimateGasRequest, EthBalanceProvider, EthCallProvider, EthCallRequest, EthCallSuccess,
+    EthGetLogsFilter, EthLogsProvider, GasEstimateProvider, HttpJsonRpcProvider, RpcFuture,
     TransactionBroadcastProvider, TransactionReceiptProvider,
 };
 pub use runner::spawn_executor;
 pub use signer::ExecutorSigner;
 pub use simulator::{simulate_execution_intent, SimulationResult};
 pub use transaction::{
-    build_execution_transaction_request, ensure_no_submitted_transaction, sign_eip1559_transaction,
+    assemble_eip1559_signed_transaction, build_execution_transaction_request,
+    eip1559_transaction_prehash, ensure_no_submitted_transaction, sign_eip1559_transaction,
     ExecutionTransaction, ExecutionTransactionRequest, ExecutionTransactionStatus,
 };
 pub use tx_builder::{

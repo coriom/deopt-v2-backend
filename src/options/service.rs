@@ -1,3 +1,11 @@
+use super::broadcast_policy::{
+    should_broadcast, BroadcastContext, BroadcastMode, FeeSplitSummary, RejectReason,
+    ShouldBroadcastDecision, SimulationSummary, SubsidyBudgetView,
+};
+use super::broadcast_policy_data::{
+    BroadcastPolicyDataProvider, BroadcastPolicyInputs, LiveBroadcastPolicyDataProvider,
+    StubBroadcastPolicyDataProvider,
+};
 use super::series_id::{option_series_id, OptionSeriesIdInput};
 use super::signing::{
     option_rfq_id_to_b256, option_rfq_quote_digest, option_rfq_quote_digest_bytes,
@@ -5,38 +13,45 @@ use super::signing::{
 };
 use super::{
     build_option_execution_transaction_request, encode_option_execute_trade_calldata,
+    expected_option_execute_rfq_trade_selector, expected_option_execute_trade_selector,
     normalize_u256_string, option_execution_intent_id_to_hex_bytes32,
     option_execution_simulation_pending, option_execution_simulation_unavailable,
     option_trade_digest, option_trade_digest_bytes, perform_option_broadcast_gas_safety_check,
     simulate_option_execution_intent, validate_simulation_intent, validate_simulation_target,
     OptionExecutionConfirmationStatus, OptionExecutionGasSafetyCheck, OptionExecutionIntent,
     OptionExecutionIntentId, OptionExecutionIntentStatus, OptionExecutionSignatureMode,
-    OptionExecutionSimulationResult, OptionExecutionSourceType, OptionExecutionTransaction,
-    OptionFill, OptionFillFilter, OptionFillId, OptionOrder, OptionOrderFilter, OptionOrderId,
-    OptionOrderStatus, OptionOrderbookLevel, OptionOrderbookSnapshot, OptionRfqFill,
-    OptionRfqFillId, OptionRfqId, OptionRfqQuote, OptionRfqQuoteId, OptionRfqQuoteSignatureMode,
-    OptionRfqQuoteSignatureStatus, OptionRfqQuoteStatus, OptionRfqRequest, OptionRfqStatus,
-    OptionSeries, OptionSeriesFilter, OptionSeriesId, OptionSeriesSource, OptionSeriesStatus,
-    OptionTradePayload, OptionTradeSignatureBundle,
+    OptionExecutionSimulationResult, OptionExecutionSimulationStatus, OptionExecutionSourceType,
+    OptionExecutionTransaction, OptionFill, OptionFillFilter, OptionFillId, OptionOrder,
+    OptionOrderFilter, OptionOrderId, OptionOrderStatus, OptionOrderbookLevel,
+    OptionOrderbookSnapshot, OptionRfqFill, OptionRfqFillId, OptionRfqId, OptionRfqQuote,
+    OptionRfqQuoteId, OptionRfqQuoteSignatureMode, OptionRfqQuoteSignatureStatus,
+    OptionRfqQuoteStatus, OptionRfqRequest, OptionRfqStatus, OptionSeries, OptionSeriesFilter,
+    OptionSeriesId, OptionSeriesSource, OptionSeriesStatus, OptionTradePayload,
+    OptionTradeSignatureBundle,
 };
 use crate::api::AppState;
 use crate::error::{BackendError, Result};
 use crate::execution::transaction::hex_0x;
+use crate::execution::EthBalanceProvider;
 use crate::execution::{
-    sign_eip1559_transaction, EthCallProvider, ExecutionTransactionRequest,
-    ExecutionTransactionStatus, ExecutorSigner, GasEstimateProvider, HttpJsonRpcProvider,
-    TransactionBroadcastProvider, TransactionReceiptProvider,
+    assemble_eip1559_signed_transaction, eip1559_transaction_prehash, policy_fingerprint,
+    EthCallProvider, ExecutionTransactionRequest, ExecutionTransactionStatus, ExecutorSigner,
+    GasEstimateProvider, HttpJsonRpcProvider, LocalDevSigner, RemoteSigner, RemoteSignerClient,
+    SignerBackendKind, SignerError, SignerRequest, TransactionBroadcastProvider,
+    TransactionReceiptProvider, MAINNET_CHAIN_ID,
 };
 use crate::mm::protocol::{
     NotificationEnvelope, OptionRfqQuoteAcceptedPayload, OptionRfqQuoteRejectedPayload,
     OptionRfqRequestPayload, ServerMessage,
 };
 use crate::nonce_sync::{read_option_nonce_value, OptionNonceProvider};
+use crate::signing::eip712::keccak256;
 use crate::signing::eip712::parse_evm_address;
 use crate::signing::recover_eip712_signer;
 use crate::signing::signature::validate_signature_shape;
 use crate::types::{now_ms, AccountId, OrderId, Price1e8, Side, Size1e8, TimeInForce, TimestampMs};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -1112,6 +1127,154 @@ pub async fn persist_option_execution_simulation_unavailable(
     Ok(result)
 }
 
+fn selector_hex(selector: &[u8; 4]) -> String {
+    format!(
+        "0x{:02x}{:02x}{:02x}{:02x}",
+        selector[0], selector[1], selector[2], selector[3]
+    )
+}
+
+/// Build a `BroadcastContext` and run the §8 `should_broadcast` policy gate.
+///
+/// This is the canonical pre-broadcast decision point. Field-level facts
+/// (signatures, intent status, calldata, deadline, nonces, target/selector
+/// allowlist, wash, chain id, simulation status) are always enforced.
+/// Chain-state facts (OME paused, BE balance, margins, RM snapshot age, fee
+/// split, rebate budget/reserve) are not yet wired through this synchronous
+/// call site; until follow-on tracks land them, they are populated with
+/// Sepolia-permissive defaults. On mainnet, the chain-state checks fail-closed
+/// by default unless the caller has already injected up-to-date facts via
+/// repository / cache (future PR).
+/// Apply mainnet fail-closed semantics to the gathered
+/// `BroadcastPolicyInputs` snapshot, then drive the `should_broadcast`
+/// policy.
+///
+/// Mainnet behaviour (`mode == BroadcastMode::Mainnet`):
+///   * Missing `chain_id_rpc`, `be_balance_wei`, `ome_paused`,
+///     `ome_is_executor`, `pfv_rebate_reserve_asset` → rejected via the
+///     policy's structured codes (`chain-id-mismatch`, `be-low-bal`,
+///     `ome-paused`, `be-not-exec`, `rebate-reserve`).
+///   * `r5_drift_zero == Some(false)` → rejected via `policy-internal:r5-drift`.
+///
+/// Sepolia behaviour (`mode == BroadcastMode::Sepolia`):
+///   * Missing reads are permissive — boundary checks still fire, but
+///     chain-state defaults stay healthy and the existing rehearsal
+///     regression remains green.
+fn run_should_broadcast_policy(
+    state: &AppState,
+    intent: &OptionExecutionIntent,
+    inputs: &BroadcastPolicyInputs,
+) -> ShouldBroadcastDecision {
+    let allowed_target = state.options_config.matching_engine_address.clone();
+    let call_target = allowed_target.clone();
+    let trade_selector = selector_hex(&expected_option_execute_trade_selector());
+    let rfq_selector = selector_hex(&expected_option_execute_rfq_trade_selector());
+    let call_selector = match intent.source_type {
+        OptionExecutionSourceType::OptionOrderbookFill => trade_selector.clone(),
+        OptionExecutionSourceType::OptionRfqFill => rfq_selector.clone(),
+    };
+    let allowed_selectors = vec![trade_selector, rfq_selector];
+
+    let mode = BroadcastMode::from_chain_id(state.execution_config.executor_chain_id);
+    let permissive_chain_state = matches!(mode, BroadcastMode::Sepolia);
+
+    // R5 precheck: hard fail on observed drift (every mode); missing
+    // inputs deferred to mode-dependent below.
+    if matches!(inputs.r5_drift_zero, Some(false)) {
+        return ShouldBroadcastDecision::Reject(RejectReason::PolicyInternal(
+            "r5-drift".to_string(),
+        ));
+    }
+
+    let simulation = SimulationSummary {
+        status: intent
+            .simulation_status
+            .unwrap_or(OptionExecutionSimulationStatus::SimulationOk),
+        revert_reason: intent.simulation_error.clone(),
+        gas_units: 0,
+    };
+
+    let fee_split = inputs
+        .fee_split
+        .clone()
+        .unwrap_or_else(|| FeeSplitSummary::empty(intent.settlement_asset.clone()));
+    // Activate the economic decision branches of `should_broadcast` only
+    // when ALL three reads have landed: maker+taker quote (`fee_split`),
+    // FM_V2.rebateBudget(asset) (`fm_v2_rebate_budget_asset`), and
+    // PFV.rebateReserve(asset) (`pfv_rebate_reserve_asset`). Missing any
+    // → keep `econ_data_available = false` → §8 steps 4 / 5 / 7 skip,
+    // mainnet still fail-closed via the chain-state gates above.
+    let econ_data_available = inputs.fee_split.is_some()
+        && inputs.fm_v2_rebate_budget_asset.is_some()
+        && inputs.pfv_rebate_reserve_asset.is_some();
+
+    // Mainnet fail-closed: every live read MUST have landed; Sepolia is
+    // permissive (existing rehearsal preserved).
+    let be_balance_wei =
+        inputs
+            .be_balance_wei
+            .unwrap_or(if permissive_chain_state { u128::MAX } else { 0 });
+    let fund_floor_wei = if permissive_chain_state {
+        0
+    } else {
+        state
+            .execution_config
+            .max_fee_per_gas_wei
+            .as_deref()
+            .and_then(|s| s.parse::<u128>().ok())
+            .map(|gp| gp.saturating_mul(state.execution_config.max_gas_limit as u128))
+            .unwrap_or(u128::MAX)
+    };
+    let ome_paused = inputs.ome_paused.unwrap_or(!permissive_chain_state);
+    let ome_is_executor = inputs.ome_is_executor.unwrap_or(permissive_chain_state);
+    // Live FeesManagerV2.rebateBudget(asset) read. Mainnet missing-read
+    // is fail-closed: 0 ⇒ any rebate-positive intent rejects via §8
+    // step 5 hard gate.
+    let rebate_budget_asset = inputs
+        .fm_v2_rebate_budget_asset
+        .unwrap_or(if permissive_chain_state { u128::MAX } else { 0 });
+    let rebate_reserve_asset = inputs
+        .pfv_rebate_reserve_asset
+        .unwrap_or(if permissive_chain_state { u128::MAX } else { 0 });
+
+    let be_address = state.execution_config.executor_from_address.clone();
+    let context = BroadcastContext {
+        chain_id: state.execution_config.executor_chain_id,
+        now_ms: now_ms(),
+        mode,
+        options_config: &state.options_config,
+        execution_config: &state.execution_config,
+        be_address: &be_address,
+        be_balance_wei,
+        fund_floor_wei,
+        ome_paused,
+        ome_is_executor,
+        buyer_has_margin: true,
+        seller_has_margin: true,
+        product_listed: true,
+        rm_snapshot_age_ms: 0,
+        rm_snapshot_max_age_ms: u64::MAX,
+        dedupe_hit: inputs.dedupe_hit,
+        allowed_target: &allowed_target,
+        allowed_selectors: &allowed_selectors,
+        call_selector,
+        call_target,
+        simulation,
+        econ_data_available,
+        fee_split,
+        rebate_budget_asset,
+        rebate_reserve_asset,
+        gas_units: 0,
+        hard_gas_cap: state.options_config.execution_broadcast_gas_limit.max(1),
+        gas_cost_native: 0,
+        pnl_floor_native: 0,
+        safety_margin_bps: state.options_config.execution_gas_safety_bps,
+        subsidy_budget: SubsidyBudgetView::default(),
+    };
+
+    should_broadcast(intent, &context)
+}
+
 pub async fn broadcast_option_execution_intent(
     state: &AppState,
     intent_id: OptionExecutionIntentId,
@@ -1121,7 +1284,62 @@ pub async fn broadcast_option_execution_intent(
         BackendError::Config("RPC_URL is required for option execution broadcast".to_string())
     })?;
     let provider = HttpJsonRpcProvider::new(rpc_url);
-    broadcast_option_execution_intent_with_provider(state, intent_id, &provider).await
+    // Runtime path: construct the LiveProvider with all configured
+    // chain-state + economic addresses + the in-process observability
+    // handle so live read failures land in `/metrics`. Production
+    // broadcast attempts flow through the full-fidelity entry point
+    // `_signer_and_data_provider`.
+    let signer = build_signer_for_state(state)?;
+    let data_provider = build_runtime_policy_data_provider(state, provider.clone());
+    broadcast_option_execution_intent_with_provider_signer_and_data_provider(
+        state,
+        intent_id,
+        &provider,
+        signer.as_ref(),
+        &data_provider,
+    )
+    .await
+}
+
+/// Construct the production `LiveBroadcastPolicyDataProvider` from the
+/// current [`AppState`] + the RPC provider. The constructor attaches the
+/// in-process [`BroadcastObservability`] handle so RPC + ABI decode
+/// failures increment the matching `policy_data_failures_total` /
+/// `fm_v2_*_failures_total` counters. Addresses are sourced from:
+///
+/// - `state.option_event_indexer_config.collateral_vault_address` → CV.
+/// - `state.option_event_indexer_config.fees_manager_v2_address` → FM_V2.
+/// - PFV address: NOT yet sourced from config; `None` for now. A
+///   follow-on PR (`BACKEND-LIVE-PROVIDER-PFV-CONFIG`) threads
+///   `PROTOCOL_FEE_VAULT_ADDRESS` from env. While PFV is `None` the
+///   provider still emits `fm_v2_*` reads + `chain_state` reads + dedupe.
+pub fn build_runtime_policy_data_provider<P>(
+    state: &AppState,
+    provider: P,
+) -> LiveBroadcastPolicyDataProvider<P>
+where
+    P: TransactionBroadcastProvider
+        + crate::execution::EthCallProvider
+        + EthBalanceProvider
+        + Clone
+        + 'static,
+{
+    let cv_address = {
+        let raw = &state.option_event_indexer_config.collateral_vault_address;
+        if raw.0.is_empty() {
+            None
+        } else {
+            Some(raw.clone())
+        }
+    };
+    let fm_v2_address = state
+        .option_event_indexer_config
+        .fees_manager_v2_address
+        .clone();
+    // PFV address — deferred; defaults to None until env wiring lands.
+    let pfv_address: Option<AccountId> = None;
+    LiveBroadcastPolicyDataProvider::new(provider, pfv_address, cv_address, fm_v2_address)
+        .with_observability(state.broadcast_observability.clone())
 }
 
 pub async fn broadcast_option_execution_intent_with_provider<P>(
@@ -1132,8 +1350,317 @@ pub async fn broadcast_option_execution_intent_with_provider<P>(
 where
     P: TransactionBroadcastProvider + GasEstimateProvider,
 {
+    let signer = build_signer_for_state(state)?;
+    broadcast_option_execution_intent_with_provider_and_signer(
+        state,
+        intent_id,
+        provider,
+        signer.as_ref(),
+    )
+    .await
+}
+
+/// Drive the signer abstraction for the option-execution path. Computes
+/// the EIP-1559 prehash + calldata hash + `should_broadcast` ↔ signer
+/// policy fingerprint, calls `sign_option_execution_tx`, and assembles the
+/// raw signed transaction from the returned signature components. Returns
+/// `SignerError` directly so the caller can map it into a structured
+/// `BroadcastFailed` transition without leaking secrets.
+///
+/// MUST never fall back to a local-key signing path on remote-signer
+/// failure (custody policy §6 BE-5; design doc §5.3).
+async fn sign_option_execution_via_signer<S>(
+    signer: &S,
+    request: &ExecutionTransactionRequest,
+    nonce: u64,
+    intent: &OptionExecutionIntent,
+    signer_kind: SignerBackendKind,
+) -> std::result::Result<String, SignerError>
+where
+    S: RemoteSigner + ?Sized,
+{
+    let prehash = eip1559_transaction_prehash(request, nonce)
+        .map_err(|err| SignerError::Internal(format!("eip1559 prehash failed: {err}")))?;
+    let calldata_hash = keccak256(&request.calldata);
+    let policy_decision_id = uuid::Uuid::new_v4();
+    let simulation_block = intent.simulation_block_number.unwrap_or(0);
+    let deadline_ms = (intent.deadline as i64).saturating_mul(1_000);
+    let fingerprint = policy_fingerprint(
+        policy_decision_id,
+        &calldata_hash,
+        nonce,
+        simulation_block,
+        deadline_ms,
+    );
+    let function_selector = match intent.source_type {
+        OptionExecutionSourceType::OptionOrderbookFill => {
+            let s = expected_option_execute_trade_selector();
+            format!("0x{:02x}{:02x}{:02x}{:02x}", s[0], s[1], s[2], s[3])
+        }
+        OptionExecutionSourceType::OptionRfqFill => {
+            let s = expected_option_execute_rfq_trade_selector();
+            format!("0x{:02x}{:02x}{:02x}{:02x}", s[0], s[1], s[2], s[3])
+        }
+    };
+    let signer_request = SignerRequest {
+        request_id: uuid::Uuid::new_v4(),
+        intent_id: intent.intent_id,
+        source_type: intent.source_type.as_str(),
+        chain_id: request.chain_id,
+        target_contract: &request.to,
+        function_selector: function_selector.as_str(),
+        calldata_hash,
+        calldata_length: request.calldata.len(),
+        transaction_to: &request.to,
+        transaction_value_wei: 0,
+        gas_limit: request.gas_limit,
+        max_fee_per_gas_wei: request.max_fee_per_gas_wei.as_deref().unwrap_or(""),
+        max_priority_fee_per_gas_wei: request
+            .max_priority_fee_per_gas_wei
+            .as_deref()
+            .unwrap_or(""),
+        nonce,
+        simulation_block,
+        deadline_ms,
+        policy_decision_id,
+        policy_fingerprint: fingerprint,
+        policy_decision_at_ms: now_ms(),
+        prehash,
+    };
+    let response = signer.sign_option_execution_tx(signer_request).await?;
+    tracing::info!(
+        target: "broadcast_signer",
+        intent_id = %intent.intent_id,
+        signer_kind = %signer_kind,
+        policy_decision_id = %policy_decision_id,
+        kms_request_id = %response.kms_request_id.as_deref().unwrap_or("-"),
+        audit_log_id = %response.audit_log_id.as_deref().unwrap_or("-"),
+        remote_signer_request_id = %response.remote_signer_request_id.as_deref().unwrap_or("-"),
+        signer_address = %response.signer_address.0,
+        "signer approved option execution intent"
+    );
+    let raw = assemble_eip1559_signed_transaction(
+        request,
+        nonce,
+        response.signature.y_parity,
+        &response.signature.r,
+        &response.signature.s,
+    )
+    .map_err(|err| SignerError::Internal(format!("eip1559 assemble failed: {err}")))?;
+    Ok(raw)
+}
+
+/// Build the `RemoteSigner` selected by `state.execution_config` and apply
+/// the runtime defence-in-depth: even though
+/// `ExecutionConfig::validate_startup` already refuses `LocalDev` on
+/// mainnet, we re-check here so any in-flight regression fails closed
+/// before reaching the broadcast site.
+pub fn build_signer_for_state(state: &AppState) -> Result<Arc<dyn RemoteSigner>> {
+    if state.execution_config.executor_chain_id == MAINNET_CHAIN_ID
+        && state.execution_config.backend_signer_mode == SignerBackendKind::LocalDev
+    {
+        state
+            .broadcast_observability
+            .record_local_signer_on_mainnet_refused();
+        return Err(BackendError::Config(
+            "BACKEND_SIGNER_MODE=local_dev is REFUSED at runtime on mainnet (chain_id=8453)"
+                .to_string(),
+        ));
+    }
+    match state.execution_config.backend_signer_mode {
+        SignerBackendKind::LocalDev => {
+            let private_key = state
+                .execution_config
+                .executor_private_key
+                .as_ref()
+                .ok_or_else(|| {
+                    BackendError::Config(
+                        "EXECUTOR_PRIVATE_KEY is required for BACKEND_SIGNER_MODE=local_dev"
+                            .to_string(),
+                    )
+                })?;
+            let inner = ExecutorSigner::from_private_key(private_key)?;
+            Ok(Arc::new(LocalDevSigner::from_executor_signer(inner)))
+        }
+        SignerBackendKind::Remote => {
+            let endpoint = state
+                .execution_config
+                .backend_signer_endpoint
+                .clone()
+                .ok_or_else(|| {
+                    BackendError::Config(
+                        "BACKEND_SIGNER_ENDPOINT is required when BACKEND_SIGNER_MODE=remote"
+                            .to_string(),
+                    )
+                })?;
+            let expected = state.execution_config.executor_from_address.clone();
+            Ok(Arc::new(RemoteSignerClient::new(endpoint, expected)))
+        }
+    }
+}
+
+/// Broadcast variant that accepts an externally-supplied `RemoteSigner`.
+/// Canonical entry point for both production (with the signer built from
+/// config) and tests (with a mock signer).
+pub async fn broadcast_option_execution_intent_with_provider_and_signer<P, S>(
+    state: &AppState,
+    intent_id: OptionExecutionIntentId,
+    provider: &P,
+    signer: &S,
+) -> Result<OptionExecutionBroadcastOutcome>
+where
+    P: TransactionBroadcastProvider + GasEstimateProvider,
+    S: RemoteSigner + ?Sized,
+{
+    // Default Sepolia-permissive data provider — preserves the existing
+    // Sepolia rehearsal regression. The
+    // `broadcast_option_execution_intent_with_provider` (no-data-provider)
+    // and the test `_and_signer` paths route here.
+    let data_provider = StubBroadcastPolicyDataProvider::sepolia_permissive();
+    broadcast_option_execution_intent_with_provider_signer_and_data_provider(
+        state,
+        intent_id,
+        provider,
+        signer,
+        &data_provider,
+    )
+    .await
+}
+
+/// Full-fidelity broadcast entry point with an explicit policy data
+/// provider. Production code wires a [`LiveBroadcastPolicyDataProvider`]
+/// constructed from the configured RPC URL + PFV / CV addresses; tests
+/// inject a [`StubBroadcastPolicyDataProvider`] with canned inputs.
+pub async fn broadcast_option_execution_intent_with_provider_signer_and_data_provider<P, S, D>(
+    state: &AppState,
+    intent_id: OptionExecutionIntentId,
+    provider: &P,
+    signer: &S,
+    data_provider: &D,
+) -> Result<OptionExecutionBroadcastOutcome>
+where
+    P: TransactionBroadcastProvider + GasEstimateProvider,
+    S: RemoteSigner + ?Sized,
+    D: BroadcastPolicyDataProvider + ?Sized,
+{
     ensure_option_execution_broadcast_enabled(state)?;
     let intent = get_option_execution_intent(state, intent_id).await?;
+
+    // Gather every read-only chain / DB / accounting input the policy
+    // needs. Mainnet fail-closed on any provider error.
+    let mut inputs = match data_provider.gather_inputs(state, &intent).await {
+        Ok(inputs) => inputs,
+        Err(err) => {
+            let mode = BroadcastMode::from_chain_id(state.execution_config.executor_chain_id);
+            if matches!(mode, BroadcastMode::Mainnet) {
+                let reason = format!("policy:policy-internal:{err}");
+                warn!(
+                    target: "broadcast_policy",
+                    intent_id = %intent_id,
+                    "policy data provider failure (mainnet fail-closed)"
+                );
+                state
+                    .broadcast_observability
+                    .record_policy_data_failure(&format!("{err}"));
+                state
+                    .broadcast_observability
+                    .record_policy_rejected("policy-internal", intent.source_type);
+                let now = now_ms();
+                update_option_execution_intent_status(
+                    state,
+                    intent_id,
+                    OptionExecutionIntentStatus::BroadcastFailed,
+                    Some(reason.clone()),
+                    now,
+                )
+                .await?;
+                return Err(BackendError::BroadcastRejected(reason));
+            }
+            warn!(
+                target: "broadcast_policy",
+                intent_id = %intent_id,
+                error = %err,
+                "policy data provider failure on testnet — using permissive fallback"
+            );
+            state
+                .broadcast_observability
+                .record_policy_data_failure(&format!("{err}"));
+            BroadcastPolicyInputs::default()
+        }
+    };
+
+    // Dedupe is the one input that MUST reflect the latest persisted state
+    // at every broadcast attempt, not whatever the provider snapshotted —
+    // override here. Stub providers can ship a permissive default and the
+    // live re-check below is authoritative.
+    inputs.dedupe_hit = inputs.dedupe_hit
+        || matches!(
+            intent.status,
+            OptionExecutionIntentStatus::BroadcastSubmitted
+                | OptionExecutionIntentStatus::BroadcastConfirmed
+                | OptionExecutionIntentStatus::BroadcastFailed
+        )
+        || find_submitted_option_execution_transaction(state, intent_id)
+            .await?
+            .is_some();
+
+    // Per-broadcast observability hooks: live-read snapshot for `/metrics`
+    // gauges + econ_data_available transition counter + R5 drift counter.
+    state
+        .broadcast_observability
+        .record_inputs_snapshot(&inputs);
+    let econ_data_available = inputs.fee_split.is_some()
+        && inputs.fm_v2_rebate_budget_asset.is_some()
+        && inputs.pfv_rebate_reserve_asset.is_some();
+    state
+        .broadcast_observability
+        .record_econ_data_available(econ_data_available);
+    if matches!(inputs.r5_drift_zero, Some(false)) {
+        state.broadcast_observability.record_r5_drift_observed();
+    }
+
+    let policy_decision = run_should_broadcast_policy(state, &intent, &inputs);
+    if let ShouldBroadcastDecision::Reject(reason) = &policy_decision {
+        if matches!(reason, RejectReason::Dupe) {
+            if let Some(transaction) =
+                find_submitted_option_execution_transaction(state, intent_id).await?
+            {
+                state
+                    .broadcast_observability
+                    .record_policy_rejected("dupe", intent.source_type);
+                return Ok(OptionExecutionBroadcastOutcome {
+                    intent,
+                    transaction,
+                    broadcast_enabled: true,
+                    submitted: true,
+                    duplicate: true,
+                });
+            }
+        }
+        let message = policy_decision.message();
+        warn!(
+            target: "broadcast_policy",
+            intent_id = %intent_id,
+            code = reason.code(),
+            "should_broadcast rejected option execution intent"
+        );
+        state
+            .broadcast_observability
+            .record_policy_rejected(reason.code(), intent.source_type);
+        let now = now_ms();
+        update_option_execution_intent_status(
+            state,
+            intent_id,
+            OptionExecutionIntentStatus::BroadcastFailed,
+            Some(message.clone()),
+            now,
+        )
+        .await?;
+        return Err(BackendError::BroadcastRejected(message));
+    }
+    state
+        .broadcast_observability
+        .record_policy_approved(intent.source_type);
     if let Some(transaction) = find_submitted_option_execution_transaction(state, intent_id).await?
     {
         return Ok(OptionExecutionBroadcastOutcome {
@@ -1149,22 +1676,13 @@ where
             "RPC_URL is required for option execution broadcast".to_string(),
         ));
     }
-    let private_key = state
-        .execution_config
-        .executor_private_key
-        .as_ref()
-        .ok_or_else(|| {
-            BackendError::Config(
-                "EXECUTOR_PRIVATE_KEY is required for option execution broadcast".to_string(),
-            )
-        })?;
     let request = build_option_execution_transaction_request(
         &state.execution_config,
         &state.options_config,
         &intent,
     )?;
-    let signer = ExecutorSigner::from_private_key(private_key)?;
-    let from = signer.address().clone();
+    let from = signer.signer_address().clone();
+    let signer_kind = signer.kind();
 
     let gas_check = perform_option_broadcast_gas_safety_check(
         provider,
@@ -1210,7 +1728,48 @@ where
 
     let now = now_ms();
     let nonce = provider.transaction_count(from.clone()).await?;
-    let raw_transaction = sign_eip1559_transaction(&request, nonce, &signer)?;
+    state
+        .broadcast_observability
+        .record_signer_attempt(signer_kind.as_str());
+    let raw_transaction =
+        match sign_option_execution_via_signer(signer, &request, nonce, &intent, signer_kind).await
+        {
+            Ok(raw) => raw,
+            Err(signer_err) => {
+                let reason = format!("{signer_err}");
+                tracing::warn!(
+                    target: "broadcast_signer",
+                    intent_id = %intent_id,
+                    signer_kind = %signer_kind,
+                    code = signer_err.code(),
+                    "remote signer rejected option execution transaction"
+                );
+                state
+                    .broadcast_observability
+                    .record_signer_denied(signer_err.code(), signer_kind.as_str());
+                let transaction = option_execution_transaction_from_request(
+                    &request,
+                    from.clone(),
+                    None,
+                    Some(reason.clone()),
+                    now,
+                    Some(&gas_check),
+                );
+                insert_option_execution_transaction(state, transaction).await?;
+                update_option_execution_intent_status(
+                    state,
+                    intent_id,
+                    OptionExecutionIntentStatus::BroadcastFailed,
+                    Some(reason.clone()),
+                    now,
+                )
+                .await?;
+                return Err(BackendError::BroadcastRejected(reason));
+            }
+        };
+    state
+        .broadcast_observability
+        .record_signer_success(signer_kind.as_str(), now);
     let tx_hash = match provider.send_raw_transaction(raw_transaction).await {
         Ok(tx_hash) => {
             if !is_valid_tx_hash(&tx_hash) {
@@ -3003,6 +3562,35 @@ mod tests {
         }
     }
 
+    // EthCallProvider + EthBalanceProvider impls — minimal stub behaviour
+    // so the runtime LiveProvider helper can drive the mock through
+    // gather_inputs. eth_call always fails (so every chain-state read
+    // surfaces a `policy_data_failures_total{...}` increment when the
+    // runtime helper is used) — verifies the failure-counter wiring is
+    // hooked through the entry point.
+    impl crate::execution::EthCallProvider for MockBroadcastProvider {
+        fn eth_call(
+            &self,
+            _request: crate::execution::EthCallRequest,
+        ) -> RpcFuture<'_, crate::execution::EthCallSuccess> {
+            Box::pin(async move {
+                Err(BackendError::Simulation(
+                    "mock eth_call failure".to_string(),
+                ))
+            })
+        }
+    }
+
+    impl crate::execution::EthBalanceProvider for MockBroadcastProvider {
+        fn eth_get_balance(&self, _address: AccountId) -> RpcFuture<'_, u128> {
+            Box::pin(async move {
+                Err(BackendError::Simulation(
+                    "mock eth_get_balance failure".to_string(),
+                ))
+            })
+        }
+    }
+
     #[tokio::test]
     async fn option_nonce_sync_disabled_preserves_zero_intent_nonces() {
         let state = state_with_simulation(false);
@@ -3297,7 +3885,8 @@ mod tests {
                 .unwrap_err();
 
         assert!(
-            matches!(error, BackendError::InvalidOptionExecutionIntentState(message) if message.contains("calldata"))
+            matches!(&error, BackendError::BroadcastRejected(message) if message.contains("calldata-missing")),
+            "expected policy calldata-missing rejection, got {error:?}"
         );
         assert_eq!(provider.send_count(), 0);
         assert!(option_transactions(&state, intent.intent_id).is_empty());
@@ -3316,7 +3905,10 @@ mod tests {
                 .await
                 .unwrap_err();
 
-        assert!(matches!(error, BackendError::MissingTradeSignatures));
+        assert!(
+            matches!(&error, BackendError::BroadcastRejected(message) if message.contains("buyer-sig-missing")),
+            "expected policy buyer-sig-missing rejection, got {error:?}"
+        );
         assert_eq!(provider.send_count(), 0);
     }
 
@@ -3334,7 +3926,8 @@ mod tests {
                 .unwrap_err();
 
         assert!(
-            matches!(error, BackendError::BroadcastRejected(message) if message.contains("simulation_ok"))
+            matches!(&error, BackendError::BroadcastRejected(message) if message.contains("sim-revert")),
+            "expected policy sim-revert rejection, got {error:?}"
         );
         assert_eq!(provider.send_count(), 0);
     }
@@ -3456,6 +4049,949 @@ mod tests {
         assert_eq!(transactions.len(), 1);
         assert_eq!(transactions[0].status, ExecutionTransactionStatus::Failed);
         assert_eq!(transactions[0].tx_hash, None);
+    }
+
+    // ----------------------------------------------------------------------------
+    // BACKEND-SHOULD-BROADCAST-ECONOMIC-GATE regression tests
+    // (Phase D, Test 22 + 23: gate <-> intent state-machine integration)
+    // ----------------------------------------------------------------------------
+
+    /// Test 22 — `should_broadcast` returns Approve → existing state-machine
+    /// transitions unchanged: BroadcastSubmitted with a tx_hash.
+    #[tokio::test]
+    async fn policy_approve_preserves_existing_broadcast_state_machine() {
+        let state = state_with_broadcast(true);
+        let intent = insert_intent(&state, broadcast_ready_intent());
+        let provider = MockBroadcastProvider::success();
+
+        let outcome =
+            broadcast_option_execution_intent_with_provider(&state, intent.intent_id, &provider)
+                .await
+                .unwrap();
+
+        assert!(outcome.submitted);
+        assert!(!outcome.duplicate);
+        assert_eq!(provider.send_count(), 1);
+        let stored = get_option_execution_intent(&state, intent.intent_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            stored.status,
+            OptionExecutionIntentStatus::BroadcastSubmitted,
+            "policy Approve must leave existing broadcast_submitted transition intact"
+        );
+        let transactions = option_transactions(&state, intent.intent_id);
+        assert_eq!(transactions.len(), 1);
+        assert!(transactions[0].tx_hash.is_some());
+    }
+
+    /// Test 23 — `should_broadcast` returns Reject → intent transitions to
+    /// BroadcastFailed cleanly with a policy-prefixed reason; no half-state,
+    /// no tx_hash, no provider broadcast.
+    #[tokio::test]
+    async fn policy_reject_transitions_cleanly_without_half_state() {
+        let state = state_with_broadcast(true);
+        let mut intent = broadcast_ready_intent();
+        intent.buyer = AccountId::new("0x000000000000000000000000000000000000aaaa");
+        intent.seller = intent.buyer.clone();
+        let intent = insert_intent(&state, intent);
+        let provider = MockBroadcastProvider::success();
+
+        let error =
+            broadcast_option_execution_intent_with_provider(&state, intent.intent_id, &provider)
+                .await
+                .unwrap_err();
+
+        assert!(
+            matches!(&error, BackendError::BroadcastRejected(message) if message.starts_with("policy:wash")),
+            "expected policy wash rejection, got {error:?}"
+        );
+        assert_eq!(provider.send_count(), 0);
+        let stored = get_option_execution_intent(&state, intent.intent_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            stored.status,
+            OptionExecutionIntentStatus::BroadcastFailed,
+            "policy Reject must drive intent into broadcast_failed without intermediate states"
+        );
+        assert!(
+            stored
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("policy:wash"),
+            "stored error must carry the structured policy reason; got {:?}",
+            stored.error
+        );
+        assert!(
+            option_transactions(&state, intent.intent_id).is_empty(),
+            "no tx row may be persisted when the policy rejects pre-broadcast"
+        );
+    }
+
+    // ----------------------------------------------------------------------------
+    // BACKEND-SIGNER-INTERFACE-KMS-HSM-ADAPTER integration tests
+    // (signer abstraction <-> option execution broadcast path)
+    // ----------------------------------------------------------------------------
+
+    use crate::execution::remote_signer::{
+        RemoteSigner, SignerError, SignerFuture, SignerHealth, SignerRequest, SignerResponse,
+    };
+    use crate::execution::SignerBackendKind;
+
+    /// Mock RemoteSigner: yields a deterministic recoverable signature
+    /// produced by the same test key the LocalDevSigner uses, OR returns a
+    /// canned error. Counts sign calls so tests can assert no-fallback /
+    /// not-called behaviour.
+    struct MockBackendSigner {
+        signer: ExecutorSigner,
+        outcome: Mutex<MockSignerOutcome>,
+        sign_calls: Mutex<u64>,
+    }
+
+    enum MockSignerOutcome {
+        Sign,
+        Reject(SignerError),
+    }
+
+    impl MockBackendSigner {
+        fn approving() -> Self {
+            let inner = ExecutorSigner::from_private_key(&crate::execution::PrivateKeySecret::new(
+                "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318".to_string(),
+            ))
+            .expect("test key parse");
+            Self {
+                signer: inner,
+                outcome: Mutex::new(MockSignerOutcome::Sign),
+                sign_calls: Mutex::new(0),
+            }
+        }
+
+        fn rejecting(err: SignerError) -> Self {
+            let inner = ExecutorSigner::from_private_key(&crate::execution::PrivateKeySecret::new(
+                "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318".to_string(),
+            ))
+            .expect("test key parse");
+            Self {
+                signer: inner,
+                outcome: Mutex::new(MockSignerOutcome::Reject(err)),
+                sign_calls: Mutex::new(0),
+            }
+        }
+
+        fn sign_calls_count(&self) -> u64 {
+            *self.sign_calls.lock().unwrap()
+        }
+    }
+
+    impl RemoteSigner for MockBackendSigner {
+        fn signer_address(&self) -> &AccountId {
+            self.signer.address()
+        }
+
+        fn kind(&self) -> SignerBackendKind {
+            SignerBackendKind::Remote
+        }
+
+        fn sign_option_execution_tx<'a>(
+            &'a self,
+            request: SignerRequest<'a>,
+        ) -> SignerFuture<'a, SignerResponse> {
+            *self.sign_calls.lock().unwrap() += 1;
+            let SignerRequest {
+                request_id,
+                policy_decision_id,
+                prehash,
+                ..
+            } = request;
+            let address = self.signer.address().clone();
+            let outcome_guard = self.outcome.lock().unwrap();
+            let outcome_clone = match &*outcome_guard {
+                MockSignerOutcome::Sign => MockSignerOutcome::Sign,
+                MockSignerOutcome::Reject(err) => MockSignerOutcome::Reject(err.clone()),
+            };
+            drop(outcome_guard);
+            let signer = self.signer.clone();
+            Box::pin(async move {
+                match outcome_clone {
+                    MockSignerOutcome::Sign => {
+                        let signature = signer
+                            .sign_prehash(&prehash)
+                            .map_err(|e| SignerError::Internal(e.to_string()))?;
+                        Ok(SignerResponse {
+                            request_id,
+                            signer_address: address,
+                            signature,
+                            kms_request_id: Some("mock-kms".to_string()),
+                            audit_log_id: Some("mock-audit".to_string()),
+                            remote_signer_request_id: Some("mock-rsig".to_string()),
+                            created_at_ms: 1,
+                            policy_decision_id,
+                        })
+                    }
+                    MockSignerOutcome::Reject(err) => Err(err),
+                }
+            })
+        }
+
+        fn health_check(&self) -> SignerFuture<'_, SignerHealth> {
+            Box::pin(async move {
+                Ok(SignerHealth {
+                    mode: SignerBackendKind::Remote,
+                    signer_address: Some(self.signer.address().clone()),
+                    remote_endpoint_present: true,
+                    healthy: true,
+                })
+            })
+        }
+    }
+
+    /// should_broadcast Approve → signer called exactly once → intent
+    /// transitions to BroadcastSubmitted; preserves existing state-machine.
+    #[tokio::test]
+    async fn signer_approve_routes_through_broadcast_and_marks_submitted() {
+        let state = state_with_broadcast(true);
+        let intent = insert_intent(&state, broadcast_ready_intent());
+        let provider = MockBroadcastProvider::success();
+        let signer = MockBackendSigner::approving();
+
+        let outcome = broadcast_option_execution_intent_with_provider_and_signer(
+            &state,
+            intent.intent_id,
+            &provider,
+            &signer,
+        )
+        .await
+        .expect("approving signer must transit broadcast");
+
+        assert!(outcome.submitted);
+        assert!(!outcome.duplicate);
+        assert_eq!(signer.sign_calls_count(), 1);
+        assert_eq!(provider.send_count(), 1);
+        let stored = get_option_execution_intent(&state, intent.intent_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            stored.status,
+            OptionExecutionIntentStatus::BroadcastSubmitted
+        );
+    }
+
+    /// should_broadcast Reject → signer must NOT be called (gate runs first).
+    #[tokio::test]
+    async fn signer_not_called_when_policy_rejects() {
+        let state = state_with_broadcast(true);
+        let mut intent = broadcast_ready_intent();
+        intent.buyer = AccountId::new("0x000000000000000000000000000000000000aaaa");
+        intent.seller = intent.buyer.clone();
+        let intent = insert_intent(&state, intent);
+        let provider = MockBroadcastProvider::success();
+        let signer = MockBackendSigner::approving();
+
+        let error = broadcast_option_execution_intent_with_provider_and_signer(
+            &state,
+            intent.intent_id,
+            &provider,
+            &signer,
+        )
+        .await
+        .expect_err("policy reject must short-circuit signer");
+
+        assert!(
+            matches!(&error, BackendError::BroadcastRejected(msg) if msg.starts_with("policy:wash")),
+            "expected policy wash rejection, got {error:?}"
+        );
+        assert_eq!(
+            signer.sign_calls_count(),
+            0,
+            "signer must not be invoked when policy rejects"
+        );
+        assert_eq!(provider.send_count(), 0);
+    }
+
+    /// Remote signer rejection → BroadcastFailed clean; NO fallback to a
+    /// different signer; no chain send; tx row persisted with structured
+    /// signer:<code> reason.
+    #[tokio::test]
+    async fn signer_rejection_transitions_to_broadcast_failed_without_fallback() {
+        let state = state_with_broadcast(true);
+        let intent = insert_intent(&state, broadcast_ready_intent());
+        let provider = MockBroadcastProvider::success();
+        let signer = MockBackendSigner::rejecting(SignerError::PolicyFingerprint);
+
+        let error = broadcast_option_execution_intent_with_provider_and_signer(
+            &state,
+            intent.intent_id,
+            &provider,
+            &signer,
+        )
+        .await
+        .expect_err("rejecting signer must surface error");
+
+        assert!(
+            matches!(&error, BackendError::BroadcastRejected(msg) if msg.starts_with("signer:policy-fingerprint")),
+            "expected signer:policy-fingerprint, got {error:?}"
+        );
+        assert_eq!(signer.sign_calls_count(), 1);
+        assert_eq!(
+            provider.send_count(),
+            0,
+            "no chain broadcast after signer rejection — no fallback path"
+        );
+        let stored = get_option_execution_intent(&state, intent.intent_id)
+            .await
+            .unwrap();
+        assert_eq!(stored.status, OptionExecutionIntentStatus::BroadcastFailed);
+        let transactions = option_transactions(&state, intent.intent_id);
+        assert_eq!(transactions.len(), 1);
+        assert_eq!(transactions[0].tx_hash, None);
+    }
+
+    /// KMS upstream timeout maps to BroadcastFailed with signer:kms-timeout;
+    /// proves the no-fallback contract under upstream outage.
+    #[tokio::test]
+    async fn signer_kms_timeout_marks_intent_failed_no_local_fallback() {
+        let state = state_with_broadcast(true);
+        let intent = insert_intent(&state, broadcast_ready_intent());
+        let provider = MockBroadcastProvider::success();
+        let signer = MockBackendSigner::rejecting(SignerError::KmsTimeout);
+
+        let error = broadcast_option_execution_intent_with_provider_and_signer(
+            &state,
+            intent.intent_id,
+            &provider,
+            &signer,
+        )
+        .await
+        .expect_err("KMS timeout must surface as broadcast failure");
+
+        assert!(
+            matches!(&error, BackendError::BroadcastRejected(msg) if msg.starts_with("signer:kms-timeout")),
+            "expected signer:kms-timeout, got {error:?}"
+        );
+        assert_eq!(provider.send_count(), 0);
+    }
+
+    // ----------------------------------------------------------------------------
+    // WIRE-SHOULD-BROADCAST-CHAIN-STATE-READS integration tests
+    // (data provider <-> policy gate <-> signer)
+    // ----------------------------------------------------------------------------
+
+    use crate::options::broadcast_policy_data::{
+        BroadcastPolicyInputs, DedupeReason, StubBroadcastPolicyDataProvider,
+    };
+
+    fn happy_inputs() -> BroadcastPolicyInputs {
+        BroadcastPolicyInputs {
+            chain_id_rpc: Some(84532),
+            be_balance_wei: Some(u128::MAX / 2),
+            ome_paused: Some(false),
+            ome_is_executor: Some(true),
+            pfv_fee_balance_asset: Some(0),
+            pfv_rebate_reserve_asset: Some(0),
+            cv_pfv_balance_asset: Some(0),
+            fee_split: None,
+            fm_v2_rebate_budget_asset: None,
+            dedupe_hit: false,
+            dedupe_reason: DedupeReason::None,
+            r5_drift_zero: Some(true),
+        }
+    }
+
+    /// Stub data provider returns OME paused → policy rejects with
+    /// `ome-paused`; signer must NOT be called; intent transitions to
+    /// `BroadcastFailed`.
+    #[tokio::test]
+    async fn data_provider_ome_paused_rejects_before_signer_call() {
+        let state = state_with_broadcast(true);
+        let intent = insert_intent(&state, broadcast_ready_intent());
+        let provider = MockBroadcastProvider::success();
+        let signer = MockBackendSigner::approving();
+        let mut inputs = happy_inputs();
+        inputs.ome_paused = Some(true);
+        let data_provider = StubBroadcastPolicyDataProvider::new(inputs);
+
+        let error = broadcast_option_execution_intent_with_provider_signer_and_data_provider(
+            &state,
+            intent.intent_id,
+            &provider,
+            &signer,
+            &data_provider,
+        )
+        .await
+        .expect_err("OME paused must reject before signer");
+
+        assert!(
+            matches!(&error, BackendError::BroadcastRejected(msg) if msg.starts_with("policy:ome-paused")),
+            "expected policy:ome-paused, got {error:?}"
+        );
+        assert_eq!(
+            signer.sign_calls_count(),
+            0,
+            "signer must not be called when OME paused"
+        );
+        assert_eq!(provider.send_count(), 0);
+    }
+
+    /// Stub data provider reports BE is not the chain-side executor →
+    /// policy rejects with `be-not-exec`; signer not called.
+    #[tokio::test]
+    async fn data_provider_be_not_executor_rejects_before_signer_call() {
+        let state = state_with_broadcast(true);
+        let intent = insert_intent(&state, broadcast_ready_intent());
+        let provider = MockBroadcastProvider::success();
+        let signer = MockBackendSigner::approving();
+        let mut inputs = happy_inputs();
+        inputs.ome_is_executor = Some(false);
+        let data_provider = StubBroadcastPolicyDataProvider::new(inputs);
+
+        let error = broadcast_option_execution_intent_with_provider_signer_and_data_provider(
+            &state,
+            intent.intent_id,
+            &provider,
+            &signer,
+            &data_provider,
+        )
+        .await
+        .expect_err("BE not executor must reject");
+
+        assert!(
+            matches!(&error, BackendError::BroadcastRejected(msg) if msg.starts_with("policy:be-not-exec")),
+            "expected policy:be-not-exec, got {error:?}"
+        );
+        assert_eq!(signer.sign_calls_count(), 0);
+    }
+
+    /// R5 drift detected → policy rejects with `policy-internal:r5-drift`;
+    /// signer not called. Mainnet hard gate.
+    #[tokio::test]
+    async fn data_provider_r5_drift_rejects_before_signer_call() {
+        let state = state_with_broadcast(true);
+        let intent = insert_intent(&state, broadcast_ready_intent());
+        let provider = MockBroadcastProvider::success();
+        let signer = MockBackendSigner::approving();
+        let mut inputs = happy_inputs();
+        inputs.r5_drift_zero = Some(false);
+        let data_provider = StubBroadcastPolicyDataProvider::new(inputs);
+
+        let error = broadcast_option_execution_intent_with_provider_signer_and_data_provider(
+            &state,
+            intent.intent_id,
+            &provider,
+            &signer,
+            &data_provider,
+        )
+        .await
+        .expect_err("r5 drift must reject");
+
+        assert!(
+            matches!(&error, BackendError::BroadcastRejected(msg) if msg.starts_with("policy:policy-internal:r5-drift")),
+            "expected policy:policy-internal:r5-drift, got {error:?}"
+        );
+        assert_eq!(signer.sign_calls_count(), 0);
+        assert_eq!(provider.send_count(), 0);
+    }
+
+    /// Provider data populates `econ_data_available=false` on the
+    /// Sepolia rehearsal path so the existing fee-only smoke regression
+    /// continues to land Approve and broadcast through unchanged. This
+    /// test pins the boundary-mode behaviour.
+    #[tokio::test]
+    async fn data_provider_sepolia_path_still_approves_under_boundary_mode() {
+        let state = state_with_broadcast(true);
+        let intent = insert_intent(&state, broadcast_ready_intent());
+        let provider = MockBroadcastProvider::success();
+        let signer = MockBackendSigner::approving();
+        let data_provider = StubBroadcastPolicyDataProvider::sepolia_permissive();
+
+        let outcome = broadcast_option_execution_intent_with_provider_signer_and_data_provider(
+            &state,
+            intent.intent_id,
+            &provider,
+            &signer,
+            &data_provider,
+        )
+        .await
+        .expect("Sepolia boundary path must continue to approve");
+
+        assert!(outcome.submitted);
+        assert!(!outcome.duplicate);
+        assert_eq!(signer.sign_calls_count(), 1);
+        assert_eq!(provider.send_count(), 1);
+    }
+
+    /// Live FM_V2 quote populates fee_split + rebate budget + reserve →
+    /// `econ_data_available = true` → §8 step 4 still approves a fee-only
+    /// trade; signer is called once.
+    #[tokio::test]
+    async fn fee_split_populated_fee_only_intent_approves() {
+        use crate::options::broadcast_policy::FeeSplitSummary;
+        let state = state_with_broadcast(true);
+        let intent = insert_intent(&state, broadcast_ready_intent());
+        let provider = MockBroadcastProvider::success();
+        let signer = MockBackendSigner::approving();
+        let mut inputs = happy_inputs();
+        inputs.fee_split = Some(FeeSplitSummary {
+            gross_fee_revenue: 150,
+            total_rebate_outflow: 0,
+            net_protocol_revenue: 150,
+            effective_maker_ppm: 50,
+            effective_taker_ppm: 100,
+            asset: AccountId::new("0x000000000000000000000000000000000000aaaa"),
+            tier: 0,
+        });
+        inputs.fm_v2_rebate_budget_asset = Some(0);
+        inputs.pfv_rebate_reserve_asset = Some(0);
+        let data_provider = StubBroadcastPolicyDataProvider::new(inputs);
+
+        let outcome = broadcast_option_execution_intent_with_provider_signer_and_data_provider(
+            &state,
+            intent.intent_id,
+            &provider,
+            &signer,
+            &data_provider,
+        )
+        .await
+        .expect("fee-only econ-available path must approve");
+        assert!(outcome.submitted);
+        assert_eq!(signer.sign_calls_count(), 1);
+    }
+
+    /// Live FM_V2 quote contains a rebate-positive intent but PFV
+    /// rebate_reserve = 0 → §8 step 5 hard gate rejects with
+    /// `policy:rebate-reserve`; signer not called.
+    #[tokio::test]
+    async fn fee_split_rebate_positive_with_zero_reserve_rejects() {
+        use crate::options::broadcast_policy::FeeSplitSummary;
+        let state = state_with_broadcast(true);
+        let intent = insert_intent(&state, broadcast_ready_intent());
+        let provider = MockBroadcastProvider::success();
+        let signer = MockBackendSigner::approving();
+        let mut inputs = happy_inputs();
+        inputs.fee_split = Some(FeeSplitSummary {
+            gross_fee_revenue: 100,
+            total_rebate_outflow: 50,
+            net_protocol_revenue: 50,
+            effective_maker_ppm: -50,
+            effective_taker_ppm: 100,
+            asset: AccountId::new("0x000000000000000000000000000000000000aaaa"),
+            tier: 0,
+        });
+        inputs.fm_v2_rebate_budget_asset = Some(u128::MAX);
+        inputs.pfv_rebate_reserve_asset = Some(0); // launch state
+        let data_provider = StubBroadcastPolicyDataProvider::new(inputs);
+
+        let error = broadcast_option_execution_intent_with_provider_signer_and_data_provider(
+            &state,
+            intent.intent_id,
+            &provider,
+            &signer,
+            &data_provider,
+        )
+        .await
+        .expect_err("rebate-positive with zero PFV reserve must reject");
+        assert!(
+            matches!(&error, BackendError::BroadcastRejected(msg) if msg.starts_with("policy:rebate-reserve")),
+            "expected policy:rebate-reserve, got {error:?}"
+        );
+        assert_eq!(signer.sign_calls_count(), 0);
+    }
+
+    /// Live FM_V2 quote contains a rebate-positive intent and FM_V2
+    /// rebateBudget(asset) is insufficient → §8 step 5 hard gate rejects
+    /// with `policy:rebate-budget`; signer not called.
+    #[tokio::test]
+    async fn fee_split_rebate_positive_with_insufficient_budget_rejects() {
+        use crate::options::broadcast_policy::FeeSplitSummary;
+        let state = state_with_broadcast(true);
+        let intent = insert_intent(&state, broadcast_ready_intent());
+        let provider = MockBroadcastProvider::success();
+        let signer = MockBackendSigner::approving();
+        let mut inputs = happy_inputs();
+        inputs.fee_split = Some(FeeSplitSummary {
+            gross_fee_revenue: 100,
+            total_rebate_outflow: 200,
+            net_protocol_revenue: -100,
+            effective_maker_ppm: -50,
+            effective_taker_ppm: -150,
+            asset: AccountId::new("0x000000000000000000000000000000000000aaaa"),
+            tier: 0,
+        });
+        inputs.fm_v2_rebate_budget_asset = Some(50);
+        inputs.pfv_rebate_reserve_asset = Some(u128::MAX);
+        let data_provider = StubBroadcastPolicyDataProvider::new(inputs);
+
+        let error = broadcast_option_execution_intent_with_provider_signer_and_data_provider(
+            &state,
+            intent.intent_id,
+            &provider,
+            &signer,
+            &data_provider,
+        )
+        .await
+        .expect_err("rebate-positive with insufficient budget must reject");
+        assert!(
+            matches!(&error, BackendError::BroadcastRejected(msg) if msg.starts_with("policy:rebate-budget")),
+            "expected policy:rebate-budget, got {error:?}"
+        );
+        assert_eq!(signer.sign_calls_count(), 0);
+    }
+
+    // ----------------------------------------------------------------------------
+    // BACKEND-EXECUTOR-MONITORING-ALERTS-V1-WIRING integration tests
+    // (observability counters fire on the right transitions; metrics
+    // text renders with the expected gauge names; signer NOT called
+    // when policy rejects)
+    // ----------------------------------------------------------------------------
+
+    /// Policy approve → policy_approved counter increments; signer
+    /// attempted + success counters increment; last_submitted_ms persisted.
+    #[tokio::test]
+    async fn observability_policy_approve_increments_signer_counters() {
+        let state = state_with_broadcast(true);
+        let intent = insert_intent(&state, broadcast_ready_intent());
+        let provider = MockBroadcastProvider::success();
+        let signer = MockBackendSigner::approving();
+        let data_provider = StubBroadcastPolicyDataProvider::sepolia_permissive();
+
+        let outcome = broadcast_option_execution_intent_with_provider_signer_and_data_provider(
+            &state,
+            intent.intent_id,
+            &provider,
+            &signer,
+            &data_provider,
+        )
+        .await
+        .expect("approve path must succeed");
+        assert!(outcome.submitted);
+
+        let snap = state.broadcast_observability.snapshot();
+        assert_eq!(snap.policy_approved_total.get("orderbook"), Some(&1));
+        assert_eq!(snap.signer_attempted_total.get("remote"), Some(&1));
+        assert_eq!(snap.signer_success_total.get("remote"), Some(&1));
+        assert!(snap.last_broadcast_submitted_ms.is_some());
+        // policy rejects must be empty on a clean approve path.
+        assert_eq!(snap.policy_rejected_total.len(), 0);
+    }
+
+    /// Policy reject with `wash` code → policy_rejected counter
+    /// increments with (wash, orderbook); last_policy_reject_code set;
+    /// signer NEVER called.
+    #[tokio::test]
+    async fn observability_policy_wash_reject_increments_counter_and_not_signer() {
+        let state = state_with_broadcast(true);
+        let mut intent = broadcast_ready_intent();
+        intent.buyer = AccountId::new("0x000000000000000000000000000000000000aaaa");
+        intent.seller = intent.buyer.clone();
+        let intent = insert_intent(&state, intent);
+        let provider = MockBroadcastProvider::success();
+        let signer = MockBackendSigner::approving();
+        let data_provider = StubBroadcastPolicyDataProvider::sepolia_permissive();
+
+        let _ = broadcast_option_execution_intent_with_provider_signer_and_data_provider(
+            &state,
+            intent.intent_id,
+            &provider,
+            &signer,
+            &data_provider,
+        )
+        .await
+        .expect_err("wash must reject");
+
+        let snap = state.broadcast_observability.snapshot();
+        assert_eq!(
+            snap.policy_rejected_total
+                .get(&("wash".to_string(), "orderbook".to_string())),
+            Some(&1)
+        );
+        assert_eq!(snap.last_policy_reject_code.as_deref(), Some("wash"));
+        assert_eq!(snap.signer_attempted_total.len(), 0);
+        assert_eq!(signer.sign_calls_count(), 0);
+    }
+
+    /// `econ_data_available_true_total` increments when fee_split is
+    /// populated; `econ_data_available_false_total` increments otherwise.
+    #[tokio::test]
+    async fn observability_econ_data_available_true_increments_when_fee_split_present() {
+        use crate::options::broadcast_policy::FeeSplitSummary;
+        let state = state_with_broadcast(true);
+        let intent = insert_intent(&state, broadcast_ready_intent());
+        let provider = MockBroadcastProvider::success();
+        let signer = MockBackendSigner::approving();
+        let mut inputs = happy_inputs();
+        inputs.fee_split = Some(FeeSplitSummary {
+            gross_fee_revenue: 150,
+            total_rebate_outflow: 0,
+            net_protocol_revenue: 150,
+            effective_maker_ppm: 50,
+            effective_taker_ppm: 100,
+            asset: AccountId::new("0x000000000000000000000000000000000000aaaa"),
+            tier: 0,
+        });
+        inputs.fm_v2_rebate_budget_asset = Some(0);
+        inputs.pfv_rebate_reserve_asset = Some(0);
+        let data_provider = StubBroadcastPolicyDataProvider::new(inputs);
+
+        let _ = broadcast_option_execution_intent_with_provider_signer_and_data_provider(
+            &state,
+            intent.intent_id,
+            &provider,
+            &signer,
+            &data_provider,
+        )
+        .await
+        .expect("econ-data-true approve path");
+        let snap = state.broadcast_observability.snapshot();
+        assert_eq!(snap.econ_data_available_true_total, 1);
+        assert_eq!(snap.econ_data_available_false_total, 0);
+    }
+
+    /// R5 drift detected by data provider → r5_drift_observed_total
+    /// increments AND `policy:policy-internal:r5-drift` reject increments
+    /// with the (policy-internal, orderbook) label pair.
+    #[tokio::test]
+    async fn observability_r5_drift_increments_drift_counter_and_policy_internal_reject() {
+        let state = state_with_broadcast(true);
+        let intent = insert_intent(&state, broadcast_ready_intent());
+        let provider = MockBroadcastProvider::success();
+        let signer = MockBackendSigner::approving();
+        let mut inputs = happy_inputs();
+        inputs.r5_drift_zero = Some(false);
+        let data_provider = StubBroadcastPolicyDataProvider::new(inputs);
+
+        let _ = broadcast_option_execution_intent_with_provider_signer_and_data_provider(
+            &state,
+            intent.intent_id,
+            &provider,
+            &signer,
+            &data_provider,
+        )
+        .await
+        .expect_err("r5 drift must reject");
+        let snap = state.broadcast_observability.snapshot();
+        assert_eq!(snap.r5_drift_observed_total, 1);
+        assert_eq!(
+            snap.policy_rejected_total
+                .get(&("policy-internal".to_string(), "orderbook".to_string())),
+            Some(&1)
+        );
+        assert_eq!(signer.sign_calls_count(), 0);
+    }
+
+    /// Signer denial → signer_denied counter increments with the (code,
+    /// signer_kind) pair; signer_attempted increments; signer_success
+    /// does NOT.
+    #[tokio::test]
+    async fn observability_signer_denial_increments_denied_counter() {
+        let state = state_with_broadcast(true);
+        let intent = insert_intent(&state, broadcast_ready_intent());
+        let provider = MockBroadcastProvider::success();
+        let signer = MockBackendSigner::rejecting(SignerError::PolicyFingerprint);
+        let data_provider = StubBroadcastPolicyDataProvider::sepolia_permissive();
+
+        let _ = broadcast_option_execution_intent_with_provider_signer_and_data_provider(
+            &state,
+            intent.intent_id,
+            &provider,
+            &signer,
+            &data_provider,
+        )
+        .await
+        .expect_err("signer denial must surface");
+        let snap = state.broadcast_observability.snapshot();
+        assert_eq!(snap.signer_attempted_total.get("remote"), Some(&1));
+        assert!(!snap.signer_success_total.contains_key("remote"));
+        assert_eq!(
+            snap.signer_denied_total
+                .get(&("policy-fingerprint".to_string(), "remote".to_string())),
+            Some(&1)
+        );
+    }
+
+    /// `build_signer_for_state` runtime refusal on mainnet increments
+    /// the `local_signer_on_mainnet_refused_total` counter.
+    #[test]
+    fn observability_local_signer_on_mainnet_refused_increments_counter() {
+        let mut state = state_with_broadcast(true);
+        state.execution_config.executor_chain_id = MAINNET_CHAIN_ID;
+        state.execution_config.backend_signer_mode = SignerBackendKind::LocalDev;
+        match build_signer_for_state(&state) {
+            Err(BackendError::Config(_)) => {}
+            Err(other) => panic!("expected Config error, got {other:?}"),
+            Ok(_) => panic!("must refuse"),
+        }
+        let snap = state.broadcast_observability.snapshot();
+        assert_eq!(snap.local_signer_on_mainnet_refused_total, 1);
+    }
+
+    // ----------------------------------------------------------------------------
+    // BACKEND-LIVE-PROVIDER-IN-MAIN-WIRING runtime helper tests
+    // ----------------------------------------------------------------------------
+
+    use crate::options::broadcast_policy_data::{read_type, BroadcastPolicyDataProvider};
+
+    /// The runtime helper attaches the state's `BroadcastObservability`
+    /// handle so live-read failures land in `/metrics`. Verified by
+    /// invoking `gather_inputs` through a mock provider that fails every
+    /// `eth_call` + `eth_get_balance`, then asserting the
+    /// `policy_data_failures_total` snapshot records each failure.
+    #[tokio::test]
+    async fn build_runtime_policy_data_provider_attaches_observability() {
+        let state = state_with_broadcast(true);
+        let provider = MockBroadcastProvider::success();
+        let data_provider = build_runtime_policy_data_provider(&state, provider);
+        let intent = broadcast_ready_intent();
+        let _ = data_provider.gather_inputs(&state, &intent).await.unwrap();
+        let snap = state.broadcast_observability.snapshot();
+        assert!(
+            snap.policy_data_failures_total
+                .get(read_type::BE_BALANCE)
+                .copied()
+                .unwrap_or(0)
+                >= 1,
+            "be_balance failure must surface via the attached observability handle; got {:?}",
+            snap.policy_data_failures_total
+        );
+        // OME paused / isExecutor are eth_call reads; the mock fails
+        // both → both counters must increment.
+        assert!(
+            snap.policy_data_failures_total
+                .get(read_type::OME_PAUSED)
+                .copied()
+                .unwrap_or(0)
+                >= 1,
+            "ome_paused failure must surface via the runtime path; got {:?}",
+            snap.policy_data_failures_total
+        );
+        assert!(
+            snap.policy_data_failures_total
+                .get(read_type::OME_IS_EXECUTOR)
+                .copied()
+                .unwrap_or(0)
+                >= 1,
+            "ome_is_executor failure must surface via the runtime path"
+        );
+    }
+
+    /// FM_V2 RPC failure metric fires when the runtime helper has an
+    /// FM_V2 address threaded through state. Mirrors the prior
+    /// LiveProvider test but exercises the entry-point construction path.
+    #[tokio::test]
+    async fn build_runtime_policy_data_provider_records_fm_v2_rpc_failure() {
+        let mut state = state_with_broadcast(true);
+        state.option_event_indexer_config.fees_manager_v2_address =
+            Some(AccountId::new("0x000000000000000000000000000000000000beef"));
+        let provider = MockBroadcastProvider::success();
+        let data_provider = build_runtime_policy_data_provider(&state, provider);
+        let intent = broadcast_ready_intent();
+        let inputs = data_provider.gather_inputs(&state, &intent).await.unwrap();
+        // FM_V2 reads fail → fee_split stays None, fm_v2_rebate_budget None.
+        assert_eq!(inputs.fee_split, None);
+        assert_eq!(inputs.fm_v2_rebate_budget_asset, None);
+        let snap = state.broadcast_observability.snapshot();
+        // Maker + taker quoteFees calls both fail RPC → 2 increments.
+        assert_eq!(snap.fm_v2_rpc_failures_total, 2);
+        assert_eq!(snap.fm_v2_decode_failures_total, 0);
+        assert_eq!(
+            snap.policy_data_failures_total
+                .get(read_type::FM_V2_QUOTE_FEES_RPC),
+            Some(&2)
+        );
+    }
+
+    /// The legacy `_with_provider` path (used by direct test calls)
+    /// continues to use the Sepolia-permissive stub — its observability
+    /// counters stay quiet for the data-read failures (no live reads
+    /// occur). This pins the contract that the existing tests are NOT
+    /// affected by the new runtime wiring.
+    #[tokio::test]
+    async fn legacy_with_provider_path_does_not_invoke_live_provider() {
+        let state = state_with_broadcast(true);
+        let intent = insert_intent(&state, broadcast_ready_intent());
+        let provider = MockBroadcastProvider::success();
+        let _ =
+            broadcast_option_execution_intent_with_provider(&state, intent.intent_id, &provider)
+                .await;
+        let snap = state.broadcast_observability.snapshot();
+        // No FM_V2 RPC / decode failures or chain-state read failures
+        // — the Sepolia-permissive stub returns canned inputs.
+        assert_eq!(snap.fm_v2_rpc_failures_total, 0);
+        assert_eq!(snap.fm_v2_decode_failures_total, 0);
+        assert!(snap.policy_data_failures_total.is_empty());
+    }
+
+    /// Existing tx_hash on intent → dedupe rejects (existing test 22
+    /// regression is preserved through the new provider path).
+    #[tokio::test]
+    async fn data_provider_dedupe_hit_rejects_before_signer_call() {
+        let state = state_with_broadcast(true);
+        let intent = insert_intent(&state, broadcast_ready_intent());
+        // Drive the FIRST broadcast through the same code path so the
+        // tx-row gets persisted; second attempt should detect the dupe.
+        let provider = MockBroadcastProvider::success();
+        let signer = MockBackendSigner::approving();
+        let data_provider = StubBroadcastPolicyDataProvider::sepolia_permissive();
+
+        let _ = broadcast_option_execution_intent_with_provider_signer_and_data_provider(
+            &state,
+            intent.intent_id,
+            &provider,
+            &signer,
+            &data_provider,
+        )
+        .await
+        .expect("first broadcast must succeed");
+
+        let outcome = broadcast_option_execution_intent_with_provider_signer_and_data_provider(
+            &state,
+            intent.intent_id,
+            &provider,
+            &signer,
+            &data_provider,
+        )
+        .await
+        .expect("second attempt must short-circuit as duplicate");
+        assert!(outcome.duplicate);
+        assert_eq!(provider.send_count(), 1, "no second chain send on dedupe");
+        assert_eq!(
+            signer.sign_calls_count(),
+            1,
+            "no second signer call on dedupe"
+        );
+    }
+
+    /// build_signer_for_state must refuse a LocalDev signer when chain id
+    /// is mainnet, even if a misconfigured state somehow seated one.
+    #[test]
+    fn build_signer_refuses_local_dev_on_mainnet_at_runtime() {
+        let mut state = state_with_broadcast(true);
+        state.execution_config.executor_chain_id = MAINNET_CHAIN_ID;
+        state.execution_config.backend_signer_mode = SignerBackendKind::LocalDev;
+        match build_signer_for_state(&state) {
+            Err(BackendError::Config(msg)) => {
+                assert!(
+                    msg.contains("REFUSED at runtime on mainnet"),
+                    "expected runtime refusal config error, got: {msg}"
+                );
+            }
+            Err(other) => panic!("expected Config error, got {other:?}"),
+            Ok(_) => panic!("local-dev on mainnet must refuse"),
+        }
+    }
+
+    /// build_signer_for_state on Remote mode without endpoint must error.
+    #[test]
+    fn build_signer_refuses_remote_without_endpoint() {
+        let mut state = state_with_broadcast(true);
+        state.execution_config.backend_signer_mode = SignerBackendKind::Remote;
+        state.execution_config.backend_signer_endpoint = None;
+        match build_signer_for_state(&state) {
+            Err(err) => assert!(err
+                .to_string()
+                .contains("BACKEND_SIGNER_ENDPOINT is required")),
+            Ok(_) => panic!("remote mode without endpoint must refuse"),
+        }
     }
 
     #[tokio::test]

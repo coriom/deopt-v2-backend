@@ -170,8 +170,164 @@ pub async fn render_metrics(state: &AppState) -> Result<String> {
     append_option_metrics(state, &mut metrics).await?;
     append_fee_metrics(state, &mut metrics).await?;
     append_mm_metrics(state, &mut metrics)?;
+    append_broadcast_observability_metrics(state, &mut metrics);
 
     Ok(metrics.finish())
+}
+
+/// Render the in-process [`BroadcastObservability`] snapshot into the
+/// Prometheus text output. Counters are emitted as gauges (Prometheus
+/// scraper computes rates downstream); last-seen live-read values are
+/// emitted as gauges with the value bit-truncated to `u64` via
+/// `u128_to_u64_gauge`. Labels are restricted to the
+/// `BroadcastObservability` whitelist (`source_type`, `code`,
+/// `signer_kind`); no intent_id / address / secret ever appears.
+fn append_broadcast_observability_metrics(state: &AppState, metrics: &mut MetricsText) {
+    let snap = state.broadcast_observability.snapshot();
+
+    // ---- policy approve / reject counters (as gauges of cumulative count) ----
+    metrics.append_labeled_gauge_2(
+        "deopt_option_broadcast_policy_approved_total",
+        "Cumulative count of option-execution broadcasts where should_broadcast approved, by source_type.",
+        "source_type",
+        &snap.policy_approved_total,
+    );
+    metrics.append_labeled_pair_gauge(
+        "deopt_option_broadcast_policy_rejected_total",
+        "Cumulative count of should_broadcast rejections, by reject code + source_type.",
+        "code",
+        "source_type",
+        &snap.policy_rejected_total,
+    );
+
+    // ---- signer counters ----
+    metrics.append_labeled_gauge_2(
+        "deopt_option_broadcast_signer_attempted_total",
+        "Cumulative count of signer-attempt invocations, by signer_kind.",
+        "signer_kind",
+        &snap.signer_attempted_total,
+    );
+    metrics.append_labeled_gauge_2(
+        "deopt_option_broadcast_signer_success_total",
+        "Cumulative count of signer-success returns, by signer_kind.",
+        "signer_kind",
+        &snap.signer_success_total,
+    );
+    metrics.append_labeled_pair_gauge(
+        "deopt_option_broadcast_signer_denied_total",
+        "Cumulative count of signer-denial returns, by signer-error code + signer_kind.",
+        "code",
+        "signer_kind",
+        &snap.signer_denied_total,
+    );
+
+    // ---- policy data read failures ----
+    metrics.append_labeled_gauge_2(
+        "deopt_option_broadcast_policy_data_failures_total",
+        "Cumulative count of policy-data provider read failures, by read-type tag.",
+        "read_type",
+        &snap.policy_data_failures_total,
+    );
+
+    metrics.gauge(
+        "deopt_option_broadcast_econ_data_available_true_total",
+        "Cumulative count of broadcast attempts where econ_data_available was true.",
+        snap.econ_data_available_true_total,
+    );
+    metrics.gauge(
+        "deopt_option_broadcast_econ_data_available_false_total",
+        "Cumulative count of broadcast attempts where econ_data_available was false (boundary mode).",
+        snap.econ_data_available_false_total,
+    );
+    metrics.gauge(
+        "deopt_option_broadcast_fm_v2_decode_failures_total",
+        "Cumulative count of FeesManagerV2 ABI decode failures during a gather_inputs call.",
+        snap.fm_v2_decode_failures_total,
+    );
+    metrics.gauge(
+        "deopt_option_broadcast_fm_v2_rpc_failures_total",
+        "Cumulative count of FeesManagerV2 eth_call RPC failures during a gather_inputs call.",
+        snap.fm_v2_rpc_failures_total,
+    );
+    metrics.gauge(
+        "deopt_option_broadcast_r5_drift_observed_total",
+        "Cumulative count of broadcast attempts where R5 drift (CV(PFV,asset) != feeBalance + rebateReserve) was observed.",
+        snap.r5_drift_observed_total,
+    );
+    metrics.gauge(
+        "deopt_option_broadcast_local_signer_on_mainnet_refused_total",
+        "Cumulative count of mainnet runtime refusals of a LocalDev signer (defence-in-depth).",
+        snap.local_signer_on_mainnet_refused_total,
+    );
+
+    // ---- last-seen live-read gauges (chain-state + economic) ----
+    if let Some(value) = snap.last_be_balance_wei {
+        metrics.gauge(
+            "deopt_option_broadcast_last_be_balance_wei",
+            "Most recent eth_getBalance(BACKEND_EXECUTOR) seen by a broadcast attempt (wei, truncated to u64).",
+            u128_to_u64_gauge(value),
+        );
+    }
+    if let Some(paused) = snap.last_ome_paused {
+        metrics.gauge(
+            "deopt_option_broadcast_last_ome_paused",
+            "Most recent NEW_OME.paused() seen by a broadcast attempt (1 = paused, 0 = not paused).",
+            bool_value(paused),
+        );
+    }
+    if let Some(is_exec) = snap.last_ome_is_executor {
+        metrics.gauge(
+            "deopt_option_broadcast_last_ome_is_executor",
+            "Most recent NEW_OME.isExecutor(BACKEND_EXECUTOR) seen by a broadcast attempt (1 = is executor, 0 = not).",
+            bool_value(is_exec),
+        );
+    }
+    if let Some(value) = snap.last_pfv_fee_balance {
+        metrics.gauge(
+            "deopt_option_broadcast_last_pfv_fee_balance",
+            "Most recent PFV.feeBalance(asset) seen by a broadcast attempt (asset units, truncated to u64).",
+            u128_to_u64_gauge(value),
+        );
+    }
+    if let Some(value) = snap.last_pfv_rebate_reserve {
+        metrics.gauge(
+            "deopt_option_broadcast_last_pfv_rebate_reserve",
+            "Most recent PFV.rebateReserve(asset) seen by a broadcast attempt (asset units, truncated to u64).",
+            u128_to_u64_gauge(value),
+        );
+    }
+    if let Some(value) = snap.last_cv_pfv_balance {
+        metrics.gauge(
+            "deopt_option_broadcast_last_cv_pfv_balance",
+            "Most recent CV.balances(PFV,asset) seen by a broadcast attempt (asset units, truncated to u64).",
+            u128_to_u64_gauge(value),
+        );
+    }
+    if let Some(value) = snap.last_fm_v2_rebate_budget {
+        metrics.gauge(
+            "deopt_option_broadcast_last_fm_v2_rebate_budget",
+            "Most recent FeesManagerV2.rebateBudget(asset) seen by a broadcast attempt (asset units, truncated to u64).",
+            u128_to_u64_gauge(value),
+        );
+    }
+    if let Some(r5) = snap.last_r5_drift_zero {
+        metrics.gauge(
+            "deopt_option_broadcast_last_r5_drift_zero",
+            "Most recent R5 drift-zero result (1 = drift zero, 0 = drift observed).",
+            bool_value(r5),
+        );
+    }
+    if let Some(ms) = snap.last_broadcast_submitted_ms {
+        metrics.gauge(
+            "deopt_option_broadcast_last_submitted_ms",
+            "UTC milliseconds of the most recent broadcast that the signer successfully signed.",
+            ms.max(0) as u64,
+        );
+    }
+}
+
+fn u128_to_u64_gauge(value: u128) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 async fn append_database_metrics(state: &AppState, metrics: &mut MetricsText) -> Result<()> {
@@ -899,6 +1055,68 @@ impl MetricsText {
 
     fn finish(self) -> String {
         self.output
+    }
+
+    /// Emit a single labelled gauge keyed by a string label.
+    ///
+    /// Used by [`append_broadcast_observability_metrics`] to render
+    /// counter snapshots without growing the existing
+    /// [`Self::labeled_gauges`] signature.
+    fn append_labeled_gauge_2(
+        &mut self,
+        name: &'static str,
+        help: &'static str,
+        label_name: &'static str,
+        counts: &BTreeMap<String, u64>,
+    ) {
+        self.describe(name, help, "gauge");
+        let mut sanitized: BTreeMap<String, u64> = BTreeMap::new();
+        for (label, value) in counts {
+            let entry = sanitized.entry(safe_label_value(label)).or_insert(0);
+            *entry = entry.saturating_add(*value);
+        }
+        for (label, value) in sanitized {
+            self.output.push_str(name);
+            self.output.push('{');
+            self.output.push_str(label_name);
+            self.output.push_str("=\"");
+            self.output.push_str(&label);
+            self.output.push_str("\"} ");
+            self.output.push_str(&value.to_string());
+            self.output.push('\n');
+        }
+    }
+
+    /// Emit a gauge with two labels (e.g. reject code + source_type).
+    fn append_labeled_pair_gauge(
+        &mut self,
+        name: &'static str,
+        help: &'static str,
+        label_a: &'static str,
+        label_b: &'static str,
+        counts: &BTreeMap<(String, String), u64>,
+    ) {
+        self.describe(name, help, "gauge");
+        let mut sanitized: BTreeMap<(String, String), u64> = BTreeMap::new();
+        for ((a, b), value) in counts {
+            let key = (safe_label_value(a), safe_label_value(b));
+            let entry = sanitized.entry(key).or_insert(0);
+            *entry = entry.saturating_add(*value);
+        }
+        for ((a, b), value) in sanitized {
+            self.output.push_str(name);
+            self.output.push('{');
+            self.output.push_str(label_a);
+            self.output.push_str("=\"");
+            self.output.push_str(&a);
+            self.output.push_str("\",");
+            self.output.push_str(label_b);
+            self.output.push_str("=\"");
+            self.output.push_str(&b);
+            self.output.push_str("\"} ");
+            self.output.push_str(&value.to_string());
+            self.output.push('\n');
+        }
     }
 }
 

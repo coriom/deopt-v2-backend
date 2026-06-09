@@ -254,6 +254,9 @@ mod tests {
             ),
             perp_engine_address: AccountId::new("0x0000000000000000000000000000000000000000"),
             old_perp_engine_address: None,
+            backend_signer_mode: crate::execution::SignerBackendKind::LocalDev,
+            backend_signer_endpoint: None,
+            executor_allow_local_signer: false,
         }
     }
 

@@ -106,6 +106,22 @@ impl AppConfig {
             old_perp_engine_address: optional_env(&mut lookup, "OLD_PERP_ENGINE_ADDRESS")
                 .filter(|value| !value.is_empty())
                 .map(AccountId::new),
+            backend_signer_mode: {
+                let endpoint = lookup("BACKEND_SIGNER_ENDPOINT").filter(|value| !value.is_empty());
+                match lookup("BACKEND_SIGNER_MODE").filter(|value| !value.is_empty()) {
+                    Some(value) => crate::execution::SignerBackendKind::parse(&value)
+                        .map_err(crate::error::BackendError::Config)?,
+                    None if endpoint.is_some() => crate::execution::SignerBackendKind::Remote,
+                    None => crate::execution::SignerBackendKind::LocalDev,
+                }
+            },
+            backend_signer_endpoint: lookup("BACKEND_SIGNER_ENDPOINT")
+                .filter(|value| !value.is_empty()),
+            executor_allow_local_signer: parse_env(
+                &mut lookup,
+                "EXECUTOR_ALLOW_LOCAL_SIGNER",
+                "false",
+            )?,
         };
         let indexer = IndexerConfig {
             enabled: parse_env(&mut lookup, "INDEXER_ENABLED", "false")?,
@@ -1143,6 +1159,7 @@ mod tests {
                 "DATABASE_URL",
                 "postgres://deopt:deopt@127.0.0.1:5432/deopt_v2_backend",
             ),
+            ("EXECUTOR_ALLOW_LOCAL_SIGNER", "true"),
         ])
         .unwrap_err();
 
@@ -1173,6 +1190,7 @@ mod tests {
                 "EXECUTOR_PRIVATE_KEY",
                 "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318",
             ),
+            ("EXECUTOR_ALLOW_LOCAL_SIGNER", "true"),
         ])
         .unwrap_err();
 
@@ -1195,6 +1213,7 @@ mod tests {
                 "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318",
             ),
             ("RPC_URL", "https://example.invalid"),
+            ("EXECUTOR_ALLOW_LOCAL_SIGNER", "true"),
         ])
         .unwrap_err();
 
@@ -1214,6 +1233,7 @@ mod tests {
             ("RPC_URL", "https://example.invalid"),
             ("EXECUTOR_MAX_FEE_PER_GAS_WEI", "1000000000"),
             ("EXECUTOR_MAX_PRIORITY_FEE_PER_GAS_WEI", "100000000"),
+            ("EXECUTOR_ALLOW_LOCAL_SIGNER", "true"),
         ])
         .unwrap_err();
 
@@ -1236,6 +1256,7 @@ mod tests {
             ("RPC_URL", "https://example.invalid"),
             ("EXECUTOR_MAX_FEE_PER_GAS_WEI", "1000000000"),
             ("EXECUTOR_MAX_PRIORITY_FEE_PER_GAS_WEI", "100000000"),
+            ("EXECUTOR_ALLOW_LOCAL_SIGNER", "true"),
         ])
         .unwrap();
 
@@ -1259,6 +1280,7 @@ mod tests {
             ("RPC_URL", "https://example.invalid"),
             ("EXECUTOR_MAX_FEE_PER_GAS_WEI", "1000000000"),
             ("EXECUTOR_MAX_PRIORITY_FEE_PER_GAS_WEI", "100000000"),
+            ("EXECUTOR_ALLOW_LOCAL_SIGNER", "true"),
         ])
         .unwrap();
 

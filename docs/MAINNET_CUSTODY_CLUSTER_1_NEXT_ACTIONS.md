@@ -5,11 +5,18 @@ mutation. No `.env` edit. No Safe-tx. No broadcast. No mainnet.** Companion
 to `~/DEOPT/MAINNET_CUSTODY_DECISIONS_ADDENDUM_TEMPLATE.md` and
 `deopt-v2-backend/docs/MAINNET_CUSTODY_DECISION_DEPENDENCY_MAP.md`.
 
-**Date:** 2026-06-08
-**Cluster 1 status:** **UNRESOLVED — no operator input file present.**
-**Next actionable step:** operator fills the private input template at
-`~/DEOPT/private/mainnet_custody/MAINNET_CUSTODY_CLUSTER_1_OPERATOR_INPUT_TEMPLATE.private.md`
-(mode 600; outside all repo trees).
+**Date:** 2026-06-08 (initial; closure update 2026-06-09)
+**Cluster 1 status (updated 2026-06-09):** **RESOLVED PRIVATELY.**
+Operator filled the private input file; both OPS_SAFE_MAINNET and
+GOV_SAFE_MAINNET are deployed on Base mainnet at the expected 2-of-3 /
+3-of-5 thresholds; roster disjointness confirmed on chain.
+Public redacted summary at
+`deopt-v2-backend/docs/MAINNET_CUSTODY_CLUSTER_1_RESOLUTION_REDACTED.md`.
+Private artefact at
+`~/DEOPT/private/mainnet_custody/MAINNET_CUSTODY_CLUSTER_1_RESOLUTION.private.md`
+(mode 600; sha256 in `CLUSTER_1_HASHES.txt`).
+**Next actionable step:** `MAINNET-CUSTODY-CLUSTER-2-RESOLUTION`
+(KMS / HSM provider + BE topology).
 
 ---
 
@@ -22,8 +29,8 @@ no .env edit                                                        ✅
 no broadcast                                                        ✅
 no mainnet                                                          ✅
 no real signer names / contact details written here                 ✅
-no mainnet addresses written here                                   ✅
-no Q-CD marked OPERATOR-DECIDED in this doc (Cluster 1 UNRESOLVED)  ✅
+no signer EOA addresses written here                                ✅
+no hardware-wallet serials written here                             ✅
 ```
 
 ---
@@ -32,16 +39,24 @@ no Q-CD marked OPERATOR-DECIDED in this doc (Cluster 1 UNRESOLVED)  ✅
 
 | Q-CD | Topic | Required sign-off | Current status |
 |---|---|---|---|
-| Q-CD-1 | OPS_MULTISIG signer roster | Operator + Security | OPEN |
-| Q-CD-2 | OPS_MULTISIG threshold | Operator + Security | OPEN |
-| Q-CD-3 | GOVERNANCE_MULTISIG signer roster | Operator + Governance | OPEN |
-| Q-CD-4 | GOVERNANCE_MULTISIG threshold | Operator + Governance | OPEN |
-| Q-CD-13 | Sepolia rehearsal commitment | Operator + Security | OPEN |
+| Q-CD-1 | OPS_MULTISIG signer roster | Operator + Security | **OPERATOR-DECIDED-PRIVATE** (3 signers; per-signer detail in offline binder; OPS Safe deployed) |
+| Q-CD-2 | OPS_MULTISIG threshold | Operator + Security | **OPERATOR-DECIDED: 2-of-3** (chain-verified `getThreshold() = 2`) |
+| Q-CD-3 | GOVERNANCE_MULTISIG signer roster | Operator + Governance | **OPERATOR-DECIDED-PRIVATE** (5 signers; per-signer detail in offline binder; GOV Safe deployed) |
+| Q-CD-4 | GOVERNANCE_MULTISIG threshold | Operator + Governance | **OPERATOR-DECIDED: 3-of-5** (chain-verified `getThreshold() = 3`) |
+| Q-CD-13 | Sepolia rehearsal commitment | Operator + Security | **OPERATOR-DECIDED: TRUE** (rehearsal log artefact pending) |
 
-All 5 Q-CDs remain OPEN. No operator input file detected at any of
-the candidate paths (private dir, top-level filenames). Per the
-hard rule in the task brief, **no Q-CD is marked OPERATOR-DECIDED
-without verifiable operator evidence**.
+Independent on-chain verification (Base mainnet, chainId 8453, public
+RPC, no API key, no secret printed):
+- OPS_SAFE_MAINNET `0xce0e46Db…C932` — Safe v1.4.1; threshold 2; owners 3; nonce 0.
+- GOV_SAFE_MAINNET `0x7C6Ce20e…b166` — Safe v1.4.1; threshold 3; owners 5; nonce 0.
+- Roster disjointness: 0 overlap (computed off-disk; owner addresses never persisted).
+- Sepolia DEPLOYER not owner of either Safe (mainnet DEPLOYER Q-CD-8 still OPEN — full DEPLOYER attestation reverifies once Q-CD-8 resolves).
+
+Public redacted summary doc:
+`deopt-v2-backend/docs/MAINNET_CUSTODY_CLUSTER_1_RESOLUTION_REDACTED.md`.
+Private artefact + sha256:
+`~/DEOPT/private/mainnet_custody/MAINNET_CUSTODY_CLUSTER_1_RESOLUTION.private.md`
++ `CLUSTER_1_HASHES.txt`.
 
 ---
 
@@ -158,42 +173,18 @@ on independent timelines.
 
 ---
 
-## 4. Next recommended milestone
+## 4. Next recommended milestone (Cluster 1 RESOLVED state)
 
-### 4.1 If Cluster 1 stays UNRESOLVED (current state)
+Cluster 1 closed privately on 2026-06-09 with chain-anchored
+attestation. Next milestones in priority order:
 
-**`OPERATOR-FILL-CLUSTER-1-INPUT`** — operator + Security + Governance
-leads convene to fill the private input template at
-`~/DEOPT/private/mainnet_custody/MAINNET_CUSTODY_CLUSTER_1_OPERATOR_INPUT_TEMPLATE.private.md`
-(mode 600). The fill is offline / in-binder for the signer details;
-the template stores only placeholder labels + booleans + jurisdiction
-classes + opaque binder refs.
+1. **`MAINNET-CUSTODY-CLUSTER-2-RESOLUTION`** — Q-CD-5 / Q-CD-6 / Q-CD-14 / Q-CD-15 (KMS / HSM provider + BE topology + region pair + key-deletion lock). Unlocks gap-list D-1 (backend KMS interface impl) and V2G-Y Y-F. **Highest single-leverage item: Q-CD-5** (KMS provider Pattern A/B/C).
+2. **`MAINNET-AUDIT-EXT-KICKOFF`** (P0-1) — ship handoff bundle including the redacted Cluster 1 closure summary. Longest external timeline (~10-12 weeks). Runs in parallel.
+3. **`MAINNET-MANIFEST-FILL-GROUP-A`** — read-only manifest-fill PR (no chain action) writing the 13 Group A slots that Cluster 1 unblocks. Companion to P0-2 progress.
+4. **`MAINNET-CUSTODY-CLUSTER-1-REHEARSAL-LOG`** (operator follow-up) — execute the Q-CD-13 Sepolia rehearsal sessions for both signer rosters; archive rehearsal log; back-fill the §6 rehearsal-log path + §7.2 sign-off labels in the private input file (no public-doc change required).
+5. **`MAINNET-CUSTODY-CLUSTER-3-RESOLUTION`** (after Cluster 2 or in parallel) — Q-CD-7 / Q-CD-8 / Q-CD-9 (TREASURY + DEPLOYER + BE funding).
 
-**Acceptance for OPERATOR-FILL-CLUSTER-1-INPUT:**
-- All `<FILL: ...>` placeholders in the private template replaced.
-- Validator §7 contract met (per template).
-- Three sign-off blocks filled with `utc_ts`.
-- No private key / seed / mnemonic / personal contact details written.
-- File stays mode 600 under `~/DEOPT/private/mainnet_custody/`.
-
-**Downstream after operator fill:** `MAINNET-CUSTODY-CLUSTER-1-VALIDATE-AND-EMIT`
-parses the filled file, validates, computes sha256, emits the public
-redacted summary at
-`deopt-v2-backend/docs/MAINNET_CUSTODY_CLUSTER_1_RESOLUTION_REDACTED.md`,
-and updates RUN_STATE.md.
-
-### 4.2 If Cluster 1 had been RESOLVED (alternative branch — for documentation completeness)
-
-If a future iteration of this milestone finds the operator input
-present and valid, the next recommended milestones in priority order
-would be:
-
-1. **`MAINNET-CUSTODY-CLUSTER-2-RESOLUTION`** — Q-CD-5/6/14/15 (KMS provider + region + BE topology). Unlocks backend KMS implementation + V2G-Y Y-F + AUDIT-EXT trust-boundary review. Highest single-leverage item: Q-CD-5.
-2. **`MAINNET-AUDIT-EXT-KICKOFF`** (P0-1) — ships handoff bundle including the resolved Cluster 1. Longest external timeline (~10-12 weeks). Runs in parallel.
-3. **`MAINNET-OPS-SAFE-DEPLOY-PACKET`** — operator-runbook for actually deploying the OPS_MULTISIG_MAINNET Safe (per `GOVERNANCE_OPS_MULTISIG_DEPLOY_PLAN_V2G_GOV_D2.md` mainnet variant). Read-only design at first; broadcast is operator-authorised separately.
-4. **`MAINNET-GOV-SAFE-DEPLOY-PACKET`** — analogous for GOVERNANCE_MULTISIG_MAINNET.
-
-These four can run roughly in parallel once Cluster 1 closes.
+Items 1, 2, 3, and 4 can run in parallel.
 
 ---
 
@@ -201,13 +192,16 @@ These four can run roughly in parallel once Cluster 1 closes.
 
 | Path | Status |
 |---|---|
-| `~/DEOPT/private/mainnet_custody/MAINNET_CUSTODY_CLUSTER_1_OPERATOR_INPUT_TEMPLATE.private.md` | **CREATED** (mode 600, 333 lines, outside all repo trees) |
-| `deopt-v2-backend/docs/MAINNET_CUSTODY_CLUSTER_1_NEXT_ACTIONS.md` | **CREATED** (this file) |
-| `~/DEOPT/RUN_STATE.md` | **APPENDED** with redacted milestone-status note |
+| `~/DEOPT/private/mainnet_custody/MAINNET_CUSTODY_CLUSTER_1_OPERATOR_INPUT_TEMPLATE.private.md` | filled in place by operator on 2026-06-09; mode 600 |
+| `~/DEOPT/private/mainnet_custody/MAINNET_CUSTODY_CLUSTER_1_RESOLUTION.private.md` | **CREATED** on 2026-06-09 (mode 600, outside all repo trees) |
+| `~/DEOPT/private/mainnet_custody/CLUSTER_1_HASHES.txt` | **CREATED** on 2026-06-09 (mode 600) |
+| `deopt-v2-backend/docs/MAINNET_CUSTODY_CLUSTER_1_RESOLUTION_REDACTED.md` | **CREATED** on 2026-06-09 (public redacted summary) |
+| `deopt-v2-backend/docs/MAINNET_CUSTODY_CLUSTER_1_NEXT_ACTIONS.md` | **UPDATED** on 2026-06-09 (this file; resolution state) |
+| `~/DEOPT/RUN_STATE.md` | **APPENDED** with redacted closure note (no sensitive details) |
 
-**No private resolved file produced** (no operator input present).
-**No public redacted summary produced** (no resolved decisions to redact).
-**No source touched. No `.env` edit. No chain mutation.**
+**No source touched. No `.env` edit. No chain mutation. No Safe-tx.
+No mainnet broadcast.** Read-only chain probes against
+`https://mainnet.base.org` (public, no API key) verified Safe state.
 
 ---
 
