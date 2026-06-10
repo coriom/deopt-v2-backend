@@ -1622,6 +1622,17 @@ where
     state
         .broadcast_observability
         .record_econ_data_available(econ_data_available);
+    // Surface the most-recent effective maker/taker ppm — the same
+    // values that drive `should_broadcast`'s §8 negative-effective-ppm
+    // gate — to operators via `/executor/health/v2`. Guarded by
+    // `inputs.fee_split.is_some()` so a missing `fee_split` (boundary
+    // mode) never records fake `(0, 0)`; the snapshot retains the
+    // previous reading.
+    if let Some(fee_split) = inputs.fee_split.as_ref() {
+        state
+            .broadcast_observability
+            .record_effective_fee_ppm(fee_split.effective_maker_ppm, fee_split.effective_taker_ppm);
+    }
     if matches!(inputs.r5_drift_zero, Some(false)) {
         state.broadcast_observability.record_r5_drift_observed();
     }
@@ -4752,6 +4763,117 @@ mod tests {
         let snap = state.broadcast_observability.snapshot();
         assert_eq!(snap.econ_data_available_true_total, 1);
         assert_eq!(snap.econ_data_available_false_total, 0);
+    }
+
+    /// When `fee_split` is populated, the broadcast call site records the
+    /// effective maker + taker ppm singletons using the EXACT values
+    /// from the `FeeSplitSummary` that drove `should_broadcast`. Pins
+    /// the contract that the JSON `/executor/health/v2` endpoint reports
+    /// the same numbers the policy gate saw.
+    #[tokio::test]
+    async fn observability_effective_fee_ppm_recorded_when_fee_split_present() {
+        use crate::options::broadcast_policy::FeeSplitSummary;
+        let state = state_with_broadcast(true);
+        let intent = insert_intent(&state, broadcast_ready_intent());
+        let provider = MockBroadcastProvider::success();
+        let signer = MockBackendSigner::approving();
+        let mut inputs = happy_inputs();
+        inputs.fee_split = Some(FeeSplitSummary {
+            gross_fee_revenue: 150,
+            total_rebate_outflow: 0,
+            net_protocol_revenue: 150,
+            effective_maker_ppm: 42,
+            effective_taker_ppm: 99,
+            asset: AccountId::new("0x000000000000000000000000000000000000aaaa"),
+            tier: 0,
+        });
+        inputs.fm_v2_rebate_budget_asset = Some(0);
+        inputs.pfv_rebate_reserve_asset = Some(0);
+        let data_provider = StubBroadcastPolicyDataProvider::new(inputs);
+
+        let _ = broadcast_option_execution_intent_with_provider_signer_and_data_provider(
+            &state,
+            intent.intent_id,
+            &provider,
+            &signer,
+            &data_provider,
+        )
+        .await
+        .expect("approve path");
+        let snap = state.broadcast_observability.snapshot();
+        assert_eq!(snap.last_effective_maker_ppm, Some(42));
+        assert_eq!(snap.last_effective_taker_ppm, Some(99));
+    }
+
+    /// RFQ-source intents take the same broadcast path as orderbook
+    /// intents, so the effective-ppm singletons MUST also land when the
+    /// `source_type` is `OptionRfqFill`. Pins the cross-source contract.
+    #[tokio::test]
+    async fn observability_effective_fee_ppm_recorded_on_rfq_path() {
+        use crate::options::broadcast_policy::FeeSplitSummary;
+        let state = state_with_broadcast(true);
+        let mut intent_template = broadcast_ready_intent();
+        intent_template.source_type = OptionExecutionSourceType::OptionRfqFill;
+        let intent = insert_intent(&state, intent_template);
+        let provider = MockBroadcastProvider::success();
+        let signer = MockBackendSigner::approving();
+        let mut inputs = happy_inputs();
+        inputs.fee_split = Some(FeeSplitSummary {
+            gross_fee_revenue: 200,
+            total_rebate_outflow: 0,
+            net_protocol_revenue: 200,
+            effective_maker_ppm: 15,
+            effective_taker_ppm: 60,
+            asset: AccountId::new("0x000000000000000000000000000000000000aaaa"),
+            tier: 0,
+        });
+        inputs.fm_v2_rebate_budget_asset = Some(0);
+        inputs.pfv_rebate_reserve_asset = Some(0);
+        let data_provider = StubBroadcastPolicyDataProvider::new(inputs);
+
+        let _ = broadcast_option_execution_intent_with_provider_signer_and_data_provider(
+            &state,
+            intent.intent_id,
+            &provider,
+            &signer,
+            &data_provider,
+        )
+        .await
+        .expect("RFQ-source approve path");
+        let snap = state.broadcast_observability.snapshot();
+        assert_eq!(snap.last_effective_maker_ppm, Some(15));
+        assert_eq!(snap.last_effective_taker_ppm, Some(60));
+        assert_eq!(snap.policy_approved_total.get("rfq"), Some(&1));
+    }
+
+    /// When `fee_split` is `None` (boundary mode), the broadcast call
+    /// site MUST NOT record fake `(0, 0)` effective-ppm readings — the
+    /// snapshot retains whatever (possibly None) value it held before
+    /// the attempt. Pins the "no fake zeros" contract.
+    #[tokio::test]
+    async fn observability_effective_fee_ppm_not_recorded_when_fee_split_missing() {
+        let state = state_with_broadcast(true);
+        let intent = insert_intent(&state, broadcast_ready_intent());
+        let provider = MockBroadcastProvider::success();
+        let signer = MockBackendSigner::approving();
+        let mut inputs = happy_inputs();
+        inputs.fee_split = None;
+        let data_provider = StubBroadcastPolicyDataProvider::new(inputs);
+
+        let _ = broadcast_option_execution_intent_with_provider_signer_and_data_provider(
+            &state,
+            intent.intent_id,
+            &provider,
+            &signer,
+            &data_provider,
+        )
+        .await
+        .expect("approve path under boundary mode");
+        let snap = state.broadcast_observability.snapshot();
+        assert_eq!(snap.last_effective_maker_ppm, None);
+        assert_eq!(snap.last_effective_taker_ppm, None);
+        // The boundary-mode counter still increments.
+        assert_eq!(snap.econ_data_available_false_total, 1);
     }
 
     /// R5 drift detected by data provider → r5_drift_observed_total

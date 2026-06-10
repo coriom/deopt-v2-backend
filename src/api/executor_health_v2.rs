@@ -273,8 +273,8 @@ pub fn build_executor_health_v2(state: &AppState) -> ExecutorHealthV2Response {
 
     let economics_last_seen = EconomicsLastSeenBlock {
         fm_v2_rebate_budget: snap.last_fm_v2_rebate_budget,
-        effective_maker_ppm: None,
-        effective_taker_ppm: None,
+        effective_maker_ppm: snap.last_effective_maker_ppm,
+        effective_taker_ppm: snap.last_effective_taker_ppm,
         econ_data_available_true_total: snap.econ_data_available_true_total,
         econ_data_available_false_total: snap.econ_data_available_false_total,
     };
@@ -319,11 +319,7 @@ pub fn build_executor_health_v2(state: &AppState) -> ExecutorHealthV2Response {
         last_broadcast_submitted_ms: snap.last_broadcast_submitted_ms,
     };
 
-    let not_tracked_yet = vec![
-        "execution_flags.be_balance_floor_wei".to_string(),
-        "economics_last_seen.effective_maker_ppm".to_string(),
-        "economics_last_seen.effective_taker_ppm".to_string(),
-    ];
+    let not_tracked_yet = vec!["execution_flags.be_balance_floor_wei".to_string()];
 
     let (overall_status, reasons, hard_stops, warnings) =
         compute_status(state, &snap, &live_provider_config);
@@ -680,30 +676,72 @@ mod tests {
         let state = base_state();
         let response = build_executor_health_v2(&state);
         // Shipped across BACKEND-OBSERVABILITY-LAST-SINGLETON-FIELDS +
-        // BACKEND-OBSERVABILITY-LAST-POLICY-DATA-FAILURE-SINGLETON: the
-        // four fields below must NO LONGER appear here.
+        // BACKEND-OBSERVABILITY-LAST-POLICY-DATA-FAILURE-SINGLETON +
+        // BACKEND-LIVE-PROVIDER-EFFECTIVE-PPM-CACHE: the six fields
+        // below must NO LONGER appear here.
         for shipped in [
             "signer.last_signer_error_code",
             "policy_gate.last_reject_source_type",
             "policy_gate.econ_data_available_last",
             "policy_gate.last_policy_data_failure_type",
+            "economics_last_seen.effective_maker_ppm",
+            "economics_last_seen.effective_taker_ppm",
         ] {
             assert!(
                 !response.not_tracked_yet.iter().any(|f| f == shipped),
                 "{shipped} should no longer be in not_tracked_yet"
             );
         }
-        // Still pending.
-        for pending in [
-            "execution_flags.be_balance_floor_wei",
-            "economics_last_seen.effective_maker_ppm",
-            "economics_last_seen.effective_taker_ppm",
-        ] {
-            assert!(
-                response.not_tracked_yet.iter().any(|f| f == pending),
-                "{pending} should still be in not_tracked_yet"
-            );
-        }
+        // Still pending — only the BE balance floor remains.
+        assert!(response
+            .not_tracked_yet
+            .iter()
+            .any(|f| f == "execution_flags.be_balance_floor_wei"));
+        assert_eq!(
+            response.not_tracked_yet.len(),
+            1,
+            "exactly one entry should remain after this milestone"
+        );
+    }
+
+    #[test]
+    fn health_endpoint_surfaces_effective_maker_taker_ppm_singletons() {
+        let state = base_state();
+        // Initial — None.
+        assert_eq!(
+            build_executor_health_v2(&state)
+                .economics_last_seen
+                .effective_maker_ppm,
+            None
+        );
+        assert_eq!(
+            build_executor_health_v2(&state)
+                .economics_last_seen
+                .effective_taker_ppm,
+            None
+        );
+        state
+            .broadcast_observability
+            .record_effective_fee_ppm(50, 100);
+        let response = build_executor_health_v2(&state);
+        assert_eq!(response.economics_last_seen.effective_maker_ppm, Some(50));
+        assert_eq!(response.economics_last_seen.effective_taker_ppm, Some(100));
+    }
+
+    #[test]
+    fn health_endpoint_surfaces_negative_effective_ppm() {
+        // Defence-in-depth pin: i64 representation correctly carries
+        // negative effective ppm (rebate-discount profiles). The
+        // policy gate already rejects these via the
+        // `negative-effective-ppm` reject code on mainnet; the JSON
+        // surface only reports — it does not gate.
+        let state = base_state();
+        state
+            .broadcast_observability
+            .record_effective_fee_ppm(-25, 30);
+        let response = build_executor_health_v2(&state);
+        assert_eq!(response.economics_last_seen.effective_maker_ppm, Some(-25));
+        assert_eq!(response.economics_last_seen.effective_taker_ppm, Some(30));
     }
 
     #[test]

@@ -1,6 +1,20 @@
 # BACKEND-FEES-MANAGER-V2-ABI-AND-FEE-SPLIT-WIRING — result
 
 **Status:** SHIPPED 2026-06-09 (Phase G close-out).
+
+> **Addendum (2026-06-10, follow-on `BACKEND-LIVE-PROVIDER-EFFECTIVE-PPM-CACHE`):**
+> the `FeeSplitSummary.effective_maker_ppm` / `.effective_taker_ppm`
+> fields are now also surfaced via
+> `BroadcastObservabilitySnapshot.last_effective_maker_ppm` /
+> `.last_effective_taker_ppm`, populated by a single call-site update
+> in `src/options/service.rs` immediately after
+> `record_econ_data_available`. The recorder is guarded by
+> `if let Some(fee_split) = inputs.fee_split.as_ref()` so boundary
+> mode never records fake `(0, 0)`. The JSON `/executor/health/v2`
+> endpoint reports these values verbatim — by construction, the policy
+> gate reads the same numbers. See
+> `docs/BACKEND_LIVE_PROVIDER_EFFECTIVE_PPM_CACHE_RESULT.md`.
+
 **Scope:** wire `IFeesManagerV2.quoteFees(...)` + `rebateBudget(asset)`
 read-only ABI calls into the broadcast policy data provider, populate
 `fee_split` + `fm_v2_rebate_budget_asset`, and flip

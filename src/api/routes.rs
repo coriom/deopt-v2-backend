@@ -5011,6 +5011,8 @@ mod tests {
             "policy_gate.last_reject_source_type",
             "policy_gate.econ_data_available_last",
             "policy_gate.last_policy_data_failure_type",
+            "economics_last_seen.effective_maker_ppm",
+            "economics_last_seen.effective_taker_ppm",
         ] {
             assert!(
                 !not_tracked.iter().any(|f| f == shipped),
@@ -5019,10 +5021,32 @@ mod tests {
         }
         assert!(not_tracked
             .iter()
-            .any(|f| f == "economics_last_seen.effective_maker_ppm"));
-        assert!(not_tracked
-            .iter()
             .any(|f| f == "execution_flags.be_balance_floor_wei"));
+        assert_eq!(
+            not_tracked.len(),
+            1,
+            "exactly one entry should remain after BACKEND-LIVE-PROVIDER-EFFECTIVE-PPM-CACHE"
+        );
+    }
+
+    /// `/executor/health/v2` exposes `economics_last_seen.effective_maker_ppm`
+    /// + `effective_taker_ppm` end-to-end via the HTTP envelope after
+    /// BACKEND-LIVE-PROVIDER-EFFECTIVE-PPM-CACHE shipped. Signed i64 +
+    /// JSON serialises both values verbatim (no truncation to u64).
+    #[tokio::test]
+    async fn executor_health_v2_surfaces_effective_maker_taker_ppm() {
+        let state = AppState::new(EngineState::with_default_markets());
+        state
+            .broadcast_observability
+            .record_effective_fee_ppm(-25, 75);
+        let response = router(state)
+            .oneshot(get_request("/executor/health/v2", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["economics_last_seen"]["effective_maker_ppm"], -25);
+        assert_eq!(json["economics_last_seen"]["effective_taker_ppm"], 75);
     }
 
     /// `/executor/health/v2` exposes `policy_gate.last_policy_data_failure_type`

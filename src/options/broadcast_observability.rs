@@ -92,6 +92,16 @@ pub struct BroadcastObservabilitySnapshot {
     pub last_fm_v2_rebate_budget: Option<u128>,
     pub last_r5_drift_zero: Option<bool>,
     pub last_dedupe_reason: Option<String>,
+    /// Most recent computed effective maker fee ppm produced by the
+    /// live FeesManagerV2 / `aggregate_fee_split` path. Signed i64
+    /// because the policy gate already permits negative ppm under RFQ
+    /// rebate-discount profiles (and rejects them on mainnet via the
+    /// `negative-effective-ppm` reject code). `None` when the broadcast
+    /// attempt's `fee_split` was missing (no fake zeros are recorded).
+    pub last_effective_maker_ppm: Option<i64>,
+    /// Most recent computed effective taker fee ppm. Same semantics as
+    /// [`Self::last_effective_maker_ppm`].
+    pub last_effective_taker_ppm: Option<i64>,
 }
 
 #[derive(Default)]
@@ -124,6 +134,8 @@ struct BroadcastObservabilityInner {
     last_fm_v2_rebate_budget: Option<u128>,
     last_r5_drift_zero: Option<bool>,
     last_dedupe_reason: Option<String>,
+    last_effective_maker_ppm: Option<i64>,
+    last_effective_taker_ppm: Option<i64>,
 }
 
 /// Thread-safe in-process observability counters. Shared across the
@@ -170,7 +182,23 @@ impl BroadcastObservability {
             last_fm_v2_rebate_budget: inner.last_fm_v2_rebate_budget,
             last_r5_drift_zero: inner.last_r5_drift_zero,
             last_dedupe_reason: inner.last_dedupe_reason.clone(),
+            last_effective_maker_ppm: inner.last_effective_maker_ppm,
+            last_effective_taker_ppm: inner.last_effective_taker_ppm,
         }
+    }
+
+    /// Persist the most recent computed effective maker + taker fee ppm
+    /// values for surfacing by the JSON health endpoint. Pure singleton
+    /// — does NOT bump any cumulative counter and does NOT increment
+    /// `econ_data_available_true_total` (that is already handled by
+    /// [`Self::record_econ_data_available`]). Caller MUST only invoke
+    /// this when the live `fee_split` was observed; the broadcast site
+    /// guards the call via `if let Some(fee_split) = inputs.fee_split…`
+    /// so a missing `fee_split` never produces a fake `(0, 0)` reading.
+    pub fn record_effective_fee_ppm(&self, maker_ppm: i64, taker_ppm: i64) {
+        let mut inner = self.inner.lock().expect("broadcast observability poisoned");
+        inner.last_effective_maker_ppm = Some(maker_ppm);
+        inner.last_effective_taker_ppm = Some(taker_ppm);
     }
 
     pub fn record_policy_approved(&self, source_type: OptionExecutionSourceType) {
@@ -624,6 +652,42 @@ mod tests {
         assert!(!value.contains('='));
         assert!(!value.contains('.'));
         assert!(value.len() <= 48);
+    }
+
+    #[test]
+    fn effective_fee_ppm_singleton_stores_both_sides() {
+        let obs = BroadcastObservability::new();
+        assert_eq!(obs.snapshot().last_effective_maker_ppm, None);
+        assert_eq!(obs.snapshot().last_effective_taker_ppm, None);
+        obs.record_effective_fee_ppm(50, 100);
+        let snap = obs.snapshot();
+        assert_eq!(snap.last_effective_maker_ppm, Some(50));
+        assert_eq!(snap.last_effective_taker_ppm, Some(100));
+    }
+
+    #[test]
+    fn effective_fee_ppm_singleton_overwrites_with_most_recent() {
+        let obs = BroadcastObservability::new();
+        obs.record_effective_fee_ppm(50, 100);
+        obs.record_effective_fee_ppm(75, 125);
+        obs.record_effective_fee_ppm(-25, 30);
+        let snap = obs.snapshot();
+        assert_eq!(snap.last_effective_maker_ppm, Some(-25));
+        assert_eq!(snap.last_effective_taker_ppm, Some(30));
+    }
+
+    #[test]
+    fn effective_fee_ppm_singleton_independent_of_econ_data_available_counter() {
+        // Pin: record_effective_fee_ppm does NOT bump
+        // `econ_data_available_*_total` — those counters are owned by
+        // `record_econ_data_available`. Otherwise a future regression
+        // could double-count broadcasts.
+        let obs = BroadcastObservability::new();
+        obs.record_effective_fee_ppm(50, 100);
+        let snap = obs.snapshot();
+        assert_eq!(snap.econ_data_available_true_total, 0);
+        assert_eq!(snap.econ_data_available_false_total, 0);
+        assert_eq!(snap.econ_data_available_last, None);
     }
 
     #[test]

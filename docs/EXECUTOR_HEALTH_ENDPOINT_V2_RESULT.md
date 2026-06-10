@@ -21,6 +21,15 @@
 > entries shrunk from 4 to 3 — see
 > `docs/BACKEND_OBSERVABILITY_LAST_POLICY_DATA_FAILURE_SINGLETON_RESULT.md`
 > for details.
+>
+> **Addendum (2026-06-10, follow-on `BACKEND-LIVE-PROVIDER-EFFECTIVE-PPM-CACHE`):**
+> the 5th + 6th singletons `economics_last_seen.effective_maker_ppm`
+> and `effective_taker_ppm` are now populated from the same
+> `FeeSplitSummary` fields that drive `should_broadcast`'s §8
+> negative-effective-ppm gate. Status logic + redaction contract
+> unchanged. Remaining `not_tracked_yet` shrunk from 3 to 1
+> (`execution_flags.be_balance_floor_wei` only) — see
+> `docs/BACKEND_LIVE_PROVIDER_EFFECTIVE_PPM_CACHE_RESULT.md`.
 
 ## 1. Goal
 
