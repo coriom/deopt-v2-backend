@@ -832,9 +832,7 @@ pub async fn account_positions(
         } else {
             ("short", (-signed) as u128)
         };
-        let avg_entry_price_1e8 = premium_sum
-            .checked_div(size_sum)
-            .map(|v| v.to_string());
+        let avg_entry_price_1e8 = premium_sum.checked_div(size_sum).map(|v| v.to_string());
         positions.push(Position {
             series_id,
             size: abs_size.to_string(),
@@ -920,23 +918,172 @@ pub async fn account_balances(
     State(state): State<AppState>,
     Path(address): Path<String>,
 ) -> Result<Json<Envelope<BalancesData>>, TradingApiError> {
-    let _acct = parse_address_or_400(&state, &address)?;
-    // Balances require RPC reads against CollateralVault.balances(account, token)
-    // for every configured collateral token. The list comes from
-    // CollateralVaultViews.getCollateralTokens(). M-P2b ships an empty
-    // balances envelope with an explicit SOURCE_UNAVAILABLE warning;
-    // M-P2c wires the RPC orchestration co-located with this handler.
+    // Production path: build an HttpJsonRpcProvider from
+    // `state.execution_config.rpc_url` when configured; otherwise route
+    // straight to the M-P2b partial fallback.
+    let provider = state
+        .execution_config
+        .rpc_url
+        .as_ref()
+        .map(|url| crate::execution::rpc::HttpJsonRpcProvider::new(url.clone()));
+    account_balances_impl(&state, &address, provider.as_ref()).await
+}
+
+pub(crate) async fn account_balances_impl<P>(
+    state: &AppState,
+    address: &str,
+    provider: Option<&P>,
+) -> Result<Json<Envelope<BalancesData>>, TradingApiError>
+where
+    P: crate::execution::rpc::EthCallProvider,
+{
+    let acct = parse_address_or_400(state, address)?;
+    let from = &state.execution_config.executor_from_address;
+    let mut warnings: Vec<Warning> = Vec::new();
+    let mut balances: Vec<BalanceRow> = Vec::new();
+    let mut all_ok = true;
+
+    // Need both the views address and the underlying CV address to read
+    // anything. If either is missing, fall through to the partial-empty
+    // fallback (matches M-P2b behaviour).
+    let views_configured = state.trading_views.collateral_vault_views_address.is_some();
+    let cv_configured = state.trading_views.collateral_vault_address.is_some();
+    let provider_configured = provider.is_some();
+
+    if views_configured && cv_configured && provider_configured {
+        let provider = provider.expect("checked above");
+        match crate::api::trading_views::try_get_collateral_tokens(
+            &state.trading_views,
+            from,
+            provider,
+        )
+        .await
+        {
+            Ok(Some(tokens)) => {
+                for token in tokens {
+                    match crate::api::trading_views::try_get_balance(
+                        &state.trading_views,
+                        from,
+                        &acct,
+                        token,
+                        provider,
+                    )
+                    .await
+                    {
+                        Ok(Some(bal)) => balances.push(BalanceRow {
+                            token: format!("{token:#x}"),
+                            symbol: None,
+                            decimals: None,
+                            balance: bal.to_string(),
+                            balance_with_yield: None,
+                            strategy_assets_preview: None,
+                            is_collateral_active: None,
+                        }),
+                        Ok(None) => {
+                            // CV address removed mid-read; treat as configuration gap.
+                            all_ok = false;
+                            warnings.push(warning_source_unavailable(
+                                "collateral_vault_address not configured; per-token balance unreachable.",
+                            ));
+                            break;
+                        }
+                        Err(e) => {
+                            all_ok = false;
+                            warnings.push(Warning {
+                                code: "RPC_UNAVAILABLE".to_string(),
+                                message: format!(
+                                    "balance read failed for token {token:#x}: {}",
+                                    sanitise_rpc_err(&e)
+                                ),
+                                details: serde_json::json!({}),
+                            });
+                            break;
+                        }
+                    }
+                }
+            }
+            Ok(None) => {
+                all_ok = false;
+                warnings.push(warning_source_unavailable(
+                    "collateral_vault_views_address not configured; token list unreachable.",
+                ));
+            }
+            Err(e) => {
+                all_ok = false;
+                warnings.push(Warning {
+                    code: "RPC_UNAVAILABLE".to_string(),
+                    message: format!(
+                        "collateral token list read failed: {}",
+                        sanitise_rpc_err(&e)
+                    ),
+                    details: serde_json::json!({}),
+                });
+            }
+        }
+    } else {
+        all_ok = false;
+        let mut reasons = Vec::new();
+        if !views_configured {
+            reasons.push("CollateralVaultViews address");
+        }
+        if !cv_configured {
+            reasons.push("CollateralVault address");
+        }
+        if !provider_configured {
+            reasons.push("RPC provider (EXECUTION RPC_URL)");
+        }
+        warnings.push(warning_source_unavailable(&format!(
+            "Per-token balances require: {}. Falling back to empty list.",
+            reasons.join(", ")
+        )));
+    }
+
+    let status: &'static str = if all_ok && !balances.is_empty() {
+        "ok"
+    } else {
+        "partial"
+    };
     Ok(Json(Envelope {
-        status: "partial",
+        status,
         data: BalancesData {
-            address: address.clone(),
-            balances: Vec::new(),
+            address: address.to_string(),
+            balances,
         },
-        warnings: vec![warning_source_unavailable(
-            "Per-token balances require CollateralVaultViews.getCollateralTokens + CollateralVault.balances RPC orchestration; tracked in M-P2c.",
-        )],
-        meta: MetaBlock::new(&state, "db"),
+        warnings,
+        meta: MetaBlock::new(state, if all_ok { "rpc" } else { "db" }),
     }))
+}
+
+/// Sanitise RPC-side error messages so the response envelope never
+/// exposes a raw RPC URL or a provider's internal trace. We strip
+/// anything that looks like an HTTP(S) URL.
+fn sanitise_rpc_err(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == 'h' {
+            // Speculatively match http:// or https://
+            let rest: String = chars.clone().take(7).collect();
+            if rest.starts_with("ttp://") || rest.starts_with("ttps://") {
+                // Skip until whitespace / end.
+                while let Some(&nx) = chars.peek() {
+                    if nx.is_whitespace() {
+                        break;
+                    }
+                    chars.next();
+                }
+                out.push_str("<url-redacted>");
+                continue;
+            }
+        }
+        out.push(c);
+    }
+    // Cap length to 200 chars; truncate noisy provider dumps.
+    if out.len() > 200 {
+        out.truncate(200);
+        out.push('…');
+    }
+    out
 }
 
 pub async fn account_history(
@@ -1826,6 +1973,155 @@ mod tests {
             assert!(!body.contains("aws_kms"), "{body}");
             assert!(!body.contains("signer_mode"), "{body}");
         }
+    }
+
+    // ----- M-P2d — account_balances_impl with provider injection -----
+
+    use crate::api::trading_views::tests::ProgrammableMockProvider;
+    use crate::api::trading_views::TradingViewsConfig;
+
+    #[tokio::test]
+    async fn balances_impl_fully_unconfigured_falls_back_to_partial() {
+        let s = test_state();
+        let env = account_balances_impl::<ProgrammableMockProvider>(
+            &s,
+            "0x1234567890abcdef1234567890abcdef12345678",
+            None,
+        )
+        .await
+        .expect("partial");
+        assert_eq!(env.0.status, "partial");
+        assert!(env.0.data.balances.is_empty());
+        assert!(env
+            .0
+            .warnings
+            .iter()
+            .any(|w| w.code == "SOURCE_UNAVAILABLE_FIELD"));
+    }
+
+    #[tokio::test]
+    async fn balances_impl_invalid_address_rejected() {
+        let s = test_state();
+        let err = account_balances_impl::<ProgrammableMockProvider>(&s, "nope", None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, TradingErrorCode::InvalidAddress);
+    }
+
+    #[tokio::test]
+    async fn balances_impl_configured_addresses_no_provider_still_partial() {
+        let mut s = test_state();
+        s.trading_views = TradingViewsConfig {
+            collateral_vault_views_address: Some(AccountId::new(
+                "0x0000000000000000000000000000000000000aaa",
+            )),
+            collateral_vault_address: Some(AccountId::new(
+                "0x0000000000000000000000000000000000000bbb",
+            )),
+            ..Default::default()
+        };
+        let env = account_balances_impl::<ProgrammableMockProvider>(
+            &s,
+            "0x1234567890abcdef1234567890abcdef12345678",
+            None,
+        )
+        .await
+        .expect("partial");
+        assert_eq!(env.0.status, "partial");
+        assert!(env
+            .0
+            .warnings
+            .iter()
+            .any(|w| { w.message.contains("RPC provider") || w.message.contains("RPC_URL") }));
+    }
+
+    #[tokio::test]
+    async fn balances_impl_configured_returns_ok_when_provider_yields_tokens() {
+        use alloy_primitives::{Address, U256};
+        use alloy_sol_types::SolValue;
+        let mut s = test_state();
+        s.trading_views = TradingViewsConfig {
+            collateral_vault_views_address: Some(AccountId::new(
+                "0x0000000000000000000000000000000000000aaa",
+            )),
+            collateral_vault_address: Some(AccountId::new(
+                "0x0000000000000000000000000000000000000bbb",
+            )),
+            ..Default::default()
+        };
+        let tokens: Vec<Address> = vec![Address::from([1u8; 20])];
+        let token_list_encoded = SolValue::abi_encode(&tokens);
+        let balance_encoded = SolValue::abi_encode(&U256::from(1_000_000u64));
+        let mock = ProgrammableMockProvider::new();
+        mock.returns([0xb5, 0x8e, 0xb6, 0x3f], token_list_encoded);
+        mock.returns([0xc2, 0x3f, 0x00, 0x1f], balance_encoded);
+        let env = account_balances_impl(
+            &s,
+            "0x1234567890abcdef1234567890abcdef12345678",
+            Some(&mock),
+        )
+        .await
+        .expect("ok");
+        assert_eq!(env.0.status, "ok");
+        assert_eq!(env.0.data.balances.len(), 1);
+        assert_eq!(env.0.data.balances[0].balance, "1000000");
+        assert!(env.0.warnings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn balances_impl_rpc_failure_falls_back_to_partial_with_sanitised_warning() {
+        let mut s = test_state();
+        s.trading_views = TradingViewsConfig {
+            collateral_vault_views_address: Some(AccountId::new(
+                "0x0000000000000000000000000000000000000aaa",
+            )),
+            collateral_vault_address: Some(AccountId::new(
+                "0x0000000000000000000000000000000000000bbb",
+            )),
+            ..Default::default()
+        };
+        let mock = ProgrammableMockProvider::new();
+        mock.fails([0xb5, 0x8e, 0xb6, 0x3f]); // Token list fetch fails.
+        let env = account_balances_impl(
+            &s,
+            "0x1234567890abcdef1234567890abcdef12345678",
+            Some(&mock),
+        )
+        .await
+        .expect("partial");
+        assert_eq!(env.0.status, "partial");
+        let w = env
+            .0
+            .warnings
+            .iter()
+            .find(|w| w.code == "RPC_UNAVAILABLE")
+            .expect("RPC_UNAVAILABLE warning");
+        // No raw http(s):// URL in the message.
+        assert!(!w.message.contains("http://"));
+        assert!(!w.message.contains("https://"));
+    }
+
+    #[tokio::test]
+    async fn sanitise_rpc_err_strips_urls() {
+        let s =
+            sanitise_rpc_err("connect failed to http://secret-rpc.example.com:8545/abc more text");
+        assert!(s.contains("<url-redacted>"));
+        assert!(!s.contains("secret-rpc"));
+    }
+
+    #[tokio::test]
+    async fn sanitise_rpc_err_strips_https_too() {
+        let s =
+            sanitise_rpc_err("eth_call rejected at https://provider.example.invalid/v1/key extra");
+        assert!(s.contains("<url-redacted>"));
+        assert!(!s.contains("provider.example"));
+    }
+
+    #[tokio::test]
+    async fn sanitise_rpc_err_caps_length() {
+        let big = "x".repeat(500);
+        let s = sanitise_rpc_err(&big);
+        assert!(s.len() <= 203); // 200 + ellipsis bytes
     }
 
     // -- Test helpers --

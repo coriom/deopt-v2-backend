@@ -332,8 +332,14 @@ pub fn required_role_for(method: &str, path: &str) -> AdminRole {
             | ("POST", "/admin/options/reconciliations/tick")
             // Preflight surface — produces calldata / packet payloads
             // for off-band signing.
-            | ("GET", "/admin/fees/v2/smoke/readiness")
-    );
+            | ("GET", "/admin/fees/v2/smoke/readiness") // M-P4c — local/test-only execution-intent + tx-status
+                                                        // fixture. Mutating POSTs require Operator. Read endpoint
+                                                        // (GET) falls through to Viewer by default. The fixture
+                                                        // additionally hard-refuses mainnet at the handler layer
+                                                        // (defence-in-depth), so even an Operator token cannot
+                                                        // exercise it against chain_id 8453.
+    ) || (method == "POST"
+        && (path == "/admin/test/execution-intents" || path.starts_with("/admin/test/intent/")));
     if is_operator {
         return AdminRole::Operator;
     }

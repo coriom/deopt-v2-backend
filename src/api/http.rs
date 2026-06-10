@@ -45,6 +45,19 @@ pub struct AppState {
     pub rfq_config: RfqConfig,
     pub options_config: OptionsConfig,
     pub fees_config: FeesConfig,
+    /// M-P2d — Optional addresses for the trading-views read surface.
+    /// All fields default to `None`; trading handlers fall back to the
+    /// M-P2b partial-data path when any field is absent.
+    pub trading_views: crate::api::trading_views::TradingViewsConfig,
+    /// M-P4c — Local/test-only execution-intent + tx-status fixture
+    /// guard. Disabled by default; runtime-refused on `chain_id == 8453`.
+    /// See `crate::api::local_test_fixtures` for the full safety
+    /// envelope. NEVER read in production code paths.
+    pub local_test_fixtures: crate::api::local_test_fixtures::LocalTestFixturesConfig,
+    /// M-P4c — In-memory synthetic intent store. Used only by handlers
+    /// under `/admin/test/*` and `/trading/test/*`. Never persisted.
+    pub local_test_intents:
+        std::sync::Arc<std::sync::Mutex<crate::api::local_test_fixtures::LocalTestIntentStore>>,
     pub mm_gateway_config: MmGatewayConfig,
     pub mm_permissions_config: MmPermissionsConfig,
     pub admin_config: AdminConfig,
@@ -230,6 +243,10 @@ impl AppState {
             mm_sessions: MmSessionRegistry::new(),
             trade_signatures: Arc::new(Mutex::new(HashMap::new())),
             broadcast_observability: Arc::new(crate::options::BroadcastObservability::new()),
+            trading_views: crate::api::trading_views::TradingViewsConfig::disabled(),
+            local_test_fixtures: crate::api::local_test_fixtures::LocalTestFixturesConfig::disabled(
+            ),
+            local_test_intents: crate::api::local_test_fixtures::shared_store(),
         }
     }
 

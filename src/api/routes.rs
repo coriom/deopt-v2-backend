@@ -472,6 +472,39 @@ pub fn router(state: AppState) -> Router {
             get(crate::api::trading::account_history),
         )
         .route("/trading/health", get(crate::api::trading::trading_health))
+        // ---------------------------------------------------------------
+        // M-P4c — Local/test-only execution-intent + tx-status fixtures.
+        //
+        // Disabled by default. Returns HTTP 404 unless
+        // `LocalTestFixturesConfig::enabled_for_chain_id(chain_id)` was
+        // installed AND `state.chain_id != 8453`. NEVER touches a
+        // public chain, NEVER calls signer / AWS / KMS, NEVER mutates
+        // production execution-transaction rows.
+        //
+        // Admin Bearer is enforced by `admin_route_gate` for the
+        // `/admin/test/*` routes via the existing `/admin/*` prefix
+        // match. The `/trading/test/tx-status/:intent_id` read endpoint
+        // is unauthenticated by design — it serves the synthetic
+        // fixture store only and is HTTP-404 when disabled.
+        //
+        // See `crate::api::local_test_fixtures` + `docs/E2E_LOCAL_TX_STATUS_CYCLER_RESULT.md`.
+        // ---------------------------------------------------------------
+        .route(
+            "/admin/test/execution-intents",
+            post(crate::api::local_test_fixtures::create_local_test_intent),
+        )
+        .route(
+            "/admin/test/intent/:intent_id",
+            get(crate::api::local_test_fixtures::get_local_test_intent),
+        )
+        .route(
+            "/admin/test/intent/:intent_id/transition",
+            post(crate::api::local_test_fixtures::transition_local_test_intent),
+        )
+        .route(
+            "/trading/test/tx-status/:intent_id",
+            get(crate::api::local_test_fixtures::get_local_test_tx_status),
+        )
         .layer(axum::middleware::from_fn_with_state(
             gate_state,
             admin_route_gate,
@@ -9324,6 +9357,431 @@ mod tests {
     async fn response_text(response: Response) -> String {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         String::from_utf8(body.to_vec()).unwrap()
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // M-P4c — Local/test-only fixture HTTP integration tests.
+    //
+    // These assert the route-layer behaviour of
+    // `crate::api::local_test_fixtures::*`:
+    //   * disabled fixture or mainnet chain id → 404 (indistinguishable
+    //     from a non-existent route);
+    //   * enabled fixture on sepolia / anvil → create + transition +
+    //     read succeed via /admin/test/* + /trading/test/*;
+    //   * invalid transitions → 400;
+    //   * production `/executor/transactions/:intent_id` is unchanged
+    //     when fixtures are disabled or enabled (fixture rows live in
+    //     a separate in-memory store).
+    //
+    // No signer call. No broadcast. No RPC. No AWS / KMS. No `.env`
+    // read. No production tx-table mutation.
+    // ──────────────────────────────────────────────────────────────────
+
+    fn local_test_state_disabled_mainnet() -> AppState {
+        // Default constructor: chain_id=84532, fixtures::disabled().
+        let mut state = admin_state(false);
+        state.chain_id = 8453;
+        state.local_test_fixtures =
+            crate::api::local_test_fixtures::LocalTestFixturesConfig::disabled();
+        state
+    }
+
+    fn local_test_state_disabled_sepolia() -> AppState {
+        admin_state(false)
+    }
+
+    fn local_test_state_enabled_sepolia() -> AppState {
+        let mut state = admin_state(false);
+        state.chain_id = 84532;
+        state.local_test_fixtures =
+            crate::api::local_test_fixtures::LocalTestFixturesConfig::enabled_for_chain_id(84532);
+        state
+    }
+
+    fn local_test_state_enabled_anvil() -> AppState {
+        let mut state = admin_state(false);
+        state.chain_id = 31337;
+        state.local_test_fixtures =
+            crate::api::local_test_fixtures::LocalTestFixturesConfig::enabled_for_chain_id(31337);
+        state
+    }
+
+    fn post_json_request(path: &str, body: serde_json::Value) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    /// HTTP — fixture creation endpoint returns 404 when fixtures are
+    /// disabled (production default). The 404 is intentional: it must
+    /// be indistinguishable from a non-existent route so prod probing
+    /// cannot fingerprint the test surface.
+    #[tokio::test]
+    async fn http_create_intent_returns_404_when_fixtures_disabled() {
+        let state = local_test_state_disabled_sepolia();
+        let response = router(state)
+            .oneshot(post_json_request(
+                "/admin/test/execution-intents",
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// HTTP — even on mainnet (`chain_id == 8453`), the create endpoint
+    /// MUST return 404 — the `enabled_for_chain_id(8453)` factory
+    /// would have refused anyway, and the runtime `assert_enabled`
+    /// adds a second layer.
+    #[tokio::test]
+    async fn http_create_intent_returns_404_on_mainnet_chain_id() {
+        let mut state = local_test_state_disabled_mainnet();
+        // Defence-in-depth: even if someone mis-installs an enabled
+        // config on mainnet (impossible via the factory), the runtime
+        // check must still refuse.
+        state.local_test_fixtures =
+            crate::api::local_test_fixtures::LocalTestFixturesConfig::enabled_for_chain_id(8453);
+        let response = router(state)
+            .oneshot(post_json_request(
+                "/admin/test/execution-intents",
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// HTTP — fixture transition endpoint returns 404 when disabled.
+    #[tokio::test]
+    async fn http_transition_returns_404_when_fixtures_disabled() {
+        let state = local_test_state_disabled_sepolia();
+        let intent_id = Uuid::new_v4();
+        let response = router(state)
+            .oneshot(post_json_request(
+                &format!("/admin/test/intent/{intent_id}/transition"),
+                serde_json::json!({ "to_status": "pending" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// HTTP — `/trading/test/tx-status/:intent_id` returns 404 when
+    /// fixtures are disabled. (The frontend's existing route-intercept
+    /// fallback catches this case.)
+    #[tokio::test]
+    async fn http_tx_status_read_returns_404_when_fixtures_disabled() {
+        let state = local_test_state_disabled_sepolia();
+        let response = router(state)
+            .oneshot(get_request(
+                &format!("/trading/test/tx-status/{}", Uuid::new_v4()),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// HTTP — create returns 200 + a synthetic intent envelope when
+    /// fixtures are enabled on sepolia.
+    #[tokio::test]
+    async fn http_create_intent_returns_200_when_enabled_sepolia() {
+        let state = local_test_state_enabled_sepolia();
+        let response = router(state)
+            .oneshot(post_json_request(
+                "/admin/test/execution-intents",
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["status"], "created");
+        assert_eq!(json["synthetic"], true);
+        let tx_hash = json["tx_hash"].as_str().unwrap();
+        assert!(
+            tx_hash.starts_with("0xdeadbee5"),
+            "tx_hash must carry the synthetic deadbee5 marker"
+        );
+        assert!(json["request_id"].as_str().unwrap().starts_with("test-"));
+    }
+
+    /// HTTP — full create → pending → confirmed lifecycle via the
+    /// public read endpoint on anvil.
+    #[tokio::test]
+    async fn http_full_lifecycle_create_pending_confirmed_on_anvil() {
+        let state = local_test_state_enabled_anvil();
+        let app = router(state);
+
+        // Create.
+        let response = app
+            .clone()
+            .oneshot(post_json_request(
+                "/admin/test/execution-intents",
+                serde_json::json!({"account": "0xf39Fd6e51aaD88F6F4ce6aB8827279cffFb92266"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        let intent_id = json["intent_id"].as_str().unwrap().to_string();
+
+        // Transition → pending.
+        let response = app
+            .clone()
+            .oneshot(post_json_request(
+                &format!("/admin/test/intent/{intent_id}/transition"),
+                serde_json::json!({"to_status": "pending"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["status"], "pending");
+
+        // Transition → confirmed.
+        let response = app
+            .clone()
+            .oneshot(post_json_request(
+                &format!("/admin/test/intent/{intent_id}/transition"),
+                serde_json::json!({"to_status": "confirmed"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Public read of synthetic status.
+        let response = app
+            .oneshot(get_request(
+                &format!("/trading/test/tx-status/{intent_id}"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["status"], "confirmed");
+        assert_eq!(json["source"], "local_test_fixture");
+        assert_eq!(json["synthetic"], true);
+        assert_eq!(json["transitions"].as_array().unwrap().len(), 2);
+    }
+
+    /// HTTP — invalid transition (e.g. created→confirmed) → 400.
+    #[tokio::test]
+    async fn http_invalid_transition_returns_400() {
+        let state = local_test_state_enabled_sepolia();
+        let app = router(state);
+
+        let response = app
+            .clone()
+            .oneshot(post_json_request(
+                "/admin/test/execution-intents",
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        let intent_id = response_json(response).await["intent_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let response = app
+            .oneshot(post_json_request(
+                &format!("/admin/test/intent/{intent_id}/transition"),
+                serde_json::json!({"to_status": "confirmed"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// HTTP — transition for an unknown intent → 404.
+    #[tokio::test]
+    async fn http_transition_unknown_intent_returns_404() {
+        let state = local_test_state_enabled_sepolia();
+        let response = router(state)
+            .oneshot(post_json_request(
+                &format!("/admin/test/intent/{}/transition", Uuid::new_v4()),
+                serde_json::json!({"to_status": "pending"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// HTTP — bad uuid → 404 (not 400, to match the generic
+    /// "not found" surface so a probe can't differentiate).
+    #[tokio::test]
+    async fn http_transition_malformed_uuid_returns_404() {
+        let state = local_test_state_enabled_sepolia();
+        let response = router(state)
+            .oneshot(post_json_request(
+                "/admin/test/intent/not-a-uuid/transition",
+                serde_json::json!({"to_status": "pending"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// HTTP — bad to_status string → 400.
+    #[tokio::test]
+    async fn http_transition_unknown_status_returns_400() {
+        let state = local_test_state_enabled_sepolia();
+        let app = router(state);
+        let response = app
+            .clone()
+            .oneshot(post_json_request(
+                "/admin/test/execution-intents",
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        let intent_id = response_json(response).await["intent_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let response = app
+            .oneshot(post_json_request(
+                &format!("/admin/test/intent/{intent_id}/transition"),
+                serde_json::json!({"to_status": "broadcast_confirmed"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// HTTP — fixture endpoints don't bleed into production
+    /// `/executor/transactions/:intent_id`. Even after a fixture intent
+    /// is created and cycled, the production endpoint reports an empty
+    /// array for that uuid because the fixture row is held in a
+    /// separate in-memory store with no link to the production tables.
+    #[tokio::test]
+    async fn executor_transactions_unchanged_when_fixture_intent_created() {
+        let state = local_test_state_enabled_sepolia();
+        let app = router(state);
+        let response = app
+            .clone()
+            .oneshot(post_json_request(
+                "/admin/test/execution-intents",
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        let intent_id = response_json(response).await["intent_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let response = app
+            .oneshot(get_request(
+                &format!("/executor/transactions/{intent_id}"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert!(
+            json.as_array().unwrap().is_empty(),
+            "production /executor/transactions/:intent_id must report empty for a fixture intent"
+        );
+    }
+
+    /// HTTP — response envelope never leaks `Authorization`,
+    /// `private_key`, `kms`, `aws`, or `rpc_url`. Sanity check on the
+    /// JSON surface.
+    #[tokio::test]
+    async fn http_response_envelope_never_leaks_secrets() {
+        let state = local_test_state_enabled_sepolia();
+        let app = router(state);
+        let response = app
+            .clone()
+            .oneshot(post_json_request(
+                "/admin/test/execution-intents",
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        let intent_id = response_json(response).await["intent_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let response = app
+            .oneshot(get_request(
+                &format!("/trading/test/tx-status/{intent_id}"),
+                None,
+            ))
+            .await
+            .unwrap();
+        let body = response_text(response).await;
+        let lower = body.to_ascii_lowercase();
+        for forbidden in [
+            "authorization",
+            "private_key",
+            "private-key",
+            "aws_access_key",
+            "kms",
+            "rpc_url",
+            "bearer ",
+            "0x_private",
+        ] {
+            assert!(
+                !lower.contains(forbidden),
+                "response leaked forbidden token: {forbidden}\n--- body ---\n{body}\n------------"
+            );
+        }
+    }
+
+    /// HTTP — GET single intent works when enabled.
+    #[tokio::test]
+    async fn http_get_intent_returns_intent_when_known() {
+        let state = local_test_state_enabled_sepolia();
+        let app = router(state);
+        let response = app
+            .clone()
+            .oneshot(post_json_request(
+                "/admin/test/execution-intents",
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        let intent_id = response_json(response).await["intent_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let response = app
+            .oneshot(get_request(
+                &format!("/admin/test/intent/{intent_id}"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["status"], "created");
+    }
+
+    /// HTTP — admin Bearer-equivalent gate: when admin_config requires
+    /// the shared token, `/admin/test/execution-intents` is blocked
+    /// without the token (the existing `admin_route_gate` middleware
+    /// enforces this for every `/admin/*` path; the fixture inherits
+    /// the gate for free).
+    #[tokio::test]
+    async fn http_admin_gate_blocks_test_endpoint_without_token() {
+        let mut state = admin_state(true);
+        state.local_test_fixtures =
+            crate::api::local_test_fixtures::LocalTestFixturesConfig::enabled_for_chain_id(84532);
+        let response = router(state)
+            .oneshot(post_json_request(
+                "/admin/test/execution-intents",
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 }
 
