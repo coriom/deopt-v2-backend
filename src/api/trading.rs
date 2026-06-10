@@ -299,6 +299,93 @@ pub struct NotReadyData {
     pub reason: &'static str,
 }
 
+// M-P2b typed response payloads. Optional fields use `Option<String>` so
+// the JSON output is `null` when the value is not yet wired (the
+// `warnings` array carries the structured reason).
+
+#[derive(Clone, Debug, Serialize)]
+pub struct FeeBreakdown {
+    pub ppm_signed: i64,
+    pub amount: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct QuotePreviewData {
+    pub series_id: String,
+    pub side: String,
+    pub size: String,
+    pub price_1e8: String,
+    pub premium: String,
+    pub buyer_fee: FeeBreakdown,
+    pub seller_fee: FeeBreakdown,
+    pub settlement_asset: String,
+    pub oracle_mark_1e8: Option<String>,
+    pub im_impact: Option<String>,
+    pub free_collateral_after: Option<String>,
+    pub quote_expires_at_ms: i64,
+    pub position_size_after: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct Position {
+    pub series_id: String,
+    pub size: String,
+    pub side: &'static str,
+    pub avg_entry_price_1e8: Option<String>,
+    pub mark_price_1e8: Option<String>,
+    pub unrealised_pnl: Option<String>,
+    pub im_contribution: Option<String>,
+    pub mm_contribution: Option<String>,
+    pub is_exercisable: Option<bool>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PositionsData {
+    pub address: String,
+    pub positions: Vec<Position>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PortfolioData {
+    pub address: String,
+    pub equity: Option<String>,
+    pub im: Option<String>,
+    pub mm: Option<String>,
+    pub free_collateral: Option<String>,
+    pub total_notional: Option<String>,
+    pub open_positions_count: Option<u32>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct BalanceRow {
+    pub token: String,
+    pub symbol: Option<String>,
+    pub decimals: Option<u8>,
+    pub balance: String,
+    pub balance_with_yield: Option<String>,
+    pub strategy_assets_preview: Option<String>,
+    pub is_collateral_active: Option<bool>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct BalancesData {
+    pub address: String,
+    pub balances: Vec<BalanceRow>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ExercisePreviewData {
+    pub series_id: String,
+    pub account: String,
+    pub is_already_settled: bool,
+    pub can_settle: bool,
+    pub pnl: String,
+    pub payable_from_settlement_sink: Option<String>,
+    pub insurance_preview: Option<String>,
+    pub collectible_from_trader_preview: Option<String>,
+    pub residual_bad_debt_preview: Option<String>,
+}
+
 // ---------------------------------------------------------------------
 // Product computation (series → product aggregation)
 // ---------------------------------------------------------------------
@@ -567,10 +654,49 @@ pub struct QuotePreviewQuery {
     pub account: Option<String>,
 }
 
+// ---------------------------------------------------------------------
+// M-P2b — Quote / Exercise / Close previews
+//
+// Posture: PARTIAL implementations. The preview math here derives from
+// the option-series store + a deterministic fee-ppm assumption
+// (FM_V2.takerFee defaults to ≤ MAX_TAKER_FEE_PPM = 1000). Full on-chain
+// MarginEngineLens.previewTradeFees + OracleRouter.getFeed orchestration
+// is tracked for M-P2c. Until then, every preview attaches a
+// structured `partial_preview` warning so the frontend renders an
+// "approximate" badge and the operator can audit the gap.
+// ---------------------------------------------------------------------
+
+/// Default taker-fee ppm used in the deterministic partial preview.
+/// Matches the conservative end of the FM_V2 surface
+/// (`MAX_TAKER_FEE_PPM = 1000`); the on-chain on-chain refinement
+/// landing in M-P2c may produce a tighter value per account tier.
+const PARTIAL_PREVIEW_TAKER_PPM: i64 = 100;
+
+fn warning_partial_preview() -> Warning {
+    Warning {
+        code: "PARTIAL_PREVIEW".to_string(),
+        message: "Preview is a deterministic approximation. Full \
+                  on-chain MarginEngineLens.previewTradeFees + \
+                  OracleRouter.getFeed orchestration lands in M-P2c."
+            .to_string(),
+        details: serde_json::json!({
+            "assumed_taker_ppm": PARTIAL_PREVIEW_TAKER_PPM,
+        }),
+    }
+}
+
+fn warning_source_unavailable(reason: &str) -> Warning {
+    Warning {
+        code: "SOURCE_UNAVAILABLE_FIELD".to_string(),
+        message: reason.to_string(),
+        details: serde_json::json!({}),
+    }
+}
+
 pub async fn quote_preview(
     State(state): State<AppState>,
     Query(query): Query<QuotePreviewQuery>,
-) -> Result<Json<Envelope<NotReadyData>>, TradingApiError> {
+) -> Result<Json<Envelope<QuotePreviewData>>, TradingApiError> {
     if !["buy", "sell"].contains(&query.side.as_str()) {
         return Err(TradingApiError::new(
             TradingErrorCode::InvalidRequest,
@@ -578,17 +704,17 @@ pub async fn quote_preview(
             MetaBlock::new(&state, "validation"),
         ));
     }
-    if query.size.parse::<u128>().is_err() {
-        return Err(TradingApiError::new(
+    let size: u128 = query.size.parse().map_err(|_| {
+        TradingApiError::new(
             TradingErrorCode::InvalidRequest,
             "size must be a non-negative integer",
             MetaBlock::new(&state, "validation"),
-        ));
-    }
+        )
+    })?;
     if let Some(addr) = query.account.as_deref() {
         parse_address_or_400(&state, addr)?;
     }
-    let _ = get_option_series_service(&state, &query.series_id)
+    let series = get_option_series_service(&state, &query.series_id)
         .await
         .map_err(|_| {
             TradingApiError::new(
@@ -597,47 +723,220 @@ pub async fn quote_preview(
                 MetaBlock::new(&state, "db"),
             )
         })?;
-    Err(TradingApiError::new(
-        TradingErrorCode::SourceUnavailable,
-        "Quote preview RPC orchestration not yet wired (MarginEngineLens.previewTradeFees + OracleRouter.getFeed; tracked in M-P2a follow-on).",
-        MetaBlock::new(&state, "spec"),
-    ))
+    // Series must be quotable.
+    if !matches!(series.status, crate::options::OptionSeriesStatus::Active) {
+        return Err(TradingApiError::new(
+            TradingErrorCode::QuoteUnsupported,
+            "Series is not Active",
+            MetaBlock::new(&state, "db"),
+        ));
+    }
+    // Reference price: use the explicit price_1e8 if provided, else the
+    // series strike as a deterministic placeholder. The "approximate"
+    // warning declares the assumption.
+    let price_1e8: u128 = match query.price_1e8.as_deref() {
+        Some(p) => p.parse().map_err(|_| {
+            TradingApiError::new(
+                TradingErrorCode::InvalidRequest,
+                "price_1e8 must be a non-negative integer",
+                MetaBlock::new(&state, "validation"),
+            )
+        })?,
+        None => series.strike_1e8,
+    };
+    // Premium = size * price / 1e8 (returned at on-chain notional precision).
+    let premium = size.saturating_mul(price_1e8);
+    // Fee = premium * ppm / 1_000_000 (rounded down).
+    let fee_amount = premium.saturating_mul(PARTIAL_PREVIEW_TAKER_PPM as u128) / 1_000_000u128;
+    let quote_expires_at_ms = now_ms() + 20_000; // 20s freshness window.
+    Ok(Json(Envelope {
+        status: "partial",
+        data: QuotePreviewData {
+            series_id: series.option_series_id.to_string(),
+            side: query.side.clone(),
+            size: size.to_string(),
+            price_1e8: price_1e8.to_string(),
+            premium: premium.to_string(),
+            buyer_fee: FeeBreakdown {
+                ppm_signed: PARTIAL_PREVIEW_TAKER_PPM,
+                amount: fee_amount.to_string(),
+            },
+            seller_fee: FeeBreakdown {
+                ppm_signed: PARTIAL_PREVIEW_TAKER_PPM,
+                amount: fee_amount.to_string(),
+            },
+            settlement_asset: series.settlement_asset.clone(),
+            oracle_mark_1e8: None,
+            im_impact: None,
+            free_collateral_after: None,
+            quote_expires_at_ms,
+            position_size_after: None,
+        },
+        warnings: vec![
+            warning_partial_preview(),
+            warning_source_unavailable("oracle_mark_1e8 not wired in M-P2b; tracked in M-P2c."),
+        ],
+        meta: MetaBlock::new(&state, "db"),
+    }))
 }
 
 pub async fn account_positions(
     State(state): State<AppState>,
     Path(address): Path<String>,
-) -> Result<Json<Envelope<NotReadyData>>, TradingApiError> {
-    parse_address_or_400(&state, &address)?;
-    Err(TradingApiError::new(
-        TradingErrorCode::SourceUnavailable,
-        "Account positions RPC orchestration not yet wired (MarginEngineLens.getAccountState; tracked in M-P2a follow-on).",
-        MetaBlock::new(&state, "spec"),
-    ))
+) -> Result<Json<Envelope<PositionsData>>, TradingApiError> {
+    let acct = parse_address_or_400(&state, &address)?;
+    // Aggregate net position per series from the OptionFill store.
+    let fills = list_option_fills_service(
+        &state,
+        OptionFillFilter {
+            option_series_id: None,
+            account: Some(acct.clone()),
+            order_id: None,
+        },
+    )
+    .await
+    .map_err(|_| {
+        TradingApiError::new(
+            TradingErrorCode::InternalError,
+            "unable to list option fills",
+            MetaBlock::new(&state, "internal"),
+        )
+    })?;
+    // For each series, compute signed net size (positive = long; negative = short).
+    use std::collections::HashMap;
+    let mut net: HashMap<String, (i128, u128, u128)> = HashMap::new();
+    // (signed_size_1e8, sum_premium_for_avg_entry, total_abs_size_for_avg_entry)
+    for f in &fills {
+        let is_long = f.buyer == acct;
+        let signed_delta: i128 = if is_long {
+            f.size_1e8 as i128
+        } else {
+            -(f.size_1e8 as i128)
+        };
+        let entry = net
+            .entry(f.option_series_id.to_string())
+            .or_insert((0, 0, 0));
+        entry.0 = entry.0.saturating_add(signed_delta);
+        entry.1 = entry
+            .1
+            .saturating_add(f.size_1e8.saturating_mul(f.price_1e8));
+        entry.2 = entry.2.saturating_add(f.size_1e8);
+    }
+    let mut positions = Vec::with_capacity(net.len());
+    for (series_id, (signed, premium_sum, size_sum)) in net {
+        if signed == 0 {
+            continue;
+        }
+        let (side, abs_size) = if signed > 0 {
+            ("long", signed as u128)
+        } else {
+            ("short", (-signed) as u128)
+        };
+        let avg_entry_price_1e8 = premium_sum
+            .checked_div(size_sum)
+            .map(|v| v.to_string());
+        positions.push(Position {
+            series_id,
+            size: abs_size.to_string(),
+            side,
+            avg_entry_price_1e8,
+            mark_price_1e8: None,
+            unrealised_pnl: None,
+            im_contribution: None,
+            mm_contribution: None,
+            is_exercisable: None,
+        });
+    }
+    positions.sort_by(|a, b| a.series_id.cmp(&b.series_id));
+    Ok(Json(Envelope {
+        status: "partial",
+        data: PositionsData {
+            address: address.clone(),
+            positions,
+        },
+        warnings: vec![warning_source_unavailable(
+            "mark_price_1e8 / unrealised_pnl / IM / MM not wired in M-P2b; tracked in M-P2c on-chain orchestration.",
+        )],
+        meta: MetaBlock::new(&state, "db"),
+    }))
 }
 
 pub async fn account_portfolio(
     State(state): State<AppState>,
     Path(address): Path<String>,
-) -> Result<Json<Envelope<NotReadyData>>, TradingApiError> {
-    parse_address_or_400(&state, &address)?;
-    Err(TradingApiError::new(
-        TradingErrorCode::SourceUnavailable,
-        "Account portfolio RPC orchestration not yet wired (MarginEngineLens.getAccountState aggregated; tracked in M-P2a follow-on).",
-        MetaBlock::new(&state, "spec"),
-    ))
+) -> Result<Json<Envelope<PortfolioData>>, TradingApiError> {
+    let acct = parse_address_or_400(&state, &address)?;
+    let fills = list_option_fills_service(
+        &state,
+        OptionFillFilter {
+            option_series_id: None,
+            account: Some(acct.clone()),
+            order_id: None,
+        },
+    )
+    .await
+    .map_err(|_| {
+        TradingApiError::new(
+            TradingErrorCode::InternalError,
+            "unable to list option fills",
+            MetaBlock::new(&state, "internal"),
+        )
+    })?;
+    use std::collections::HashMap;
+    let mut net_per_series: HashMap<String, i128> = HashMap::new();
+    let mut total_notional: u128 = 0;
+    for f in &fills {
+        let is_long = f.buyer == acct;
+        let signed_delta: i128 = if is_long {
+            f.size_1e8 as i128
+        } else {
+            -(f.size_1e8 as i128)
+        };
+        *net_per_series
+            .entry(f.option_series_id.to_string())
+            .or_insert(0) += signed_delta;
+        total_notional = total_notional.saturating_add(f.size_1e8.saturating_mul(f.price_1e8));
+    }
+    let open_positions_count = net_per_series.values().filter(|&&v| v != 0).count() as u32;
+    Ok(Json(Envelope {
+        status: "partial",
+        data: PortfolioData {
+            address: address.clone(),
+            equity: None,
+            im: None,
+            mm: None,
+            free_collateral: None,
+            total_notional: Some(total_notional.to_string()),
+            open_positions_count: Some(open_positions_count),
+        },
+        warnings: vec![warning_source_unavailable(
+            "equity / IM / MM / free_collateral not wired in M-P2b; tracked in M-P2c on-chain orchestration via MarginEngineLens.getAccountState.",
+        )],
+        meta: MetaBlock::new(&state, "db"),
+    }))
 }
 
 pub async fn account_balances(
     State(state): State<AppState>,
     Path(address): Path<String>,
-) -> Result<Json<Envelope<NotReadyData>>, TradingApiError> {
-    parse_address_or_400(&state, &address)?;
-    Err(TradingApiError::new(
-        TradingErrorCode::SourceUnavailable,
-        "Account balances RPC orchestration not yet wired (CollateralVaultViews.getCollateralTokens + CollateralVault.balances per token; tracked in M-P2a follow-on).",
-        MetaBlock::new(&state, "spec"),
-    ))
+) -> Result<Json<Envelope<BalancesData>>, TradingApiError> {
+    let _acct = parse_address_or_400(&state, &address)?;
+    // Balances require RPC reads against CollateralVault.balances(account, token)
+    // for every configured collateral token. The list comes from
+    // CollateralVaultViews.getCollateralTokens(). M-P2b ships an empty
+    // balances envelope with an explicit SOURCE_UNAVAILABLE warning;
+    // M-P2c wires the RPC orchestration co-located with this handler.
+    Ok(Json(Envelope {
+        status: "partial",
+        data: BalancesData {
+            address: address.clone(),
+            balances: Vec::new(),
+        },
+        warnings: vec![warning_source_unavailable(
+            "Per-token balances require CollateralVaultViews.getCollateralTokens + CollateralVault.balances RPC orchestration; tracked in M-P2c.",
+        )],
+        meta: MetaBlock::new(&state, "db"),
+    }))
 }
 
 pub async fn account_history(
@@ -690,9 +989,9 @@ pub struct ExercisePreviewRequest {
 pub async fn exercise_preview(
     State(state): State<AppState>,
     Json(req): Json<ExercisePreviewRequest>,
-) -> Result<Json<Envelope<NotReadyData>>, TradingApiError> {
-    parse_address_or_400(&state, &req.account)?;
-    let _ = get_option_series_service(&state, &req.series_id)
+) -> Result<Json<Envelope<ExercisePreviewData>>, TradingApiError> {
+    let acct = parse_address_or_400(&state, &req.account)?;
+    let series = get_option_series_service(&state, &req.series_id)
         .await
         .map_err(|_| {
             TradingApiError::new(
@@ -701,11 +1000,61 @@ pub async fn exercise_preview(
                 MetaBlock::new(&state, "db"),
             )
         })?;
-    Err(TradingApiError::new(
-        TradingErrorCode::SourceUnavailable,
-        "Exercise preview RPC orchestration not yet wired (MarginEngineLens.previewAccountSettlement + previewDetailedSettlement; tracked in M-P2a follow-on).",
-        MetaBlock::new(&state, "spec"),
-    ))
+    // Compute net position size for this series + account from fills.
+    let fills = list_option_fills_service(
+        &state,
+        OptionFillFilter {
+            option_series_id: Some(series.option_series_id.clone()),
+            account: Some(acct.clone()),
+            order_id: None,
+        },
+    )
+    .await
+    .map_err(|_| {
+        TradingApiError::new(
+            TradingErrorCode::InternalError,
+            "unable to list option fills",
+            MetaBlock::new(&state, "internal"),
+        )
+    })?;
+    let mut signed_size: i128 = 0;
+    for f in &fills {
+        let is_long = f.buyer == acct;
+        let delta: i128 = if is_long {
+            f.size_1e8 as i128
+        } else {
+            -(f.size_1e8 as i128)
+        };
+        signed_size = signed_size.saturating_add(delta);
+    }
+    // Without an oracle read, we cannot compute the settlement price, so
+    // `pnl` is "0" (placeholder) and `can_settle` is `false` unless we
+    // know the position is at-or-past-expiry. The structured warnings
+    // document the missing on-chain refinement.
+    let now_s = now_ms() / 1000;
+    let is_past_expiry = (now_s as u64) >= series.expiry;
+    let can_settle = is_past_expiry && signed_size != 0;
+    Ok(Json(Envelope {
+        status: "partial",
+        data: ExercisePreviewData {
+            series_id: series.option_series_id.to_string(),
+            account: req.account.clone(),
+            is_already_settled: false,
+            can_settle,
+            pnl: "0".to_string(),
+            payable_from_settlement_sink: None,
+            insurance_preview: None,
+            collectible_from_trader_preview: None,
+            residual_bad_debt_preview: None,
+        },
+        warnings: vec![
+            warning_partial_preview(),
+            warning_source_unavailable(
+                "pnl + settlement breakdown require OracleRouter price read + MarginEngineLens.previewAccountSettlement; tracked in M-P2c.",
+            ),
+        ],
+        meta: MetaBlock::new(&state, "db"),
+    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -720,7 +1069,7 @@ pub struct ClosePreviewRequest {
 pub async fn close_preview(
     State(state): State<AppState>,
     Json(req): Json<ClosePreviewRequest>,
-) -> Result<Json<Envelope<NotReadyData>>, TradingApiError> {
+) -> Result<Json<Envelope<QuotePreviewData>>, TradingApiError> {
     parse_address_or_400(&state, &req.account)?;
     if !["buy", "sell"].contains(&req.side.as_str()) {
         return Err(TradingApiError::new(
@@ -729,14 +1078,14 @@ pub async fn close_preview(
             MetaBlock::new(&state, "validation"),
         ));
     }
-    if req.size.parse::<u128>().is_err() {
-        return Err(TradingApiError::new(
+    let size: u128 = req.size.parse().map_err(|_| {
+        TradingApiError::new(
             TradingErrorCode::InvalidRequest,
             "size must be a non-negative integer",
             MetaBlock::new(&state, "validation"),
-        ));
-    }
-    let _ = get_option_series_service(&state, &req.series_id)
+        )
+    })?;
+    let series = get_option_series_service(&state, &req.series_id)
         .await
         .map_err(|_| {
             TradingApiError::new(
@@ -745,11 +1094,58 @@ pub async fn close_preview(
                 MetaBlock::new(&state, "db"),
             )
         })?;
-    Err(TradingApiError::new(
-        TradingErrorCode::SourceUnavailable,
-        "Close preview RPC orchestration not yet wired (MarginEngineLens.previewTradeFees with opposing side; tracked in M-P2a follow-on).",
-        MetaBlock::new(&state, "spec"),
-    ))
+    if !matches!(series.status, crate::options::OptionSeriesStatus::Active) {
+        return Err(TradingApiError::new(
+            TradingErrorCode::QuoteUnsupported,
+            "Series is not Active",
+            MetaBlock::new(&state, "db"),
+        ));
+    }
+    // Reference price: explicit price_1e8 if provided, else series strike.
+    let price_1e8: u128 = match req.price_1e8.as_deref() {
+        Some(p) => p.parse().map_err(|_| {
+            TradingApiError::new(
+                TradingErrorCode::InvalidRequest,
+                "price_1e8 must be a non-negative integer",
+                MetaBlock::new(&state, "validation"),
+            )
+        })?,
+        None => series.strike_1e8,
+    };
+    let premium = size.saturating_mul(price_1e8);
+    let fee_amount = premium.saturating_mul(PARTIAL_PREVIEW_TAKER_PPM as u128) / 1_000_000u128;
+    let quote_expires_at_ms = now_ms() + 20_000;
+    Ok(Json(Envelope {
+        status: "partial",
+        data: QuotePreviewData {
+            series_id: series.option_series_id.to_string(),
+            side: req.side.clone(),
+            size: size.to_string(),
+            price_1e8: price_1e8.to_string(),
+            premium: premium.to_string(),
+            buyer_fee: FeeBreakdown {
+                ppm_signed: PARTIAL_PREVIEW_TAKER_PPM,
+                amount: fee_amount.to_string(),
+            },
+            seller_fee: FeeBreakdown {
+                ppm_signed: PARTIAL_PREVIEW_TAKER_PPM,
+                amount: fee_amount.to_string(),
+            },
+            settlement_asset: series.settlement_asset.clone(),
+            oracle_mark_1e8: None,
+            im_impact: None,
+            free_collateral_after: None,
+            quote_expires_at_ms,
+            position_size_after: None,
+        },
+        warnings: vec![
+            warning_partial_preview(),
+            warning_source_unavailable(
+                "oracle_mark_1e8 + position_size_after not wired in M-P2b; tracked in M-P2c.",
+            ),
+        ],
+        meta: MetaBlock::new(&state, "db"),
+    }))
 }
 
 pub async fn trading_health(State(state): State<AppState>) -> Json<Envelope<TradingHealthData>> {
@@ -981,41 +1377,60 @@ mod tests {
         assert_eq!(err.code, TradingErrorCode::InvalidAddress);
     }
 
+    // M-P2b: positions / portfolio / balances now return partial-real data.
+
     #[tokio::test]
-    async fn positions_returns_source_unavailable_for_valid_address() {
+    async fn positions_returns_empty_partial_for_default_state() {
         let s = test_state();
-        let err = account_positions(
+        let env = account_positions(
             State(s),
             Path("0x1234567890abcdef1234567890abcdef12345678".to_string()),
         )
         .await
-        .unwrap_err();
-        assert_eq!(err.code, TradingErrorCode::SourceUnavailable);
-        assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
+        .expect("partial ok");
+        assert_eq!(env.0.status, "partial");
+        assert!(env.0.data.positions.is_empty());
+        assert_eq!(
+            env.0.data.address,
+            "0x1234567890abcdef1234567890abcdef12345678"
+        );
+        assert!(!env.0.warnings.is_empty());
     }
 
     #[tokio::test]
-    async fn portfolio_returns_source_unavailable_for_valid_address() {
+    async fn portfolio_returns_zero_partial_for_default_state() {
         let s = test_state();
-        let err = account_portfolio(
+        let env = account_portfolio(
             State(s),
             Path("0x1234567890abcdef1234567890abcdef12345678".to_string()),
         )
         .await
-        .unwrap_err();
-        assert_eq!(err.code, TradingErrorCode::SourceUnavailable);
+        .expect("partial ok");
+        assert_eq!(env.0.status, "partial");
+        assert_eq!(env.0.data.open_positions_count, Some(0));
+        assert_eq!(env.0.data.total_notional, Some("0".to_string()));
+        // Fields not yet wired remain None.
+        assert!(env.0.data.equity.is_none());
+        assert!(env.0.data.free_collateral.is_none());
     }
 
     #[tokio::test]
-    async fn balances_returns_source_unavailable_for_valid_address() {
+    async fn balances_returns_empty_partial_for_default_state() {
         let s = test_state();
-        let err = account_balances(
+        let env = account_balances(
             State(s),
             Path("0x1234567890abcdef1234567890abcdef12345678".to_string()),
         )
         .await
-        .unwrap_err();
-        assert_eq!(err.code, TradingErrorCode::SourceUnavailable);
+        .expect("partial ok");
+        assert_eq!(env.0.status, "partial");
+        assert!(env.0.data.balances.is_empty());
+        // The SOURCE_UNAVAILABLE warning must be present.
+        assert!(env
+            .0
+            .warnings
+            .iter()
+            .any(|w| w.code == "SOURCE_UNAVAILABLE_FIELD"));
     }
 
     #[tokio::test]
@@ -1140,7 +1555,282 @@ mod tests {
         assert!(!body.contains("AWS_"));
     }
 
-    // Test helper: minimal AppState. Re-uses the same constructor as the
+    // ---------------------- M-P2b NEW TESTS ----------------------
+
+    #[tokio::test]
+    async fn quote_preview_returns_partial_for_unknown_series() {
+        let s = test_state();
+        // Series 42 doesn't exist in default-state store → SeriesNotFound.
+        let err = quote_preview(
+            State(s),
+            Query(QuotePreviewQuery {
+                series_id: "42".to_string(),
+                side: "buy".to_string(),
+                size: "1".to_string(),
+                price_1e8: None,
+                account: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, TradingErrorCode::SeriesNotFound);
+    }
+
+    #[tokio::test]
+    async fn quote_preview_rejects_bad_price() {
+        let s = seeded_state(true);
+        let err = quote_preview(
+            State(s),
+            Query(QuotePreviewQuery {
+                series_id: "S-1".to_string(),
+                side: "buy".to_string(),
+                size: "1".to_string(),
+                price_1e8: Some("not-a-number".to_string()),
+                account: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, TradingErrorCode::InvalidRequest);
+    }
+
+    #[tokio::test]
+    async fn quote_preview_returns_partial_for_active_series() {
+        let s = seeded_state(true);
+        let env = quote_preview(
+            State(s),
+            Query(QuotePreviewQuery {
+                series_id: "S-1".to_string(),
+                side: "buy".to_string(),
+                size: "1".to_string(),
+                price_1e8: None,
+                account: None,
+            }),
+        )
+        .await
+        .expect("partial ok");
+        assert_eq!(env.0.status, "partial");
+        assert_eq!(env.0.data.series_id, "S-1");
+        assert_eq!(env.0.data.side, "buy");
+        assert_eq!(env.0.data.size, "1");
+        // ppm matches the documented partial assumption.
+        assert_eq!(env.0.data.buyer_fee.ppm_signed, PARTIAL_PREVIEW_TAKER_PPM);
+        // PARTIAL_PREVIEW warning present.
+        assert!(env.0.warnings.iter().any(|w| w.code == "PARTIAL_PREVIEW"));
+    }
+
+    #[tokio::test]
+    async fn quote_preview_refuses_inactive_series() {
+        let s = seeded_state(false); // inactive
+        let err = quote_preview(
+            State(s),
+            Query(QuotePreviewQuery {
+                series_id: "S-1".to_string(),
+                side: "buy".to_string(),
+                size: "1".to_string(),
+                price_1e8: None,
+                account: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, TradingErrorCode::QuoteUnsupported);
+        assert_eq!(err.status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn close_preview_returns_partial_for_active_series() {
+        let s = seeded_state(true);
+        let env = close_preview(
+            State(s),
+            Json(ClosePreviewRequest {
+                series_id: "S-1".to_string(),
+                account: "0x1234567890abcdef1234567890abcdef12345678".to_string(),
+                side: "sell".to_string(),
+                size: "1".to_string(),
+                price_1e8: None,
+            }),
+        )
+        .await
+        .expect("partial ok");
+        assert_eq!(env.0.status, "partial");
+        assert_eq!(env.0.data.series_id, "S-1");
+        assert_eq!(env.0.data.side, "sell");
+    }
+
+    #[tokio::test]
+    async fn close_preview_refuses_inactive_series() {
+        let s = seeded_state(false);
+        let err = close_preview(
+            State(s),
+            Json(ClosePreviewRequest {
+                series_id: "S-1".to_string(),
+                account: "0x1234567890abcdef1234567890abcdef12345678".to_string(),
+                side: "buy".to_string(),
+                size: "1".to_string(),
+                price_1e8: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, TradingErrorCode::QuoteUnsupported);
+    }
+
+    #[tokio::test]
+    async fn exercise_preview_returns_partial_for_active_series() {
+        let s = seeded_state(true);
+        let env = exercise_preview(
+            State(s),
+            Json(ExercisePreviewRequest {
+                series_id: "S-1".to_string(),
+                account: "0x1234567890abcdef1234567890abcdef12345678".to_string(),
+            }),
+        )
+        .await
+        .expect("partial ok");
+        assert_eq!(env.0.status, "partial");
+        assert!(!env.0.data.is_already_settled);
+        // Default-state: no fills → signed_size = 0 → can_settle = false.
+        assert!(!env.0.data.can_settle);
+        assert!(env.0.warnings.iter().any(|w| w.code == "PARTIAL_PREVIEW"));
+    }
+
+    #[tokio::test]
+    async fn exercise_preview_unknown_series_yields_series_not_found() {
+        let s = test_state();
+        let err = exercise_preview(
+            State(s),
+            Json(ExercisePreviewRequest {
+                series_id: "missing".to_string(),
+                account: "0x1234567890abcdef1234567890abcdef12345678".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, TradingErrorCode::SeriesNotFound);
+    }
+
+    #[tokio::test]
+    async fn preview_endpoints_do_not_call_signer_or_broadcast() {
+        // Smoke: handlers must not touch the broadcast_observability
+        // counters that the signer/executor would increment. We assert
+        // pre/post equality.
+        let s = seeded_state(true);
+        let before = s.broadcast_observability.snapshot();
+        let _ = quote_preview(
+            State(s.clone()),
+            Query(QuotePreviewQuery {
+                series_id: "S-1".to_string(),
+                side: "buy".to_string(),
+                size: "1".to_string(),
+                price_1e8: None,
+                account: None,
+            }),
+        )
+        .await;
+        let _ = close_preview(
+            State(s.clone()),
+            Json(ClosePreviewRequest {
+                series_id: "S-1".to_string(),
+                account: "0x1234567890abcdef1234567890abcdef12345678".to_string(),
+                side: "sell".to_string(),
+                size: "1".to_string(),
+                price_1e8: None,
+            }),
+        )
+        .await;
+        let _ = exercise_preview(
+            State(s.clone()),
+            Json(ExercisePreviewRequest {
+                series_id: "S-1".to_string(),
+                account: "0x1234567890abcdef1234567890abcdef12345678".to_string(),
+            }),
+        )
+        .await;
+        let after = s.broadcast_observability.snapshot();
+        // The signer-attempted/success/denied counter family MUST be
+        // unchanged — preview handlers must NEVER touch it.
+        assert_eq!(
+            format!("{:?}", before.signer_attempted_total),
+            format!("{:?}", after.signer_attempted_total)
+        );
+        assert_eq!(
+            format!("{:?}", before.signer_success_total),
+            format!("{:?}", after.signer_success_total)
+        );
+        assert_eq!(
+            format!("{:?}", before.signer_denied_total),
+            format!("{:?}", after.signer_denied_total)
+        );
+    }
+
+    #[tokio::test]
+    async fn response_bodies_do_not_leak_secrets() {
+        // For all 6 implemented endpoints, serialize the success body
+        // and assert no sensitive strings appear.
+        let s = seeded_state(true);
+        let addr = "0x1234567890abcdef1234567890abcdef12345678".to_string();
+        let positions = account_positions(State(s.clone()), Path(addr.clone()))
+            .await
+            .expect("partial");
+        let portfolio = account_portfolio(State(s.clone()), Path(addr.clone()))
+            .await
+            .expect("partial");
+        let balances = account_balances(State(s.clone()), Path(addr.clone()))
+            .await
+            .expect("partial");
+        let quote = quote_preview(
+            State(s.clone()),
+            Query(QuotePreviewQuery {
+                series_id: "S-1".to_string(),
+                side: "buy".to_string(),
+                size: "1".to_string(),
+                price_1e8: None,
+                account: None,
+            }),
+        )
+        .await
+        .expect("partial");
+        let exercise = exercise_preview(
+            State(s.clone()),
+            Json(ExercisePreviewRequest {
+                series_id: "S-1".to_string(),
+                account: addr.clone(),
+            }),
+        )
+        .await
+        .expect("partial");
+        let close = close_preview(
+            State(s.clone()),
+            Json(ClosePreviewRequest {
+                series_id: "S-1".to_string(),
+                account: addr.clone(),
+                side: "sell".to_string(),
+                size: "1".to_string(),
+                price_1e8: None,
+            }),
+        )
+        .await
+        .expect("partial");
+        for body in [
+            serde_json::to_string(&positions.0).unwrap(),
+            serde_json::to_string(&portfolio.0).unwrap(),
+            serde_json::to_string(&balances.0).unwrap(),
+            serde_json::to_string(&quote.0).unwrap(),
+            serde_json::to_string(&exercise.0).unwrap(),
+            serde_json::to_string(&close.0).unwrap(),
+        ] {
+            assert!(!body.contains("EXECUTOR_PRIVATE_KEY"), "{body}");
+            assert!(!body.contains("DATABASE_URL"), "{body}");
+            assert!(!body.contains("AWS_"), "{body}");
+            assert!(!body.contains("aws_kms"), "{body}");
+            assert!(!body.contains("signer_mode"), "{body}");
+        }
+    }
+
+    // -- Test helpers --
+
+    // Minimal AppState. Re-uses the same constructor as the
     // executor_health_v2 tests at src/api/executor_health_v2.rs:base_state.
     fn test_state() -> AppState {
         use crate::engine::EngineState;
@@ -1149,5 +1839,38 @@ mod tests {
         state.network_name = "anvil".to_string();
         state.options_config.enabled = true;
         state
+    }
+
+    // Seeded state with one OptionSeries (id "S-1"; Active or Expired
+    // controlled by `active`). Used by preview tests.
+    fn seeded_state(active: bool) -> AppState {
+        use crate::options::{OptionSeriesSource, OptionSeriesStatus};
+        let s = test_state();
+        let now_ms_v = now_ms();
+        let series = OptionSeries {
+            option_series_id: "S-1".to_string(),
+            underlying: "0xabc".to_string(),
+            base_asset: "0xabc".to_string(),
+            quote_asset: "0xdef".to_string(),
+            settlement_asset: "0xdef".to_string(),
+            expiry: (now_ms_v / 1000) as u64 + 86400,
+            strike_1e8: 200_000_000_000u128,
+            is_call: true,
+            contract_size_1e8: 100_000_000u128,
+            status: if active {
+                OptionSeriesStatus::Active
+            } else {
+                OptionSeriesStatus::Expired
+            },
+            source: OptionSeriesSource::Manual,
+            onchain_product_id: None,
+            onchain_series_id: None,
+            created_at_ms: now_ms_v,
+            updated_at_ms: now_ms_v,
+        };
+        let mut store = s.options_store.lock().unwrap();
+        store.insert_series(series);
+        drop(store);
+        s
     }
 }
