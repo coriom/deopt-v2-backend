@@ -102,6 +102,14 @@ pub struct BroadcastObservabilitySnapshot {
     /// Most recent computed effective taker fee ppm. Same semantics as
     /// [`Self::last_effective_maker_ppm`].
     pub last_effective_taker_ppm: Option<i64>,
+    /// Most recent BE-balance floor in wei used as the §6 broadcast-policy
+    /// fund-floor input. Computed inside `run_should_broadcast_policy`
+    /// as `EXECUTOR_MAX_FEE_PER_GAS_WEI × EXECUTOR_MAX_GAS_LIMIT` when
+    /// the chain mode is not permissive, otherwise `0` (Sepolia
+    /// rehearsal). Surfaced via `/executor/health/v2` so operators can
+    /// confirm the floor the policy gate is checking against. `None`
+    /// until the first broadcast attempt.
+    pub last_be_balance_floor_wei: Option<u128>,
 }
 
 #[derive(Default)]
@@ -136,6 +144,7 @@ struct BroadcastObservabilityInner {
     last_dedupe_reason: Option<String>,
     last_effective_maker_ppm: Option<i64>,
     last_effective_taker_ppm: Option<i64>,
+    last_be_balance_floor_wei: Option<u128>,
 }
 
 /// Thread-safe in-process observability counters. Shared across the
@@ -184,7 +193,21 @@ impl BroadcastObservability {
             last_dedupe_reason: inner.last_dedupe_reason.clone(),
             last_effective_maker_ppm: inner.last_effective_maker_ppm,
             last_effective_taker_ppm: inner.last_effective_taker_ppm,
+            last_be_balance_floor_wei: inner.last_be_balance_floor_wei,
         }
+    }
+
+    /// Persist the most recent BE-balance floor (wei) used as the §6
+    /// broadcast-policy fund-floor input. Recorder fires for every
+    /// `should_broadcast` invocation — orderbook + RFQ paths alike —
+    /// because the floor is computed inside `run_should_broadcast_policy`
+    /// from `state.execution_config` and used as
+    /// [`crate::options::broadcast_policy::BroadcastContext::fund_floor_wei`].
+    /// Caller MUST pass the exact value the policy gate consumes;
+    /// numeric only, never a free-form string.
+    pub fn record_be_balance_floor_wei(&self, value: u128) {
+        let mut inner = self.inner.lock().expect("broadcast observability poisoned");
+        inner.last_be_balance_floor_wei = Some(value);
     }
 
     /// Persist the most recent computed effective maker + taker fee ppm
@@ -652,6 +675,46 @@ mod tests {
         assert!(!value.contains('='));
         assert!(!value.contains('.'));
         assert!(value.len() <= 48);
+    }
+
+    #[test]
+    fn be_balance_floor_wei_singleton_stores_value() {
+        let obs = BroadcastObservability::new();
+        assert_eq!(obs.snapshot().last_be_balance_floor_wei, None);
+        obs.record_be_balance_floor_wei(1_000_000_000);
+        assert_eq!(
+            obs.snapshot().last_be_balance_floor_wei,
+            Some(1_000_000_000)
+        );
+    }
+
+    #[test]
+    fn be_balance_floor_wei_singleton_overwrites_with_most_recent() {
+        let obs = BroadcastObservability::new();
+        obs.record_be_balance_floor_wei(1_000);
+        obs.record_be_balance_floor_wei(u128::MAX);
+        obs.record_be_balance_floor_wei(0);
+        // 0 IS a legitimately-recorded Sepolia permissive value; the
+        // recorder accepts any u128 the policy gate passed in.
+        assert_eq!(obs.snapshot().last_be_balance_floor_wei, Some(0));
+    }
+
+    #[test]
+    fn be_balance_floor_wei_singleton_does_not_collide_with_be_balance_wei() {
+        // Defence-in-depth pin: the floor and the most-recent observed
+        // BE balance share a "wei" unit but MUST remain independent
+        // singletons (the floor is policy-config-derived; the
+        // most-recent balance is chain-state-derived).
+        let obs = BroadcastObservability::new();
+        obs.record_be_balance_floor_wei(500);
+        let inputs = BroadcastPolicyInputs {
+            be_balance_wei: Some(1_500),
+            ..Default::default()
+        };
+        obs.record_inputs_snapshot(&inputs);
+        let snap = obs.snapshot();
+        assert_eq!(snap.last_be_balance_floor_wei, Some(500));
+        assert_eq!(snap.last_be_balance_wei, Some(1_500));
     }
 
     #[test]

@@ -2,6 +2,12 @@
 
 **Posture:** SHIPPED at 2026-06-10.
 
+> **Addendum (2026-06-10, follow-on `BACKEND-OBSERVABILITY-BE-BALANCE-FLOOR-EXPOSE`):**
+> the recommended next-milestone in §14 below shipped. The 7th + last
+> `not_tracked_yet` entry (`be_balance_floor_wei`) closed; the
+> `/executor/health/v2` `not_tracked_yet` array is now **empty**. See
+> `docs/BACKEND_OBSERVABILITY_BE_BALANCE_FLOOR_EXPOSE_RESULT.md`.
+
 ## 1. Goal
 
 Persist the most-recent computed effective maker + taker fee ppm

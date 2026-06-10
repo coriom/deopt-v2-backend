@@ -1004,6 +1004,41 @@ impl OptionSeriesStore {
         transactions
     }
 
+    /// In-memory mirror of
+    /// [`PgRepository::list_recent_option_execution_transactions`].
+    /// Each tuple is `(tx, source_type)` — `source_type` is sourced
+    /// from the parent intent (if present) so the unified
+    /// `/executor/transactions` list endpoint reports the same
+    /// discriminator string DB consumers would see (`"option_orderbook_fill"`
+    /// or `"option_rfq_fill"`). Orphaned rows (no intent) carry
+    /// `source_type = None`.
+    pub fn list_recent_option_execution_transactions(
+        &self,
+        limit: u32,
+    ) -> Vec<(OptionExecutionTransaction, Option<String>)> {
+        let mut transactions: Vec<OptionExecutionTransaction> = self
+            .option_execution_transactions
+            .values()
+            .cloned()
+            .collect();
+        transactions.sort_by(|left, right| {
+            right
+                .created_at_ms
+                .cmp(&left.created_at_ms)
+                .then_with(|| right.transaction_id.cmp(&left.transaction_id))
+        });
+        transactions
+            .into_iter()
+            .take(limit as usize)
+            .map(|tx| {
+                let source_type = self
+                    .get_option_execution_intent(tx.intent_id)
+                    .map(|intent| intent.source_type.as_str().to_string());
+                (tx, source_type)
+            })
+            .collect()
+    }
+
     pub fn cancel_option_rfq(&mut self, option_rfq_id: OptionRfqId) -> Result<OptionRfqRequest> {
         let rfq = self
             .option_rfqs

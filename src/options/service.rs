@@ -1225,6 +1225,13 @@ fn run_should_broadcast_policy(
             .map(|gp| gp.saturating_mul(state.execution_config.max_gas_limit as u128))
             .unwrap_or(u128::MAX)
     };
+    // Surface the exact fund-floor value that §6 will check against
+    // `be_balance_wei` so `/executor/health/v2` can report what the
+    // policy gate is using. Fires once per `should_broadcast` call —
+    // shared between orderbook + RFQ source types.
+    state
+        .broadcast_observability
+        .record_be_balance_floor_wei(fund_floor_wei);
     let ome_paused = inputs.ome_paused.unwrap_or(!permissive_chain_state);
     let ome_is_executor = inputs.ome_is_executor.unwrap_or(permissive_chain_state);
     // Live FeesManagerV2.rebateBudget(asset) read. Mainnet missing-read
@@ -4843,6 +4850,61 @@ mod tests {
         let snap = state.broadcast_observability.snapshot();
         assert_eq!(snap.last_effective_maker_ppm, Some(15));
         assert_eq!(snap.last_effective_taker_ppm, Some(60));
+        assert_eq!(snap.policy_approved_total.get("rfq"), Some(&1));
+    }
+
+    /// `run_should_broadcast_policy` records the BE-balance-floor (the
+    /// same `fund_floor_wei` it passes into the policy context) into the
+    /// observability snapshot for every broadcast attempt, regardless
+    /// of source type. Pins the orderbook path.
+    #[tokio::test]
+    async fn observability_be_balance_floor_wei_recorded_on_orderbook_path() {
+        let state = state_with_broadcast(true);
+        let intent = insert_intent(&state, broadcast_ready_intent());
+        let provider = MockBroadcastProvider::success();
+        let signer = MockBackendSigner::approving();
+        let data_provider = StubBroadcastPolicyDataProvider::sepolia_permissive();
+
+        let _ = broadcast_option_execution_intent_with_provider_signer_and_data_provider(
+            &state,
+            intent.intent_id,
+            &provider,
+            &signer,
+            &data_provider,
+        )
+        .await
+        .expect("approve path");
+        let snap = state.broadcast_observability.snapshot();
+        // state_with_broadcast(true) sets chain_id to Sepolia → permissive
+        // chain state → fund_floor_wei = 0. The 0 is a legitimate
+        // policy reading; the singleton MUST report it verbatim.
+        assert_eq!(snap.last_be_balance_floor_wei, Some(0));
+    }
+
+    /// Same as above but with the RFQ source — pins the cross-source
+    /// contract that `run_should_broadcast_policy` records the floor
+    /// independent of `source_type`.
+    #[tokio::test]
+    async fn observability_be_balance_floor_wei_recorded_on_rfq_path() {
+        let state = state_with_broadcast(true);
+        let mut intent_template = broadcast_ready_intent();
+        intent_template.source_type = OptionExecutionSourceType::OptionRfqFill;
+        let intent = insert_intent(&state, intent_template);
+        let provider = MockBroadcastProvider::success();
+        let signer = MockBackendSigner::approving();
+        let data_provider = StubBroadcastPolicyDataProvider::sepolia_permissive();
+
+        let _ = broadcast_option_execution_intent_with_provider_signer_and_data_provider(
+            &state,
+            intent.intent_id,
+            &provider,
+            &signer,
+            &data_provider,
+        )
+        .await
+        .expect("RFQ-source approve path");
+        let snap = state.broadcast_observability.snapshot();
+        assert_eq!(snap.last_be_balance_floor_wei, Some(0));
         assert_eq!(snap.policy_approved_total.get("rfq"), Some(&1));
     }
 

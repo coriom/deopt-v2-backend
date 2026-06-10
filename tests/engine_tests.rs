@@ -1121,6 +1121,8 @@ fn simulation_config_without_persistence_requirement() -> ExecutionConfig {
         backend_signer_mode: deopt_v2_backend::execution::SignerBackendKind::LocalDev,
         backend_signer_endpoint: None,
         executor_allow_local_signer: false,
+        backend_signer_provider: None,
+        backend_signer_timeout_ms: 2500,
     }
 }
 

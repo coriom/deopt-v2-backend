@@ -96,7 +96,7 @@ use crate::rfq::{
     RfqQuoteStatus, RfqRequest, RfqStatus, RFQ_QUOTE_TYPE,
 };
 use crate::types::TimeInForce;
-use crate::types::{now_ms, AccountId, MarketId, OrderId, Side};
+use crate::types::{now_ms, AccountId, MarketId, OrderId, Side, TimestampMs};
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -425,6 +425,53 @@ pub fn router(state: AppState) -> Router {
             get(admin_fees_vault_reconciliation),
         )
         .route("/admin/recent", get(admin_recent))
+        // ---------------------------------------------------------------
+        // M-P2a — frontend-facing trading API. Public; no auth.
+        // See `docs/BACKEND_TRADING_API_CONSOLIDATION_RESULT.md` +
+        // `docs/openapi/trading-api.openapi.json`.
+        // ---------------------------------------------------------------
+        .route("/options/products", get(crate::api::trading::list_products))
+        .route(
+            "/options/products/batch",
+            get(crate::api::trading::batch_products),
+        )
+        .route(
+            "/options/products/:product_id",
+            get(crate::api::trading::get_product),
+        )
+        .route(
+            "/options/series/:series_id/details",
+            get(crate::api::trading::series_details),
+        )
+        .route(
+            "/options/quotes/preview",
+            get(crate::api::trading::quote_preview),
+        )
+        .route(
+            "/options/exercise/preview",
+            post(crate::api::trading::exercise_preview),
+        )
+        .route(
+            "/options/close/preview",
+            post(crate::api::trading::close_preview),
+        )
+        .route(
+            "/accounts/:address/positions",
+            get(crate::api::trading::account_positions),
+        )
+        .route(
+            "/accounts/:address/portfolio",
+            get(crate::api::trading::account_portfolio),
+        )
+        .route(
+            "/accounts/:address/balances",
+            get(crate::api::trading::account_balances),
+        )
+        .route(
+            "/accounts/:address/history",
+            get(crate::api::trading::account_history),
+        )
+        .route("/trading/health", get(crate::api::trading::trading_health))
         .layer(axum::middleware::from_fn_with_state(
             gate_state,
             admin_route_gate,
@@ -3885,30 +3932,280 @@ struct ExecutorTransactionsQuery {
     limit: Option<u32>,
 }
 
+/// Return the most-recent execution transactions across BOTH the
+/// legacy PERP `execution_transactions` table AND the
+/// `option_execution_transactions` table, projected onto the unified
+/// [`ExecutorTransactionView`] shape with a `source` discriminator.
+///
+/// Bugfix history (`BACKEND-EXECUTOR-TRANSACTIONS-LIST-EXTEND`,
+/// 2026-06-10): the legacy handler queried only
+/// `execution_transactions` so OPTION rows were absent from the
+/// operator's recent-tx list. The fixed handler queries both tables,
+/// merges, sorts latest-first (`created_at_ms DESC` with
+/// `transaction_id DESC` tiebreak), and truncates to the requested
+/// `limit`. The `limit` semantics are preserved: the cap applies to
+/// the FINAL merged list, not to each side independently, so a
+/// `limit=50` request returns up to 50 rows regardless of which table
+/// they came from.
+///
+/// Read-only. Never performs an RPC probe; never broadcasts; never
+/// emits a secret.
 async fn executor_transactions(
     State(state): State<AppState>,
     Query(query): Query<ExecutorTransactionsQuery>,
-) -> Result<Json<Vec<ExecutionTransaction>>, ApiError> {
-    let Some(repository) = state.repository.clone() else {
-        return Ok(Json(Vec::new()));
-    };
+) -> Result<Json<Vec<ExecutorTransactionView>>, ApiError> {
     let limit = query.limit.unwrap_or(50).clamp(1, 500);
-    Ok(Json(
-        repository.list_recent_execution_transactions(limit).await?,
-    ))
+
+    let (perp_rows, option_rows) = if let Some(repository) = state.repository.clone() {
+        let perp = repository.list_recent_execution_transactions(limit).await?;
+        // Over-fetch is intentional: we trim the merged list to `limit`
+        // after sorting, so each side must be allowed to contribute up
+        // to `limit` rows when the other side has fewer.
+        let option = repository
+            .list_recent_option_execution_transactions(limit)
+            .await
+            .unwrap_or_default();
+        (perp, option)
+    } else {
+        let store = state
+            .options_store
+            .lock()
+            .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?;
+        let option = store.list_recent_option_execution_transactions(limit);
+        // The legacy `execution_transactions` table has no in-memory
+        // fallback; empty is the correct value in test / dry-run
+        // contexts (mirrors the by-intent variant).
+        (Vec::new(), option)
+    };
+
+    let chain_id = if perp_rows.is_empty() && option_rows.is_empty() {
+        None
+    } else {
+        Some(state.execution_config.executor_chain_id)
+    };
+
+    let mut combined: Vec<ExecutorTransactionView> = perp_rows
+        .into_iter()
+        .map(|tx| ExecutorTransactionView::from_perp(tx, chain_id))
+        .chain(option_rows.into_iter().map(|(tx, source_type)| {
+            ExecutorTransactionView::from_option(tx, source_type, chain_id)
+        }))
+        .collect();
+    combined.sort_by(|a, b| {
+        b.created_at_ms
+            .cmp(&a.created_at_ms)
+            .then_with(|| b.transaction_id.cmp(&a.transaction_id))
+    });
+    combined.truncate(limit as usize);
+    Ok(Json(combined))
 }
 
+/// Unified view of an execution-transaction row for the operator
+/// `/executor/transactions/:intent_id` endpoint. Backs both the legacy
+/// `execution_transactions` table (PERP intents) and the
+/// `option_execution_transactions` table (OPTION intents — orderbook +
+/// RFQ source paths). Field names preserve the legacy
+/// `ExecutionTransaction` shape so existing PERP consumers see the
+/// same JSON keys; option-specific fields (`source`, `source_type`,
+/// receipt + gas details) are additive `Option<T>` slots that are
+/// `None` for legacy rows.
+///
+/// Status / confirmation_status are emitted as snake_case strings
+/// rather than enum variants so downstream consumers can render either
+/// table's vocabulary uniformly. Two stable vocabularies live behind
+/// the same key:
+///   * PERP rows (`source == "perp"`) — values from
+///     `confirmation::ConfirmationStatus`.
+///   * OPTION rows (`source == "option"`) — values from
+///     `options::types::OptionExecutionConfirmationStatus`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct ExecutorTransactionView {
+    transaction_id: String,
+    intent_id: Uuid,
+    onchain_intent_id: Option<String>,
+    chain_id: Option<u64>,
+    /// Discriminator for which table backed this row.
+    /// `"perp"` ⇒ legacy `execution_transactions`.
+    /// `"option"` ⇒ `option_execution_transactions`.
+    source: &'static str,
+    /// Option-only — `"orderbook"` | `"rfq"` when the backing intent is
+    /// an option execution intent. Always `None` for PERP rows.
+    source_type: Option<String>,
+    from: Option<String>,
+    target: String,
+    calldata: String,
+    value_wei: String,
+    gas_limit: Option<u64>,
+    tx_hash: Option<String>,
+    status: String,
+    error: Option<String>,
+    confirmation_status: Option<String>,
+    confirmed_at_ms: Option<TimestampMs>,
+    confirmed_block_number: Option<u64>,
+    receipt_status: Option<u64>,
+    receipt_block_hash: Option<String>,
+    receipt_block_number: Option<u64>,
+    receipt_observed_at_ms: Option<TimestampMs>,
+    gas_used: Option<u64>,
+    effective_gas_price: Option<String>,
+    cumulative_gas_used: Option<u64>,
+    confirmation_error: Option<String>,
+    created_at_ms: TimestampMs,
+    updated_at_ms: TimestampMs,
+}
+
+impl ExecutorTransactionView {
+    fn from_perp(tx: ExecutionTransaction, chain_id: Option<u64>) -> Self {
+        Self {
+            transaction_id: tx.transaction_id,
+            intent_id: tx.intent_id,
+            onchain_intent_id: tx.onchain_intent_id,
+            chain_id,
+            source: "perp",
+            source_type: None,
+            from: None,
+            target: tx.target.0,
+            calldata: tx.calldata,
+            value_wei: tx.value_wei,
+            gas_limit: None,
+            tx_hash: tx.tx_hash,
+            status: tx.status.as_str().to_string(),
+            error: tx.error,
+            confirmation_status: tx.confirmation_status.map(|s| s.as_str().to_string()),
+            confirmed_at_ms: tx.confirmed_at_ms,
+            confirmed_block_number: tx.confirmed_block_number,
+            receipt_status: None,
+            receipt_block_hash: None,
+            receipt_block_number: tx.confirmed_block_number,
+            receipt_observed_at_ms: None,
+            gas_used: None,
+            effective_gas_price: None,
+            cumulative_gas_used: None,
+            confirmation_error: tx.confirmation_error,
+            created_at_ms: tx.created_at_ms,
+            updated_at_ms: tx.updated_at_ms,
+        }
+    }
+
+    fn from_option(
+        tx: crate::options::OptionExecutionTransaction,
+        source_type: Option<String>,
+        chain_id: Option<u64>,
+    ) -> Self {
+        let confirmation_status = tx
+            .confirmation_status
+            .map(|status| status.as_str().to_string());
+        Self {
+            transaction_id: tx.transaction_id,
+            intent_id: tx.intent_id,
+            onchain_intent_id: tx.onchain_intent_id,
+            chain_id,
+            source: "option",
+            source_type,
+            from: Some(tx.from.0),
+            target: tx.to.0,
+            calldata: tx.calldata,
+            value_wei: tx.value_wei,
+            gas_limit: tx.gas_limit,
+            tx_hash: tx.tx_hash,
+            status: tx.status.as_str().to_string(),
+            error: tx.error,
+            confirmation_status,
+            confirmed_at_ms: tx.confirmed_at_ms,
+            confirmed_block_number: tx.confirmed_block_number,
+            receipt_status: tx.receipt_status,
+            receipt_block_hash: tx.receipt_block_hash,
+            receipt_block_number: tx.confirmed_block_number,
+            receipt_observed_at_ms: tx.receipt_observed_at_ms,
+            gas_used: tx.gas_used,
+            effective_gas_price: tx.effective_gas_price,
+            cumulative_gas_used: tx.cumulative_gas_used,
+            confirmation_error: tx.confirmation_error,
+            created_at_ms: tx.created_at_ms,
+            updated_at_ms: tx.updated_at_ms,
+        }
+    }
+}
+
+/// Return every persisted execution transaction associated with the
+/// given intent_id, unified across the PERP `execution_transactions`
+/// and OPTION `option_execution_transactions` tables.
+///
+/// Bugfix history (`OPTION-EXECUTION-TX-VISIBILITY-FIX`, 2026-06-10):
+/// the legacy handler queried only `execution_transactions` and
+/// therefore returned `[]` for OPTION intents (orderbook + RFQ),
+/// even after they reached `broadcast_confirmed`. The handler now
+/// joins both tables and reports the source-of-truth provenance via
+/// the `source` discriminator on each row. Ordering: latest first
+/// (created_at_ms DESC; transaction_id DESC tiebreak — same as the
+/// per-table SQL).
+///
+/// Read-only. Never performs an RPC probe; never broadcasts; never
+/// emits a secret. Empty array iff neither table has a row for the
+/// given intent_id.
 async fn executor_transactions_for_intent(
     State(state): State<AppState>,
     Path(intent_id): Path<String>,
-) -> Result<Json<Vec<ExecutionTransaction>>, ApiError> {
-    let Some(repository) = state.repository.clone() else {
-        return Ok(Json(Vec::new()));
+) -> Result<Json<Vec<ExecutorTransactionView>>, ApiError> {
+    let intent_uuid = parse_uuid(&intent_id)?;
+
+    // Load perp + option rows. With a configured Postgres repository,
+    // both tables are queried directly. Without (test / dry-run
+    // contexts), we fall back to the in-memory option store so the
+    // bugfix is observable end-to-end without a live DB. The legacy
+    // PERP `execution_transactions` table has no in-memory fallback;
+    // empty is the correct answer in that mode.
+    let (perp_rows, option_rows, option_source_type) =
+        if let Some(repository) = state.repository.clone() {
+            let perp = repository.get_transactions_for_intent(intent_uuid).await?;
+            let option = repository
+                .get_option_execution_transactions_for_intent(intent_uuid)
+                .await
+                .unwrap_or_default();
+            let source_type = if option.is_empty() {
+                None
+            } else {
+                match repository.get_option_execution_intent(intent_uuid).await {
+                    Ok(Some(intent)) => Some(intent.source_type.as_str().to_string()),
+                    _ => None,
+                }
+            };
+            (perp, option, source_type)
+        } else {
+            let store = state
+                .options_store
+                .lock()
+                .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?;
+            let option = store.option_execution_transactions_for_intent(intent_uuid);
+            let source_type = if option.is_empty() {
+                None
+            } else {
+                store
+                    .get_option_execution_intent(intent_uuid)
+                    .map(|intent| intent.source_type.as_str().to_string())
+            };
+            (Vec::new(), option, source_type)
+        };
+
+    let chain_id = if perp_rows.is_empty() && option_rows.is_empty() {
+        None
+    } else {
+        Some(state.execution_config.executor_chain_id)
     };
-    let intent_id = parse_uuid(&intent_id)?;
-    Ok(Json(
-        repository.get_transactions_for_intent(intent_id).await?,
-    ))
+
+    let mut combined: Vec<ExecutorTransactionView> = perp_rows
+        .into_iter()
+        .map(|tx| ExecutorTransactionView::from_perp(tx, chain_id))
+        .chain(option_rows.into_iter().map(|tx| {
+            ExecutorTransactionView::from_option(tx, option_source_type.clone(), chain_id)
+        }))
+        .collect();
+    combined.sort_by(|a, b| {
+        b.created_at_ms
+            .cmp(&a.created_at_ms)
+            .then_with(|| b.transaction_id.cmp(&a.transaction_id))
+    });
+    Ok(Json(combined))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -5006,26 +5303,34 @@ mod tests {
             .iter()
             .map(|v| v.as_str().unwrap_or("").to_string())
             .collect::<Vec<_>>();
-        for shipped in [
-            "signer.last_signer_error_code",
-            "policy_gate.last_reject_source_type",
-            "policy_gate.econ_data_available_last",
-            "policy_gate.last_policy_data_failure_type",
-            "economics_last_seen.effective_maker_ppm",
-            "economics_last_seen.effective_taker_ppm",
-        ] {
-            assert!(
-                !not_tracked.iter().any(|f| f == shipped),
-                "{shipped} should no longer be in not_tracked_yet"
-            );
-        }
-        assert!(not_tracked
-            .iter()
-            .any(|f| f == "execution_flags.be_balance_floor_wei"));
+        // BACKEND-OBSERVABILITY-BE-BALANCE-FLOOR-EXPOSE closed the
+        // last gap; every documented field is now populated. The array
+        // must be empty.
+        assert!(
+            not_tracked.is_empty(),
+            "not_tracked_yet should be empty; got {not_tracked:?}"
+        );
+    }
+
+    /// `/executor/health/v2` exposes `chain_state_last_seen.be_balance_floor_wei`
+    /// end-to-end via the HTTP envelope after
+    /// BACKEND-OBSERVABILITY-BE-BALANCE-FLOOR-EXPOSE shipped. u128
+    /// values within the JSON-safe range serialise verbatim.
+    #[tokio::test]
+    async fn executor_health_v2_surfaces_be_balance_floor_wei() {
+        let state = AppState::new(EngineState::with_default_markets());
+        state
+            .broadcast_observability
+            .record_be_balance_floor_wei(2_000_000_000_000_000);
+        let response = router(state)
+            .oneshot(get_request("/executor/health/v2", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
         assert_eq!(
-            not_tracked.len(),
-            1,
-            "exactly one entry should remain after BACKEND-LIVE-PROVIDER-EFFECTIVE-PPM-CACHE"
+            json["chain_state_last_seen"]["be_balance_floor_wei"],
+            2_000_000_000_000_000_u64
         );
     }
 
@@ -7276,6 +7581,480 @@ mod tests {
         assert_eq!(json["events"]["total"], 0);
         assert_eq!(json["health"]["stage"], "simulation_ok");
         assert_eq!(json["health"]["is_terminal_success"], false);
+    }
+
+    /// `OPTION-EXECUTION-TX-VISIBILITY-FIX` — root cause regression
+    /// test. Before this milestone, `/executor/transactions/:intent_id`
+    /// returned `[]` for OPTION intents (orderbook + RFQ) even after
+    /// they reached `broadcast_confirmed`, because the handler only
+    /// queried the legacy `execution_transactions` table. The fixed
+    /// handler also queries `option_execution_transactions` (or the
+    /// in-memory store fallback) and reports the row via the unified
+    /// `ExecutorTransactionView` shape.
+    fn route_orderbook_option_intent() -> OptionExecutionIntent {
+        OptionExecutionIntent {
+            intent_id: Uuid::from_u128(0xb1),
+            source_type: crate::options::OptionExecutionSourceType::OptionOrderbookFill,
+            ..route_calldata_ready_intent()
+        }
+    }
+
+    fn route_rfq_option_intent() -> OptionExecutionIntent {
+        OptionExecutionIntent {
+            intent_id: Uuid::from_u128(0xb2),
+            source_type: crate::options::OptionExecutionSourceType::OptionRfqFill,
+            source_id: "rfq-fill-1".to_string(),
+            ..route_calldata_ready_intent()
+        }
+    }
+
+    fn route_option_execution_tx(
+        intent_id: Uuid,
+        tx_hash: &str,
+        confirmation: Option<crate::options::OptionExecutionConfirmationStatus>,
+    ) -> crate::options::OptionExecutionTransaction {
+        crate::options::OptionExecutionTransaction {
+            transaction_id: format!("opt-tx-{}", &tx_hash[..10]),
+            intent_id,
+            onchain_intent_id: Some(
+                "0x1111111111111111111111111111111111111111111111111111111111111111".to_string(),
+            ),
+            from: AccountId::new("0x00000000000000000000000000000000000000be"),
+            to: AccountId::new("0x00000000000000000000000000000000000000ee"),
+            calldata: "0x031f77b3deadbeef".to_string(),
+            value_wei: "0".to_string(),
+            gas_limit: Some(200_000),
+            tx_hash: Some(tx_hash.to_string()),
+            status: crate::execution::ExecutionTransactionStatus::Submitted,
+            error: None,
+            estimated_gas: Some(180_000),
+            required_gas: Some(180_000),
+            simulation_gas_limit: Some(200_000),
+            broadcast_gas_limit: Some(200_000),
+            gas_safety_bps: Some(1_000),
+            gas_check_status: None,
+            gas_check_error: None,
+            confirmation_status: confirmation,
+            confirmed_at_ms: confirmation.map(|_| 10_000),
+            confirmed_block_number: confirmation.map(|_| 42),
+            receipt_status: confirmation.map(|_| 1),
+            confirmation_error: None,
+            gas_used: confirmation.map(|_| 175_321),
+            effective_gas_price: confirmation.map(|_| "1000000000".to_string()),
+            cumulative_gas_used: confirmation.map(|_| 175_321),
+            receipt_block_hash: confirmation.map(|_| {
+                "0x2222222222222222222222222222222222222222222222222222222222222222".to_string()
+            }),
+            receipt_transaction_index: confirmation.map(|_| 0),
+            receipt_observed_at_ms: confirmation.map(|_| 11_000),
+            created_at_ms: 5_000,
+            updated_at_ms: 12_000,
+        }
+    }
+
+    fn insert_route_option_tx(state: &AppState, tx: crate::options::OptionExecutionTransaction) {
+        state
+            .options_store
+            .lock()
+            .unwrap()
+            .insert_option_execution_transaction(tx)
+            .expect("test fixture insert");
+    }
+
+    #[tokio::test]
+    async fn executor_transactions_for_intent_returns_orderbook_option_tx() {
+        let state = admin_state(false);
+        let intent = route_orderbook_option_intent();
+        let intent_id = intent.intent_id;
+        insert_route_option_intent(&state, intent);
+        let tx_hash = "0x8538066ce0a10ede63f9e4c66161be8efdcd0edf6a63d176af0967b4bde95326";
+        insert_route_option_tx(
+            &state,
+            route_option_execution_tx(
+                intent_id,
+                tx_hash,
+                Some(crate::options::OptionExecutionConfirmationStatus::MinedSuccess),
+            ),
+        );
+
+        let response = router(state)
+            .oneshot(get_request(
+                &format!("/executor/transactions/{intent_id}"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        let rows = json.as_array().expect("array");
+        assert_eq!(rows.len(), 1, "must surface the option tx, not []");
+        assert_eq!(rows[0]["source"], "option");
+        assert_eq!(rows[0]["source_type"], "option_orderbook_fill");
+        assert_eq!(rows[0]["intent_id"], intent_id.to_string());
+        assert_eq!(rows[0]["tx_hash"], tx_hash);
+        assert_eq!(rows[0]["status"], "submitted");
+        assert_eq!(rows[0]["confirmation_status"], "mined_success");
+        assert_eq!(rows[0]["confirmed_block_number"], 42);
+        assert_eq!(rows[0]["receipt_status"], 1);
+        assert_eq!(rows[0]["gas_used"], 175_321);
+        assert_eq!(
+            rows[0]["from"],
+            "0x00000000000000000000000000000000000000be"
+        );
+    }
+
+    /// `OPTION-EXECUTION-TX-VISIBILITY-FIX` — RFQ source regression
+    /// test, mirroring the exact scenario observed during the live
+    /// Sepolia RFQ smoke (intent
+    /// `95516dbd-a68c-41eb-869f-e6790d9091f2`, tx
+    /// `0x8538066c…5326`). The endpoint MUST surface the confirmed
+    /// transaction for RFQ-source intents identically to orderbook
+    /// intents.
+    #[tokio::test]
+    async fn executor_transactions_for_intent_returns_rfq_option_tx_rfq_smoke_regression() {
+        let state = admin_state(false);
+        let intent = route_rfq_option_intent();
+        let intent_id = intent.intent_id;
+        insert_route_option_intent(&state, intent);
+        // Same tx_hash as the live RFQ smoke that surfaced the bug.
+        let tx_hash = "0x8538066ce0a10ede63f9e4c66161be8efdcd0edf6a63d176af0967b4bde95326";
+        insert_route_option_tx(
+            &state,
+            route_option_execution_tx(
+                intent_id,
+                tx_hash,
+                Some(crate::options::OptionExecutionConfirmationStatus::MinedSuccess),
+            ),
+        );
+
+        let response = router(state)
+            .oneshot(get_request(
+                &format!("/executor/transactions/{intent_id}"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        let rows = json.as_array().expect("array");
+        assert_eq!(rows.len(), 1, "RFQ confirmed intent must NOT return []");
+        assert_eq!(rows[0]["source"], "option");
+        assert_eq!(rows[0]["source_type"], "option_rfq_fill");
+        assert_eq!(rows[0]["tx_hash"], tx_hash);
+        assert_eq!(rows[0]["confirmation_status"], "mined_success");
+    }
+
+    /// Intent without any transaction row should return `[]` — and only
+    /// then. Pins that the fix has not introduced false positives.
+    #[tokio::test]
+    async fn executor_transactions_for_intent_returns_empty_when_no_tx_exists() {
+        let state = admin_state(false);
+        let intent = route_orderbook_option_intent();
+        let intent_id = intent.intent_id;
+        insert_route_option_intent(&state, intent);
+        // No transaction row inserted.
+
+        let response = router(state)
+            .oneshot(get_request(
+                &format!("/executor/transactions/{intent_id}"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert!(json.as_array().unwrap().is_empty());
+    }
+
+    /// Multiple attempts for the same intent (e.g., a failed broadcast
+    /// followed by a successful re-submission) should each appear,
+    /// ordered latest-first.
+    #[tokio::test]
+    async fn executor_transactions_for_intent_returns_attempts_latest_first() {
+        let state = admin_state(false);
+        let intent = route_orderbook_option_intent();
+        let intent_id = intent.intent_id;
+        insert_route_option_intent(&state, intent);
+
+        let mut first = route_option_execution_tx(
+            intent_id,
+            "0xaaaa066ce0a10ede63f9e4c66161be8efdcd0edf6a63d176af0967b4bde95326",
+            None,
+        );
+        first.transaction_id = "opt-tx-attempt-1".to_string();
+        first.status = crate::execution::ExecutionTransactionStatus::Failed;
+        first.error = Some("rpc failed".to_string());
+        first.created_at_ms = 1_000;
+        first.updated_at_ms = 1_500;
+
+        let mut second = route_option_execution_tx(
+            intent_id,
+            "0xbbbb066ce0a10ede63f9e4c66161be8efdcd0edf6a63d176af0967b4bde95326",
+            Some(crate::options::OptionExecutionConfirmationStatus::MinedSuccess),
+        );
+        second.transaction_id = "opt-tx-attempt-2".to_string();
+        second.created_at_ms = 5_000;
+
+        insert_route_option_tx(&state, first);
+        insert_route_option_tx(&state, second);
+
+        let response = router(state)
+            .oneshot(get_request(
+                &format!("/executor/transactions/{intent_id}"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        let rows = json.as_array().expect("array");
+        assert_eq!(rows.len(), 2);
+        // Latest first by created_at_ms.
+        assert_eq!(rows[0]["transaction_id"], "opt-tx-attempt-2");
+        assert_eq!(rows[0]["confirmation_status"], "mined_success");
+        assert_eq!(rows[1]["transaction_id"], "opt-tx-attempt-1");
+        assert_eq!(rows[1]["status"], "failed");
+        assert_eq!(rows[1]["error"], "rpc failed");
+    }
+
+    /// `BACKEND-EXECUTOR-TRANSACTIONS-LIST-EXTEND` — list endpoint
+    /// surfaces an OPTION orderbook tx alongside the unified
+    /// `source: "option"` discriminator + `source_type:
+    /// "option_orderbook_fill"`. Pins the regression that OPTION rows
+    /// no longer disappear from the recent-tx list.
+    #[tokio::test]
+    async fn executor_transactions_list_includes_option_orderbook_tx() {
+        let state = admin_state(false);
+        let intent = route_orderbook_option_intent();
+        let intent_id = intent.intent_id;
+        insert_route_option_intent(&state, intent);
+        let tx_hash = "0xaaaa066ce0a10ede63f9e4c66161be8efdcd0edf6a63d176af0967b4bde95326";
+        insert_route_option_tx(
+            &state,
+            route_option_execution_tx(
+                intent_id,
+                tx_hash,
+                Some(crate::options::OptionExecutionConfirmationStatus::MinedSuccess),
+            ),
+        );
+
+        let response = router(state)
+            .oneshot(get_request("/executor/transactions", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        let rows = json.as_array().expect("array");
+        assert_eq!(rows.len(), 1, "option row must appear in the list");
+        assert_eq!(rows[0]["source"], "option");
+        assert_eq!(rows[0]["source_type"], "option_orderbook_fill");
+        assert_eq!(rows[0]["tx_hash"], tx_hash);
+        assert_eq!(rows[0]["confirmation_status"], "mined_success");
+    }
+
+    /// List endpoint surfaces an OPTION RFQ tx — same regression as the
+    /// by-intent variant but on the list surface. Uses the live-smoke
+    /// tx hash to pin against the production scenario.
+    #[tokio::test]
+    async fn executor_transactions_list_includes_option_rfq_tx_smoke_regression() {
+        let state = admin_state(false);
+        let intent = route_rfq_option_intent();
+        let intent_id = intent.intent_id;
+        insert_route_option_intent(&state, intent);
+        let tx_hash = "0x8538066ce0a10ede63f9e4c66161be8efdcd0edf6a63d176af0967b4bde95326";
+        insert_route_option_tx(
+            &state,
+            route_option_execution_tx(
+                intent_id,
+                tx_hash,
+                Some(crate::options::OptionExecutionConfirmationStatus::MinedSuccess),
+            ),
+        );
+
+        let response = router(state)
+            .oneshot(get_request("/executor/transactions", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        let rows = json.as_array().expect("array");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["source"], "option");
+        assert_eq!(rows[0]["source_type"], "option_rfq_fill");
+        assert_eq!(rows[0]["tx_hash"], tx_hash);
+    }
+
+    /// Multiple OPTION rows in the list are ordered latest-first by
+    /// `created_at_ms`, with `transaction_id DESC` tiebreak — the same
+    /// ordering the by-intent variant uses.
+    #[tokio::test]
+    async fn executor_transactions_list_orders_latest_first() {
+        let state = admin_state(false);
+        let intent = route_orderbook_option_intent();
+        let intent_id = intent.intent_id;
+        insert_route_option_intent(&state, intent);
+
+        let mut earlier = route_option_execution_tx(
+            intent_id,
+            "0xbbbb066ce0a10ede63f9e4c66161be8efdcd0edf6a63d176af0967b4bde95326",
+            None,
+        );
+        earlier.transaction_id = "opt-tx-earlier".to_string();
+        earlier.status = crate::execution::ExecutionTransactionStatus::Failed;
+        earlier.created_at_ms = 1_000;
+
+        let mut later = route_option_execution_tx(
+            intent_id,
+            "0xcccc066ce0a10ede63f9e4c66161be8efdcd0edf6a63d176af0967b4bde95326",
+            Some(crate::options::OptionExecutionConfirmationStatus::MinedSuccess),
+        );
+        later.transaction_id = "opt-tx-later".to_string();
+        later.created_at_ms = 5_000;
+
+        insert_route_option_tx(&state, earlier);
+        insert_route_option_tx(&state, later);
+
+        let response = router(state)
+            .oneshot(get_request("/executor/transactions", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        let rows = json.as_array().expect("array");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["transaction_id"], "opt-tx-later");
+        assert_eq!(rows[1]["transaction_id"], "opt-tx-earlier");
+    }
+
+    /// `limit` query parameter caps the final merged list. We model
+    /// three separate option intents — one tx each, distinct
+    /// `created_at_ms` values — and assert that `?limit=1` returns the
+    /// latest only.
+    #[tokio::test]
+    async fn executor_transactions_list_respects_limit_query_param() {
+        let state = admin_state(false);
+        for i in 0..3 {
+            let mut intent = route_orderbook_option_intent();
+            intent.intent_id = Uuid::from_u128(0xb1 + i as u128);
+            let intent_id = intent.intent_id;
+            insert_route_option_intent(&state, intent);
+
+            let mut tx = route_option_execution_tx(
+                intent_id,
+                &format!("0x{:064x}", i + 1),
+                Some(crate::options::OptionExecutionConfirmationStatus::MinedSuccess),
+            );
+            tx.transaction_id = format!("opt-tx-{i}");
+            tx.created_at_ms = 1_000 + (i as i64) * 1_000;
+            insert_route_option_tx(&state, tx);
+        }
+
+        let response = router(state)
+            .oneshot(get_request("/executor/transactions?limit=1", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        let rows = json.as_array().expect("array");
+        assert_eq!(rows.len(), 1, "limit=1 must cap the merged list to 1");
+        assert_eq!(rows[0]["transaction_id"], "opt-tx-2");
+    }
+
+    /// Empty list is the correct answer when no rows exist in either
+    /// table. Pins the no-false-positive contract on the list surface.
+    #[tokio::test]
+    async fn executor_transactions_list_returns_empty_when_no_rows_exist() {
+        let state = admin_state(false);
+        let response = router(state)
+            .oneshot(get_request("/executor/transactions", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert!(json.as_array().unwrap().is_empty());
+    }
+
+    /// List endpoint must never expose private keys, RPC URLs with
+    /// tokens, admin tokens, or signer endpoint URLs even when those
+    /// values sit in the AppState. Mirrors the by-intent redaction
+    /// pin.
+    #[tokio::test]
+    async fn executor_transactions_list_does_not_expose_secrets() {
+        let private_key = "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318";
+        let rpc_with_token = "https://rpc.example/sensitive-provider-key";
+        let mut state = admin_state(false);
+        state.execution_config.rpc_url = Some(rpc_with_token.to_string());
+        state.execution_config.executor_private_key =
+            Some(PrivateKeySecret::new(private_key.to_string()));
+        state.execution_config.backend_signer_endpoint =
+            Some("https://signer.example/secret-mtls-path".to_string());
+
+        let intent = route_orderbook_option_intent();
+        let intent_id = intent.intent_id;
+        insert_route_option_intent(&state, intent);
+        insert_route_option_tx(
+            &state,
+            route_option_execution_tx(
+                intent_id,
+                "0xdddd066ce0a10ede63f9e4c66161be8efdcd0edf6a63d176af0967b4bde95326",
+                Some(crate::options::OptionExecutionConfirmationStatus::MinedSuccess),
+            ),
+        );
+
+        let response = router(state)
+            .oneshot(get_request("/executor/transactions", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_text(response).await;
+        assert!(!body.contains(private_key));
+        assert!(!body.contains("sensitive-provider-key"));
+        assert!(!body.contains("secret-mtls-path"));
+        assert!(body.contains("\"source\":\"option\""));
+    }
+
+    /// The endpoint must never expose private keys, RPC URLs with
+    /// tokens, admin tokens, signer endpoints, or DATABASE_URL even
+    /// when those values happen to sit in the AppState.
+    #[tokio::test]
+    async fn executor_transactions_for_intent_does_not_expose_secrets() {
+        let private_key = "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318";
+        let rpc_with_token = "https://rpc.example/sensitive-provider-key";
+        let mut state = admin_state(false);
+        state.execution_config.rpc_url = Some(rpc_with_token.to_string());
+        state.execution_config.executor_private_key =
+            Some(PrivateKeySecret::new(private_key.to_string()));
+        state.execution_config.backend_signer_endpoint =
+            Some("https://signer.example/secret-mtls-path".to_string());
+
+        let intent = route_orderbook_option_intent();
+        let intent_id = intent.intent_id;
+        insert_route_option_intent(&state, intent);
+        insert_route_option_tx(
+            &state,
+            route_option_execution_tx(
+                intent_id,
+                "0xcccc066ce0a10ede63f9e4c66161be8efdcd0edf6a63d176af0967b4bde95326",
+                Some(crate::options::OptionExecutionConfirmationStatus::MinedSuccess),
+            ),
+        );
+
+        let response = router(state)
+            .oneshot(get_request(
+                &format!("/executor/transactions/{intent_id}"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_text(response).await;
+        assert!(!body.contains(private_key));
+        assert!(!body.contains("sensitive-provider-key"));
+        assert!(!body.contains("secret-mtls-path"));
+        // Structural assertions — fields the consumer expects.
+        assert!(body.contains("\"source\":\"option\""));
+        assert!(body.contains("\"intent_id\":"));
+        assert!(body.contains("\"tx_hash\":"));
     }
 
     #[tokio::test]

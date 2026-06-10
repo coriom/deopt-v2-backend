@@ -263,7 +263,7 @@ pub fn build_executor_health_v2(state: &AppState) -> ExecutorHealthV2Response {
 
     let chain_state_last_seen = ChainStateLastSeenBlock {
         be_balance_wei: snap.last_be_balance_wei,
-        be_balance_floor_wei: None,
+        be_balance_floor_wei: snap.last_be_balance_floor_wei,
         ome_paused: snap.last_ome_paused,
         ome_is_executor: snap.last_ome_is_executor,
         pfv_fee_balance: snap.last_pfv_fee_balance,
@@ -319,7 +319,11 @@ pub fn build_executor_health_v2(state: &AppState) -> ExecutorHealthV2Response {
         last_broadcast_submitted_ms: snap.last_broadcast_submitted_ms,
     };
 
-    let not_tracked_yet = vec!["execution_flags.be_balance_floor_wei".to_string()];
+    // BACKEND-OBSERVABILITY-BE-BALANCE-FLOOR-EXPOSE closed the
+    // last gap; the field lives on `chain_state_last_seen` (the prior
+    // `execution_flags.be_balance_floor_wei` label was a docs typo).
+    // Every documented health-endpoint field now reports live data.
+    let not_tracked_yet: Vec<String> = Vec::new();
 
     let (overall_status, reasons, hard_stops, warnings) =
         compute_status(state, &snap, &live_provider_config);
@@ -672,35 +676,16 @@ mod tests {
     }
 
     #[test]
-    fn not_tracked_yet_lists_remaining_unimplemented_fields() {
+    fn not_tracked_yet_is_empty_after_be_balance_floor_milestone() {
+        // BACKEND-OBSERVABILITY-BE-BALANCE-FLOOR-EXPOSE closed the
+        // final gap. Every documented health-endpoint field now
+        // reports live data; `not_tracked_yet` is empty.
         let state = base_state();
         let response = build_executor_health_v2(&state);
-        // Shipped across BACKEND-OBSERVABILITY-LAST-SINGLETON-FIELDS +
-        // BACKEND-OBSERVABILITY-LAST-POLICY-DATA-FAILURE-SINGLETON +
-        // BACKEND-LIVE-PROVIDER-EFFECTIVE-PPM-CACHE: the six fields
-        // below must NO LONGER appear here.
-        for shipped in [
-            "signer.last_signer_error_code",
-            "policy_gate.last_reject_source_type",
-            "policy_gate.econ_data_available_last",
-            "policy_gate.last_policy_data_failure_type",
-            "economics_last_seen.effective_maker_ppm",
-            "economics_last_seen.effective_taker_ppm",
-        ] {
-            assert!(
-                !response.not_tracked_yet.iter().any(|f| f == shipped),
-                "{shipped} should no longer be in not_tracked_yet"
-            );
-        }
-        // Still pending — only the BE balance floor remains.
-        assert!(response
-            .not_tracked_yet
-            .iter()
-            .any(|f| f == "execution_flags.be_balance_floor_wei"));
-        assert_eq!(
-            response.not_tracked_yet.len(),
-            1,
-            "exactly one entry should remain after this milestone"
+        assert!(
+            response.not_tracked_yet.is_empty(),
+            "not_tracked_yet should be empty; got {:?}",
+            response.not_tracked_yet
         );
     }
 
@@ -726,6 +711,37 @@ mod tests {
         let response = build_executor_health_v2(&state);
         assert_eq!(response.economics_last_seen.effective_maker_ppm, Some(50));
         assert_eq!(response.economics_last_seen.effective_taker_ppm, Some(100));
+    }
+
+    #[test]
+    fn health_endpoint_surfaces_be_balance_floor_wei_singleton() {
+        let state = base_state();
+        // Initial — None.
+        assert_eq!(
+            build_executor_health_v2(&state)
+                .chain_state_last_seen
+                .be_balance_floor_wei,
+            None
+        );
+        state
+            .broadcast_observability
+            .record_be_balance_floor_wei(1_500_000_000_000_000);
+        let response = build_executor_health_v2(&state);
+        assert_eq!(
+            response.chain_state_last_seen.be_balance_floor_wei,
+            Some(1_500_000_000_000_000)
+        );
+    }
+
+    #[test]
+    fn health_endpoint_surfaces_zero_be_balance_floor_legitimately() {
+        // Sepolia permissive path computes `fund_floor_wei = 0` — that
+        // is a valid policy state, not a "fake zero" placeholder. The
+        // health endpoint must report the 0 verbatim.
+        let state = base_state();
+        state.broadcast_observability.record_be_balance_floor_wei(0);
+        let response = build_executor_health_v2(&state);
+        assert_eq!(response.chain_state_last_seen.be_balance_floor_wei, Some(0));
     }
 
     #[test]

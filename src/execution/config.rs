@@ -63,6 +63,25 @@ pub struct ExecutionConfig {
     /// testnets (`chain_id ∈ {84532, …}`). `chain_id == 31337` (anvil)
     /// is granted implicit local-dev privilege independent of this flag.
     pub executor_allow_local_signer: bool,
+    /// Optional pluggable-provider kind used when
+    /// `backend_signer_mode == Remote`. `None` means the
+    /// production `RemoteSignerClient` continues to use its
+    /// `UnimplementedTransport` default — fail-closed; no signing
+    /// capability. A configured value names the vendor adapter the
+    /// operator intends to wire in. `Mock` is REFUSED on mainnet
+    /// (`chain_id == 8453`) per
+    /// `MAINNET_SIGNER_VENDOR_ADAPTER_REQUIREMENTS.md §3` and
+    /// `BACKEND_KMS_VENDOR_ADAPTER_IMPLEMENTATION_PLUGGABLE_RESULT.md`.
+    pub backend_signer_provider: Option<crate::execution::signer_adapters::SignerProviderKind>,
+    /// Per-request timeout (milliseconds) applied by the remote
+    /// signer adapter to vendor calls (AWS KMS / GCP KMS / Turnkey /
+    /// etc.). Default 2500 ms per
+    /// `MAINNET_SIGNER_VENDOR_ADAPTER_REQUIREMENTS.md §2.10`.
+    /// Range enforced at env load: 100..=30000. Adapter MUST treat a
+    /// missing value as the default and MUST NOT retry sign requests
+    /// on timeout (re-sign risks duplicate intent submission with a
+    /// different nonce).
+    pub backend_signer_timeout_ms: u32,
 }
 
 impl ExecutionConfig {
@@ -91,6 +110,8 @@ impl ExecutionConfig {
             backend_signer_mode: SignerBackendKind::LocalDev,
             backend_signer_endpoint: None,
             executor_allow_local_signer: false,
+            backend_signer_provider: None,
+            backend_signer_timeout_ms: 2500,
         }
     }
 
@@ -222,6 +243,21 @@ impl ExecutionConfig {
                     return Err(BackendError::Config(
                         "BACKEND_SIGNER_ENDPOINT is required when BACKEND_SIGNER_MODE=remote"
                             .to_string(),
+                    ));
+                }
+                // Mainnet hard-refuses the `Mock` pluggable provider —
+                // defence-in-depth on top of the runtime guard in
+                // `signer_adapters::PluggableRemoteSignerTransport`'s
+                // health-check `healthy` flag.
+                if self.executor_chain_id == MAINNET_CHAIN_ID
+                    && matches!(
+                        self.backend_signer_provider,
+                        Some(crate::execution::signer_adapters::SignerProviderKind::Mock)
+                    )
+                {
+                    return Err(BackendError::Config(
+                        "BACKEND_REMOTE_SIGNER_PROVIDER=mock is REFUSED on mainnet (chain_id=8453); \
+                         configure an operational vendor adapter".to_string(),
                     ));
                 }
             }
@@ -367,5 +403,60 @@ mod tests {
         cfg.executor_allow_local_signer = false;
         cfg.validate_startup(true)
             .expect("anvil chain-id must allow local-signer by default");
+    }
+
+    #[test]
+    fn mainnet_with_mock_pluggable_provider_refuses_startup() {
+        let mut cfg = mainnet_remote_base();
+        cfg.backend_signer_provider =
+            Some(crate::execution::signer_adapters::SignerProviderKind::Mock);
+        let err = cfg
+            .validate_startup(true)
+            .expect_err("mainnet must refuse mock provider");
+        assert!(err
+            .to_string()
+            .contains("BACKEND_REMOTE_SIGNER_PROVIDER=mock is REFUSED on mainnet"));
+    }
+
+    #[test]
+    fn mainnet_with_operational_provider_kind_passes() {
+        let mut cfg = mainnet_remote_base();
+        cfg.backend_signer_provider =
+            Some(crate::execution::signer_adapters::SignerProviderKind::AwsKms);
+        cfg.validate_startup(true)
+            .expect("mainnet with operational provider must pass");
+    }
+
+    #[test]
+    fn mainnet_without_provider_passes_but_runtime_remains_fail_closed() {
+        // Default `backend_signer_provider = None` keeps
+        // `RemoteSignerClient` on its `UnimplementedTransport`
+        // default. Startup MAY pass (the operator may stage the
+        // adapter wiring in a follow-on); runtime broadcast attempts
+        // still fail with `SignerError::Transport(...)`.
+        let cfg = mainnet_remote_base();
+        assert!(cfg.backend_signer_provider.is_none());
+        cfg.validate_startup(true)
+            .expect("mainnet without provider must still pass startup; runtime is fail-closed");
+    }
+
+    #[test]
+    fn sepolia_with_mock_provider_allowed() {
+        let mut cfg = ExecutionConfig {
+            execution_enabled: true,
+            dry_run: false,
+            real_broadcast_enabled: true,
+            executor_chain_id: BASE_SEPOLIA_CHAIN_ID,
+            rpc_url: Some("https://example.invalid".to_string()),
+            max_fee_per_gas_wei: Some("1000000000".to_string()),
+            max_priority_fee_per_gas_wei: Some("100000000".to_string()),
+            backend_signer_mode: SignerBackendKind::Remote,
+            backend_signer_endpoint: Some("https://signer.invalid".to_string()),
+            ..ExecutionConfig::disabled()
+        };
+        cfg.backend_signer_provider =
+            Some(crate::execution::signer_adapters::SignerProviderKind::Mock);
+        cfg.validate_startup(true)
+            .expect("Sepolia + remote + mock allowed");
     }
 }

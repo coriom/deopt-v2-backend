@@ -1,0 +1,561 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "DeOpt V2 — Trading API",
+    "version": "0.1.0-mvp",
+    "description": "Frontend-facing trading API for the DeOpt V2 testnet beta. Wallet-anchored (no Bearer for public reads). Companion to the frozen Solidity ABI at deopt-v2-sol/abis/freeze-v2-product-rc1/. Not yet audited; testnet beta only.",
+    "contact": {
+      "name": "DeOpt Operator",
+      "url": "https://example.invalid"
+    },
+    "license": { "name": "Internal" }
+  },
+  "servers": [
+    { "url": "http://localhost:3000", "description": "local backend (anvil + postgres)" },
+    { "url": "https://sepolia-backend.example.invalid", "description": "Base Sepolia rehearsal backend (operator-managed)" }
+  ],
+  "tags": [
+    { "name": "products", "description": "Product / market aggregates" },
+    { "name": "series", "description": "Option series" },
+    { "name": "orderbook", "description": "Orderbook snapshots" },
+    { "name": "quotes", "description": "Trade preview" },
+    { "name": "accounts", "description": "Wallet-anchored reads (positions, portfolio, history, balances)" },
+    { "name": "exercise", "description": "Settlement / exercise preview" },
+    { "name": "health", "description": "Frontend-safe health" }
+  ],
+  "paths": {
+    "/options/products": {
+      "get": {
+        "tags": ["products"],
+        "summary": "List products (underlying / settlement-asset / cp / expiry aggregates)",
+        "parameters": [
+          { "$ref": "#/components/parameters/UnderlyingFilter" },
+          { "$ref": "#/components/parameters/IsCallFilter" },
+          { "$ref": "#/components/parameters/IncludeInactive" },
+          { "$ref": "#/components/parameters/Limit" },
+          { "$ref": "#/components/parameters/Cursor" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Products list",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ProductsListEnvelope" }
+              }
+            }
+          },
+          "503": { "$ref": "#/components/responses/IndexerStaleOrRpcUnavailable" },
+          "500": { "$ref": "#/components/responses/InternalError" }
+        }
+      }
+    },
+    "/options/products/{product_id}": {
+      "get": {
+        "tags": ["products"],
+        "summary": "Product detail",
+        "parameters": [
+          { "name": "product_id", "in": "path", "required": true, "schema": { "$ref": "#/components/schemas/ProductId" } }
+        ],
+        "responses": {
+          "200": { "description": "Product detail", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProductDetailEnvelope" } } } },
+          "404": { "$ref": "#/components/responses/ProductNotFound" },
+          "503": { "$ref": "#/components/responses/IndexerStaleOrRpcUnavailable" }
+        }
+      }
+    },
+    "/options/products/batch": {
+      "get": {
+        "tags": ["products"],
+        "summary": "Batch read products by ids",
+        "parameters": [
+          { "name": "ids", "in": "query", "required": true, "schema": { "type": "string" }, "description": "Comma-separated product ids; max 100 per call." }
+        ],
+        "responses": {
+          "200": { "description": "Batch products", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProductsBatchEnvelope" } } } },
+          "400": { "$ref": "#/components/responses/InvalidRequest" }
+        }
+      }
+    },
+    "/options/series/{series_id}/details": {
+      "get": {
+        "tags": ["series"],
+        "summary": "Series augmented detail (with orderbook top + last fill + oracle mark)",
+        "parameters": [
+          { "name": "series_id", "in": "path", "required": true, "schema": { "$ref": "#/components/schemas/SeriesId" } }
+        ],
+        "responses": {
+          "200": { "description": "Series detail", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SeriesDetailEnvelope" } } } },
+          "404": { "$ref": "#/components/responses/SeriesNotFound" }
+        }
+      }
+    },
+    "/options/quotes/preview": {
+      "get": {
+        "tags": ["quotes"],
+        "summary": "Server-side fee + oracle + IM-impact preview for a hypothetical trade",
+        "parameters": [
+          { "name": "series_id", "in": "query", "required": true, "schema": { "$ref": "#/components/schemas/SeriesId" } },
+          { "name": "side", "in": "query", "required": true, "schema": { "type": "string", "enum": ["buy", "sell"] } },
+          { "name": "size", "in": "query", "required": true, "schema": { "$ref": "#/components/schemas/DecimalString" } },
+          { "name": "price_1e8", "in": "query", "required": false, "schema": { "$ref": "#/components/schemas/DecimalString" } },
+          { "name": "account", "in": "query", "required": false, "schema": { "$ref": "#/components/schemas/EthAddress" }, "description": "Optional; when present the preview includes IM-impact + free-collateral-after." }
+        ],
+        "responses": {
+          "200": { "description": "Quote preview", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/QuotePreviewEnvelope" } } } },
+          "422": { "$ref": "#/components/responses/PreviewRevertedOrUnsupported" }
+        }
+      }
+    },
+    "/accounts/{address}/positions": {
+      "get": {
+        "tags": ["accounts"],
+        "summary": "Aggregated open positions for an account",
+        "parameters": [
+          { "name": "address", "in": "path", "required": true, "schema": { "$ref": "#/components/schemas/EthAddress" } }
+        ],
+        "responses": {
+          "200": { "description": "Positions", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PositionsEnvelope" } } } },
+          "400": { "$ref": "#/components/responses/InvalidAddress" }
+        }
+      }
+    },
+    "/accounts/{address}/portfolio": {
+      "get": {
+        "tags": ["accounts"],
+        "summary": "Portfolio summary (equity, IM, MM, free collateral)",
+        "parameters": [
+          { "name": "address", "in": "path", "required": true, "schema": { "$ref": "#/components/schemas/EthAddress" } }
+        ],
+        "responses": {
+          "200": { "description": "Portfolio", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PortfolioEnvelope" } } } },
+          "400": { "$ref": "#/components/responses/InvalidAddress" }
+        }
+      }
+    },
+    "/accounts/{address}/history": {
+      "get": {
+        "tags": ["accounts"],
+        "summary": "Account trade + lifecycle history (paginated)",
+        "parameters": [
+          { "name": "address", "in": "path", "required": true, "schema": { "$ref": "#/components/schemas/EthAddress" } },
+          { "$ref": "#/components/parameters/Limit" },
+          { "$ref": "#/components/parameters/Cursor" }
+        ],
+        "responses": {
+          "200": { "description": "History", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/HistoryEnvelope" } } } },
+          "400": { "$ref": "#/components/responses/InvalidAddress" }
+        }
+      }
+    },
+    "/accounts/{address}/balances": {
+      "get": {
+        "tags": ["accounts"],
+        "summary": "Per-token balances (vault + yield strategy preview)",
+        "parameters": [
+          { "name": "address", "in": "path", "required": true, "schema": { "$ref": "#/components/schemas/EthAddress" } }
+        ],
+        "responses": {
+          "200": { "description": "Balances", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BalancesEnvelope" } } } },
+          "400": { "$ref": "#/components/responses/InvalidAddress" }
+        }
+      }
+    },
+    "/options/exercise/preview": {
+      "post": {
+        "tags": ["exercise"],
+        "summary": "Pure-read exercise / settlement preview (no broadcast, no signer, no mutation)",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ExercisePreviewRequest" } } }
+        },
+        "responses": {
+          "200": { "description": "Exercise preview", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ExercisePreviewEnvelope" } } } },
+          "422": { "$ref": "#/components/responses/PreviewRevertedOrUnsupported" }
+        }
+      }
+    },
+    "/options/close/preview": {
+      "post": {
+        "tags": ["quotes"],
+        "summary": "Pure-read close-position preview (no broadcast, no signer, no mutation)",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ClosePreviewRequest" } } }
+        },
+        "responses": {
+          "200": { "description": "Close preview", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/QuotePreviewEnvelope" } } } },
+          "422": { "$ref": "#/components/responses/PreviewRevertedOrUnsupported" }
+        }
+      }
+    },
+    "/trading/health": {
+      "get": {
+        "tags": ["health"],
+        "summary": "Frontend-safe health (subset of /executor/health/v2)",
+        "responses": {
+          "200": { "description": "Health", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/TradingHealthEnvelope" } } } }
+        }
+      }
+    }
+  },
+  "components": {
+    "parameters": {
+      "UnderlyingFilter": { "name": "underlying", "in": "query", "required": false, "schema": { "$ref": "#/components/schemas/EthAddress" } },
+      "IsCallFilter": { "name": "is_call", "in": "query", "required": false, "schema": { "type": "boolean" } },
+      "IncludeInactive": { "name": "include_inactive", "in": "query", "required": false, "schema": { "type": "boolean", "default": false } },
+      "Limit": { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 1, "maximum": 200, "default": 50 } },
+      "Cursor": { "name": "cursor", "in": "query", "required": false, "schema": { "type": "string", "description": "Opaque base64 cursor returned by a previous call." } }
+    },
+    "responses": {
+      "InvalidAddress": { "description": "Wallet address malformed", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } } },
+      "InvalidRequest": { "description": "Request body or query malformed", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } } },
+      "ProductNotFound": { "description": "Product id unknown", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } } },
+      "SeriesNotFound": { "description": "Series id unknown", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } } },
+      "PreviewRevertedOrUnsupported": { "description": "Preview not computable (sol view reverted, series paused, settled, expired, etc.)", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } } },
+      "IndexerStaleOrRpcUnavailable": { "description": "Indexer lag exceeded or RPC unreachable", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } } },
+      "InternalError": { "description": "Unexpected server error", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } } }
+    },
+    "schemas": {
+      "EthAddress": { "type": "string", "pattern": "^0x[a-fA-F0-9]{40}$" },
+      "DecimalString": { "type": "string", "pattern": "^-?[0-9]+$" },
+      "ProductId": { "type": "string", "pattern": "^0x[a-fA-F0-9]{64}$" },
+      "SeriesId": { "type": "string", "pattern": "^[0-9]+$" },
+      "Hex32": { "type": "string", "pattern": "^0x[a-fA-F0-9]{64}$" },
+      "MetaBlock": {
+        "type": "object",
+        "required": ["chain_id", "request_id", "generated_at_ms"],
+        "properties": {
+          "source": { "type": "string", "enum": ["db", "rpc", "indexer", "rpc+cache", "cache"] },
+          "block_number": { "type": "integer" },
+          "indexed_block": { "type": "integer" },
+          "freshness_ms": { "type": "integer" },
+          "chain_id": { "type": "integer", "examples": [8453, 84532, 31337] },
+          "request_id": { "type": "string", "format": "uuid" },
+          "generated_at_ms": { "type": "integer" },
+          "pagination": {
+            "type": "object",
+            "properties": { "next_cursor": { "type": "string", "nullable": true }, "has_more": { "type": "boolean" } }
+          }
+        }
+      },
+      "Warning": {
+        "type": "object",
+        "required": ["code", "message"],
+        "properties": {
+          "code": { "type": "string" },
+          "message": { "type": "string" },
+          "details": { "type": "object", "additionalProperties": true }
+        }
+      },
+      "ErrorEnvelope": {
+        "type": "object",
+        "required": ["status", "error", "meta"],
+        "properties": {
+          "status": { "type": "string", "enum": ["error"] },
+          "error": {
+            "type": "object",
+            "required": ["code", "message"],
+            "properties": {
+              "code": { "type": "string", "enum": ["INVALID_ADDRESS", "INVALID_REQUEST", "PRODUCT_NOT_FOUND", "SERIES_NOT_FOUND", "ORDERBOOK_UNAVAILABLE", "QUOTE_STALE", "QUOTE_UNSUPPORTED", "INSUFFICIENT_BALANCE", "INSUFFICIENT_COLLATERAL", "PREVIEW_REVERTED", "INDEXER_STALE", "RPC_UNAVAILABLE", "SIGNER_UNAVAILABLE", "EXECUTOR_UNAVAILABLE", "SOURCE_UNAVAILABLE", "RATE_LIMITED", "INTERNAL_ERROR"] },
+              "message": { "type": "string" },
+              "details": { "type": "object", "additionalProperties": true }
+            }
+          },
+          "meta": { "$ref": "#/components/schemas/MetaBlock" }
+        }
+      },
+      "Product": {
+        "type": "object",
+        "required": ["product_id", "underlying", "settlement_asset", "is_call", "expiry_ms"],
+        "properties": {
+          "product_id": { "$ref": "#/components/schemas/ProductId" },
+          "underlying": { "$ref": "#/components/schemas/EthAddress" },
+          "underlying_symbol": { "type": "string" },
+          "settlement_asset": { "$ref": "#/components/schemas/EthAddress" },
+          "settlement_asset_symbol": { "type": "string" },
+          "is_call": { "type": "boolean" },
+          "expiry_ms": { "type": "integer" },
+          "expiry": { "type": "string", "format": "date-time" },
+          "series_count": { "type": "integer" },
+          "is_active_any": { "type": "boolean" },
+          "spot_price_1e8": { "$ref": "#/components/schemas/DecimalString" },
+          "spot_price_age_ms": { "type": "integer" }
+        }
+      },
+      "ProductsListEnvelope": {
+        "type": "object",
+        "required": ["status", "data", "meta"],
+        "properties": {
+          "status": { "type": "string", "enum": ["ok", "stale", "partial"] },
+          "data": { "type": "object", "required": ["products"], "properties": { "products": { "type": "array", "items": { "$ref": "#/components/schemas/Product" } } } },
+          "warnings": { "type": "array", "items": { "$ref": "#/components/schemas/Warning" } },
+          "meta": { "$ref": "#/components/schemas/MetaBlock" }
+        }
+      },
+      "ProductDetailEnvelope": {
+        "type": "object",
+        "required": ["status", "data", "meta"],
+        "properties": {
+          "status": { "type": "string", "enum": ["ok", "stale", "partial"] },
+          "data": { "type": "object", "required": ["product", "series_ids"], "properties": { "product": { "$ref": "#/components/schemas/Product" }, "series_ids": { "type": "array", "items": { "$ref": "#/components/schemas/SeriesId" } } } },
+          "warnings": { "type": "array", "items": { "$ref": "#/components/schemas/Warning" } },
+          "meta": { "$ref": "#/components/schemas/MetaBlock" }
+        }
+      },
+      "ProductsBatchEnvelope": {
+        "type": "object",
+        "required": ["status", "data", "meta"],
+        "properties": {
+          "status": { "type": "string", "enum": ["ok", "stale", "partial"] },
+          "data": { "type": "object", "required": ["products"], "properties": { "products": { "type": "array", "items": { "$ref": "#/components/schemas/Product" } } } },
+          "warnings": { "type": "array", "items": { "$ref": "#/components/schemas/Warning" } },
+          "meta": { "$ref": "#/components/schemas/MetaBlock" }
+        }
+      },
+      "Series": {
+        "type": "object",
+        "required": ["series_id", "product_id", "underlying", "settlement_asset", "is_call", "strike_1e8", "expiry_ms"],
+        "properties": {
+          "series_id": { "$ref": "#/components/schemas/SeriesId" },
+          "product_id": { "$ref": "#/components/schemas/ProductId" },
+          "underlying": { "$ref": "#/components/schemas/EthAddress" },
+          "settlement_asset": { "$ref": "#/components/schemas/EthAddress" },
+          "is_call": { "type": "boolean" },
+          "strike_1e8": { "$ref": "#/components/schemas/DecimalString" },
+          "expiry_ms": { "type": "integer" },
+          "expiry": { "type": "string", "format": "date-time" },
+          "contract_size_1e8": { "$ref": "#/components/schemas/DecimalString" },
+          "is_active": { "type": "boolean" },
+          "metadata": { "type": "string", "pattern": "^0x[a-fA-F0-9]*$" }
+        }
+      },
+      "OrderbookTop": {
+        "type": "object",
+        "properties": {
+          "best_bid_price_1e8": { "$ref": "#/components/schemas/DecimalString" },
+          "best_bid_size": { "$ref": "#/components/schemas/DecimalString" },
+          "best_ask_price_1e8": { "$ref": "#/components/schemas/DecimalString" },
+          "best_ask_size": { "$ref": "#/components/schemas/DecimalString" }
+        }
+      },
+      "LastFill": {
+        "type": "object",
+        "properties": {
+          "price_1e8": { "$ref": "#/components/schemas/DecimalString" },
+          "qty": { "$ref": "#/components/schemas/DecimalString" },
+          "side": { "type": "string", "enum": ["buy", "sell"] },
+          "block_number": { "type": "integer" },
+          "block_timestamp_ms": { "type": "integer" },
+          "tx_hash": { "$ref": "#/components/schemas/Hex32" }
+        }
+      },
+      "SeriesDetailEnvelope": {
+        "type": "object",
+        "required": ["status", "data", "meta"],
+        "properties": {
+          "status": { "type": "string", "enum": ["ok", "stale", "partial"] },
+          "data": {
+            "type": "object",
+            "required": ["series"],
+            "properties": {
+              "series": { "$ref": "#/components/schemas/Series" },
+              "orderbook_top": { "$ref": "#/components/schemas/OrderbookTop" },
+              "last_fill": { "$ref": "#/components/schemas/LastFill", "nullable": true },
+              "oracle_mark_1e8": { "$ref": "#/components/schemas/DecimalString" }
+            }
+          },
+          "warnings": { "type": "array", "items": { "$ref": "#/components/schemas/Warning" } },
+          "meta": { "$ref": "#/components/schemas/MetaBlock" }
+        }
+      },
+      "QuotePreview": {
+        "type": "object",
+        "required": ["series_id", "side", "size", "premium"],
+        "properties": {
+          "series_id": { "$ref": "#/components/schemas/SeriesId" },
+          "side": { "type": "string", "enum": ["buy", "sell"] },
+          "size": { "$ref": "#/components/schemas/DecimalString" },
+          "price_1e8": { "$ref": "#/components/schemas/DecimalString" },
+          "premium": { "$ref": "#/components/schemas/DecimalString" },
+          "buyer_fee": { "type": "object", "properties": { "ppm_signed": { "type": "integer" }, "amount": { "$ref": "#/components/schemas/DecimalString" } } },
+          "seller_fee": { "type": "object", "properties": { "ppm_signed": { "type": "integer" }, "amount": { "$ref": "#/components/schemas/DecimalString" } } },
+          "settlement_asset": { "$ref": "#/components/schemas/EthAddress" },
+          "oracle_mark_1e8": { "$ref": "#/components/schemas/DecimalString" },
+          "im_impact": { "$ref": "#/components/schemas/DecimalString" },
+          "free_collateral_after": { "$ref": "#/components/schemas/DecimalString" },
+          "quote_expires_at_ms": { "type": "integer" },
+          "position_size_after": { "$ref": "#/components/schemas/DecimalString" }
+        }
+      },
+      "QuotePreviewEnvelope": {
+        "type": "object",
+        "required": ["status", "data", "meta"],
+        "properties": {
+          "status": { "type": "string", "enum": ["ok", "stale", "partial"] },
+          "data": { "$ref": "#/components/schemas/QuotePreview" },
+          "warnings": { "type": "array", "items": { "$ref": "#/components/schemas/Warning" } },
+          "meta": { "$ref": "#/components/schemas/MetaBlock" }
+        }
+      },
+      "Position": {
+        "type": "object",
+        "required": ["series_id", "size", "side"],
+        "properties": {
+          "series_id": { "$ref": "#/components/schemas/SeriesId" },
+          "product_id": { "$ref": "#/components/schemas/ProductId" },
+          "size": { "$ref": "#/components/schemas/DecimalString" },
+          "side": { "type": "string", "enum": ["long", "short"] },
+          "avg_entry_price_1e8": { "$ref": "#/components/schemas/DecimalString" },
+          "mark_price_1e8": { "$ref": "#/components/schemas/DecimalString" },
+          "unrealised_pnl": { "$ref": "#/components/schemas/DecimalString" },
+          "im_contribution": { "$ref": "#/components/schemas/DecimalString" },
+          "mm_contribution": { "$ref": "#/components/schemas/DecimalString" },
+          "is_exercisable": { "type": "boolean" }
+        }
+      },
+      "PositionsEnvelope": {
+        "type": "object",
+        "required": ["status", "data", "meta"],
+        "properties": {
+          "status": { "type": "string", "enum": ["ok", "stale", "partial"] },
+          "data": { "type": "object", "required": ["address", "positions"], "properties": { "address": { "$ref": "#/components/schemas/EthAddress" }, "positions": { "type": "array", "items": { "$ref": "#/components/schemas/Position" } } } },
+          "warnings": { "type": "array", "items": { "$ref": "#/components/schemas/Warning" } },
+          "meta": { "$ref": "#/components/schemas/MetaBlock" }
+        }
+      },
+      "PortfolioEnvelope": {
+        "type": "object",
+        "required": ["status", "data", "meta"],
+        "properties": {
+          "status": { "type": "string", "enum": ["ok", "stale", "partial"] },
+          "data": {
+            "type": "object",
+            "required": ["address", "equity", "im", "mm", "free_collateral"],
+            "properties": {
+              "address": { "$ref": "#/components/schemas/EthAddress" },
+              "equity": { "$ref": "#/components/schemas/DecimalString" },
+              "im": { "$ref": "#/components/schemas/DecimalString" },
+              "mm": { "$ref": "#/components/schemas/DecimalString" },
+              "free_collateral": { "$ref": "#/components/schemas/DecimalString" },
+              "total_notional": { "$ref": "#/components/schemas/DecimalString" },
+              "open_positions_count": { "type": "integer" }
+            }
+          },
+          "warnings": { "type": "array", "items": { "$ref": "#/components/schemas/Warning" } },
+          "meta": { "$ref": "#/components/schemas/MetaBlock" }
+        }
+      },
+      "HistoryItem": {
+        "type": "object",
+        "required": ["event_kind", "block_timestamp_ms"],
+        "properties": {
+          "event_kind": { "type": "string", "enum": ["fill", "rfq_fill", "order_cancel", "rfq_cancel", "exercise", "settle", "deposit", "withdraw"] },
+          "series_id": { "$ref": "#/components/schemas/SeriesId" },
+          "side": { "type": "string", "enum": ["buy", "sell", "long", "short"] },
+          "size": { "$ref": "#/components/schemas/DecimalString" },
+          "price_1e8": { "$ref": "#/components/schemas/DecimalString" },
+          "fee_paid": { "$ref": "#/components/schemas/DecimalString" },
+          "tx_hash": { "$ref": "#/components/schemas/Hex32" },
+          "block_number": { "type": "integer" },
+          "block_timestamp_ms": { "type": "integer" },
+          "intent_id": { "type": "string" }
+        }
+      },
+      "HistoryEnvelope": {
+        "type": "object",
+        "required": ["status", "data", "meta"],
+        "properties": {
+          "status": { "type": "string", "enum": ["ok", "stale", "partial"] },
+          "data": { "type": "object", "required": ["items"], "properties": { "items": { "type": "array", "items": { "$ref": "#/components/schemas/HistoryItem" } } } },
+          "warnings": { "type": "array", "items": { "$ref": "#/components/schemas/Warning" } },
+          "meta": { "$ref": "#/components/schemas/MetaBlock" }
+        }
+      },
+      "Balance": {
+        "type": "object",
+        "required": ["token", "balance"],
+        "properties": {
+          "token": { "$ref": "#/components/schemas/EthAddress" },
+          "symbol": { "type": "string" },
+          "decimals": { "type": "integer" },
+          "balance": { "$ref": "#/components/schemas/DecimalString" },
+          "balance_with_yield": { "$ref": "#/components/schemas/DecimalString" },
+          "strategy_assets_preview": { "$ref": "#/components/schemas/DecimalString" },
+          "is_collateral_active": { "type": "boolean" }
+        }
+      },
+      "BalancesEnvelope": {
+        "type": "object",
+        "required": ["status", "data", "meta"],
+        "properties": {
+          "status": { "type": "string", "enum": ["ok", "stale", "partial"] },
+          "data": { "type": "object", "required": ["address", "balances"], "properties": { "address": { "$ref": "#/components/schemas/EthAddress" }, "balances": { "type": "array", "items": { "$ref": "#/components/schemas/Balance" } } } },
+          "warnings": { "type": "array", "items": { "$ref": "#/components/schemas/Warning" } },
+          "meta": { "$ref": "#/components/schemas/MetaBlock" }
+        }
+      },
+      "ExercisePreviewRequest": {
+        "type": "object",
+        "required": ["series_id", "account"],
+        "properties": {
+          "series_id": { "$ref": "#/components/schemas/SeriesId" },
+          "account": { "$ref": "#/components/schemas/EthAddress" }
+        }
+      },
+      "ExercisePreviewEnvelope": {
+        "type": "object",
+        "required": ["status", "data", "meta"],
+        "properties": {
+          "status": { "type": "string", "enum": ["ok", "stale", "partial"] },
+          "data": {
+            "type": "object",
+            "required": ["series_id", "account", "is_already_settled", "can_settle", "pnl"],
+            "properties": {
+              "series_id": { "$ref": "#/components/schemas/SeriesId" },
+              "account": { "$ref": "#/components/schemas/EthAddress" },
+              "is_already_settled": { "type": "boolean" },
+              "can_settle": { "type": "boolean" },
+              "pnl": { "$ref": "#/components/schemas/DecimalString" },
+              "payable_from_settlement_sink": { "$ref": "#/components/schemas/DecimalString" },
+              "insurance_preview": { "$ref": "#/components/schemas/DecimalString" },
+              "collectible_from_trader_preview": { "$ref": "#/components/schemas/DecimalString" },
+              "residual_bad_debt_preview": { "$ref": "#/components/schemas/DecimalString" }
+            }
+          },
+          "warnings": { "type": "array", "items": { "$ref": "#/components/schemas/Warning" } },
+          "meta": { "$ref": "#/components/schemas/MetaBlock" }
+        }
+      },
+      "ClosePreviewRequest": {
+        "type": "object",
+        "required": ["series_id", "account", "side", "size"],
+        "properties": {
+          "series_id": { "$ref": "#/components/schemas/SeriesId" },
+          "account": { "$ref": "#/components/schemas/EthAddress" },
+          "side": { "type": "string", "enum": ["buy", "sell"] },
+          "size": { "$ref": "#/components/schemas/DecimalString" },
+          "price_1e8": { "$ref": "#/components/schemas/DecimalString" }
+        }
+      },
+      "TradingHealthEnvelope": {
+        "type": "object",
+        "required": ["status", "data", "meta"],
+        "properties": {
+          "status": { "type": "string", "enum": ["ok", "degraded", "unhealthy"] },
+          "data": {
+            "type": "object",
+            "required": ["overall_status", "indexer_lag_blocks", "rpc_reachable"],
+            "properties": {
+              "overall_status": { "type": "string", "enum": ["ok", "degraded", "unhealthy"] },
+              "indexer_lag_blocks": { "type": "integer" },
+              "rpc_reachable": { "type": "boolean" },
+              "chain_id": { "type": "integer" },
+              "indexed_block": { "type": "integer" }
+            }
+          },
+          "meta": { "$ref": "#/components/schemas/MetaBlock" }
+        }
+      }
+    }
+  }
+}

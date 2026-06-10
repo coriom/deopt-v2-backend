@@ -1659,6 +1659,50 @@ impl PgRepository {
             .collect()
     }
 
+    /// Recent OPTION execution transactions joined with their parent
+    /// intent's `source_type` so the unified list endpoint can populate
+    /// `ExecutorTransactionView.source_type` without an N+1 follow-up
+    /// query. Ordering mirrors `list_recent_execution_transactions`:
+    /// `created_at_ms DESC, transaction_id DESC`.
+    ///
+    /// The intent row should always exist (the broadcast write path
+    /// requires the intent first) — but if a join misses (data drift /
+    /// orphaned tx row), the transaction is still returned with
+    /// `source_type = None` so operators can observe the issue.
+    pub async fn list_recent_option_execution_transactions(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<(OptionExecutionTransaction, Option<String>)>> {
+        let rows = sqlx::query(
+            "SELECT t.transaction_id, t.intent_id, t.onchain_intent_id, t.sender, t.target,
+                    t.calldata, t.value_wei, t.gas_limit, t.tx_hash, t.status, t.error,
+                    t.created_at_ms, t.updated_at_ms,
+                    t.estimated_gas, t.required_gas, t.simulation_gas_limit, t.broadcast_gas_limit,
+                    t.gas_safety_bps, t.gas_check_status, t.gas_check_error,
+                    t.confirmation_status, t.confirmed_at_ms, t.confirmed_block_number,
+                    t.receipt_status, t.confirmation_error,
+                    t.gas_used, t.effective_gas_price, t.cumulative_gas_used,
+                    t.receipt_block_hash, t.receipt_transaction_index, t.receipt_observed_at_ms,
+                    i.source_type AS intent_source_type
+             FROM option_execution_transactions AS t
+             LEFT JOIN option_execution_intents AS i ON i.intent_id = t.intent_id
+             ORDER BY t.created_at_ms DESC, t.transaction_id DESC
+             LIMIT $1",
+        )
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows.into_iter() {
+            let source_type: Option<String> = row_get(&row, "intent_source_type")?;
+            let tx = option_execution_transaction_from_row(row)?;
+            out.push((tx, source_type));
+        }
+        Ok(out)
+    }
+
     pub async fn find_submitted_transaction_by_intent(
         &self,
         intent_id: Uuid,

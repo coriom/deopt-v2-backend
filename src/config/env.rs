@@ -122,6 +122,24 @@ impl AppConfig {
                 "EXECUTOR_ALLOW_LOCAL_SIGNER",
                 "false",
             )?,
+            backend_signer_provider: match lookup("BACKEND_REMOTE_SIGNER_PROVIDER")
+                .filter(|value| !value.is_empty())
+            {
+                Some(value) => Some(
+                    crate::execution::signer_adapters::SignerProviderKind::parse(&value)
+                        .map_err(crate::error::BackendError::Config)?,
+                ),
+                None => None,
+            },
+            backend_signer_timeout_ms: {
+                let value: u32 = parse_env(&mut lookup, "BACKEND_SIGNER_TIMEOUT_MS", "2500")?;
+                if !(100..=30_000).contains(&value) {
+                    return Err(crate::error::BackendError::Config(format!(
+                        "BACKEND_SIGNER_TIMEOUT_MS must be in 100..=30000 (got {value})"
+                    )));
+                }
+                value
+            },
         };
         let indexer = IndexerConfig {
             enabled: parse_env(&mut lookup, "INDEXER_ENABLED", "false")?,
@@ -2185,5 +2203,110 @@ mod tests {
             config.option_event_indexer.protocol_fee_vault_address, None,
             "empty string must be treated as not set, not as a malformed address"
         );
+    }
+
+    #[test]
+    fn backend_remote_signer_provider_absent_yields_none() {
+        let config = config_from_pairs([]).unwrap();
+        assert_eq!(config.execution.backend_signer_provider, None);
+    }
+
+    #[test]
+    fn backend_remote_signer_provider_parses_each_variant() {
+        for (input, expected) in [
+            (
+                "mock",
+                crate::execution::signer_adapters::SignerProviderKind::Mock,
+            ),
+            (
+                "aws_kms",
+                crate::execution::signer_adapters::SignerProviderKind::AwsKms,
+            ),
+            (
+                "turnkey",
+                crate::execution::signer_adapters::SignerProviderKind::Turnkey,
+            ),
+            (
+                "fireblocks",
+                crate::execution::signer_adapters::SignerProviderKind::Fireblocks,
+            ),
+            (
+                "gcp_kms",
+                crate::execution::signer_adapters::SignerProviderKind::GcpKms,
+            ),
+            (
+                "azure_hsm",
+                crate::execution::signer_adapters::SignerProviderKind::AzureHsm,
+            ),
+            (
+                "vendor_agnostic",
+                crate::execution::signer_adapters::SignerProviderKind::VendorAgnostic,
+            ),
+        ] {
+            let config = config_from_pairs([("BACKEND_REMOTE_SIGNER_PROVIDER", input)]).unwrap();
+            assert_eq!(
+                config.execution.backend_signer_provider,
+                Some(expected),
+                "input `{input}` should parse to {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn backend_remote_signer_provider_unknown_value_rejects_at_startup() {
+        let error = config_from_pairs([("BACKEND_REMOTE_SIGNER_PROVIDER", "xxx")]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("invalid BACKEND_REMOTE_SIGNER_PROVIDER"),
+            "expected unknown-vendor rejection, got: {error}"
+        );
+    }
+
+    #[test]
+    fn backend_signer_timeout_ms_default_is_2500() {
+        let config = config_from_pairs([]).unwrap();
+        assert_eq!(config.execution.backend_signer_timeout_ms, 2500);
+    }
+
+    #[test]
+    fn backend_signer_timeout_ms_parses_override() {
+        let config = config_from_pairs([("BACKEND_SIGNER_TIMEOUT_MS", "5000")]).unwrap();
+        assert_eq!(config.execution.backend_signer_timeout_ms, 5000);
+    }
+
+    #[test]
+    fn backend_signer_timeout_ms_rejects_zero() {
+        let error = config_from_pairs([("BACKEND_SIGNER_TIMEOUT_MS", "0")]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("BACKEND_SIGNER_TIMEOUT_MS must be in 100..=30000"),
+            "expected lower-bound rejection, got: {error}"
+        );
+    }
+
+    #[test]
+    fn backend_signer_timeout_ms_rejects_below_floor() {
+        let error = config_from_pairs([("BACKEND_SIGNER_TIMEOUT_MS", "50")]).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("BACKEND_SIGNER_TIMEOUT_MS must be in 100..=30000"));
+    }
+
+    #[test]
+    fn backend_signer_timeout_ms_rejects_above_ceiling() {
+        let error = config_from_pairs([("BACKEND_SIGNER_TIMEOUT_MS", "60000")]).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("BACKEND_SIGNER_TIMEOUT_MS must be in 100..=30000"));
+    }
+
+    #[test]
+    fn backend_signer_timeout_ms_accepts_boundary_values() {
+        let lo = config_from_pairs([("BACKEND_SIGNER_TIMEOUT_MS", "100")]).unwrap();
+        assert_eq!(lo.execution.backend_signer_timeout_ms, 100);
+        let hi = config_from_pairs([("BACKEND_SIGNER_TIMEOUT_MS", "30000")]).unwrap();
+        assert_eq!(hi.execution.backend_signer_timeout_ms, 30000);
     }
 }

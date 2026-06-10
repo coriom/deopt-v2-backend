@@ -95,6 +95,7 @@ NO mainnet broadcast while rebate profiles can create negative
 | Touches | `src/api/routes.rs` route handler; refer to `option_execution_transactions` for option intents (existing legacy `execution_transactions` for perp dry-run path retained) |
 | Test | integration test against Sepolia recent intents; regression test ensures perp intent still returns its row |
 | Auditor anchor | operational UX; not a security finding but auditor expects clean operator-side observability |
+| Posture | **SHIPPED 2026-06-10**. Handler now joins both tables and projects rows onto a unified `ExecutorTransactionView` shape with a `source` discriminator; orderbook + RFQ visibility both pinned by integration tests (incl. live-smoke regression against the exact tx hash). See `docs/OPTION_EXECUTION_TX_VISIBILITY_FIX_RESULT.md`. Follow-on `BACKEND-EXECUTOR-TRANSACTIONS-LIST-EXTEND` (2026-06-10) extended the LIST variant (`GET /executor/transactions`) with the same unified shape; see `docs/BACKEND_EXECUTOR_TRANSACTIONS_LIST_EXTEND_RESULT.md`. |
 
 ---
 

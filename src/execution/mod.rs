@@ -9,6 +9,7 @@ pub mod revert;
 pub mod rpc;
 pub mod runner;
 pub mod signer;
+pub mod signer_adapters;
 pub mod simulator;
 pub mod transaction;
 pub mod tx_builder;

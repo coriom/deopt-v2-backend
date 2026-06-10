@@ -30,6 +30,16 @@
 > unchanged. Remaining `not_tracked_yet` shrunk from 3 to 1
 > (`execution_flags.be_balance_floor_wei` only) — see
 > `docs/BACKEND_LIVE_PROVIDER_EFFECTIVE_PPM_CACHE_RESULT.md`.
+>
+> **Addendum (2026-06-10, follow-on `BACKEND-OBSERVABILITY-BE-BALANCE-FLOOR-EXPOSE` — FINAL):**
+> the 7th + last singleton `chain_state_last_seen.be_balance_floor_wei`
+> is now populated by the `BroadcastObservabilitySnapshot` from the
+> `fund_floor_wei` value computed inside `run_should_broadcast_policy`.
+> (Note: the prior `not_tracked_yet` label said `execution_flags.*` —
+> a docs typo; the field always lived on `chain_state_last_seen`.)
+> `not_tracked_yet` is now **EMPTY** — every documented schema field
+> reports live data. Status logic + redaction contract unchanged. See
+> `docs/BACKEND_OBSERVABILITY_BE_BALANCE_FLOOR_EXPOSE_RESULT.md`.
 
 ## 1. Goal
 

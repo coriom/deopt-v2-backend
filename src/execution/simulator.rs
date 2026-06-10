@@ -257,6 +257,8 @@ mod tests {
             backend_signer_mode: crate::execution::SignerBackendKind::LocalDev,
             backend_signer_endpoint: None,
             executor_allow_local_signer: false,
+            backend_signer_provider: None,
+            backend_signer_timeout_ms: 2500,
         }
     }
 

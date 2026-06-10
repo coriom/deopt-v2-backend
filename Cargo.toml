@@ -4,7 +4,21 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
 
+[features]
+default = []
+# Opt-in feature for the real `aws-sdk-kms`-backed AWS KMS transport.
+# Default builds DO NOT pull the AWS SDK — keeping the dependency
+# graph minimal for non-mainnet operators. Production mainnet
+# deployments enable this feature explicitly via
+# `cargo build --features aws-kms-transport`. See
+# `docs/BACKEND_AWS_KMS_PRODUCTION_TRANSPORT_RESULT.md`.
+aws-kms-transport = ["dep:aws-config", "dep:aws-sdk-kms", "dep:aws-smithy-runtime-api", "dep:aws-smithy-types"]
+
 [dependencies]
+aws-config = { version = "1.5", optional = true, default-features = false, features = ["rustls", "rt-tokio", "behavior-version-latest"] }
+aws-sdk-kms = { version = "1.47", optional = true, default-features = false, features = ["rustls", "rt-tokio", "behavior-version-latest"] }
+aws-smithy-runtime-api = { version = "1.7", optional = true, default-features = false, features = ["client"] }
+aws-smithy-types = { version = "1.2", optional = true, default-features = false }
 axum = "0.7"
 alloy-primitives = "0.7"
 alloy-sol-types = "0.7"
