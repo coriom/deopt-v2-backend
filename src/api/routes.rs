@@ -344,6 +344,7 @@ pub fn router(state: AppState) -> Router {
             post(submit_execution_intent_signatures),
         )
         .route("/executor/status", get(executor_status))
+        .route("/executor/health/v2", get(executor_health_v2))
         .route("/executor/tick", post(executor_tick))
         .route(
             "/executor/simulate/:intent_id",
@@ -1507,6 +1508,10 @@ async fn vault_observability_config(state: &AppState) -> vault_obs::VaultObserva
     let rebate_budget_assets = load_rebate_budget_assets(state).await;
     vault_obs::build_config(
         state.execution_config.rpc_url.clone(),
+        state
+            .option_event_indexer_config
+            .protocol_fee_vault_address
+            .clone(),
         Some(
             state
                 .option_event_indexer_config
@@ -3610,6 +3615,12 @@ async fn executor_status(State(state): State<AppState>) -> Json<crate::execution
     Json(state.execution_config.status())
 }
 
+async fn executor_health_v2(
+    State(state): State<AppState>,
+) -> Json<crate::api::ExecutorHealthV2Response> {
+    Json(crate::api::build_executor_health_v2(&state))
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 struct ExecutorTickResponse {
     #[serde(rename = "pendingSeen")]
@@ -4873,6 +4884,196 @@ mod tests {
         assert!(!body.contains(wallet));
         assert!(!body.contains(tx_hash));
         assert!(!body.contains(uuid));
+    }
+
+    /// `/executor/health/v2` returns HTTP 200 with the canonical
+    /// non-sensitive JSON envelope (status + flags + observability), even
+    /// on a fully-disabled bare state.
+    #[tokio::test]
+    async fn executor_health_v2_returns_200_with_envelope() {
+        let state = AppState::new(EngineState::with_default_markets());
+        let response = router(state)
+            .oneshot(get_request("/executor/health/v2", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["service"]["name"], "deopt-v2-backend");
+        assert_eq!(json["overall_status"], "green");
+        assert!(json["execution_flags"].is_object());
+        assert!(json["signer"].is_object());
+        assert!(json["policy_gate"].is_object());
+        assert!(json["live_provider_config"].is_object());
+        assert!(json["chain_state_last_seen"].is_object());
+        assert!(json["economics_last_seen"].is_object());
+        assert!(json["r5"].is_object());
+        assert!(json["recent_policy_decisions"].is_object());
+        assert!(json["recent_signer_events"].is_object());
+        assert!(json["observability"].is_object());
+        assert!(json["warnings"].is_array());
+        assert!(json["hard_stops"].is_array());
+        assert!(json["not_tracked_yet"].is_array());
+        assert!(json["reasons"].is_array());
+    }
+
+    /// `/executor/health/v2` must never emit any secret. Even when the
+    /// state happens to carry an RPC URL with an embedded token and an
+    /// executor private key in memory (defence-in-depth: those should
+    /// never be present on a hardened mainnet runtime), the JSON output
+    /// must omit them.
+    #[tokio::test]
+    async fn executor_health_v2_does_not_expose_secrets() {
+        let private_key = "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318";
+        let rpc_with_token = "https://rpc.example/sensitive-provider-key";
+        let admin_token = "test-admin-token";
+        let mut state = admin_state(true);
+        state.execution_config.rpc_url = Some(rpc_with_token.to_string());
+        state.execution_config.executor_private_key =
+            Some(PrivateKeySecret::new(private_key.to_string()));
+        state.execution_config.backend_signer_endpoint =
+            Some("https://signer.example/secret-mtls-path".to_string());
+
+        let response = router(state)
+            .oneshot(get_request("/executor/health/v2", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_text(response).await;
+        assert!(!body.contains(private_key));
+        assert!(!body.contains("sensitive-provider-key"));
+        assert!(!body.contains("secret-mtls-path"));
+        assert!(!body.contains(admin_token));
+        // structural assertions
+        assert!(body.contains("\"overall_status\""));
+        assert!(body.contains("\"hard_stops\""));
+    }
+
+    /// `/executor/health/v2` exposes the PFV / FM_V2 / CV `configured`
+    /// booleans so frontend / operator consumers can detect a launch-blocker
+    /// without scraping `/metrics`.
+    #[tokio::test]
+    async fn executor_health_v2_reports_pfv_fm_v2_cv_configured_booleans() {
+        let mut state = AppState::new(EngineState::with_default_markets());
+        state.option_event_indexer_config.protocol_fee_vault_address =
+            Some(AccountId::new("0x00000000000000000000000000000000000000aa"));
+        state.option_event_indexer_config.fees_manager_v2_address =
+            Some(AccountId::new("0x00000000000000000000000000000000000000bb"));
+        state.option_event_indexer_config.collateral_vault_address =
+            AccountId::new("0x00000000000000000000000000000000000000cc");
+
+        let response = router(state)
+            .oneshot(get_request("/executor/health/v2", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(
+            json["live_provider_config"]["protocol_fee_vault_configured"],
+            true
+        );
+        assert_eq!(
+            json["live_provider_config"]["fees_manager_v2_configured"],
+            true
+        );
+        assert_eq!(
+            json["live_provider_config"]["collateral_vault_configured"],
+            true
+        );
+        assert_eq!(
+            json["live_provider_config"]["protocol_fee_vault_address"].as_str(),
+            Some("0x00000000000000000000000000000000000000aa")
+        );
+    }
+
+    /// `/executor/health/v2` lists currently-unimplemented fields in
+    /// `not_tracked_yet` so downstream consumers do not silently miss a
+    /// gap. After BACKEND-OBSERVABILITY-LAST-SINGLETON-FIELDS shipped,
+    /// `signer.last_signer_error_code` / `policy_gate.last_reject_source_type`
+    /// / `policy_gate.econ_data_available_last` MUST no longer appear in
+    /// the array — they are now persisted by the snapshot.
+    #[tokio::test]
+    async fn executor_health_v2_lists_not_tracked_yet_fields() {
+        let state = AppState::new(EngineState::with_default_markets());
+        let response = router(state)
+            .oneshot(get_request("/executor/health/v2", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        let not_tracked = json["not_tracked_yet"]
+            .as_array()
+            .expect("not_tracked_yet must be an array")
+            .iter()
+            .map(|v| v.as_str().unwrap_or("").to_string())
+            .collect::<Vec<_>>();
+        for shipped in [
+            "signer.last_signer_error_code",
+            "policy_gate.last_reject_source_type",
+            "policy_gate.econ_data_available_last",
+            "policy_gate.last_policy_data_failure_type",
+        ] {
+            assert!(
+                !not_tracked.iter().any(|f| f == shipped),
+                "{shipped} should no longer be in not_tracked_yet"
+            );
+        }
+        assert!(not_tracked
+            .iter()
+            .any(|f| f == "economics_last_seen.effective_maker_ppm"));
+        assert!(not_tracked
+            .iter()
+            .any(|f| f == "execution_flags.be_balance_floor_wei"));
+    }
+
+    /// `/executor/health/v2` exposes `policy_gate.last_policy_data_failure_type`
+    /// end-to-end via the HTTP envelope after
+    /// BACKEND-OBSERVABILITY-LAST-POLICY-DATA-FAILURE-SINGLETON shipped.
+    #[tokio::test]
+    async fn executor_health_v2_surfaces_last_policy_data_failure_type() {
+        let state = AppState::new(EngineState::with_default_markets());
+        state.broadcast_observability.record_policy_data_failure(
+            crate::options::broadcast_policy_data::read_type::PFV_REBATE_RESERVE,
+        );
+        let response = router(state)
+            .oneshot(get_request("/executor/health/v2", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(
+            json["policy_gate"]["last_policy_data_failure_type"],
+            "pfv_rebate_reserve"
+        );
+    }
+
+    /// `/executor/health/v2` surfaces the three newly-persisted
+    /// singletons (`last_reject_source_type`, `last_signer_error_code`,
+    /// `econ_data_available_last`) end-to-end via the HTTP envelope.
+    #[tokio::test]
+    async fn executor_health_v2_surfaces_singleton_observability_fields() {
+        let state = AppState::new(EngineState::with_default_markets());
+        // Drive each singleton.
+        state.broadcast_observability.record_policy_rejected(
+            "rebate-reserve",
+            crate::options::types::OptionExecutionSourceType::OptionRfqFill,
+        );
+        state
+            .broadcast_observability
+            .record_signer_denied("kms-timeout", "remote");
+        state
+            .broadcast_observability
+            .record_econ_data_available(true);
+
+        let response = router(state)
+            .oneshot(get_request("/executor/health/v2", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["policy_gate"]["last_reject_code"], "rebate-reserve");
+        assert_eq!(json["policy_gate"]["last_reject_source_type"], "rfq");
+        assert_eq!(json["policy_gate"]["econ_data_available_last"], true);
+        assert_eq!(json["signer"]["last_signer_error_code"], "kms-timeout");
     }
 
     /// V2F-P: the `deopt_perp_fee_charged_v2_total{consumer=...}` metric
@@ -6703,6 +6904,7 @@ mod tests {
             )),
             fees_manager_v2_address: None,
             old_margin_engine_address: None,
+            protocol_fee_vault_address: None,
         };
         let event = route_option_execution_event();
         state
@@ -6794,6 +6996,7 @@ mod tests {
             fees_manager_address: None,
             fees_manager_v2_address: None,
             old_margin_engine_address: None,
+            protocol_fee_vault_address: None,
         };
 
         let response = router(state)
@@ -6828,6 +7031,7 @@ mod tests {
             fees_manager_address: None,
             fees_manager_v2_address: None,
             old_margin_engine_address: None,
+            protocol_fee_vault_address: None,
         };
         let app = router(state.clone());
 

@@ -407,6 +407,32 @@ impl AppConfig {
             optional_env(&mut lookup, "OLD_MARGIN_ENGINE_ADDRESS")
                 .filter(|value| !value.is_empty())
                 .map(AccountId::new);
+        // ProtocolFeeVault address — fed into the runtime
+        // `LiveBroadcastPolicyDataProvider` so `should_broadcast`'s
+        // PFV-side chain reads (`feeBalance(asset)` +
+        // `rebateReserve(asset)`) fire. Defaults to `None` (no
+        // permissive default — `should_broadcast` fails closed on
+        // mainnet when the reserve read is missing).
+        let option_event_indexer_protocol_fee_vault_address =
+            optional_env(&mut lookup, "PROTOCOL_FEE_VAULT_ADDRESS")
+                .or_else(|| {
+                    optional_env(
+                        &mut lookup,
+                        "OPTION_EVENT_INDEXER_PROTOCOL_FEE_VAULT_ADDRESS",
+                    )
+                })
+                .or_else(|| optional_env(&mut lookup, "PROTOCOL_FEE_VAULT"))
+                .filter(|value| !value.is_empty())
+                .map(AccountId::new);
+        // Validate address shape if provided; reject malformed input
+        // at startup so it never reaches the LiveProvider eth_call.
+        if let Some(addr) = option_event_indexer_protocol_fee_vault_address.as_ref() {
+            crate::signing::eip712::parse_evm_address(addr).map_err(|err| {
+                crate::error::BackendError::Config(format!(
+                    "invalid PROTOCOL_FEE_VAULT_ADDRESS: {err}"
+                ))
+            })?;
+        }
         let option_reconciliation = OptionReconciliationConfig {
             enabled: parse_env(&mut lookup, "OPTION_RECONCILIATION_WORKER_ENABLED", "false")?,
             poll_interval_ms: parse_env(
@@ -457,6 +483,7 @@ impl AppConfig {
             fees_manager_address: option_event_indexer_fees_manager_address,
             fees_manager_v2_address: option_event_indexer_fees_manager_v2_address,
             old_margin_engine_address: option_event_indexer_old_margin_engine_address,
+            protocol_fee_vault_address: option_event_indexer_protocol_fee_vault_address,
         };
         let signature_verification_mode =
             parse_env(&mut lookup, "SIGNATURE_VERIFICATION_MODE", "disabled")?;
@@ -2070,5 +2097,93 @@ mod tests {
             .map(|(key, value)| (key.to_string(), value.to_string()))
             .collect();
         AppConfig::from_lookup(|key| values.get(key).cloned())
+    }
+
+    // ----------------------------------------------------------------------------
+    // BACKEND-LIVE-PROVIDER-PFV-CONFIG env-loader tests
+    // ----------------------------------------------------------------------------
+
+    #[test]
+    fn protocol_fee_vault_address_absent_yields_none() {
+        let config = config_from_pairs([]).unwrap();
+        assert_eq!(
+            config
+                .option_event_indexer
+                .protocol_fee_vault_address
+                .as_ref(),
+            None,
+            "no env key set → typed field stays None"
+        );
+    }
+
+    #[test]
+    fn protocol_fee_vault_address_canonical_env_key_parses() {
+        let config = config_from_pairs([(
+            "PROTOCOL_FEE_VAULT_ADDRESS",
+            "0x7C0a3B6feBd5BFFc164f37738299AeB453181886",
+        )])
+        .unwrap();
+        assert!(config
+            .option_event_indexer
+            .protocol_fee_vault_address
+            .is_some());
+    }
+
+    #[test]
+    fn protocol_fee_vault_address_namespaced_env_key_parses() {
+        let config = config_from_pairs([(
+            "OPTION_EVENT_INDEXER_PROTOCOL_FEE_VAULT_ADDRESS",
+            "0x7C0a3B6feBd5BFFc164f37738299AeB453181886",
+        )])
+        .unwrap();
+        assert!(config
+            .option_event_indexer
+            .protocol_fee_vault_address
+            .is_some());
+    }
+
+    #[test]
+    fn protocol_fee_vault_address_short_alias_parses() {
+        let config = config_from_pairs([(
+            "PROTOCOL_FEE_VAULT",
+            "0x7C0a3B6feBd5BFFc164f37738299AeB453181886",
+        )])
+        .unwrap();
+        assert!(config
+            .option_event_indexer
+            .protocol_fee_vault_address
+            .is_some());
+    }
+
+    #[test]
+    fn protocol_fee_vault_address_invalid_hex_rejects() {
+        let error =
+            config_from_pairs([("PROTOCOL_FEE_VAULT_ADDRESS", "not-a-valid-address")]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("invalid PROTOCOL_FEE_VAULT_ADDRESS"),
+            "expected config rejection, got: {error}"
+        );
+    }
+
+    #[test]
+    fn protocol_fee_vault_address_short_hex_rejects() {
+        let error = config_from_pairs([("PROTOCOL_FEE_VAULT_ADDRESS", "0xabc")]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("invalid PROTOCOL_FEE_VAULT_ADDRESS"),
+            "expected length rejection, got: {error}"
+        );
+    }
+
+    #[test]
+    fn protocol_fee_vault_address_empty_string_yields_none() {
+        let config = config_from_pairs([("PROTOCOL_FEE_VAULT_ADDRESS", "")]).unwrap();
+        assert_eq!(
+            config.option_event_indexer.protocol_fee_vault_address, None,
+            "empty string must be treated as not set, not as a malformed address"
+        );
     }
 }

@@ -185,6 +185,41 @@ pub async fn render_metrics(state: &AppState) -> Result<String> {
 fn append_broadcast_observability_metrics(state: &AppState, metrics: &mut MetricsText) {
     let snap = state.broadcast_observability.snapshot();
 
+    // ---- runtime LiveProvider config-state gauges (low cardinality,
+    //      from typed config; complement the vault_observability layer's
+    //      `deopt_protocol_fee_vault_configured` rendered above). ----
+    metrics.gauge(
+        "deopt_option_broadcast_protocol_fee_vault_configured",
+        "1 if PROTOCOL_FEE_VAULT_ADDRESS is configured via OptionEventIndexerConfig and the runtime LiveProvider issues PFV reads. 0 if PFV reads are skipped silently.",
+        bool_value(
+            state
+                .option_event_indexer_config
+                .protocol_fee_vault_address
+                .is_some(),
+        ),
+    );
+    metrics.gauge(
+        "deopt_option_broadcast_fees_manager_v2_configured",
+        "1 if FEES_MANAGER_V2 address is configured and the runtime LiveProvider issues quoteFees + rebateBudget reads.",
+        bool_value(
+            state
+                .option_event_indexer_config
+                .fees_manager_v2_address
+                .is_some(),
+        ),
+    );
+    metrics.gauge(
+        "deopt_option_broadcast_collateral_vault_configured",
+        "1 if COLLATERAL_VAULT address is configured and the runtime LiveProvider issues CV(PFV,asset) reads (used by R5 precheck).",
+        bool_value(
+            !state
+                .option_event_indexer_config
+                .collateral_vault_address
+                .0
+                .is_empty(),
+        ),
+    );
+
     // ---- policy approve / reject counters (as gauges of cumulative count) ----
     metrics.append_labeled_gauge_2(
         "deopt_option_broadcast_policy_approved_total",
@@ -668,6 +703,10 @@ async fn append_protocol_fee_vault_metrics(
     let fallback_assets: Vec<String> = rebate_budget_by_asset.keys().cloned().collect();
     let cfg = vault_obs::build_config(
         state.execution_config.rpc_url.clone(),
+        state
+            .option_event_indexer_config
+            .protocol_fee_vault_address
+            .clone(),
         Some(
             state
                 .option_event_indexer_config

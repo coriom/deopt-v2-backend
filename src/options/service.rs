@@ -1336,8 +1336,15 @@ where
         .option_event_indexer_config
         .fees_manager_v2_address
         .clone();
-    // PFV address — deferred; defaults to None until env wiring lands.
-    let pfv_address: Option<AccountId> = None;
+    // PFV address — sourced from
+    // `OptionEventIndexerConfig::protocol_fee_vault_address`
+    // (`PROTOCOL_FEE_VAULT_ADDRESS` env key). `None` keeps fail-closed
+    // posture: `should_broadcast`'s rebate-reserve hard gate defaults
+    // to 0 on mainnet, rejecting any rebate-positive intent.
+    let pfv_address = state
+        .option_event_indexer_config
+        .protocol_fee_vault_address
+        .clone();
     LiveBroadcastPolicyDataProvider::new(provider, pfv_address, cv_address, fm_v2_address)
         .with_observability(state.broadcast_observability.clone())
 }
@@ -4897,6 +4904,63 @@ mod tests {
             snap.policy_data_failures_total
                 .get(read_type::FM_V2_QUOTE_FEES_RPC),
             Some(&2)
+        );
+    }
+
+    /// Configured PFV address flows through the runtime helper into the
+    /// LiveProvider — failing eth_calls now record `pfv_fee_balance` +
+    /// `pfv_rebate_reserve` failures via the bounded label vocabulary.
+    /// This proves the typed-config plumbing fires the LiveProvider's
+    /// PFV branch instead of the prior milestone's silently-skipped path.
+    #[tokio::test]
+    async fn build_runtime_policy_data_provider_threads_pfv_address_into_live_reads() {
+        let mut state = state_with_broadcast(true);
+        state.option_event_indexer_config.protocol_fee_vault_address =
+            Some(AccountId::new("0x000000000000000000000000000000000000beef"));
+        let provider = MockBroadcastProvider::success();
+        let data_provider = build_runtime_policy_data_provider(&state, provider);
+        let intent = broadcast_ready_intent();
+        let _ = data_provider.gather_inputs(&state, &intent).await.unwrap();
+        let snap = state.broadcast_observability.snapshot();
+        assert_eq!(
+            snap.policy_data_failures_total
+                .get(read_type::PFV_FEE_BALANCE),
+            Some(&1),
+            "PFV configured → feeBalance read attempted; eth_call mock fails → counter increments"
+        );
+        assert_eq!(
+            snap.policy_data_failures_total
+                .get(read_type::PFV_REBATE_RESERVE),
+            Some(&1),
+            "PFV configured → rebateReserve read attempted; eth_call mock fails → counter increments"
+        );
+    }
+
+    /// When PFV address is NOT configured, the runtime helper passes
+    /// `None`; the LiveProvider's PFV branch is silently skipped, so
+    /// neither `pfv_fee_balance` nor `pfv_rebate_reserve` failure
+    /// counters move. Confirms backwards-compat with the prior milestone
+    /// posture (mainnet fail-closed via the default-0 rebate-reserve gate).
+    #[tokio::test]
+    async fn build_runtime_policy_data_provider_skips_pfv_reads_when_address_unset() {
+        let state = state_with_broadcast(true);
+        // Default: state.option_event_indexer_config.protocol_fee_vault_address == None.
+        let provider = MockBroadcastProvider::success();
+        let data_provider = build_runtime_policy_data_provider(&state, provider);
+        let intent = broadcast_ready_intent();
+        let _ = data_provider.gather_inputs(&state, &intent).await.unwrap();
+        let snap = state.broadcast_observability.snapshot();
+        assert!(
+            !snap
+                .policy_data_failures_total
+                .contains_key(read_type::PFV_FEE_BALANCE),
+            "PFV unset → no feeBalance read attempt → no counter increment"
+        );
+        assert!(
+            !snap
+                .policy_data_failures_total
+                .contains_key(read_type::PFV_REBATE_RESERVE),
+            "PFV unset → no rebateReserve read attempt → no counter increment"
         );
     }
 

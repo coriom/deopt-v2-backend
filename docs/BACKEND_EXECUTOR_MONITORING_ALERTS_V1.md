@@ -1,5 +1,12 @@
 # BACKEND_EXECUTOR monitoring + alerts spec — V1
 
+> **Adjunct surface (2026-06-10):** the operator UI / frontend can hit
+> `GET /executor/health/v2` for a non-sensitive JSON summary of the
+> same state surfaced here in Prometheus form. The endpoint exposes
+> `overall_status ∈ {green, yellow, red}` + a `hard_stops` array
+> derived from the §3 paging-alert taxonomy. See
+> `docs/EXECUTOR_HEALTH_ENDPOINT_V2_RESULT.md` for the schema.
+
 **Posture:** specification + reference architecture. Mirrors the
 `ALERTING_SPEC.md` V1B conventions (Prometheus text format at
 `/metrics`, low-cardinality labels only, no secret material in

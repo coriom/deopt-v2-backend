@@ -26,6 +26,12 @@ use crate::options::types::OptionExecutionSourceType;
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
+/// Stable code recorded by [`BroadcastObservability::record_local_signer_on_mainnet_refused`]
+/// as the `last_signer_error_code` singleton. Not part of the
+/// `SignerError::code()` taxonomy because that branch never reaches a
+/// signer — the runtime guard fires before any sign attempt.
+pub const LOCAL_MAINNET_REFUSED_CODE: &str = "local_mainnet_refused";
+
 /// Snapshot returned by [`BroadcastObservability::snapshot`]; used by the
 /// `/metrics` and `/readiness` endpoints to render Prometheus text and
 /// JSON status.
@@ -44,8 +50,39 @@ pub struct BroadcastObservabilitySnapshot {
     pub r5_drift_observed_total: u64,
     pub local_signer_on_mainnet_refused_total: u64,
     pub last_policy_reject_code: Option<String>,
+    /// Source type of the most recent `should_broadcast` rejection — one
+    /// of the bounded `source_type_label` values (`orderbook` | `rfq`).
+    /// Mirrors the cumulative `policy_rejected_total{code, source_type}`
+    /// counter as a "what just happened" singleton for the JSON health
+    /// endpoint. None until the first rejection.
+    pub last_reject_source_type: Option<String>,
+    /// Bounded singleton of the most recent signer error code. Values
+    /// come from one of: (a) `SignerError::code()` (the §4.2 taxonomy:
+    /// `chain-not-allowed` / `kms-timeout` / `transport` / …) when the
+    /// `RemoteSigner::sign_option_execution_tx` future returns Err; (b)
+    /// the literal `"local_mainnet_refused"` when defence-in-depth
+    /// refuses a `LocalDev` signer on mainnet. Never contains endpoint
+    /// URL, credentials, or free-form provider error text. None until
+    /// the first signer error.
+    pub last_signer_error_code: Option<String>,
+    /// Bounded singleton of the most recent live-provider read failure
+    /// `read_type` — exactly the same value populated into the
+    /// `policy_data_failures_total{read_type}` counter, which comes
+    /// from the hardcoded `crate::options::broadcast_policy_data::read_type`
+    /// constants taxonomy (`be_balance` / `ome_paused` /
+    /// `pfv_rebate_reserve` / `fm_v2_quote_fees_rpc` / …). Never
+    /// carries a raw error message, RPC URL, calldata, provider
+    /// endpoint, intent_id, or contract address. None until the first
+    /// failure.
+    pub last_policy_data_failure_type: Option<String>,
     pub last_signer_kind: Option<String>,
     pub last_broadcast_submitted_ms: Option<i64>,
+    /// Most recent `econ_data_available` decision for the policy
+    /// context. `Some(true)` means `fee_split`, `fm_v2_rebate_budget`,
+    /// and `pfv_rebate_reserve` were all observed for the broadcast
+    /// attempt; `Some(false)` means boundary mode was used. `None`
+    /// until the first attempt.
+    pub econ_data_available_last: Option<bool>,
     pub last_be_balance_wei: Option<u128>,
     pub last_ome_paused: Option<bool>,
     pub last_ome_is_executor: Option<bool>,
@@ -72,8 +109,12 @@ struct BroadcastObservabilityInner {
     r5_drift_observed: u64,
     local_signer_on_mainnet_refused: u64,
     last_policy_reject_code: Option<String>,
+    last_reject_source_type: Option<String>,
+    last_signer_error_code: Option<String>,
+    last_policy_data_failure_type: Option<String>,
     last_signer_kind: Option<String>,
     last_broadcast_submitted_ms: Option<i64>,
+    econ_data_available_last: Option<bool>,
     last_be_balance_wei: Option<u128>,
     last_ome_paused: Option<bool>,
     last_ome_is_executor: Option<bool>,
@@ -114,8 +155,12 @@ impl BroadcastObservability {
             r5_drift_observed_total: inner.r5_drift_observed,
             local_signer_on_mainnet_refused_total: inner.local_signer_on_mainnet_refused,
             last_policy_reject_code: inner.last_policy_reject_code.clone(),
+            last_reject_source_type: inner.last_reject_source_type.clone(),
+            last_signer_error_code: inner.last_signer_error_code.clone(),
+            last_policy_data_failure_type: inner.last_policy_data_failure_type.clone(),
             last_signer_kind: inner.last_signer_kind.clone(),
             last_broadcast_submitted_ms: inner.last_broadcast_submitted_ms,
+            econ_data_available_last: inner.econ_data_available_last,
             last_be_balance_wei: inner.last_be_balance_wei,
             last_ome_paused: inner.last_ome_paused,
             last_ome_is_executor: inner.last_ome_is_executor,
@@ -140,9 +185,10 @@ impl BroadcastObservability {
         let source = source_type_label(source_type);
         *inner
             .policy_rejected
-            .entry((code_norm.clone(), source))
+            .entry((code_norm.clone(), source.clone()))
             .or_insert(0) += 1;
         inner.last_policy_reject_code = Some(code_norm);
+        inner.last_reject_source_type = Some(source);
     }
 
     pub fn record_signer_attempt(&self, signer_kind: &str) {
@@ -163,13 +209,18 @@ impl BroadcastObservability {
         let mut inner = self.inner.lock().expect("broadcast observability poisoned");
         let code_norm = sanitize_label(code);
         let kind = sanitize_label(signer_kind);
-        *inner.signer_denied.entry((code_norm, kind)).or_insert(0) += 1;
+        *inner
+            .signer_denied
+            .entry((code_norm.clone(), kind))
+            .or_insert(0) += 1;
+        inner.last_signer_error_code = Some(code_norm);
     }
 
     pub fn record_policy_data_failure(&self, read_type: &str) {
         let mut inner = self.inner.lock().expect("broadcast observability poisoned");
         let key = sanitize_label(read_type);
-        *inner.policy_data_failures.entry(key).or_insert(0) += 1;
+        *inner.policy_data_failures.entry(key.clone()).or_insert(0) += 1;
+        inner.last_policy_data_failure_type = Some(key);
     }
 
     pub fn record_econ_data_available(&self, available: bool) {
@@ -179,6 +230,7 @@ impl BroadcastObservability {
         } else {
             inner.econ_data_available_false += 1;
         }
+        inner.econ_data_available_last = Some(available);
     }
 
     pub fn record_fm_v2_decode_failure(&self) {
@@ -199,6 +251,11 @@ impl BroadcastObservability {
     pub fn record_local_signer_on_mainnet_refused(&self) {
         let mut inner = self.inner.lock().expect("broadcast observability poisoned");
         inner.local_signer_on_mainnet_refused += 1;
+        // Surface the refusal via the `last_signer_error_code` singleton
+        // so the JSON health endpoint reflects the most-recent signer
+        // event even though this branch never calls `record_signer_denied`
+        // (it never contacted a signer — the runtime guard fired first).
+        inner.last_signer_error_code = Some(LOCAL_MAINNET_REFUSED_CODE.to_string());
     }
 
     /// Persist the most recent live-read snapshot for use by readiness +
@@ -428,5 +485,158 @@ mod tests {
         obs.record_local_signer_on_mainnet_refused();
         let snap = obs.snapshot();
         assert_eq!(snap.local_signer_on_mainnet_refused_total, 2);
+    }
+
+    #[test]
+    fn reject_stores_last_reject_source_type_singleton() {
+        let obs = BroadcastObservability::new();
+        assert_eq!(obs.snapshot().last_reject_source_type, None);
+        obs.record_policy_rejected("rebate-reserve", OptionExecutionSourceType::OptionRfqFill);
+        assert_eq!(
+            obs.snapshot().last_reject_source_type.as_deref(),
+            Some("rfq")
+        );
+        // most-recent overrides earlier
+        obs.record_policy_rejected(
+            "negative-effective-ppm",
+            OptionExecutionSourceType::OptionOrderbookFill,
+        );
+        let snap = obs.snapshot();
+        assert_eq!(snap.last_reject_source_type.as_deref(), Some("orderbook"));
+        assert_eq!(
+            snap.last_policy_reject_code.as_deref(),
+            Some("negative-effective-ppm")
+        );
+    }
+
+    #[test]
+    fn signer_denied_stores_last_signer_error_code_singleton() {
+        let obs = BroadcastObservability::new();
+        assert_eq!(obs.snapshot().last_signer_error_code, None);
+        obs.record_signer_denied("kms-timeout", "remote");
+        assert_eq!(
+            obs.snapshot().last_signer_error_code.as_deref(),
+            Some("kms-timeout")
+        );
+        // most-recent overrides earlier
+        obs.record_signer_denied("transport", "remote");
+        assert_eq!(
+            obs.snapshot().last_signer_error_code.as_deref(),
+            Some("transport")
+        );
+    }
+
+    #[test]
+    fn local_mainnet_refusal_sets_last_signer_error_code() {
+        let obs = BroadcastObservability::new();
+        obs.record_local_signer_on_mainnet_refused();
+        assert_eq!(
+            obs.snapshot().last_signer_error_code.as_deref(),
+            Some(LOCAL_MAINNET_REFUSED_CODE)
+        );
+        assert_eq!(obs.snapshot().local_signer_on_mainnet_refused_total, 1);
+    }
+
+    #[test]
+    fn signer_error_code_remains_bounded_under_arbitrary_input() {
+        let obs = BroadcastObservability::new();
+        // a maliciously-shaped code carrying an endpoint-like URL is
+        // sanitised by the existing `sanitize_label` (strips `@` and
+        // most non-alnum, caps to 48 chars). Pins the redaction
+        // contract for the singleton.
+        obs.record_signer_denied("https://signer.invalid/secret?token=abcdef", "remote");
+        let code = obs
+            .snapshot()
+            .last_signer_error_code
+            .expect("singleton populated");
+        assert!(!code.contains('@'));
+        assert!(!code.contains('?'));
+        assert!(code.len() <= 48);
+    }
+
+    #[test]
+    fn policy_data_failure_stores_last_failure_type_singleton() {
+        let obs = BroadcastObservability::new();
+        assert_eq!(obs.snapshot().last_policy_data_failure_type, None);
+        obs.record_policy_data_failure(
+            crate::options::broadcast_policy_data::read_type::FM_V2_QUOTE_FEES_RPC,
+        );
+        assert_eq!(
+            obs.snapshot().last_policy_data_failure_type.as_deref(),
+            Some("fm_v2_quote_fees_rpc")
+        );
+        // counter still increments alongside the singleton
+        assert_eq!(
+            obs.snapshot()
+                .policy_data_failures_total
+                .get("fm_v2_quote_fees_rpc"),
+            Some(&1)
+        );
+    }
+
+    #[test]
+    fn policy_data_failure_singleton_overwrites_with_most_recent() {
+        let obs = BroadcastObservability::new();
+        obs.record_policy_data_failure(
+            crate::options::broadcast_policy_data::read_type::PFV_REBATE_RESERVE,
+        );
+        obs.record_policy_data_failure(
+            crate::options::broadcast_policy_data::read_type::OME_PAUSED,
+        );
+        obs.record_policy_data_failure(
+            crate::options::broadcast_policy_data::read_type::FM_V2_QUOTE_FEES_DECODE,
+        );
+        let snap = obs.snapshot();
+        assert_eq!(
+            snap.last_policy_data_failure_type.as_deref(),
+            Some("fm_v2_quote_fees_decode")
+        );
+        // each cumulative counter still records its own bucket
+        assert_eq!(
+            snap.policy_data_failures_total.get("pfv_rebate_reserve"),
+            Some(&1)
+        );
+        assert_eq!(snap.policy_data_failures_total.get("ome_paused"), Some(&1));
+        assert_eq!(
+            snap.policy_data_failures_total
+                .get("fm_v2_quote_fees_decode"),
+            Some(&1)
+        );
+    }
+
+    #[test]
+    fn policy_data_failure_singleton_remains_bounded_under_arbitrary_input() {
+        // Defence-in-depth: even if a caller passed a URL-shaped or
+        // address-shaped string into record_policy_data_failure (which
+        // they should not — the production code uses only the
+        // hardcoded `read_type::*` constants), `sanitize_label` strips
+        // URL punctuation + caps to 48 chars so the singleton can never
+        // surface a routable endpoint or 0x-address.
+        let obs = BroadcastObservability::new();
+        obs.record_policy_data_failure("https://rpc.example/sensitive-provider-key?token=abc");
+        let value = obs
+            .snapshot()
+            .last_policy_data_failure_type
+            .expect("singleton populated");
+        assert!(!value.contains("://"));
+        assert!(!value.contains('/'));
+        assert!(!value.contains('?'));
+        assert!(!value.contains('='));
+        assert!(!value.contains('.'));
+        assert!(value.len() <= 48);
+    }
+
+    #[test]
+    fn econ_data_available_last_reflects_most_recent_decision() {
+        let obs = BroadcastObservability::new();
+        assert_eq!(obs.snapshot().econ_data_available_last, None);
+        obs.record_econ_data_available(true);
+        assert_eq!(obs.snapshot().econ_data_available_last, Some(true));
+        obs.record_econ_data_available(false);
+        let snap = obs.snapshot();
+        assert_eq!(snap.econ_data_available_last, Some(false));
+        // cumulative counters still increment alongside the singleton
+        assert_eq!(snap.econ_data_available_true_total, 1);
+        assert_eq!(snap.econ_data_available_false_total, 1);
     }
 }

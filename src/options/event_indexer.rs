@@ -76,6 +76,17 @@ pub struct OptionEventIndexerConfig {
     /// execution traffic. `None` means "OLD address not configured"
     /// and any unmatched OPTION consumer is bucketed as `"unknown"`.
     pub old_margin_engine_address: Option<AccountId>,
+    /// Optional address of the deployed
+    /// [`ProtocolFeeVault`](https://...) contract. When `Some(...)`,
+    /// the runtime [`LiveBroadcastPolicyDataProvider`] issues
+    /// `feeBalance(asset)` + `rebateReserve(asset)` reads against this
+    /// address, populating `pfv_fee_balance_asset` /
+    /// `pfv_rebate_reserve_asset` in
+    /// [`BroadcastPolicyInputs`]. `None` keeps both fields `None` →
+    /// mainnet fail-closed via the `should_broadcast` chain-state gates
+    /// (specifically the Cluster 4 launch-invariant
+    /// `policy:rebate-reserve` reject which defaults to 0 when missing).
+    pub protocol_fee_vault_address: Option<AccountId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -100,6 +111,7 @@ impl OptionEventIndexerConfig {
             fees_manager_address: None,
             fees_manager_v2_address: None,
             old_margin_engine_address: None,
+            protocol_fee_vault_address: None,
         }
     }
 
@@ -2559,6 +2571,7 @@ mod tests {
             )),
             fees_manager_v2_address: None,
             old_margin_engine_address: None,
+            protocol_fee_vault_address: None,
         };
         let roles: Vec<String> = config
             .emitter_contracts()
@@ -2815,6 +2828,7 @@ mod tests {
             fees_manager_address: None,
             fees_manager_v2_address: None,
             old_margin_engine_address: None,
+            protocol_fee_vault_address: None,
         };
         state
     }

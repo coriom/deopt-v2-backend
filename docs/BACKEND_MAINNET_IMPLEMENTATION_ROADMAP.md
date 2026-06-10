@@ -73,6 +73,19 @@ NO mainnet broadcast while rebate profiles can create negative
 | Synthetic-fire test | quarterly drill — MON-8 |
 | Auditor anchor | Q-37 (Cluster 4 operator allowlist) + monitoring closure for minimum-pass §10 |
 
+### 1.4.1 `EXECUTOR-HEALTH-ENDPOINT-V2` (operator-side JSON summary)
+
+| Aspect | Value |
+|---|---|
+| Source spec | this doc §1.4 + `BACKEND_EXECUTOR_MONITORING_ALERTS_V1.md` + `BACKEND_VAULT_OBSERVABILITY_USE_TYPED_CONFIG_RESULT.md` next-milestone recommendation |
+| Output | `GET /executor/health/v2` — non-sensitive JSON envelope for admin UI / frontend / operator consumers that cannot scrape Prometheus |
+| Touches | new `src/api/executor_health_v2.rs`; `src/api/routes.rs` (route + handler + 4 integration tests) |
+| Schema | groups: service / execution_flags / signer / policy_gate / live_provider_config / chain_state_last_seen / economics_last_seen / r5 / recent_policy_decisions / recent_signer_events / observability / warnings / hard_stops / not_tracked_yet / overall_status / reasons |
+| Status logic | green / yellow / red; red is reserved for custody-policy hard stops (mainnet local-signer attempt, mainnet env-key seated, OME paused, BE not executor, R5 drift) |
+| Secret-safety | redaction unit + integration tests pin the contract that no private key, RPC URL, signer endpoint, or admin token can appear |
+| Auditor anchor | non-launch-critical; closes the operator-UX gap from §1.4 (Prometheus-only consumers had no admin/frontend JSON path) |
+| Posture | SHIPPED 2026-06-10 — 926 / 926 backend tests green; see `docs/EXECUTOR_HEALTH_ENDPOINT_V2_RESULT.md` |
+
 ### 1.5 `OPTION-EXECUTION-TX-VISIBILITY-FIX`
 
 | Aspect | Value |

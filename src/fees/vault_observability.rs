@@ -113,19 +113,33 @@ impl VaultObservabilityConfig {
     }
 }
 
-/// Read configuration from process env. Pure: no chain calls, no
-/// allocations beyond the returned struct. Falls back to the rebate
-/// budget asset list when `PROTOCOL_FEE_VAULT_RECONCILIATION_ASSETS`
-/// is unset.
+/// Build the vault-observability config from typed inputs supplied by
+/// the caller. The PFV address is now received as a `protocol_fee_vault_address`
+/// parameter — sourced upstream from
+/// `OptionEventIndexerConfig::protocol_fee_vault_address`
+/// (`PROTOCOL_FEE_VAULT_ADDRESS` env key, parsed + validated at the
+/// canonical env loader). Pure: no chain calls, no allocations beyond
+/// the returned struct.
+///
+/// The `PROTOCOL_FEE_VAULT_RECONCILIATION_ASSETS` env var still drives
+/// the asset list (an observability-scan-only knob — not a chain-side
+/// launch-invariant input), with `fallback_assets` taking effect when
+/// the env var is unset. This single remaining env read is decoupled
+/// from the broadcast policy chain-side reads.
 pub fn build_config(
     rpc_url: Option<String>,
+    protocol_fee_vault_address: Option<AccountId>,
     collateral_vault_address: Option<AccountId>,
     fees_manager_v2_address: Option<AccountId>,
     fallback_assets: Vec<String>,
 ) -> VaultObservabilityConfig {
-    let vault_address = std::env::var("PROTOCOL_FEE_VAULT_ADDRESS")
-        .ok()
-        .and_then(|v| sanitize_address(&v));
+    // Normalise the caller-supplied PFV address through the same
+    // `sanitize_address` helper used previously so behaviour for
+    // mixed-case / unprefixed input matches the prior env-var read.
+    let vault_address = protocol_fee_vault_address
+        .as_ref()
+        .map(|addr| addr.0.as_str())
+        .and_then(sanitize_address);
 
     let asset_strings = std::env::var("PROTOCOL_FEE_VAULT_RECONCILIATION_ASSETS")
         .ok()
@@ -860,11 +874,12 @@ mod tests {
 
     #[test]
     fn build_config_pulls_assets_from_env_then_falls_back() {
-        // Unset both env vars first.
-        std::env::remove_var("PROTOCOL_FEE_VAULT_ADDRESS");
+        // Vault address is now a typed parameter; the asset env var is
+        // still the only direct env read remaining in `build_config`.
         std::env::remove_var("PROTOCOL_FEE_VAULT_RECONCILIATION_ASSETS");
         let cfg = build_config(
             Some("http://rpc".to_string()),
+            None,
             None,
             None,
             vec!["0x6eAe407f5640B006faC9965182e238582A3B412E".to_string()],
@@ -876,6 +891,57 @@ mod tests {
             "0x6eae407f5640b006fac9965182e238582a3b412e"
         );
         assert!(!cfg.is_configured());
+    }
+
+    #[test]
+    fn build_config_receives_typed_pfv_address_from_caller() {
+        std::env::remove_var("PROTOCOL_FEE_VAULT_RECONCILIATION_ASSETS");
+        let pfv = AccountId::new("0x7c0a3b6febd5bffc164f37738299aeb453181886");
+        let cfg = build_config(
+            Some("http://rpc".to_string()),
+            Some(pfv.clone()),
+            None,
+            None,
+            vec!["0x6eAe407f5640B006faC9965182e238582A3B412E".to_string()],
+        );
+        assert!(cfg.is_configured());
+        assert_eq!(
+            cfg.vault_address.as_ref().map(|a| a.0.as_str()),
+            Some("0x7c0a3b6febd5bffc164f37738299aeb453181886")
+        );
+    }
+
+    #[test]
+    fn build_config_typed_pfv_address_is_normalised_to_lowercase() {
+        std::env::remove_var("PROTOCOL_FEE_VAULT_RECONCILIATION_ASSETS");
+        // Caller supplies a mixed-case address; `build_config` normalises
+        // via the same `sanitize_address` helper used previously.
+        let mixed_case = AccountId::new("0x7C0a3B6feBd5BFFc164f37738299AeB453181886");
+        let cfg = build_config(None, Some(mixed_case), None, None, vec![]);
+        assert_eq!(
+            cfg.vault_address.as_ref().map(|a| a.0.as_str()),
+            Some("0x7c0a3b6febd5bffc164f37738299aeb453181886"),
+            "build_config must normalise the typed PFV address through sanitize_address"
+        );
+    }
+
+    #[test]
+    fn build_config_ignores_legacy_protocol_fee_vault_address_env_var() {
+        // Defence-in-depth: even if `PROTOCOL_FEE_VAULT_ADDRESS` is set
+        // in the process env at runtime, `build_config` must use the
+        // typed parameter — never the env var directly. This pins the
+        // single-source-of-truth contract.
+        std::env::set_var(
+            "PROTOCOL_FEE_VAULT_ADDRESS",
+            "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+        );
+        std::env::remove_var("PROTOCOL_FEE_VAULT_RECONCILIATION_ASSETS");
+        let cfg = build_config(Some("http://rpc".to_string()), None, None, None, vec![]);
+        assert!(
+            cfg.vault_address.is_none(),
+            "must NOT read from PROTOCOL_FEE_VAULT_ADDRESS env var"
+        );
+        std::env::remove_var("PROTOCOL_FEE_VAULT_ADDRESS");
     }
 
     #[test]
