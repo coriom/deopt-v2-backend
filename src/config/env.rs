@@ -1,4 +1,5 @@
 use crate::admin::{AdminConfig, MetricsConfig};
+use crate::api::trading_views::TradingViewsConfig;
 use crate::confirmation::ConfirmationConfig;
 use crate::error::{BackendError, Result};
 use crate::execution::{ExecutionConfig, PrivateKeySecret};
@@ -43,6 +44,12 @@ pub struct AppConfig {
     pub eip712_domain: Eip712Domain,
     pub persistence_enabled: bool,
     pub database_url: Option<String>,
+    /// M-P2e — Optional public contract addresses for the read-only
+    /// trading_views surface. All fields are optional; missing addresses
+    /// route the trading handlers to the M-P2b partial-data path.
+    /// Malformed addresses fail config validation at startup with a
+    /// clear `BackendError::Config`.
+    pub trading_views: TradingViewsConfig,
 }
 
 impl AppConfig {
@@ -541,6 +548,33 @@ impl AppConfig {
         admin.validate_startup()?;
         metrics.validate_startup(&admin)?;
 
+        // M-P2e — Optional public contract addresses for the
+        // read-only trading_views surface. Disabled by default;
+        // upgrades handler envelopes to "ok" when configured.
+        // NEVER touches signer / AWS / KMS / broadcast paths.
+        let trading_views = TradingViewsConfig {
+            margin_engine_lens_address: parse_optional_address_env(
+                &mut lookup,
+                "OPTION_MARGIN_ENGINE_LENS_ADDRESS",
+            )?,
+            collateral_vault_views_address: parse_optional_address_env(
+                &mut lookup,
+                "OPTION_COLLATERAL_VAULT_VIEWS_ADDRESS",
+            )?,
+            collateral_vault_address: parse_optional_address_env(
+                &mut lookup,
+                "OPTION_COLLATERAL_VAULT_ADDRESS",
+            )?,
+            oracle_router_address: parse_optional_address_env(
+                &mut lookup,
+                "OPTION_ORACLE_ROUTER_ADDRESS",
+            )?,
+            margin_engine_address: parse_optional_address_env(
+                &mut lookup,
+                "OPTION_MARGIN_ENGINE_ADDRESS",
+            )?,
+        };
+
         Ok(Self {
             host,
             port,
@@ -567,6 +601,7 @@ impl AppConfig {
             eip712_domain,
             persistence_enabled,
             database_url,
+            trading_views,
         })
     }
 
@@ -583,6 +618,40 @@ fn get_env(lookup: &mut impl FnMut(&str) -> Option<String>, key: &str, default: 
 
 fn optional_env(lookup: &mut impl FnMut(&str) -> Option<String>, key: &str) -> Option<String> {
     lookup(key).filter(|value| !value.is_empty())
+}
+
+/// M-P2e — Parse an optional EVM address env var. Empty / unset →
+/// `Ok(None)`. Malformed → `Err(BackendError::Config(…))` with a
+/// human-readable reason that NEVER reveals the configured value.
+///
+/// Accepts canonical `0x` + 40-hex-char addresses, case-insensitive.
+fn parse_optional_address_env(
+    lookup: &mut impl FnMut(&str) -> Option<String>,
+    key: &str,
+) -> Result<Option<AccountId>> {
+    let Some(raw) = optional_env(lookup, key) else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    let hex = trimmed.strip_prefix("0x").ok_or_else(|| {
+        BackendError::Config(format!(
+            "{key} must be a 0x-prefixed EVM address (40 hex chars)"
+        ))
+    })?;
+    if hex.len() != 40 {
+        return Err(BackendError::Config(format!(
+            "{key} must have exactly 40 hex characters after the 0x prefix"
+        )));
+    }
+    if !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(BackendError::Config(format!(
+            "{key} contains non-hex characters"
+        )));
+    }
+    Ok(Some(AccountId::new(format!(
+        "0x{}",
+        hex.to_ascii_lowercase()
+    ))))
 }
 
 fn parse_env<T>(
@@ -2115,6 +2184,159 @@ mod tests {
             .map(|(key, value)| (key.to_string(), value.to_string()))
             .collect();
         AppConfig::from_lookup(|key| values.get(key).cloned())
+    }
+
+    // ----------------------------------------------------------------------------
+    // M-P2e env-loader tests — TradingViewsConfig
+    // ----------------------------------------------------------------------------
+
+    #[test]
+    fn trading_views_addresses_all_absent_yields_disabled_config() {
+        let config = config_from_pairs([]).unwrap();
+        assert_eq!(config.trading_views, TradingViewsConfig::disabled());
+        assert!(config.trading_views.margin_engine_lens_address.is_none());
+        assert!(config
+            .trading_views
+            .collateral_vault_views_address
+            .is_none());
+        assert!(config.trading_views.collateral_vault_address.is_none());
+        assert!(config.trading_views.oracle_router_address.is_none());
+        assert!(config.trading_views.margin_engine_address.is_none());
+    }
+
+    #[test]
+    fn trading_views_addresses_all_present_parsed_to_lowercase_canonical_form() {
+        let config = config_from_pairs([
+            (
+                "OPTION_MARGIN_ENGINE_LENS_ADDRESS",
+                "0xAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAa",
+            ),
+            (
+                "OPTION_COLLATERAL_VAULT_VIEWS_ADDRESS",
+                "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            ),
+            (
+                "OPTION_COLLATERAL_VAULT_ADDRESS",
+                "0xCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+            ),
+            (
+                "OPTION_ORACLE_ROUTER_ADDRESS",
+                "0xdddddddddddddddddddddddddddddddddddddddd",
+            ),
+            (
+                "OPTION_MARGIN_ENGINE_ADDRESS",
+                "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            ),
+        ])
+        .unwrap();
+        assert_eq!(
+            config
+                .trading_views
+                .margin_engine_lens_address
+                .as_ref()
+                .unwrap()
+                .0,
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(
+            config
+                .trading_views
+                .collateral_vault_views_address
+                .as_ref()
+                .unwrap()
+                .0,
+            "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        );
+        assert_eq!(
+            config
+                .trading_views
+                .collateral_vault_address
+                .as_ref()
+                .unwrap()
+                .0,
+            "0xcccccccccccccccccccccccccccccccccccccccc"
+        );
+        assert_eq!(
+            config
+                .trading_views
+                .oracle_router_address
+                .as_ref()
+                .unwrap()
+                .0,
+            "0xdddddddddddddddddddddddddddddddddddddddd"
+        );
+        assert_eq!(
+            config
+                .trading_views
+                .margin_engine_address
+                .as_ref()
+                .unwrap()
+                .0,
+            "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        );
+    }
+
+    #[test]
+    fn trading_views_address_missing_0x_prefix_rejected() {
+        let err = config_from_pairs([(
+            "OPTION_MARGIN_ENGINE_LENS_ADDRESS",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )])
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("OPTION_MARGIN_ENGINE_LENS_ADDRESS"));
+        assert!(err.to_string().contains("0x-prefixed"));
+    }
+
+    #[test]
+    fn trading_views_address_wrong_length_rejected() {
+        let err = config_from_pairs([("OPTION_ORACLE_ROUTER_ADDRESS", "0xabc")]).unwrap_err();
+        assert!(err.to_string().contains("40 hex characters"));
+    }
+
+    #[test]
+    fn trading_views_address_non_hex_character_rejected() {
+        let err = config_from_pairs([(
+            "OPTION_COLLATERAL_VAULT_ADDRESS",
+            "0xzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+        )])
+        .unwrap_err();
+        assert!(err.to_string().contains("non-hex"));
+    }
+
+    #[test]
+    fn trading_views_empty_string_treated_as_absent() {
+        let config = config_from_pairs([
+            ("OPTION_MARGIN_ENGINE_LENS_ADDRESS", ""),
+            ("OPTION_COLLATERAL_VAULT_ADDRESS", ""),
+        ])
+        .unwrap();
+        assert!(config.trading_views.margin_engine_lens_address.is_none());
+        assert!(config.trading_views.collateral_vault_address.is_none());
+    }
+
+    #[test]
+    fn trading_views_partial_config_only_populates_supplied_fields() {
+        let config = config_from_pairs([(
+            "OPTION_ORACLE_ROUTER_ADDRESS",
+            "0x1234567890abcdef1234567890abcdef12345678",
+        )])
+        .unwrap();
+        assert!(config.trading_views.oracle_router_address.is_some());
+        assert!(config.trading_views.margin_engine_lens_address.is_none());
+        assert!(config.trading_views.collateral_vault_address.is_none());
+    }
+
+    #[test]
+    fn trading_views_error_message_never_echoes_the_configured_value() {
+        // Defence-in-depth: a malformed key must never leak its contents
+        // into the error string (since logs may capture startup errors).
+        let secret = "0xCAFEBABECAFEBABECAFEBABECAFEBABECAFEBABEzz"; // last two chars non-hex
+        let err = config_from_pairs([("OPTION_MARGIN_ENGINE_ADDRESS", secret)]).unwrap_err();
+        let msg = err.to_string();
+        assert!(!msg.contains("CAFEBABE"));
+        assert!(!msg.contains(secret));
     }
 
     // ----------------------------------------------------------------------------

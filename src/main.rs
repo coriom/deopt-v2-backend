@@ -90,6 +90,7 @@ async fn main() -> deopt_v2_backend::Result<()> {
     state.fees_config = config.fees.clone();
     state.admin_config = config.admin.clone();
     state.metrics_config = config.metrics.clone();
+    state.trading_views = config.trading_views.clone();
     let app = router(state.clone());
 
     if config.execution.execution_enabled && config.execution.dry_run {

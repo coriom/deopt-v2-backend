@@ -47,12 +47,17 @@ use alloy_sol_types::{sol, SolCall};
 /// inside `AppState` with all-`None` defaults; operator-side wiring
 /// from env vars lands with `M-P2d` once the per-deploy address
 /// inventory is finalised. M-P2c provides the type + behaviour only.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TradingViewsConfig {
     pub margin_engine_lens_address: Option<AccountId>,
     pub collateral_vault_views_address: Option<AccountId>,
     pub collateral_vault_address: Option<AccountId>,
     pub oracle_router_address: Option<AccountId>,
+    /// M-P2e — Address of the MarginEngine contract passed as the
+    /// `marginEngine` parameter to lens read functions. The lens
+    /// itself lives at `margin_engine_lens_address`; this is the
+    /// engine the lens is reading from.
+    pub margin_engine_address: Option<AccountId>,
 }
 
 impl TradingViewsConfig {
@@ -93,11 +98,22 @@ sol! {
     function getFeed(address baseAsset, address quoteAsset) external view returns (bytes memory);
 
     function hasActiveFeed(address baseAsset, address quoteAsset) external view returns (bool);
+
+    // OracleRouter — read-only, fail-fast price probe. Reverts if the
+    // feed is stale or missing; selector 0x63851ea3 verified against
+    // the frozen ABI. Returns a single uint256 mark price scaled by
+    // the underlying feed's decimals (typically 1e8 for chain-link
+    // style feeds).
+    function getPriceSafe(address baseAsset, address quoteAsset) external view returns (uint256);
 }
 
 // ---------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------
+
+pub fn address_from_account(a: &AccountId) -> Option<Address> {
+    account_to_address(a)
+}
 
 fn account_to_address(a: &AccountId) -> Option<Address> {
     a.0.strip_prefix("0x").and_then(|hex| {
@@ -178,6 +194,200 @@ pub async fn try_get_balance<P: EthCallProvider>(
         .await
         .map_err(|e| format!("eth_call failed: {e}"))?;
     let decoded = balancesCall::abi_decode_returns(&success.output, true)
+        .map_err(|e| format!("decode failed: {e}"))?;
+    Ok(Some(decoded._0))
+}
+
+/// MarginEngineLens.getAccountState — read-only account snapshot
+/// (equity / IM / MM / free collateral). Returns the encoded bytes; the
+/// caller's interpretation may be a thin pass-through if the
+/// downstream consumer prefers the raw on-chain shape.
+pub async fn try_get_account_state<P: EthCallProvider>(
+    cfg: &TradingViewsConfig,
+    from: &AccountId,
+    margin_engine: Address,
+    trader: Address,
+    provider: &P,
+) -> Result<Option<Vec<u8>>, String> {
+    let Some(lens_addr) = cfg.margin_engine_lens_address.as_ref() else {
+        return Ok(None);
+    };
+    let req = EthCallRequest {
+        from: from.clone(),
+        to: lens_addr.clone(),
+        data: getAccountStateCall {
+            marginEngine: margin_engine,
+            trader,
+        }
+        .abi_encode(),
+        value: 0,
+        gas_limit: None,
+    };
+    let success = provider
+        .eth_call(req)
+        .await
+        .map_err(|e| format!("eth_call failed: {e}"))?;
+    Ok(Some(success.output))
+}
+
+/// MarginEngineLens.previewAccountSettlement — read-only payoff /
+/// settlement preview for a single account-series tuple.
+pub async fn try_preview_account_settlement<P: EthCallProvider>(
+    cfg: &TradingViewsConfig,
+    from: &AccountId,
+    margin_engine: Address,
+    option_id: U256,
+    trader: Address,
+    provider: &P,
+) -> Result<Option<Vec<u8>>, String> {
+    let Some(lens_addr) = cfg.margin_engine_lens_address.as_ref() else {
+        return Ok(None);
+    };
+    let req = EthCallRequest {
+        from: from.clone(),
+        to: lens_addr.clone(),
+        data: previewAccountSettlementCall {
+            marginEngine: margin_engine,
+            optionId: option_id,
+            trader,
+        }
+        .abi_encode(),
+        value: 0,
+        gas_limit: None,
+    };
+    let success = provider
+        .eth_call(req)
+        .await
+        .map_err(|e| format!("eth_call failed: {e}"))?;
+    Ok(Some(success.output))
+}
+
+/// MarginEngineLens.previewDetailedSettlement — read-only itemised
+/// settlement breakdown (payable / insurance preview / collectible /
+/// residual bad debt). Encoded bytes only.
+pub async fn try_preview_detailed_settlement<P: EthCallProvider>(
+    cfg: &TradingViewsConfig,
+    from: &AccountId,
+    margin_engine: Address,
+    option_id: U256,
+    trader: Address,
+    provider: &P,
+) -> Result<Option<Vec<u8>>, String> {
+    let Some(lens_addr) = cfg.margin_engine_lens_address.as_ref() else {
+        return Ok(None);
+    };
+    let req = EthCallRequest {
+        from: from.clone(),
+        to: lens_addr.clone(),
+        data: previewDetailedSettlementCall {
+            marginEngine: margin_engine,
+            optionId: option_id,
+            trader,
+        }
+        .abi_encode(),
+        value: 0,
+        gas_limit: None,
+    };
+    let success = provider
+        .eth_call(req)
+        .await
+        .map_err(|e| format!("eth_call failed: {e}"))?;
+    Ok(Some(success.output))
+}
+
+/// OracleRouter.getFeed — read-only oracle descriptor for a
+/// (base, quote) pair. Encoded bytes only.
+pub async fn try_get_oracle_feed<P: EthCallProvider>(
+    cfg: &TradingViewsConfig,
+    from: &AccountId,
+    base_asset: Address,
+    quote_asset: Address,
+    provider: &P,
+) -> Result<Option<Vec<u8>>, String> {
+    let Some(oracle_addr) = cfg.oracle_router_address.as_ref() else {
+        return Ok(None);
+    };
+    let req = EthCallRequest {
+        from: from.clone(),
+        to: oracle_addr.clone(),
+        data: getFeedCall {
+            baseAsset: base_asset,
+            quoteAsset: quote_asset,
+        }
+        .abi_encode(),
+        value: 0,
+        gas_limit: None,
+    };
+    let success = provider
+        .eth_call(req)
+        .await
+        .map_err(|e| format!("eth_call failed: {e}"))?;
+    Ok(Some(success.output))
+}
+
+/// OracleRouter.getPriceSafe — single-uint256 mark price for a
+/// (base, quote) pair. Reverts on-chain when the feed is stale or
+/// missing; the helper surfaces that as `Err(String)` so the handler
+/// can emit a structured warning rather than panic.
+pub async fn try_get_oracle_price_safe<P: EthCallProvider>(
+    cfg: &TradingViewsConfig,
+    from: &AccountId,
+    base_asset: Address,
+    quote_asset: Address,
+    provider: &P,
+) -> Result<Option<U256>, String> {
+    let Some(oracle_addr) = cfg.oracle_router_address.as_ref() else {
+        return Ok(None);
+    };
+    let req = EthCallRequest {
+        from: from.clone(),
+        to: oracle_addr.clone(),
+        data: getPriceSafeCall {
+            baseAsset: base_asset,
+            quoteAsset: quote_asset,
+        }
+        .abi_encode(),
+        value: 0,
+        gas_limit: None,
+    };
+    let success = provider
+        .eth_call(req)
+        .await
+        .map_err(|e| format!("eth_call failed: {e}"))?;
+    let decoded = getPriceSafeCall::abi_decode_returns(&success.output, true)
+        .map_err(|e| format!("decode failed: {e}"))?;
+    Ok(Some(decoded._0))
+}
+
+/// OracleRouter.hasActiveFeed — boolean liveness probe for a (base,
+/// quote) pair. Cheap to call; suitable for the partial-vs-ok decision
+/// in handler envelopes.
+pub async fn try_has_active_feed<P: EthCallProvider>(
+    cfg: &TradingViewsConfig,
+    from: &AccountId,
+    base_asset: Address,
+    quote_asset: Address,
+    provider: &P,
+) -> Result<Option<bool>, String> {
+    let Some(oracle_addr) = cfg.oracle_router_address.as_ref() else {
+        return Ok(None);
+    };
+    let req = EthCallRequest {
+        from: from.clone(),
+        to: oracle_addr.clone(),
+        data: hasActiveFeedCall {
+            baseAsset: base_asset,
+            quoteAsset: quote_asset,
+        }
+        .abi_encode(),
+        value: 0,
+        gas_limit: None,
+    };
+    let success = provider
+        .eth_call(req)
+        .await
+        .map_err(|e| format!("eth_call failed: {e}"))?;
+    let decoded = hasActiveFeedCall::abi_decode_returns(&success.output, true)
         .map_err(|e| format!("decode failed: {e}"))?;
     Ok(Some(decoded._0))
 }
@@ -316,6 +526,16 @@ pub mod tests {
         }
         .abi_encode();
         assert_eq!(&bytes[..4], &[0x6c, 0x16, 0x6b, 0xb3]);
+    }
+
+    #[test]
+    fn selector_get_price_safe() {
+        let bytes = getPriceSafeCall {
+            baseAsset: Address::ZERO,
+            quoteAsset: Address::ZERO,
+        }
+        .abi_encode();
+        assert_eq!(&bytes[..4], &[0x63, 0x85, 0x1e, 0xa3]);
     }
 
     // ----- Mock provider -----
@@ -566,5 +786,261 @@ pub mod tests {
             "0xZZZZ567890abcdef1234567890abcdef12345678"
         ))
         .is_none());
+    }
+
+    // ----- try_get_account_state (M-P2e) -----
+
+    #[tokio::test]
+    async fn account_state_returns_none_when_lens_not_configured() {
+        let cfg = TradingViewsConfig::default();
+        let mock = ProgrammableMockProvider::new();
+        let out =
+            try_get_account_state(&cfg, &anvil_address(), Address::ZERO, Address::ZERO, &mock)
+                .await;
+        assert!(matches!(out, Ok(None)));
+    }
+
+    #[tokio::test]
+    async fn account_state_returns_bytes_when_configured() {
+        let cfg = TradingViewsConfig {
+            margin_engine_lens_address: Some(anvil_address()),
+            ..Default::default()
+        };
+        let raw = vec![1u8, 2, 3, 4, 5];
+        let mock = ProgrammableMockProvider::new();
+        mock.returns([0xa5, 0x7b, 0xd4, 0xcc], raw.clone());
+        let out =
+            try_get_account_state(&cfg, &anvil_address(), Address::ZERO, Address::ZERO, &mock)
+                .await
+                .expect("ok")
+                .expect("Some");
+        assert_eq!(out, raw);
+    }
+
+    #[tokio::test]
+    async fn account_state_rpc_failure_yields_err() {
+        let cfg = TradingViewsConfig {
+            margin_engine_lens_address: Some(anvil_address()),
+            ..Default::default()
+        };
+        let mock = ProgrammableMockProvider::new();
+        mock.fails([0xa5, 0x7b, 0xd4, 0xcc]);
+        let out =
+            try_get_account_state(&cfg, &anvil_address(), Address::ZERO, Address::ZERO, &mock)
+                .await;
+        assert!(out.is_err());
+    }
+
+    // ----- try_preview_account_settlement (M-P2e) -----
+
+    #[tokio::test]
+    async fn preview_account_settlement_returns_none_when_lens_not_configured() {
+        let cfg = TradingViewsConfig::default();
+        let mock = ProgrammableMockProvider::new();
+        let out = try_preview_account_settlement(
+            &cfg,
+            &anvil_address(),
+            Address::ZERO,
+            U256::ZERO,
+            Address::ZERO,
+            &mock,
+        )
+        .await;
+        assert!(matches!(out, Ok(None)));
+    }
+
+    #[tokio::test]
+    async fn preview_account_settlement_returns_bytes_when_configured() {
+        let cfg = TradingViewsConfig {
+            margin_engine_lens_address: Some(anvil_address()),
+            ..Default::default()
+        };
+        let raw = vec![0xfe, 0xed, 0xfa, 0xce];
+        let mock = ProgrammableMockProvider::new();
+        mock.returns([0xe8, 0x02, 0x99, 0xc3], raw.clone());
+        let out = try_preview_account_settlement(
+            &cfg,
+            &anvil_address(),
+            Address::ZERO,
+            U256::from(42u64),
+            Address::ZERO,
+            &mock,
+        )
+        .await
+        .expect("ok")
+        .expect("Some");
+        assert_eq!(out, raw);
+    }
+
+    // ----- try_preview_detailed_settlement (M-P2e) -----
+
+    #[tokio::test]
+    async fn preview_detailed_settlement_returns_none_when_lens_not_configured() {
+        let cfg = TradingViewsConfig::default();
+        let mock = ProgrammableMockProvider::new();
+        let out = try_preview_detailed_settlement(
+            &cfg,
+            &anvil_address(),
+            Address::ZERO,
+            U256::ZERO,
+            Address::ZERO,
+            &mock,
+        )
+        .await;
+        assert!(matches!(out, Ok(None)));
+    }
+
+    #[tokio::test]
+    async fn preview_detailed_settlement_returns_bytes_when_configured() {
+        let cfg = TradingViewsConfig {
+            margin_engine_lens_address: Some(anvil_address()),
+            ..Default::default()
+        };
+        let raw = vec![0xba, 0xad, 0xf0, 0x0d];
+        let mock = ProgrammableMockProvider::new();
+        mock.returns([0x88, 0x4c, 0xea, 0xae], raw.clone());
+        let out = try_preview_detailed_settlement(
+            &cfg,
+            &anvil_address(),
+            Address::ZERO,
+            U256::ZERO,
+            Address::ZERO,
+            &mock,
+        )
+        .await
+        .expect("ok")
+        .expect("Some");
+        assert_eq!(out, raw);
+    }
+
+    // ----- try_get_oracle_feed (M-P2e) -----
+
+    #[tokio::test]
+    async fn oracle_feed_returns_none_when_oracle_not_configured() {
+        let cfg = TradingViewsConfig::default();
+        let mock = ProgrammableMockProvider::new();
+        let out =
+            try_get_oracle_feed(&cfg, &anvil_address(), Address::ZERO, Address::ZERO, &mock).await;
+        assert!(matches!(out, Ok(None)));
+    }
+
+    #[tokio::test]
+    async fn oracle_feed_returns_bytes_when_configured() {
+        let cfg = TradingViewsConfig {
+            oracle_router_address: Some(anvil_address()),
+            ..Default::default()
+        };
+        let raw = vec![0x5a, 0xfe, 0x57, 0xab];
+        let mock = ProgrammableMockProvider::new();
+        mock.returns([0xd2, 0xed, 0xb6, 0xdd], raw.clone());
+        let out = try_get_oracle_feed(
+            &cfg,
+            &anvil_address(),
+            Address::from([0xaa; 20]),
+            Address::from([0xbb; 20]),
+            &mock,
+        )
+        .await
+        .expect("ok")
+        .expect("Some");
+        assert_eq!(out, raw);
+    }
+
+    // ----- try_has_active_feed (M-P2e) -----
+
+    #[tokio::test]
+    async fn has_active_feed_returns_none_when_oracle_not_configured() {
+        let cfg = TradingViewsConfig::default();
+        let mock = ProgrammableMockProvider::new();
+        let out =
+            try_has_active_feed(&cfg, &anvil_address(), Address::ZERO, Address::ZERO, &mock).await;
+        assert!(matches!(out, Ok(None)));
+    }
+
+    #[tokio::test]
+    async fn has_active_feed_returns_true_when_configured() {
+        let cfg = TradingViewsConfig {
+            oracle_router_address: Some(anvil_address()),
+            ..Default::default()
+        };
+        let encoded = alloy_sol_types::SolValue::abi_encode(&true);
+        let mock = ProgrammableMockProvider::new();
+        mock.returns([0x6c, 0x16, 0x6b, 0xb3], encoded);
+        let out = try_has_active_feed(
+            &cfg,
+            &anvil_address(),
+            Address::from([0xaa; 20]),
+            Address::from([0xbb; 20]),
+            &mock,
+        )
+        .await
+        .expect("ok")
+        .expect("Some");
+        assert!(out);
+    }
+
+    // ----- try_get_oracle_price_safe (M-P2e) -----
+
+    #[tokio::test]
+    async fn oracle_price_returns_none_when_oracle_not_configured() {
+        let cfg = TradingViewsConfig::default();
+        let mock = ProgrammableMockProvider::new();
+        let out =
+            try_get_oracle_price_safe(&cfg, &anvil_address(), Address::ZERO, Address::ZERO, &mock)
+                .await;
+        assert!(matches!(out, Ok(None)));
+    }
+
+    #[tokio::test]
+    async fn oracle_price_returns_value_when_configured() {
+        let cfg = TradingViewsConfig {
+            oracle_router_address: Some(anvil_address()),
+            ..Default::default()
+        };
+        let price = U256::from(3_500_000_000_000u128);
+        let encoded = alloy_sol_types::SolValue::abi_encode(&price);
+        let mock = ProgrammableMockProvider::new();
+        mock.returns([0x63, 0x85, 0x1e, 0xa3], encoded);
+        let out = try_get_oracle_price_safe(
+            &cfg,
+            &anvil_address(),
+            Address::from([0xaa; 20]),
+            Address::from([0xbb; 20]),
+            &mock,
+        )
+        .await
+        .expect("ok")
+        .expect("Some");
+        assert_eq!(out, price);
+    }
+
+    #[tokio::test]
+    async fn oracle_price_rpc_revert_yields_err() {
+        let cfg = TradingViewsConfig {
+            oracle_router_address: Some(anvil_address()),
+            ..Default::default()
+        };
+        let mock = ProgrammableMockProvider::new();
+        mock.fails([0x63, 0x85, 0x1e, 0xa3]);
+        let out =
+            try_get_oracle_price_safe(&cfg, &anvil_address(), Address::ZERO, Address::ZERO, &mock)
+                .await;
+        assert!(out.is_err());
+    }
+
+    #[tokio::test]
+    async fn has_active_feed_returns_false_when_oracle_says_false() {
+        let cfg = TradingViewsConfig {
+            oracle_router_address: Some(anvil_address()),
+            ..Default::default()
+        };
+        let encoded = alloy_sol_types::SolValue::abi_encode(&false);
+        let mock = ProgrammableMockProvider::new();
+        mock.returns([0x6c, 0x16, 0x6b, 0xb3], encoded);
+        let out = try_has_active_feed(&cfg, &anvil_address(), Address::ZERO, Address::ZERO, &mock)
+            .await
+            .expect("ok")
+            .expect("Some");
+        assert!(!out);
     }
 }

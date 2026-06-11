@@ -576,13 +576,25 @@ pub async fn series_details(
     State(state): State<AppState>,
     Path(series_id): Path<String>,
 ) -> Result<Json<Envelope<SeriesDetailData>>, TradingApiError> {
-    let series = get_option_series_service(&state, &series_id)
+    let provider = rpc_provider_from_state(&state);
+    series_details_impl(&state, &series_id, provider.as_ref()).await
+}
+
+pub(crate) async fn series_details_impl<P>(
+    state: &AppState,
+    series_id: &str,
+    provider: Option<&P>,
+) -> Result<Json<Envelope<SeriesDetailData>>, TradingApiError>
+where
+    P: crate::execution::rpc::EthCallProvider,
+{
+    let series = get_option_series_service(state, series_id)
         .await
         .map_err(|_| {
             TradingApiError::new(
                 TradingErrorCode::SeriesNotFound,
                 "Series id unknown",
-                MetaBlock::new(&state, "db"),
+                MetaBlock::new(state, "db"),
             )
         })?;
     let pid = compute_product_id(
@@ -597,7 +609,7 @@ pub async fn series_details(
             account: None,
             order_id: None,
         };
-        list_option_fills_service(&state, filter)
+        list_option_fills_service(state, filter)
             .await
             .ok()
             .and_then(|mut v| v.pop())
@@ -608,6 +620,64 @@ pub async fn series_details(
         side: side_str(f.taker_side),
         created_at_ms: f.created_at_ms,
     });
+
+    // M-P2e — read-only OracleRouter.getPriceSafe(underlying, settlement)
+    // when configured AND the RPC provider is available. Surface stale /
+    // missing-feed reverts as a structured ORACLE_UNAVAILABLE warning.
+    let mut warnings: Vec<Warning> = Vec::new();
+    let mut oracle_mark_1e8: Option<String> = None;
+    let oracle_configured = state.trading_views.oracle_router_address.is_some();
+    let provider_configured = provider.is_some();
+    if oracle_configured && provider_configured {
+        let p = provider.expect("checked");
+        let underlying_addr = address_from_account_str(&series.underlying);
+        let settlement_addr = address_from_account_str(&series.settlement_asset);
+        match (underlying_addr, settlement_addr) {
+            (Some(base), Some(quote)) => {
+                let from = &state.execution_config.executor_from_address;
+                match crate::api::trading_views::try_get_oracle_price_safe(
+                    &state.trading_views,
+                    from,
+                    base,
+                    quote,
+                    p,
+                )
+                .await
+                {
+                    Ok(Some(price)) => {
+                        oracle_mark_1e8 = Some(price.to_string());
+                    }
+                    Ok(None) => warnings.push(warning_config_missing(
+                        "oracle_router_address vanished mid-read; oracle_mark_1e8 unavailable.",
+                    )),
+                    Err(e) => warnings.push(warning_oracle_unavailable(&format!(
+                        "OracleRouter.getPriceSafe failed: {}",
+                        sanitise_rpc_err(&e)
+                    ))),
+                }
+            }
+            _ => warnings.push(warning_source_unavailable(
+                "underlying or settlement_asset is not a valid EVM address; oracle skipped.",
+            )),
+        }
+    } else {
+        if !oracle_configured {
+            warnings.push(warning_config_missing(
+                "OPTION_ORACLE_ROUTER_ADDRESS not configured; oracle_mark_1e8 unavailable.",
+            ));
+        }
+        if !provider_configured {
+            warnings.push(warning_rpc_unavailable(
+                "RPC provider not configured; oracle_mark_1e8 unavailable.",
+            ));
+        }
+    }
+
+    let status: &'static str = if oracle_mark_1e8.is_some() {
+        "ok"
+    } else {
+        "partial"
+    };
 
     let data = SeriesDetailData {
         series: SeriesSummary {
@@ -623,17 +693,13 @@ pub async fn series_details(
         },
         orderbook_top: None,
         last_fill,
-        oracle_mark_1e8: None,
+        oracle_mark_1e8,
     };
     Ok(Json(Envelope {
-        status: "ok",
+        status,
         data,
-        warnings: vec![Warning {
-            code: "ORACLE_MARK_NOT_WIRED".to_string(),
-            message: "oracle_mark_1e8 + orderbook_top will be wired in M-P2a follow-on".to_string(),
-            details: serde_json::json!({}),
-        }],
-        meta: MetaBlock::new(&state, "db"),
+        warnings,
+        meta: MetaBlock::new(state, if status == "ok" { "rpc" } else { "db" }),
     }))
 }
 
@@ -697,30 +763,42 @@ pub async fn quote_preview(
     State(state): State<AppState>,
     Query(query): Query<QuotePreviewQuery>,
 ) -> Result<Json<Envelope<QuotePreviewData>>, TradingApiError> {
+    let provider = rpc_provider_from_state(&state);
+    quote_preview_impl(&state, query, provider.as_ref()).await
+}
+
+pub(crate) async fn quote_preview_impl<P>(
+    state: &AppState,
+    query: QuotePreviewQuery,
+    provider: Option<&P>,
+) -> Result<Json<Envelope<QuotePreviewData>>, TradingApiError>
+where
+    P: crate::execution::rpc::EthCallProvider,
+{
     if !["buy", "sell"].contains(&query.side.as_str()) {
         return Err(TradingApiError::new(
             TradingErrorCode::InvalidRequest,
             "side must be 'buy' or 'sell'",
-            MetaBlock::new(&state, "validation"),
+            MetaBlock::new(state, "validation"),
         ));
     }
     let size: u128 = query.size.parse().map_err(|_| {
         TradingApiError::new(
             TradingErrorCode::InvalidRequest,
             "size must be a non-negative integer",
-            MetaBlock::new(&state, "validation"),
+            MetaBlock::new(state, "validation"),
         )
     })?;
     if let Some(addr) = query.account.as_deref() {
-        parse_address_or_400(&state, addr)?;
+        parse_address_or_400(state, addr)?;
     }
-    let series = get_option_series_service(&state, &query.series_id)
+    let series = get_option_series_service(state, &query.series_id)
         .await
         .map_err(|_| {
             TradingApiError::new(
                 TradingErrorCode::SeriesNotFound,
                 "Series id unknown",
-                MetaBlock::new(&state, "db"),
+                MetaBlock::new(state, "db"),
             )
         })?;
     // Series must be quotable.
@@ -728,7 +806,7 @@ pub async fn quote_preview(
         return Err(TradingApiError::new(
             TradingErrorCode::QuoteUnsupported,
             "Series is not Active",
-            MetaBlock::new(&state, "db"),
+            MetaBlock::new(state, "db"),
         ));
     }
     // Reference price: use the explicit price_1e8 if provided, else the
@@ -739,17 +817,55 @@ pub async fn quote_preview(
             TradingApiError::new(
                 TradingErrorCode::InvalidRequest,
                 "price_1e8 must be a non-negative integer",
-                MetaBlock::new(&state, "validation"),
+                MetaBlock::new(state, "validation"),
             )
         })?,
         None => series.strike_1e8,
     };
-    // Premium = size * price / 1e8 (returned at on-chain notional precision).
     let premium = size.saturating_mul(price_1e8);
-    // Fee = premium * ppm / 1_000_000 (rounded down).
     let fee_amount = premium.saturating_mul(PARTIAL_PREVIEW_TAKER_PPM as u128) / 1_000_000u128;
     let quote_expires_at_ms = now_ms() + 20_000; // 20s freshness window.
+
+    // M-P2e — read-only oracle mark when configured.
+    let mut warnings: Vec<Warning> = Vec::new();
+    let mut oracle_mark_1e8: Option<String> = None;
+    if state.trading_views.oracle_router_address.is_some() {
+        if let Some(p) = provider {
+            let underlying_addr = address_from_account_str(&series.underlying);
+            let settlement_addr = address_from_account_str(&series.settlement_asset);
+            if let (Some(base), Some(quote)) = (underlying_addr, settlement_addr) {
+                match crate::api::trading_views::try_get_oracle_price_safe(
+                    &state.trading_views,
+                    &state.execution_config.executor_from_address,
+                    base,
+                    quote,
+                    p,
+                )
+                .await
+                {
+                    Ok(Some(mark)) => oracle_mark_1e8 = Some(mark.to_string()),
+                    Ok(None) => {}
+                    Err(e) => warnings.push(warning_oracle_unavailable(&format!(
+                        "OracleRouter.getPriceSafe failed: {}",
+                        sanitise_rpc_err(&e)
+                    ))),
+                }
+            }
+        }
+    }
+    warnings.push(warning_partial_preview());
+    if oracle_mark_1e8.is_none() {
+        warnings.push(warning_oracle_unavailable(
+            "oracle_mark_1e8 unavailable (OracleRouter address or RPC not configured).",
+        ));
+    }
+
     Ok(Json(Envelope {
+        // quote_preview is intentionally always "partial" — premium /
+        // fee math here is a deterministic approximation. Even when the
+        // oracle is wired the math doesn't switch to "ok" because
+        // PARTIAL_PREVIEW_TAKER_PPM is still a hard-coded placeholder
+        // (real previewTradeFees decoding lands in a follow-on).
         status: "partial",
         data: QuotePreviewData {
             series_id: series.option_series_id.to_string(),
@@ -766,17 +882,14 @@ pub async fn quote_preview(
                 amount: fee_amount.to_string(),
             },
             settlement_asset: series.settlement_asset.clone(),
-            oracle_mark_1e8: None,
+            oracle_mark_1e8,
             im_impact: None,
             free_collateral_after: None,
             quote_expires_at_ms,
             position_size_after: None,
         },
-        warnings: vec![
-            warning_partial_preview(),
-            warning_source_unavailable("oracle_mark_1e8 not wired in M-P2b; tracked in M-P2c."),
-        ],
-        meta: MetaBlock::new(&state, "db"),
+        warnings,
+        meta: MetaBlock::new(state, "db"),
     }))
 }
 
@@ -784,10 +897,22 @@ pub async fn account_positions(
     State(state): State<AppState>,
     Path(address): Path<String>,
 ) -> Result<Json<Envelope<PositionsData>>, TradingApiError> {
-    let acct = parse_address_or_400(&state, &address)?;
+    let provider = rpc_provider_from_state(&state);
+    account_positions_impl(&state, &address, provider.as_ref()).await
+}
+
+pub(crate) async fn account_positions_impl<P>(
+    state: &AppState,
+    address: &str,
+    provider: Option<&P>,
+) -> Result<Json<Envelope<PositionsData>>, TradingApiError>
+where
+    P: crate::execution::rpc::EthCallProvider,
+{
+    let acct = parse_address_or_400(state, address)?;
     // Aggregate net position per series from the OptionFill store.
     let fills = list_option_fills_service(
-        &state,
+        state,
         OptionFillFilter {
             option_series_id: None,
             account: Some(acct.clone()),
@@ -799,7 +924,7 @@ pub async fn account_positions(
         TradingApiError::new(
             TradingErrorCode::InternalError,
             "unable to list option fills",
-            MetaBlock::new(&state, "internal"),
+            MetaBlock::new(state, "internal"),
         )
     })?;
     // For each series, compute signed net size (positive = long; negative = short).
@@ -846,16 +971,97 @@ pub async fn account_positions(
         });
     }
     positions.sort_by(|a, b| a.series_id.cmp(&b.series_id));
+
+    // M-P2e — per-position oracle mark when oracle is configured. We
+    // call OracleRouter.getPriceSafe(underlying, settlement) for each
+    // distinct (underlying, settlement) pair. The on-chain function
+    // reverts on stale feeds; we map any revert to a structured
+    // warning + leave that series' mark as None.
+    let mut warnings: Vec<Warning> = Vec::new();
+    let oracle_configured = state.trading_views.oracle_router_address.is_some();
+    let provider_configured = provider.is_some();
+    let mut any_mark_resolved = false;
+    if oracle_configured && provider_configured {
+        let p = provider.expect("checked");
+        let from = &state.execution_config.executor_from_address;
+        use std::collections::HashMap;
+        let mut mark_cache: HashMap<(String, String), Option<String>> = HashMap::new();
+        for pos in positions.iter_mut() {
+            // Look up series metadata to obtain underlying/settlement.
+            let series = match get_option_series_service(state, &pos.series_id).await {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let key = (series.underlying.clone(), series.settlement_asset.clone());
+            let cached = mark_cache.get(&key).cloned();
+            let resolved = if let Some(c) = cached {
+                c
+            } else {
+                let underlying_addr = address_from_account_str(&series.underlying);
+                let settlement_addr = address_from_account_str(&series.settlement_asset);
+                let result = match (underlying_addr, settlement_addr) {
+                    (Some(base), Some(quote)) => {
+                        match crate::api::trading_views::try_get_oracle_price_safe(
+                            &state.trading_views,
+                            from,
+                            base,
+                            quote,
+                            p,
+                        )
+                        .await
+                        {
+                            Ok(Some(mark)) => Some(mark.to_string()),
+                            Ok(None) => None,
+                            Err(_) => None,
+                        }
+                    }
+                    _ => None,
+                };
+                mark_cache.insert(key, result.clone());
+                result
+            };
+            if resolved.is_some() {
+                any_mark_resolved = true;
+            }
+            pos.mark_price_1e8 = resolved;
+        }
+        if !any_mark_resolved && !positions.is_empty() {
+            warnings.push(warning_oracle_unavailable(
+                "OracleRouter.getPriceSafe failed or returned no marks for any open series.",
+            ));
+        }
+    } else {
+        if !oracle_configured {
+            warnings.push(warning_config_missing(
+                "OPTION_ORACLE_ROUTER_ADDRESS not configured; mark_price_1e8 unavailable.",
+            ));
+        }
+        if !provider_configured {
+            warnings.push(warning_rpc_unavailable(
+                "RPC provider not configured; mark_price_1e8 unavailable.",
+            ));
+        }
+    }
+    if !any_mark_resolved {
+        warnings.push(warning_source_unavailable(
+            "unrealised_pnl / IM / MM contribution not wired without per-series mark + per-position lens read.",
+        ));
+    }
+
+    let status: &'static str = if any_mark_resolved && !positions.is_empty() {
+        "ok"
+    } else {
+        "partial"
+    };
+
     Ok(Json(Envelope {
-        status: "partial",
+        status,
         data: PositionsData {
-            address: address.clone(),
+            address: address.to_string(),
             positions,
         },
-        warnings: vec![warning_source_unavailable(
-            "mark_price_1e8 / unrealised_pnl / IM / MM not wired in M-P2b; tracked in M-P2c on-chain orchestration.",
-        )],
-        meta: MetaBlock::new(&state, "db"),
+        warnings,
+        meta: MetaBlock::new(state, if status == "ok" { "rpc" } else { "db" }),
     }))
 }
 
@@ -863,9 +1069,21 @@ pub async fn account_portfolio(
     State(state): State<AppState>,
     Path(address): Path<String>,
 ) -> Result<Json<Envelope<PortfolioData>>, TradingApiError> {
-    let acct = parse_address_or_400(&state, &address)?;
+    let provider = rpc_provider_from_state(&state);
+    account_portfolio_impl(&state, &address, provider.as_ref()).await
+}
+
+pub(crate) async fn account_portfolio_impl<P>(
+    state: &AppState,
+    address: &str,
+    provider: Option<&P>,
+) -> Result<Json<Envelope<PortfolioData>>, TradingApiError>
+where
+    P: crate::execution::rpc::EthCallProvider,
+{
+    let acct = parse_address_or_400(state, address)?;
     let fills = list_option_fills_service(
-        &state,
+        state,
         OptionFillFilter {
             option_series_id: None,
             account: Some(acct.clone()),
@@ -877,7 +1095,7 @@ pub async fn account_portfolio(
         TradingApiError::new(
             TradingErrorCode::InternalError,
             "unable to list option fills",
-            MetaBlock::new(&state, "internal"),
+            MetaBlock::new(state, "internal"),
         )
     })?;
     use std::collections::HashMap;
@@ -896,21 +1114,99 @@ pub async fn account_portfolio(
         total_notional = total_notional.saturating_add(f.size_1e8.saturating_mul(f.price_1e8));
     }
     let open_positions_count = net_per_series.values().filter(|&&v| v != 0).count() as u32;
+
+    // M-P2e — read MarginEngineLens.getAccountState when configured.
+    let mut warnings: Vec<Warning> = Vec::new();
+    let mut equity: Option<String> = None;
+    let mut im: Option<String> = None;
+    let mut mm: Option<String> = None;
+    let mut free_collateral: Option<String> = None;
+
+    let lens_configured = state.trading_views.margin_engine_lens_address.is_some();
+    let me_configured = state.trading_views.margin_engine_address.is_some();
+    let provider_configured = provider.is_some();
+    if lens_configured && me_configured && provider_configured {
+        let p = provider.expect("checked");
+        let me_acct = state
+            .trading_views
+            .margin_engine_address
+            .as_ref()
+            .expect("checked");
+        let me_addr = address_from_account_str(&me_acct.0);
+        let trader_addr = address_from_account_str(&acct.0);
+        match (me_addr, trader_addr) {
+            (Some(me), Some(trader)) => {
+                let from = &state.execution_config.executor_from_address;
+                match crate::api::trading_views::try_get_account_state(
+                    &state.trading_views,
+                    from,
+                    me,
+                    trader,
+                    p,
+                )
+                .await
+                {
+                    Ok(Some(bytes)) => match decode_account_state(&bytes) {
+                        Ok(decoded) => {
+                            equity = Some(decoded.equity_base.to_string());
+                            mm = Some(decoded.maintenance_margin_base.to_string());
+                            im = Some(decoded.initial_margin_base.to_string());
+                            free_collateral = Some(decoded.free_collateral_base.to_string());
+                        }
+                        Err(e) => warnings.push(warning_account_state_unavailable(&format!(
+                            "AccountState decode failed: {}",
+                            sanitise_rpc_err(&e)
+                        ))),
+                    },
+                    Ok(None) => warnings.push(warning_config_missing(
+                        "margin_engine_lens_address vanished mid-read.",
+                    )),
+                    Err(e) => warnings.push(warning_account_state_unavailable(&format!(
+                        "MarginEngineLens.getAccountState failed: {}",
+                        sanitise_rpc_err(&e)
+                    ))),
+                }
+            }
+            _ => warnings.push(warning_source_unavailable(
+                "margin engine or trader address is not a valid EVM address.",
+            )),
+        }
+    } else {
+        let mut reasons: Vec<&str> = Vec::new();
+        if !lens_configured {
+            reasons.push("OPTION_MARGIN_ENGINE_LENS_ADDRESS");
+        }
+        if !me_configured {
+            reasons.push("OPTION_MARGIN_ENGINE_ADDRESS");
+        }
+        if !provider_configured {
+            reasons.push("EXECUTION_RPC_URL");
+        }
+        warnings.push(warning_config_missing(&format!(
+            "AccountState read requires: {}.",
+            reasons.join(", ")
+        )));
+    }
+
+    let status: &'static str =
+        if equity.is_some() && im.is_some() && mm.is_some() && free_collateral.is_some() {
+            "ok"
+        } else {
+            "partial"
+        };
     Ok(Json(Envelope {
-        status: "partial",
+        status,
         data: PortfolioData {
-            address: address.clone(),
-            equity: None,
-            im: None,
-            mm: None,
-            free_collateral: None,
+            address: address.to_string(),
+            equity,
+            im,
+            mm,
+            free_collateral,
             total_notional: Some(total_notional.to_string()),
             open_positions_count: Some(open_positions_count),
         },
-        warnings: vec![warning_source_unavailable(
-            "equity / IM / MM / free_collateral not wired in M-P2b; tracked in M-P2c on-chain orchestration via MarginEngineLens.getAccountState.",
-        )],
-        meta: MetaBlock::new(&state, "db"),
+        warnings,
+        meta: MetaBlock::new(state, if status == "ok" { "rpc" } else { "db" }),
     }))
 }
 
@@ -1054,6 +1350,171 @@ where
     }))
 }
 
+// ---------------------------------------------------------------------
+// M-P2e — internal helpers for read-only RPC orchestration
+// ---------------------------------------------------------------------
+
+/// Build an `Option<HttpJsonRpcProvider>` from `state.execution_config.rpc_url`.
+/// Returns `None` when no RPC URL is configured — handlers then take the
+/// partial-data path with structured warnings.
+fn rpc_provider_from_state(state: &AppState) -> Option<crate::execution::rpc::HttpJsonRpcProvider> {
+    state
+        .execution_config
+        .rpc_url
+        .as_ref()
+        .map(|url| crate::execution::rpc::HttpJsonRpcProvider::new(url.clone()))
+}
+
+/// Parse an `AccountId` hex string into an `alloy` `Address`.
+/// Returns `None` for malformed input.
+fn address_from_account_str(s: &str) -> Option<alloy_primitives::Address> {
+    crate::api::trading_views::address_from_account(&AccountId::new(s.to_string()))
+}
+
+/// Decode the AccountState tuple returned by
+/// `MarginEngineLens.getAccountState`. The on-chain shape is verified
+/// against `~/DEOPT/deopt-v2-sol/abis/freeze-v2-product-rc1/MarginEngineLens.abi.json`:
+///
+/// ```text
+/// (int256 equityBase, uint256 maintenanceMarginBase, uint256 initialMarginBase,
+///  int256 freeCollateralBase, uint256 marginRatioBps, uint256 openSeriesCount,
+///  uint256 totalShortOpenContracts, bool liquidatable)
+/// ```
+#[derive(Clone, Debug)]
+struct DecodedAccountState {
+    equity_base: alloy_primitives::I256,
+    maintenance_margin_base: alloy_primitives::U256,
+    initial_margin_base: alloy_primitives::U256,
+    free_collateral_base: alloy_primitives::I256,
+}
+
+fn decode_account_state(bytes: &[u8]) -> Result<DecodedAccountState, String> {
+    use alloy_primitives::{I256, U256};
+    use alloy_sol_types::sol_data;
+    use alloy_sol_types::SolType;
+    type Tup = (
+        sol_data::Int<256>,
+        sol_data::Uint<256>,
+        sol_data::Uint<256>,
+        sol_data::Int<256>,
+        sol_data::Uint<256>,
+        sol_data::Uint<256>,
+        sol_data::Uint<256>,
+        sol_data::Bool,
+    );
+    let (equity, mm, im, free, _ratio, _count, _short, _liq): (
+        I256,
+        U256,
+        U256,
+        I256,
+        U256,
+        U256,
+        U256,
+        bool,
+    ) = Tup::abi_decode(bytes, true).map_err(|e| format!("account state decode: {e}"))?;
+    Ok(DecodedAccountState {
+        equity_base: equity,
+        maintenance_margin_base: mm,
+        initial_margin_base: im,
+        free_collateral_base: free,
+    })
+}
+
+/// Decode the SettlementPreview tuple returned by
+/// `MarginEngineLens.previewAccountSettlement`. The on-chain shape is
+/// verified against `~/DEOPT/deopt-v2-sol/abis/freeze-v2-product-rc1/MarginEngineLens.abi.json`:
+///
+/// ```text
+/// (int256 pnl, uint256 grossAmount, uint256 collectibleAmount,
+///  uint256 payableFromSettlementSink, uint256 insurancePreview,
+///  uint256 residualBadDebtPreview, bool isSettled, bool canSettle)
+/// ```
+#[derive(Clone, Debug)]
+struct DecodedSettlementPreview {
+    pnl: alloy_primitives::I256,
+    collectible_amount: alloy_primitives::U256,
+    payable_from_settlement_sink: alloy_primitives::U256,
+    insurance_preview: alloy_primitives::U256,
+    residual_bad_debt_preview: alloy_primitives::U256,
+    is_settled: bool,
+    can_settle: bool,
+}
+
+fn decode_settlement_preview(bytes: &[u8]) -> Result<DecodedSettlementPreview, String> {
+    use alloy_primitives::{I256, U256};
+    use alloy_sol_types::sol_data;
+    use alloy_sol_types::SolType;
+    type Tup = (
+        sol_data::Int<256>,
+        sol_data::Uint<256>,
+        sol_data::Uint<256>,
+        sol_data::Uint<256>,
+        sol_data::Uint<256>,
+        sol_data::Uint<256>,
+        sol_data::Bool,
+        sol_data::Bool,
+    );
+    let (pnl, _gross, collectible, payable, insurance, residual, is_settled, can_settle): (
+        I256,
+        U256,
+        U256,
+        U256,
+        U256,
+        U256,
+        bool,
+        bool,
+    ) = Tup::abi_decode(bytes, true).map_err(|e| format!("settlement preview decode: {e}"))?;
+    Ok(DecodedSettlementPreview {
+        pnl,
+        collectible_amount: collectible,
+        payable_from_settlement_sink: payable,
+        insurance_preview: insurance,
+        residual_bad_debt_preview: residual,
+        is_settled,
+        can_settle,
+    })
+}
+
+fn warning_rpc_unavailable(reason: &str) -> Warning {
+    Warning {
+        code: "RPC_UNAVAILABLE".to_string(),
+        message: reason.to_string(),
+        details: serde_json::json!({}),
+    }
+}
+
+fn warning_oracle_unavailable(reason: &str) -> Warning {
+    Warning {
+        code: "ORACLE_UNAVAILABLE".to_string(),
+        message: reason.to_string(),
+        details: serde_json::json!({}),
+    }
+}
+
+fn warning_config_missing(reason: &str) -> Warning {
+    Warning {
+        code: "CONFIG_MISSING".to_string(),
+        message: reason.to_string(),
+        details: serde_json::json!({}),
+    }
+}
+
+fn warning_account_state_unavailable(reason: &str) -> Warning {
+    Warning {
+        code: "ACCOUNT_STATE_UNAVAILABLE".to_string(),
+        message: reason.to_string(),
+        details: serde_json::json!({}),
+    }
+}
+
+fn warning_settlement_preview_unavailable(reason: &str) -> Warning {
+    Warning {
+        code: "SETTLEMENT_PREVIEW_UNAVAILABLE".to_string(),
+        message: reason.to_string(),
+        details: serde_json::json!({}),
+    }
+}
+
 /// Sanitise RPC-side error messages so the response envelope never
 /// exposes a raw RPC URL or a provider's internal trace. We strip
 /// anything that looks like an HTTP(S) URL.
@@ -1137,19 +1598,30 @@ pub async fn exercise_preview(
     State(state): State<AppState>,
     Json(req): Json<ExercisePreviewRequest>,
 ) -> Result<Json<Envelope<ExercisePreviewData>>, TradingApiError> {
-    let acct = parse_address_or_400(&state, &req.account)?;
-    let series = get_option_series_service(&state, &req.series_id)
+    let provider = rpc_provider_from_state(&state);
+    exercise_preview_impl(&state, req, provider.as_ref()).await
+}
+
+pub(crate) async fn exercise_preview_impl<P>(
+    state: &AppState,
+    req: ExercisePreviewRequest,
+    provider: Option<&P>,
+) -> Result<Json<Envelope<ExercisePreviewData>>, TradingApiError>
+where
+    P: crate::execution::rpc::EthCallProvider,
+{
+    let acct = parse_address_or_400(state, &req.account)?;
+    let series = get_option_series_service(state, &req.series_id)
         .await
         .map_err(|_| {
             TradingApiError::new(
                 TradingErrorCode::SeriesNotFound,
                 "Series id unknown",
-                MetaBlock::new(&state, "db"),
+                MetaBlock::new(state, "db"),
             )
         })?;
-    // Compute net position size for this series + account from fills.
     let fills = list_option_fills_service(
-        &state,
+        state,
         OptionFillFilter {
             option_series_id: Some(series.option_series_id.clone()),
             account: Some(acct.clone()),
@@ -1161,7 +1633,7 @@ pub async fn exercise_preview(
         TradingApiError::new(
             TradingErrorCode::InternalError,
             "unable to list option fills",
-            MetaBlock::new(&state, "internal"),
+            MetaBlock::new(state, "internal"),
         )
     })?;
     let mut signed_size: i128 = 0;
@@ -1174,33 +1646,117 @@ pub async fn exercise_preview(
         };
         signed_size = signed_size.saturating_add(delta);
     }
-    // Without an oracle read, we cannot compute the settlement price, so
-    // `pnl` is "0" (placeholder) and `can_settle` is `false` unless we
-    // know the position is at-or-past-expiry. The structured warnings
-    // document the missing on-chain refinement.
     let now_s = now_ms() / 1000;
     let is_past_expiry = (now_s as u64) >= series.expiry;
-    let can_settle = is_past_expiry && signed_size != 0;
+    let mut can_settle = is_past_expiry && signed_size != 0;
+    let mut is_already_settled = false;
+    let mut pnl: String = "0".to_string();
+    let mut payable_from_settlement_sink: Option<String> = None;
+    let mut insurance_preview: Option<String> = None;
+    let mut collectible_from_trader_preview: Option<String> = None;
+    let mut residual_bad_debt_preview: Option<String> = None;
+    let mut warnings: Vec<Warning> = Vec::new();
+    let mut settlement_resolved = false;
+
+    let lens_configured = state.trading_views.margin_engine_lens_address.is_some();
+    let me_configured = state.trading_views.margin_engine_address.is_some();
+    let provider_configured = provider.is_some();
+    if lens_configured && me_configured && provider_configured {
+        let p = provider.expect("checked");
+        let me_acct = state
+            .trading_views
+            .margin_engine_address
+            .as_ref()
+            .expect("checked");
+        let me_addr = address_from_account_str(&me_acct.0);
+        let trader_addr = address_from_account_str(&acct.0);
+        let option_id_u256 = series.onchain_series_id.as_deref().and_then(|s| {
+            alloy_primitives::U256::from_str_radix(s.trim_start_matches("0x"), 16).ok()
+        });
+        match (me_addr, trader_addr, option_id_u256) {
+            (Some(me), Some(trader), Some(option_id)) => {
+                let from = &state.execution_config.executor_from_address;
+                match crate::api::trading_views::try_preview_account_settlement(
+                    &state.trading_views,
+                    from,
+                    me,
+                    option_id,
+                    trader,
+                    p,
+                )
+                .await
+                {
+                    Ok(Some(bytes)) => match decode_settlement_preview(&bytes) {
+                        Ok(decoded) => {
+                            pnl = decoded.pnl.to_string();
+                            payable_from_settlement_sink =
+                                Some(decoded.payable_from_settlement_sink.to_string());
+                            insurance_preview = Some(decoded.insurance_preview.to_string());
+                            collectible_from_trader_preview =
+                                Some(decoded.collectible_amount.to_string());
+                            residual_bad_debt_preview =
+                                Some(decoded.residual_bad_debt_preview.to_string());
+                            is_already_settled = decoded.is_settled;
+                            can_settle = decoded.can_settle;
+                            settlement_resolved = true;
+                        }
+                        Err(e) => warnings.push(warning_settlement_preview_unavailable(&format!(
+                            "SettlementPreview decode failed: {}",
+                            sanitise_rpc_err(&e)
+                        ))),
+                    },
+                    Ok(None) => warnings.push(warning_config_missing(
+                        "margin_engine_lens_address vanished mid-read.",
+                    )),
+                    Err(e) => warnings.push(warning_settlement_preview_unavailable(&format!(
+                        "MarginEngineLens.previewAccountSettlement failed: {}",
+                        sanitise_rpc_err(&e)
+                    ))),
+                }
+            }
+            (_, _, None) => warnings.push(warning_source_unavailable(
+                "series.onchain_series_id is missing or not a valid uint256.",
+            )),
+            _ => warnings.push(warning_source_unavailable(
+                "margin engine or trader address is not a valid EVM address.",
+            )),
+        }
+    } else {
+        let mut reasons: Vec<&str> = Vec::new();
+        if !lens_configured {
+            reasons.push("OPTION_MARGIN_ENGINE_LENS_ADDRESS");
+        }
+        if !me_configured {
+            reasons.push("OPTION_MARGIN_ENGINE_ADDRESS");
+        }
+        if !provider_configured {
+            reasons.push("EXECUTION_RPC_URL");
+        }
+        warnings.push(warning_config_missing(&format!(
+            "Settlement preview requires: {}.",
+            reasons.join(", ")
+        )));
+    }
+    if !settlement_resolved {
+        warnings.push(warning_partial_preview());
+    }
+
+    let status: &'static str = if settlement_resolved { "ok" } else { "partial" };
     Ok(Json(Envelope {
-        status: "partial",
+        status,
         data: ExercisePreviewData {
             series_id: series.option_series_id.to_string(),
             account: req.account.clone(),
-            is_already_settled: false,
+            is_already_settled,
             can_settle,
-            pnl: "0".to_string(),
-            payable_from_settlement_sink: None,
-            insurance_preview: None,
-            collectible_from_trader_preview: None,
-            residual_bad_debt_preview: None,
+            pnl,
+            payable_from_settlement_sink,
+            insurance_preview,
+            collectible_from_trader_preview,
+            residual_bad_debt_preview,
         },
-        warnings: vec![
-            warning_partial_preview(),
-            warning_source_unavailable(
-                "pnl + settlement breakdown require OracleRouter price read + MarginEngineLens.previewAccountSettlement; tracked in M-P2c.",
-            ),
-        ],
-        meta: MetaBlock::new(&state, "db"),
+        warnings,
+        meta: MetaBlock::new(state, if status == "ok" { "rpc" } else { "db" }),
     }))
 }
 
@@ -1217,44 +1773,55 @@ pub async fn close_preview(
     State(state): State<AppState>,
     Json(req): Json<ClosePreviewRequest>,
 ) -> Result<Json<Envelope<QuotePreviewData>>, TradingApiError> {
-    parse_address_or_400(&state, &req.account)?;
+    let provider = rpc_provider_from_state(&state);
+    close_preview_impl(&state, req, provider.as_ref()).await
+}
+
+pub(crate) async fn close_preview_impl<P>(
+    state: &AppState,
+    req: ClosePreviewRequest,
+    provider: Option<&P>,
+) -> Result<Json<Envelope<QuotePreviewData>>, TradingApiError>
+where
+    P: crate::execution::rpc::EthCallProvider,
+{
+    parse_address_or_400(state, &req.account)?;
     if !["buy", "sell"].contains(&req.side.as_str()) {
         return Err(TradingApiError::new(
             TradingErrorCode::InvalidRequest,
             "side must be 'buy' or 'sell'",
-            MetaBlock::new(&state, "validation"),
+            MetaBlock::new(state, "validation"),
         ));
     }
     let size: u128 = req.size.parse().map_err(|_| {
         TradingApiError::new(
             TradingErrorCode::InvalidRequest,
             "size must be a non-negative integer",
-            MetaBlock::new(&state, "validation"),
+            MetaBlock::new(state, "validation"),
         )
     })?;
-    let series = get_option_series_service(&state, &req.series_id)
+    let series = get_option_series_service(state, &req.series_id)
         .await
         .map_err(|_| {
             TradingApiError::new(
                 TradingErrorCode::SeriesNotFound,
                 "Series id unknown",
-                MetaBlock::new(&state, "db"),
+                MetaBlock::new(state, "db"),
             )
         })?;
     if !matches!(series.status, crate::options::OptionSeriesStatus::Active) {
         return Err(TradingApiError::new(
             TradingErrorCode::QuoteUnsupported,
             "Series is not Active",
-            MetaBlock::new(&state, "db"),
+            MetaBlock::new(state, "db"),
         ));
     }
-    // Reference price: explicit price_1e8 if provided, else series strike.
     let price_1e8: u128 = match req.price_1e8.as_deref() {
         Some(p) => p.parse().map_err(|_| {
             TradingApiError::new(
                 TradingErrorCode::InvalidRequest,
                 "price_1e8 must be a non-negative integer",
-                MetaBlock::new(&state, "validation"),
+                MetaBlock::new(state, "validation"),
             )
         })?,
         None => series.strike_1e8,
@@ -1262,6 +1829,41 @@ pub async fn close_preview(
     let premium = size.saturating_mul(price_1e8);
     let fee_amount = premium.saturating_mul(PARTIAL_PREVIEW_TAKER_PPM as u128) / 1_000_000u128;
     let quote_expires_at_ms = now_ms() + 20_000;
+
+    // M-P2e — read-only oracle mark when configured.
+    let mut warnings: Vec<Warning> = Vec::new();
+    let mut oracle_mark_1e8: Option<String> = None;
+    if state.trading_views.oracle_router_address.is_some() {
+        if let Some(p) = provider {
+            let underlying_addr = address_from_account_str(&series.underlying);
+            let settlement_addr = address_from_account_str(&series.settlement_asset);
+            if let (Some(base), Some(quote)) = (underlying_addr, settlement_addr) {
+                match crate::api::trading_views::try_get_oracle_price_safe(
+                    &state.trading_views,
+                    &state.execution_config.executor_from_address,
+                    base,
+                    quote,
+                    p,
+                )
+                .await
+                {
+                    Ok(Some(mark)) => oracle_mark_1e8 = Some(mark.to_string()),
+                    Ok(None) => {}
+                    Err(e) => warnings.push(warning_oracle_unavailable(&format!(
+                        "OracleRouter.getPriceSafe failed: {}",
+                        sanitise_rpc_err(&e)
+                    ))),
+                }
+            }
+        }
+    }
+    warnings.push(warning_partial_preview());
+    if oracle_mark_1e8.is_none() {
+        warnings.push(warning_oracle_unavailable(
+            "oracle_mark_1e8 unavailable (OracleRouter address or RPC not configured).",
+        ));
+    }
+
     Ok(Json(Envelope {
         status: "partial",
         data: QuotePreviewData {
@@ -1279,19 +1881,14 @@ pub async fn close_preview(
                 amount: fee_amount.to_string(),
             },
             settlement_asset: series.settlement_asset.clone(),
-            oracle_mark_1e8: None,
+            oracle_mark_1e8,
             im_impact: None,
             free_collateral_after: None,
             quote_expires_at_ms,
             position_size_after: None,
         },
-        warnings: vec![
-            warning_partial_preview(),
-            warning_source_unavailable(
-                "oracle_mark_1e8 + position_size_after not wired in M-P2b; tracked in M-P2c.",
-            ),
-        ],
-        meta: MetaBlock::new(&state, "db"),
+        warnings,
+        meta: MetaBlock::new(state, "db"),
     }))
 }
 
@@ -2168,5 +2765,528 @@ mod tests {
         store.insert_series(series);
         drop(store);
         s
+    }
+
+    /// M-P2e — seeded state with a series whose underlying / settlement
+    /// addresses are real 0x40-hex strings (so the trading_views
+    /// helpers can parse them), and whose onchain_series_id is a
+    /// valid 0x-prefixed uint256.
+    fn seeded_state_with_addresses() -> AppState {
+        use crate::options::{OptionSeriesSource, OptionSeriesStatus};
+        let s = test_state();
+        let now_ms_v = now_ms();
+        let series = OptionSeries {
+            option_series_id: "S-1".to_string(),
+            underlying: "0x1111111111111111111111111111111111111111".to_string(),
+            base_asset: "0x1111111111111111111111111111111111111111".to_string(),
+            quote_asset: "0x2222222222222222222222222222222222222222".to_string(),
+            settlement_asset: "0x2222222222222222222222222222222222222222".to_string(),
+            expiry: (now_ms_v / 1000) as u64 + 86400,
+            strike_1e8: 200_000_000_000u128,
+            is_call: true,
+            contract_size_1e8: 100_000_000u128,
+            status: OptionSeriesStatus::Active,
+            source: OptionSeriesSource::Manual,
+            onchain_product_id: None,
+            onchain_series_id: Some(format!("0x{:064x}", 7u64)),
+            created_at_ms: now_ms_v,
+            updated_at_ms: now_ms_v,
+        };
+        let mut store = s.options_store.lock().unwrap();
+        store.insert_series(series);
+        drop(store);
+        s
+    }
+
+    fn tv_config_full() -> TradingViewsConfig {
+        TradingViewsConfig {
+            margin_engine_lens_address: Some(AccountId::new(
+                "0x3333333333333333333333333333333333333333",
+            )),
+            collateral_vault_views_address: None,
+            collateral_vault_address: None,
+            oracle_router_address: Some(AccountId::new(
+                "0x4444444444444444444444444444444444444444",
+            )),
+            margin_engine_address: Some(AccountId::new(
+                "0x5555555555555555555555555555555555555555",
+            )),
+        }
+    }
+
+    fn encode_account_state(equity: i64, mm: u128, im: u128, free: i64) -> Vec<u8> {
+        use alloy_primitives::{I256, U256};
+        use alloy_sol_types::SolValue;
+        let tup: (I256, U256, U256, I256, U256, U256, U256, bool) = (
+            I256::try_from(equity).unwrap(),
+            U256::from(mm),
+            U256::from(im),
+            I256::try_from(free).unwrap(),
+            U256::from(0u64),
+            U256::from(0u64),
+            U256::from(0u64),
+            false,
+        );
+        SolValue::abi_encode(&tup)
+    }
+
+    fn encode_settlement_preview(
+        pnl: i64,
+        collectible: u128,
+        payable: u128,
+        insurance: u128,
+        residual: u128,
+        is_settled: bool,
+        can_settle: bool,
+    ) -> Vec<u8> {
+        use alloy_primitives::{I256, U256};
+        use alloy_sol_types::SolValue;
+        let tup: (I256, U256, U256, U256, U256, U256, bool, bool) = (
+            I256::try_from(pnl).unwrap(),
+            U256::from(0u64),
+            U256::from(collectible),
+            U256::from(payable),
+            U256::from(insurance),
+            U256::from(residual),
+            is_settled,
+            can_settle,
+        );
+        SolValue::abi_encode(&tup)
+    }
+
+    // ---------------------- M-P2e PHASE 5 TESTS ----------------------
+
+    // ----- series_details_impl -----
+
+    #[tokio::test]
+    async fn series_details_impl_no_provider_returns_partial() {
+        let s = seeded_state_with_addresses();
+        let env = series_details_impl::<ProgrammableMockProvider>(&s, "S-1", None)
+            .await
+            .expect("ok");
+        assert_eq!(env.0.status, "partial");
+        assert!(env.0.data.oracle_mark_1e8.is_none());
+        assert!(env
+            .0
+            .warnings
+            .iter()
+            .any(|w| w.code == "CONFIG_MISSING" || w.code == "RPC_UNAVAILABLE"));
+    }
+
+    #[tokio::test]
+    async fn series_details_impl_oracle_configured_returns_ok_with_mark() {
+        use alloy_primitives::U256;
+        use alloy_sol_types::SolValue;
+        let mut s = seeded_state_with_addresses();
+        s.trading_views = tv_config_full();
+        let mock = ProgrammableMockProvider::new();
+        let encoded_price = SolValue::abi_encode(&U256::from(3_500_000_000_000u128));
+        mock.returns([0x63, 0x85, 0x1e, 0xa3], encoded_price);
+        let env = series_details_impl(&s, "S-1", Some(&mock))
+            .await
+            .expect("ok");
+        assert_eq!(env.0.status, "ok");
+        assert_eq!(env.0.data.oracle_mark_1e8.as_deref(), Some("3500000000000"));
+        assert_eq!(env.0.meta.source, "rpc");
+    }
+
+    #[tokio::test]
+    async fn series_details_impl_oracle_revert_falls_back_to_partial() {
+        let mut s = seeded_state_with_addresses();
+        s.trading_views = tv_config_full();
+        let mock = ProgrammableMockProvider::new();
+        mock.fails([0x63, 0x85, 0x1e, 0xa3]);
+        let env = series_details_impl(&s, "S-1", Some(&mock))
+            .await
+            .expect("ok");
+        assert_eq!(env.0.status, "partial");
+        assert!(env
+            .0
+            .warnings
+            .iter()
+            .any(|w| w.code == "ORACLE_UNAVAILABLE"));
+    }
+
+    #[tokio::test]
+    async fn series_details_impl_unknown_series_is_404() {
+        let s = test_state();
+        let err = series_details_impl::<ProgrammableMockProvider>(&s, "S-UNKNOWN", None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, TradingErrorCode::SeriesNotFound);
+    }
+
+    // ----- quote_preview_impl -----
+
+    #[tokio::test]
+    async fn quote_preview_impl_no_provider_returns_partial_oracle_warning() {
+        let s = seeded_state_with_addresses();
+        let env = quote_preview_impl::<ProgrammableMockProvider>(
+            &s,
+            QuotePreviewQuery {
+                series_id: "S-1".to_string(),
+                side: "buy".to_string(),
+                size: "1".to_string(),
+                price_1e8: None,
+                account: None,
+            },
+            None,
+        )
+        .await
+        .expect("ok");
+        assert_eq!(env.0.status, "partial");
+        assert!(env.0.data.oracle_mark_1e8.is_none());
+        assert!(env
+            .0
+            .warnings
+            .iter()
+            .any(|w| w.code == "ORACLE_UNAVAILABLE"));
+    }
+
+    #[tokio::test]
+    async fn quote_preview_impl_oracle_configured_populates_oracle_mark() {
+        use alloy_primitives::U256;
+        use alloy_sol_types::SolValue;
+        let mut s = seeded_state_with_addresses();
+        s.trading_views = tv_config_full();
+        let mock = ProgrammableMockProvider::new();
+        mock.returns(
+            [0x63, 0x85, 0x1e, 0xa3],
+            SolValue::abi_encode(&U256::from(123_456_789_000u128)),
+        );
+        let env = quote_preview_impl(
+            &s,
+            QuotePreviewQuery {
+                series_id: "S-1".to_string(),
+                side: "sell".to_string(),
+                size: "5".to_string(),
+                price_1e8: None,
+                account: None,
+            },
+            Some(&mock),
+        )
+        .await
+        .expect("ok");
+        assert_eq!(env.0.data.oracle_mark_1e8.as_deref(), Some("123456789000"));
+    }
+
+    // ----- account_positions_impl -----
+
+    #[tokio::test]
+    async fn account_positions_impl_no_oracle_returns_partial_with_config_warning() {
+        let s = seeded_state_with_addresses();
+        let env = account_positions_impl::<ProgrammableMockProvider>(
+            &s,
+            "0x1234567890abcdef1234567890abcdef12345678",
+            None,
+        )
+        .await
+        .expect("ok");
+        assert_eq!(env.0.status, "partial");
+        assert!(env
+            .0
+            .warnings
+            .iter()
+            .any(|w| w.code == "CONFIG_MISSING" || w.code == "RPC_UNAVAILABLE"));
+    }
+
+    // ----- account_portfolio_impl -----
+
+    #[tokio::test]
+    async fn account_portfolio_impl_no_provider_returns_partial_config_missing() {
+        let s = test_state();
+        let env = account_portfolio_impl::<ProgrammableMockProvider>(
+            &s,
+            "0x1234567890abcdef1234567890abcdef12345678",
+            None,
+        )
+        .await
+        .expect("ok");
+        assert_eq!(env.0.status, "partial");
+        assert!(env.0.data.equity.is_none());
+        assert!(env.0.warnings.iter().any(|w| w.code == "CONFIG_MISSING"));
+    }
+
+    #[tokio::test]
+    async fn account_portfolio_impl_lens_configured_returns_ok_with_equity() {
+        let mut s = test_state();
+        s.trading_views = tv_config_full();
+        let mock = ProgrammableMockProvider::new();
+        let encoded = encode_account_state(1_000_000, 10_000, 25_000, 500_000);
+        mock.returns([0xa5, 0x7b, 0xd4, 0xcc], encoded);
+        let env = account_portfolio_impl(
+            &s,
+            "0x6666666666666666666666666666666666666666",
+            Some(&mock),
+        )
+        .await
+        .expect("ok");
+        assert_eq!(env.0.status, "ok");
+        assert_eq!(env.0.data.equity.as_deref(), Some("1000000"));
+        assert_eq!(env.0.data.mm.as_deref(), Some("10000"));
+        assert_eq!(env.0.data.im.as_deref(), Some("25000"));
+        assert_eq!(env.0.data.free_collateral.as_deref(), Some("500000"));
+    }
+
+    #[tokio::test]
+    async fn account_portfolio_impl_lens_revert_falls_back_to_partial() {
+        let mut s = test_state();
+        s.trading_views = tv_config_full();
+        let mock = ProgrammableMockProvider::new();
+        mock.fails([0xa5, 0x7b, 0xd4, 0xcc]);
+        let env = account_portfolio_impl(
+            &s,
+            "0x6666666666666666666666666666666666666666",
+            Some(&mock),
+        )
+        .await
+        .expect("ok");
+        assert_eq!(env.0.status, "partial");
+        assert!(env
+            .0
+            .warnings
+            .iter()
+            .any(|w| w.code == "ACCOUNT_STATE_UNAVAILABLE"));
+    }
+
+    #[tokio::test]
+    async fn account_portfolio_impl_invalid_address_rejected() {
+        let s = test_state();
+        let err = account_portfolio_impl::<ProgrammableMockProvider>(&s, "not-an-address", None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, TradingErrorCode::InvalidAddress);
+    }
+
+    // ----- exercise_preview_impl -----
+
+    #[tokio::test]
+    async fn exercise_preview_impl_no_provider_returns_partial() {
+        let s = seeded_state_with_addresses();
+        let env = exercise_preview_impl::<ProgrammableMockProvider>(
+            &s,
+            ExercisePreviewRequest {
+                series_id: "S-1".to_string(),
+                account: "0x1234567890abcdef1234567890abcdef12345678".to_string(),
+            },
+            None,
+        )
+        .await
+        .expect("ok");
+        assert_eq!(env.0.status, "partial");
+        assert!(env.0.warnings.iter().any(|w| w.code == "CONFIG_MISSING"));
+    }
+
+    #[tokio::test]
+    async fn exercise_preview_impl_settlement_populates_when_lens_returns_ok() {
+        let mut s = seeded_state_with_addresses();
+        s.trading_views = tv_config_full();
+        let mock = ProgrammableMockProvider::new();
+        let encoded = encode_settlement_preview(42_000, 5_000, 3_000, 1_000, 500, false, true);
+        mock.returns([0xe8, 0x02, 0x99, 0xc3], encoded);
+        let env = exercise_preview_impl(
+            &s,
+            ExercisePreviewRequest {
+                series_id: "S-1".to_string(),
+                account: "0x1234567890abcdef1234567890abcdef12345678".to_string(),
+            },
+            Some(&mock),
+        )
+        .await
+        .expect("ok");
+        assert_eq!(env.0.status, "ok");
+        assert_eq!(env.0.data.pnl, "42000");
+        assert_eq!(
+            env.0.data.collectible_from_trader_preview.as_deref(),
+            Some("5000")
+        );
+        assert_eq!(
+            env.0.data.payable_from_settlement_sink.as_deref(),
+            Some("3000")
+        );
+        assert_eq!(env.0.data.insurance_preview.as_deref(), Some("1000"));
+        assert_eq!(env.0.data.residual_bad_debt_preview.as_deref(), Some("500"));
+        assert!(!env.0.data.is_already_settled);
+        assert!(env.0.data.can_settle);
+    }
+
+    #[tokio::test]
+    async fn exercise_preview_impl_lens_failure_falls_back_to_partial() {
+        let mut s = seeded_state_with_addresses();
+        s.trading_views = tv_config_full();
+        let mock = ProgrammableMockProvider::new();
+        mock.fails([0xe8, 0x02, 0x99, 0xc3]);
+        let env = exercise_preview_impl(
+            &s,
+            ExercisePreviewRequest {
+                series_id: "S-1".to_string(),
+                account: "0x1234567890abcdef1234567890abcdef12345678".to_string(),
+            },
+            Some(&mock),
+        )
+        .await
+        .expect("ok");
+        assert_eq!(env.0.status, "partial");
+        assert!(env
+            .0
+            .warnings
+            .iter()
+            .any(|w| w.code == "SETTLEMENT_PREVIEW_UNAVAILABLE"));
+    }
+
+    #[tokio::test]
+    async fn exercise_preview_impl_invalid_account_rejected() {
+        let s = seeded_state_with_addresses();
+        let err = exercise_preview_impl::<ProgrammableMockProvider>(
+            &s,
+            ExercisePreviewRequest {
+                series_id: "S-1".to_string(),
+                account: "nope".to_string(),
+            },
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, TradingErrorCode::InvalidAddress);
+    }
+
+    // ----- close_preview_impl -----
+
+    #[tokio::test]
+    async fn close_preview_impl_no_provider_returns_partial_oracle_warning() {
+        let s = seeded_state_with_addresses();
+        let env = close_preview_impl::<ProgrammableMockProvider>(
+            &s,
+            ClosePreviewRequest {
+                series_id: "S-1".to_string(),
+                account: "0x1234567890abcdef1234567890abcdef12345678".to_string(),
+                side: "buy".to_string(),
+                size: "2".to_string(),
+                price_1e8: None,
+            },
+            None,
+        )
+        .await
+        .expect("ok");
+        assert_eq!(env.0.status, "partial");
+        assert!(env.0.data.oracle_mark_1e8.is_none());
+        assert!(env
+            .0
+            .warnings
+            .iter()
+            .any(|w| w.code == "ORACLE_UNAVAILABLE"));
+    }
+
+    #[tokio::test]
+    async fn close_preview_impl_oracle_configured_populates_mark() {
+        use alloy_primitives::U256;
+        use alloy_sol_types::SolValue;
+        let mut s = seeded_state_with_addresses();
+        s.trading_views = tv_config_full();
+        let mock = ProgrammableMockProvider::new();
+        mock.returns(
+            [0x63, 0x85, 0x1e, 0xa3],
+            SolValue::abi_encode(&U256::from(999_999_999u128)),
+        );
+        let env = close_preview_impl(
+            &s,
+            ClosePreviewRequest {
+                series_id: "S-1".to_string(),
+                account: "0x1234567890abcdef1234567890abcdef12345678".to_string(),
+                side: "sell".to_string(),
+                size: "1".to_string(),
+                price_1e8: None,
+            },
+            Some(&mock),
+        )
+        .await
+        .expect("ok");
+        assert_eq!(env.0.data.oracle_mark_1e8.as_deref(), Some("999999999"));
+    }
+
+    // ----- decoder tests -----
+
+    #[test]
+    fn decode_account_state_roundtrips() {
+        let encoded = encode_account_state(-100, 200, 300, -400);
+        let d = decode_account_state(&encoded).expect("decode ok");
+        assert_eq!(d.equity_base.to_string(), "-100");
+        assert_eq!(d.maintenance_margin_base.to_string(), "200");
+        assert_eq!(d.initial_margin_base.to_string(), "300");
+        assert_eq!(d.free_collateral_base.to_string(), "-400");
+    }
+
+    #[test]
+    fn decode_account_state_rejects_garbage() {
+        let out = decode_account_state(&[0u8; 4]);
+        assert!(out.is_err());
+    }
+
+    #[test]
+    fn decode_settlement_preview_roundtrips() {
+        let encoded = encode_settlement_preview(-7, 1, 2, 3, 4, true, false);
+        let d = decode_settlement_preview(&encoded).expect("decode ok");
+        assert_eq!(d.pnl.to_string(), "-7");
+        assert_eq!(d.collectible_amount.to_string(), "1");
+        assert_eq!(d.payable_from_settlement_sink.to_string(), "2");
+        assert_eq!(d.insurance_preview.to_string(), "3");
+        assert_eq!(d.residual_bad_debt_preview.to_string(), "4");
+        assert!(d.is_settled);
+        assert!(!d.can_settle);
+    }
+
+    // ----- secret-leak guards -----
+
+    #[tokio::test]
+    async fn series_details_response_never_leaks_secrets() {
+        let mut s = seeded_state_with_addresses();
+        s.trading_views = tv_config_full();
+        let mock = ProgrammableMockProvider::new();
+        mock.fails([0x63, 0x85, 0x1e, 0xa3]);
+        let env = series_details_impl(&s, "S-1", Some(&mock))
+            .await
+            .expect("ok");
+        let body = serde_json::to_string(&env.0).unwrap();
+        for forbidden in [
+            "EXECUTOR_PRIVATE_KEY",
+            "DATABASE_URL",
+            "AWS_ACCESS_KEY",
+            "AWS_SECRET_ACCESS_KEY",
+            "arn:aws:kms",
+            "Bearer ",
+            "http://",
+            "https://",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "series_details body leaked '{forbidden}': {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn portfolio_response_never_leaks_secrets_on_rpc_failure() {
+        let mut s = test_state();
+        s.trading_views = tv_config_full();
+        let mock = ProgrammableMockProvider::new();
+        mock.fails([0xa5, 0x7b, 0xd4, 0xcc]);
+        let env = account_portfolio_impl(
+            &s,
+            "0x6666666666666666666666666666666666666666",
+            Some(&mock),
+        )
+        .await
+        .expect("ok");
+        let body = serde_json::to_string(&env.0).unwrap();
+        for forbidden in [
+            "EXECUTOR_PRIVATE_KEY",
+            "DATABASE_URL",
+            "AWS_ACCESS_KEY",
+            "arn:aws:kms",
+            "http://",
+            "https://",
+        ] {
+            assert!(!body.contains(forbidden), "leak: {forbidden}\n{body}");
+        }
     }
 }
