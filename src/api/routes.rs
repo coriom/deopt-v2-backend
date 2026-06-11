@@ -274,10 +274,8 @@ pub fn router(state: AppState) -> Router {
             "/options/orders",
             post(submit_option_order).get(list_option_orders),
         )
-        .route(
-            "/options/execution-intents",
-            get(list_option_execution_intents),
-        )
+        // GET /options/execution-intents is wired further below alongside
+        // the M-P2f POST handler so both verbs share a single route entry.
         .route(
             "/options/execution-intents/:intent_id",
             get(get_option_execution_intent),
@@ -472,6 +470,15 @@ pub fn router(state: AppState) -> Router {
             get(crate::api::trading::account_history),
         )
         .route("/trading/health", get(crate::api::trading::trading_health))
+        // M-P2f — Public/user-wallet create-intent endpoint (B7 close).
+        // No admin Bearer. No signer call. No broadcast. The handler
+        // delegates to the existing intent service and writes only to
+        // the option_execution_intents table; the downstream signing /
+        // signature-submit / tx-status flow is unchanged.
+        .route(
+            "/options/execution-intents",
+            post(crate::api::trading::create_execution_intent).get(list_option_execution_intents),
+        )
         // ---------------------------------------------------------------
         // M-P4c — Local/test-only execution-intent + tx-status fixtures.
         //

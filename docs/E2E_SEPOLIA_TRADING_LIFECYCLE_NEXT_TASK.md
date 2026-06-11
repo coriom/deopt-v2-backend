@@ -1,169 +1,141 @@
-# Next-task prompt: E2E-SEPOLIA-TRADING-LIFECYCLE (M-P5)
+# E2E_SEPOLIA_TRADING_LIFECYCLE_NEXT_TASK (M-P5)
 
-Copy/paste this prompt verbatim to initiate M-P5. **M-P5 is NOT yet
-ready** — it gates on M-P4b (Playwright + cycler) + M-P2c (on-chain
-RPC orchestration) closure. This file is a forward placeholder.
-
----
-
-```
-Workspace root is ~/DEOPT.
-
-Execute E2E-SEPOLIA-TRADING-LIFECYCLE only.
-
-This is M-P5 of the product-readiness roadmap. The goal is to run
-the full DeOpt V2 trading lifecycle against Base Sepolia rehearsal
-infrastructure, validating that the M-P4 local lifecycle composes
-under real L2 + RPC + indexer + reconciliation conditions.
-
-Hard prerequisites (ALL MUST be closed):
-  - M-P4 closed (E2E local lifecycle).
-  - M-P4b closed (Playwright + mock-status cycler).
-  - M-P2c closed (on-chain RPC orchestration for 6 trading endpoints).
-
-If any of the above is not yet closed, STOP and surface the gap.
-
-Do not deploy to mainnet.
-Do not broadcast to mainnet.
-Do not send Sepolia transactions OUTSIDE the rehearsal scenarios
-documented below. Each Sepolia tx must be explicit + approved in the
-scenario script.
-Do not create Safe transactions.
-Do not create AWS resources.
-Do not edit production `.env` (use `.env.sepolia.local`).
-Do not expose secrets.
-Do not touch mainnet.
-Do not expose admin Bearer to trading UI.
-
-Strategic context:
-
-External audit deferred until M-P7 closure. M-P5 is the final pre-
-public-beta confidence step before M-P6 (public docs beta pack)
-opens the rehearsal to outside testers.
-
-Goal:
-
-Run the orderbook 9-step scenario + RFQ 7-step scenario + 10-row
-failure-case sweep from `E2E_TRADING_LIFECYCLE_TEST_PLAN.md §2`
-against:
-  - Base Sepolia chain id 84532;
-  - operator-managed Sepolia RPC URL;
-  - Sepolia-deployed contract addresses (from M-P4 rehearsal);
-  - backend pointed at Sepolia + Postgres;
-  - frontend pointed at backend with NEXT_PUBLIC_CHAIN_ENV=sepolia;
-  - Playwright harness from M-P4b adapted for Sepolia.
-
-Verify:
-  - R5 drift = 0 across the full scenario sweep;
-  - indexer caught up at end (lag < 5 blocks);
-  - reconciliation drift = 0;
-  - Cluster 4 launch invariant: PFV.rebateReserve(asset) === 0 +
-    FM_V2.rebateBudget(asset) === 0;
-  - signer policy: all broadcasts succeeded via the in-process k256
-    signer (Sepolia rehearsal only); no remote signer required.
-
-Required Phase A — inspect:
-  - `~/DEOPT/deopt-v2-backend/docs/E2E_TRADING_LIFECYCLE_TEST_PLAN.md §2`;
-  - `~/DEOPT/deopt-v2-backend/docs/E2E_LOCAL_TRADING_LIFECYCLE_RESULT.md`;
-  - `~/DEOPT/deopt-v2-backend/docs/BACKEND_TRADING_API_PHASE_2_RESULT.md`;
-  - `~/DEOPT/deopt-v2-frontend/docs/FRONTEND_TRADING_SIGNING_RESULT.md`;
-  - operator-side Sepolia rehearsal evidence at
-    `~/DEOPT/deopt-v2-sol/docs/V2G_GOV_G_RESULT.md` (anchored addresses).
-
-Required Phase B — environment:
-  - Create `.env.sepolia.local` (gitignored) with operator-supplied
-    Sepolia RPC URL + rehearsal-only Sepolia executor private key
-    + Sepolia contract addresses.
-  - **NEVER** commit `.env.sepolia.local`.
-  - Sepolia executor private key MUST be a rehearsal-only key; NOT
-    a key that holds real funds anywhere.
-  - Mainnet defence-in-depth: backend startup MUST refuse to
-    accept `EXECUTOR_PRIVATE_KEY` when `chain_id == 8453` (already
-    tested by `validate_signer_backend`).
-
-Required Phase C — scenarios:
-Execute the scenarios from `E2E_TRADING_LIFECYCLE_TEST_PLAN.md §2`:
-  - 9-step orderbook lifecycle;
-  - 7-step RFQ lifecycle;
-  - 10-row failure case sweep.
-
-Required Phase D — verification:
-  - R5 drift = 0 (CV.balances(PFV, asset) - PFV.feeBalance -
-    PFV.rebateReserve === 0).
-  - `GET /reconciliation/status` → drift = 0.
-  - `GET /indexer/status` → lag < 5 blocks.
-  - Cluster 4 launch invariant pin.
-
-Required Phase E — result doc + RUN_STATE:
-Create
-`~/DEOPT/deopt-v2-backend/docs/E2E_SEPOLIA_TRADING_LIFECYCLE_RESULT.md`:
-  - environment summary (Sepolia chain id; RPC reachable; contracts
-    anchored);
-  - scenario pass / fail per step;
-  - failure-case pass / fail per row;
-  - R5 drift final value;
-  - reconciliation result;
-  - tx hash + block list (operator-public-safe);
-  - blockers remaining for M-P6.
-
-Update `~/DEOPT/RUN_STATE.md` with concise closure paragraph.
-
-Validation:
-  - All Playwright specs from M-P4b run green against Sepolia
-    rehearsal.
-  - `cargo test`, `npx next build` clean.
-  - `git diff --check`, `git status`.
-  - Sensitive-string scan: NO mainnet contract addresses; NO
-    production secrets; Sepolia RPC URL allowed in `.env.sepolia.local`
-    ONLY; tx hashes allowed in result doc.
-
-Forbidden:
-  - no mainnet tx;
-  - no live broadcast against any chain OTHER than Sepolia for the
-    specific tx documented in the scenarios;
-  - no Safe tx;
-  - no governance mutation;
-  - no fund movement OUTSIDE the rehearsal scenarios;
-  - no production `.env` edit;
-  - no AWS resource creation;
-  - no KMS key creation;
-  - no real AWS account IDs / KMS key IDs / KMS ARNs;
-  - no guessed mainnet executor address;
-  - no production signer address guess;
-  - no invented mainnet contract addresses;
-  - no audited claim;
-  - no mainnet-ready claim;
-  - no admin Bearer in trading UI.
-
-Hard stops:
-  - stop if any scenario step would require a mainnet tx;
-  - stop if R5 drift becomes non-zero (file as a regression);
-  - stop if reconciliation drift becomes non-zero;
-  - stop if indexer falls > 5 blocks behind and doesn't catch up;
-  - stop if a Sepolia tx fails with a revert other than the
-    deliberately-induced failure-case reverts;
-  - stop if Playwright cannot reach the Sepolia backend;
-  - stop if a wallet popup asks for mainnet tx;
-  - stop if `validate_signer_backend` refuses startup unexpectedly.
-
-Return final report grouped by:
-workspace,
-docs/source inspected,
-environment,
-orderbook scenario,
-RFQ scenario,
-failure-case sweep,
-R5 drift,
-reconciliation,
-Cluster 4 launch invariant,
-tx hashes + blocks,
-RUN_STATE update,
-files changed,
-validations,
-blockers remaining,
-next milestone recommendation (M-P6 public docs beta pack).
-```
+**Date written:** 2026-06-10
+**Origin milestone:** M-P3c (`FRONTEND-CREATE-INTENT-UX`) — closed B3.
+**Target milestone:** `E2E-SEPOLIA-TRADING-LIFECYCLE` (M-P5) — end-to-end
+rehearsal on Base Sepolia (chain 84532) only.
+**Posture:** **DRY-RUN FIRST. Operator-approval-gated for any live
+broadcast.** **No mainnet.** **No Safe tx.** **No AWS/KMS creation.**
+**No production `.env` edit.** **No real funds movement.** **No
+audited-claim.**
 
 ---
+
+## 1. Posture (read this first)
+
+This milestone is **the first time** the DeOpt V2 stack exercises a
+real public-chain transaction end-to-end. The posture is strict
+because of that:
+
+* **Sepolia only** (chain 84532). Mainnet (chain 8453) is permanently
+  disabled in every code path and ALL four defence-in-depth gates
+  must remain intact.
+* **Dry-run first.** Every step is rehearsed against anvil + the
+  M-P4c local-test cycler first; only after the dry-run passes is
+  a live Sepolia broadcast considered.
+* **Operator approval required** before any live Sepolia
+  `eth_sendRawTransaction`. The operator approval lives outside this
+  milestone (a separate sign-off doc).
+* **No Safe tx.** Sepolia rehearsal uses the existing executor
+  signer, not the production Safe-multi-sig flow.
+* **No AWS / KMS creation.** Sepolia rehearsal uses the existing
+  AWS/KMS configuration if already provisioned, OR the local
+  private-key signer for the testnet rehearsal. **No new AWS
+  resources, no new KMS keys, no production secrets are created.**
+* **No production `.env` edit.** Any env values needed for the
+  rehearsal go in `.env.sepolia` or a dedicated test config — never
+  in a file that production reads.
+
+## 2. Gates that must be green before M-P5 starts
+
+| Gate | Source |
+|---|---|
+| B1 LOCAL_INTENT_FIXTURE_MISSING | closed (M-P4c) |
+| B2 ON_CHAIN_RPC_NOT_WIRED | closed (M-P2e) |
+| B3 FRONTEND_CREATE_INTENT_UX_MISSING | closed (M-P3c) |
+| B5 BACKEND_TX_STATUS_FIXTURE_MISSING | closed (M-P4c) |
+| Backend `cargo test --all-targets` 1182+ green | confirmed at M-P2e |
+| Frontend `tsc + eslint + next build + playwright list` clean | confirmed at M-P3c |
+| Mainnet hard-gate, 4 gates intact | confirmed at every milestone |
+
+## 3. Scope — M-P5
+
+### Phase A — Dry-run on anvil + M-P4c cycler
+
+1. Anvil starts (chain 31337).
+2. Backend starts with `OPTION_*_ADDRESS` env keys populated against
+   anvil-deployed contracts.
+3. Backend M-P4c fixture is enabled
+   (`LocalTestFixturesConfig::enabled_for_chain_id(31337)`).
+4. Frontend connects via the wallet fixture (Playwright).
+5. Trade ticket: Create intent → Sign → Submit → Tx Status drives
+   CREATED → BROADCAST → CONFIRMED via the cycler.
+6. **Expected: all 21 Playwright specs pass + new M-P5 specs added.**
+
+### Phase B — Sepolia rehearsal (dry-run only)
+
+1. Backend `.env.sepolia` (NOT `.env`) populated with sepolia RPC URL
+   + executor private key + the 5 sepolia contract addresses.
+2. Backend started against Sepolia (chain 84532).
+3. M-P4c fixture **disabled** for Sepolia (only used for anvil
+   tests).
+4. Frontend connects to backend; submits a quote-preview → create
+   intent → fetch signing payload. **STOP before signing.**
+5. Operator reviews the signing payload, the EIP-712 domain
+   (chainId=84532), the verifying contract, and the tx envelope.
+6. **Sign-off doc** required before proceeding.
+
+### Phase C — Live Sepolia broadcast (operator-gated)
+
+1. Operator approves the rehearsal.
+2. User signs typed data in wallet on Sepolia.
+3. Backend submits signature, operator broadcasts via existing
+   executor.
+4. Tx hash recorded; tx-status timeline drives through real
+   on-chain confirmations.
+5. R5 drift check + reconciliation check pass.
+6. **Expected: zero unexpected reverts; zero unexpected fee
+   movements; zero Safe-tx exposure; zero AWS/KMS resource creation.**
+
+## 4. Forbidden in M-P5
+
+* No mainnet broadcast.
+* No Safe tx (Sepolia or otherwise).
+* No production `.env` edit.
+* No new AWS account / KMS key / IAM role creation.
+* No new GitHub workflow that touches mainnet.
+* No Solidity modification.
+* No new ABI binding (Sepolia uses the frozen `v2-product-freeze-rc1`
+  artefacts).
+* No bypass of mainnet hard-gates.
+* No "mainnet-ready" claim — that comes after M-P6/M-P7 + audit.
+
+## 5. Hard stops
+
+Stop and ask the user before proceeding if:
+
+* Sepolia broadcast would require editing production `.env`.
+* Sepolia broadcast would require a Safe tx.
+* Sepolia signer mechanism is unclear or undocumented.
+* R5 drift check is non-zero.
+* Reconciliation check shows unexpected divergence.
+* Any frontend code path could leak admin Bearer to the trading UI.
+* Local setup would overwrite developer data.
+
+## 6. R5 drift + reconciliation prerequisites
+
+Before any live broadcast:
+
+* `R5 drift = 0` (existing constraint from V2G-GOV-G).
+* Backend reconciliation worker has run and reports `match` for the
+  pre-rehearsal state.
+* M-P4c local-test fixture is **disabled** on Sepolia (re-asserted at
+  startup).
+
+## 7. Deliverables for M-P5
+
+* `docs/E2E_SEPOLIA_TRADING_LIFECYCLE_DRY_RUN_RESULT.md`
+* `docs/E2E_SEPOLIA_TRADING_LIFECYCLE_RUNBOOK.md`
+* `docs/E2E_SEPOLIA_OPERATOR_SIGNOFF.md` (one-page approval template)
+* Updated `RUN_STATE.md` with the closure paragraph.
+
+## 8. Cross-links
+
+* `BACKEND_TRADING_API_PHASE_5_RESULT.md` (M-P2e)
+* `E2E_LOCAL_TX_STATUS_CYCLER_RESULT.md` (M-P4c)
+* `~/DEOPT/deopt-v2-frontend/docs/FRONTEND_CREATE_INTENT_UX_RESULT.md` (M-P3c)
+* `~/DEOPT/deopt-v2-frontend/docs/TRADING_CREATE_INTENT_FLOW_RUNBOOK.md` (M-P3c)
+* `BACKEND_LIVE_BROADCAST_FLAG_FLIP_RUNBOOK_V2G_FX_Q1_C.md` (live broadcast safety)
+* `BACKEND_SIGNER_CUTOVER_RUNBOOK_V2G_FX_Q1.md` (signer config)
 
 **End of next-task prompt.**

@@ -2393,6 +2393,84 @@ async fn create_option_orderbook_execution_intents(
     Ok(intents)
 }
 
+/// M-P2f (B7 close) — User-wallet-initiated execution intent creation.
+///
+/// Public/no-admin-Bearer counterpart to
+/// `create_option_orderbook_execution_intent`. Where the orderbook
+/// variant builds the intent from a server-side `OptionFill` after
+/// matching, this function builds it from caller-supplied trade
+/// parameters (both buyer + seller are required, since the
+/// counterparty resolver is not yet wired). The intent is inserted
+/// into the same store/repository the existing signing-payload /
+/// signature-submit / tx-status endpoints already read from, so the
+/// downstream UI flow works unchanged.
+///
+/// **Posture (verified by tests in `src/api/trading.rs`):**
+///   * NEVER signs.
+///   * NEVER broadcasts.
+///   * NEVER calls the signer / AWS / KMS.
+///   * NEVER touches a public chain (no `eth_call`, no
+///     `eth_sendRawTransaction`).
+///   * NEVER mutates production transaction tables — only the
+///     existing `option_execution_intents` table (which is the same
+///     table the M-P2a/M-P3b flow has always written to).
+///
+/// Returns the inserted `OptionExecutionIntent` with
+/// `status = SignaturesRequired`. The caller is the frontend's
+/// `CreateIntentButton`; the user then explicitly clicks "Sign" to
+/// drive the existing signing-payload flow.
+pub async fn create_user_initiated_execution_intent_from_quote(
+    state: &AppState,
+    series: &OptionSeries,
+    buyer: AccountId,
+    seller: AccountId,
+    side: crate::types::Side,
+    size_1e8: crate::types::Size1e8,
+    price_1e8: crate::types::Price1e8,
+) -> Result<OptionExecutionIntent> {
+    ensure_enabled(state)?;
+    validate_account(&buyer)?;
+    validate_account(&seller)?;
+    if size_1e8 == 0 {
+        return Err(BackendError::ZeroSize);
+    }
+    if price_1e8 == 0 {
+        return Err(BackendError::ZeroPrice);
+    }
+    if buyer.0.eq_ignore_ascii_case(&seller.0) {
+        return Err(BackendError::SelfTrade);
+    }
+    if !matches!(series.status, OptionSeriesStatus::Active) {
+        return Err(BackendError::InvalidOptionSeriesState(
+            "option series is not active".to_string(),
+        ));
+    }
+    // The user is the taker; the counterparty role is "maker" for
+    // book-keeping purposes only — no order-book matching is
+    // performed here. The `buyer_is_maker` flag is set based on
+    // `side`: when the caller is buying, the seller is the maker.
+    let buyer_is_maker = matches!(side, crate::types::Side::Sell);
+    let nonce_provider = option_nonce_provider(state)?;
+    let (buyer_nonce, seller_nonce) =
+        option_execution_nonces(state, nonce_provider.as_ref(), &buyer, &seller).await?;
+    let source_id = Uuid::new_v4().to_string();
+    let intent = build_option_execution_intent(
+        state,
+        series,
+        OptionExecutionSourceType::OptionOrderbookFill,
+        source_id,
+        buyer,
+        seller,
+        price_1e8,
+        size_1e8,
+        buyer_is_maker,
+        buyer_nonce,
+        seller_nonce,
+        now_ms(),
+    )?;
+    insert_option_execution_intent(state, intent).await
+}
+
 async fn insert_option_execution_intent(
     state: &AppState,
     intent: OptionExecutionIntent,

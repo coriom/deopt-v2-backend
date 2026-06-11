@@ -16,6 +16,7 @@
 
 use crate::api::http::AppState;
 use crate::options::service::{
+    create_user_initiated_execution_intent_from_quote,
     get_option_series as get_option_series_service, list_option_fills as list_option_fills_service,
     list_option_series as list_option_series_service,
 };
@@ -387,6 +388,54 @@ pub struct ExercisePreviewData {
 }
 
 // ---------------------------------------------------------------------
+// M-P2f — Create-intent request / response DTOs (B7 close)
+//
+// Public/user-wallet endpoint. **No admin Bearer.** Mints an
+// `OptionExecutionIntent` from caller-supplied trade parameters; the
+// user explicitly clicks "Sign" afterwards to drive the existing
+// signing-payload / signature-submit flow. NEVER signs. NEVER
+// broadcasts. NEVER calls the signer / AWS / KMS.
+// ---------------------------------------------------------------------
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct CreateExecutionIntentRequest {
+    pub series_id: String,
+    pub side: String,
+    pub size_1e8: String,
+    pub price_1e8: String,
+    pub buyer: Option<String>,
+    pub seller: Option<String>,
+    /// Optional. When supplied, the backend may resolve buyer + seller
+    /// from a previously-issued RFQ quote. As of M-P2f this is a
+    /// forward-compatibility hook only: the body's explicit buyer and
+    /// seller fields are mandatory and the quote_id is ignored. A future
+    /// milestone (BACKEND-QUOTE-COUNTERPARTY-RESOLVER) will activate it.
+    pub quote_id: Option<String>,
+    /// Optional client-side correlation id. Echoed back in the
+    /// response `meta.request_id` if supplied; otherwise the backend
+    /// generates a fresh uuid.
+    pub client_request_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CreateExecutionIntentData {
+    pub intent_id: String,
+    pub request_id: String,
+    pub status: String,
+    /// `true` iff the user can immediately call
+    /// `GET /options/execution-intents/:intent_id/signing-payload`.
+    pub signing_payload_available: bool,
+    /// Next step the UI should take. One of:
+    ///   * `"request_signing_payload"` — happy path.
+    ///   * `"pending_backend_support"` — partial; the UI should
+    ///     surface an amber notice.
+    pub next_step: &'static str,
+    /// Optional deadline beyond which the intent will be rejected at
+    /// broadcast. Null when the backend has not yet wired a deadline.
+    pub expires_at_ms: Option<i64>,
+}
+
+// ---------------------------------------------------------------------
 // Product computation (series → product aggregation)
 // ---------------------------------------------------------------------
 
@@ -709,6 +758,188 @@ fn side_str(s: crate::types::Side) -> &'static str {
         Side::Buy => "buy",
         Side::Sell => "sell",
     }
+}
+
+fn parse_side(value: &str) -> Option<crate::types::Side> {
+    match value {
+        "buy" => Some(crate::types::Side::Buy),
+        "sell" => Some(crate::types::Side::Sell),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------
+// M-P2f — POST /options/execution-intents (B7 close)
+// ---------------------------------------------------------------------
+
+/// Public/user-wallet endpoint that mints an
+/// `OptionExecutionIntent` from caller-supplied trade params. The
+/// returned `intent_id` is consumed by the existing
+/// signing-payload / signature-submit / tx-status endpoints.
+///
+/// **No admin Bearer.** **No signer call.** **No broadcast.**
+/// **No AWS / KMS call.** The handler delegates to
+/// `create_user_initiated_execution_intent_from_quote` in the
+/// service layer, which writes only to the existing
+/// `option_execution_intents` table (the same table the M-P2a/M-P3b
+/// flow has always written to).
+///
+/// ## Response shape
+///
+/// The body is **flat** (not the standard `Envelope<T>` shape) to
+/// match the frontend client `createExecutionIntent` decoder which
+/// looks for `intent_id` on the top-level object. The fields are
+/// captured by `CreateExecutionIntentData`.
+///
+/// ## Error mapping
+///
+/// | Condition | TradingErrorCode | HTTP |
+/// |---|---|---|
+/// | side ∉ {buy,sell} | InvalidRequest | 400 |
+/// | size_1e8 not parseable / zero | InvalidRequest | 400 |
+/// | price_1e8 not parseable / zero | InvalidRequest | 400 |
+/// | buyer or seller missing | InvalidRequest | 400 |
+/// | buyer / seller malformed address | InvalidAddress | 400 |
+/// | series_id unknown | SeriesNotFound | 404 |
+/// | series not Active | QuoteUnsupported | 400 |
+/// | buyer == seller (self-trade) | InvalidRequest | 400 |
+/// | options disabled | InternalError | 500 |
+/// | options not configured for execution | InternalError | 500 |
+pub async fn create_execution_intent(
+    State(state): State<AppState>,
+    Json(req): Json<CreateExecutionIntentRequest>,
+) -> Result<Json<CreateExecutionIntentData>, TradingApiError> {
+    let side = parse_side(&req.side).ok_or_else(|| {
+        TradingApiError::new(
+            TradingErrorCode::InvalidRequest,
+            "side must be 'buy' or 'sell'",
+            MetaBlock::new(&state, "validation"),
+        )
+    })?;
+    let size_1e8: u128 = req.size_1e8.parse().map_err(|_| {
+        TradingApiError::new(
+            TradingErrorCode::InvalidRequest,
+            "size_1e8 must be a non-negative integer",
+            MetaBlock::new(&state, "validation"),
+        )
+    })?;
+    if size_1e8 == 0 {
+        return Err(TradingApiError::new(
+            TradingErrorCode::InvalidRequest,
+            "size_1e8 must be positive",
+            MetaBlock::new(&state, "validation"),
+        ));
+    }
+    let price_1e8: u128 = req.price_1e8.parse().map_err(|_| {
+        TradingApiError::new(
+            TradingErrorCode::InvalidRequest,
+            "price_1e8 must be a non-negative integer",
+            MetaBlock::new(&state, "validation"),
+        )
+    })?;
+    if price_1e8 == 0 {
+        return Err(TradingApiError::new(
+            TradingErrorCode::InvalidRequest,
+            "price_1e8 must be positive",
+            MetaBlock::new(&state, "validation"),
+        ));
+    }
+    let buyer_raw = req.buyer.as_deref().ok_or_else(|| {
+        TradingApiError::new(
+            TradingErrorCode::InvalidRequest,
+            "buyer address is required (counterparty resolver not yet wired)",
+            MetaBlock::new(&state, "validation"),
+        )
+    })?;
+    let seller_raw = req.seller.as_deref().ok_or_else(|| {
+        TradingApiError::new(
+            TradingErrorCode::InvalidRequest,
+            "seller address is required (counterparty resolver not yet wired)",
+            MetaBlock::new(&state, "validation"),
+        )
+    })?;
+    let buyer = parse_address_or_400(&state, buyer_raw)?;
+    let seller = parse_address_or_400(&state, seller_raw)?;
+    if buyer.0.eq_ignore_ascii_case(&seller.0) {
+        return Err(TradingApiError::new(
+            TradingErrorCode::InvalidRequest,
+            "buyer and seller must differ",
+            MetaBlock::new(&state, "validation"),
+        ));
+    }
+
+    let series = get_option_series_service(&state, &req.series_id)
+        .await
+        .map_err(|_| {
+            TradingApiError::new(
+                TradingErrorCode::SeriesNotFound,
+                "Series id unknown",
+                MetaBlock::new(&state, "db"),
+            )
+        })?;
+    if !matches!(series.status, crate::options::OptionSeriesStatus::Active) {
+        return Err(TradingApiError::new(
+            TradingErrorCode::QuoteUnsupported,
+            "Series is not Active",
+            MetaBlock::new(&state, "db"),
+        ));
+    }
+
+    let intent = create_user_initiated_execution_intent_from_quote(
+        &state, &series, buyer, seller, side, size_1e8, price_1e8,
+    )
+    .await
+    .map_err(|err| {
+        // Map service-layer BackendError to a public TradingErrorCode.
+        // Internal-shape errors collapse to InternalError WITHOUT
+        // surfacing the raw message (the message can carry config
+        // hints that aren't appropriate for a public endpoint).
+        use crate::error::BackendError;
+        let (code, message) = match &err {
+            BackendError::ZeroSize | BackendError::ZeroPrice => {
+                (TradingErrorCode::InvalidRequest, err.to_string())
+            }
+            BackendError::SelfTrade => (
+                TradingErrorCode::InvalidRequest,
+                "buyer and seller must differ".to_string(),
+            ),
+            BackendError::MalformedAccountAddress => (
+                TradingErrorCode::InvalidAddress,
+                "address shape invalid".to_string(),
+            ),
+            BackendError::InvalidOptionSeriesState(reason)
+            | BackendError::InvalidOptionExecutionIntentState(reason) => {
+                (TradingErrorCode::InvalidRequest, reason.clone())
+            }
+            BackendError::OptionsDisabled => (
+                TradingErrorCode::InternalError,
+                "options service not enabled".to_string(),
+            ),
+            _ => (
+                TradingErrorCode::InternalError,
+                "intent creation failed".to_string(),
+            ),
+        };
+        TradingApiError::new(code, message, MetaBlock::new(&state, "intent_service"))
+    })?;
+
+    let request_id = req
+        .client_request_id
+        .clone()
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    Ok(Json(CreateExecutionIntentData {
+        intent_id: intent.intent_id.to_string(),
+        request_id,
+        status: intent.status.as_str().to_string(),
+        signing_payload_available: matches!(
+            intent.status,
+            crate::options::OptionExecutionIntentStatus::SignaturesRequired
+                | crate::options::OptionExecutionIntentStatus::SignaturesReady
+                | crate::options::OptionExecutionIntentStatus::CalldataReady
+        ),
+        next_step: "request_signing_payload",
+        expires_at_ms: None,
+    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -3288,5 +3519,376 @@ mod tests {
         ] {
             assert!(!body.contains(forbidden), "leak: {forbidden}\n{body}");
         }
+    }
+
+    // ---------------------- M-P2f CREATE-INTENT TESTS ----------------------
+
+    /// Seeded state with options execution enabled + a series whose
+    /// onchain_series_id is the actual `option_product_registry_option_id`
+    /// computed against the seeded metadata. The matching engine
+    /// address is set to a deterministic non-zero placeholder so the
+    /// nonce-sync precheck (disabled by default) doesn't fail.
+    fn seeded_state_for_create_intent() -> AppState {
+        use crate::options::{OptionSeriesSource, OptionSeriesStatus};
+        let mut s = test_state();
+        // Enable options execution so the service path is reachable.
+        s.options_config.execution_enabled = true;
+        s.options_config.execution_require_persistence = false;
+        s.options_config.matching_engine_address =
+            AccountId::new("0x00000000000000000000000000000000000000ee");
+        s.options_config.execution_eip712_domain.verifying_contract =
+            s.options_config.matching_engine_address.clone();
+
+        let now_ms_v = now_ms();
+        let underlying = AccountId::new("0x1111111111111111111111111111111111111111");
+        let settlement = AccountId::new("0x2222222222222222222222222222222222222222");
+        let expiry = (now_ms_v / 1000) as u64 + 86400;
+        let strike_1e8: u64 = 200_000_000_000;
+        let contract_size_1e8: u128 = 100_000_000;
+        let is_call = true;
+        // Compute the real option_id (european variant).
+        let option_id = crate::options::option_product_registry_option_id(
+            &underlying,
+            &settlement,
+            expiry,
+            strike_1e8,
+            contract_size_1e8,
+            is_call,
+            true,
+        )
+        .expect("option_id compute");
+        let series = OptionSeries {
+            option_series_id: "S-1".to_string(),
+            underlying: underlying.0.clone(),
+            base_asset: underlying.0.clone(),
+            quote_asset: settlement.0.clone(),
+            settlement_asset: settlement.0.clone(),
+            expiry,
+            strike_1e8: strike_1e8 as u128,
+            is_call,
+            contract_size_1e8,
+            status: OptionSeriesStatus::Active,
+            source: OptionSeriesSource::Manual,
+            onchain_product_id: None,
+            onchain_series_id: Some(option_id.to_string()),
+            created_at_ms: now_ms_v,
+            updated_at_ms: now_ms_v,
+        };
+        let mut store = s.options_store.lock().unwrap();
+        store.insert_series(series);
+        drop(store);
+        s
+    }
+
+    fn valid_create_request() -> CreateExecutionIntentRequest {
+        CreateExecutionIntentRequest {
+            series_id: "S-1".to_string(),
+            side: "buy".to_string(),
+            size_1e8: "100000000".to_string(),
+            price_1e8: "10000".to_string(),
+            buyer: Some("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()),
+            seller: Some("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string()),
+            quote_id: None,
+            client_request_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn create_intent_success_returns_intent_id_and_request_id() {
+        let s = seeded_state_for_create_intent();
+        let env = create_execution_intent(State(s), Json(valid_create_request()))
+            .await
+            .expect("ok");
+        let data = &env.0;
+        assert!(!data.intent_id.is_empty());
+        assert!(!data.request_id.is_empty());
+        assert_eq!(data.status, "signatures_required");
+        assert!(data.signing_payload_available);
+        assert_eq!(data.next_step, "request_signing_payload");
+        assert!(data.expires_at_ms.is_none());
+    }
+
+    #[tokio::test]
+    async fn create_intent_echoes_client_request_id_when_provided() {
+        let s = seeded_state_for_create_intent();
+        let mut req = valid_create_request();
+        req.client_request_id = Some("my-correlation-id".to_string());
+        let env = create_execution_intent(State(s), Json(req))
+            .await
+            .expect("ok");
+        assert_eq!(env.0.request_id, "my-correlation-id");
+    }
+
+    #[tokio::test]
+    async fn create_intent_rejects_invalid_side() {
+        let s = seeded_state_for_create_intent();
+        let mut req = valid_create_request();
+        req.side = "diagonal".to_string();
+        let err = create_execution_intent(State(s), Json(req))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, TradingErrorCode::InvalidRequest);
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn create_intent_rejects_zero_size() {
+        let s = seeded_state_for_create_intent();
+        let mut req = valid_create_request();
+        req.size_1e8 = "0".to_string();
+        let err = create_execution_intent(State(s), Json(req))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, TradingErrorCode::InvalidRequest);
+    }
+
+    #[tokio::test]
+    async fn create_intent_rejects_zero_price() {
+        let s = seeded_state_for_create_intent();
+        let mut req = valid_create_request();
+        req.price_1e8 = "0".to_string();
+        let err = create_execution_intent(State(s), Json(req))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, TradingErrorCode::InvalidRequest);
+    }
+
+    #[tokio::test]
+    async fn create_intent_rejects_non_numeric_size() {
+        let s = seeded_state_for_create_intent();
+        let mut req = valid_create_request();
+        req.size_1e8 = "lots".to_string();
+        let err = create_execution_intent(State(s), Json(req))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, TradingErrorCode::InvalidRequest);
+    }
+
+    #[tokio::test]
+    async fn create_intent_rejects_missing_buyer() {
+        let s = seeded_state_for_create_intent();
+        let mut req = valid_create_request();
+        req.buyer = None;
+        let err = create_execution_intent(State(s), Json(req))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, TradingErrorCode::InvalidRequest);
+    }
+
+    #[tokio::test]
+    async fn create_intent_rejects_missing_seller() {
+        let s = seeded_state_for_create_intent();
+        let mut req = valid_create_request();
+        req.seller = None;
+        let err = create_execution_intent(State(s), Json(req))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, TradingErrorCode::InvalidRequest);
+    }
+
+    #[tokio::test]
+    async fn create_intent_rejects_malformed_buyer_address() {
+        let s = seeded_state_for_create_intent();
+        let mut req = valid_create_request();
+        req.buyer = Some("nope".to_string());
+        let err = create_execution_intent(State(s), Json(req))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, TradingErrorCode::InvalidAddress);
+    }
+
+    #[tokio::test]
+    async fn create_intent_rejects_malformed_seller_address() {
+        let s = seeded_state_for_create_intent();
+        let mut req = valid_create_request();
+        req.seller = Some("0xZZZ".to_string());
+        let err = create_execution_intent(State(s), Json(req))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, TradingErrorCode::InvalidAddress);
+    }
+
+    #[tokio::test]
+    async fn create_intent_rejects_self_trade() {
+        let s = seeded_state_for_create_intent();
+        let mut req = valid_create_request();
+        req.seller = req.buyer.clone();
+        let err = create_execution_intent(State(s), Json(req))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, TradingErrorCode::InvalidRequest);
+    }
+
+    #[tokio::test]
+    async fn create_intent_unknown_series_returns_series_not_found() {
+        let s = seeded_state_for_create_intent();
+        let mut req = valid_create_request();
+        req.series_id = "S-DOES-NOT-EXIST".to_string();
+        let err = create_execution_intent(State(s), Json(req))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, TradingErrorCode::SeriesNotFound);
+    }
+
+    #[tokio::test]
+    async fn create_intent_inactive_series_returns_quote_unsupported() {
+        use crate::options::OptionSeriesStatus;
+        let s = seeded_state_for_create_intent();
+        // Force the seeded series into Disabled state via the
+        // store's mutating helper (insert_series is no-op when the
+        // series_id already exists).
+        {
+            let mut store = s.options_store.lock().unwrap();
+            let _ = OptionSeriesStatus::Disabled;
+            store
+                .disable_series("S-1", crate::types::now_ms())
+                .expect("disable");
+        }
+        let err = create_execution_intent(State(s), Json(valid_create_request()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, TradingErrorCode::QuoteUnsupported);
+    }
+
+    #[tokio::test]
+    async fn create_intent_persists_intent_via_signing_payload_consumer() {
+        // The created intent_id must be visible to the existing
+        // get_option_execution_intent / signing-payload endpoints.
+        let s = seeded_state_for_create_intent();
+        let env = create_execution_intent(State(s.clone()), Json(valid_create_request()))
+            .await
+            .expect("ok");
+        let intent_id = &env.0.intent_id;
+        let stored = s
+            .options_store
+            .lock()
+            .unwrap()
+            .get_option_execution_intent(Uuid::parse_str(intent_id).expect("uuid"))
+            .map(|i: crate::options::OptionExecutionIntent| i.intent_id.to_string());
+        assert_eq!(stored.as_deref(), Some(intent_id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn create_intent_response_body_never_leaks_secrets() {
+        let s = seeded_state_for_create_intent();
+        let env = create_execution_intent(State(s), Json(valid_create_request()))
+            .await
+            .expect("ok");
+        let body = serde_json::to_string(&env.0).unwrap();
+        for forbidden in [
+            "EXECUTOR_PRIVATE_KEY",
+            "DATABASE_URL",
+            "AWS_ACCESS_KEY",
+            "AWS_SECRET_ACCESS_KEY",
+            "arn:aws:kms",
+            "Bearer ",
+            "http://",
+            "https://",
+            "rpc_url",
+        ] {
+            assert!(!body.contains(forbidden), "leak: {forbidden}\n{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn create_intent_status_starts_at_signatures_required() {
+        // Defence-in-depth: the returned intent must be in the
+        // `SignaturesRequired` state, NOT `BroadcastConfirmed` or any
+        // other terminal/in-flight state — the user has not signed yet.
+        let s = seeded_state_for_create_intent();
+        let env = create_execution_intent(State(s.clone()), Json(valid_create_request()))
+            .await
+            .expect("ok");
+        let intent = s
+            .options_store
+            .lock()
+            .unwrap()
+            .get_option_execution_intent(Uuid::parse_str(&env.0.intent_id).expect("uuid"))
+            .expect("intent stored");
+        assert_eq!(
+            intent.status,
+            crate::options::OptionExecutionIntentStatus::SignaturesRequired
+        );
+        assert!(intent.buyer_signature.is_none());
+        assert!(intent.seller_signature.is_none());
+    }
+
+    #[tokio::test]
+    async fn create_intent_quote_id_is_accepted_but_ignored() {
+        // Forward-compat hook — the caller may supply quote_id; M-P2f
+        // does not yet resolve it. Endpoint must succeed when the
+        // explicit buyer + seller fields are also supplied.
+        let s = seeded_state_for_create_intent();
+        let mut req = valid_create_request();
+        req.quote_id = Some("RFQ-quote-uuid-placeholder".to_string());
+        let env = create_execution_intent(State(s), Json(req))
+            .await
+            .expect("ok");
+        assert!(!env.0.intent_id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_intent_does_not_set_calldata_or_signatures() {
+        // The handler must never produce calldata (that's the operator
+        // pipeline's job) and must never carry a signature in the
+        // returned intent.
+        let s = seeded_state_for_create_intent();
+        let env = create_execution_intent(State(s.clone()), Json(valid_create_request()))
+            .await
+            .expect("ok");
+        let intent = s
+            .options_store
+            .lock()
+            .unwrap()
+            .get_option_execution_intent(Uuid::parse_str(&env.0.intent_id).expect("uuid"))
+            .expect("intent stored");
+        assert!(intent.calldata.is_none());
+        assert!(intent.buyer_signature.is_none());
+        assert!(intent.seller_signature.is_none());
+        assert!(intent.simulated_at_ms.is_none());
+    }
+
+    #[tokio::test]
+    async fn create_intent_endpoint_has_no_admin_bearer_requirement() {
+        // The handler signature accepts `State(state)` only — no
+        // `headers: HeaderMap`, no `AdminIdentity` extractor. A bare
+        // call without any auth context produces a successful intent.
+        let s = seeded_state_for_create_intent();
+        let env = create_execution_intent(State(s), Json(valid_create_request())).await;
+        assert!(env.is_ok());
+    }
+
+    #[tokio::test]
+    async fn create_intent_size_too_large_is_rejected_safely() {
+        // Defence-in-depth: a u128 max input must not panic. The
+        // service layer catches conversion overflow as an
+        // InvalidOptionExecutionIntentState error which maps to
+        // InvalidRequest at the public surface.
+        let s = seeded_state_for_create_intent();
+        let mut req = valid_create_request();
+        req.size_1e8 = u128::MAX.to_string();
+        let err = create_execution_intent(State(s), Json(req))
+            .await
+            .unwrap_err();
+        // Either InvalidRequest (overflow detected) or InternalError
+        // (caught later) — both are acceptable; the contract is that
+        // the handler must not panic and must produce a 4xx/5xx
+        // response without leaking internals.
+        assert!(matches!(
+            err.code,
+            TradingErrorCode::InvalidRequest | TradingErrorCode::InternalError
+        ));
+    }
+
+    #[tokio::test]
+    async fn create_intent_returns_distinct_intent_ids_per_request() {
+        let s = seeded_state_for_create_intent();
+        let a = create_execution_intent(State(s.clone()), Json(valid_create_request()))
+            .await
+            .expect("ok");
+        let b = create_execution_intent(State(s), Json(valid_create_request()))
+            .await
+            .expect("ok");
+        assert_ne!(a.0.intent_id, b.0.intent_id);
     }
 }

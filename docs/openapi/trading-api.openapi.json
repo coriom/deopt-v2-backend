@@ -89,6 +89,33 @@
         }
       }
     },
+    "/options/execution-intents": {
+      "post": {
+        "tags": ["intents"],
+        "summary": "Create a user-wallet execution intent from a quote/trade preview",
+        "description": "M-P2f (B7 close). Public/user-wallet endpoint. NEVER signs. NEVER broadcasts. NEVER calls the signer / AWS / KMS. The returned intent_id is consumed by GET /options/execution-intents/{intent_id}/signing-payload and POST /options/execution-intents/{intent_id}/signatures.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/CreateExecutionIntentRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Intent created.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/CreateExecutionIntentData" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/InvalidRequest" },
+          "404": { "$ref": "#/components/responses/SeriesNotFound" }
+        }
+      }
+    },
     "/options/quotes/preview": {
       "get": {
         "tags": ["quotes"],
@@ -217,6 +244,32 @@
     },
     "schemas": {
       "EthAddress": { "type": "string", "pattern": "^0x[a-fA-F0-9]{40}$" },
+      "CreateExecutionIntentRequest": {
+        "type": "object",
+        "required": ["series_id", "side", "size_1e8", "price_1e8"],
+        "properties": {
+          "series_id": { "$ref": "#/components/schemas/SeriesId" },
+          "side": { "type": "string", "enum": ["buy", "sell"] },
+          "size_1e8": { "$ref": "#/components/schemas/DecimalString" },
+          "price_1e8": { "$ref": "#/components/schemas/DecimalString" },
+          "buyer": { "$ref": "#/components/schemas/EthAddress" },
+          "seller": { "$ref": "#/components/schemas/EthAddress" },
+          "quote_id": { "type": "string", "description": "Forward-compatibility hook — ignored in M-P2f." },
+          "client_request_id": { "type": "string", "description": "Optional correlation id; echoed back as response.request_id." }
+        }
+      },
+      "CreateExecutionIntentData": {
+        "type": "object",
+        "required": ["intent_id", "request_id", "status", "signing_payload_available", "next_step"],
+        "properties": {
+          "intent_id": { "type": "string", "format": "uuid" },
+          "request_id": { "type": "string" },
+          "status": { "type": "string", "description": "OptionExecutionIntentStatus snake_case (e.g. signatures_required)." },
+          "signing_payload_available": { "type": "boolean" },
+          "next_step": { "type": "string", "enum": ["request_signing_payload", "pending_backend_support"] },
+          "expires_at_ms": { "type": "integer", "nullable": true }
+        }
+      },
       "DecimalString": { "type": "string", "pattern": "^-?[0-9]+$" },
       "ProductId": { "type": "string", "pattern": "^0x[a-fA-F0-9]{64}$" },
       "SeriesId": { "type": "string", "pattern": "^[0-9]+$" },
