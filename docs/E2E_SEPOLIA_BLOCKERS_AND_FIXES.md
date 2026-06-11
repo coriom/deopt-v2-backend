@@ -9,7 +9,52 @@ explicitly-approved Sepolia test broadcast.
 
 ## Blockers
 
-### BS-1 — `OPTION_COLLATERAL_VAULT_VIEWS_ADDRESS unknown` (Medium)
+> **Cross-link (M-P5-RO + M-P5-PROV, 2026-06-10):** read-only
+> confirmations against BS-2 / BS-3 / BS-4 / BS-5 could NOT be
+> performed in either run (no operator-supplied RPC URL or
+> addresses in either environment). M-P5-PROV added
+> `.gitignore` safeguards for `operator-private/`, `*.private.md`,
+> `*.private.env`, and `.env.sepolia*` in all 3 repos so the
+> operator can safely populate private inputs. Per-blocker fix
+> briefs added:
+> * `SEPOLIA-MARGIN-ENGINE-LENS-DEPLOY_NEXT_TASK.md` (BS-2)
+> * `SEPOLIA-EXECUTOR-AUTH-GRANT_NEXT_TASK.md` (BS-3 if false)
+> * `SEPOLIA-BUYER-SELLER-FUNDING_NEXT_TASK.md` (BS-4)
+> * `SEPOLIA-ACTIVE-SERIES-ORACLE-SETUP_NEXT_TASK.md` (BS-5)
+>
+> The 4 rows below remain accurate; the playbook in
+> `E2E_SEPOLIA_READ_ONLY_CONFIRMATION_LOG.md` is unchanged.
+
+> **Cross-link (M-P5-RO2, 2026-06-10):** on-chain read-only checks
+> NOW EXECUTED via the populated private operator input file. All
+> 4 OPEN rows refined to actionable sub-states:
+> * BS-2 → **DEPLOYMENT_REQUIRED** (lens address still empty)
+> * BS-3 → **GOVERNANCE_ACTION_REQUIRED** (`isExecutor==false` on chain)
+> * BS-4 → **LOW_BALANCE + LOW_ALLOWANCE** (all 6 buckets failing)
+> * BS-5 → **ORACLE_FEED_MISSING** (2 series exist; feeds registered;
+>   `getPriceSafe==0` on both — mock oracle is stale)
+>
+> See `E2E_SEPOLIA_READONLY_CHECKS_WITH_RPC_RESULT.md`.
+
+> **Cross-link (SETUP-FIXES-PACK-PREFLIGHT, 2026-06-11):** the 4 BS
+> fixes are now grouped into one approval-gated execution pack.
+> Preflight + per-step command templates:
+> `SEPOLIA_SETUP_FIXES_PACK_PREFLIGHT_RESULT.md`. Execution prompt
+> (literal approval line required):
+> `SEPOLIA_SETUP_FIXES_PACK_EXECUTION_NEXT_TASK.md`. Order:
+> BS-5 → BS-3 → BS-4 → BS-2. Each blocker still has its own
+> standalone `SEPOLIA-*_NEXT_TASK.md` brief; the pack is a
+> convenience grouping, not a replacement.
+
+### BS-1 — `OPTION_COLLATERAL_VAULT_VIEWS_ADDRESS unknown` — **CLOSED (M-P5-FIXES, 2026-06-10)**
+
+`CollateralVaultViews` is an `abstract contract` inherited by the
+concrete `CollateralVault`. The deployed Sepolia address for both
+backend env keys is the same:
+`0x00340C360353a5AB784c5Bc5c44322A6AF0625D3`. See
+`E2E_SEPOLIA_FIXES_RESULT.md` §4.
+
+### BS-1 (original analysis below — kept for historical reference)
 
 **Symptom:** No checked-in sol/docs surface a Sepolia address for the
 `CollateralVaultViews` contract. Without it, the backend's
@@ -101,7 +146,7 @@ Expected: `status == "ok"` with a non-null `oracle_mark_1e8` value.
 
 | Blocker | Severity | Blocks Phase A? | Blocks Phase B? |
 |---|---|---|---|
-| BS-1 OPTION_COLLATERAL_VAULT_VIEWS unknown | Medium | NO (partial OK) | NO (UX degraded only) |
+| BS-1 OPTION_COLLATERAL_VAULT_VIEWS unknown | ~~Medium~~ | ~~NO (partial OK)~~ | **CLOSED (M-P5-FIXES)** |
 | BS-2 OPTION_MARGIN_ENGINE_LENS unknown | Medium | NO (partial OK) | NO (UX degraded only) |
 | BS-3 Executor auth unconfirmed | High | NO | **YES — must close** |
 | BS-4 Collateral prefunding unconfirmed | High | NO | **YES — must close** |

@@ -3,6 +3,15 @@ target/
 .env.*
 !.env.example
 
+# Operator-private Sepolia inputs (RPC URLs, addresses, balances).
+# NEVER commit a populated copy.
+operator-private/
+*.private.md
+*.private.env
+.env.sepolia
+.env.sepolia.local
+.env.sepolia.private
+
 .DS_Store
 Thumbs.db
 *.swp

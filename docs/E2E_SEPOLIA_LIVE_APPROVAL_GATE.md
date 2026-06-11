@@ -7,6 +7,34 @@ broadcast.
 typing the literal approval line.** No mainnet. No Safe tx. No AWS
 resource creation. No production `.env` edit.
 
+> **Current gate status (M-P5-RO2, 2026-06-10): GATE NOT MET.**
+> Precondition P1 fails. On-chain read-only checks executed; 4
+> blockers OPEN with refined sub-states (see
+> `E2E_SEPOLIA_READONLY_CHECKS_WITH_RPC_RESULT.md` §9):
+> * BS-2 DEPLOYMENT_REQUIRED
+> * BS-3 GOVERNANCE_ACTION_REQUIRED (`isExecutor==false`)
+> * BS-4 LOW_BALANCE + LOW_ALLOWANCE
+> * BS-5 ORACLE_FEED_MISSING (price=0; feed stale)
+>
+> Recommended close order: BS-5 → BS-3 → BS-4 → BS-2.
+
+> **SETUP-FIXES-PACK-PREFLIGHT (2026-06-11):** the 4 fixes are now
+> grouped into one approval-gated execution pack. The pack does NOT
+> change this gate's preconditions — once BS-2 / BS-3 / BS-4 / BS-5
+> are CONFIRMED by the pack, the operator still types the **separate**
+> live-broadcast approval line in §9 of this doc. The pack approval
+> line ("I approve Base Sepolia setup fixes execution for BS-2,
+> BS-3, BS-4, and BS-5.") is a DIFFERENT line; it authorises the
+> pack only, NOT the live broadcast. Preflight result:
+> `SEPOLIA_SETUP_FIXES_PACK_PREFLIGHT_RESULT.md`. Execution prompt:
+> `SEPOLIA_SETUP_FIXES_PACK_EXECUTION_NEXT_TASK.md`.
+
+> **SETUP-FIXES-PACK-EXECUTION (2026-06-11): STOPPED at Phase A.**
+> Operator approval line received and accepted. Pack halted at
+> preflight: required private keys MISSING (all 4). No state-
+> mutating call invoked. Gate remains NOT MET. Details:
+> `SEPOLIA_SETUP_FIXES_PACK_EXECUTION_PARTIAL_RESULT.md`.
+
 > **CRITICAL.** This document does NOT itself authorise a broadcast.
 > It defines the preconditions, the placeholders, and the literal
 > approval line. The operator MUST manually sign off (in a separate
