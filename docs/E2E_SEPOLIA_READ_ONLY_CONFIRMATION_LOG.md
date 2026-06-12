@@ -19,6 +19,80 @@ broadcast. NO role grant. NO token transfer. NO mint. NO approve.**
 > `E2E_SEPOLIA_READONLY_CHECKS_WITH_RPC_RESULT.md`. The 4 BS rows
 > all remain OPEN with refined sub-states.
 
+> **SETUP-FIXES-PACK-EXECUTION update (2026-06-12):** all 4 BS
+> rows now **CLOSED** on chain (lens deployed at
+> `0x496A57CF4e0d4F1BC5c00969Ed4C5204072ddA26`; executor authorised;
+> buyer+seller funded + approved CollateralVault; oracle refreshed
+> with `getPriceSafe` returning nonzero `ok=true`). The commands
+> below remain valid as the re-verification path. Live broadcast
+> gate now READY FOR OPERATOR APPROVAL. See
+> `SEPOLIA_SETUP_FIXES_PACK_EXECUTION_RESULT.md`.
+
+> **LIVE-BROADCAST attempt (2026-06-12, REVERTED):** the live
+> executeTrade was broadcast and reverted `NotAuthorized()` inside
+> the wired MarginEngine `0x506cD65a…`. Wiring drift discovered:
+> the private MatchingEngine `0xf2D1D85…` is no longer the
+> authorised MatchingEngine on the downstream MarginEngine. The
+> `cast call` recipes below are still correct for the setup-pack
+> verification surface; an additional read-only check should now
+> include `OptionMatchingEngine.marginEngine()` and the
+> `MarginEngine.matchingEngine()` reverse-check before any future
+> executeTrade. See `E2E_SEPOLIA_LIVE_BROADCAST_RESULT.md` §3.
+
+> **RETARGET (2026-06-12, later): Path A applied, no broadcast.**
+> Private notes retargeted to MatchingEngine
+> `0x5a5EBF9A9CCd7c012518569DE8283982982670f6` + MarginEngine
+> `0x506cD65a63C53c66ab572B9f9dd819B7BfE00D30`. Bidirectional
+> wiring verified read-only:
+> * `ME.marginEngine() == 0x506cD65a…` ✓
+> * `MarginEngine.matchingEngine() == 0x5a5EBF9A…` ✓
+> * `isExecutor(EXECUTOR_ADDRESS=0x295005fd…)` on new ME `true` ✓
+> * EIP-712 domain separator `0x68d1704576b276dd…` captured.
+>
+> The pre-flight cast call set in this log should add these 3
+> wiring asserts before any future executeTrade. See
+> `SEPOLIA_MATCHING_ENGINE_RETARGET_RESULT.md`.
+
+> **LIVE BROADCAST RETRY (2026-06-12): SUCCESS.** `executeTrade` tx
+> `0x748c94843cb4cbe31f56c84ceedc7e000a05dac567fa3fe7a1415a0de59b637a`
+> confirmed at block `42750521`, status `1`, gas `683_044`. Reads
+> below remain valid as the canonical Sepolia setup-verification
+> surface; for any future broadcast, also verify:
+> * `nonces(BUYER) / nonces(SELLER)` on the correct ME match the
+>   tuple `(buyerNonce, sellerNonce)`,
+> * `previewTradeValidity` returns 5/5 `true`,
+> * `getPriceSafe` returns nonzero + `ok=true` immediately before
+>   broadcast.
+>
+> See `E2E_SEPOLIA_LIVE_BROADCAST_RETRY_RESULT.md`.
+
+> **POST-BROADCAST DB INSPECTION (2026-06-12, read-only):** these
+> additional psql probes were added during the post-broadcast
+> reconciliation milestone to confirm the backend's DB-side
+> projection state:
+>
+> ```sql
+> -- Per success tx
+> SELECT count(*) FROM option_execution_transactions
+>   WHERE lower(tx_hash) = '0x748c94…';   -- now returns 1 (shadow row)
+> SELECT count(*) FROM option_execution_events
+>   WHERE tx_hash = '0x748c94…';          -- now returns 19 (indexed events)
+>
+> -- Per onchain_intent_id
+> SELECT intent_id FROM option_execution_intents
+>   WHERE onchain_intent_id = '0x8179a3fff8…';  -- now returns 1 (shadow row)
+>
+> -- Per cursor
+> SELECT id, last_indexed_block FROM option_event_indexer_state;
+> -- now returns last_indexed_block = 42752194 (post-catch-up)
+> ```
+>
+> Updated results (after `SEPOLIA-BACKEND-RECONCILIATION-FIX`,
+> 2026-06-12 later): all counts populated; cursor advanced.
+> Reconciliation row at `4ee96574-…` with `status=reconciled`,
+> `decoded_event_count=19`. See
+> `SEPOLIA_BACKEND_RECONCILIATION_FIX_RESULT.md`.
+
 > All commands in this log are `cast call` (eth_call) or
 > `cast code` (eth_getCode) or `cast balance` (eth_getBalance) —
 > never `cast send` or any state-mutating verb. If a command attempts

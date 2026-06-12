@@ -35,6 +35,85 @@ resource creation. No production `.env` edit.
 > mutating call invoked. Gate remains NOT MET. Details:
 > `SEPOLIA_SETUP_FIXES_PACK_EXECUTION_PARTIAL_RESULT.md`.
 
+> **GATE NOW READY FOR OPERATOR APPROVAL (2026-06-12).** All 4 BS
+> rows CLOSED on chain via the successful re-entry of the SETUP-
+> FIXES-PACK-EXECUTION:
+> * BS-2 CLOSED — lens at `0x496A57CF4e0d4F1BC5c00969Ed4C5204072ddA26`
+> * BS-3 CLOSED — `isExecutor==true`
+> * BS-4 CLOSED — buyer+seller funded (100k mUSDC) + allowance to vault
+> * BS-5 CLOSED — `getPriceSafe` nonzero, `ok=true` (caveat: `maxDelay=60s`; push setPrice immediately before broadcast)
+>
+> Preconditions P2 / P7 / P8 / P9 now MET (others were already OK).
+> The operator MAY proceed to type the §9 live-broadcast approval
+> line below. See `SEPOLIA_SETUP_FIXES_PACK_EXECUTION_RESULT.md`.
+
+> **APPROVAL CONSUMED (2026-06-12, FAILED).** Live broadcast
+> attempted; tx `0xb4e7984fdebb803afc969d6d68fc5bd0f1a6898a1a2e11e13391da882d615dfe`
+> REVERTED with `NotAuthorized()` inside the wired MarginEngine
+> `0x506cD65a…` (selector `0xea8e4eb5`). Wiring drift discovered:
+> the operator's private MatchingEngine `0xf2D1D85…` is no longer
+> the authorised MatchingEngine on the actually-wired MarginEngine
+> `0x506cD65a…` (which expects `0x5a5EBF9A…`). The approval line
+> is **consumed**; gate is now back to NOT MET. New blocker BS-6
+> tracked. Two remediation paths in
+> `E2E_SEPOLIA_LIVE_BROADCAST_FAILURE_NEXT_TASK.md`. No retry under
+> the consumed approval — operator must type a fresh approval line
+> after remediation.
+
+> **GATE READY FOR FRESH OPERATOR APPROVAL (2026-06-12, post-retarget).**
+> BS-6 CLOSED via Path A (no broadcast): private notes retargeted
+> to MatchingEngine `0x5a5EBF9A9CCd7c012518569DE8283982982670f6`
+> + MarginEngine `0x506cD65a63C53c66ab572B9f9dd819B7BfE00D30`;
+> wiring bidirectional; `isExecutor(EXECUTOR_ADDRESS)` already
+> `true`; EIP-712 dry-run clean; signatures recoverable. The retry
+> requires a **fresh approval line** (different wording from the
+> original):
+>
+> > "I approve one Base Sepolia test broadcast retry for this run."
+>
+> The retry brief is at `E2E_SEPOLIA_LIVE_BROADCAST_RETRY_NEXT_TASK.md`.
+> Outstanding precondition for the retry harness: operator supplies
+> `EXECUTOR_PRIVATE_KEY` for EOA `0x295005fd…` (the only authorised
+> broadcaster on the new ME; our OWNER key is NOT `isExecutor==true`
+> there). See `SEPOLIA_MATCHING_ENGINE_RETARGET_RESULT.md`.
+
+> **BROADCAST CONFIRMED — RETRY SUCCESS (2026-06-12).** The fresh
+> approval line was consumed by `executeTrade` tx
+> `0x748c94843cb4cbe31f56c84ceedc7e000a05dac567fa3fe7a1415a0de59b637a`
+> at block `42750521` on the correctly-wired MatchingEngine
+> `0x5a5EBF9A…`. Status `1`, gas `683_044`, broadcaster
+> `EXECUTOR_PRIVATE_KEY` → `0x295005fd…`. Nonces advanced `2 → 3`
+> for both buyer and seller; positions ±1 on MarginEngine;
+> `OptionTradeExecuted` event captured; vault balance reconciliation
+> + fee accounting clean. **M-P5 Phase B is COMPLETE.** Approval
+> CONSUMED. Gate now closed for this lifecycle. Subsequent Sepolia
+> broadcasts would each need their own fresh approval line, but
+> none are required for M-P5 closure. See
+> `E2E_SEPOLIA_LIVE_BROADCAST_RETRY_RESULT.md` for the full record.
+
+> **POST-BROADCAST RECONCILIATION (2026-06-12, no-broadcast):**
+> backend was offline; startup was deemed unsafe (binary built
+> `2026-06-03` before the retarget; `EXECUTOR_REAL_BROADCAST_ENABLED=true`
+> in `.env`; indexer cursor 389k blocks behind). Phase B/C/D/E/F
+> SKIPPED with documented rationale; chain-side state independently
+> re-verified read-only (nonces, positions, vault balances all
+> consistent with the trade). Backend DB-side projection scoped
+> in `SEPOLIA_BACKEND_RECONCILIATION_FIX_NEXT_TASK.md` (separate
+> approval line: "I approve Base Sepolia backend reconciliation
+> fix for this run."). This gate is unchanged — no new chain
+> broadcast is required.
+
+> **BACKEND RECONCILIATION CLOSED (2026-06-12, later, no-broadcast):**
+> backend rebuilt from source, started with all broadcast paths
+> hard-disabled, indexer caught up to block `42752194`, shadow
+> intent + transaction backfilled, reconciliation worker tick
+> produced `status=reconciled` / `decoded_event_count=19` /
+> `trading_fee_event_count=2` / `internal_transfer_event_count=3`
+> / no mismatch. API postchecks all green. The chain-side gate
+> remains CONSUMED from the original retry success; no new chain
+> broadcast is authorised. See
+> `SEPOLIA_BACKEND_RECONCILIATION_FIX_RESULT.md`.
+
 > **CRITICAL.** This document does NOT itself authorise a broadcast.
 > It defines the preconditions, the placeholders, and the literal
 > approval line. The operator MUST manually sign off (in a separate

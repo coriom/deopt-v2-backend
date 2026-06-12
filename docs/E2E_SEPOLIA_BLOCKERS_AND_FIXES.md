@@ -46,6 +46,17 @@ explicitly-approved Sepolia test broadcast.
 > standalone `SEPOLIA-*_NEXT_TASK.md` brief; the pack is a
 > convenience grouping, not a replacement.
 
+> **Cross-link (SETUP-FIXES-PACK-EXECUTION, 2026-06-12):** the pack
+> **EXECUTED SUCCESSFULLY** with the operator approval line. **All
+> 4 BS rows now CLOSED on chain:**
+> * BS-2 → **CLOSED** (lens deployed at `0x496A57CF4e0d4F1BC5c00969Ed4C5204072ddA26`)
+> * BS-3 → **CLOSED** (`isExecutor==true`)
+> * BS-4 → **CLOSED** (buyer+seller hold 100k mUSDC + allowance to CollateralVault)
+> * BS-5 → **CLOSED** (`getPriceSafe` nonzero + `ok=true`; 60s maxDelay caveat documented)
+>
+> 10 successful on-chain txs; live broadcast gate now **READY FOR
+> OPERATOR APPROVAL**. See `SEPOLIA_SETUP_FIXES_PACK_EXECUTION_RESULT.md`.
+
 ### BS-1 — `OPTION_COLLATERAL_VAULT_VIEWS_ADDRESS unknown` — **CLOSED (M-P5-FIXES, 2026-06-10)**
 
 `CollateralVaultViews` is an `abstract contract` inherited by the

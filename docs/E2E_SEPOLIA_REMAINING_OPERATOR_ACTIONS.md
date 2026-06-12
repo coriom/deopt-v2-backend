@@ -48,6 +48,17 @@ the M-P5 Phase B live approval gate is signed.
 > approval line remains unconsumed and valid until 2026-06-11
 > T23:57:18Z; operator may re-run within that window after
 > supplying the keys.
+
+> **SETUP-FIXES-PACK-EXECUTION CLOSURE (2026-06-12):** operator
+> populated keys; pack RE-ENTERED with a fresh approval line;
+> **all 4 BS rows now CLOSED on chain.** Lens deployed at
+> `0x496A57CF4e0d4F1BC5c00969Ed4C5204072ddA26`; executor
+> authorised; buyer+seller funded (100k mUSDC each) + approved
+> CollateralVault; oracle refreshed. 10 confirmed on-chain txs.
+> See `SEPOLIA_SETUP_FIXES_PACK_EXECUTION_RESULT.md`. **A-1 …
+> A-4 in §1 are all CLOSED.** Live broadcast gate now READY FOR
+> OPERATOR APPROVAL (separate broadcast approval line still
+> required per `E2E_SEPOLIA_LIVE_APPROVAL_GATE.md` §9).
 **Posture:** read-only checks + non-broadcast operator-side fixes.
 **Hard forbidden:** mainnet RPC, mainnet tx, Safe tx, AWS / KMS
 creation, production `.env` edit, signer call from any of these
