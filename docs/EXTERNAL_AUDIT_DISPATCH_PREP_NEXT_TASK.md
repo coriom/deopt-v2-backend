@@ -7,6 +7,8 @@
 
 > **This task is NOT executed by the calling milestone (security re-anchor).** It packages audit-dispatch preparation into one approval-gated milestone.
 
+> **Status note (2026-06-12, re. URL-fill milestone):** The `OPERATOR_PUBLIC_BETA_URLS_FILL` milestone executed on 2026-06-12 and confirmed that public-beta channel URLs remaining as placeholders is **NON-BLOCKING** for this audit-prep arc. An auditor reviews source / freeze artefacts / invariants / threat model — not the community channels. This brief proceeds independently of `OPERATOR_PUBLIC_BETA_URLS_FILL_RESULT.md`.
+
 ---
 
 ## 1. Literal operator approval line (REQUIRED, VERBATIM)

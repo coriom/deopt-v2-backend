@@ -82,6 +82,36 @@ Every box below must be ✓ before posting the public announcement. A single ☐
 * ☐ Footer placeholders match the doc placeholders (consistent token names).
 * ☐ Initial welcome message posted in each channel.
 
+### 1.5b URL fill status (from `OPERATOR_PUBLIC_BETA_URLS_FILL` milestone)
+
+Source of truth: `deopt-v2-backend/docs/OPERATOR_PUBLIC_BETA_URLS_FILL_RESULT.md` + `deopt-v2-backend/docs/OPERATOR_PUBLIC_BETA_URLS_REMAINING_ACTIONS.md`. As of the last URL-fill milestone (2026-06-12), no operator-supplied URLs were available — all rows below remain ☐ pending operator substitution.
+
+| # | Item | Status row | Where it's verified |
+|---|---|---|---|
+| 1 | App URL configured (publishable, HTTPS, not localhost, not mainnet) | ☐ | `PublicBetaFooter`; the app is reachable at the URL the operator deploys to. |
+| 2 | Docs URL configured (hosted docs root) | ☐ | Footer's quickstart / testing-guide / limitations slots become clickable anchors. |
+| 3 | Quickstart URL configured | ☐ | Footer `public-beta-link-quickstart` data-testid is an `<a>`, not a `<span>`. |
+| 4 | Testing guide URL configured | ☐ | Footer `public-beta-link-testing-guide` is an `<a>`. |
+| 5 | Known-limitations URL configured | ☐ | Footer `public-beta-link-limitations` is an `<a>`. |
+| 6 | Feedback form configured | ☐ | Footer `public-beta-link-feedback` is an `<a>`; sign-failure CTA in `SigningStateModal` also becomes clickable. |
+| 7 | Community channel (Discord / Telegram) configured | ☐ | Footer `public-beta-link-discord` is an `<a>`. Telegram is doc-side only. |
+| 8 | GitHub / issues URL configured | ☐ | Footer `public-beta-link-github` is an `<a>`; matches `docs/public-beta/` token `{{ GITHUB_REPO_URL }}`. |
+| 9 | API base URL configured | ☐ | `docs/public-beta/DEVELOPER_API_GUIDE.md` `{{ API_BASE_URL }}` substituted; backend `/trading/health` reachable from a public origin. |
+| 10 | Status URL configured (optional) | ☐ | Operator-side status page (Uptime / BetterStack / similar). Not required for launch. |
+| 11 | Frontend public-beta footer links live | ☐ | `pendingPlaceholderCount()` returns `0` OR the operator has documented why a subset remains. |
+| 12 | No admin / private link in frontend | ✓ | `tests/e2e/no-admin-bearer.spec.ts` enforces zero `Authorization` headers; `tests/e2e/public-beta-footer.spec.ts` enforces footer-DOM secret scan. |
+| 13 | No "audited / mainnet-ready" claim anywhere | ✓ | Every milestone runs a positive-claim drift scan; only negative-framed disclaimers permitted. |
+| 14 | No "safe for real funds" language anywhere | ✓ | Same scan. |
+| 15 | Testnet banner visible on every trading route | ✓ | `tests/e2e/landing.spec.ts` + `tests/e2e/public-beta-footer.spec.ts` `safety-copy bullets` test. |
+| 16 | Wrong-network blocker visible | ✓ | `tests/e2e/wrong-network-banner.spec.ts` (3 specs). |
+| 17 | Mainnet hard-stop visible (chain id 8453) | ✓ | `tests/e2e/mainnet-disabled.spec.ts` (2 specs). |
+
+Rows 12-17 are ✓ at the freeze moment and verified by the e2e suite. Rows 1-11 remain ☐ until the operator either:
+* supplies real URLs via `OPERATOR_PUBLIC_BETA_URLS_FILL_NEXT_TASK.md` AND substitutes them in `src/lib/public-beta-links.ts`, OR
+* explicitly documents in `OPERATOR_PUBLIC_BETA_URLS_REMAINING_ACTIONS.md` that a particular slot will ship as a placeholder for the initial announcement.
+
+Partial substitution is supported per slot (`isPlaceholderHref` degrades the unfilled slots independently).
+
 ### 1.6 Operator readiness
 
 * ☐ Operator has the rights to create / configure all the channels above.

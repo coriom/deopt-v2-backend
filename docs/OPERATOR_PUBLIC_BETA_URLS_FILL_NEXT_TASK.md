@@ -2,6 +2,9 @@
 
 **Date written:** 2026-06-12
 **Origin:** `docs/public-beta/OPERATOR_PUBLIC_BETA_URLS_FILL.md` + `COMMUNITY_FEEDBACK_LOOP_RESULT.md`
+
+> **Status note (2026-06-12, post-execution):** This brief was executed on 2026-06-12. Result: NO operator-supplied URLs were available at execution time, so all 6 frontend slots + 6 doc-side tokens remain placeholders. The frontend link config was refactored to a 4-status type union but no URL was invented. Full result in `OPERATOR_PUBLIC_BETA_URLS_FILL_RESULT.md`; remaining operator action list in `OPERATOR_PUBLIC_BETA_URLS_REMAINING_ACTIONS.md`. **This brief is reusable** — re-running it with the same approval line whenever the operator has real URLs in hand will perform the substitution.
+
 **Target:** swap the `{{PLACEHOLDER}}` tokens in the frontend link config + the public-beta docs for the operator's real, publicly-accessible channel URLs (Discord, GitHub, feedback form, hosted-docs root, app URL, API base URL).
 **Posture:** **Docs + frontend link-config string substitution only. NEVER mainnet. NEVER chain transactions. NEVER backend `.env` edit. NEVER private key handling. NEVER add admin / bearer / RPC-with-key URLs. NEVER claim "audited" or "mainnet-ready".**
 
