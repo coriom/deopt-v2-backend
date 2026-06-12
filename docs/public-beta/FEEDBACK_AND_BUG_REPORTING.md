@@ -15,11 +15,15 @@ The DeOpt V2 public-beta team accepts feedback through the following channels:
 | Telegram | `{{ TELEGRAM_INVITE_URL }}` | Real-time chat (alt to Discord). |
 | Feedback form | `{{ FEEDBACK_FORM_URL }}` | Structured bug reports if you'd rather not open a GitHub account. |
 
-> Placeholder URLs above are intentional. The operator fills them in before the beta is publicly announced. If you're reading this and the URLs are still placeholders, the beta hasn't launched publicly yet.
+> Placeholder URLs above are intentional. The operator fills them in before the beta is publicly announced. If you're reading this and the URLs are still placeholders, the beta hasn't launched publicly yet. See [OPERATOR_PUBLIC_BETA_URLS_FILL.md](./OPERATOR_PUBLIC_BETA_URLS_FILL.md) for the substitution checklist.
 
 ---
 
 ## 2. Bug report template
+
+> **Quick path:** copy from [BUG_REPORT_TEMPLATE.md](./BUG_REPORT_TEMPLATE.md) — that doc has a fuller safety checklist (no private keys, no seed phrases, no RPC URLs with embedded keys, no admin bearer tokens, no `.env` contents) and a more detailed environment table.
+>
+> The compact template below remains here for reference.
 
 Please include as many of these fields as you can. The more we have, the faster we can reproduce.
 
@@ -144,6 +148,17 @@ We treat these reports seriously. A formal bug-bounty program is not active yet,
 * **Be kind.** Bug reports are welcome; rudeness is not.
 
 Thank you for testing DeOpt V2. Your feedback is what makes a beta worth running.
+
+---
+
+## 10. See also
+
+* [BUG_REPORT_TEMPLATE.md](./BUG_REPORT_TEMPLATE.md) — full-fat bug report template with safety checklist.
+* [FEEDBACK_TRIAGE_WORKFLOW.md](./FEEDBACK_TRIAGE_WORKFLOW.md) — operator-side triage classification + severity + escalation.
+* [COMMUNITY_ONBOARDING.md](./COMMUNITY_ONBOARDING.md) — onboarding for external testers.
+* [PUBLIC_TESTNET_BETA_LAUNCH_CHECKLIST.md](./PUBLIC_TESTNET_BETA_LAUNCH_CHECKLIST.md) — operator launch checklist.
+* [PUBLIC_TESTNET_BETA_ANNOUNCEMENT_DRAFT.md](./PUBLIC_TESTNET_BETA_ANNOUNCEMENT_DRAFT.md) — announcement copy drafts (incl. pause / rollback template).
+* [OPERATOR_PUBLIC_BETA_URLS_FILL.md](./OPERATOR_PUBLIC_BETA_URLS_FILL.md) — placeholder-URL substitution checklist.
 
 ---
 

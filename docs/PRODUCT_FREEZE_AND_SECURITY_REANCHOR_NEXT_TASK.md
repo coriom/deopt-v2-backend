@@ -69,6 +69,9 @@ Draft the following docs under `deopt-v2-sol/docs/security-review-packet/`:
 | P5 | `.env` (`deopt-v2-backend/.env`) untouched | `stat -c '%y'` |
 | P6 | Private file untouched | `stat -c '%a %y'` |
 | P7 | `~/DEOPT/private/mainnet_custody/` NOT read (out of scope) | trust |
+| P8 | Community-feedback-loop docs in place (read-only dependency for `KNOWN_ISSUES.md` cross-references) | `ls docs/public-beta/{FEEDBACK_TRIAGE_WORKFLOW.md,COMMUNITY_ONBOARDING.md,PUBLIC_TESTNET_BETA_LAUNCH_CHECKLIST.md}` |
+
+> Note: P8 is satisfied by `COMMUNITY_FEEDBACK_LOOP_RESULT.md` (2026-06-12). This milestone does **not** depend on the `{{PUBLIC_BETA_*_URL}}` placeholders being filled — placeholder URLs are explicitly permitted to remain during the security re-anchor.
 
 ---
 

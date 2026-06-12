@@ -17,6 +17,15 @@ This directory is the public-facing documentation pack for the DeOpt V2 Base Sep
 7. [FEEDBACK_AND_BUG_REPORTING.md](./FEEDBACK_AND_BUG_REPORTING.md) — how to send us bug reports.
 8. [FAQ.md](./FAQ.md) — common questions.
 
+### Community feedback loop (2026-06-12)
+
+9. [COMMUNITY_ONBOARDING.md](./COMMUNITY_ONBOARDING.md) — onboarding for external testers (join, try, report).
+10. [BUG_REPORT_TEMPLATE.md](./BUG_REPORT_TEMPLATE.md) — public-safe bug report template with safety checklist.
+11. [FEEDBACK_TRIAGE_WORKFLOW.md](./FEEDBACK_TRIAGE_WORKFLOW.md) — operator-facing triage playbook (classification, severity, escalation, pause criteria).
+12. [PUBLIC_TESTNET_BETA_LAUNCH_CHECKLIST.md](./PUBLIC_TESTNET_BETA_LAUNCH_CHECKLIST.md) — pre/post-launch operator checklist.
+13. [PUBLIC_TESTNET_BETA_ANNOUNCEMENT_DRAFT.md](./PUBLIC_TESTNET_BETA_ANNOUNCEMENT_DRAFT.md) — Discord / X / LinkedIn / README announcement drafts + pause-rollback template.
+14. [OPERATOR_PUBLIC_BETA_URLS_FILL.md](./OPERATOR_PUBLIC_BETA_URLS_FILL.md) — checklist for swapping `{{PLACEHOLDER}}` tokens into real URLs.
+
 ---
 
 ## Public-beta launch checklist (for the operator)
@@ -25,7 +34,7 @@ This directory is the public-facing documentation pack for the DeOpt V2 Base Sep
 |---|---|---|
 | 1 | Docs complete (this directory) | ✓ |
 | 2 | App URL placeholder set (`{{APP_URL}}`) in user-facing docs | ✓ |
-| 3 | Feedback channel configured (GitHub issues / Discord / Telegram placeholders) | ☐ (operator to fill) |
+| 3 | Feedback channel docs ready (templates + triage workflow + operator-fill checklist) | ✓ (`COMMUNITY_FEEDBACK_LOOP_RESULT.md`, 2026-06-12); placeholders remain — see `OPERATOR_PUBLIC_BETA_URLS_FILL.md` |
 | 4 | Faucet + mUSDC flow documented | ✓ |
 | 5 | Known limitations published | ✓ |
 | 6 | Testnet disclaimers visible in every doc | ✓ |
