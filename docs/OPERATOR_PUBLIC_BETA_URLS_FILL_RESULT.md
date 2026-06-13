@@ -10,6 +10,28 @@
 
 ---
 
+## 0. Post-hoc note (2026-06-12, after FRONTEND-TESTNET-PRODUCT-V2-DA-FOLLOWUP)
+
+The Discord URL was supplied **after** this milestone closed, as part of the FRONTEND-TESTNET-PRODUCT-V2-DA-FOLLOWUP. The frontend link config now has:
+
+* `discord` → `status: "live"`, `href: "https://discord.gg/zaEMvWuxu"`.
+
+## 0a. Second post-hoc note (2026-06-13, after FRONTEND-INTEGRATED-DOCS-AND-FEEDBACK)
+
+The remaining 5 placeholder slots from this milestone were resolved on 2026-06-13 by the **`FRONTEND-INTEGRATED-DOCS-AND-FEEDBACK`** milestone, which replaced external URLs with internal Next.js routes (and wired GitHub to the public org URL). The frontend link config now has:
+
+* `quickstart` → `/docs/quickstart` (internal Next route, status live)
+* `testing-guide` → `/docs/testing-guide` (internal, live)
+* `limitations` → `/docs/limitations` (internal, live)
+* `feedback` → `/feedback` (internal, live — copyable bug-report template page; no server-side email)
+* `github` → `https://github.com/DeOpt` (external, live)
+
+Only `{{APP_URL}}` (doc-side; no frontend link slot) remains placeholder. See `FRONTEND_INTEGRATED_DOCS_AND_FEEDBACK_RESULT.md` for the wiring details and `PUBLIC_TESTNET_BETA_LAUNCH_REMAINING_ACTIONS.md` for the (now single-blocker) launch path.
+
+The original Discord-only post-hoc note above remains valid as historical record.
+
+---
+
 ## 1. Outcome (TL;DR)
 
 * Phase A discovery: **NO operator-supplied URLs available** from any safe local source or shell env var.

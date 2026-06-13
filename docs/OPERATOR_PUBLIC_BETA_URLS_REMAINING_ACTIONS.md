@@ -5,6 +5,8 @@
 > **Why this doc exists:** the `OPERATOR_PUBLIC_BETA_URLS_FILL` milestone (2026-06-12) discovered that no operator-supplied URLs were available from any safe local source (no `private/operator-public-beta-urls.*` file, no shell env var). All 6 frontend slots + 6 doc-side tokens remain placeholders.
 >
 > **Status of the URL-fill milestone itself:** EXECUTED but URL substitution NOT COMPLETE — see `OPERATOR_PUBLIC_BETA_URLS_FILL_RESULT.md`. The blocker is operator-side: the channels themselves need to be created/configured before URLs can be substituted.
+>
+> **Updated 2026-06-13 (post-`FRONTEND-INTEGRATED-DOCS-AND-FEEDBACK`):** 6 of the original 7 slots are now LIVE. The frontend serves quickstart / testing-guide / limitations / feedback as internal Next routes (`/docs/quickstart`, `/docs/testing-guide`, `/docs/limitations`, `/feedback`); GitHub points at `https://github.com/DeOpt`; Discord remains at `https://discord.gg/zaEMvWuxu`. Only the **App URL** (`{{APP_URL}}`, doc-side; no frontend slot) is still missing — gated on operator hosting. See `FRONTEND_INTEGRATED_DOCS_AND_FEEDBACK_RESULT.md` for the wiring details.
 
 ---
 

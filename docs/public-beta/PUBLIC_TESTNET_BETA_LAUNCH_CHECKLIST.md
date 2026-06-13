@@ -6,6 +6,30 @@ This is NOT a mainnet launch checklist. This is a **public-testnet-beta launch**
 
 ---
 
+## 0. Current launch readiness verdict (refreshed by `PUBLIC-TESTNET-BETA-LAUNCH-PREFLIGHT`)
+
+**As of 2026-06-13 (updated post-`FRONTEND_INTEGRATED_DOCS_AND_FEEDBACK`): NOT READY — but only ONE remaining hard blocker.**
+
+Blockers (rows extracted from the preflight result + the integrated-docs-and-feedback result):
+
+| Blocker | Status | Owner action | Required before announcement? | Required before wider beta? |
+|---|---|---|---|---|
+| **App URL (`{{APP_URL}}`)** | **MISSING — sole remaining hard blocker** | Operator stands up publishable HTTPS URL for the deployed Next.js frontend (Vercel / Netlify / Cloudflare Pages / S3+CloudFront / etc.) | **YES** | YES |
+| ~~Feedback channel URL~~ | **CLOSED** — `/feedback` internal route (copy-to-clipboard bug-report template + Discord + GitHub CTAs); wired 2026-06-13 | — | ✓ already met | ✓ |
+| ~~GitHub URL~~ | **CLOSED** — `https://github.com/DeOpt` live; wired 2026-06-13 | — | ✓ already met | ✓ |
+| ~~Quickstart URL~~ | **CLOSED** — `/docs/quickstart` internal route; SSG-prerendered from mirrored MD; wired 2026-06-13 | — | ✓ already met | ✓ |
+| ~~Testing-Guide URL~~ | **CLOSED** — `/docs/testing-guide`; wired 2026-06-13 | — | ✓ already met | ✓ |
+| ~~Limitations URL~~ | **CLOSED** — `/docs/limitations`; wired 2026-06-13 | — | ✓ already met | ✓ |
+| Discord URL | LIVE (`https://discord.gg/zaEMvWuxu`, wired 2026-06-12) | — | ✓ already met | ✓ |
+| API base URL (`{{ API_BASE_URL }}`) | PLACEHOLDER | Optional — frontend bundles its own backend URL at build time | NOT_REQUIRED_FOR_LAUNCH (unless API-integrator section added to announcement) | OPTIONAL |
+| Status page URL | MISSING | Optional — operator-side status page (Uptime / BetterStack / similar) | NOT_REQUIRED_FOR_LAUNCH | OPTIONAL |
+
+Until App URL flips to LIVE, the verdict stays NOT READY. Re-run path: `docs/PUBLIC_TESTNET_BETA_LAUNCH_PREFLIGHT_RERUN_NEXT_TASK.md`. On READY (post-`{{APP_URL}}` stand-up), the preflight will create `PUBLIC_TESTNET_BETA_LAUNCH_NEXT_TASK.md` with a separate publication approval line.
+
+Soft launch (Discord-only, no public post) does NOT require this verdict to flip — see `PUBLIC_TESTNET_BETA_LAUNCH_REMAINING_ACTIONS.md §7`.
+
+---
+
 ## 1. Pre-launch hard gates
 
 Every box below must be ✓ before posting the public announcement. A single ☐ is a hold.
@@ -94,7 +118,7 @@ Source of truth: `deopt-v2-backend/docs/OPERATOR_PUBLIC_BETA_URLS_FILL_RESULT.md
 | 4 | Testing guide URL configured | ☐ | Footer `public-beta-link-testing-guide` is an `<a>`. |
 | 5 | Known-limitations URL configured | ☐ | Footer `public-beta-link-limitations` is an `<a>`. |
 | 6 | Feedback form configured | ☐ | Footer `public-beta-link-feedback` is an `<a>`; sign-failure CTA in `SigningStateModal` also becomes clickable. |
-| 7 | Community channel (Discord / Telegram) configured | ☐ | Footer `public-beta-link-discord` is an `<a>`. Telegram is doc-side only. |
+| 7 | Community channel (Discord / Telegram) configured | ✓ Discord (`https://discord.gg/zaEMvWuxu`, wired 2026-06-12 via FRONTEND-TESTNET-PRODUCT-V2-DA-FOLLOWUP); ☐ Telegram (doc-side only, still placeholder) | Footer `public-beta-link-discord` is an `<a>`. Telegram is doc-side only. |
 | 8 | GitHub / issues URL configured | ☐ | Footer `public-beta-link-github` is an `<a>`; matches `docs/public-beta/` token `{{ GITHUB_REPO_URL }}`. |
 | 9 | API base URL configured | ☐ | `docs/public-beta/DEVELOPER_API_GUIDE.md` `{{ API_BASE_URL }}` substituted; backend `/trading/health` reachable from a public origin. |
 | 10 | Status URL configured (optional) | ☐ | Operator-side status page (Uptime / BetterStack / similar). Not required for launch. |
@@ -106,7 +130,7 @@ Source of truth: `deopt-v2-backend/docs/OPERATOR_PUBLIC_BETA_URLS_FILL_RESULT.md
 | 16 | Wrong-network blocker visible | ✓ | `tests/e2e/wrong-network-banner.spec.ts` (3 specs). |
 | 17 | Mainnet hard-stop visible (chain id 8453) | ✓ | `tests/e2e/mainnet-disabled.spec.ts` (2 specs). |
 
-Rows 12-17 are ✓ at the freeze moment and verified by the e2e suite. Rows 1-11 remain ☐ until the operator either:
+Rows 12-17 are ✓ at the freeze moment and verified by the e2e suite. **Updated 2026-06-13 (FRONTEND-OPTIONS-CHAIN-TERMINAL-V1):** the frontend now also ships a self-contained options-chain terminal at `/trade` with the professional Calls | Strike | Puts ladder, a 5-tab detail panel (Trade / Payoff / Greeks / Details / Risk), a 4-tab bottom panel (Balances / Positions / Trades / Events), a hamburger drawer with docs / feedback / community / limitations / changelog, and a refactored top navbar (Trade / Markets / Portfolio / API / Académie). Greeks + bid/ask + IV are honestly marked "n/a testnet" rather than faked. Catalog grew to 96 tests in 24 files. **Updated 2026-06-13 (FRONTEND-TESTNET-PRODUCT-V3-TRADING-EXPERIENCE):** the frontend now also surfaces (a) a "Before you trade" readiness helper on every product page covering wallet / network / testnet ETH / testnet mUSDC, (b) richer V3 product cards with Call/Put badge + metadata grid (expiry / series / collateral / active), (c) explicit trade-ticket microcopy explaining "your wallet signs typed data, the operator-side executor submits the testnet transaction on Base Sepolia, no real funds", (d) a tx-timeline backend-trailing-notice so testers don't panic when the indexer lags Basescan. Catalog grew to 63 tests in 20 files. Rows 1-11 remain ☐ until the operator either:
 * supplies real URLs via `OPERATOR_PUBLIC_BETA_URLS_FILL_NEXT_TASK.md` AND substitutes them in `src/lib/public-beta-links.ts`, OR
 * explicitly documents in `OPERATOR_PUBLIC_BETA_URLS_REMAINING_ACTIONS.md` that a particular slot will ship as a placeholder for the initial announcement.
 
