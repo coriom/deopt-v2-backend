@@ -130,6 +130,22 @@ Source of truth: `deopt-v2-backend/docs/OPERATOR_PUBLIC_BETA_URLS_FILL_RESULT.md
 | 16 | Wrong-network blocker visible | ✓ | `tests/e2e/wrong-network-banner.spec.ts` (3 specs). |
 | 17 | Mainnet hard-stop visible (chain id 8453) | ✓ | `tests/e2e/mainnet-disabled.spec.ts` (2 specs). |
 
+### 1.5c Frontend public testnet deploy preflight (2026-06-13)
+
+Source of truth: `deopt-v2-backend/docs/FRONTEND_PUBLIC_TESTNET_DEPLOY_PREFLIGHT_RESULT.md` + `deopt-v2-backend/docs/FRONTEND_PUBLIC_TESTNET_DEPLOY_OPERATOR_CHECKLIST.md`.
+
+| # | Item | Status row | Where it's verified |
+|---|---|---|---|
+| D1 | `deopt-v2-frontend` build green (`npm run build`) under deploy-preflight | ✓ | 16 prerendered routes, 4 SSG doc slugs, 2 dynamic, Turbopack 3.8s. |
+| D2 | Public env matrix documented | ✓ | `FRONTEND_PUBLIC_TESTNET_DEPLOY_PREFLIGHT_RESULT.md §2`. Only `NEXT_PUBLIC_TRADING_API_BASE_URL` + `NEXT_PUBLIC_CHAIN_ENV` required. |
+| D3 | Deployment plan documented (Vercel primary + Netlify / Cloudflare fallback) | ✓ | Same doc §3. No `vercel.json` / `netlify.toml` / `wrangler.toml` required. |
+| D4 | Pre-deploy sensitive-string scans on `.next/static/**` | ✓ | Zero bearer / RPC-key / DATABASE_URL / mainnet-RPC / 64-hex hits. |
+| D5 | Admin route edge-block recipe available | ✓ | Operator checklist §5 (Vercel `vercel.json` redirect, Netlify `netlify.toml`, Cloudflare Pages bulk redirect). Optional; without an operator-pasted Bearer token the admin route is harmless. |
+| D6 | Operator deploy checklist published | ✓ | `FRONTEND_PUBLIC_TESTNET_DEPLOY_OPERATOR_CHECKLIST.md` covers hosting choice, env matrix, smoke URLs, disclaimer guards, negative checks, footer links, admin edge-block, post-deploy bundle scans. |
+| D7 | App URL stood up | ☐ | Operator action. Once live, run `OPERATOR_PUBLIC_BETA_URLS_FILL_RERUN_NEXT_TASK.md` then `PUBLIC_TESTNET_BETA_LAUNCH_PREFLIGHT_RERUN_NEXT_TASK.md`. |
+
+Rows D1-D6 are ✓ at the freeze moment. Row D7 is the sole remaining hard blocker.
+
 Rows 12-17 are ✓ at the freeze moment and verified by the e2e suite. **Updated 2026-06-13 (FRONTEND-OPTIONS-CHAIN-TERMINAL-V1):** the frontend now also ships a self-contained options-chain terminal at `/trade` with the professional Calls | Strike | Puts ladder, a 5-tab detail panel (Trade / Payoff / Greeks / Details / Risk), a 4-tab bottom panel (Balances / Positions / Trades / Events), a hamburger drawer with docs / feedback / community / limitations / changelog, and a refactored top navbar (Trade / Markets / Portfolio / API / Académie). Greeks + bid/ask + IV are honestly marked "n/a testnet" rather than faked. Catalog grew to 96 tests in 24 files. **Updated 2026-06-13 (FRONTEND-TESTNET-PRODUCT-V3-TRADING-EXPERIENCE):** the frontend now also surfaces (a) a "Before you trade" readiness helper on every product page covering wallet / network / testnet ETH / testnet mUSDC, (b) richer V3 product cards with Call/Put badge + metadata grid (expiry / series / collateral / active), (c) explicit trade-ticket microcopy explaining "your wallet signs typed data, the operator-side executor submits the testnet transaction on Base Sepolia, no real funds", (d) a tx-timeline backend-trailing-notice so testers don't panic when the indexer lags Basescan. Catalog grew to 63 tests in 20 files. Rows 1-11 remain ☐ until the operator either:
 * supplies real URLs via `OPERATOR_PUBLIC_BETA_URLS_FILL_NEXT_TASK.md` AND substitutes them in `src/lib/public-beta-links.ts`, OR
 * explicitly documents in `OPERATOR_PUBLIC_BETA_URLS_REMAINING_ACTIONS.md` that a particular slot will ship as a placeholder for the initial announcement.

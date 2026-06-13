@@ -1,7 +1,9 @@
 # PUBLIC-TESTNET-BETA-LAUNCH-PREFLIGHT — RERUN — Next Task Brief
 
-**Date written:** 2026-06-13
-**Origin:** `FRONTEND_INTEGRATED_DOCS_AND_FEEDBACK_RESULT.md` + `PUBLIC_TESTNET_BETA_LAUNCH_PREFLIGHT_RESULT.md`.
+**Date written:** 2026-06-13 (initial); **deploy-preflight addendum 2026-06-13**.
+**Origin:** `FRONTEND_INTEGRATED_DOCS_AND_FEEDBACK_RESULT.md` + `PUBLIC_TESTNET_BETA_LAUNCH_PREFLIGHT_RESULT.md` + `FRONTEND_PUBLIC_TESTNET_DEPLOY_PREFLIGHT_RESULT.md`.
+
+> **Addendum (2026-06-13, post-deploy-preflight):** `FRONTEND_PUBLIC_TESTNET_DEPLOY_PREFLIGHT_RESULT.md` confirmed the frontend is READY TO DEPLOY: build green, env matrix documented, admin posture contained. The only remaining hard blocker is operator hosting (the `<APP_URL>`). The order to follow is now: (1) operator stands up `<APP_URL>` per `docs/FRONTEND_PUBLIC_TESTNET_DEPLOY_OPERATOR_CHECKLIST.md`; (2) rerun `OPERATOR-PUBLIC-BETA-URLS-FILL` per `docs/OPERATOR_PUBLIC_BETA_URLS_FILL_RERUN_NEXT_TASK.md`; (3) rerun THIS preflight to flip the launch verdict to READY.
 **Target:** re-evaluate the public testnet beta launch readiness verdict now that 5 of the 6 URL blockers have been replaced by internal frontend routes and GitHub is wired to `https://github.com/DeOpt`. The previous preflight (2026-06-13 earlier today) returned **NOT READY** because App / Feedback / GitHub were all placeholder; this rerun should observe the new state and flip the verdict accordingly.
 
 **Posture:** **Docs + verification only (same as the original preflight). NEVER mainnet. NEVER chain transactions. NEVER backend `.env` edit. NEVER private key handling. NEVER publish an announcement under this brief.**
