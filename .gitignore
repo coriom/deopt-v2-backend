@@ -2,6 +2,7 @@ target/
 .env
 .env.*
 !.env.example
+!.env.local.example
 
 # Operator-private Sepolia inputs (RPC URLs, addresses, balances).
 # NEVER commit a populated copy.

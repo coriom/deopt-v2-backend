@@ -105,8 +105,40 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::str::FromStr;
+use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
+
+/// Build a CORS layer for the public trading API.
+///
+/// Reads `CORS_ALLOWED_ORIGINS` (comma-separated list of HTTPS or
+/// `http://localhost`/`http://127.0.0.1` origins). Defaults to the two
+/// localhost frontend dev origins so a freshly-cloned repo can run
+/// `cargo run` + `npm run dev` without any extra config.
+///
+/// Production deployments MUST explicitly set `CORS_ALLOWED_ORIGINS` to
+/// the operator-controlled frontend app URL (e.g.
+/// `https://<frontend-host>.vercel.app`). Setting `CORS_ALLOWED_ORIGINS=`
+/// to the empty string yields an empty allow-list (effectively disabling
+/// browser cross-origin access — useful for backend-only deployments).
+fn cors_layer_from_env() -> CorsLayer {
+    use axum::http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
+    use axum::http::{HeaderValue, Method};
+
+    let origins_raw = std::env::var("CORS_ALLOWED_ORIGINS")
+        .unwrap_or_else(|_| "http://localhost:3000,http://127.0.0.1:3000".to_string());
+    let origins: Vec<HeaderValue> = origins_raw
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| HeaderValue::from_str(s).ok())
+        .collect();
+
+    CorsLayer::new()
+        .allow_origin(origins)
+        .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
+        .allow_headers([CONTENT_TYPE, ACCEPT, AUTHORIZATION])
+}
 
 /// V2G-W2 — admin route gate middleware.
 ///
@@ -517,6 +549,7 @@ pub fn router(state: AppState) -> Router {
             admin_route_gate,
         ))
         .layer(TraceLayer::new_for_http())
+        .layer(cors_layer_from_env())
         .with_state(state)
 }
 

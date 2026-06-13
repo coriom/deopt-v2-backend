@@ -42,6 +42,10 @@ This checklist documents Vercel in detail; the others mirror it.
 * ☐ Output directory: leave as Vercel default.
 * ☐ Node version: 20.x.
 
+### 2.0 Pre-flight LOCAL gate (added 2026-06-13, post-LOCAL-FULLSTACK-TESTNET-BETA-SMOKE)
+
+Before deploying the frontend publicly, run `~/DEOPT/scripts/local-backend.sh` + `~/DEOPT/scripts/local-frontend.sh` + `~/DEOPT/scripts/local-smoke.sh` once. The local smoke must return `9 pass / 0 fail` and the frontend at `http://localhost:3000/trade` must render the options-chain terminal without the backend-unavailable fallback. See `docs/LOCAL_FULLSTACK_RUNBOOK.md`.
+
 ### 2.1 Environment variables (Production + Preview)
 
 Add ONLY these:
