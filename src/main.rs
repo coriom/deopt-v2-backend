@@ -87,6 +87,7 @@ async fn main() -> deopt_v2_backend::Result<()> {
     state.database_configured = config.database_url.is_some();
     state.mm_gateway_config = config.mm_gateway.clone();
     state.mm_permissions_config = config.mm_permissions.clone();
+    state.public_ws_config = config.public_ws.clone();
     state.fees_config = config.fees.clone();
     state.admin_config = config.admin.clone();
     state.metrics_config = config.metrics.clone();
@@ -129,6 +130,8 @@ async fn main() -> deopt_v2_backend::Result<()> {
         metrics_enabled = config.metrics.enabled,
         mm_gateway_enabled = config.mm_gateway.enabled,
         mm_permissions_enabled = config.mm_permissions.enabled,
+        public_ws_enabled = config.public_ws.enabled,
+        public_ws_path = %config.public_ws.path,
         indexer_enabled = config.indexer.enabled,
         reconciliation_enabled = config.reconciliation.enabled,
         executor_dry_run = config.execution.dry_run,

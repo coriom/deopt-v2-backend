@@ -38,6 +38,10 @@ pub struct AppConfig {
     pub fees: FeesConfig,
     pub mm_gateway: MmGatewayConfig,
     pub mm_permissions: MmPermissionsConfig,
+    /// BACKEND-PUBLIC-WS-API-V1 — knobs for the public `/ws`
+    /// WebSocket endpoint mounted on the same Axum HTTP listener.
+    /// Distinct from `mm_gateway` (operator-whitelisted WebTransport).
+    pub public_ws: crate::api::public_ws::PublicWsConfig,
     pub admin: AdminConfig,
     pub metrics: MetricsConfig,
     pub signature_verification_mode: SignatureVerificationMode,
@@ -552,6 +556,56 @@ impl AppConfig {
         // read-only trading_views surface. Disabled by default;
         // upgrades handler envelopes to "ok" when configured.
         // NEVER touches signer / AWS / KMS / broadcast paths.
+        let public_ws_defaults = crate::api::public_ws::PublicWsConfig::default_testnet();
+        let public_ws = crate::api::public_ws::PublicWsConfig {
+            enabled: parse_env(
+                &mut lookup,
+                "PUBLIC_WS_ENABLED",
+                if public_ws_defaults.enabled {
+                    "true"
+                } else {
+                    "false"
+                },
+            )?,
+            path: get_env(&mut lookup, "PUBLIC_WS_PATH", &public_ws_defaults.path),
+            max_connections: parse_env(
+                &mut lookup,
+                "PUBLIC_WS_MAX_CONNECTIONS",
+                &public_ws_defaults.max_connections.to_string(),
+            )?,
+            max_subscriptions_per_connection: parse_env(
+                &mut lookup,
+                "PUBLIC_WS_MAX_SUBSCRIPTIONS_PER_CONNECTION",
+                &public_ws_defaults
+                    .max_subscriptions_per_connection
+                    .to_string(),
+            )?,
+            max_frame_bytes: parse_env(
+                &mut lookup,
+                "PUBLIC_WS_MAX_FRAME_BYTES",
+                &public_ws_defaults.max_frame_bytes.to_string(),
+            )?,
+            client_rate_limit_per_sec: parse_env(
+                &mut lookup,
+                "PUBLIC_WS_CLIENT_RATE_LIMIT_PER_SEC",
+                &public_ws_defaults.client_rate_limit_per_sec.to_string(),
+            )?,
+            heartbeat_interval_ms: parse_env(
+                &mut lookup,
+                "PUBLIC_WS_HEARTBEAT_INTERVAL_MS",
+                &public_ws_defaults.heartbeat_interval_ms.to_string(),
+            )?,
+            snapshot_interval_ms: parse_env(
+                &mut lookup,
+                "PUBLIC_WS_SNAPSHOT_INTERVAL_MS",
+                &public_ws_defaults.snapshot_interval_ms.to_string(),
+            )?,
+            challenge_ttl_ms: parse_env(
+                &mut lookup,
+                "PUBLIC_WS_CHALLENGE_TTL_MS",
+                &public_ws_defaults.challenge_ttl_ms.to_string(),
+            )?,
+        };
         let trading_views = TradingViewsConfig {
             margin_engine_lens_address: parse_optional_address_env(
                 &mut lookup,
@@ -595,6 +649,7 @@ impl AppConfig {
             fees,
             mm_gateway,
             mm_permissions,
+            public_ws,
             admin,
             metrics,
             signature_verification_mode,

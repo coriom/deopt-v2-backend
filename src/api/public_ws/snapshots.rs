@@ -1,0 +1,324 @@
+//! Snapshot generators for the public WebSocket channels.
+//!
+//! Each generator calls the existing HTTP handler / service so the WS
+//! surface and the HTTP surface stay perfectly in lock-step — there is
+//! no second implementation that could drift.
+//!
+//! Generators never fabricate live data. They either return the same
+//! `data` block the HTTP envelope would carry, or a SOURCE_UNAVAILABLE
+//! sentinel that the dispatcher converts into a clean error frame.
+
+use super::protocol::Channel;
+use crate::api::AppState;
+use axum::extract::{Query, State};
+use serde_json::Value;
+
+#[derive(Debug)]
+pub enum SnapshotError {
+    /// The underlying source returned an upstream error or has no data.
+    SourceUnavailable(String),
+    /// Channel doesn't have a snapshot generator wired yet.
+    NotImplemented,
+}
+
+/// Run the matching HTTP handler in-process and return its `data`
+/// payload as `serde_json::Value`. Public channels only — private
+/// channels go through `build_snapshot_for_address`.
+pub async fn build_snapshot(state: &AppState, channel: Channel) -> Result<Value, SnapshotError> {
+    match channel {
+        Channel::TradingHealth => snapshot_trading_health(state).await,
+        Channel::OptionsProducts => snapshot_options_products(state).await,
+        Channel::Leaderboard => snapshot_leaderboard(state).await,
+        Channel::AccountPositions
+        | Channel::AccountPortfolio
+        | Channel::AccountBalances
+        | Channel::AccountOrders
+        | Channel::AccountFills
+        | Channel::AccountHistory
+        | Channel::AccountIntentStatus
+        | Channel::AccountSettlements
+        | Channel::AccountLiquidations => Err(SnapshotError::NotImplemented),
+    }
+}
+
+/// Address-scoped snapshot for `account.*` channels. Reuses the
+/// existing HTTP handlers so the REST and WS surfaces never drift.
+///
+/// V1 wires four channels with real sources (`positions`, `portfolio`,
+/// `balances`, `history`) and surfaces honest empty arrays for the
+/// remaining five (`orders`, `fills`, `intent_status`, `settlements`,
+/// `liquidations`). No private data is fabricated; no global data is
+/// returned inside an account channel.
+pub async fn build_snapshot_for_address(
+    state: &AppState,
+    channel: Channel,
+    address: &str,
+) -> Result<Value, SnapshotError> {
+    match channel {
+        Channel::AccountPositions => snapshot_account_positions(state, address).await,
+        Channel::AccountPortfolio => snapshot_account_portfolio(state, address).await,
+        Channel::AccountBalances => snapshot_account_balances(state, address).await,
+        Channel::AccountHistory => snapshot_account_history(state, address).await,
+        Channel::AccountOrders => Ok(empty_account_collection("orders", address)),
+        Channel::AccountFills => Ok(empty_account_collection("fills", address)),
+        Channel::AccountIntentStatus => Ok(empty_account_collection("intents", address)),
+        Channel::AccountSettlements => Ok(empty_account_collection("settlements", address)),
+        Channel::AccountLiquidations => Ok(empty_account_collection("liquidations", address)),
+        // Public channels never route through this path.
+        Channel::TradingHealth | Channel::OptionsProducts | Channel::Leaderboard => {
+            Err(SnapshotError::NotImplemented)
+        }
+    }
+}
+
+fn empty_account_collection(key: &'static str, address: &str) -> Value {
+    serde_json::json!({
+        "address": address,
+        "source": "empty",
+        key: [],
+    })
+}
+
+async fn snapshot_account_positions(
+    state: &AppState,
+    address: &str,
+) -> Result<Value, SnapshotError> {
+    match crate::api::trading::account_positions(
+        State(state.clone()),
+        axum::extract::Path(address.to_string()),
+    )
+    .await
+    {
+        Ok(env) => serde_json::to_value(&env.0.data).map_err(|e| {
+            SnapshotError::SourceUnavailable(format!("account.positions serialization failed: {e}"))
+        }),
+        Err(_) => Err(SnapshotError::SourceUnavailable(
+            "account.positions upstream error".to_string(),
+        )),
+    }
+}
+
+async fn snapshot_account_portfolio(
+    state: &AppState,
+    address: &str,
+) -> Result<Value, SnapshotError> {
+    match crate::api::trading::account_portfolio(
+        State(state.clone()),
+        axum::extract::Path(address.to_string()),
+    )
+    .await
+    {
+        Ok(env) => serde_json::to_value(&env.0.data).map_err(|e| {
+            SnapshotError::SourceUnavailable(format!("account.portfolio serialization failed: {e}"))
+        }),
+        Err(_) => Err(SnapshotError::SourceUnavailable(
+            "account.portfolio upstream error".to_string(),
+        )),
+    }
+}
+
+async fn snapshot_account_balances(
+    state: &AppState,
+    address: &str,
+) -> Result<Value, SnapshotError> {
+    match crate::api::trading::account_balances(
+        State(state.clone()),
+        axum::extract::Path(address.to_string()),
+    )
+    .await
+    {
+        Ok(env) => serde_json::to_value(&env.0.data).map_err(|e| {
+            SnapshotError::SourceUnavailable(format!("account.balances serialization failed: {e}"))
+        }),
+        Err(_) => Err(SnapshotError::SourceUnavailable(
+            "account.balances upstream error".to_string(),
+        )),
+    }
+}
+
+async fn snapshot_account_history(state: &AppState, address: &str) -> Result<Value, SnapshotError> {
+    let q = crate::api::trading::HistoryV2Query {
+        tab: Some("trades".to_string()),
+        range: Some("last_month".to_string()),
+        page: Some(1),
+        page_size: Some(100),
+    };
+    match crate::api::trading::account_history_v2(
+        State(state.clone()),
+        axum::extract::Path(address.to_string()),
+        Query(q),
+    )
+    .await
+    {
+        Ok(env) => serde_json::to_value(&env.0.data).map_err(|e| {
+            SnapshotError::SourceUnavailable(format!("account.history serialization failed: {e}"))
+        }),
+        Err(_) => Err(SnapshotError::SourceUnavailable(
+            "account.history upstream error".to_string(),
+        )),
+    }
+}
+
+async fn snapshot_trading_health(state: &AppState) -> Result<Value, SnapshotError> {
+    let response = crate::api::trading::trading_health(State(state.clone())).await;
+    serde_json::to_value(&response.0.data).map_err(|e| {
+        SnapshotError::SourceUnavailable(format!("trading.health serialization failed: {e}"))
+    })
+}
+
+async fn snapshot_options_products(state: &AppState) -> Result<Value, SnapshotError> {
+    let q = crate::api::trading::ListProductsQuery::default();
+    match crate::api::trading::list_products(State(state.clone()), Query(q)).await {
+        Ok(env) => serde_json::to_value(&env.0.data).map_err(|e| {
+            SnapshotError::SourceUnavailable(format!("options.products serialization failed: {e}"))
+        }),
+        Err(_) => Err(SnapshotError::SourceUnavailable(
+            "options.products upstream error".to_string(),
+        )),
+    }
+}
+
+async fn snapshot_leaderboard(state: &AppState) -> Result<Value, SnapshotError> {
+    let q = crate::api::trading::LeaderboardQuery {
+        range: Some("last_month".to_string()),
+        page: Some(1),
+        page_size: Some(100),
+    };
+    match crate::api::trading::leaderboard(State(state.clone()), Query(q)).await {
+        Ok(env) => serde_json::to_value(&env.0.data).map_err(|e| {
+            SnapshotError::SourceUnavailable(format!("leaderboard serialization failed: {e}"))
+        }),
+        Err(_) => Err(SnapshotError::SourceUnavailable(
+            "leaderboard upstream error".to_string(),
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::EngineState;
+
+    fn test_state() -> AppState {
+        let mut s = AppState::new(EngineState::new(Vec::new()));
+        s.chain_id = 31337;
+        s.network_name = "anvil".to_string();
+        s.options_config.enabled = true;
+        s
+    }
+
+    #[tokio::test]
+    async fn trading_health_snapshot_is_serialisable() {
+        let v = build_snapshot(&test_state(), Channel::TradingHealth)
+            .await
+            .expect("ok");
+        assert!(v.is_object());
+        assert!(v.get("overall_status").is_some());
+        assert_eq!(v["chain_id"], 31337);
+    }
+
+    #[tokio::test]
+    async fn options_products_snapshot_is_serialisable() {
+        let v = build_snapshot(&test_state(), Channel::OptionsProducts)
+            .await
+            .expect("ok");
+        assert!(v.is_object());
+        assert!(v.get("products").is_some());
+    }
+
+    #[tokio::test]
+    async fn leaderboard_snapshot_is_serialisable() {
+        let v = build_snapshot(&test_state(), Channel::Leaderboard)
+            .await
+            .expect("ok");
+        assert!(v.is_object());
+        assert!(v.get("items").is_some());
+    }
+
+    #[tokio::test]
+    async fn account_channels_are_not_implemented_via_public_build_snapshot() {
+        // The public-channel `build_snapshot` always rejects
+        // `account.*` — those go through `build_snapshot_for_address`.
+        for c in [
+            Channel::AccountPositions,
+            Channel::AccountPortfolio,
+            Channel::AccountBalances,
+            Channel::AccountOrders,
+            Channel::AccountFills,
+            Channel::AccountHistory,
+            Channel::AccountIntentStatus,
+            Channel::AccountSettlements,
+            Channel::AccountLiquidations,
+        ] {
+            let r = build_snapshot(&test_state(), c).await;
+            assert!(matches!(r, Err(SnapshotError::NotImplemented)));
+        }
+    }
+
+    const TEST_ADDR: &str = "0x1234567890abcdef1234567890abcdef12345678";
+
+    #[tokio::test]
+    async fn account_positions_snapshot_is_serialisable_for_an_address() {
+        let v = build_snapshot_for_address(&test_state(), Channel::AccountPositions, TEST_ADDR)
+            .await
+            .expect("positions ok");
+        assert!(v.is_object());
+        assert_eq!(v["address"], TEST_ADDR);
+    }
+
+    #[tokio::test]
+    async fn account_portfolio_snapshot_is_serialisable_for_an_address() {
+        let v = build_snapshot_for_address(&test_state(), Channel::AccountPortfolio, TEST_ADDR)
+            .await
+            .expect("portfolio ok");
+        assert!(v.is_object());
+    }
+
+    #[tokio::test]
+    async fn account_balances_snapshot_is_serialisable_for_an_address() {
+        let v = build_snapshot_for_address(&test_state(), Channel::AccountBalances, TEST_ADDR)
+            .await
+            .expect("balances ok");
+        assert!(v.is_object());
+    }
+
+    #[tokio::test]
+    async fn account_history_snapshot_is_serialisable_for_an_address() {
+        let v = build_snapshot_for_address(&test_state(), Channel::AccountHistory, TEST_ADDR)
+            .await
+            .expect("history ok");
+        assert!(v.is_object());
+        assert_eq!(v["tab"], "trades");
+        assert_eq!(v["address"], TEST_ADDR);
+    }
+
+    #[tokio::test]
+    async fn deferred_account_channels_return_honest_empty_arrays() {
+        for (channel, key) in [
+            (Channel::AccountOrders, "orders"),
+            (Channel::AccountFills, "fills"),
+            (Channel::AccountIntentStatus, "intents"),
+            (Channel::AccountSettlements, "settlements"),
+            (Channel::AccountLiquidations, "liquidations"),
+        ] {
+            let v = build_snapshot_for_address(&test_state(), channel, TEST_ADDR)
+                .await
+                .expect("empty ok");
+            assert_eq!(v["address"], TEST_ADDR);
+            assert_eq!(v["source"], "empty");
+            assert_eq!(v[key].as_array().expect("array").len(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn public_channels_are_rejected_by_address_scoped_path() {
+        for c in [
+            Channel::TradingHealth,
+            Channel::OptionsProducts,
+            Channel::Leaderboard,
+        ] {
+            let r = build_snapshot_for_address(&test_state(), c, TEST_ADDR).await;
+            assert!(matches!(r, Err(SnapshotError::NotImplemented)));
+        }
+    }
+}

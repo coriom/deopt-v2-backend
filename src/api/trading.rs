@@ -20,7 +20,9 @@ use crate::options::service::{
     get_option_series as get_option_series_service, list_option_fills as list_option_fills_service,
     list_option_series as list_option_series_service,
 };
-use crate::options::{OptionFill, OptionFillFilter, OptionSeries, OptionSeriesFilter};
+use crate::options::{
+    OptionFill, OptionFillFilter, OptionOrderFilter, OptionSeries, OptionSeriesFilter,
+};
 use crate::signing::eip712::parse_evm_address;
 use crate::types::{now_ms, AccountId};
 use axum::extract::{Path, Query, State};
@@ -283,6 +285,94 @@ pub struct HistoryItem {
 #[derive(Clone, Debug, Serialize)]
 pub struct HistoryData {
     pub items: Vec<HistoryItem>,
+}
+
+// FRONTEND-BACKEND-HISTORY-V1 — richer tabbed history payload.
+//
+// Every column documented in the V1 brief is encoded as `Option<String>`
+// (or `Option<u64>` / `Option<i64>` for natural numbers) on a single
+// item type so the wire shape stays stable across tabs. Fields not
+// applicable to a given tab are emitted as JSON `null`.
+//
+// Source coverage today:
+//   - `trades`        → `option_fills` rows where the address is buyer or seller
+//   - `orders`        → `option_orders` rows where the address is the order owner
+//   - `transactions`  → `option_execution_intents` rows where the address is buyer or seller
+//   - `settlement` / `funding` / `interest` / `liquidations` → empty arrays
+//     (no source data exists yet — perps + settlement events are not in
+//     scope for this V1 milestone)
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct HistoryV2Item {
+    pub time_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instrument: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub side: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub amount: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub price: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pnl: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fees: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tx_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub asset: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub block: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gas: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub order_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit_price: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filled: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settlement_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub market: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub position: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payment: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub principal: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub liquidation_price: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub penalty: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct HistoryV2Data {
+    pub address: String,
+    pub chain: String,
+    pub chain_id: u64,
+    pub range: String,
+    pub tab: String,
+    pub page: u32,
+    pub page_size: u32,
+    pub total_records: usize,
+    pub items: Vec<HistoryV2Item>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1819,6 +1909,540 @@ pub async fn account_history(
     }))
 }
 
+// ---------------------------------------------------------------------
+// FRONTEND-BACKEND-HISTORY-V1 — tabbed, paginated, range-scoped history
+// ---------------------------------------------------------------------
+
+/// Tabs surfaced by the V1 frontend history page. The four `_empty`
+/// variants intentionally return zero rows today; they are kept in the
+/// API so the frontend tab order is stable as perps + settlement land.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HistoryTab {
+    Trades,
+    Transactions,
+    Orders,
+    Settlement,
+    Funding,
+    Interest,
+    Liquidations,
+}
+
+impl HistoryTab {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Trades => "trades",
+            Self::Transactions => "transactions",
+            Self::Orders => "orders",
+            Self::Settlement => "settlement",
+            Self::Funding => "funding",
+            Self::Interest => "interest",
+            Self::Liquidations => "liquidations",
+        }
+    }
+
+    fn parse(v: &str) -> Option<Self> {
+        match v {
+            "trades" => Some(Self::Trades),
+            "transactions" => Some(Self::Transactions),
+            "orders" => Some(Self::Orders),
+            "settlement" => Some(Self::Settlement),
+            "funding" => Some(Self::Funding),
+            "interest" => Some(Self::Interest),
+            "liquidations" => Some(Self::Liquidations),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HistoryRange {
+    LastDay,
+    LastWeek,
+    LastMonth,
+    LastQuarter,
+    All,
+}
+
+impl HistoryRange {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::LastDay => "last_day",
+            Self::LastWeek => "last_week",
+            Self::LastMonth => "last_month",
+            Self::LastQuarter => "last_quarter",
+            Self::All => "all",
+        }
+    }
+
+    fn parse(v: &str) -> Option<Self> {
+        match v {
+            "last_day" => Some(Self::LastDay),
+            "last_week" => Some(Self::LastWeek),
+            "last_month" => Some(Self::LastMonth),
+            "last_quarter" => Some(Self::LastQuarter),
+            "all" => Some(Self::All),
+            _ => None,
+        }
+    }
+
+    /// Inclusive lower bound on `created_at_ms`. `None` for `All`.
+    fn since_ms(self, now_ms: i64) -> Option<i64> {
+        const DAY: i64 = 24 * 60 * 60 * 1000;
+        match self {
+            Self::LastDay => Some(now_ms - DAY),
+            Self::LastWeek => Some(now_ms - 7 * DAY),
+            Self::LastMonth => Some(now_ms - 30 * DAY),
+            Self::LastQuarter => Some(now_ms - 90 * DAY),
+            Self::All => None,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct HistoryV2Query {
+    pub tab: Option<String>,
+    pub range: Option<String>,
+    pub page: Option<u32>,
+    pub page_size: Option<u32>,
+}
+
+const MAX_HISTORY_PAGE_SIZE: u32 = 10_000;
+const DEFAULT_HISTORY_PAGE_SIZE: u32 = 100;
+
+fn chain_name_for(chain_id: u64) -> &'static str {
+    match chain_id {
+        1 => "ethereum-mainnet",
+        8453 => "base-mainnet",
+        84532 => "base-sepolia",
+        11155111 => "ethereum-sepolia",
+        31337 => "anvil",
+        _ => "unknown",
+    }
+}
+
+fn empty_history_envelope(
+    state: &AppState,
+    address: &str,
+    tab: HistoryTab,
+    range: HistoryRange,
+    page: u32,
+    page_size: u32,
+) -> Json<Envelope<HistoryV2Data>> {
+    Json(Envelope {
+        status: "ok",
+        data: HistoryV2Data {
+            address: address.to_string(),
+            chain: chain_name_for(state.chain_id).to_string(),
+            chain_id: state.chain_id,
+            range: range.as_str().to_string(),
+            tab: tab.as_str().to_string(),
+            page,
+            page_size,
+            total_records: 0,
+            items: Vec::new(),
+        },
+        warnings: Vec::new(),
+        meta: MetaBlock::new(state, "db"),
+    })
+}
+
+pub async fn account_history_v2(
+    State(state): State<AppState>,
+    Path(address): Path<String>,
+    Query(q): Query<HistoryV2Query>,
+) -> Result<Json<Envelope<HistoryV2Data>>, TradingApiError> {
+    let acct = parse_address_or_400(&state, &address)?;
+
+    let tab_str = q.tab.as_deref().unwrap_or("trades");
+    let tab = HistoryTab::parse(tab_str).ok_or_else(|| {
+        TradingApiError::new(
+            TradingErrorCode::InvalidRequest,
+            "Unknown history tab; expected one of trades/transactions/orders/settlement/funding/interest/liquidations.",
+            MetaBlock::new(&state, "validation"),
+        )
+    })?;
+    let range_str = q.range.as_deref().unwrap_or("last_month");
+    let range = HistoryRange::parse(range_str).ok_or_else(|| {
+        TradingApiError::new(
+            TradingErrorCode::InvalidRequest,
+            "Unknown history range; expected one of last_day/last_week/last_month/last_quarter/all.",
+            MetaBlock::new(&state, "validation"),
+        )
+    })?;
+    let page = q.page.unwrap_or(1).max(1);
+    let page_size = q
+        .page_size
+        .unwrap_or(DEFAULT_HISTORY_PAGE_SIZE)
+        .clamp(1, MAX_HISTORY_PAGE_SIZE);
+
+    // Tabs that don't have source data yet return a clean empty page.
+    match tab {
+        HistoryTab::Settlement
+        | HistoryTab::Funding
+        | HistoryTab::Interest
+        | HistoryTab::Liquidations => {
+            return Ok(empty_history_envelope(
+                &state, &address, tab, range, page, page_size,
+            ));
+        }
+        _ => {}
+    }
+
+    let since = range.since_ms(now_ms());
+
+    let mut items: Vec<HistoryV2Item> = match tab {
+        HistoryTab::Trades => trades_rows_for(&state, &acct, since).await?,
+        HistoryTab::Orders => orders_rows_for(&state, &acct, since).await?,
+        HistoryTab::Transactions => transactions_rows_for(&state, &acct, since).await?,
+        _ => Vec::new(),
+    };
+    items.sort_by(|a, b| b.time_ms.cmp(&a.time_ms));
+    let total_records = items.len();
+
+    let start = ((page - 1) as usize).saturating_mul(page_size as usize);
+    let end = start.saturating_add(page_size as usize).min(total_records);
+    let page_items = if start >= total_records {
+        Vec::new()
+    } else {
+        items[start..end].to_vec()
+    };
+
+    Ok(Json(Envelope {
+        status: "ok",
+        data: HistoryV2Data {
+            address: address.clone(),
+            chain: chain_name_for(state.chain_id).to_string(),
+            chain_id: state.chain_id,
+            range: range.as_str().to_string(),
+            tab: tab.as_str().to_string(),
+            page,
+            page_size,
+            total_records,
+            items: page_items,
+        },
+        warnings: Vec::new(),
+        meta: MetaBlock::new(&state, "db"),
+    }))
+}
+
+async fn trades_rows_for(
+    state: &AppState,
+    acct: &AccountId,
+    since_ms: Option<i64>,
+) -> Result<Vec<HistoryV2Item>, TradingApiError> {
+    let fills = list_option_fills_service(
+        state,
+        OptionFillFilter {
+            option_series_id: None,
+            account: Some(acct.clone()),
+            order_id: None,
+        },
+    )
+    .await
+    .map_err(|_| {
+        TradingApiError::new(
+            TradingErrorCode::InternalError,
+            "unable to list option fills",
+            MetaBlock::new(state, "internal"),
+        )
+    })?;
+
+    let mut out = Vec::with_capacity(fills.len());
+    for f in fills {
+        if let Some(min) = since_ms {
+            if f.created_at_ms < min {
+                continue;
+            }
+        }
+        let is_buyer = f.buyer.0.eq_ignore_ascii_case(&acct.0);
+        let side = if is_buyer { "buy" } else { "sell" };
+        let role = if (is_buyer && f.maker_order_id == f.buy_order_id)
+            || (!is_buyer && f.maker_order_id == f.sell_order_id)
+        {
+            "maker"
+        } else {
+            "taker"
+        };
+        out.push(HistoryV2Item {
+            time_ms: f.created_at_ms,
+            instrument: Some(f.option_series_id.to_string()),
+            side: Some(side.to_string()),
+            amount: Some(f.size_1e8.to_string()),
+            price: Some(f.price_1e8.to_string()),
+            total: None,
+            pnl: None,
+            fees: None,
+            status: Some("filled".to_string()),
+            kind: Some("option".to_string()),
+            role: Some(role.to_string()),
+            tx_hash: None,
+            ..HistoryV2Item::default()
+        });
+    }
+    Ok(out)
+}
+
+async fn orders_rows_for(
+    state: &AppState,
+    acct: &AccountId,
+    since_ms: Option<i64>,
+) -> Result<Vec<HistoryV2Item>, TradingApiError> {
+    use crate::options::service::list_option_orders as list_option_orders_service;
+    let orders = list_option_orders_service(
+        state,
+        OptionOrderFilter {
+            option_series_id: None,
+            account: Some(acct.clone()),
+            status: None,
+            side: None,
+        },
+    )
+    .await
+    .map_err(|_| {
+        TradingApiError::new(
+            TradingErrorCode::InternalError,
+            "unable to list option orders",
+            MetaBlock::new(state, "internal"),
+        )
+    })?;
+
+    let mut out = Vec::with_capacity(orders.len());
+    for o in orders {
+        if let Some(min) = since_ms {
+            if o.created_at_ms < min {
+                continue;
+            }
+        }
+        let filled_amount_1e8 = o.size_1e8.saturating_sub(o.remaining_size_1e8);
+        let side_str = match o.side {
+            crate::types::Side::Buy => "buy",
+            crate::types::Side::Sell => "sell",
+        };
+        let tif_str = match o.time_in_force {
+            crate::types::TimeInForce::Gtc => "gtc",
+            crate::types::TimeInForce::Ioc => "ioc",
+            crate::types::TimeInForce::Fok => "fok",
+        };
+        out.push(HistoryV2Item {
+            time_ms: o.created_at_ms,
+            instrument: Some(o.option_series_id.to_string()),
+            side: Some(side_str.to_string()),
+            order_type: Some(tif_str.to_string()),
+            amount: Some(o.size_1e8.to_string()),
+            limit_price: Some(o.price_1e8.to_string()),
+            filled: Some(filled_amount_1e8.to_string()),
+            status: Some(o.status.as_str().to_string()),
+            role: None,
+            tx_hash: None,
+            ..HistoryV2Item::default()
+        });
+    }
+    Ok(out)
+}
+
+async fn transactions_rows_for(
+    state: &AppState,
+    acct: &AccountId,
+    since_ms: Option<i64>,
+) -> Result<Vec<HistoryV2Item>, TradingApiError> {
+    use crate::options::service::list_option_execution_intents as list_option_execution_intents_service;
+    let intents = list_option_execution_intents_service(state)
+        .await
+        .map_err(|_| {
+            TradingApiError::new(
+                TradingErrorCode::InternalError,
+                "unable to list option execution intents",
+                MetaBlock::new(state, "internal"),
+            )
+        })?;
+
+    let chain_label = chain_name_for(state.chain_id).to_string();
+    let mut out: Vec<HistoryV2Item> = Vec::new();
+    for i in intents {
+        let is_buyer = i.buyer.0.eq_ignore_ascii_case(&acct.0);
+        let is_seller = i.seller.0.eq_ignore_ascii_case(&acct.0);
+        if !is_buyer && !is_seller {
+            continue;
+        }
+        let t = i.updated_at_ms.max(i.created_at_ms);
+        if let Some(min) = since_ms {
+            if t < min {
+                continue;
+            }
+        }
+        out.push(HistoryV2Item {
+            time_ms: t,
+            instrument: Some(i.option_series_id.to_string()),
+            action: Some("option_execute".to_string()),
+            asset: Some(i.settlement_asset.0.clone()),
+            amount: Some(i.source_size_1e8.to_string()),
+            status: Some(i.status.as_str().to_string()),
+            tx_hash: None,
+            block: None,
+            gas: None,
+            side: Some(if is_buyer {
+                "buy".to_string()
+            } else {
+                "sell".to_string()
+            }),
+            kind: Some("option".to_string()),
+            ..HistoryV2Item::default()
+        });
+        // The intent.tx_hash + block + gas live on the linked
+        // option_execution_transactions row; that table is not exposed
+        // by a service helper yet, so V1 leaves those fields null and
+        // a follow-on milestone can backfill from the transactions
+        // store without changing the wire shape.
+        let _ = chain_label;
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------
+// FRONTEND-BACKEND-LEADERBOARD-V1 — global ranking of accounts by
+// trading volume, derived from `option_fills`.
+// ---------------------------------------------------------------------
+
+#[derive(Clone, Debug, Serialize)]
+pub struct LeaderboardItem {
+    pub rank: u32,
+    pub address: String,
+    pub trade_count: u64,
+    /// Sum of `size_1e8 * price_1e8 / 1e8` across the participant's
+    /// fills, encoded as a base-10 string so the JSON layer never
+    /// truncates large values.
+    pub volume_1e8: String,
+    /// Realized PnL — `null` in V1 (requires settlement-event
+    /// indexing). The wire shape reserves the field so a follow-on
+    /// milestone can backfill without breaking clients.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub realized_pnl_1e8: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct LeaderboardData {
+    pub chain: String,
+    pub chain_id: u64,
+    pub range: String,
+    pub page: u32,
+    pub page_size: u32,
+    pub total_records: usize,
+    pub items: Vec<LeaderboardItem>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LeaderboardQuery {
+    pub range: Option<String>,
+    pub page: Option<u32>,
+    pub page_size: Option<u32>,
+}
+
+pub async fn leaderboard(
+    State(state): State<AppState>,
+    Query(q): Query<LeaderboardQuery>,
+) -> Result<Json<Envelope<LeaderboardData>>, TradingApiError> {
+    let range_str = q.range.as_deref().unwrap_or("last_month");
+    let range = HistoryRange::parse(range_str).ok_or_else(|| {
+        TradingApiError::new(
+            TradingErrorCode::InvalidRequest,
+            "Unknown leaderboard range; expected one of last_day/last_week/last_month/last_quarter/all.",
+            MetaBlock::new(&state, "validation"),
+        )
+    })?;
+    let page = q.page.unwrap_or(1).max(1);
+    let page_size = q
+        .page_size
+        .unwrap_or(DEFAULT_HISTORY_PAGE_SIZE)
+        .clamp(1, MAX_HISTORY_PAGE_SIZE);
+
+    let fills = list_option_fills_service(
+        &state,
+        OptionFillFilter {
+            option_series_id: None,
+            account: None,
+            order_id: None,
+        },
+    )
+    .await
+    .map_err(|_| {
+        TradingApiError::new(
+            TradingErrorCode::InternalError,
+            "unable to list option fills",
+            MetaBlock::new(&state, "internal"),
+        )
+    })?;
+
+    let since = range.since_ms(now_ms());
+
+    // address(lowercased) → (trade_count, volume_1e8 accumulator)
+    let mut agg: std::collections::HashMap<String, (u64, u128)> = std::collections::HashMap::new();
+    for f in fills {
+        if let Some(min) = since {
+            if f.created_at_ms < min {
+                continue;
+            }
+        }
+        // Notional notional_1e8 = (price_1e8 * size_1e8) / 1e8.
+        // Use u128 multiplication then divide; both inputs are u64-ish
+        // so this cannot overflow on testnet-scale data.
+        let notional = (f.price_1e8 as u128).saturating_mul(f.size_1e8 as u128) / 100_000_000u128;
+        let buyer = f.buyer.0.to_ascii_lowercase();
+        let seller = f.seller.0.to_ascii_lowercase();
+        let entry_b = agg.entry(buyer).or_insert((0, 0));
+        entry_b.0 = entry_b.0.saturating_add(1);
+        entry_b.1 = entry_b.1.saturating_add(notional);
+        let entry_s = agg.entry(seller).or_insert((0, 0));
+        entry_s.0 = entry_s.0.saturating_add(1);
+        entry_s.1 = entry_s.1.saturating_add(notional);
+    }
+
+    let mut ranked: Vec<(String, u64, u128)> = agg
+        .into_iter()
+        .map(|(addr, (tc, vol))| (addr, tc, vol))
+        .collect();
+    // Sort by volume desc, then trade_count desc, then address asc for
+    // deterministic ties.
+    ranked.sort_by(|a, b| {
+        b.2.cmp(&a.2)
+            .then_with(|| b.1.cmp(&a.1))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+
+    let total_records = ranked.len();
+    let start = ((page - 1) as usize).saturating_mul(page_size as usize);
+    let end = start.saturating_add(page_size as usize).min(total_records);
+    let page_items: Vec<LeaderboardItem> = if start >= total_records {
+        Vec::new()
+    } else {
+        ranked[start..end]
+            .iter()
+            .enumerate()
+            .map(|(i, (addr, tc, vol))| LeaderboardItem {
+                rank: (start + i + 1) as u32,
+                address: addr.clone(),
+                trade_count: *tc,
+                volume_1e8: vol.to_string(),
+                realized_pnl_1e8: None,
+            })
+            .collect()
+    };
+
+    Ok(Json(Envelope {
+        status: "ok",
+        data: LeaderboardData {
+            chain: chain_name_for(state.chain_id).to_string(),
+            chain_id: state.chain_id,
+            range: range.as_str().to_string(),
+            page,
+            page_size,
+            total_records,
+            items: page_items,
+        },
+        warnings: Vec::new(),
+        meta: MetaBlock::new(&state, "db"),
+    }))
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ExercisePreviewRequest {
     pub series_id: String,
@@ -2428,6 +3052,261 @@ mod tests {
         .expect("history ok");
         assert_eq!(env.0.status, "ok");
         assert!(env.0.data.items.is_empty());
+    }
+
+    // FRONTEND-BACKEND-HISTORY-V1 unit tests.
+    fn default_history_query() -> HistoryV2Query {
+        HistoryV2Query {
+            tab: None,
+            range: None,
+            page: None,
+            page_size: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn history_v2_rejects_invalid_address() {
+        let s = test_state();
+        let err = account_history_v2(
+            State(s),
+            Path("nope".to_string()),
+            Query(default_history_query()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, TradingErrorCode::InvalidAddress);
+    }
+
+    #[tokio::test]
+    async fn history_v2_rejects_unknown_tab() {
+        let s = test_state();
+        let mut q = default_history_query();
+        q.tab = Some("garbage".to_string());
+        let err = account_history_v2(
+            State(s),
+            Path("0x1234567890abcdef1234567890abcdef12345678".to_string()),
+            Query(q),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, TradingErrorCode::InvalidRequest);
+    }
+
+    #[tokio::test]
+    async fn history_v2_rejects_unknown_range() {
+        let s = test_state();
+        let mut q = default_history_query();
+        q.range = Some("forever".to_string());
+        let err = account_history_v2(
+            State(s),
+            Path("0x1234567890abcdef1234567890abcdef12345678".to_string()),
+            Query(q),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, TradingErrorCode::InvalidRequest);
+    }
+
+    #[tokio::test]
+    async fn history_v2_defaults_resolve_cleanly() {
+        let s = test_state();
+        let env = account_history_v2(
+            State(s),
+            Path("0x1234567890abcdef1234567890abcdef12345678".to_string()),
+            Query(default_history_query()),
+        )
+        .await
+        .expect("history v2 ok");
+        assert_eq!(env.0.status, "ok");
+        assert_eq!(env.0.data.tab, "trades");
+        assert_eq!(env.0.data.range, "last_month");
+        assert_eq!(env.0.data.page, 1);
+        assert_eq!(env.0.data.page_size, 100);
+        assert_eq!(env.0.data.total_records, 0);
+        assert!(env.0.data.items.is_empty());
+        assert_eq!(env.0.data.chain, "anvil");
+        assert_eq!(env.0.data.chain_id, 31337);
+    }
+
+    #[tokio::test]
+    async fn history_v2_settlement_funding_interest_liquidations_are_empty() {
+        let s = test_state();
+        for t in ["settlement", "funding", "interest", "liquidations"] {
+            let mut q = default_history_query();
+            q.tab = Some(t.to_string());
+            let env = account_history_v2(
+                State(s.clone()),
+                Path("0x1234567890abcdef1234567890abcdef12345678".to_string()),
+                Query(q),
+            )
+            .await
+            .expect("history v2 ok");
+            assert_eq!(env.0.data.tab, t);
+            assert_eq!(env.0.data.total_records, 0);
+            assert!(env.0.data.items.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn history_v2_page_size_is_clamped_to_max_10000() {
+        let s = test_state();
+        let mut q = default_history_query();
+        q.page_size = Some(99_999);
+        let env = account_history_v2(
+            State(s),
+            Path("0x1234567890abcdef1234567890abcdef12345678".to_string()),
+            Query(q),
+        )
+        .await
+        .expect("history v2 ok");
+        assert_eq!(env.0.data.page_size, 10_000);
+    }
+
+    #[tokio::test]
+    async fn history_v2_page_zero_normalises_to_one() {
+        let s = test_state();
+        let mut q = default_history_query();
+        q.page = Some(0);
+        let env = account_history_v2(
+            State(s),
+            Path("0x1234567890abcdef1234567890abcdef12345678".to_string()),
+            Query(q),
+        )
+        .await
+        .expect("history v2 ok");
+        assert_eq!(env.0.data.page, 1);
+    }
+
+    // FRONTEND-BACKEND-LEADERBOARD-V1 tests.
+    fn default_leaderboard_query() -> LeaderboardQuery {
+        LeaderboardQuery {
+            range: None,
+            page: None,
+            page_size: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn leaderboard_rejects_unknown_range() {
+        let s = test_state();
+        let mut q = default_leaderboard_query();
+        q.range = Some("forever".to_string());
+        let err = leaderboard(State(s), Query(q)).await.unwrap_err();
+        assert_eq!(err.code, TradingErrorCode::InvalidRequest);
+    }
+
+    #[tokio::test]
+    async fn leaderboard_defaults_resolve_cleanly_on_empty_state() {
+        let s = test_state();
+        let env = leaderboard(State(s), Query(default_leaderboard_query()))
+            .await
+            .expect("leaderboard ok");
+        assert_eq!(env.0.status, "ok");
+        assert_eq!(env.0.data.range, "last_month");
+        assert_eq!(env.0.data.page, 1);
+        assert_eq!(env.0.data.page_size, 100);
+        assert_eq!(env.0.data.total_records, 0);
+        assert!(env.0.data.items.is_empty());
+        assert_eq!(env.0.data.chain, "anvil");
+        assert_eq!(env.0.data.chain_id, 31337);
+    }
+
+    #[tokio::test]
+    async fn leaderboard_page_size_is_clamped_to_max_10000() {
+        let s = test_state();
+        let mut q = default_leaderboard_query();
+        q.page_size = Some(99_999);
+        let env = leaderboard(State(s), Query(q))
+            .await
+            .expect("leaderboard ok");
+        assert_eq!(env.0.data.page_size, 10_000);
+    }
+
+    #[tokio::test]
+    async fn leaderboard_page_zero_normalises_to_one() {
+        let s = test_state();
+        let mut q = default_leaderboard_query();
+        q.page = Some(0);
+        let env = leaderboard(State(s), Query(q))
+            .await
+            .expect("leaderboard ok");
+        assert_eq!(env.0.data.page, 1);
+    }
+
+    #[tokio::test]
+    async fn leaderboard_aggregates_buyer_and_seller_volumes() {
+        use crate::options::OptionFill;
+        use crate::types::{AccountId, OrderId, Side};
+        use uuid::Uuid;
+        let s = test_state();
+        let alice = AccountId::new("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string());
+        let bob = AccountId::new("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string());
+        let carol = AccountId::new("0xcccccccccccccccccccccccccccccccccccccccc".to_string());
+        // Seed two fills: (alice buyer, bob seller) and (carol buyer, alice seller).
+        // Both at price=100_00000000 (i.e. $100), size=2_00000000 (i.e. 2.0
+        // contracts) → notional = price * size / 1e8 = 200_00000000.
+        let now = now_ms();
+        let oid = || OrderId(Uuid::new_v4());
+        let fills = vec![
+            OptionFill {
+                fill_id: Uuid::new_v4(),
+                option_series_id: "S-1".to_string(),
+                buy_order_id: oid(),
+                sell_order_id: oid(),
+                buyer: alice.clone(),
+                seller: bob.clone(),
+                maker_order_id: oid(),
+                taker_order_id: oid(),
+                taker_side: Side::Buy,
+                price_1e8: 100_00000000,
+                size_1e8: 2_00000000,
+                created_at_ms: now,
+            },
+            OptionFill {
+                fill_id: Uuid::new_v4(),
+                option_series_id: "S-1".to_string(),
+                buy_order_id: oid(),
+                sell_order_id: oid(),
+                buyer: carol.clone(),
+                seller: alice.clone(),
+                maker_order_id: oid(),
+                taker_order_id: oid(),
+                taker_side: Side::Buy,
+                price_1e8: 100_00000000,
+                size_1e8: 2_00000000,
+                created_at_ms: now,
+            },
+        ];
+        // Inject fills directly into the in-memory store. This is the
+        // same path the local seed harness uses for trading tests.
+        {
+            let mut store = s.options_store.lock().expect("lock");
+            for f in fills {
+                store.insert_fill_for_test(f);
+            }
+        }
+        let env = leaderboard(State(s), Query(default_leaderboard_query()))
+            .await
+            .expect("leaderboard ok");
+        assert_eq!(env.0.data.total_records, 3);
+        let items = &env.0.data.items;
+        // Alice participated in BOTH fills → 2 trades, volume = 2 × 200_00000000.
+        assert_eq!(items[0].rank, 1);
+        assert_eq!(items[0].address, alice.0.to_ascii_lowercase());
+        assert_eq!(items[0].trade_count, 2);
+        assert_eq!(items[0].volume_1e8, "40000000000");
+        // Bob and Carol each participated in 1 fill, same notional —
+        // tie-broken by address (asc).
+        assert_eq!(items[1].rank, 2);
+        assert_eq!(items[2].rank, 3);
+        for it in &items[1..] {
+            assert_eq!(it.trade_count, 1);
+            assert_eq!(it.volume_1e8, "20000000000");
+        }
+        // realized_pnl_1e8 is skipped (None) in V1.
+        for it in items {
+            assert!(it.realized_pnl_1e8.is_none());
+        }
     }
 
     #[tokio::test]

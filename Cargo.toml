@@ -19,11 +19,12 @@ aws-config = { version = "1.5", optional = true, default-features = false, featu
 aws-sdk-kms = { version = "1.47", optional = true, default-features = false, features = ["rustls", "rt-tokio", "behavior-version-latest"] }
 aws-smithy-runtime-api = { version = "1.7", optional = true, default-features = false, features = ["client"] }
 aws-smithy-types = { version = "1.2", optional = true, default-features = false }
-axum = "0.7"
+axum = { version = "0.7", features = ["ws"] }
 alloy-primitives = "0.7"
 alloy-sol-types = "0.7"
 chrono = { version = "0.4", features = ["serde", "clock"] }
 dotenvy = "0.15"
+futures = { version = "0.3", default-features = false, features = ["std"] }
 k256 = { version = "0.13", features = ["ecdsa"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 quinn = { version = "=0.11.5", default-features = false, features = ["runtime-tokio", "rustls"] }

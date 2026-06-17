@@ -501,6 +501,16 @@ pub fn router(state: AppState) -> Router {
             "/accounts/:address/history",
             get(crate::api::trading::account_history),
         )
+        .route(
+            "/accounts/:address/history/v2",
+            get(crate::api::trading::account_history_v2),
+        )
+        .route("/leaderboard", get(crate::api::trading::leaderboard))
+        // BACKEND-PUBLIC-WS-API-V1 — public WebSocket fanout for
+        // market data / health / leaderboard. Browser-friendly. The
+        // operator-whitelisted MM Gateway over WebTransport remains a
+        // separate surface and is NOT mounted here.
+        .route("/ws", get(crate::api::public_ws::public_ws_route))
         .route("/trading/health", get(crate::api::trading::trading_health))
         // M-P2f — Public/user-wallet create-intent endpoint (B7 close).
         // No admin Bearer. No signer call. No broadcast. The handler

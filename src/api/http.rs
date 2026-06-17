@@ -1,4 +1,5 @@
 use crate::admin::{AdminConfig, MetricsConfig};
+use crate::api::public_ws::PublicWsConfig;
 use crate::confirmation::ConfirmationConfig;
 use crate::db::PgRepository;
 use crate::engine::EngineState;
@@ -60,6 +61,11 @@ pub struct AppState {
         std::sync::Arc<std::sync::Mutex<crate::api::local_test_fixtures::LocalTestIntentStore>>,
     pub mm_gateway_config: MmGatewayConfig,
     pub mm_permissions_config: MmPermissionsConfig,
+    /// BACKEND-PUBLIC-WS-API-V1 — knobs for the new `/ws` public
+    /// WebSocket endpoint. The MM Gateway over WebTransport is a
+    /// separate operator-whitelisted surface; its config lives in
+    /// `mm_gateway_config` and is not affected by this field.
+    pub public_ws_config: PublicWsConfig,
     pub admin_config: AdminConfig,
     pub metrics_config: MetricsConfig,
     pub rfq_store: Arc<Mutex<RfqStore>>,
@@ -234,6 +240,7 @@ impl AppState {
             fees_config,
             mm_gateway_config: MmGatewayConfig::default(),
             mm_permissions_config: MmPermissionsConfig::disabled(),
+            public_ws_config: PublicWsConfig::default_testnet(),
             admin_config: AdminConfig::disabled(),
             metrics_config: MetricsConfig::enabled_by_default(),
             rfq_store: Arc::new(Mutex::new(RfqStore::new())),

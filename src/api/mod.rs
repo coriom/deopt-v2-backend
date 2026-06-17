@@ -2,6 +2,7 @@ pub mod dto;
 pub mod executor_health_v2;
 pub mod http;
 pub mod local_test_fixtures;
+pub mod public_ws;
 pub mod routes;
 pub mod trading;
 pub mod trading_views;

@@ -88,6 +88,15 @@ impl OptionSeriesStore {
         Ok(order)
     }
 
+    /// Test-only helper used by `api::trading::tests` to seed
+    /// `OptionFill` rows directly. The production path inserts fills
+    /// via `submit_order_and_match`; this helper bypasses the matching
+    /// engine so unit tests can pin a known set of participants.
+    #[cfg(test)]
+    pub fn insert_fill_for_test(&mut self, fill: OptionFill) {
+        self.fills.insert(fill.fill_id, fill);
+    }
+
     pub fn submit_order_and_match(
         &mut self,
         mut incoming: OptionOrder,
