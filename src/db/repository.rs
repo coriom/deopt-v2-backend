@@ -14,7 +14,9 @@ use crate::fees::{FeeEvent, FeeFlowType, FeeMarketType, RebateAccrual, VolumeBuc
 use crate::indexer::IndexedPerpTrade;
 use crate::mm::{MmAccountPermissions, MmProductPermission};
 use crate::monitoring::FeeEventLabels;
-use crate::options::store::status_for_remaining;
+use crate::options::store::{
+    build_option_match_plan, enforce_tif_plan, final_status_for_tif, status_for_remaining,
+};
 use crate::options::{
     OptionEventIndexerState, OptionExecutionConfirmationStatus, OptionExecutionEvent,
     OptionExecutionEventLink, OptionExecutionGasCheckStatus, OptionExecutionIntent,
@@ -38,7 +40,7 @@ use crate::types::{now_ms, AccountId, OrderStatus, Side, TimeInForce, TimestampM
 use sqlx::postgres::{PgArguments, PgPool, PgRow};
 use sqlx::query::Query;
 use sqlx::{Postgres, Row, Transaction};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -1988,9 +1990,9 @@ impl PgRepository {
             sqlx::query(
                 "INSERT INTO option_orders (
                 order_id, option_series_id, account, side, price_1e8, size_1e8,
-                remaining_size_1e8, time_in_force, client_order_id, nonce, deadline_ms,
-                signature, status, created_at_ms, updated_at_ms
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
+                remaining_size_1e8, time_in_force, post_only, client_order_id, nonce,
+                deadline_ms, signature, status, created_at_ms, updated_at_ms
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
             ),
             order,
         )
@@ -2006,13 +2008,15 @@ impl PgRepository {
         updated_at_ms: TimestampMs,
     ) -> Result<(OptionOrder, Vec<OptionFill>)> {
         let mut tx = self.begin().await?;
-        insert_option_order_tx(&mut tx, &incoming).await?;
 
+        // Lock the opposite side of the book in a single critical
+        // section. The FOR UPDATE clause ensures the candidates do not
+        // change between plan construction and execution.
         let opposite_side = incoming.side.opposite();
         let rows = sqlx::query(
             "SELECT order_id, option_series_id, account, side, price_1e8, size_1e8,
-                    remaining_size_1e8, time_in_force, client_order_id, nonce, deadline_ms,
-                    signature, status, created_at_ms, updated_at_ms
+                    remaining_size_1e8, time_in_force, post_only, client_order_id, nonce,
+                    deadline_ms, signature, status, created_at_ms, updated_at_ms
              FROM option_orders
              WHERE option_series_id = $1
                AND side = $2
@@ -2026,50 +2030,71 @@ impl PgRepository {
         .await
         .map_err(|error| BackendError::Persistence(error.to_string()))?;
 
-        let mut makers = rows
+        let candidates_all = rows
             .into_iter()
             .map(option_order_from_row)
             .collect::<Result<Vec<_>>>()?;
-        sort_option_match_candidates(&mut makers, incoming.side);
+        let mut candidates = candidates_all
+            .into_iter()
+            .filter(|maker| can_match_option_orders(&incoming, maker))
+            .collect::<Vec<_>>();
+        sort_option_match_candidates(&mut candidates, incoming.side);
 
-        let mut fills = Vec::new();
-        for mut maker in makers {
-            if incoming.remaining_size_1e8 == 0 {
-                break;
-            }
-            if !can_match_option_orders(&incoming, &maker) {
-                continue;
-            }
-            let fill_size = incoming.remaining_size_1e8.min(maker.remaining_size_1e8);
-            if fill_size == 0 {
-                continue;
-            }
+        // Build the deterministic match plan, then validate TIF +
+        // post-only. A rejection here aborts the tx without any insert
+        // or update: the failed FOK / marketable post-only / etc.
+        // leaves the book untouched.
+        let plan = build_option_match_plan(&incoming, &candidates);
+        enforce_tif_plan(&incoming, &plan)?;
 
-            let fill = option_fill_from_match(&incoming, &maker, fill_size, updated_at_ms);
-            incoming.remaining_size_1e8 -= fill_size;
-            maker.remaining_size_1e8 -= fill_size;
+        // Plan validated — insert the taker with its final status
+        // pre-computed so the row never reflects an inconsistent
+        // intermediate state inside the tx.
+        let final_taker = {
+            let mut staged = incoming.clone();
+            staged.remaining_size_1e8 = staged.size_1e8 - plan.total_fill_size_1e8;
+            staged.updated_at_ms = updated_at_ms;
+            staged.status = final_status_for_tif(&staged);
+            staged
+        };
+        insert_option_order_tx(&mut tx, &final_taker).await?;
+
+        // Execute the planned legs against the locked makers. Each
+        // leg's fill_size_1e8 was capped at the maker's remaining at
+        // plan-build time and the FOR UPDATE lock prevents any
+        // concurrent decrement, so the underflow defense is purely
+        // belt-and-braces.
+        let mut maker_by_id: HashMap<_, _> =
+            candidates.into_iter().map(|m| (m.order_id, m)).collect();
+        let mut fills = Vec::with_capacity(plan.legs.len());
+        for leg in &plan.legs {
+            let Some(maker) = maker_by_id.get_mut(&leg.maker_id) else {
+                return Err(BackendError::Persistence(format!(
+                    "match plan referenced unknown maker {}",
+                    leg.maker_id
+                )));
+            };
+            let fill = option_fill_from_match(&incoming, maker, leg.fill_size_1e8, updated_at_ms);
+            incoming.remaining_size_1e8 -= leg.fill_size_1e8;
+            maker.remaining_size_1e8 -= leg.fill_size_1e8;
             maker.status = status_for_remaining(maker.size_1e8, maker.remaining_size_1e8);
             maker.updated_at_ms = updated_at_ms;
-            update_option_order_tx(&mut tx, &maker).await?;
+            update_option_order_tx(&mut tx, maker).await?;
             insert_option_fill_tx(&mut tx, &fill).await?;
             fills.push(fill);
         }
 
-        incoming.status = status_for_remaining(incoming.size_1e8, incoming.remaining_size_1e8);
-        incoming.updated_at_ms = updated_at_ms;
-        update_option_order_tx(&mut tx, &incoming).await?;
-
         tx.commit()
             .await
             .map_err(|error| BackendError::Persistence(error.to_string()))?;
-        Ok((incoming, fills))
+        Ok((final_taker, fills))
     }
 
     pub async fn list_option_orders(&self) -> Result<Vec<OptionOrder>> {
         let rows = sqlx::query(
             "SELECT order_id, option_series_id, account, side, price_1e8, size_1e8,
-                    remaining_size_1e8, time_in_force, client_order_id, nonce, deadline_ms,
-                    signature, status, created_at_ms, updated_at_ms
+                    remaining_size_1e8, time_in_force, post_only, client_order_id, nonce,
+                    deadline_ms, signature, status, created_at_ms, updated_at_ms
              FROM option_orders
              ORDER BY created_at_ms ASC, order_id ASC",
         )
@@ -2082,8 +2107,8 @@ impl PgRepository {
     pub async fn get_option_order(&self, order_id: OptionOrderId) -> Result<Option<OptionOrder>> {
         let row = sqlx::query(
             "SELECT order_id, option_series_id, account, side, price_1e8, size_1e8,
-                    remaining_size_1e8, time_in_force, client_order_id, nonce, deadline_ms,
-                    signature, status, created_at_ms, updated_at_ms
+                    remaining_size_1e8, time_in_force, post_only, client_order_id, nonce,
+                    deadline_ms, signature, status, created_at_ms, updated_at_ms
              FROM option_orders
              WHERE order_id = $1",
         )
@@ -2104,8 +2129,8 @@ impl PgRepository {
              SET status = 'cancelled', updated_at_ms = $2
              WHERE order_id = $1 AND status IN ('open', 'partially_filled')
              RETURNING order_id, option_series_id, account, side, price_1e8, size_1e8,
-                       remaining_size_1e8, time_in_force, client_order_id, nonce, deadline_ms,
-                       signature, status, created_at_ms, updated_at_ms",
+                       remaining_size_1e8, time_in_force, post_only, client_order_id, nonce,
+                       deadline_ms, signature, status, created_at_ms, updated_at_ms",
         )
         .bind(order_id.to_string())
         .bind(timestamp_to_i64(updated_at_ms))
@@ -2124,14 +2149,205 @@ impl PgRepository {
         )))
     }
 
+    // ===== OPTIONS-CONDITIONAL-ORDERS-TP-SL-V1 =====================
+
+    pub async fn insert_conditional_order(
+        &self,
+        order: &crate::options::conditional_orders::ConditionalOrder,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO options_conditional_orders (
+                id, account, option_series_id, position_side, option_kind,
+                conditional_type, trigger_source, trigger_condition, trigger_price_1e8,
+                quantity_1e8, execution_type, limit_price_1e8, reduce_only,
+                oco_group_id, status, child_order_id, failure_code, failure_message,
+                expires_at_ms, triggered_at_ms, completed_at_ms,
+                created_at_ms, updated_at_ms, version
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+                      $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)",
+        )
+        .bind(order.id)
+        .bind(&order.account.0)
+        .bind(&order.option_series_id)
+        .bind(order.position_side.as_str())
+        .bind(order.option_kind.as_str())
+        .bind(order.conditional_type.as_str())
+        .bind(order.trigger_source.as_str())
+        .bind(order.trigger_condition.as_str())
+        .bind(order.trigger_price_1e8.to_string())
+        .bind(order.quantity_1e8.to_string())
+        .bind(order.execution_type.as_str())
+        .bind(order.limit_price_1e8.to_string())
+        .bind(order.reduce_only)
+        .bind(order.oco_group_id)
+        .bind(order.status.as_str())
+        .bind(&order.child_order_id)
+        .bind(&order.failure_code)
+        .bind(&order.failure_message)
+        .bind(order.expires_at_ms.map(timestamp_to_i64))
+        .bind(order.triggered_at_ms.map(timestamp_to_i64))
+        .bind(order.completed_at_ms.map(timestamp_to_i64))
+        .bind(timestamp_to_i64(order.created_at_ms))
+        .bind(timestamp_to_i64(order.updated_at_ms))
+        .bind(order.version)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|e| BackendError::Persistence(e.to_string()))
+    }
+
+    pub async fn get_conditional_order(
+        &self,
+        id: uuid::Uuid,
+    ) -> Result<Option<crate::options::conditional_orders::ConditionalOrder>> {
+        let row = sqlx::query(CONDITIONAL_ORDER_SELECT)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| BackendError::Persistence(e.to_string()))?;
+        row.map(conditional_order_from_row).transpose()
+    }
+
+    pub async fn list_conditional_orders(
+        &self,
+        filter: &crate::options::conditional_orders::ConditionalOrderFilter,
+    ) -> Result<Vec<crate::options::conditional_orders::ConditionalOrder>> {
+        let rows = sqlx::query(
+            "SELECT id, account, option_series_id, position_side, option_kind,
+                    conditional_type, trigger_source, trigger_condition, trigger_price_1e8,
+                    quantity_1e8, execution_type, limit_price_1e8, reduce_only,
+                    oco_group_id, status, child_order_id, failure_code, failure_message,
+                    expires_at_ms, triggered_at_ms, completed_at_ms,
+                    created_at_ms, updated_at_ms, version
+             FROM options_conditional_orders
+             ORDER BY created_at_ms ASC, id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| BackendError::Persistence(e.to_string()))?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let order = conditional_order_from_row(row)?;
+            if filter.matches(&order) {
+                out.push(order);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Optimistic-lock update — fails with `InvalidConditionalOrderId`
+    /// if the row has been mutated by another worker since the caller
+    /// loaded it. Increments `version` automatically.
+    pub async fn update_conditional_order(
+        &self,
+        order: &crate::options::conditional_orders::ConditionalOrder,
+    ) -> Result<crate::options::conditional_orders::ConditionalOrder> {
+        let row = sqlx::query(
+            "UPDATE options_conditional_orders
+             SET status = $2,
+                 child_order_id = $3,
+                 failure_code = $4,
+                 failure_message = $5,
+                 triggered_at_ms = $6,
+                 completed_at_ms = $7,
+                 updated_at_ms = $8,
+                 version = version + 1
+             WHERE id = $1 AND version = $9
+             RETURNING id, account, option_series_id, position_side, option_kind,
+                       conditional_type, trigger_source, trigger_condition, trigger_price_1e8,
+                       quantity_1e8, execution_type, limit_price_1e8, reduce_only,
+                       oco_group_id, status, child_order_id, failure_code, failure_message,
+                       expires_at_ms, triggered_at_ms, completed_at_ms,
+                       created_at_ms, updated_at_ms, version",
+        )
+        .bind(order.id)
+        .bind(order.status.as_str())
+        .bind(&order.child_order_id)
+        .bind(&order.failure_code)
+        .bind(&order.failure_message)
+        .bind(order.triggered_at_ms.map(timestamp_to_i64))
+        .bind(order.completed_at_ms.map(timestamp_to_i64))
+        .bind(timestamp_to_i64(order.updated_at_ms))
+        // Optimistic lock: the caller's pre-bumped version was
+        // `order.version` (we incremented it client-side before
+        // calling update). We require the DB to currently hold the
+        // PREVIOUS version `order.version - 1`.
+        .bind(order.version.saturating_sub(1))
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| BackendError::Persistence(e.to_string()))?;
+        match row {
+            Some(r) => conditional_order_from_row(r),
+            None => Err(BackendError::InvalidConditionalOrderId),
+        }
+    }
+
+    /// Atomic claim — transitions `armed → triggering` (or `armed →
+    /// cancelled` if `cancel == true`) for a single id. Returns the
+    /// fresh row, or `None` if another worker won the race.
+    pub async fn claim_conditional_order_armed(
+        &self,
+        id: uuid::Uuid,
+        next: crate::options::conditional_orders::ConditionalOrderStatus,
+        now_ms: TimestampMs,
+    ) -> Result<Option<crate::options::conditional_orders::ConditionalOrder>> {
+        let row = sqlx::query(
+            "UPDATE options_conditional_orders
+             SET status = $2, updated_at_ms = $3, version = version + 1
+             WHERE id = $1 AND status = 'armed'
+             RETURNING id, account, option_series_id, position_side, option_kind,
+                       conditional_type, trigger_source, trigger_condition, trigger_price_1e8,
+                       quantity_1e8, execution_type, limit_price_1e8, reduce_only,
+                       oco_group_id, status, child_order_id, failure_code, failure_message,
+                       expires_at_ms, triggered_at_ms, completed_at_ms,
+                       created_at_ms, updated_at_ms, version",
+        )
+        .bind(id)
+        .bind(next.as_str())
+        .bind(timestamp_to_i64(now_ms))
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| BackendError::Persistence(e.to_string()))?;
+        row.map(conditional_order_from_row).transpose()
+    }
+
+    /// Cancel any still-armed OCO siblings other than `winner_id`
+    /// atomically. Records `oco_sibling_triggered` as the reason.
+    pub async fn cancel_oco_siblings(
+        &self,
+        group: uuid::Uuid,
+        winner_id: uuid::Uuid,
+        now_ms: TimestampMs,
+    ) -> Result<u64> {
+        let res = sqlx::query(
+            "UPDATE options_conditional_orders
+             SET status = 'cancelled',
+                 failure_code = 'oco_sibling_triggered',
+                 failure_message = 'sibling conditional order triggered first',
+                 completed_at_ms = $3,
+                 updated_at_ms = $3,
+                 version = version + 1
+             WHERE oco_group_id = $1
+               AND id != $2
+               AND status = 'armed'",
+        )
+        .bind(group)
+        .bind(winner_id)
+        .bind(timestamp_to_i64(now_ms))
+        .execute(&self.pool)
+        .await
+        .map_err(|e| BackendError::Persistence(e.to_string()))?;
+        Ok(res.rows_affected())
+    }
+
     pub async fn open_option_orders_for_series(
         &self,
         option_series_id: &str,
     ) -> Result<Vec<OptionOrder>> {
         let rows = sqlx::query(
             "SELECT order_id, option_series_id, account, side, price_1e8, size_1e8,
-                    remaining_size_1e8, time_in_force, client_order_id, nonce, deadline_ms,
-                    signature, status, created_at_ms, updated_at_ms
+                    remaining_size_1e8, time_in_force, post_only, client_order_id, nonce,
+                    deadline_ms, signature, status, created_at_ms, updated_at_ms
              FROM option_orders
              WHERE option_series_id = $1 AND status IN ('open', 'partially_filled')
              ORDER BY created_at_ms ASC, order_id ASC",
@@ -2151,6 +2367,31 @@ impl PgRepository {
              FROM option_fills
              ORDER BY created_at_ms ASC, fill_id ASC",
         )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        rows.into_iter().map(option_fill_from_row).collect()
+    }
+
+    /// OPTIONS-CONDITIONAL-ORDERS-TP-SL-V1 — fills filtered to a
+    /// single (account, series_id). Used by the conditional-orders
+    /// service to compute the reducible position size.
+    pub async fn list_option_fills_for_account_and_series(
+        &self,
+        account: &AccountId,
+        series_id: &str,
+    ) -> Result<Vec<OptionFill>> {
+        let rows = sqlx::query(
+            "SELECT fill_id, option_series_id, buy_order_id, sell_order_id, buyer, seller,
+                    maker_order_id, taker_order_id, taker_side, price_1e8, size_1e8,
+                    created_at_ms
+             FROM option_fills
+             WHERE option_series_id = $1
+               AND (lower(buyer) = lower($2) OR lower(seller) = lower($2))
+             ORDER BY created_at_ms ASC, fill_id ASC",
+        )
+        .bind(series_id)
+        .bind(&account.0)
         .fetch_all(&self.pool)
         .await
         .map_err(|error| BackendError::Persistence(error.to_string()))?;
@@ -4215,6 +4456,7 @@ fn option_order_from_row(row: PgRow) -> Result<OptionOrder> {
                 BackendError::Persistence(format!("invalid option order remaining size: {error}"))
             })?,
         time_in_force: parse_time_in_force(&time_in_force)?,
+        post_only: row_get(&row, "post_only")?,
         client_order_id: row_get(&row, "client_order_id")?,
         nonce: nonce
             .map(|value| {
@@ -4228,6 +4470,62 @@ fn option_order_from_row(row: PgRow) -> Result<OptionOrder> {
         status: OptionOrderStatus::parse(&status)?,
         created_at_ms: row_get(&row, "created_at_ms")?,
         updated_at_ms: row_get(&row, "updated_at_ms")?,
+    })
+}
+
+// OPTIONS-CONDITIONAL-ORDERS-TP-SL-V1
+const CONDITIONAL_ORDER_SELECT: &str =
+    "SELECT id, account, option_series_id, position_side, option_kind,
+            conditional_type, trigger_source, trigger_condition, trigger_price_1e8,
+            quantity_1e8, execution_type, limit_price_1e8, reduce_only,
+            oco_group_id, status, child_order_id, failure_code, failure_message,
+            expires_at_ms, triggered_at_ms, completed_at_ms,
+            created_at_ms, updated_at_ms, version
+     FROM options_conditional_orders
+     WHERE id = $1";
+
+fn conditional_order_from_row(
+    row: PgRow,
+) -> Result<crate::options::conditional_orders::ConditionalOrder> {
+    use crate::options::conditional_orders as cond;
+    let position_side: String = row_get(&row, "position_side")?;
+    let option_kind: String = row_get(&row, "option_kind")?;
+    let conditional_type: String = row_get(&row, "conditional_type")?;
+    let trigger_source: String = row_get(&row, "trigger_source")?;
+    let trigger_condition: String = row_get(&row, "trigger_condition")?;
+    let execution_type: String = row_get(&row, "execution_type")?;
+    let status: String = row_get(&row, "status")?;
+    Ok(cond::ConditionalOrder {
+        id: row_get(&row, "id")?,
+        account: AccountId::new(row_get::<String>(&row, "account")?),
+        option_series_id: row_get(&row, "option_series_id")?,
+        position_side: cond::PositionSide::parse(&position_side)?,
+        option_kind: cond::OptionKind::parse(&option_kind)?,
+        conditional_type: cond::ConditionalType::parse(&conditional_type)?,
+        trigger_source: cond::TriggerSource::parse(&trigger_source)?,
+        trigger_condition: cond::TriggerCondition::parse(&trigger_condition)?,
+        trigger_price_1e8: row_get::<String>(&row, "trigger_price_1e8")?
+            .parse()
+            .map_err(|e| BackendError::Persistence(format!("invalid trigger_price_1e8: {e}")))?,
+        quantity_1e8: row_get::<String>(&row, "quantity_1e8")?
+            .parse()
+            .map_err(|e| BackendError::Persistence(format!("invalid quantity_1e8: {e}")))?,
+        execution_type: cond::ConditionalExecutionType::parse(&execution_type)?,
+        limit_price_1e8: row_get::<String>(&row, "limit_price_1e8")?
+            .parse()
+            .map_err(|e| BackendError::Persistence(format!("invalid limit_price_1e8: {e}")))?,
+        reduce_only: row_get(&row, "reduce_only")?,
+        oco_group_id: row_get(&row, "oco_group_id")?,
+        status: cond::ConditionalOrderStatus::parse(&status)?,
+        child_order_id: row_get(&row, "child_order_id")?,
+        failure_code: row_get(&row, "failure_code")?,
+        failure_message: row_get(&row, "failure_message")?,
+        expires_at_ms: row_get(&row, "expires_at_ms")?,
+        triggered_at_ms: row_get(&row, "triggered_at_ms")?,
+        completed_at_ms: row_get(&row, "completed_at_ms")?,
+        created_at_ms: row_get(&row, "created_at_ms")?,
+        updated_at_ms: row_get(&row, "updated_at_ms")?,
+        version: row_get(&row, "version")?,
     })
 }
 
@@ -4766,6 +5064,7 @@ fn insert_option_order_query<'q>(
         .bind(order.size_1e8.to_string())
         .bind(order.remaining_size_1e8.to_string())
         .bind(tif_to_str(order.time_in_force))
+        .bind(order.post_only)
         .bind(&order.client_order_id)
         .bind(order.nonce.map(|value| value.to_string()))
         .bind(order.deadline_ms.map(timestamp_to_i64))
@@ -4783,9 +5082,9 @@ async fn insert_option_order_tx(
         sqlx::query(
             "INSERT INTO option_orders (
                 order_id, option_series_id, account, side, price_1e8, size_1e8,
-                remaining_size_1e8, time_in_force, client_order_id, nonce, deadline_ms,
-                signature, status, created_at_ms, updated_at_ms
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
+                remaining_size_1e8, time_in_force, post_only, client_order_id, nonce,
+                deadline_ms, signature, status, created_at_ms, updated_at_ms
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
         ),
         order,
     )

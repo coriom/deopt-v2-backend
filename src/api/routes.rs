@@ -306,6 +306,15 @@ pub fn router(state: AppState) -> Router {
             "/options/orders",
             post(submit_option_order).get(list_option_orders),
         )
+        // OPTIONS-CONDITIONAL-ORDERS-TP-SL-V1
+        .route(
+            "/accounts/:address/conditional-orders",
+            post(create_conditional_order_route).get(list_conditional_orders_route),
+        )
+        .route(
+            "/accounts/:address/conditional-orders/:id",
+            get(get_conditional_order_route).delete(cancel_conditional_order_route),
+        )
         // GET /options/execution-intents is wired further below alongside
         // the M-P2f POST handler so both verbs share a single route entry.
         .route(
@@ -2060,6 +2069,8 @@ struct SubmitOptionOrderRequest {
     price_1e8: String,
     size_1e8: String,
     time_in_force: TimeInForce,
+    #[serde(default)]
+    post_only: bool,
     client_order_id: Option<String>,
     nonce: Option<u64>,
     deadline_ms: Option<i64>,
@@ -2296,6 +2307,7 @@ struct OptionOrderResponse {
     size_1e8: String,
     remaining_size_1e8: String,
     time_in_force: TimeInForce,
+    post_only: bool,
     client_order_id: Option<String>,
     nonce: Option<String>,
     deadline_ms: Option<i64>,
@@ -2323,6 +2335,7 @@ impl From<OptionOrder> for OptionOrderResponse {
             size_1e8: order.size_1e8.to_string(),
             remaining_size_1e8: order.remaining_size_1e8.to_string(),
             time_in_force: order.time_in_force,
+            post_only: order.post_only,
             client_order_id: order.client_order_id,
             nonce: order.nonce.map(|value| value.to_string()),
             deadline_ms: order.deadline_ms,
@@ -2734,6 +2747,7 @@ async fn submit_option_order(
             price_1e8: parse_fixed_u128("price_1e8", &request.price_1e8)?,
             size_1e8: parse_fixed_u128("size_1e8", &request.size_1e8)?,
             time_in_force: request.time_in_force,
+            post_only: request.post_only,
             client_order_id: request.client_order_id,
             nonce: request.nonce,
             deadline_ms: request.deadline_ms,
@@ -2768,6 +2782,168 @@ async fn list_option_orders(
     Ok(Json(
         orders.into_iter().map(OptionOrderResponse::from).collect(),
     ))
+}
+
+// ===== OPTIONS-CONDITIONAL-ORDERS-TP-SL-V1 ============================
+
+#[derive(Clone, Debug, Deserialize)]
+struct ConditionalLegBody {
+    conditional_type: crate::options::conditional_orders::ConditionalType,
+    trigger_price_1e8: String,
+    limit_price_1e8: String,
+    #[serde(default)]
+    trigger_condition: Option<crate::options::conditional_orders::TriggerCondition>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct CreateConditionalOrderBody {
+    option_series_id: String,
+    quantity_1e8: String,
+    legs: Vec<ConditionalLegBody>,
+    #[serde(default)]
+    link_as_oco: bool,
+    #[serde(default)]
+    expires_at_ms: Option<i64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ConditionalOrderResponseDto {
+    id: String,
+    account: String,
+    option_series_id: String,
+    position_side: String,
+    option_kind: String,
+    conditional_type: String,
+    trigger_source: String,
+    trigger_condition: String,
+    trigger_price_1e8: String,
+    quantity_1e8: String,
+    execution_type: String,
+    limit_price_1e8: String,
+    reduce_only: bool,
+    oco_group_id: Option<String>,
+    status: String,
+    child_order_id: Option<String>,
+    failure_code: Option<String>,
+    failure_message: Option<String>,
+    expires_at_ms: Option<i64>,
+    triggered_at_ms: Option<i64>,
+    completed_at_ms: Option<i64>,
+    created_at_ms: i64,
+    updated_at_ms: i64,
+    version: i64,
+}
+
+impl From<crate::options::conditional_orders::ConditionalOrder> for ConditionalOrderResponseDto {
+    fn from(o: crate::options::conditional_orders::ConditionalOrder) -> Self {
+        Self {
+            id: o.id.to_string(),
+            account: o.account.0,
+            option_series_id: o.option_series_id,
+            position_side: o.position_side.as_str().to_string(),
+            option_kind: o.option_kind.as_str().to_string(),
+            conditional_type: o.conditional_type.as_str().to_string(),
+            trigger_source: o.trigger_source.as_str().to_string(),
+            trigger_condition: o.trigger_condition.as_str().to_string(),
+            trigger_price_1e8: o.trigger_price_1e8.to_string(),
+            quantity_1e8: o.quantity_1e8.to_string(),
+            execution_type: o.execution_type.as_str().to_string(),
+            limit_price_1e8: o.limit_price_1e8.to_string(),
+            reduce_only: o.reduce_only,
+            oco_group_id: o.oco_group_id.map(|g| g.to_string()),
+            status: o.status.as_str().to_string(),
+            child_order_id: o.child_order_id,
+            failure_code: o.failure_code,
+            failure_message: o.failure_message,
+            expires_at_ms: o.expires_at_ms,
+            triggered_at_ms: o.triggered_at_ms,
+            completed_at_ms: o.completed_at_ms,
+            created_at_ms: o.created_at_ms,
+            updated_at_ms: o.updated_at_ms,
+            version: o.version,
+        }
+    }
+}
+
+async fn create_conditional_order_route(
+    State(state): State<AppState>,
+    Path(address): Path<String>,
+    Json(body): Json<CreateConditionalOrderBody>,
+) -> Result<Json<Vec<ConditionalOrderResponseDto>>, ApiError> {
+    use crate::options::conditional_orders as cond;
+    let mut leg_inputs = Vec::with_capacity(body.legs.len());
+    for leg in &body.legs {
+        leg_inputs.push(cond::ConditionalLegInput {
+            conditional_type: leg.conditional_type,
+            trigger_price_1e8: parse_fixed_u128("trigger_price_1e8", &leg.trigger_price_1e8)?,
+            limit_price_1e8: parse_fixed_u128("limit_price_1e8", &leg.limit_price_1e8)?,
+            explicit_trigger_condition: leg.trigger_condition,
+        });
+    }
+    let input = cond::CreateConditionalOrderInput {
+        account: AccountId::new(address),
+        option_series_id: body.option_series_id,
+        quantity_1e8: parse_fixed_u128("quantity_1e8", &body.quantity_1e8)?,
+        legs: leg_inputs,
+        link_as_oco: body.link_as_oco,
+        expires_at_ms: body.expires_at_ms,
+    };
+    let created = cond::create_conditional_orders(&state, input).await?;
+    Ok(Json(
+        created
+            .into_iter()
+            .map(ConditionalOrderResponseDto::from)
+            .collect(),
+    ))
+}
+
+async fn list_conditional_orders_route(
+    State(state): State<AppState>,
+    Path(address): Path<String>,
+) -> Result<Json<Vec<ConditionalOrderResponseDto>>, ApiError> {
+    use crate::options::conditional_orders as cond;
+    let orders = cond::list_conditional_orders(
+        &state,
+        cond::ConditionalOrderFilter {
+            account: Some(AccountId::new(address)),
+            ..Default::default()
+        },
+    )
+    .await?;
+    Ok(Json(
+        orders
+            .into_iter()
+            .map(ConditionalOrderResponseDto::from)
+            .collect(),
+    ))
+}
+
+async fn get_conditional_order_route(
+    State(state): State<AppState>,
+    Path((address, id)): Path<(String, String)>,
+) -> Result<Json<ConditionalOrderResponseDto>, ApiError> {
+    use crate::options::conditional_orders as cond;
+    let id = uuid::Uuid::parse_str(&id)
+        .map_err(|_| ApiError::from(BackendError::InvalidConditionalOrderId))?;
+    let order = cond::get_conditional_order(&state, id)
+        .await?
+        .ok_or(BackendError::InvalidConditionalOrderId)?;
+    if !order.account.0.eq_ignore_ascii_case(&address) {
+        return Err(ApiError::from(BackendError::InvalidConditionalOrderId));
+    }
+    Ok(Json(order.into()))
+}
+
+async fn cancel_conditional_order_route(
+    State(state): State<AppState>,
+    Path((address, id)): Path<(String, String)>,
+) -> Result<Json<ConditionalOrderResponseDto>, ApiError> {
+    use crate::options::conditional_orders as cond;
+    let id = uuid::Uuid::parse_str(&id)
+        .map_err(|_| ApiError::from(BackendError::InvalidConditionalOrderId))?;
+    let account = AccountId::new(address);
+    let cancelled = cond::cancel_conditional_order(&state, id, &account).await?;
+    Ok(Json(cancelled.into()))
 }
 
 async fn get_option_order(
@@ -9951,6 +10127,19 @@ impl From<BackendError> for ApiError {
             | BackendError::PostOnlyWouldMatch
             | BackendError::SelfTrade
             | BackendError::UnsupportedTimeInForce(_)
+            | BackendError::FokNotFillable
+            | BackendError::InvalidTimeInForceCombination(_)
+            | BackendError::InvalidConditionalOrderId
+            | BackendError::InvalidConditionalOrderState(_)
+            | BackendError::ConditionalOrderAlreadyTerminal
+            | BackendError::NoReduciblePosition(_)
+            | BackendError::QuantityExceedsPosition
+            | BackendError::InvalidTriggerDirection
+            | BackendError::InvalidTriggerPrice
+            | BackendError::InvalidConditionalLimitPrice
+            | BackendError::OracleUnavailable
+            | BackendError::DuplicateConditionalOrderKey
+            | BackendError::OcoSiblingTerminal
             | BackendError::UnsupportedCommand(_)
             | BackendError::Simulation(_)
             | BackendError::SimulationReverted(_)

@@ -863,6 +863,8 @@ pub struct OptionOrder {
     pub size_1e8: Size1e8,
     pub remaining_size_1e8: Size1e8,
     pub time_in_force: TimeInForce,
+    #[serde(default)]
+    pub post_only: bool,
     pub client_order_id: Option<String>,
     pub nonce: Option<u64>,
     pub deadline_ms: Option<TimestampMs>,

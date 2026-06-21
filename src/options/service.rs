@@ -79,6 +79,7 @@ pub struct SubmitOptionOrderInput {
     pub price_1e8: Price1e8,
     pub size_1e8: Size1e8,
     pub time_in_force: TimeInForce,
+    pub post_only: bool,
     pub client_order_id: Option<String>,
     pub nonce: Option<u64>,
     pub deadline_ms: Option<TimestampMs>,
@@ -352,12 +353,7 @@ pub async fn submit_option_order(
     if input.size_1e8 == 0 {
         return Err(BackendError::ZeroSize);
     }
-    if input.time_in_force != TimeInForce::Gtc {
-        return Err(BackendError::UnsupportedTimeInForce(format!(
-            "{:?}",
-            input.time_in_force
-        )));
-    }
+    validate_tif_combination(input.time_in_force, input.post_only)?;
     if let Some(deadline_ms) = input.deadline_ms {
         if now_ms() >= deadline_ms {
             return Err(BackendError::DeadlineExpired);
@@ -385,6 +381,7 @@ pub async fn submit_option_order(
         size_1e8: input.size_1e8,
         remaining_size_1e8: input.size_1e8,
         time_in_force: input.time_in_force,
+        post_only: input.post_only,
         client_order_id: input.client_order_id,
         nonce: input.nonce,
         deadline_ms: input.deadline_ms,
@@ -3109,6 +3106,29 @@ fn ensure_option_execution_broadcast_enabled(state: &AppState) -> Result<()> {
 
 fn validate_account(account: &AccountId) -> Result<()> {
     parse_evm_address(account).map(|_| ())
+}
+
+/// Reject TIF / post-only combinations whose semantics are ambiguous
+/// or undefined. Options have no market-order variant (`price_1e8 == 0`
+/// is already rejected upstream), so `POST_ONLY_REQUIRES_LIMIT` is not
+/// emitted here.
+fn validate_tif_combination(tif: TimeInForce, post_only: bool) -> Result<()> {
+    if post_only {
+        match tif {
+            TimeInForce::Gtc => {}
+            TimeInForce::Ioc => {
+                return Err(BackendError::InvalidTimeInForceCombination(
+                    "post-only is not compatible with IOC".to_string(),
+                ));
+            }
+            TimeInForce::Fok => {
+                return Err(BackendError::InvalidTimeInForceCombination(
+                    "post-only is not compatible with FOK".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_option_rfq_quote_ttl(state: &AppState, quote_ttl_ms: u64) -> Result<()> {

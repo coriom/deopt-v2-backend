@@ -15,6 +15,33 @@ pub enum BackendError {
     SelfTrade,
     #[error("time in force is unsupported: {0}")]
     UnsupportedTimeInForce(String),
+    #[error("fill-or-kill order is not fully fillable")]
+    FokNotFillable,
+    #[error("invalid time-in-force combination: {0}")]
+    InvalidTimeInForceCombination(String),
+    // OPTIONS-CONDITIONAL-ORDERS-TP-SL-V1
+    #[error("invalid conditional order id")]
+    InvalidConditionalOrderId,
+    #[error("invalid conditional order state: {0}")]
+    InvalidConditionalOrderState(String),
+    #[error("conditional order is already terminal")]
+    ConditionalOrderAlreadyTerminal,
+    #[error("no reducible option position for series {0}")]
+    NoReduciblePosition(String),
+    #[error("conditional order quantity exceeds the reducible position size")]
+    QuantityExceedsPosition,
+    #[error("conditional trigger direction is inconsistent with the position")]
+    InvalidTriggerDirection,
+    #[error("conditional order trigger price must be > 0")]
+    InvalidTriggerPrice,
+    #[error("conditional order limit price must be > 0")]
+    InvalidConditionalLimitPrice,
+    #[error("underlying oracle price is unavailable or stale")]
+    OracleUnavailable,
+    #[error("duplicate conditional order idempotency key")]
+    DuplicateConditionalOrderKey,
+    #[error("oco sibling already triggered or terminal")]
+    OcoSiblingTerminal,
     #[error("command is unsupported: {0}")]
     UnsupportedCommand(String),
     #[error("order not found: {0}")]

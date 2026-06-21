@@ -5,6 +5,9 @@ use deopt_v2_backend::engine::EngineState;
 use deopt_v2_backend::execution::{spawn_executor, Executor};
 use deopt_v2_backend::indexer::{spawn_indexer, Indexer};
 use deopt_v2_backend::mm::transport::webtransport::spawn_webtransport_gateway;
+use deopt_v2_backend::options::conditional_orders::{
+    spawn_conditional_orders_worker, ConditionalOrdersConfig,
+};
 use deopt_v2_backend::options::{
     spawn_option_confirmation_worker, spawn_option_event_indexer,
     spawn_option_reconciliation_worker,
@@ -92,6 +95,10 @@ async fn main() -> deopt_v2_backend::Result<()> {
     state.admin_config = config.admin.clone();
     state.metrics_config = config.metrics.clone();
     state.trading_views = config.trading_views.clone();
+    // OPTIONS-CONDITIONAL-ORDERS-PERSISTENT-E2E-V1 — read worker env
+    // vars. Defaults are safe (enabled=false) so this is a no-op for
+    // any operator who has not opted in.
+    state.conditional_orders_config = ConditionalOrdersConfig::from_env();
     let app = router(state.clone());
 
     if config.execution.execution_enabled && config.execution.dry_run {
@@ -111,6 +118,9 @@ async fn main() -> deopt_v2_backend::Result<()> {
     spawn_option_confirmation_worker(state.clone());
     spawn_option_event_indexer(state.clone());
     spawn_option_reconciliation_worker(state.clone());
+    // Default-off. Refuses to spawn when oracle/RPC missing — see
+    // implementation in `src/options/conditional_orders.rs`.
+    spawn_conditional_orders_worker(state.clone());
     spawn_webtransport_gateway(config.mm_gateway.clone(), state).await?;
 
     info!(

@@ -45,6 +45,7 @@ pub struct AppState {
     pub reconciliation_config: ReconciliationConfig,
     pub rfq_config: RfqConfig,
     pub options_config: OptionsConfig,
+    pub conditional_orders_config: crate::options::conditional_orders::ConditionalOrdersConfig,
     pub fees_config: FeesConfig,
     /// M-P2d — Optional addresses for the trading-views read surface.
     /// All fields default to `None`; trading handlers fall back to the
@@ -237,6 +238,8 @@ impl AppState {
             reconciliation_config,
             rfq_config,
             options_config,
+            conditional_orders_config:
+                crate::options::conditional_orders::ConditionalOrdersConfig::default(),
             fees_config,
             mm_gateway_config: MmGatewayConfig::default(),
             mm_permissions_config: MmPermissionsConfig::disabled(),
@@ -293,6 +296,37 @@ impl AppState {
             FeesConfig::disabled(),
             84532,
         )
+    }
+
+    /// OPTIONS-CONDITIONAL-ORDERS-LIVE-POSTGRES-PROOF-V1 — test-only
+    /// builder that wires a real `PgRepository` onto the AppState so
+    /// the conditional-orders service routes through the DB mirror
+    /// (rather than the in-memory store) under integration tests.
+    pub fn with_options_config_and_repository(
+        engine: EngineState,
+        options_config: OptionsConfig,
+        repository: PgRepository,
+    ) -> Self {
+        let mut state = Self::with_all_config(
+            engine,
+            SignatureVerificationMode::Disabled,
+            Eip712Domain::default(),
+            Some(repository.clone()),
+            ExecutionConfig::disabled(),
+            PerpNonceSyncConfig::disabled(),
+            OptionNonceSyncConfig::disabled(),
+            ConfirmationConfig::disabled(),
+            IndexerConfig::disabled(),
+            ReconciliationConfig::disabled(),
+            RfqConfig::disabled(),
+            options_config,
+            FeesConfig::disabled(),
+            84532,
+        );
+        state.persistence_enabled = true;
+        state.database_configured = true;
+        state.repository = Some(repository);
+        state
     }
 
     pub fn with_options_and_fees_config(

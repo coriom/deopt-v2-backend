@@ -1688,7 +1688,7 @@ fn rpc_provider_from_state(state: &AppState) -> Option<crate::execution::rpc::Ht
 
 /// Parse an `AccountId` hex string into an `alloy` `Address`.
 /// Returns `None` for malformed input.
-fn address_from_account_str(s: &str) -> Option<alloy_primitives::Address> {
+pub(crate) fn address_from_account_str(s: &str) -> Option<alloy_primitives::Address> {
     crate::api::trading_views::address_from_account(&AccountId::new(s.to_string()))
 }
 

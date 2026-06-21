@@ -10,7 +10,7 @@ use super::{
 };
 use crate::error::{BackendError, Result};
 use crate::execution::ExecutionTransactionStatus;
-use crate::types::{Side, TimestampMs};
+use crate::types::{Price1e8, Side, TimeInForce, TimestampMs};
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -28,6 +28,8 @@ pub struct OptionSeriesStore {
     option_execution_events: HashMap<(u64, String, u64), OptionExecutionEvent>,
     option_event_indexer_states: HashMap<String, OptionEventIndexerState>,
     option_execution_reconciliations: HashMap<String, OptionExecutionReconciliation>,
+    // OPTIONS-CONDITIONAL-ORDERS-TP-SL-V1
+    conditional_orders: HashMap<uuid::Uuid, crate::options::conditional_orders::ConditionalOrder>,
 }
 
 impl OptionSeriesStore {
@@ -108,42 +110,43 @@ impl OptionSeriesStore {
             ));
         }
 
-        let mut makers = self
+        // Snapshot compatible resting orders in price–time priority,
+        // then build a deterministic match plan WITHOUT mutating state.
+        let mut candidates = self
             .orders
             .values()
             .filter(|order| can_match(&incoming, order))
             .cloned()
             .collect::<Vec<_>>();
-        sort_match_candidates(&mut makers, incoming.side);
+        sort_match_candidates(&mut candidates, incoming.side);
+        let plan = build_option_match_plan(&incoming, &candidates);
 
-        let mut fills = Vec::new();
-        for maker_snapshot in makers {
-            if incoming.remaining_size_1e8 == 0 {
-                break;
-            }
-            let Some(maker) = self.orders.get_mut(&maker_snapshot.order_id) else {
+        // Validate TIF + post-only. Errors here mean ZERO mutation: the
+        // taker is never inserted, no fills, no maker updates.
+        enforce_tif_plan(&incoming, &plan)?;
+
+        // Execute the planned legs. The single-threaded Mutex-guarded
+        // store means the snapshot is still authoritative — but we
+        // re-check each maker's remaining size defensively.
+        let mut fills = Vec::with_capacity(plan.legs.len());
+        for leg in &plan.legs {
+            let Some(maker) = self.orders.get_mut(&leg.maker_id) else {
                 continue;
             };
-            if !can_match(&incoming, maker) {
+            if maker.remaining_size_1e8 < leg.fill_size_1e8 {
                 continue;
             }
-
-            let fill_size = incoming.remaining_size_1e8.min(maker.remaining_size_1e8);
-            if fill_size == 0 {
-                continue;
-            }
-
-            let fill = option_fill_from_match(&incoming, maker, fill_size, updated_at_ms);
-            incoming.remaining_size_1e8 -= fill_size;
-            maker.remaining_size_1e8 -= fill_size;
+            let fill = option_fill_from_match(&incoming, maker, leg.fill_size_1e8, updated_at_ms);
+            incoming.remaining_size_1e8 -= leg.fill_size_1e8;
+            maker.remaining_size_1e8 -= leg.fill_size_1e8;
             maker.status = status_for_remaining(maker.size_1e8, maker.remaining_size_1e8);
             maker.updated_at_ms = updated_at_ms;
             self.fills.insert(fill.fill_id, fill.clone());
             fills.push(fill);
         }
 
-        incoming.status = status_for_remaining(incoming.size_1e8, incoming.remaining_size_1e8);
         incoming.updated_at_ms = updated_at_ms;
+        incoming.status = final_status_for_tif(&incoming);
         self.orders.insert(incoming.order_id, incoming.clone());
         Ok((incoming, fills))
     }
@@ -216,6 +219,69 @@ impl OptionSeriesStore {
 
     pub fn get_fill(&self, fill_id: OptionFillId) -> Option<OptionFill> {
         self.fills.get(&fill_id).cloned()
+    }
+
+    // ---- OPTIONS-CONDITIONAL-ORDERS-TP-SL-V1 helpers ----
+
+    /// Insert a freshly-built conditional order (caller has already
+    /// run the reduce-only + OCO validations).
+    pub fn insert_conditional_order(
+        &mut self,
+        order: crate::options::conditional_orders::ConditionalOrder,
+    ) {
+        self.conditional_orders.insert(order.id, order);
+    }
+
+    pub fn get_conditional_order(
+        &self,
+        id: uuid::Uuid,
+    ) -> Option<crate::options::conditional_orders::ConditionalOrder> {
+        self.conditional_orders.get(&id).cloned()
+    }
+
+    pub fn list_conditional_orders(
+        &self,
+        filter: &crate::options::conditional_orders::ConditionalOrderFilter,
+    ) -> Vec<crate::options::conditional_orders::ConditionalOrder> {
+        let mut out: Vec<_> = self
+            .conditional_orders
+            .values()
+            .filter(|o| filter.matches(o))
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| {
+            a.created_at_ms
+                .cmp(&b.created_at_ms)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        out
+    }
+
+    /// Optimistic-lock update: the caller bumped `version`; we trust
+    /// it here because the in-memory store is single-threaded behind
+    /// the AppState mutex. The DB-backed mirror enforces `version`
+    /// via a WHERE clause.
+    pub fn update_conditional_order(
+        &mut self,
+        order: crate::options::conditional_orders::ConditionalOrder,
+    ) -> Result<()> {
+        if !self.conditional_orders.contains_key(&order.id) {
+            return Err(BackendError::InvalidConditionalOrderId);
+        }
+        self.conditional_orders.insert(order.id, order);
+        Ok(())
+    }
+
+    /// Snapshot of resting orders on the OPPOSITE side of `taker`
+    /// that are price-compatible. Mirrors the filter in
+    /// `submit_order_and_match` so the worker can build the same
+    /// match plan deterministically.
+    pub fn list_open_match_candidates(&self, taker: &OptionOrder) -> Vec<OptionOrder> {
+        self.orders
+            .values()
+            .filter(|order| can_match(taker, order))
+            .cloned()
+            .collect()
     }
 
     pub fn fills_for_order(&self, order_id: OptionOrderId) -> Vec<OptionFill> {
@@ -1123,6 +1189,13 @@ fn can_match(incoming: &OptionOrder, resting: &OptionOrder) -> bool {
         }
 }
 
+/// Public re-export of the price-time priority sort so the conditional
+/// orders worker can reuse it on a borrowed snapshot when planning a
+/// child IOC order.
+pub fn sort_match_candidates_view(orders: &mut [OptionOrder], taker_side: Side) {
+    sort_match_candidates(orders, taker_side)
+}
+
 fn sort_match_candidates(orders: &mut [OptionOrder], taker_side: Side) {
     orders.sort_by(|left, right| {
         let price_order = match taker_side {
@@ -1142,6 +1215,88 @@ pub(crate) fn status_for_remaining(size_1e8: u128, remaining_size_1e8: u128) -> 
         OptionOrderStatus::PartiallyFilled
     } else {
         OptionOrderStatus::Open
+    }
+}
+
+/// Deterministic per-maker plan entry. Built from a snapshot of resting
+/// orders; never mutates state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct OptionMatchLeg {
+    pub maker_id: OptionOrderId,
+    pub maker_price_1e8: Price1e8,
+    pub fill_size_1e8: u128,
+}
+
+/// Full match plan for an incoming taker. `total_fill_size_1e8` is the
+/// sum of all leg sizes — used by FOK to decide whether the order is
+/// fully fillable before any mutation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct OptionMatchPlan {
+    pub legs: Vec<OptionMatchLeg>,
+    pub total_fill_size_1e8: u128,
+}
+
+/// Compose a match plan from a *sorted* list of compatible resting
+/// orders (price–time priority). Caller is responsible for filtering /
+/// sorting; this only walks the candidates in order until the incoming
+/// taker is exhausted.
+pub(crate) fn build_option_match_plan(
+    incoming: &OptionOrder,
+    candidates: &[OptionOrder],
+) -> OptionMatchPlan {
+    let mut legs = Vec::new();
+    let mut remaining = incoming.size_1e8;
+    let mut total: u128 = 0;
+    for maker in candidates {
+        if remaining == 0 {
+            break;
+        }
+        let fill_size = remaining.min(maker.remaining_size_1e8);
+        if fill_size == 0 {
+            continue;
+        }
+        legs.push(OptionMatchLeg {
+            maker_id: maker.order_id,
+            maker_price_1e8: maker.price_1e8,
+            fill_size_1e8: fill_size,
+        });
+        remaining -= fill_size;
+        total += fill_size;
+    }
+    OptionMatchPlan {
+        legs,
+        total_fill_size_1e8: total,
+    }
+}
+
+/// Validate the planned match against TIF + post-only constraints.
+/// Runs BEFORE any mutation so FOK/post-only rejections leave the book
+/// untouched.
+pub(crate) fn enforce_tif_plan(order: &OptionOrder, plan: &OptionMatchPlan) -> Result<()> {
+    if order.post_only && !plan.legs.is_empty() {
+        return Err(BackendError::PostOnlyWouldMatch);
+    }
+    if matches!(order.time_in_force, TimeInForce::Fok) && plan.total_fill_size_1e8 < order.size_1e8
+    {
+        return Err(BackendError::FokNotFillable);
+    }
+    Ok(())
+}
+
+/// Final status of the taker once the planned legs have been applied.
+/// Honours TIF semantics: GTC rests, IOC cancels remainder, FOK is
+/// always fully filled when it reaches this point (validated earlier).
+pub(crate) fn final_status_for_tif(order: &OptionOrder) -> OptionOrderStatus {
+    let base = status_for_remaining(order.size_1e8, order.remaining_size_1e8);
+    match order.time_in_force {
+        TimeInForce::Gtc => base,
+        TimeInForce::Ioc => match base {
+            OptionOrderStatus::Open | OptionOrderStatus::PartiallyFilled => {
+                OptionOrderStatus::Cancelled
+            }
+            other => other,
+        },
+        TimeInForce::Fok => base,
     }
 }
 

@@ -19,10 +19,10 @@ use deopt_v2_backend::options::{
     expected_option_execute_trade_selector, option_execute_trade_selector,
     option_product_registry_option_id, option_rfq_id_to_b256, option_rfq_quote_digest,
     option_series_id, option_series_id_to_b256, OptionExecutionIntentStatus,
-    OptionExecutionSignatureMode, OptionExecutionSourceType, OptionFillFilter, OptionOrderFilter,
-    OptionOrderStatus, OptionRfqQuote, OptionRfqQuoteSignatureMode, OptionRfqQuoteSignatureStatus,
-    OptionRfqQuoteSigningPayload, OptionRfqQuoteStatus, OptionRfqStatus, OptionSeriesFilter,
-    OptionSeriesIdInput, OptionSeriesStatus, OptionsConfig,
+    OptionExecutionSignatureMode, OptionExecutionSourceType, OptionFillFilter, OptionOrder,
+    OptionOrderFilter, OptionOrderStatus, OptionRfqQuote, OptionRfqQuoteSignatureMode,
+    OptionRfqQuoteSignatureStatus, OptionRfqQuoteSigningPayload, OptionRfqQuoteStatus,
+    OptionRfqStatus, OptionSeriesFilter, OptionSeriesIdInput, OptionSeriesStatus, OptionsConfig,
 };
 use deopt_v2_backend::types::{now_ms, AccountId, Side, TimeInForce};
 use k256::ecdsa::SigningKey;
@@ -239,6 +239,7 @@ fn order_input(
         price_1e8: 1_000_000_000,
         size_1e8: 100_000_000,
         time_in_force: TimeInForce::Gtc,
+        post_only: false,
         client_order_id: Some(client_order_id.to_string()),
         nonce: Some(1),
         deadline_ms: Some(now_ms() + 60_000),
@@ -603,15 +604,386 @@ async fn option_order_rejects_zero_price_and_size() {
 }
 
 #[tokio::test]
-async fn option_order_rejects_unsupported_time_in_force() {
+async fn ioc_order_with_no_liquidity_is_cancelled_and_does_not_rest() {
     let state = state();
     let option_series_id = active_series_id(&state).await;
-    let mut input = order_input(option_series_id, Side::Buy, "ioc");
+    let mut input = order_input(option_series_id.clone(), Side::Buy, "ioc-empty");
     input.time_in_force = TimeInForce::Ioc;
+
+    let outcome = submit_option_order(&state, input).await.unwrap();
+
+    assert_eq!(outcome.order.status, OptionOrderStatus::Cancelled);
+    assert_eq!(outcome.order.remaining_size_1e8, outcome.order.size_1e8);
+    assert!(outcome.fills.is_empty());
+}
+
+#[tokio::test]
+async fn fok_order_with_insufficient_liquidity_is_rejected_without_mutation() {
+    let state = state();
+    let option_series_id = active_series_id(&state).await;
+    let mut input = order_input(option_series_id.clone(), Side::Buy, "fok-empty");
+    input.time_in_force = TimeInForce::Fok;
 
     let error = submit_option_order(&state, input).await.unwrap_err();
 
-    assert!(error.to_string().contains("time in force is unsupported"));
+    assert!(
+        error.to_string().contains("fill-or-kill"),
+        "expected FOK-not-fillable error, got: {error}"
+    );
+    let orders = list_option_orders(&state, OptionOrderFilter::default())
+        .await
+        .unwrap();
+    assert!(
+        orders.is_empty(),
+        "FOK rejection must not insert the order into the book"
+    );
+}
+
+#[tokio::test]
+async fn post_only_rejected_when_combined_with_ioc() {
+    let state = state();
+    let option_series_id = active_series_id(&state).await;
+    let mut input = order_input(option_series_id, Side::Buy, "po-ioc");
+    input.time_in_force = TimeInForce::Ioc;
+    input.post_only = true;
+
+    let error = submit_option_order(&state, input).await.unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("invalid time-in-force combination"),
+        "expected invalid-combo error, got: {error}"
+    );
+}
+
+#[tokio::test]
+async fn post_only_rejected_when_combined_with_fok() {
+    let state = state();
+    let option_series_id = active_series_id(&state).await;
+    let mut input = order_input(option_series_id, Side::Buy, "po-fok");
+    input.time_in_force = TimeInForce::Fok;
+    input.post_only = true;
+
+    let error = submit_option_order(&state, input).await.unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("invalid time-in-force combination"));
+}
+
+// --- MATCHING-TIF-SEMANTICS-OPTIONS-V1 ------------------------------
+// Comprehensive matching tests for GTC / IOC / FOK / post-only.
+// `order_input` defaults to price=1_000_000_000 and size=100_000_000.
+
+async fn submit_seeded_resting(
+    state: &AppState,
+    series: &str,
+    side: Side,
+    client_id: &str,
+    price_1e8: u128,
+    size_1e8: u128,
+) -> OptionOrder {
+    let mut input = order_input(series.to_string(), side, client_id);
+    input.price_1e8 = price_1e8;
+    input.size_1e8 = size_1e8;
+    let outcome = submit_option_order(state, input).await.unwrap();
+    outcome.order
+}
+
+#[tokio::test]
+async fn gtc_partial_fill_rests_remainder() {
+    let state = state();
+    let series = active_series_id(&state).await;
+    submit_seeded_resting(
+        &state,
+        &series,
+        Side::Sell,
+        "ask",
+        1_000_000_000,
+        30_000_000,
+    )
+    .await;
+
+    let mut taker = order_input(series, Side::Buy, "gtc-partial");
+    taker.size_1e8 = 100_000_000;
+    let outcome = submit_option_order(&state, taker).await.unwrap();
+
+    assert_eq!(outcome.fills.len(), 1);
+    assert_eq!(outcome.fills[0].size_1e8, 30_000_000);
+    assert_eq!(outcome.order.remaining_size_1e8, 70_000_000);
+    assert_eq!(outcome.order.status, OptionOrderStatus::PartiallyFilled);
+}
+
+#[tokio::test]
+async fn ioc_partial_fill_cancels_remainder_without_resting() {
+    let state = state();
+    let series = active_series_id(&state).await;
+    submit_seeded_resting(
+        &state,
+        &series,
+        Side::Sell,
+        "ask",
+        1_000_000_000,
+        30_000_000,
+    )
+    .await;
+
+    let mut taker = order_input(series.clone(), Side::Buy, "ioc-partial");
+    taker.time_in_force = TimeInForce::Ioc;
+    taker.size_1e8 = 100_000_000;
+    let outcome = submit_option_order(&state, taker).await.unwrap();
+
+    assert_eq!(outcome.fills.len(), 1);
+    assert_eq!(outcome.fills[0].size_1e8, 30_000_000);
+    assert_eq!(outcome.order.status, OptionOrderStatus::Cancelled);
+    assert_eq!(outcome.order.remaining_size_1e8, 70_000_000);
+
+    let open_book = list_option_orders(
+        &state,
+        OptionOrderFilter {
+            option_series_id: Some(series),
+            account: None,
+            status: Some(OptionOrderStatus::Open),
+            side: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        open_book.is_empty(),
+        "IOC remainder must never appear as Open in the book"
+    );
+}
+
+#[tokio::test]
+async fn ioc_full_fill_across_multiple_price_levels() {
+    let state = state();
+    let series = active_series_id(&state).await;
+    submit_seeded_resting(
+        &state,
+        &series,
+        Side::Sell,
+        "ask-best",
+        950_000_000,
+        50_000_000,
+    )
+    .await;
+    submit_seeded_resting(
+        &state,
+        &series,
+        Side::Sell,
+        "ask-next",
+        1_000_000_000,
+        50_000_000,
+    )
+    .await;
+
+    let mut taker = order_input(series, Side::Buy, "ioc-multi");
+    taker.time_in_force = TimeInForce::Ioc;
+    taker.price_1e8 = 1_050_000_000;
+    taker.size_1e8 = 100_000_000;
+    let outcome = submit_option_order(&state, taker).await.unwrap();
+
+    assert_eq!(outcome.fills.len(), 2);
+    // Price-time priority: best ask first.
+    assert_eq!(outcome.fills[0].price_1e8, 950_000_000);
+    assert_eq!(outcome.fills[1].price_1e8, 1_000_000_000);
+    assert_eq!(outcome.order.status, OptionOrderStatus::Filled);
+    assert_eq!(outcome.order.remaining_size_1e8, 0);
+}
+
+#[tokio::test]
+async fn fok_sufficient_across_levels_fills_atomically() {
+    let state = state();
+    let series = active_series_id(&state).await;
+    submit_seeded_resting(
+        &state,
+        &series,
+        Side::Sell,
+        "ask-best",
+        950_000_000,
+        50_000_000,
+    )
+    .await;
+    submit_seeded_resting(
+        &state,
+        &series,
+        Side::Sell,
+        "ask-next",
+        1_000_000_000,
+        50_000_000,
+    )
+    .await;
+
+    let mut taker = order_input(series, Side::Buy, "fok-ok");
+    taker.time_in_force = TimeInForce::Fok;
+    taker.price_1e8 = 1_050_000_000;
+    taker.size_1e8 = 100_000_000;
+    let outcome = submit_option_order(&state, taker).await.unwrap();
+
+    assert_eq!(outcome.fills.len(), 2);
+    assert_eq!(outcome.order.status, OptionOrderStatus::Filled);
+    assert_eq!(outcome.order.remaining_size_1e8, 0);
+}
+
+#[tokio::test]
+async fn fok_price_outside_limit_is_not_counted_as_fillable() {
+    let state = state();
+    let series = active_series_id(&state).await;
+    submit_seeded_resting(
+        &state,
+        &series,
+        Side::Sell,
+        "ask-cheap",
+        950_000_000,
+        30_000_000,
+    )
+    .await;
+    submit_seeded_resting(
+        &state,
+        &series,
+        Side::Sell,
+        "ask-rich",
+        1_100_000_000,
+        70_000_000,
+    )
+    .await;
+
+    let mut taker = order_input(series.clone(), Side::Buy, "fok-limited");
+    taker.time_in_force = TimeInForce::Fok;
+    taker.price_1e8 = 1_000_000_000;
+    taker.size_1e8 = 100_000_000;
+    let error = submit_option_order(&state, taker).await.unwrap_err();
+
+    assert!(error.to_string().contains("fill-or-kill"));
+
+    let cheap_ask = list_option_orders(
+        &state,
+        OptionOrderFilter {
+            option_series_id: Some(series),
+            account: None,
+            status: None,
+            side: Some(Side::Sell),
+        },
+    )
+    .await
+    .unwrap()
+    .into_iter()
+    .find(|o| o.client_order_id.as_deref() == Some("ask-cheap"))
+    .unwrap();
+    assert_eq!(
+        cheap_ask.remaining_size_1e8, 30_000_000,
+        "FOK failure must leave maker quantity untouched"
+    );
+}
+
+#[tokio::test]
+async fn post_only_non_crossing_buy_rests() {
+    let state = state();
+    let series = active_series_id(&state).await;
+    submit_seeded_resting(
+        &state,
+        &series,
+        Side::Sell,
+        "ask-high",
+        1_100_000_000,
+        50_000_000,
+    )
+    .await;
+
+    let mut taker = order_input(series, Side::Buy, "po-buy-rest");
+    taker.price_1e8 = 1_000_000_000;
+    taker.post_only = true;
+    let outcome = submit_option_order(&state, taker).await.unwrap();
+
+    assert!(outcome.fills.is_empty());
+    assert_eq!(outcome.order.status, OptionOrderStatus::Open);
+    assert_eq!(outcome.order.remaining_size_1e8, outcome.order.size_1e8);
+    assert!(outcome.order.post_only);
+}
+
+#[tokio::test]
+async fn post_only_crossing_buy_is_rejected_without_book_mutation() {
+    let state = state();
+    let series = active_series_id(&state).await;
+    let ask = submit_seeded_resting(
+        &state,
+        &series,
+        Side::Sell,
+        "ask-cross",
+        1_000_000_000,
+        50_000_000,
+    )
+    .await;
+
+    let mut taker = order_input(series.clone(), Side::Buy, "po-cross");
+    taker.price_1e8 = 1_000_000_000;
+    taker.post_only = true;
+    let error = submit_option_order(&state, taker).await.unwrap_err();
+
+    assert!(error.to_string().contains("post-only"));
+
+    let book = list_option_orders(&state, OptionOrderFilter::default())
+        .await
+        .unwrap();
+    // Only the seeded maker remains, untouched.
+    assert_eq!(book.len(), 1);
+    let resting = book
+        .into_iter()
+        .find(|o| o.order_id == ask.order_id)
+        .unwrap();
+    assert_eq!(resting.remaining_size_1e8, 50_000_000);
+    assert_eq!(resting.status, OptionOrderStatus::Open);
+}
+
+#[tokio::test]
+async fn post_only_crossing_sell_is_rejected() {
+    let state = state();
+    let series = active_series_id(&state).await;
+    submit_seeded_resting(
+        &state,
+        &series,
+        Side::Buy,
+        "bid-cross",
+        1_000_000_000,
+        50_000_000,
+    )
+    .await;
+
+    let mut taker = order_input(series, Side::Sell, "po-sell-cross");
+    taker.price_1e8 = 1_000_000_000;
+    taker.post_only = true;
+    let error = submit_option_order(&state, taker).await.unwrap_err();
+
+    assert!(error.to_string().contains("post-only"));
+}
+
+#[tokio::test]
+async fn quantity_invariant_holds_for_ioc_partial_fill() {
+    let state = state();
+    let series = active_series_id(&state).await;
+    submit_seeded_resting(
+        &state,
+        &series,
+        Side::Sell,
+        "inv-ask",
+        1_000_000_000,
+        30_000_000,
+    )
+    .await;
+
+    let mut taker = order_input(series, Side::Buy, "inv-ioc");
+    taker.time_in_force = TimeInForce::Ioc;
+    taker.size_1e8 = 100_000_000;
+    let outcome = submit_option_order(&state, taker).await.unwrap();
+
+    let filled: u128 = outcome.fills.iter().map(|f| f.size_1e8).sum();
+    // requested = filled + remaining (cancelled at terminal status).
+    assert_eq!(
+        filled + outcome.order.remaining_size_1e8,
+        outcome.order.size_1e8
+    );
 }
 
 #[tokio::test]
