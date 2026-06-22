@@ -56,11 +56,42 @@ const ENV_VAR: &str = "CONDITIONAL_PG_TEST_DATABASE_URL";
 
 const ONE_1E8: u128 = 100_000_000;
 const PREMIUM_1E8: u128 = 1_000_000_000;
-const HOLDER: &str = "0x0000000000000000000000000000000000000111";
-const MAKER: &str = "0x0000000000000000000000000000000000000222";
 
-fn account(hex: &str) -> AccountId {
-    AccountId::new(hex.to_string())
+/// Per-test HOLDER / MAKER addresses derived from the test tag so
+/// leftover state from previous (possibly failed) runs against the
+/// same disposable database cannot interfere with the current test's
+/// position computation. `prefix` is "h" for the holder and "m" for
+/// the maker; the byte sum of the tag is appended to keep the address
+/// canonical-hex and stable across runs.
+fn per_test_holder(tag: &str) -> AccountId {
+    let sum: u32 = tag.bytes().map(u32::from).sum();
+    // 0x000…<hex of "h"=0x68><tag_byte_sum padded><tag bytes …>
+    let mut hex = String::from("0x");
+    hex.push_str(&"0".repeat(20));
+    hex.push_str(&format!("{:>04x}", sum & 0xffff));
+    for b in tag.bytes().take(8) {
+        hex.push_str(&format!("{:02x}", b));
+    }
+    while hex.len() < 42 {
+        hex.push('0');
+    }
+    hex.truncate(42);
+    AccountId::new(hex)
+}
+
+fn per_test_maker(tag: &str) -> AccountId {
+    let sum: u32 = tag.bytes().rev().map(u32::from).sum();
+    let mut hex = String::from("0x");
+    hex.push_str(&"0".repeat(20));
+    hex.push_str(&format!("ff{:>04x}", sum & 0xffff));
+    for b in tag.bytes().take(7) {
+        hex.push_str(&format!("{:02x}", b));
+    }
+    while hex.len() < 42 {
+        hex.push('1');
+    }
+    hex.truncate(42);
+    AccountId::new(hex)
 }
 
 /// Read the disposable-DB URL from env. Returns `None` if the var is
@@ -70,14 +101,35 @@ fn pg_test_url() -> Option<String> {
 }
 
 /// Build a connected, migrated repository against the disposable DB.
+/// Connect a fresh `PgRepository` to the disposable test database.
+/// Migrations are run ONCE per test-process via `ensure_migrated`;
+/// every subsequent caller skips the migration step. This avoids 8
+/// parallel tests each contending for the migration advisory lock
+/// (which manifested as `PoolTimedOut`).
 async fn fresh_pg_repository(url: &str) -> PgRepository {
-    let repo = PgRepository::connect(url)
+    ensure_migrated(url).await;
+    PgRepository::connect(url)
         .await
-        .expect("connect to disposable PG database");
-    repo.run_migrations()
-        .await
-        .expect("run migrations against disposable PG database");
-    repo
+        .expect("connect to disposable PG database")
+}
+
+/// Run the migration chain exactly once per `cargo test` process,
+/// regardless of how many tests are running in parallel. Uses a
+/// dedicated short-lived `PgRepository` for the migration so the
+/// connection / pool is dropped after the migration completes; tests
+/// then open their own pools via `fresh_pg_repository`.
+async fn ensure_migrated(url: &str) {
+    static MIGRATED: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+    MIGRATED
+        .get_or_init(|| async {
+            let repo = PgRepository::connect(url)
+                .await
+                .expect("connect for shared migration");
+            repo.run_migrations()
+                .await
+                .expect("run migrations once against disposable PG database");
+        })
+        .await;
 }
 
 /// Build an `AppState` that routes the conditional-orders service
@@ -105,7 +157,7 @@ async fn seed_long_position(state: &AppState, series: &str, size_1e8: u128, tag:
         state,
         SubmitOptionOrderInput {
             option_series_id: series.to_string(),
-            account: account(MAKER),
+            account: per_test_maker(tag),
             side: Side::Sell,
             price_1e8: PREMIUM_1E8,
             size_1e8,
@@ -123,7 +175,7 @@ async fn seed_long_position(state: &AppState, series: &str, size_1e8: u128, tag:
         state,
         SubmitOptionOrderInput {
             option_series_id: series.to_string(),
-            account: account(HOLDER),
+            account: per_test_holder(tag),
             side: Side::Buy,
             price_1e8: PREMIUM_1E8,
             size_1e8,
@@ -153,7 +205,7 @@ async fn seed_closing_bid(
         state,
         SubmitOptionOrderInput {
             option_series_id: series.to_string(),
-            account: account(MAKER),
+            account: per_test_maker(tag),
             side: Side::Buy,
             price_1e8,
             size_1e8,
@@ -197,6 +249,7 @@ async fn make_series(state: &AppState, tag: &str) -> String {
 async fn arm_oco_tp_sl(
     state: &AppState,
     series: &str,
+    tag: &str,
     qty: u128,
     tp: u128,
     sl: u128,
@@ -204,7 +257,7 @@ async fn arm_oco_tp_sl(
     create_conditional_orders(
         state,
         CreateConditionalOrderInput {
-            account: account(HOLDER),
+            account: per_test_holder(tag),
             option_series_id: series.to_string(),
             quantity_1e8: qty,
             legs: vec![
@@ -265,7 +318,7 @@ pg_test!(
             "SELECT EXISTS (SELECT 1 FROM information_schema.tables
          WHERE table_name = 'options_conditional_orders')",
         )
-        .fetch_one(&*pool)
+        .fetch_one(&pool)
         .await
         .unwrap();
         assert!(table_exists, "options_conditional_orders table missing");
@@ -273,7 +326,7 @@ pg_test!(
         let index_names: Vec<String> = sqlx::query_scalar(
             "SELECT indexname FROM pg_indexes WHERE tablename = 'options_conditional_orders'",
         )
-        .fetch_all(&*pool)
+        .fetch_all(&pool)
         .await
         .unwrap();
         let expected = [
@@ -293,7 +346,7 @@ pg_test!(
             "SELECT EXISTS (SELECT 1 FROM information_schema.columns
          WHERE table_name = 'options_conditional_orders' AND column_name = 'version')",
         )
-        .fetch_one(&*pool)
+        .fetch_one(&pool)
         .await
         .unwrap();
         assert!(version_exists, "version column missing");
@@ -304,7 +357,7 @@ pg_test!(
          WHERE tablename = 'option_orders'
            AND indexname = 'idx_option_orders_live_account_client_id')",
         )
-        .fetch_one(&*pool)
+        .fetch_one(&pool)
         .await
         .unwrap();
         assert!(
@@ -322,7 +375,15 @@ pg_test!(
         let state_a = pg_state(&url).await;
         let series = make_series(&state_a, "armed_survive").await;
         seed_long_position(&state_a, &series, ONE_1E8, "armed_survive").await;
-        arm_oco_tp_sl(&state_a, &series, ONE_1E8, 80_000_000_000, 60_000_000_000).await;
+        arm_oco_tp_sl(
+            &state_a,
+            &series,
+            "armed_survive",
+            ONE_1E8,
+            80_000_000_000,
+            60_000_000_000,
+        )
+        .await;
 
         // Reload: drop state_a, build state_b from a fresh PgRepository
         // connection (simulates a backend restart).
@@ -331,7 +392,7 @@ pg_test!(
         let armed = list_conditional_orders(
             &state_b,
             ConditionalOrderFilter {
-                account: Some(account(HOLDER)),
+                account: Some(per_test_holder("armed_survive")),
                 option_series_id: Some(series),
                 status: Some(ConditionalOrderStatus::Armed),
                 oco_group_id: None,
@@ -354,7 +415,15 @@ pg_test!(
         let series = make_series(&state_a, "no_retrigger").await;
         seed_long_position(&state_a, &series, ONE_1E8, "no_retrigger").await;
         seed_closing_bid(&state_a, &series, ONE_1E8, PREMIUM_1E8 / 2, "no_retrigger").await;
-        arm_oco_tp_sl(&state_a, &series, ONE_1E8, 80_000_000_000, 60_000_000_000).await;
+        arm_oco_tp_sl(
+            &state_a,
+            &series,
+            "no_retrigger",
+            ONE_1E8,
+            80_000_000_000,
+            60_000_000_000,
+        )
+        .await;
 
         let prices = prices_for(&series, 80_000_000_000);
         let r = evaluate_conditional_orders_tick_with_prices(&state_a, &prices)
@@ -380,20 +449,43 @@ pg_test!(
         let state = pg_state(&url).await;
         let series = make_series(&state, "stranded").await;
         seed_long_position(&state, &series, ONE_1E8, "stranded").await;
-        let rows = arm_oco_tp_sl(&state, &series, ONE_1E8, 80_000_000_000, 60_000_000_000).await;
+        let rows = arm_oco_tp_sl(
+            &state,
+            &series,
+            "stranded",
+            ONE_1E8,
+            80_000_000_000,
+            60_000_000_000,
+        )
+        .await;
         let with_child = rows[0].id;
         let without_child = rows[1].id;
 
-        // Stage one row with `Triggering + child_order_id=Some(stub)` and
-        // another with `Triggering + child_order_id=None`.
+        // Stage one row with `Triggering + child_order_id=Some(<real
+        // existing order id>)` and another with
+        // `Triggering + child_order_id=None`. PG enforces the FK on
+        // `options_conditional_orders.child_order_id →
+        // option_orders.order_id`; the in-memory store does not.
+        // Re-using one of the seed orders' ids is the cleanest way
+        // to satisfy the FK without inserting a contrived stub.
         let repo = state.repository.clone().unwrap();
+        let real_existing_order_id: String = sqlx::query_scalar(
+            "SELECT order_id FROM option_orders
+             WHERE option_series_id = $1
+             LIMIT 1",
+        )
+        .bind(&series)
+        .fetch_one(&pool_handle(&repo).await)
+        .await
+        .expect("at least one seeded option_order exists");
+
         let mut tp = repo
             .get_conditional_order(with_child)
             .await
             .unwrap()
             .unwrap();
         tp.status = ConditionalOrderStatus::Triggering;
-        tp.child_order_id = Some("stub-child".to_string());
+        tp.child_order_id = Some(real_existing_order_id);
         tp.version = tp.version.saturating_add(1);
         repo.update_conditional_order(&tp).await.unwrap();
 
@@ -408,8 +500,18 @@ pg_test!(
         repo.update_conditional_order(&sl).await.unwrap();
 
         let recovered = recover_stranded_triggering(&state, now_ms()).await.unwrap();
-        assert_eq!(recovered, 2, "both stranded rows must be swept");
+        // The recovery sweep is database-wide, not per-test, so we
+        // assert `>= 2` (our two staged rows AT LEAST were swept)
+        // rather than `== 2` which would fail if any other test in
+        // the same database left an unrelated stranded row.
+        assert!(
+            recovered >= 2,
+            "expected at least our 2 staged stranded rows to be swept (got {recovered})"
+        );
 
+        // The semantically-important assertion is the per-row final
+        // status — that our specific rows reached the documented
+        // recovery outcome.
         let tp_after = repo
             .get_conditional_order(with_child)
             .await
@@ -429,7 +531,15 @@ pg_test!(stale_oracle_creates_no_child, |url: String| async move {
     let state = pg_state(&url).await;
     let series = make_series(&state, "stale_oracle").await;
     seed_long_position(&state, &series, ONE_1E8, "stale_oracle").await;
-    arm_oco_tp_sl(&state, &series, ONE_1E8, 80_000_000_000, 60_000_000_000).await;
+    arm_oco_tp_sl(
+        &state,
+        &series,
+        "stale_oracle",
+        ONE_1E8,
+        80_000_000_000,
+        60_000_000_000,
+    )
+    .await;
 
     let empty: HashMap<String, u128> = HashMap::new();
     let r = evaluate_conditional_orders_tick_with_prices(&state, &empty)
@@ -437,12 +547,17 @@ pg_test!(stale_oracle_creates_no_child, |url: String| async move {
         .unwrap();
     assert_eq!(r.triggered, 0);
 
-    // SQL invariant: zero child option orders exist for this series.
+    // SQL invariant: zero child option orders exist FOR THIS SERIES.
+    // Scoped by `option_series_id` so concurrent tests against the
+    // same disposable database cannot pollute the cardinality count.
     let repo = state.repository.clone().unwrap();
     let child_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM option_orders WHERE client_order_id LIKE 'cond-%'",
+        "SELECT COUNT(*) FROM option_orders
+         WHERE option_series_id = $1
+           AND client_order_id LIKE 'cond-%'",
     )
-    .fetch_one(&*pool_handle(&repo).await)
+    .bind(&series)
+    .fetch_one(&pool_handle(&repo).await)
     .await
     .unwrap();
     assert_eq!(child_count, 0, "no child IOC order created on stale oracle");
@@ -454,7 +569,15 @@ pg_test!(
         let state = pg_state(&url).await;
         let series = make_series(&state, "reduced").await;
         seed_long_position(&state, &series, ONE_1E8, "reduced").await;
-        arm_oco_tp_sl(&state, &series, ONE_1E8, 80_000_000_000, 60_000_000_000).await;
+        arm_oco_tp_sl(
+            &state,
+            &series,
+            "reduced",
+            ONE_1E8,
+            80_000_000_000,
+            60_000_000_000,
+        )
+        .await;
 
         // Holder partially closes 0.40 manually.
         seed_closing_bid(
@@ -469,7 +592,7 @@ pg_test!(
             &state,
             SubmitOptionOrderInput {
                 option_series_id: series.clone(),
-                account: account(HOLDER),
+                account: per_test_holder("reduced"),
                 side: Side::Sell,
                 price_1e8: PREMIUM_1E8,
                 size_1e8: ONE_1E8 * 4 / 10,
@@ -498,12 +621,17 @@ pg_test!(
             .unwrap();
         assert!(r.triggered >= 1);
 
-        // SQL invariant: at most one cond-* child exists, with size <= 0.60.
+        // SQL invariant: at most one cond-* child exists FOR THIS
+        // SERIES, with size <= 0.60. Scoped by `option_series_id`
+        // so concurrent tests cannot inflate the cardinality.
         let repo = state.repository.clone().unwrap();
         let row: (i64, Option<String>) = sqlx::query_as(
-            "SELECT COUNT(*), MAX(size_1e8) FROM option_orders WHERE client_order_id LIKE 'cond-%'",
+            "SELECT COUNT(*), MAX(size_1e8) FROM option_orders
+             WHERE option_series_id = $1
+               AND client_order_id LIKE 'cond-%'",
         )
-        .fetch_one(&*pool_handle(&repo).await)
+        .bind(&series)
+        .fetch_one(&pool_handle(&repo).await)
         .await
         .unwrap();
         assert_eq!(row.0, 1, "exactly one child IOC order");
@@ -521,7 +649,15 @@ pg_test!(
         let state = pg_state(&url).await;
         let series = make_series(&state, "no_liquidity").await;
         seed_long_position(&state, &series, ONE_1E8, "no_liquidity").await;
-        arm_oco_tp_sl(&state, &series, ONE_1E8, 80_000_000_000, 60_000_000_000).await;
+        arm_oco_tp_sl(
+            &state,
+            &series,
+            "no_liquidity",
+            ONE_1E8,
+            80_000_000_000,
+            60_000_000_000,
+        )
+        .await;
 
         // NO closing bid → child IOC will find zero opposing liquidity.
         let prices = prices_for(&series, 80_000_000_000);
@@ -530,14 +666,18 @@ pg_test!(
             .unwrap();
 
         let repo = state.repository.clone().unwrap();
-        // SQL invariant: any cond-* child order is in a terminal status
-        // (cancelled or filled), NEVER `open` or `partially_filled`.
+        // SQL invariant: any cond-* child order FOR THIS SERIES is
+        // in a terminal status (cancelled or filled), NEVER `open`
+        // or `partially_filled`. Scoped by `option_series_id` so
+        // concurrent tests cannot inflate the count.
         let resting: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM option_orders
-         WHERE client_order_id LIKE 'cond-%'
-           AND status IN ('open', 'partially_filled')",
+             WHERE option_series_id = $1
+               AND client_order_id LIKE 'cond-%'
+               AND status IN ('open', 'partially_filled')",
         )
-        .fetch_one(&*pool_handle(&repo).await)
+        .bind(&series)
+        .fetch_one(&pool_handle(&repo).await)
         .await
         .unwrap();
         assert_eq!(resting, 0, "IOC child must never rest");
@@ -546,7 +686,7 @@ pg_test!(
         let failed = list_conditional_orders(
             &state,
             ConditionalOrderFilter {
-                account: Some(account(HOLDER)),
+                account: Some(per_test_holder("no_liquidity")),
                 option_series_id: Some(series),
                 status: Some(ConditionalOrderStatus::Failed),
                 oco_group_id: None,
@@ -568,50 +708,67 @@ pg_test!(
 pg_test!(
     two_workers_compete_for_oco_group_one_winner_only,
     |url: String| async move {
-        // Single state + two evaluator tasks. Each task gets the SAME
-        // AppState (same PgRepository pool), but they call
-        // `evaluate_conditional_orders_tick_with_prices` concurrently from
-        // separate tokio tasks. The atomic `claim_conditional_order_armed`
-        // UPDATE WHERE status='armed' is the cross-process serialiser; it
-        // is the same primitive two separate `cargo run` processes would
-        // use against the same database.
-        let state = pg_state(&url).await;
-        let series = make_series(&state, "race").await;
-        seed_long_position(&state, &series, ONE_1E8, "race").await;
-        seed_closing_bid(&state, &series, ONE_1E8, PREMIUM_1E8 / 2, "race").await;
-        let rows = arm_oco_tp_sl(&state, &series, ONE_1E8, 80_000_000_000, 80_000_000_000).await;
+        // Two evaluators, each with its OWN `PgRepository` (and
+        // therefore its OWN `sqlx::PgPool`). This mirrors the
+        // production posture of two `cargo run` processes — each
+        // process holds its own pool, no in-process pool contention.
+        // The atomic `claim_conditional_order_armed` UPDATE WHERE
+        // status='armed' is the cross-pool serialiser; PostgreSQL
+        // guarantees at most one row transitions per concurrent
+        // claim attempt.
+        //
+        // Setup goes through ONE state (state_setup); the two
+        // racing evaluator states (state_a / state_b) are built
+        // afterwards from independent connections.
+        let state_setup = pg_state(&url).await;
+        let series = make_series(&state_setup, "race").await;
+        seed_long_position(&state_setup, &series, ONE_1E8, "race").await;
+        seed_closing_bid(&state_setup, &series, ONE_1E8, PREMIUM_1E8 / 2, "race").await;
+        let rows = arm_oco_tp_sl(
+            &state_setup,
+            &series,
+            "race",
+            ONE_1E8,
+            80_000_000_000,
+            80_000_000_000,
+        )
+        .await;
         assert_eq!(rows.len(), 2, "OCO pair created");
+        drop(state_setup);
 
-        let state_arc = Arc::new(state);
+        let state_a = Arc::new(pg_state(&url).await);
+        let state_b = Arc::new(pg_state(&url).await);
         let prices = Arc::new(prices_for(&series, 80_000_000_000));
-        let mut handles = Vec::new();
-        for _ in 0..2 {
-            let s = state_arc.clone();
-            let p = prices.clone();
-            handles.push(tokio::spawn(async move {
-                evaluate_conditional_orders_tick_with_prices(&s, &p)
-                    .await
-                    .expect("tick")
-            }));
-        }
-        let mut total_triggered = 0;
-        for h in handles {
-            let r = h.await.unwrap();
-            total_triggered += r.triggered;
-        }
+        let pa = prices.clone();
+        let pb = prices.clone();
+        let sa = state_a.clone();
+        let sb = state_b.clone();
+        let handle_a = tokio::spawn(async move {
+            evaluate_conditional_orders_tick_with_prices(&sa, &pa)
+                .await
+                .expect("tick A")
+        });
+        let handle_b = tokio::spawn(async move {
+            evaluate_conditional_orders_tick_with_prices(&sb, &pb)
+                .await
+                .expect("tick B")
+        });
+        let r_a = handle_a.await.unwrap();
+        let r_b = handle_b.await.unwrap();
+        let total_triggered = r_a.triggered + r_b.triggered;
         assert_eq!(
             total_triggered, 1,
-            "exactly one OCO leg can win across concurrent evaluators"
+            "exactly one OCO leg can win across two independent PostgreSQL connections"
         );
 
-        let repo = state_arc.repository.clone().unwrap();
+        let repo = state_a.repository.clone().unwrap();
         // SQL invariants on the conditional row population.
         let completed: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM options_conditional_orders
          WHERE option_series_id = $1 AND status = 'completed'",
         )
         .bind(&series)
-        .fetch_one(&*pool_handle(&repo).await)
+        .fetch_one(&pool_handle(&repo).await)
         .await
         .unwrap();
         let cancelled: i64 = sqlx::query_scalar(
@@ -620,14 +777,14 @@ pg_test!(
            AND failure_code = 'oco_sibling_triggered'",
         )
         .bind(&series)
-        .fetch_one(&*pool_handle(&repo).await)
+        .fetch_one(&pool_handle(&repo).await)
         .await
         .unwrap();
         let cond_orders_total: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM options_conditional_orders WHERE option_series_id = $1",
         )
         .bind(&series)
-        .fetch_one(&*pool_handle(&repo).await)
+        .fetch_one(&pool_handle(&repo).await)
         .await
         .unwrap();
         assert_eq!(completed, 1, "exactly one completed leg");
@@ -640,7 +797,7 @@ pg_test!(
          WHERE option_series_id = $1 AND client_order_id LIKE 'cond-%'",
         )
         .bind(&series)
-        .fetch_one(&*pool_handle(&repo).await)
+        .fetch_one(&pool_handle(&repo).await)
         .await
         .unwrap();
         assert_eq!(
@@ -655,14 +812,18 @@ pg_test!(
            AND o.client_order_id LIKE 'cond-%'",
         )
         .bind(&series)
-        .fetch_one(&*pool_handle(&repo).await)
+        .fetch_one(&pool_handle(&repo).await)
         .await
         .unwrap();
         assert!(child_fills >= 1, "at least one fill recorded");
 
-        // After race: 5 more ticks must not create a second child.
+        // After race: 5 more ticks on EITHER independent evaluator
+        // must not create a second child.
         for _ in 0..5 {
-            evaluate_conditional_orders_tick_with_prices(&state_arc, &prices)
+            evaluate_conditional_orders_tick_with_prices(&state_a, &prices)
+                .await
+                .unwrap();
+            evaluate_conditional_orders_tick_with_prices(&state_b, &prices)
                 .await
                 .unwrap();
         }
@@ -671,7 +832,7 @@ pg_test!(
          WHERE option_series_id = $1 AND client_order_id LIKE 'cond-%'",
         )
         .bind(&series)
-        .fetch_one(&*pool_handle(&repo).await)
+        .fetch_one(&pool_handle(&repo).await)
         .await
         .unwrap();
         assert_eq!(
@@ -688,19 +849,17 @@ pg_test!(
 /// SQL assertions without going through the repository abstraction.
 /// The URL is read from `ENV_VAR` at call time; the secret never
 /// leaves process memory and is never printed by this file.
-async fn pool_handle(_repo: &PgRepository) -> std::sync::Arc<sqlx::PgPool> {
-    static POOL: tokio::sync::OnceCell<std::sync::Arc<sqlx::PgPool>> =
-        tokio::sync::OnceCell::const_new();
+/// Per-test small `sqlx::PgPool` used for raw SQL cardinality
+/// assertions. Each test creates its own pool (lazily) and drops it
+/// when the test exits — avoiding the parallel contention we saw with
+/// a single shared OnceCell pool. 2 connections per pool × 8 tests =
+/// 16 max, well within PostgreSQL's default 100-connection ceiling.
+async fn pool_handle(_repo: &PgRepository) -> sqlx::PgPool {
     let url = std::env::var(ENV_VAR).expect("ENV var must be set inside pg_test! body");
-    POOL.get_or_init(|| async {
-        std::sync::Arc::new(
-            sqlx::postgres::PgPoolOptions::new()
-                .max_connections(4)
-                .connect(&url)
-                .await
-                .expect("connect to disposable DB for raw SQL assertions"),
-        )
-    })
-    .await
-    .clone()
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .acquire_timeout(std::time::Duration::from_secs(30))
+        .connect(&url)
+        .await
+        .expect("connect to disposable DB for raw SQL assertions")
 }

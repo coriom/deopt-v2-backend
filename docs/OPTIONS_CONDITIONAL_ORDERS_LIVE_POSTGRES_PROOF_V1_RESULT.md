@@ -9,35 +9,28 @@ without re-exposing any secret to the agent.
 
 ## Status
 
-**BLOCKED — live PostgreSQL run not executed.**
+**CLOSED — live PostgreSQL proof executed and passed.**
 
-Follow-up attempt under
-`OPTIONS-CONDITIONAL-ORDERS-POSTGRES-FINAL-CLOSURE-V1` reached
-Phase 2 (passwordless admin DB-creation probe) and **stopped
-without changing anything**, exactly as the brief prescribes:
+Final counts (from the live proof on the operator-pre-created
+disposable database `deopt_cond_proof_final_01`):
+* PG-proof tests **executed**: **8**
+* PG-proof tests **passed**: **8**
+* PG-proof tests **skipped**: **0**
+* Parallel run (default `cargo test`): **8/8 in 0.69 s**.
+* Sequential diagnostic run (`--test-threads=1`): **8/8 in 4.64 s**.
 
-```
-$ sudo -n -u postgres true
-sudo: a password is required
-true_exit=1
-```
+PostgreSQL server version observed during the run:
+`PostgreSQL 16.14 (Ubuntu 16.14-0ubuntu0.24.04.1) on x86_64-pc-linux-gnu`.
+Operator-pre-created disposable database name:
+`deopt_cond_proof_final_01` (passes the allow-list
+`deopt_cond_proof_* | deopt_test_*`).
 
-The agent cannot supply the local `sudo` password
-non-interactively, and the application role
-(`DATABASE_URL`) holds no `CREATEDB` privilege — and per the
-safety brief MUST NOT be granted any. The runner script itself
-is fully ready: both PRECREATED_DB and SELF_MANAGED_DB modes
-shipped + gated + name-allow-listed; only the actual DB
-creation step requires the operator.
-
-**Counts** (from the final validation sweep of this conversation):
-* PG-proof tests **executed**: **0**
-* PG-proof tests **passed**: **0**
-* PG-proof tests **skipped**: **8**
-
-(8 skipped because `CONDITIONAL_PG_TEST_DATABASE_URL` is unset.
-Per brief: skip mode does NOT count as proof. The TP/SL
-subsystem is therefore **NOT fully closed**.)
+The runner ran in **PRECREATED_DB** mode: the operator created
+the database as Postgres superuser and exported
+`CONDITIONAL_PG_TEST_ALLOW_DISPOSABLE_DB=true` +
+`CONDITIONAL_PG_TEST_DATABASE_URL=...` in their shell. The
+agent never sourced `.env`, never called `CREATE DATABASE` /
+`DROP DATABASE`, and never echoed the URL.
 
 ## Runner architecture (after this milestone)
 
@@ -166,29 +159,37 @@ explicitly sets `state.repository = Some(repo)` and
 `state.persistence_enabled = true`. There is no in-memory
 fallback in the PG-proof test crate.
 
-## SQL / repository assertions (deferred until execution)
+## SQL / repository assertions (live results)
 
-When the operator unblocks via PRECREATED_DB or SELF_MANAGED_DB
-mode, the suite asserts (per scenario, via parameterised
-`sqlx::query_scalar` against the disposable DB):
+All asserted via parameterised `sqlx::query_scalar` against the
+disposable database, scoped by `option_series_id = $1` so
+concurrent tests cannot pollute the cardinality counts.
 
-| Query | Expected (race scenario) |
-|---|---|
-| `COUNT(*) FROM options_conditional_orders WHERE option_series_id=$1` | **2** |
-| `... WHERE status='completed'` | **1** |
-| `... WHERE status='cancelled' AND failure_code='oco_sibling_triggered'` | **1** |
-| `COUNT(*) FROM option_orders WHERE client_order_id LIKE 'cond-%'` | **1** |
-| Same query after 5 more ticks | **1** (unchanged) |
-| `COUNT(*) FROM option_fills ... linked to child` | **≥ 1** |
-| `child.time_in_force` | **`ioc`** (per the column read by `option_order_from_row`) |
-| `child.post_only` | **`false`** |
-| `child.status` after IOC matching | **`filled` or `cancelled`** (NEVER `open` / `partially_filled`) |
-| Position signed-fills invariant for HOLDER | **≥ 0** (no reversal) |
-
-The reduce-only column `reduce_only=true` is enforced server-side
-in `execute_triggered_via_repo` (the service builds the child
-with `reduce_only: true` and the database table default also
-ensures it).
+| Query | Expected | Observed |
+|---|---|---|
+| Race: `COUNT(*) FROM options_conditional_orders WHERE option_series_id=$series` | **2** | **2** ✓ |
+| Race: `... WHERE status='completed'` | **1** | **1** ✓ |
+| Race: `... WHERE status='cancelled' AND failure_code='oco_sibling_triggered'` | **1** | **1** ✓ |
+| Race: `COUNT(*) FROM option_orders WHERE option_series_id=$series AND client_order_id LIKE 'cond-%'` | **1** | **1** ✓ |
+| Race: same query after 5 more ticks on EACH evaluator | **1** (unchanged) | **1** ✓ |
+| Race: `COUNT(*) FROM option_fills f JOIN option_orders o ON ... WHERE f.option_series_id=$series AND o.client_order_id LIKE 'cond-%'` | **≥ 1** | **≥ 1** ✓ |
+| Reduced: `MAX(size_1e8) FROM option_orders WHERE option_series_id=$series AND client_order_id LIKE 'cond-%'` | **≤ 0.60 × 1e8** | passes ✓ |
+| Stale oracle: `COUNT(*) FROM option_orders ... LIKE 'cond-%'` | **0** | **0** ✓ |
+| IOC no-liquidity: `... WHERE status IN ('open','partially_filled')` | **0** | **0** ✓ |
+| Schema: table `options_conditional_orders` exists | **true** | **true** ✓ |
+| Schema: indexes `idx_options_conditional_orders_{armed,account,series,oco}` exist | **all 4** | **all 4** ✓ |
+| Schema: `version` column exists | **true** | **true** ✓ |
+| Schema: `option_orders` UNIQUE INDEX `idx_option_orders_live_account_client_id` exists | **true** | **true** ✓ |
+| Stranded recovery (TP with real child_order_id): final status | **`completed`** | **`completed`** ✓ |
+| Stranded recovery (SL with NULL child_order_id): final status | **`armed`** | **`armed`** ✓ |
+| Armed-survives-reload: armed-row count for series after `drop(state_a) → pg_state(url)` | **2** | **2** ✓ |
+| Completed-never-retriggers: triggered count over 5 ticks after reload | **0** | **0** ✓ |
+| Child `time_in_force` (via `option_order_from_row`) | **`ioc`** | **`ioc`** ✓ |
+| Child `post_only` | **`false`** | **`false`** ✓ |
+| Child `reduce_only` (table default + service-side enforcement) | **`true`** | **`true`** ✓ |
+| Child `client_order_id` | **`cond-<conditional-id>`** | **matches** ✓ |
+| Child never rests (`status IN ('open','partially_filled')`) | **never** | **never** ✓ |
+| Position signed-fills invariant for HOLDER | **≥ 0** (no reversal) | **≥ 0** ✓ |
 
 ## Concurrency proof architecture
 
@@ -218,17 +219,28 @@ database.
 
 ## Bugs found and fixes applied
 
-In this follow-up milestone:
+Across the unlock + final-closure milestones:
 
-| # | Bug | Fix |
-|---|---|---|
-| 1 | `extract_dbname` python heredoc consumed stdin from the heredoc itself instead of the piped URL — name guard would always fail with "URL has no database path". | Replaced `python3 - <<'PY' … PY` with `python3 -c '…'` so the heredoc no longer interferes with stdin. Same fix applied to the SELF_MANAGED-mode URL substitution. |
-| 2 | Single-mode script could not be unblocked without granting CREATEDB. | Added PRECREATED_DB mode which never creates/drops, never sources `.env`, never echoes the URL. |
-| 3 | Both modes could run without operator confirmation. | Added `CONDITIONAL_PG_TEST_ALLOW_DISPOSABLE_DB=true` opt-in gate. |
-| 4 | Database-name guard previously checked only `prod_*`/`mainnet_*` prefixes (allow-by-default). | Switched to allow-LIST (`deopt_cond_proof_*` and `deopt_test_*` only). |
-| 5 | Inherited secrets could leak into the cargo test environment if a future test regression read them. | Pre-cargo unset of `EXECUTOR_PRIVATE_KEY`, `BUYER_PRIVATE_KEY`, `SELLER_PRIVATE_KEY`, `RPC_URL`, `ADMIN_BEARER_TOKEN`. |
+| # | Bug | Class | Fix |
+|---|---|---|---|
+| 1 | `extract_dbname` python heredoc consumed stdin from the heredoc itself, breaking the name guard with "URL has no database path". | Script | Switched to `python3 -c '…'` so the heredoc no longer interferes with stdin. |
+| 2 | Single-mode script could not be unblocked without granting CREATEDB. | Script | Added PRECREATED_DB mode. |
+| 3 | Both modes could run without operator confirmation. | Script | Added `CONDITIONAL_PG_TEST_ALLOW_DISPOSABLE_DB=true` opt-in gate. |
+| 4 | Database-name guard was a deny-list (allow-by-default). | Script | Switched to allow-list (`deopt_cond_proof_*`, `deopt_test_*`). |
+| 5 | Inherited secrets could leak into the cargo test environment. | Script | Pre-cargo `unset` of `EXECUTOR_PRIVATE_KEY`, `BUYER_PRIVATE_KEY`, `SELLER_PRIVATE_KEY`, `RPC_URL`, `ADMIN_BEARER_TOKEN`. |
+| 6 | First live run: 8 parallel `fresh_pg_repository(url).run_migrations()` calls serialised on the migration advisory lock, exhausting the pool with `PoolTimedOut`. | Test harness | Shared the migration via a `tokio::sync::OnceCell` so the migration chain runs exactly once per `cargo test` process. |
+| 7 | Cardinality assertions used global `WHERE client_order_id LIKE 'cond-%'`, so concurrent tests inflated each other's counts (`expected 1, got 3`). | Test harness | Scoped every SQL assertion by `option_series_id = $1`. |
+| 8 | Stranded-recovery PG-proof fixture set `child_order_id="stub-child"` — a non-existent `option_orders.order_id` — violating the FK on `options_conditional_orders.child_order_id`. | Test harness | Look up a real `order_id` from `option_orders` via parameterised query before staging. Did NOT weaken the FK constraint. |
+| 9 | `recover_stranded_triggering` was invoked inside every `evaluate_conditional_orders_tick*` call. Under concurrent ticks it raced with in-flight `trigger_one`: a worker could re-arm the row another worker had just claimed, causing the second worker's optimistic-lock UPDATE to fail with `InvalidConditionalOrderId` and (if a subsequent tick re-claimed the re-armed row) duplicate child submissions. | **Production** | Moved the recovery sweep to a ONE-SHOT call at worker startup (`spawn_conditional_orders_worker`). Direct callers (tests, ad-hoc operator action) still invoke `recover_stranded_triggering` explicitly. The `client_order_id="cond-<id>"` UNIQUE INDEX on `option_orders` remains the final defence against duplicate child submission on any retry path. |
+| 10 | OCO race test sharing ONE `PgRepository` pool (5 connections) was contention-bound, producing `PoolTimedOut`. The setup also did not mirror production posture where each worker process owns its own pool. | Test harness | Switched the race test to TWO independent `PgRepository` instances (two pools) — matches the real-world cross-process race. |
+| 11 | Tests shared a single 16-connection `OnceCell` raw-SQL pool; 8-test parallel suite produced extended `PoolTimedOut` on the shared pool. | Test harness | Switched `pool_handle` to per-test small (2-connection) `PgPool` instances that auto-drop at the end of the await chain. |
+| 12 | Stale leftover state from previous failed runs contaminated per-test position calculations because HOLDER/MAKER were global constants. | Test harness | Derived HOLDER and MAKER addresses from each test's tag (`per_test_holder("reduced")`, etc.), making every test's position fully isolated regardless of prior DB state. |
+| 13 | `recover_stranded_triggering` propagated `InvalidConditionalOrderId` from the optimistic-lock UPDATE when a concurrent actor (another test, another worker) mutated the row between read and write. | **Production** | Recovery now catches `InvalidConditionalOrderId` from `persist_recovered` and skips silently (other actor effectively recovered for us). Any OTHER error still bubbles up. |
 
-No bug in the conditional-orders system itself.
+**Two production bugs found** (#9 and #13). Both fixed without
+weakening any database constraint or any safety guarantee. The
+in-memory mirror is unaffected by either fix (it's single-threaded
+behind the AppState mutex, so neither race can manifest).
 
 ## Secret-rotation checklist (variable names only — never values)
 
@@ -342,7 +354,22 @@ subsystem CANNOT be declared closed until the operator runs the
 script in PRECREATED_DB mode against a real disposable database
 and the 8 tests report `8 executed / 8 passed / 0 skipped`.
 
-## Next recommendation — minimal operator command sequence
+## Cleanup result
+
+Operator cleanup remains to be performed by the operator (the
+runner script in PRECREATED_DB mode does NOT own the
+disposable database). Operator should run, when convenient:
+
+```sh
+sudo -u postgres psql -c \
+  "SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+   WHERE datname='deopt_cond_proof_final_01'
+     AND pid <> pg_backend_pid();"
+sudo -u postgres dropdb --if-exists deopt_cond_proof_final_01
+unset CONDITIONAL_PG_TEST_DATABASE_URL CONDITIONAL_PG_TEST_ALLOW_DISPOSABLE_DB
+```
+
+## Next recommendation — minimal operator command sequence (for future re-runs)
 
 The operator runs the following three commands in their own
 shell. The agent does NOT see the URL or the password.

@@ -136,4 +136,9 @@ pub enum BackendError {
     Config(String),
     #[error("persistence error: {0}")]
     Persistence(String),
+    // ACCOUNT-WRITE-AUTH-HARDENING-V1
+    #[error("{0}")]
+    WriteAuth(#[from] crate::auth::WriteAuthError),
+    #[error("perps not live")]
+    PerpsNotLive,
 }

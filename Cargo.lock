@@ -1184,6 +1184,7 @@ version = "0.1.0"
 dependencies = [
  "alloy-primitives",
  "alloy-sol-types",
+ "async-trait",
  "aws-config",
  "aws-sdk-kms",
  "aws-smithy-runtime-api",
@@ -1193,8 +1194,10 @@ dependencies = [
  "dotenvy",
  "futures",
  "k256",
+ "once_cell",
  "quinn",
  "quinn-proto",
+ "rand 0.8.6",
  "reqwest",
  "serde",
  "serde_json",

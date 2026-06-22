@@ -1,5 +1,7 @@
 use crate::admin::{AdminConfig, MetricsConfig};
 use crate::api::public_ws::PublicWsConfig;
+use crate::auth::write_authorization::memory_store::InMemoryChallengeStore;
+use crate::auth::WriteAuthChallengeStore;
 use crate::confirmation::ConfirmationConfig;
 use crate::db::PgRepository;
 use crate::engine::EngineState;
@@ -80,6 +82,14 @@ pub struct AppState {
     /// call site; rendered into Prometheus text by
     /// `crate::monitoring::render_metrics` and into the readiness JSON.
     pub broadcast_observability: Arc<crate::options::BroadcastObservability>,
+    /// ACCOUNT-WRITE-AUTH-HARDENING-V1 — persistent (or in-memory
+    /// fallback) store for write-authorization challenges. When
+    /// `repository` is `Some`, the PgRepository instance is also used
+    /// here so challenges survive restarts and are atomic across
+    /// concurrent processes. When no repository is configured, an
+    /// in-memory store is used (suitable for unit tests only — NOT a
+    /// production-safe replay-protection surface).
+    pub write_auth_challenges: Arc<dyn WriteAuthChallengeStore + Send + Sync>,
 }
 
 impl AppState {
@@ -214,6 +224,11 @@ impl AppState {
         fees_config: FeesConfig,
         chain_id: u64,
     ) -> Self {
+        let write_auth_challenges: Arc<dyn WriteAuthChallengeStore + Send + Sync> =
+            match repository.as_ref() {
+                Some(repo) => Arc::new(repo.clone()),
+                None => Arc::new(InMemoryChallengeStore::new()),
+            };
         Self {
             engine: Arc::new(Mutex::new(engine)),
             nonces: Arc::new(Mutex::new(NonceStore::new())),
@@ -257,6 +272,7 @@ impl AppState {
             local_test_fixtures: crate::api::local_test_fixtures::LocalTestFixturesConfig::disabled(
             ),
             local_test_intents: crate::api::local_test_fixtures::shared_store(),
+            write_auth_challenges,
         }
     }
 
@@ -325,6 +341,7 @@ impl AppState {
         );
         state.persistence_enabled = true;
         state.database_configured = true;
+        state.write_auth_challenges = Arc::new(repository.clone());
         state.repository = Some(repository);
         state
     }

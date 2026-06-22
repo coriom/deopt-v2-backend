@@ -1202,10 +1202,14 @@ where
     if !state.options_config.enabled {
         return Ok(result);
     }
-    // Phase 6 — drive any persisted Triggering rows to a terminal state
-    // BEFORE we touch the oracle. The recovery sweep is safe even when
-    // the oracle is unavailable: it never decides to fire a new order.
-    recover_stranded_triggering(state, now_ms()).await?;
+    // NOTE: `recover_stranded_triggering` is intentionally NOT called
+    // per-tick. The recovery sweep is a one-shot operation owned by
+    // the worker spawn (see `spawn_conditional_orders_worker`); calling
+    // it per-tick races with concurrent `trigger_one` invocations and
+    // can re-arm a row another worker is mid-execution on, causing the
+    // optimistic-lock UPDATE in that worker to fail with
+    // `InvalidConditionalOrderId` and (if a second tick reads the
+    // re-armed row) duplicate child submissions.
     let oracle_configured = state.trading_views.oracle_router_address.is_some();
     let Some(provider) = provider else {
         result.skipped_oracle_unavailable = true;
@@ -1309,12 +1313,10 @@ pub async fn evaluate_conditional_orders_tick_with_prices(
         return Ok(result);
     }
 
-    // Phase 6 — Case C recovery sweep. A row persisted as `Triggering`
-    // means the previous tick (or a previous backend lifetime) claimed
-    // it but did not reach a terminal state. The atomic claim plus the
-    // UNIQUE child `client_order_id` index protects against duplicate
-    // child orders; we just need to drive the row to a terminal state.
-    recover_stranded_triggering(state, now_ms()).await?;
+    // NOTE: `recover_stranded_triggering` is intentionally NOT called
+    // per-tick — see the matching comment in
+    // `evaluate_conditional_orders_tick`. Direct tests call
+    // `recover_stranded_triggering` explicitly when needed.
 
     let armed = list_conditional_orders(
         state,
@@ -1374,7 +1376,7 @@ pub async fn recover_stranded_triggering(
     .await?;
     let mut count = 0usize;
     for order in stranded {
-        if order.child_order_id.is_some() {
+        let recovered_row = if order.child_order_id.is_some() {
             // Child was submitted before the crash → finalise the
             // conditional row. We trust IOC semantics: the child has
             // already reached a terminal status.
@@ -1383,16 +1385,33 @@ pub async fn recover_stranded_triggering(
             finalised.completed_at_ms = Some(now);
             finalised.updated_at_ms = now;
             finalised.version = order.version.saturating_add(1);
-            persist_recovered(state, &finalised).await?;
+            finalised
         } else {
             // Re-arm so the next normal tick picks it up.
             let mut rearmed = order.clone();
             rearmed.status = ConditionalOrderStatus::Armed;
             rearmed.updated_at_ms = now;
             rearmed.version = order.version.saturating_add(1);
-            persist_recovered(state, &rearmed).await?;
+            rearmed
+        };
+        // Tolerate optimistic-lock conflicts: if another worker
+        // (or a concurrent test fixture) has already mutated the
+        // row since we read it, the recovery for this row is
+        // effectively done by that other actor — skip silently and
+        // keep sweeping the rest of the batch. Any OTHER error
+        // (network, persistence) still bubbles up.
+        match persist_recovered(state, &recovered_row).await {
+            Ok(()) => {
+                count += 1;
+            }
+            Err(BackendError::InvalidConditionalOrderId) => {
+                tracing::debug!(
+                    conditional_id = %order.id,
+                    "stranded recovery skipped (row mutated concurrently)"
+                );
+            }
+            Err(other) => return Err(other),
         }
-        count += 1;
     }
     Ok(count)
 }
@@ -1601,6 +1620,23 @@ pub fn spawn_conditional_orders_worker(state: AppState) {
     let provider = crate::execution::HttpJsonRpcProvider::new(rpc_url);
     let interval_ms = config.poll_interval_ms;
     tokio::spawn(async move {
+        // One-shot startup recovery sweep. Drives any
+        // `Triggering`-state rows left behind by a previous backend
+        // lifetime to a terminal state before the periodic tick loop
+        // begins. Doing this OUTSIDE the loop avoids racing with our
+        // own in-flight `trigger_one` invocations (which transiently
+        // leave a row in `Triggering` for the duration of a child
+        // submission).
+        match recover_stranded_triggering(&state, crate::types::now_ms()).await {
+            Ok(swept) => {
+                if swept > 0 {
+                    tracing::info!(swept, "conditional orders startup recovery");
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "conditional orders startup recovery failed");
+            }
+        }
         let mut ticker = tokio::time::interval(std::time::Duration::from_millis(interval_ms));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {

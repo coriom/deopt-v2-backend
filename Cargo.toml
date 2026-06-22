@@ -22,8 +22,11 @@ aws-smithy-types = { version = "1.2", optional = true, default-features = false 
 axum = { version = "0.7", features = ["ws"] }
 alloy-primitives = "0.7"
 alloy-sol-types = "0.7"
+async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde", "clock"] }
 dotenvy = "0.15"
+once_cell = "1"
+rand = "0.8"
 futures = { version = "0.3", default-features = false, features = ["std"] }
 k256 = { version = "0.13", features = ["ecdsa"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

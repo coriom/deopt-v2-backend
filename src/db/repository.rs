@@ -3877,6 +3877,308 @@ impl PgRepository {
             .await
             .map_err(|error| BackendError::Persistence(error.to_string()))
     }
+
+    // ===================================================================
+    // ACCOUNT-WRITE-AUTH-HARDENING-V1 — write_auth_challenges
+    // ===================================================================
+
+    pub async fn issue_write_auth_challenge(
+        &self,
+        record: &crate::auth::ChallengeRecord,
+    ) -> std::result::Result<(), crate::auth::WriteAuthError> {
+        let result = sqlx::query(
+            "INSERT INTO write_auth_challenges (
+                nonce_bytes, account, action, chain_id, issued_at_ms,
+                expires_at_ms, status, request_digest, idempotency_key,
+                resource_id, consumed_at_ms
+             ) VALUES (
+                $1, $2, $3, $4, $5,
+                $6, $7, $8, $9,
+                $10, $11
+             )",
+        )
+        .bind(record.nonce_bytes.as_slice())
+        .bind(record.account.0.to_lowercase())
+        .bind(record.action.as_str())
+        .bind(
+            u64_to_i64("chain_id", record.chain_id)
+                .map_err(|_| crate::auth::WriteAuthError::Persistence)?,
+        )
+        .bind(record.issued_at_ms)
+        .bind(record.expires_at_ms)
+        .bind(record.status.as_str())
+        .bind(record.request_digest.map(|d| d.to_vec()))
+        .bind(record.idempotency_key.as_deref())
+        .bind(record.resource_id.as_deref())
+        .bind(record.consumed_at_ms)
+        .execute(&self.pool)
+        .await;
+        match result {
+            Ok(_) => Ok(()),
+            Err(err) if is_unique_violation(&err) => {
+                Err(crate::auth::WriteAuthError::NonceAlreadyUsed)
+            }
+            Err(_) => Err(crate::auth::WriteAuthError::Persistence),
+        }
+    }
+
+    pub async fn count_outstanding_write_auth_challenges(
+        &self,
+        account: &AccountId,
+        action: crate::auth::WriteAuthAction,
+        now_ms: TimestampMs,
+    ) -> std::result::Result<usize, crate::auth::WriteAuthError> {
+        let row = sqlx::query(
+            "SELECT COUNT(*) AS outstanding
+             FROM write_auth_challenges
+             WHERE lower(account) = lower($1)
+               AND action = $2
+               AND status = 'issued'
+               AND expires_at_ms > $3",
+        )
+        .bind(&account.0)
+        .bind(action.as_str())
+        .bind(now_ms)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|_| crate::auth::WriteAuthError::Persistence)?;
+        let count: i64 = row
+            .try_get("outstanding")
+            .map_err(|_| crate::auth::WriteAuthError::Persistence)?;
+        Ok(count.max(0) as usize)
+    }
+
+    pub async fn claim_write_auth_challenge(
+        &self,
+        nonce_bytes: [u8; 32],
+        account: &AccountId,
+        action: crate::auth::WriteAuthAction,
+        chain_id: u64,
+        request_digest: [u8; 32],
+        _idempotency_key: Option<&str>,
+        now_ms: TimestampMs,
+    ) -> std::result::Result<
+        crate::auth::write_authorization::ClaimOutcome,
+        crate::auth::WriteAuthError,
+    > {
+        use crate::auth::write_authorization::ClaimOutcome;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| crate::auth::WriteAuthError::Persistence)?;
+
+        let row = sqlx::query(
+            "SELECT account, action, chain_id, expires_at_ms, status,
+                    request_digest, resource_id
+             FROM write_auth_challenges
+             WHERE nonce_bytes = $1
+             FOR UPDATE",
+        )
+        .bind(nonce_bytes.as_slice())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|_| crate::auth::WriteAuthError::Persistence)?;
+
+        let Some(row) = row else {
+            return Ok(ClaimOutcome::NotFound);
+        };
+
+        let stored_account: String = row
+            .try_get("account")
+            .map_err(|_| crate::auth::WriteAuthError::Persistence)?;
+        let stored_action: String = row
+            .try_get("action")
+            .map_err(|_| crate::auth::WriteAuthError::Persistence)?;
+        let stored_chain_id: i64 = row
+            .try_get("chain_id")
+            .map_err(|_| crate::auth::WriteAuthError::Persistence)?;
+        let expires_at_ms: i64 = row
+            .try_get("expires_at_ms")
+            .map_err(|_| crate::auth::WriteAuthError::Persistence)?;
+        let status: String = row
+            .try_get("status")
+            .map_err(|_| crate::auth::WriteAuthError::Persistence)?;
+        let prior_digest: Option<Vec<u8>> = row
+            .try_get("request_digest")
+            .map_err(|_| crate::auth::WriteAuthError::Persistence)?;
+        let resource_id: Option<String> = row
+            .try_get("resource_id")
+            .map_err(|_| crate::auth::WriteAuthError::Persistence)?;
+
+        if !stored_account.eq_ignore_ascii_case(&account.0)
+            || stored_action != action.as_str()
+            || u64::try_from(stored_chain_id).unwrap_or(0) != chain_id
+        {
+            return Ok(ClaimOutcome::NotFound);
+        }
+
+        if expires_at_ms <= now_ms {
+            sqlx::query("UPDATE write_auth_challenges SET status = 'expired' WHERE nonce_bytes = $1 AND status = 'issued'")
+                .bind(nonce_bytes.as_slice())
+                .execute(&mut *tx)
+                .await
+                .map_err(|_| crate::auth::WriteAuthError::Persistence)?;
+            tx.commit()
+                .await
+                .map_err(|_| crate::auth::WriteAuthError::Persistence)?;
+            return Ok(ClaimOutcome::Expired);
+        }
+
+        match status.as_str() {
+            "issued" => {
+                sqlx::query(
+                    "UPDATE write_auth_challenges
+                     SET status = 'consumed',
+                         request_digest = $2,
+                         consumed_at_ms = $3
+                     WHERE nonce_bytes = $1
+                       AND status = 'issued'",
+                )
+                .bind(nonce_bytes.as_slice())
+                .bind(request_digest.to_vec())
+                .bind(now_ms)
+                .execute(&mut *tx)
+                .await
+                .map_err(|_| crate::auth::WriteAuthError::Persistence)?;
+                tx.commit()
+                    .await
+                    .map_err(|_| crate::auth::WriteAuthError::Persistence)?;
+                Ok(ClaimOutcome::Fresh)
+            }
+            "consumed" => {
+                tx.commit()
+                    .await
+                    .map_err(|_| crate::auth::WriteAuthError::Persistence)?;
+                if prior_digest.as_deref() == Some(request_digest.as_slice()) {
+                    Ok(ClaimOutcome::IdempotentReplay { resource_id })
+                } else {
+                    Ok(ClaimOutcome::PayloadMismatch)
+                }
+            }
+            _ => {
+                tx.commit()
+                    .await
+                    .map_err(|_| crate::auth::WriteAuthError::Persistence)?;
+                Ok(ClaimOutcome::Expired)
+            }
+        }
+    }
+
+    pub async fn lookup_write_auth_idempotent_result(
+        &self,
+        account: &AccountId,
+        action: crate::auth::WriteAuthAction,
+        idempotency_key: &str,
+    ) -> std::result::Result<Option<String>, crate::auth::WriteAuthError> {
+        let row = sqlx::query(
+            "SELECT resource_id
+             FROM write_auth_challenges
+             WHERE lower(account) = lower($1)
+               AND action = $2
+               AND idempotency_key = $3
+               AND status = 'consumed'
+               AND resource_id IS NOT NULL
+             LIMIT 1",
+        )
+        .bind(&account.0)
+        .bind(action.as_str())
+        .bind(idempotency_key)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|_| crate::auth::WriteAuthError::Persistence)?;
+        if let Some(row) = row {
+            Ok(row
+                .try_get("resource_id")
+                .map_err(|_| crate::auth::WriteAuthError::Persistence)?)
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub async fn attach_write_auth_resource(
+        &self,
+        nonce_bytes: [u8; 32],
+        resource_id: &str,
+    ) -> std::result::Result<(), crate::auth::WriteAuthError> {
+        sqlx::query(
+            "UPDATE write_auth_challenges
+             SET resource_id = $2
+             WHERE nonce_bytes = $1
+               AND status = 'consumed'
+               AND resource_id IS NULL",
+        )
+        .bind(nonce_bytes.as_slice())
+        .bind(resource_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|_| crate::auth::WriteAuthError::Persistence)?;
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::auth::WriteAuthChallengeStore for PgRepository {
+    async fn issue(
+        &self,
+        record: crate::auth::ChallengeRecord,
+    ) -> std::result::Result<(), crate::auth::WriteAuthError> {
+        self.issue_write_auth_challenge(&record).await
+    }
+
+    async fn count_outstanding(
+        &self,
+        account: &AccountId,
+        action: crate::auth::WriteAuthAction,
+        now_ms: TimestampMs,
+    ) -> std::result::Result<usize, crate::auth::WriteAuthError> {
+        self.count_outstanding_write_auth_challenges(account, action, now_ms)
+            .await
+    }
+
+    async fn claim(
+        &self,
+        nonce_bytes: [u8; 32],
+        account: &AccountId,
+        action: crate::auth::WriteAuthAction,
+        chain_id: u64,
+        request_digest: [u8; 32],
+        idempotency_key: Option<&str>,
+        now_ms: TimestampMs,
+    ) -> std::result::Result<
+        crate::auth::write_authorization::ClaimOutcome,
+        crate::auth::WriteAuthError,
+    > {
+        self.claim_write_auth_challenge(
+            nonce_bytes,
+            account,
+            action,
+            chain_id,
+            request_digest,
+            idempotency_key,
+            now_ms,
+        )
+        .await
+    }
+
+    async fn lookup_idempotent_result(
+        &self,
+        account: &AccountId,
+        action: crate::auth::WriteAuthAction,
+        idempotency_key: &str,
+    ) -> std::result::Result<Option<String>, crate::auth::WriteAuthError> {
+        self.lookup_write_auth_idempotent_result(account, action, idempotency_key)
+            .await
+    }
+
+    async fn attach_resource(
+        &self,
+        nonce_bytes: [u8; 32],
+        resource_id: &str,
+    ) -> std::result::Result<(), crate::auth::WriteAuthError> {
+        self.attach_write_auth_resource(nonce_bytes, resource_id)
+            .await
+    }
 }
 
 impl ExecutionIntentRepository for PgRepository {

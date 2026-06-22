@@ -1,7 +1,12 @@
 use super::AppState;
 use crate::admin::{authenticate, require_role, required_role_for, AdminAuthError, AdminIdentity};
-use crate::api::dto::{
-    parse_fixed_u128, ApiEngineEvent, ApiExecutionIntent, SubmitOrderRequest, SubmitOrderResponse,
+use crate::api::dto::{parse_fixed_u128, ApiEngineEvent, ApiExecutionIntent, SubmitOrderResponse};
+use crate::auth::write_authorization::{
+    generate_nonce, nonce_to_hex, parse_nonce_hex, verify_and_claim, AuthorizationEnvelope,
+    CanonicalValue, ChallengeRecord, ChallengeStatus, WriteAuthAction, WriteAuthError,
+    DEFAULT_CHALLENGE_TTL_MS, MAX_OUTSTANDING_CHALLENGES_PER_ACCOUNT_ACTION,
+    WRITE_AUTH_DOMAIN_CHAIN_ID, WRITE_AUTH_DOMAIN_NAME, WRITE_AUTH_DOMAIN_SALT,
+    WRITE_AUTH_DOMAIN_VERSION,
 };
 use crate::confirmation::{
     decide_confirmation, ConfirmationDecision, ConfirmationDecisionInput, ConfirmationStatus,
@@ -13,8 +18,8 @@ use crate::execution::{
     perp_trade_digest, simulate_execution_intent, DecodedRevertError, ExecutionIntentStatus,
     ExecutionTransaction, ExecutionTransactionStatus, Executor, ExecutorSigner,
     HttpJsonRpcProvider, PerpTradeDomain, PerpTradePayload, SimulationResult,
-    StoredTradeSignatures, TradeSignatureStatus, TransactionBroadcastProvider,
-    TransactionReceiptProvider, PERP_TRADE_TYPE,
+    StoredTradeSignatures, TransactionBroadcastProvider, TransactionReceiptProvider,
+    PERP_TRADE_TYPE,
 };
 use crate::fees::service::{
     admin_fee_events as admin_fee_events_service, admin_fee_rebates as admin_fee_rebates_service,
@@ -76,24 +81,19 @@ use crate::options::{
     OptionRfqQuoteStatus, OptionRfqRequest, OptionRfqStatus, OptionSeries, OptionSeriesFilter,
     OptionSeriesStatus, OPTION_EVENT_INDEXER_STATE_ID, OPTION_RFQ_QUOTE_TYPE, OPTION_TRADE_TYPE,
 };
-use crate::orders::service::{
-    cancel_order as cancel_order_shared, submit_response_from_events, submit_signed_order,
-    CancelOrderInput,
-};
+// ACCOUNT-WRITE-AUTH-HARDENING-V1: perp order service is gated until perps go live.
 use crate::reconciliation::{
     decide_direct_reconciliation, DirectReconciliationInput, ExecutionReconciliation,
     ReconciliationCounts, ReconciliationStatus, ReconciliationTickResult,
 };
 use crate::rfq::service::{
-    accept_quote as accept_rfq_quote, cancel_rfq as cancel_rfq_service,
-    create_rfq as create_rfq_service, get_rfq as get_rfq_service,
-    list_quotes as list_rfq_quotes_service, list_rfqs as list_rfqs_service,
-    quote_signing_payload as rfq_quote_signing_payload, submit_quote as submit_rfq_quote,
-    AcceptQuoteOutcome, CreateRfqInput, QuoteSigningPayloadInput, SubmitQuoteInput,
+    get_rfq as get_rfq_service, list_quotes as list_rfq_quotes_service,
+    list_rfqs as list_rfqs_service, quote_signing_payload as rfq_quote_signing_payload,
+    AcceptQuoteOutcome, QuoteSigningPayloadInput,
 };
 use crate::rfq::{
-    parse_quote_id, parse_rfq_id, rfq_id_to_hex_bytes32, RfqQuote, RfqQuoteSignatureStatus,
-    RfqQuoteStatus, RfqRequest, RfqStatus, RFQ_QUOTE_TYPE,
+    parse_rfq_id, rfq_id_to_hex_bytes32, RfqQuote, RfqQuoteSignatureStatus, RfqQuoteStatus,
+    RfqRequest, RfqStatus, RFQ_QUOTE_TYPE,
 };
 use crate::types::TimeInForce;
 use crate::types::{now_ms, AccountId, MarketId, OrderId, Side, TimestampMs};
@@ -563,6 +563,8 @@ pub fn router(state: AppState) -> Router {
             "/trading/test/tx-status/:intent_id",
             get(crate::api::local_test_fixtures::get_local_test_tx_status),
         )
+        // ACCOUNT-WRITE-AUTH-HARDENING-V1
+        .route("/auth/write-challenges", post(issue_write_auth_challenge))
         .layer(axum::middleware::from_fn_with_state(
             gate_state,
             admin_route_gate,
@@ -2061,7 +2063,7 @@ struct ListOptionSeriesQuery {
     status: Option<OptionSeriesStatus>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct SubmitOptionOrderRequest {
     option_series_id: String,
     account: AccountId,
@@ -2075,6 +2077,7 @@ struct SubmitOptionOrderRequest {
     nonce: Option<u64>,
     deadline_ms: Option<i64>,
     signature: Option<String>,
+    authorization: AuthorizationEnvelope,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
@@ -2092,7 +2095,7 @@ struct ListOptionFillsQuery {
     order_id: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct CreateOptionRfqRequest {
     taker: AccountId,
     option_series_id: String,
@@ -2100,9 +2103,10 @@ struct CreateOptionRfqRequest {
     size_1e8: String,
     limit_price_1e8: Option<String>,
     ttl_ms: Option<u64>,
+    authorization: AuthorizationEnvelope,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct SubmitOptionRfqQuoteRequest {
     mm_account: AccountId,
     session_id: Option<String>,
@@ -2112,6 +2116,7 @@ struct SubmitOptionRfqQuoteRequest {
     quote_nonce: Option<u64>,
     quote_ttl_ms: Option<u64>,
     signature: Option<String>,
+    authorization: AuthorizationEnvelope,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -2534,10 +2539,13 @@ struct OptionExecutionSigningPayloadMessage {
     deadline: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct SubmitOptionExecutionSignaturesRequest {
+    submitter: AccountId,
+    role: String,
     buyer_signature: Option<String>,
     seller_signature: Option<String>,
+    authorization: AuthorizationEnvelope,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -2738,6 +2746,24 @@ async fn submit_option_order(
     State(state): State<AppState>,
     Json(request): Json<SubmitOptionOrderRequest>,
 ) -> Result<Json<SubmitOptionOrderResponse>, ApiError> {
+    let canonical = canonical_option_order_submit(&request);
+    let verified = require_write_auth(
+        &state,
+        WriteAuthAction::OptionOrderSubmit,
+        &request.account,
+        &canonical,
+        &request.authorization,
+    )
+    .await?;
+    if let Some(resource_id) = verified.idempotent_resource_id.as_deref() {
+        let order_id = parse_option_order_id(resource_id)?;
+        let order = get_option_order_service(&state, order_id).await?;
+        let fills = get_option_order_fills_service(&state, order_id).await?;
+        return Ok(Json(SubmitOptionOrderResponse {
+            order: order.into(),
+            fills: fills.into_iter().map(OptionFillResponse::from).collect(),
+        }));
+    }
     let outcome = submit_option_order_service(
         &state,
         SubmitOptionOrderInput {
@@ -2755,6 +2781,8 @@ async fn submit_option_order(
         },
     )
     .await?;
+    let resource_id = outcome.order.order_id.to_string();
+    attach_resource_best_effort(&state, &request.authorization.nonce, &resource_id).await;
     Ok(Json(SubmitOptionOrderResponse {
         order: outcome.order.into(),
         fills: outcome
@@ -2804,6 +2832,7 @@ struct CreateConditionalOrderBody {
     link_as_oco: bool,
     #[serde(default)]
     expires_at_ms: Option<i64>,
+    authorization: AuthorizationEnvelope,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -2871,6 +2900,16 @@ async fn create_conditional_order_route(
     Json(body): Json<CreateConditionalOrderBody>,
 ) -> Result<Json<Vec<ConditionalOrderResponseDto>>, ApiError> {
     use crate::options::conditional_orders as cond;
+    let account = AccountId::new(address);
+    let canonical = canonical_conditional_order_create(&account, &body);
+    let _verified = require_write_auth(
+        &state,
+        WriteAuthAction::ConditionalOrderCreate,
+        &account,
+        &canonical,
+        &body.authorization,
+    )
+    .await?;
     let mut leg_inputs = Vec::with_capacity(body.legs.len());
     for leg in &body.legs {
         leg_inputs.push(cond::ConditionalLegInput {
@@ -2881,7 +2920,7 @@ async fn create_conditional_order_route(
         });
     }
     let input = cond::CreateConditionalOrderInput {
-        account: AccountId::new(address),
+        account: account.clone(),
         option_series_id: body.option_series_id,
         quantity_1e8: parse_fixed_u128("quantity_1e8", &body.quantity_1e8)?,
         legs: leg_inputs,
@@ -2889,6 +2928,9 @@ async fn create_conditional_order_route(
         expires_at_ms: body.expires_at_ms,
     };
     let created = cond::create_conditional_orders(&state, input).await?;
+    if let Some(first) = created.first() {
+        attach_resource_best_effort(&state, &body.authorization.nonce, &first.id.to_string()).await;
+    }
     Ok(Json(
         created
             .into_iter()
@@ -2937,12 +2979,22 @@ async fn get_conditional_order_route(
 async fn cancel_conditional_order_route(
     State(state): State<AppState>,
     Path((address, id)): Path<(String, String)>,
+    Json(body): Json<AuthorizationOnlyBody>,
 ) -> Result<Json<ConditionalOrderResponseDto>, ApiError> {
     use crate::options::conditional_orders as cond;
-    let id = uuid::Uuid::parse_str(&id)
+    let parsed_id = uuid::Uuid::parse_str(&id)
         .map_err(|_| ApiError::from(BackendError::InvalidConditionalOrderId))?;
     let account = AccountId::new(address);
-    let cancelled = cond::cancel_conditional_order(&state, id, &account).await?;
+    let canonical = canonical_conditional_order_cancel(&account, &id);
+    let _verified = require_write_auth(
+        &state,
+        WriteAuthAction::ConditionalOrderCancel,
+        &account,
+        &canonical,
+        &body.authorization,
+    )
+    .await?;
+    let cancelled = cond::cancel_conditional_order(&state, parsed_id, &account).await?;
     Ok(Json(cancelled.into()))
 }
 
@@ -3024,10 +3076,22 @@ async fn get_option_order_fills(
 async fn cancel_option_order(
     State(state): State<AppState>,
     Path(order_id): Path<String>,
+    Json(body): Json<AuthorizationOnlyBody>,
 ) -> Result<Json<OptionOrderResponse>, ApiError> {
-    let order_id = parse_option_order_id(&order_id)?;
+    let parsed_id = parse_option_order_id(&order_id)?;
+    // Bind the cancel to the order owner; reject if signer != owner.
+    let order = get_option_order_service(&state, parsed_id).await?;
+    let canonical = canonical_option_order_cancel(&order.account, &order_id);
+    let _verified = require_write_auth(
+        &state,
+        WriteAuthAction::OptionOrderCancel,
+        &order.account,
+        &canonical,
+        &body.authorization,
+    )
+    .await?;
     Ok(Json(
-        cancel_option_order_service(&state, order_id).await?.into(),
+        cancel_option_order_service(&state, parsed_id).await?.into(),
     ))
 }
 
@@ -3101,10 +3165,58 @@ async fn submit_option_execution_signatures(
     Path(intent_id): Path<String>,
     Json(request): Json<SubmitOptionExecutionSignaturesRequest>,
 ) -> Result<Json<SubmitOptionExecutionSignaturesResponse>, ApiError> {
-    let intent_id = parse_option_execution_intent_id(&intent_id)?;
+    let parsed_intent_id = parse_option_execution_intent_id(&intent_id)?;
+    // Look up the intent so we can verify the submitter is buyer/seller
+    // and that the role they declared matches.
+    let intent = get_option_execution_intent_service(&state, parsed_intent_id).await?;
+    let role = request.role.to_ascii_lowercase();
+    let (expected_account, signature_should_be_present) = match role.as_str() {
+        "buyer" => (intent.buyer.clone(), request.buyer_signature.is_some()),
+        "seller" => (intent.seller.clone(), request.seller_signature.is_some()),
+        _ => {
+            return Err(ApiError::from(BackendError::WriteAuth(
+                WriteAuthError::ActionMismatch,
+            )));
+        }
+    };
+    if !request
+        .submitter
+        .0
+        .eq_ignore_ascii_case(&expected_account.0)
+    {
+        return Err(ApiError::from(BackendError::WriteAuth(
+            WriteAuthError::SignerMismatch,
+        )));
+    }
+    if !signature_should_be_present {
+        return Err(ApiError::from(BackendError::WriteAuth(
+            WriteAuthError::PayloadMismatch,
+        )));
+    }
+    // Reject submitting the OTHER party's signature in the same call —
+    // each request carries one role's authorization.
+    let cross_role_present = match role.as_str() {
+        "buyer" => request.seller_signature.is_some(),
+        _ => request.buyer_signature.is_some(),
+    };
+    if cross_role_present {
+        return Err(ApiError::from(BackendError::WriteAuth(
+            WriteAuthError::PayloadMismatch,
+        )));
+    }
+    let canonical =
+        canonical_option_execution_intent_signature_submit(&request.submitter, &intent_id, &role);
+    let _verified = require_write_auth(
+        &state,
+        WriteAuthAction::OptionExecutionIntentSignatureSubmit,
+        &request.submitter,
+        &canonical,
+        &request.authorization,
+    )
+    .await?;
     let outcome = submit_option_execution_signatures_service(
         &state,
-        intent_id,
+        parsed_intent_id,
         SubmitOptionExecutionSignaturesInput {
             buyer_signature: request.buyer_signature,
             seller_signature: request.seller_signature,
@@ -3221,6 +3333,15 @@ async fn create_option_rfq(
     State(state): State<AppState>,
     Json(request): Json<CreateOptionRfqRequest>,
 ) -> Result<Json<OptionRfqResponse>, ApiError> {
+    let canonical = canonical_option_rfq_create(&request);
+    let _verified = require_write_auth(
+        &state,
+        WriteAuthAction::OptionRfqCreate,
+        &request.taker,
+        &canonical,
+        &request.authorization,
+    )
+    .await?;
     let rfq = create_option_rfq_service(
         &state,
         CreateOptionRfqInput {
@@ -3237,6 +3358,12 @@ async fn create_option_rfq(
         },
     )
     .await?;
+    attach_resource_best_effort(
+        &state,
+        &request.authorization.nonce,
+        &rfq.option_rfq_id.to_string(),
+    )
+    .await;
     Ok(Json(rfq.into()))
 }
 
@@ -3311,10 +3438,19 @@ async fn submit_option_rfq_quote(
     Path(option_rfq_id): Path<String>,
     Json(request): Json<SubmitOptionRfqQuoteRequest>,
 ) -> Result<Json<OptionRfqQuoteResponse>, ApiError> {
-    let option_rfq_id = parse_option_rfq_id(&option_rfq_id)?;
+    let parsed_rfq_id = parse_option_rfq_id(&option_rfq_id)?;
+    let canonical = canonical_option_rfq_quote_submit(&option_rfq_id, &request);
+    let _verified = require_write_auth(
+        &state,
+        WriteAuthAction::OptionRfqQuoteSubmit,
+        &request.mm_account,
+        &canonical,
+        &request.authorization,
+    )
+    .await?;
     let quote = submit_option_rfq_quote_service(
         &state,
-        option_rfq_id,
+        parsed_rfq_id,
         SubmitOptionRfqQuoteInput {
             mm_account: request.mm_account,
             session_id: request.session_id,
@@ -3327,6 +3463,12 @@ async fn submit_option_rfq_quote(
         },
     )
     .await?;
+    attach_resource_best_effort(
+        &state,
+        &request.authorization.nonce,
+        &quote.quote_id.to_string(),
+    )
+    .await;
     Ok(Json(quote.into()))
 }
 
@@ -3347,10 +3489,22 @@ async fn list_option_rfq_quotes(
 async fn accept_option_rfq_quote(
     State(state): State<AppState>,
     Path((option_rfq_id, quote_id)): Path<(String, String)>,
+    Json(body): Json<AuthorizationOnlyBody>,
 ) -> Result<Json<AcceptOptionRfqQuoteResponse>, ApiError> {
-    let option_rfq_id = parse_option_rfq_id(&option_rfq_id)?;
-    let quote_id = parse_option_rfq_quote_id(&quote_id)?;
-    let outcome = accept_option_rfq_quote_service(&state, option_rfq_id, quote_id).await?;
+    let parsed_rfq_id = parse_option_rfq_id(&option_rfq_id)?;
+    let parsed_quote_id = parse_option_rfq_quote_id(&quote_id)?;
+    // Resolve taker from the RFQ and require their signature.
+    let rfq = get_option_rfq_service(&state, parsed_rfq_id).await?;
+    let canonical = canonical_option_rfq_accept(&rfq.taker, &option_rfq_id, &quote_id);
+    let _verified = require_write_auth(
+        &state,
+        WriteAuthAction::OptionRfqAccept,
+        &rfq.taker,
+        &canonical,
+        &body.authorization,
+    )
+    .await?;
+    let outcome = accept_option_rfq_quote_service(&state, parsed_rfq_id, parsed_quote_id).await?;
     let option_fill_id = outcome.fill.fill_id.to_string();
     Ok(Json(AcceptOptionRfqQuoteResponse {
         option_rfq_id: outcome.rfq.option_rfq_id.to_string(),
@@ -3367,22 +3521,34 @@ async fn accept_option_rfq_quote(
 async fn cancel_option_rfq(
     State(state): State<AppState>,
     Path(option_rfq_id): Path<String>,
+    Json(body): Json<AuthorizationOnlyBody>,
 ) -> Result<Json<OptionRfqResponse>, ApiError> {
-    let option_rfq_id = parse_option_rfq_id(&option_rfq_id)?;
+    let parsed_rfq_id = parse_option_rfq_id(&option_rfq_id)?;
+    let rfq = get_option_rfq_service(&state, parsed_rfq_id).await?;
+    let canonical = canonical_option_rfq_cancel(&rfq.taker, &option_rfq_id);
+    let _verified = require_write_auth(
+        &state,
+        WriteAuthAction::OptionRfqCancel,
+        &rfq.taker,
+        &canonical,
+        &body.authorization,
+    )
+    .await?;
     Ok(Json(
-        cancel_option_rfq_service(&state, option_rfq_id)
+        cancel_option_rfq_service(&state, parsed_rfq_id)
             .await?
             .into(),
     ))
 }
 
+/// ACCOUNT-WRITE-AUTH-HARDENING-V1 — perps are non-live. Every public
+/// perp mutation route fails closed before reaching business logic or
+/// persistence. A follow-up milestone (`ACCOUNT-WRITE-AUTH-HARDENING-PERPS-V1`)
+/// enables mandatory write authorization when the perp engine becomes live.
 async fn submit_order(
-    State(state): State<AppState>,
-    Json(request): Json<SubmitOrderRequest>,
+    State(_state): State<AppState>,
 ) -> Result<Json<SubmitOrderResponse>, ApiError> {
-    let signed_order = request.into_signed_order()?;
-    let outcome = submit_signed_order(&state, signed_order).await?;
-    Ok(Json(submit_response_from_events(outcome.events)))
+    Err(BackendError::PerpsNotLive.into())
 }
 
 async fn account_perp_nonce(
@@ -3434,37 +3600,11 @@ struct CancelOrderResponse {
 }
 
 async fn cancel_order(
-    State(state): State<AppState>,
-    Path(order_id): Path<String>,
+    State(_state): State<AppState>,
+    Path(_order_id): Path<String>,
 ) -> Result<Json<CancelOrderResponse>, ApiError> {
-    let order_id = OrderId::from_str(&order_id).map_err(|_| BackendError::InvalidOrderId)?;
-    let outcome = cancel_order_shared(
-        &state,
-        CancelOrderInput {
-            account: None,
-            market_id: None,
-            order_id: Some(order_id),
-            client_order_id: None,
-        },
-    )
-    .await?;
-    let Some(event) = outcome.events.into_iter().next() else {
-        return Err(ApiError::internal());
-    };
-    Ok(Json(CancelOrderResponse {
-        status: "cancelled".to_string(),
-        event: event.into(),
-    }))
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
-struct CreateRfqRequest {
-    taker: AccountId,
-    market_id: MarketId,
-    side: Side,
-    size_1e8: String,
-    limit_price_1e8: Option<String>,
-    ttl_ms: Option<u64>,
+    // Perps non-live; see `submit_order` for context.
+    Err(BackendError::PerpsNotLive.into())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -3502,28 +3642,8 @@ impl From<RfqRequest> for RfqResponse {
     }
 }
 
-async fn create_rfq(
-    State(state): State<AppState>,
-    Json(request): Json<CreateRfqRequest>,
-) -> Result<Json<RfqResponse>, ApiError> {
-    let limit_price_1e8 = request
-        .limit_price_1e8
-        .as_deref()
-        .map(|value| parse_fixed_u128("limit_price_1e8", value))
-        .transpose()?;
-    let rfq = create_rfq_service(
-        &state,
-        CreateRfqInput {
-            taker: request.taker,
-            market_id: request.market_id,
-            side: request.side,
-            size_1e8: parse_fixed_u128("size_1e8", &request.size_1e8)?,
-            limit_price_1e8,
-            ttl_ms: request.ttl_ms,
-        },
-    )
-    .await?;
-    Ok(Json(rfq.into()))
+async fn create_rfq(State(_state): State<AppState>) -> Result<Json<RfqResponse>, ApiError> {
+    Err(BackendError::PerpsNotLive.into())
 }
 
 async fn list_rfqs(State(state): State<AppState>) -> Result<Json<Vec<RfqResponse>>, ApiError> {
@@ -3545,17 +3665,6 @@ async fn get_rfq(
             .await?
             .into(),
     ))
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
-struct SubmitQuoteRequest {
-    mm_account: AccountId,
-    price_1e8: String,
-    size_1e8: String,
-    client_quote_id: Option<String>,
-    quote_nonce: Option<u64>,
-    quote_ttl_ms: u64,
-    signature: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -3688,26 +3797,10 @@ async fn rfq_quote_payload(
 }
 
 async fn submit_quote(
-    State(state): State<AppState>,
-    Path(rfq_id): Path<String>,
-    Json(request): Json<SubmitQuoteRequest>,
+    State(_state): State<AppState>,
+    Path(_rfq_id): Path<String>,
 ) -> Result<Json<RfqQuoteResponse>, ApiError> {
-    let quote = submit_rfq_quote(
-        &state,
-        SubmitQuoteInput {
-            rfq_id: parse_rfq_id(&rfq_id)?,
-            mm_account: request.mm_account,
-            session_id: None,
-            client_quote_id: request.client_quote_id,
-            price_1e8: parse_fixed_u128("price_1e8", &request.price_1e8)?,
-            size_1e8: parse_fixed_u128("size_1e8", &request.size_1e8)?,
-            quote_nonce: request.quote_nonce,
-            quote_ttl_ms: request.quote_ttl_ms,
-            signature: request.signature,
-        },
-    )
-    .await?;
-    Ok(Json(quote.into()))
+    Err(BackendError::PerpsNotLive.into())
 }
 
 async fn list_quotes(
@@ -3749,25 +3842,17 @@ impl From<AcceptQuoteOutcome> for AcceptQuoteResponse {
 }
 
 async fn accept_quote(
-    State(state): State<AppState>,
-    Path((rfq_id, quote_id)): Path<(String, String)>,
+    State(_state): State<AppState>,
+    Path((_rfq_id, _quote_id)): Path<(String, String)>,
 ) -> Result<Json<AcceptQuoteResponse>, ApiError> {
-    Ok(Json(
-        accept_rfq_quote(&state, parse_rfq_id(&rfq_id)?, parse_quote_id(&quote_id)?)
-            .await?
-            .into(),
-    ))
+    Err(BackendError::PerpsNotLive.into())
 }
 
 async fn cancel_rfq(
-    State(state): State<AppState>,
-    Path(rfq_id): Path<String>,
+    State(_state): State<AppState>,
+    Path(_rfq_id): Path<String>,
 ) -> Result<Json<RfqResponse>, ApiError> {
-    Ok(Json(
-        cancel_rfq_service(&state, parse_rfq_id(&rfq_id)?)
-            .await?
-            .into(),
-    ))
+    Err(BackendError::PerpsNotLive.into())
 }
 
 async fn execution_intents(
@@ -3867,12 +3952,6 @@ async fn execution_intent_signing_payload(
     }))
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
-struct SubmitTradeSignaturesRequest {
-    buyer_sig: Option<String>,
-    seller_sig: Option<String>,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 struct SubmitTradeSignaturesResponse {
     intent_id: Uuid,
@@ -3883,38 +3962,11 @@ struct SubmitTradeSignaturesResponse {
 }
 
 async fn submit_execution_intent_signatures(
-    State(state): State<AppState>,
-    Path(intent_id): Path<String>,
-    Json(request): Json<SubmitTradeSignaturesRequest>,
+    State(_state): State<AppState>,
+    Path(_intent_id): Path<String>,
 ) -> Result<Json<SubmitTradeSignaturesResponse>, ApiError> {
-    let intent_id = parse_uuid(&intent_id)?;
-    let intent = get_execution_intent(&state, intent_id).await?;
-    let signatures =
-        upsert_trade_signatures(&state, intent_id, request.buyer_sig, request.seller_sig).await?;
-
-    let status = TradeSignatureStatus::from(&signatures);
-    if status.calldata_ready {
-        let payload = intent.perp_trade_payload()?;
-        let bundle = signatures
-            .bundle()?
-            .ok_or(BackendError::MissingTradeSignatures)?;
-        crate::execution::build_perp_execution_call(
-            &state.execution_config.perp_matching_engine_address,
-            intent_id,
-            &payload,
-            Some(&bundle),
-        )?;
-        update_execution_intent_status(&state, intent_id, ExecutionIntentStatus::CalldataReady)
-            .await?;
-    }
-
-    Ok(Json(SubmitTradeSignaturesResponse {
-        intent_id,
-        buyer_signature_present: status.buyer_signature_present,
-        seller_signature_present: status.seller_signature_present,
-        calldata_ready: status.calldata_ready,
-        missing_signatures: status.missing_signatures,
-    }))
+    // Perps non-live; see `submit_order` for context.
+    Err(BackendError::PerpsNotLive.into())
 }
 
 async fn executor_status(State(state): State<AppState>) -> Json<crate::execution::ExecutionStatus> {
@@ -5008,27 +5060,6 @@ async fn get_execution_intent(
         .into_iter()
         .find(|intent| intent.intent_id == intent_id)
         .ok_or(BackendError::InvalidExecutionIntentId)
-}
-
-async fn upsert_trade_signatures(
-    state: &AppState,
-    intent_id: Uuid,
-    buyer_sig: Option<String>,
-    seller_sig: Option<String>,
-) -> BackendResult<StoredTradeSignatures> {
-    if let Some(repository) = state.repository.clone() {
-        return repository
-            .upsert_execution_intent_signatures(intent_id, buyer_sig, seller_sig, now_ms())
-            .await;
-    }
-
-    let mut signatures = state
-        .trade_signatures
-        .lock()
-        .map_err(|_| BackendError::Config("signature store lock poisoned".to_string()))?;
-    let entry = signatures.entry(intent_id).or_default();
-    entry.upsert(buyer_sig, seller_sig)?;
-    Ok(entry.clone())
 }
 
 async fn get_trade_signatures(
@@ -10057,6 +10088,484 @@ fn perp_trade_type_fields() -> Vec<SigningPayloadTypeField> {
     ]
 }
 
+// ===========================================================================
+// ACCOUNT-WRITE-AUTH-HARDENING-V1 — challenge issuance + per-route authorization helpers
+// ===========================================================================
+
+#[derive(Clone, Debug, Deserialize)]
+struct IssueWriteAuthChallengeRequest {
+    account: AccountId,
+    action: String,
+    #[serde(default)]
+    idempotency_key: Option<String>,
+}
+
+/// Body shape for cancel/cancel-group routes where no business fields
+/// exist beyond the route's path params. The authorization envelope is
+/// the only payload.
+#[derive(Clone, Debug, Deserialize)]
+struct AuthorizationOnlyBody {
+    authorization: AuthorizationEnvelope,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct IssueWriteAuthChallengeResponse {
+    nonce: String,
+    deadline_ms: i64,
+    chain_id: u64,
+    action: String,
+    domain: WriteAuthDomainResponse,
+    primary_type: &'static str,
+    types: WriteAuthTypesResponse,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct WriteAuthDomainResponse {
+    name: &'static str,
+    version: &'static str,
+    #[serde(rename = "chainId")]
+    chain_id: u64,
+    salt: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct WriteAuthTypesResponse {
+    #[serde(rename = "EIP712Domain")]
+    eip712_domain: Vec<SigningPayloadTypeField>,
+    #[serde(rename = "WriteAuthorization")]
+    write_authorization: Vec<SigningPayloadTypeField>,
+}
+
+fn write_auth_domain_response() -> WriteAuthDomainResponse {
+    let mut salt_hex = String::with_capacity(66);
+    salt_hex.push_str("0x");
+    for byte in WRITE_AUTH_DOMAIN_SALT.iter() {
+        salt_hex.push_str(&format!("{:02x}", byte));
+    }
+    WriteAuthDomainResponse {
+        name: WRITE_AUTH_DOMAIN_NAME,
+        version: WRITE_AUTH_DOMAIN_VERSION,
+        chain_id: WRITE_AUTH_DOMAIN_CHAIN_ID,
+        salt: salt_hex,
+    }
+}
+
+fn write_auth_types_response() -> WriteAuthTypesResponse {
+    WriteAuthTypesResponse {
+        eip712_domain: vec![
+            SigningPayloadTypeField {
+                name: "name",
+                type_name: "string",
+            },
+            SigningPayloadTypeField {
+                name: "version",
+                type_name: "string",
+            },
+            SigningPayloadTypeField {
+                name: "chainId",
+                type_name: "uint256",
+            },
+            SigningPayloadTypeField {
+                name: "salt",
+                type_name: "bytes32",
+            },
+        ],
+        write_authorization: vec![
+            SigningPayloadTypeField {
+                name: "action",
+                type_name: "string",
+            },
+            SigningPayloadTypeField {
+                name: "account",
+                type_name: "address",
+            },
+            SigningPayloadTypeField {
+                name: "payload",
+                type_name: "bytes",
+            },
+            SigningPayloadTypeField {
+                name: "nonce",
+                type_name: "uint256",
+            },
+            SigningPayloadTypeField {
+                name: "deadline",
+                type_name: "uint256",
+            },
+            SigningPayloadTypeField {
+                name: "environment",
+                type_name: "string",
+            },
+            SigningPayloadTypeField {
+                name: "idempotencyKey",
+                type_name: "string",
+            },
+        ],
+    }
+}
+
+async fn issue_write_auth_challenge(
+    State(state): State<AppState>,
+    Json(request): Json<IssueWriteAuthChallengeRequest>,
+) -> Result<Json<IssueWriteAuthChallengeResponse>, ApiError> {
+    let action = WriteAuthAction::parse(&request.action)
+        .ok_or_else(|| ApiError::from(BackendError::WriteAuth(WriteAuthError::ActionMismatch)))?;
+    let now = now_ms();
+    let outstanding = state
+        .write_auth_challenges
+        .count_outstanding(&request.account, action, now)
+        .await
+        .map_err(BackendError::WriteAuth)?;
+    if outstanding >= MAX_OUTSTANDING_CHALLENGES_PER_ACCOUNT_ACTION {
+        return Err(ApiError::from(BackendError::WriteAuth(
+            WriteAuthError::TooManyOutstandingChallenges,
+        )));
+    }
+
+    let nonce_bytes = generate_nonce();
+    let deadline = now.saturating_add(DEFAULT_CHALLENGE_TTL_MS);
+    state
+        .write_auth_challenges
+        .issue(ChallengeRecord {
+            nonce_bytes,
+            account: request.account.clone(),
+            action,
+            chain_id: WRITE_AUTH_DOMAIN_CHAIN_ID,
+            issued_at_ms: now,
+            expires_at_ms: deadline,
+            status: ChallengeStatus::Issued,
+            request_digest: None,
+            idempotency_key: request.idempotency_key.clone(),
+            resource_id: None,
+            consumed_at_ms: None,
+        })
+        .await
+        .map_err(BackendError::WriteAuth)?;
+
+    tracing::info!(
+        target: "deopt.auth.write",
+        action = %action.as_str(),
+        account_hash = %short_hash(&request.account.0),
+        decision = %"issued",
+        "write authorization challenge issued"
+    );
+
+    Ok(Json(IssueWriteAuthChallengeResponse {
+        nonce: nonce_to_hex(&nonce_bytes),
+        deadline_ms: deadline,
+        chain_id: WRITE_AUTH_DOMAIN_CHAIN_ID,
+        action: action.as_str().to_string(),
+        domain: write_auth_domain_response(),
+        primary_type: "WriteAuthorization",
+        types: write_auth_types_response(),
+    }))
+}
+
+/// Compute a short, non-secret identifier for an account address to
+/// include in audit logs. Uses the first 10 nibbles of the lowercase
+/// address. Sufficient to correlate adjacent events without exposing
+/// the full address (which is already public on-chain, but trimming
+/// reduces casual log-mining).
+fn short_hash(account_hex: &str) -> String {
+    let trimmed = account_hex.trim_start_matches("0x").to_lowercase();
+    let prefix: String = trimmed.chars().take(10).collect();
+    format!("0x{}…", prefix)
+}
+
+/// Translate a `WriteAuthError` into an `ApiError`. Centralizes the
+/// audit log emission so every write route logs rejections uniformly.
+fn authorize_or_log(
+    action: WriteAuthAction,
+    account: &AccountId,
+    result: std::result::Result<crate::auth::WriteAuthVerified, WriteAuthError>,
+) -> Result<crate::auth::WriteAuthVerified, ApiError> {
+    match result {
+        Ok(verified) => {
+            tracing::info!(
+                target: "deopt.auth.write",
+                action = %action.as_str(),
+                account_hash = %short_hash(&account.0),
+                idempotent = verified.idempotent_resource_id.is_some(),
+                decision = %"accepted",
+                "write authorization accepted"
+            );
+            Ok(verified)
+        }
+        Err(err) => {
+            tracing::warn!(
+                target: "deopt.auth.write",
+                action = %action.as_str(),
+                account_hash = %short_hash(&account.0),
+                decision = %"rejected",
+                reason = %err,
+                "write authorization rejected"
+            );
+            Err(ApiError::from(BackendError::WriteAuth(err)))
+        }
+    }
+}
+
+async fn require_write_auth(
+    state: &AppState,
+    expected_action: WriteAuthAction,
+    expected_account: &AccountId,
+    canonical_payload: &[u8],
+    envelope: &AuthorizationEnvelope,
+) -> Result<crate::auth::WriteAuthVerified, ApiError> {
+    let result = verify_and_claim(
+        state.write_auth_challenges.as_ref(),
+        envelope,
+        expected_action,
+        expected_account,
+        canonical_payload,
+        state.chain_id,
+        now_ms(),
+    )
+    .await;
+    authorize_or_log(expected_action, expected_account, result)
+}
+
+async fn attach_resource_best_effort(state: &AppState, nonce_hex: &str, resource_id: &str) {
+    if let Ok(nonce_bytes) = parse_nonce_hex(nonce_hex) {
+        if let Err(err) = state
+            .write_auth_challenges
+            .attach_resource(nonce_bytes, resource_id)
+            .await
+        {
+            tracing::warn!(
+                target: "deopt.auth.write",
+                reason = %err,
+                "failed to attach resource id to consumed challenge"
+            );
+        }
+    }
+}
+
+// === Canonical payload builders, one per WriteAuthAction ===============
+
+fn canonical_option_order_submit(req: &SubmitOptionOrderRequest) -> Vec<u8> {
+    crate::auth::write_authorization::canonical_payload_bytes(
+        WriteAuthAction::OptionOrderSubmit,
+        &[
+            ("account", CanonicalValue::Address(req.account.clone())),
+            (
+                "option_series_id",
+                CanonicalValue::Str(req.option_series_id.clone()),
+            ),
+            (
+                "side",
+                CanonicalValue::Str(match req.side {
+                    Side::Buy => "buy".to_string(),
+                    Side::Sell => "sell".to_string(),
+                }),
+            ),
+            ("price_1e8", CanonicalValue::Str(req.price_1e8.clone())),
+            ("size_1e8", CanonicalValue::Str(req.size_1e8.clone())),
+            (
+                "time_in_force",
+                CanonicalValue::Str(match req.time_in_force {
+                    TimeInForce::Gtc => "gtc".to_string(),
+                    TimeInForce::Ioc => "ioc".to_string(),
+                    TimeInForce::Fok => "fok".to_string(),
+                }),
+            ),
+            ("post_only", CanonicalValue::Bool(req.post_only)),
+            (
+                "client_order_id",
+                req.client_order_id
+                    .as_ref()
+                    .map(|v| CanonicalValue::Str(v.clone()))
+                    .unwrap_or(CanonicalValue::Null),
+            ),
+        ],
+    )
+}
+
+fn canonical_option_order_cancel(account: &AccountId, order_id: &str) -> Vec<u8> {
+    crate::auth::write_authorization::canonical_payload_bytes(
+        WriteAuthAction::OptionOrderCancel,
+        &[
+            ("account", CanonicalValue::Address(account.clone())),
+            ("order_id", CanonicalValue::Str(order_id.to_string())),
+        ],
+    )
+}
+
+fn canonical_conditional_order_create(
+    account: &AccountId,
+    body: &CreateConditionalOrderBody,
+) -> Vec<u8> {
+    let mut fields: Vec<(&'static str, CanonicalValue)> = vec![
+        ("account", CanonicalValue::Address(account.clone())),
+        (
+            "option_series_id",
+            CanonicalValue::Str(body.option_series_id.clone()),
+        ),
+        (
+            "quantity_1e8",
+            CanonicalValue::Str(body.quantity_1e8.clone()),
+        ),
+        ("link_as_oco", CanonicalValue::Bool(body.link_as_oco)),
+        (
+            "expires_at_ms",
+            body.expires_at_ms
+                .map(|v| CanonicalValue::U128(u128::from(v.max(0) as u64)))
+                .unwrap_or(CanonicalValue::Null),
+        ),
+        ("leg_count", CanonicalValue::U64(body.legs.len() as u64)),
+    ];
+    for (idx, leg) in body.legs.iter().enumerate() {
+        let prefix = format!("leg{idx}_");
+        fields.push((
+            Box::leak(format!("{prefix}conditional_type").into_boxed_str()),
+            CanonicalValue::Str(leg.conditional_type.as_str().to_string()),
+        ));
+        fields.push((
+            Box::leak(format!("{prefix}trigger_price_1e8").into_boxed_str()),
+            CanonicalValue::Str(leg.trigger_price_1e8.clone()),
+        ));
+        fields.push((
+            Box::leak(format!("{prefix}limit_price_1e8").into_boxed_str()),
+            CanonicalValue::Str(leg.limit_price_1e8.clone()),
+        ));
+        fields.push((
+            Box::leak(format!("{prefix}trigger_condition").into_boxed_str()),
+            leg.trigger_condition
+                .map(|c| CanonicalValue::Str(c.as_str().to_string()))
+                .unwrap_or(CanonicalValue::Null),
+        ));
+    }
+    crate::auth::write_authorization::canonical_payload_bytes(
+        WriteAuthAction::ConditionalOrderCreate,
+        &fields,
+    )
+}
+
+fn canonical_conditional_order_cancel(account: &AccountId, id: &str) -> Vec<u8> {
+    crate::auth::write_authorization::canonical_payload_bytes(
+        WriteAuthAction::ConditionalOrderCancel,
+        &[
+            ("account", CanonicalValue::Address(account.clone())),
+            ("conditional_order_id", CanonicalValue::Str(id.to_string())),
+        ],
+    )
+}
+
+fn canonical_option_rfq_create(req: &CreateOptionRfqRequest) -> Vec<u8> {
+    crate::auth::write_authorization::canonical_payload_bytes(
+        WriteAuthAction::OptionRfqCreate,
+        &[
+            ("taker", CanonicalValue::Address(req.taker.clone())),
+            (
+                "option_series_id",
+                CanonicalValue::Str(req.option_series_id.clone()),
+            ),
+            (
+                "side",
+                CanonicalValue::Str(match req.side {
+                    Side::Buy => "buy".to_string(),
+                    Side::Sell => "sell".to_string(),
+                }),
+            ),
+            ("size_1e8", CanonicalValue::Str(req.size_1e8.clone())),
+            (
+                "limit_price_1e8",
+                req.limit_price_1e8
+                    .as_ref()
+                    .map(|v| CanonicalValue::Str(v.clone()))
+                    .unwrap_or(CanonicalValue::Null),
+            ),
+            (
+                "ttl_ms",
+                req.ttl_ms
+                    .map(CanonicalValue::U64)
+                    .unwrap_or(CanonicalValue::Null),
+            ),
+        ],
+    )
+}
+
+fn canonical_option_rfq_quote_submit(
+    option_rfq_id: &str,
+    req: &SubmitOptionRfqQuoteRequest,
+) -> Vec<u8> {
+    crate::auth::write_authorization::canonical_payload_bytes(
+        WriteAuthAction::OptionRfqQuoteSubmit,
+        &[
+            (
+                "option_rfq_id",
+                CanonicalValue::Str(option_rfq_id.to_string()),
+            ),
+            (
+                "mm_account",
+                CanonicalValue::Address(req.mm_account.clone()),
+            ),
+            ("price_1e8", CanonicalValue::Str(req.price_1e8.clone())),
+            ("size_1e8", CanonicalValue::Str(req.size_1e8.clone())),
+            (
+                "client_quote_id",
+                req.client_quote_id
+                    .as_ref()
+                    .map(|v| CanonicalValue::Str(v.clone()))
+                    .unwrap_or(CanonicalValue::Null),
+            ),
+            (
+                "quote_nonce",
+                req.quote_nonce
+                    .map(CanonicalValue::U64)
+                    .unwrap_or(CanonicalValue::Null),
+            ),
+            (
+                "quote_ttl_ms",
+                req.quote_ttl_ms
+                    .map(CanonicalValue::U64)
+                    .unwrap_or(CanonicalValue::Null),
+            ),
+        ],
+    )
+}
+
+fn canonical_option_rfq_accept(taker: &AccountId, option_rfq_id: &str, quote_id: &str) -> Vec<u8> {
+    crate::auth::write_authorization::canonical_payload_bytes(
+        WriteAuthAction::OptionRfqAccept,
+        &[
+            ("taker", CanonicalValue::Address(taker.clone())),
+            (
+                "option_rfq_id",
+                CanonicalValue::Str(option_rfq_id.to_string()),
+            ),
+            ("quote_id", CanonicalValue::Str(quote_id.to_string())),
+        ],
+    )
+}
+
+fn canonical_option_rfq_cancel(taker: &AccountId, option_rfq_id: &str) -> Vec<u8> {
+    crate::auth::write_authorization::canonical_payload_bytes(
+        WriteAuthAction::OptionRfqCancel,
+        &[
+            ("taker", CanonicalValue::Address(taker.clone())),
+            (
+                "option_rfq_id",
+                CanonicalValue::Str(option_rfq_id.to_string()),
+            ),
+        ],
+    )
+}
+
+fn canonical_option_execution_intent_signature_submit(
+    submitter: &AccountId,
+    intent_id: &str,
+    role: &str,
+) -> Vec<u8> {
+    crate::auth::write_authorization::canonical_payload_bytes(
+        WriteAuthAction::OptionExecutionIntentSignatureSubmit,
+        &[
+            ("submitter", CanonicalValue::Address(submitter.clone())),
+            ("intent_id", CanonicalValue::Str(intent_id.to_string())),
+            ("role", CanonicalValue::Str(role.to_string())),
+        ],
+    )
+}
+
 #[derive(Debug)]
 pub struct ApiError {
     status: StatusCode,
@@ -10146,6 +10655,25 @@ impl From<BackendError> for ApiError {
             | BackendError::Indexer(_)
             | BackendError::Config(_) => StatusCode::BAD_REQUEST,
             BackendError::Persistence(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            // ACCOUNT-WRITE-AUTH-HARDENING-V1
+            BackendError::PerpsNotLive => StatusCode::SERVICE_UNAVAILABLE,
+            BackendError::WriteAuth(ref err) => match err {
+                crate::auth::WriteAuthError::AuthorizationRequired => StatusCode::UNAUTHORIZED,
+                crate::auth::WriteAuthError::InvalidSignature => StatusCode::UNAUTHORIZED,
+                crate::auth::WriteAuthError::SignerMismatch => StatusCode::FORBIDDEN,
+                crate::auth::WriteAuthError::NonceNotFound => StatusCode::UNPROCESSABLE_ENTITY,
+                crate::auth::WriteAuthError::NonceAlreadyUsed => StatusCode::CONFLICT,
+                crate::auth::WriteAuthError::Expired => StatusCode::UNPROCESSABLE_ENTITY,
+                crate::auth::WriteAuthError::ActionMismatch => StatusCode::UNPROCESSABLE_ENTITY,
+                crate::auth::WriteAuthError::ChainMismatch => StatusCode::UNPROCESSABLE_ENTITY,
+                crate::auth::WriteAuthError::DomainMismatch => StatusCode::UNPROCESSABLE_ENTITY,
+                crate::auth::WriteAuthError::PayloadMismatch => StatusCode::CONFLICT,
+                crate::auth::WriteAuthError::IdempotencyConflict => StatusCode::CONFLICT,
+                crate::auth::WriteAuthError::Persistence => StatusCode::INTERNAL_SERVER_ERROR,
+                crate::auth::WriteAuthError::TooManyOutstandingChallenges => {
+                    StatusCode::TOO_MANY_REQUESTS
+                }
+            },
         };
         Self {
             status,

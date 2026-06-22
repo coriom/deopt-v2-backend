@@ -201,6 +201,7 @@ async fn perp_nonce_endpoint_rejects_when_disabled() {
 }
 
 #[tokio::test]
+#[ignore = "Perps non-live after ACCOUNT-WRITE-AUTH-HARDENING-V1; route fails closed with 503. Re-enable in ACCOUNT-WRITE-AUTH-HARDENING-PERPS-V1."]
 async fn post_orders_accepts_string_price_and_size() {
     let app = router(AppState::new(EngineState::with_default_markets()));
     let response = app
@@ -219,6 +220,7 @@ async fn post_orders_accepts_string_price_and_size() {
 }
 
 #[tokio::test]
+#[ignore = "Perps non-live after ACCOUNT-WRITE-AUTH-HARDENING-V1; route fails closed with 503. Re-enable in ACCOUNT-WRITE-AUTH-HARDENING-PERPS-V1."]
 async fn post_orders_rejects_non_numeric_price_string() {
     let response = router(AppState::new(EngineState::with_default_markets()))
         .oneshot(json_post(
@@ -232,6 +234,7 @@ async fn post_orders_rejects_non_numeric_price_string() {
 }
 
 #[tokio::test]
+#[ignore = "Perps non-live after ACCOUNT-WRITE-AUTH-HARDENING-V1; route fails closed with 503. Re-enable in ACCOUNT-WRITE-AUTH-HARDENING-PERPS-V1."]
 async fn post_orders_rejects_non_numeric_size_string() {
     let response = router(AppState::new(EngineState::with_default_markets()))
         .oneshot(json_post(
@@ -245,6 +248,7 @@ async fn post_orders_rejects_non_numeric_size_string() {
 }
 
 #[tokio::test]
+#[ignore = "Perps non-live after ACCOUNT-WRITE-AUTH-HARDENING-V1; route fails closed with 503. Re-enable in ACCOUNT-WRITE-AUTH-HARDENING-PERPS-V1."]
 async fn post_orders_rejects_negative_string_values() {
     let response = router(AppState::new(EngineState::with_default_markets()))
         .oneshot(json_post(
@@ -258,6 +262,7 @@ async fn post_orders_rejects_negative_string_values() {
 }
 
 #[tokio::test]
+#[ignore = "Perps non-live after ACCOUNT-WRITE-AUTH-HARDENING-V1; route fails closed with 503. Re-enable in ACCOUNT-WRITE-AUTH-HARDENING-PERPS-V1."]
 async fn post_orders_rejects_empty_string_values() {
     let response = router(AppState::new(EngineState::with_default_markets()))
         .oneshot(json_post(
@@ -271,6 +276,7 @@ async fn post_orders_rejects_empty_string_values() {
 }
 
 #[tokio::test]
+#[ignore = "Perps non-live after ACCOUNT-WRITE-AUTH-HARDENING-V1; route fails closed with 503. Re-enable in ACCOUNT-WRITE-AUTH-HARDENING-PERPS-V1."]
 async fn matched_order_response_serializes_financial_quantities_as_strings() {
     let app = router(AppState::new(EngineState::with_default_markets()));
     let maker_response = app
@@ -355,6 +361,7 @@ async fn execution_intents_api_serializes_financial_quantities_as_strings() {
 }
 
 #[tokio::test]
+#[ignore = "Perps non-live after ACCOUNT-WRITE-AUTH-HARDENING-V1; route fails closed with 503. Re-enable in ACCOUNT-WRITE-AUTH-HARDENING-PERPS-V1."]
 async fn post_orders_rejects_expired_deadline() {
     let response = router(AppState::new(EngineState::with_default_markets()))
         .oneshot(json_post(
@@ -376,6 +383,7 @@ async fn post_orders_rejects_expired_deadline() {
 }
 
 #[tokio::test]
+#[ignore = "Perps non-live after ACCOUNT-WRITE-AUTH-HARDENING-V1; route fails closed with 503. Re-enable in ACCOUNT-WRITE-AUTH-HARDENING-PERPS-V1."]
 async fn post_orders_rejects_reused_nonce_for_same_account() {
     let app = router(AppState::new(EngineState::with_default_markets()));
     let first = app
@@ -400,6 +408,7 @@ async fn post_orders_rejects_reused_nonce_for_same_account() {
 }
 
 #[tokio::test]
+#[ignore = "Perps non-live after ACCOUNT-WRITE-AUTH-HARDENING-V1; route fails closed with 503. Re-enable in ACCOUNT-WRITE-AUTH-HARDENING-PERPS-V1."]
 async fn post_orders_rejects_zero_nonce() {
     let response = router(AppState::new(EngineState::with_default_markets()))
         .oneshot(json_post(
@@ -413,6 +422,7 @@ async fn post_orders_rejects_zero_nonce() {
 }
 
 #[tokio::test]
+#[ignore = "Perps non-live after ACCOUNT-WRITE-AUTH-HARDENING-V1; route fails closed with 503. Re-enable in ACCOUNT-WRITE-AUTH-HARDENING-PERPS-V1."]
 async fn post_orders_allows_same_nonce_for_different_accounts() {
     let app = router(AppState::new(EngineState::with_default_markets()));
     let first = app
@@ -437,6 +447,7 @@ async fn post_orders_allows_same_nonce_for_different_accounts() {
 }
 
 #[tokio::test]
+#[ignore = "Perps non-live after ACCOUNT-WRITE-AUTH-HARDENING-V1; route fails closed with 503. Re-enable in ACCOUNT-WRITE-AUTH-HARDENING-PERPS-V1."]
 async fn post_orders_rejects_malformed_signature() {
     let response = router(AppState::new(EngineState::with_default_markets()))
         .oneshot(json_post(
@@ -458,6 +469,7 @@ async fn post_orders_rejects_malformed_signature() {
 }
 
 #[tokio::test]
+#[ignore = "Perps non-live after ACCOUNT-WRITE-AUTH-HARDENING-V1; route fails closed with 503. Re-enable in ACCOUNT-WRITE-AUTH-HARDENING-PERPS-V1."]
 async fn strict_signature_mode_accepts_valid_signed_order() {
     let app = router(AppState::with_signature_mode(
         EngineState::with_default_markets(),
@@ -476,6 +488,7 @@ async fn strict_signature_mode_accepts_valid_signed_order() {
 }
 
 #[tokio::test]
+#[ignore = "Perps non-live after ACCOUNT-WRITE-AUTH-HARDENING-V1; route fails closed with 503. Re-enable in ACCOUNT-WRITE-AUTH-HARDENING-PERPS-V1."]
 async fn strict_signature_mode_rejects_signer_account_mismatch() {
     let app = router(AppState::with_signature_mode(
         EngineState::with_default_markets(),
@@ -497,6 +510,7 @@ async fn strict_signature_mode_rejects_signer_account_mismatch() {
 }
 
 #[tokio::test]
+#[ignore = "Perps non-live after ACCOUNT-WRITE-AUTH-HARDENING-V1; route fails closed with 503. Re-enable in ACCOUNT-WRITE-AUTH-HARDENING-PERPS-V1."]
 async fn strict_signature_mode_rejects_malformed_account_address() {
     let app = router(AppState::with_signature_mode(
         EngineState::with_default_markets(),
@@ -517,6 +531,7 @@ async fn strict_signature_mode_rejects_malformed_account_address() {
 }
 
 #[tokio::test]
+#[ignore = "Perps non-live after ACCOUNT-WRITE-AUTH-HARDENING-V1; route fails closed with 503. Re-enable in ACCOUNT-WRITE-AUTH-HARDENING-PERPS-V1."]
 async fn strict_signature_mode_rejects_malformed_signature() {
     let app = router(AppState::with_signature_mode(
         EngineState::with_default_markets(),
@@ -536,6 +551,7 @@ async fn strict_signature_mode_rejects_malformed_signature() {
 }
 
 #[tokio::test]
+#[ignore = "Perps non-live after ACCOUNT-WRITE-AUTH-HARDENING-V1; route fails closed with 503. Re-enable in ACCOUNT-WRITE-AUTH-HARDENING-PERPS-V1."]
 async fn strict_signature_mode_rejects_tampered_price_after_signing() {
     let app = router(AppState::with_signature_mode(
         EngineState::with_default_markets(),
@@ -557,6 +573,7 @@ async fn strict_signature_mode_rejects_tampered_price_after_signing() {
 }
 
 #[tokio::test]
+#[ignore = "Perps non-live after ACCOUNT-WRITE-AUTH-HARDENING-V1; route fails closed with 503. Re-enable in ACCOUNT-WRITE-AUTH-HARDENING-PERPS-V1."]
 async fn strict_signature_mode_rejects_tampered_nonce_after_signing() {
     let app = router(AppState::with_signature_mode(
         EngineState::with_default_markets(),
@@ -734,6 +751,7 @@ async fn simulate_endpoint_rejects_when_simulation_disabled() {
 }
 
 #[tokio::test]
+#[ignore = "Perps non-live after ACCOUNT-WRITE-AUTH-HARDENING-V1; route fails closed with 503. Re-enable in ACCOUNT-WRITE-AUTH-HARDENING-PERPS-V1."]
 async fn simulate_endpoint_rejects_missing_signatures_before_rpc() {
     let app = router(
         AppState::with_signature_mode_domain_repository_and_execution_config(
@@ -851,6 +869,7 @@ async fn executor_transactions_return_empty_without_persistence() {
 }
 
 #[tokio::test]
+#[ignore = "Perps non-live after ACCOUNT-WRITE-AUTH-HARDENING-V1; route fails closed with 503. Re-enable in ACCOUNT-WRITE-AUTH-HARDENING-PERPS-V1."]
 async fn signing_payload_endpoint_returns_perp_trade_fields() {
     let app = router(AppState::new(EngineState::with_default_markets()));
     let maker = app
@@ -973,6 +992,7 @@ async fn signing_payload_missing_nonce_metadata_returns_clear_error() {
 }
 
 #[tokio::test]
+#[ignore = "Perps non-live after ACCOUNT-WRITE-AUTH-HARDENING-V1; route fails closed with 503. Re-enable in ACCOUNT-WRITE-AUTH-HARDENING-PERPS-V1."]
 async fn signature_endpoint_rejects_malformed_buyer_sig() {
     let (app, intent_id) = app_with_signed_match().await;
 
@@ -994,6 +1014,7 @@ async fn signature_endpoint_rejects_malformed_buyer_sig() {
 }
 
 #[tokio::test]
+#[ignore = "Perps non-live after ACCOUNT-WRITE-AUTH-HARDENING-V1; route fails closed with 503. Re-enable in ACCOUNT-WRITE-AUTH-HARDENING-PERPS-V1."]
 async fn signature_endpoint_rejects_malformed_seller_sig() {
     let (app, intent_id) = app_with_signed_match().await;
 
@@ -1015,6 +1036,7 @@ async fn signature_endpoint_rejects_malformed_seller_sig() {
 }
 
 #[tokio::test]
+#[ignore = "Perps non-live after ACCOUNT-WRITE-AUTH-HARDENING-V1; route fails closed with 503. Re-enable in ACCOUNT-WRITE-AUTH-HARDENING-PERPS-V1."]
 async fn submitting_both_trade_signatures_marks_calldata_ready() {
     let (app, intent_id) = app_with_signed_match().await;
 
