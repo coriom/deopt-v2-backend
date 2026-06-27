@@ -2313,13 +2313,18 @@ impl PgRepository {
 
     /// Cancel any still-armed OCO siblings other than `winner_id`
     /// atomically. Records `oco_sibling_triggered` as the reason.
+    /// ORDER-LIFECYCLE-OBSERVABILITY-WORKER-V1 — atomically cancels
+    /// every OCO sibling of `winner_id` in `group` and returns the
+    /// final cancelled rows. Returning the rows (vs. just the affected
+    /// row count) lets the worker emit one `ConditionalOrderUpdated`
+    /// lifecycle event per sibling without a second round-trip.
     pub async fn cancel_oco_siblings(
         &self,
         group: uuid::Uuid,
         winner_id: uuid::Uuid,
         now_ms: TimestampMs,
-    ) -> Result<u64> {
-        let res = sqlx::query(
+    ) -> Result<Vec<crate::options::conditional_orders::ConditionalOrder>> {
+        let rows = sqlx::query(
             "UPDATE options_conditional_orders
              SET status = 'cancelled',
                  failure_code = 'oco_sibling_triggered',
@@ -2329,15 +2334,21 @@ impl PgRepository {
                  version = version + 1
              WHERE oco_group_id = $1
                AND id != $2
-               AND status = 'armed'",
+               AND status = 'armed'
+             RETURNING id, account, option_series_id, position_side, option_kind,
+                       conditional_type, trigger_source, trigger_condition,
+                       trigger_price_1e8, quantity_1e8, execution_type, limit_price_1e8,
+                       reduce_only, oco_group_id, status, child_order_id, failure_code,
+                       failure_message, expires_at_ms, triggered_at_ms, completed_at_ms,
+                       created_at_ms, updated_at_ms, version",
         )
         .bind(group)
         .bind(winner_id)
         .bind(timestamp_to_i64(now_ms))
-        .execute(&self.pool)
+        .fetch_all(&self.pool)
         .await
         .map_err(|e| BackendError::Persistence(e.to_string()))?;
-        Ok(res.rows_affected())
+        rows.into_iter().map(conditional_order_from_row).collect()
     }
 
     pub async fn open_option_orders_for_series(

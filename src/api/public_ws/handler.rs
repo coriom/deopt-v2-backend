@@ -15,7 +15,8 @@
 
 use super::config::PublicWsConfig;
 use super::dispatcher::{dispatch, make_meta};
-use super::protocol::{ClientRequest, ServerResponse, WsError, WsErrorCode};
+use super::lifecycle::{LifecycleChannel, LifecycleEvent};
+use super::protocol::{Channel, ClientRequest, ServerResponse, WsError, WsErrorCode};
 use super::session::WsSession;
 use super::snapshots::{build_snapshot, build_snapshot_for_address};
 use crate::api::AppState;
@@ -70,6 +71,13 @@ async fn handle_socket(state: AppState, config: PublicWsConfig, mut socket: WebS
     // double-snapshot right after the initial subscribe.
     snapshot_tick.tick().await;
     heartbeat.tick().await;
+
+    // ORDER-LIFECYCLE-OBSERVABILITY-V1 — per-session subscriber for
+    // the process-wide LifecycleEvent broadcast. Filter happens
+    // INSIDE the select arm: only events whose `event.account` matches
+    // `session.account` AND whose channel has an active subscription
+    // are forwarded to the client.
+    let mut lifecycle_rx = state.lifecycle_events.subscribe();
 
     loop {
         tokio::select! {
@@ -163,9 +171,100 @@ async fn handle_socket(state: AppState, config: PublicWsConfig, mut socket: WebS
                     break;
                 }
             }
+            ev = lifecycle_rx.recv() => {
+                match ev {
+                    Ok(event) => {
+                        if let Err(e) = forward_lifecycle_event(&mut socket, &state, &mut session, event).await {
+                            warn!(target: "deopt.public_ws", connection_id = %session.connection_id, error = %e, "lifecycle_forward_failed");
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        // The client's lifecycle stream fell behind.
+                        // Frontend MUST resync via REST snapshot — the
+                        // periodic snapshot tick + the REST endpoints
+                        // are the canonical recovery surfaces.
+                        warn!(
+                            target: "deopt.public_ws",
+                            connection_id = %session.connection_id,
+                            skipped = skipped,
+                            "lifecycle_lagged"
+                        );
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        // The broadcast channel was dropped — backend is
+                        // shutting down. Close the socket cleanly.
+                        break;
+                    }
+                }
+            }
         }
     }
     info!(target: "deopt.public_ws", connection_id = %connection_id, "public_ws_close");
+}
+
+/// Forward one `LifecycleEvent` to the socket IF (a) the session is
+/// authenticated to the event's account AND (b) the corresponding
+/// channel has an active subscription on this session. Otherwise the
+/// event is silently dropped — no other account's data may ever leak
+/// out of a private session.
+async fn forward_lifecycle_event(
+    socket: &mut WebSocket,
+    state: &AppState,
+    session: &mut WsSession,
+    event: LifecycleEvent,
+) -> Result<(), String> {
+    // Privacy gate 1: session must be authenticated to the event's account.
+    let Some(session_addr) = session.account.as_ref() else {
+        return Ok(());
+    };
+    if !session_addr.0.eq_ignore_ascii_case(&event.account.0) {
+        return Ok(());
+    }
+    // Map the lifecycle channel to the protocol channel.
+    let proto_channel = match event.channel {
+        LifecycleChannel::AccountOrders => Channel::AccountOrders,
+        LifecycleChannel::AccountFills => Channel::AccountFills,
+        LifecycleChannel::AccountConditionalOrders => Channel::AccountConditionalOrders,
+    };
+    // Privacy gate 2: session must have an active subscription for that channel.
+    let Some(sub_id) = session
+        .subscriptions
+        .iter()
+        .find(|(_, s)| s.channel == proto_channel)
+        .map(|(id, _)| id.clone())
+    else {
+        return Ok(());
+    };
+    let seq = if let Some(s) = session.subscriptions.get_mut(&sub_id) {
+        let v = s.next_seq;
+        s.next_seq = v.saturating_add(1);
+        v
+    } else {
+        return Ok(());
+    };
+    let push = super::protocol::ServerNotification {
+        jsonrpc: "2.0",
+        method: "subscription",
+        params: super::protocol::SubscriptionPushParams {
+            subscription_id: sub_id,
+            channel: proto_channel.as_str(),
+            seq,
+            event_id: format!("evt_{}", Uuid::new_v4()),
+            source: "backend",
+            chain_id: state.chain_id,
+            generated_at_ms: now_ms(),
+            instrument_id: None,
+            address: Some(session_addr.0.clone()),
+            tx_hash: None,
+            data: serde_json::json!({
+                "type": "lifecycle_delta",
+                "emitted_at_ms": event.emitted_at_ms,
+                "payload": event.payload,
+            }),
+        },
+    };
+    send_text(socket, &push).await
 }
 
 async fn send_response(socket: &mut WebSocket, response: &ServerResponse) -> Result<(), String> {

@@ -1,5 +1,5 @@
 use crate::admin::{AdminConfig, MetricsConfig};
-use crate::api::public_ws::PublicWsConfig;
+use crate::api::public_ws::{LifecycleEventSender, PublicWsConfig};
 use crate::auth::write_authorization::memory_store::InMemoryChallengeStore;
 use crate::auth::WriteAuthChallengeStore;
 use crate::confirmation::ConfirmationConfig;
@@ -90,6 +90,13 @@ pub struct AppState {
     /// in-memory store is used (suitable for unit tests only — NOT a
     /// production-safe replay-protection surface).
     pub write_auth_challenges: Arc<dyn WriteAuthChallengeStore + Send + Sync>,
+    /// ORDER-LIFECYCLE-OBSERVABILITY-V1 — process-wide broadcast sink
+    /// for `LifecycleEvent`s. Mutation services emit AFTER successful
+    /// DB commit; per-session WS listeners filter and forward events
+    /// matching their authenticated `session.account`. Bounded
+    /// capacity (256) — laggy receivers get `RecvError::Lagged` and
+    /// resync via the canonical REST snapshot.
+    pub lifecycle_events: LifecycleEventSender,
 }
 
 impl AppState {
@@ -273,6 +280,7 @@ impl AppState {
             ),
             local_test_intents: crate::api::local_test_fixtures::shared_store(),
             write_auth_challenges,
+            lifecycle_events: LifecycleEventSender::default(),
         }
     }
 

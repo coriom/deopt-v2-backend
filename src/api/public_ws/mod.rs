@@ -26,9 +26,11 @@
 pub mod config;
 pub mod dispatcher;
 pub mod handler;
+pub mod lifecycle;
 pub mod protocol;
 pub mod session;
 pub mod snapshots;
 
 pub use config::PublicWsConfig;
 pub use handler::public_ws_route;
+pub use lifecycle::{LifecycleChannel, LifecycleEvent, LifecycleEventSender, LifecyclePayload};

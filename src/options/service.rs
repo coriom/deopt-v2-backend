@@ -395,6 +395,7 @@ pub async fn submit_option_order(
         let (order, fills) = repository.submit_option_order_and_match(order, now).await?;
         create_option_orderbook_execution_intents(state, &fills).await?;
         crate::fees::service::record_option_order_fills(state, &fills).await?;
+        emit_option_order_lifecycle(state, &order, &fills);
         return Ok(SubmitOptionOrderOutcome { order, fills });
     }
 
@@ -405,7 +406,58 @@ pub async fn submit_option_order(
         .submit_order_and_match(order, now)?;
     create_option_orderbook_execution_intents(state, &fills).await?;
     crate::fees::service::record_option_order_fills(state, &fills).await?;
+    emit_option_order_lifecycle(state, &order, &fills);
     Ok(SubmitOptionOrderOutcome { order, fills })
+}
+
+/// ORDER-LIFECYCLE-OBSERVABILITY-V1 — emit `OrderUpdated` for the
+/// submitted order AND one `FillCreated` per fill (broadcast to BOTH
+/// buyer and seller accounts so each side sees their own fill on
+/// `account.fills`). All events are emitted AFTER the DB commit /
+/// in-memory mutation has succeeded, so a rolled-back transaction
+/// never produces an event.
+///
+/// `pub(crate)` because `ORDER-LIFECYCLE-OBSERVABILITY-WORKER-V1`
+/// reuses this helper from the conditional-orders worker's in-memory
+/// trigger path, where the child IOC order is submitted via the
+/// matching store directly (not through `submit_option_order`).
+pub(crate) fn emit_option_order_lifecycle(
+    state: &AppState,
+    order: &OptionOrder,
+    fills: &[crate::options::OptionFill],
+) {
+    use crate::api::public_ws::{LifecycleChannel, LifecycleEvent, LifecyclePayload};
+    let now = now_ms();
+    state.lifecycle_events.emit(LifecycleEvent {
+        account: order.account.clone(),
+        channel: LifecycleChannel::AccountOrders,
+        payload: LifecyclePayload::OrderUpdated {
+            order_id: order.order_id.to_string(),
+            option_series_id: order.option_series_id.clone(),
+            status: order.status.as_str().to_string(),
+            remaining_size_1e8: order.remaining_size_1e8.to_string(),
+            size_1e8: order.size_1e8.to_string(),
+        },
+        emitted_at_ms: now,
+    });
+    for fill in fills {
+        for (account, side) in [(fill.buyer.clone(), "buy"), (fill.seller.clone(), "sell")] {
+            state.lifecycle_events.emit(LifecycleEvent {
+                account,
+                channel: LifecycleChannel::AccountFills,
+                payload: LifecyclePayload::FillCreated {
+                    fill_id: fill.fill_id.to_string(),
+                    option_series_id: fill.option_series_id.clone(),
+                    order_id: order.order_id.to_string(),
+                    side: side.to_string(),
+                    price_1e8: fill.price_1e8.to_string(),
+                    size_1e8: fill.size_1e8.to_string(),
+                    created_at_ms: fill.created_at_ms,
+                },
+                emitted_at_ms: now,
+            });
+        }
+    }
 }
 
 pub async fn list_option_orders(
@@ -447,14 +499,30 @@ pub async fn get_option_order(state: &AppState, order_id: OptionOrderId) -> Resu
 pub async fn cancel_option_order(state: &AppState, order_id: OptionOrderId) -> Result<OptionOrder> {
     ensure_enabled(state)?;
     let now = now_ms();
-    if let Some(repository) = state.repository.clone() {
-        return repository.cancel_option_order(order_id, now).await;
-    }
-    state
-        .options_store
-        .lock()
-        .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?
-        .cancel_order(order_id, now)
+    let cancelled = if let Some(repository) = state.repository.clone() {
+        repository.cancel_option_order(order_id, now).await?
+    } else {
+        state
+            .options_store
+            .lock()
+            .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?
+            .cancel_order(order_id, now)?
+    };
+    // ORDER-LIFECYCLE-OBSERVABILITY-V1 — emit AFTER successful mutation.
+    use crate::api::public_ws::{LifecycleChannel, LifecycleEvent, LifecyclePayload};
+    state.lifecycle_events.emit(LifecycleEvent {
+        account: cancelled.account.clone(),
+        channel: LifecycleChannel::AccountOrders,
+        payload: LifecyclePayload::OrderUpdated {
+            order_id: cancelled.order_id.to_string(),
+            option_series_id: cancelled.option_series_id.clone(),
+            status: cancelled.status.as_str().to_string(),
+            remaining_size_1e8: cancelled.remaining_size_1e8.to_string(),
+            size_1e8: cancelled.size_1e8.to_string(),
+        },
+        emitted_at_ms: now,
+    });
+    Ok(cancelled)
 }
 
 pub async fn list_option_fills(

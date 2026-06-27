@@ -40,6 +40,7 @@ pub enum Channel {
     AccountBalances,
     AccountOrders,
     AccountFills,
+    AccountConditionalOrders,
     AccountHistory,
     AccountIntentStatus,
     AccountSettlements,
@@ -57,6 +58,7 @@ impl Channel {
             Self::AccountBalances => "account.balances",
             Self::AccountOrders => "account.orders",
             Self::AccountFills => "account.fills",
+            Self::AccountConditionalOrders => "account.conditional_orders",
             Self::AccountHistory => "account.history",
             Self::AccountIntentStatus => "account.intent_status",
             Self::AccountSettlements => "account.settlements",
@@ -74,6 +76,7 @@ impl Channel {
             "account.balances" => Some(Self::AccountBalances),
             "account.orders" => Some(Self::AccountOrders),
             "account.fills" => Some(Self::AccountFills),
+            "account.conditional_orders" => Some(Self::AccountConditionalOrders),
             "account.history" => Some(Self::AccountHistory),
             "account.intent_status" => Some(Self::AccountIntentStatus),
             "account.settlements" => Some(Self::AccountSettlements),
@@ -91,6 +94,7 @@ impl Channel {
                 | Self::AccountBalances
                 | Self::AccountOrders
                 | Self::AccountFills
+                | Self::AccountConditionalOrders
                 | Self::AccountHistory
                 | Self::AccountIntentStatus
                 | Self::AccountSettlements

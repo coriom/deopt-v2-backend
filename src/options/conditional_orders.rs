@@ -691,6 +691,7 @@ pub fn execute_triggered_in_store(
     _series: &OptionSeries,
     conditional_id: ConditionalOrderId,
     now_ms: TimestampMs,
+    mut batch: Option<&mut WorkerLifecycleBatch>,
 ) -> Result<ConditionalOrder> {
     use crate::options::store::{
         build_option_match_plan, enforce_tif_plan, final_status_for_tif, status_for_remaining,
@@ -718,6 +719,9 @@ pub fn execute_triggered_in_store(
         finalised.updated_at_ms = now_ms;
         finalised.version = order.version.saturating_add(1);
         store.update_conditional_order(finalised.clone())?;
+        if let Some(b) = batch.as_deref_mut() {
+            b.push_conditional(finalised.clone());
+        }
         return Ok(finalised);
     }
 
@@ -748,7 +752,10 @@ pub fn execute_triggered_in_store(
             cancelled.completed_at_ms = Some(now_ms);
             cancelled.updated_at_ms = now_ms;
             cancelled.version = sib.version.saturating_add(1);
-            store.update_conditional_order(cancelled)?;
+            store.update_conditional_order(cancelled.clone())?;
+            if let Some(b) = batch.as_deref_mut() {
+                b.push_conditional(cancelled);
+            }
         }
     }
 
@@ -773,6 +780,9 @@ pub fn execute_triggered_in_store(
         closed.updated_at_ms = now_ms;
         closed.version = order.version.saturating_add(1);
         store.update_conditional_order(closed.clone())?;
+        if let Some(b) = batch.as_deref_mut() {
+            b.push_conditional(closed.clone());
+        }
         return Ok(closed);
     };
 
@@ -789,6 +799,9 @@ pub fn execute_triggered_in_store(
         failed.updated_at_ms = now_ms;
         failed.version = order.version.saturating_add(1);
         store.update_conditional_order(failed.clone())?;
+        if let Some(b) = batch.as_deref_mut() {
+            b.push_conditional(failed.clone());
+        }
         return Ok(failed);
     }
 
@@ -803,6 +816,9 @@ pub fn execute_triggered_in_store(
         closed.updated_at_ms = now_ms;
         closed.version = order.version.saturating_add(1);
         store.update_conditional_order(closed.clone())?;
+        if let Some(b) = batch.as_deref_mut() {
+            b.push_conditional(closed.clone());
+        }
         return Ok(closed);
     }
 
@@ -842,6 +858,9 @@ pub fn execute_triggered_in_store(
         failed.updated_at_ms = now_ms;
         failed.version = order.version.saturating_add(1);
         store.update_conditional_order(failed.clone())?;
+        if let Some(b) = batch.as_deref_mut() {
+            b.push_conditional(failed.clone());
+        }
         return Ok(failed);
     }
 
@@ -879,6 +898,16 @@ pub fn execute_triggered_in_store(
         ));
     }
     store.update_conditional_order(completed.clone())?;
+    // ORDER-LIFECYCLE-OBSERVABILITY-WORKER-V1 — child order + per-fill
+    // events for the in-memory path. (DB path emits these via the
+    // existing `submit_option_order` helper inside
+    // `execute_triggered_via_repo`.) The conditional terminal update
+    // event is emitted right after — both are queued and the caller
+    // emits AFTER the store lock is dropped.
+    if let Some(b) = batch.as_deref_mut() {
+        b.set_child_order(final_child.clone(), fills_out.clone());
+        b.push_conditional(completed.clone());
+    }
     // Defensive — fills_out + remaining invariant
     debug_assert_eq!(filled + remaining as u128, child_qty as u128);
     let _ = (now_ms_signed, status_for_remaining); // silence unused-import-style lints
@@ -936,13 +965,85 @@ pub async fn create_conditional_orders(
         for row in &rows {
             repo.insert_conditional_order(row).await?;
         }
+        emit_conditional_lifecycle(state, &rows);
         Ok(rows)
     } else {
         let mut store = state
             .options_store
             .lock()
             .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?;
-        create_conditional_orders_in_store(&mut store, &series, input, now)
+        let rows = create_conditional_orders_in_store(&mut store, &series, input, now)?;
+        drop(store);
+        emit_conditional_lifecycle(state, &rows);
+        Ok(rows)
+    }
+}
+
+/// ORDER-LIFECYCLE-OBSERVABILITY-V1 — emit one `ConditionalOrderUpdated`
+/// per row. Called from create / cancel / trigger paths AFTER the DB
+/// commit (or in-memory mutation) has succeeded.
+pub(crate) fn emit_conditional_lifecycle(state: &AppState, rows: &[ConditionalOrder]) {
+    use crate::api::public_ws::{LifecycleChannel, LifecycleEvent, LifecyclePayload};
+    use crate::types::now_ms;
+    let now = now_ms();
+    for row in rows {
+        state.lifecycle_events.emit(LifecycleEvent {
+            account: row.account.clone(),
+            channel: LifecycleChannel::AccountConditionalOrders,
+            payload: LifecyclePayload::ConditionalOrderUpdated {
+                conditional_order_id: row.id.to_string(),
+                option_series_id: row.option_series_id.clone(),
+                status: row.status.as_str().to_string(),
+                child_order_id: row.child_order_id.clone(),
+                oco_group_id: row.oco_group_id.map(|g| g.to_string()),
+                failure_code: row.failure_code.clone(),
+            },
+            emitted_at_ms: now,
+        });
+    }
+}
+
+/// ORDER-LIFECYCLE-OBSERVABILITY-WORKER-V1 — collect-then-emit-after-
+/// commit batch for the in-memory worker path.
+///
+/// The in-memory `execute_triggered_in_store` holds a mutex on
+/// `state.options_store` for the entire trigger sequence (claim → OCO
+/// siblings → child submission → terminal persistence). Emitting WS
+/// events while holding that lock would (a) extend lock hold time on
+/// every WS send and (b) risk a WS-layer panic poisoning the store
+/// lock. Instead, we COLLECT pending events into this batch during
+/// the mutation and EMIT them only after the function returns Ok and
+/// the caller drops the lock.
+///
+/// The DB path does NOT need this batch — its mutations are scoped to
+/// individual repository calls and emission happens between them
+/// without a long-running lock.
+#[derive(Default)]
+pub struct WorkerLifecycleBatch {
+    pub conditional_updates: Vec<ConditionalOrder>,
+    pub child_order: Option<(crate::options::OptionOrder, Vec<crate::options::OptionFill>)>,
+}
+
+impl WorkerLifecycleBatch {
+    pub fn push_conditional(&mut self, order: ConditionalOrder) {
+        self.conditional_updates.push(order);
+    }
+
+    pub fn set_child_order(
+        &mut self,
+        order: crate::options::OptionOrder,
+        fills: Vec<crate::options::OptionFill>,
+    ) {
+        self.child_order = Some((order, fills));
+    }
+
+    pub fn emit(self, state: &AppState) {
+        if !self.conditional_updates.is_empty() {
+            emit_conditional_lifecycle(state, &self.conditional_updates);
+        }
+        if let Some((order, fills)) = self.child_order {
+            crate::options::service::emit_option_order_lifecycle(state, &order, &fills);
+        }
     }
 }
 
@@ -1111,13 +1212,18 @@ pub async fn cancel_conditional_order(
         updated.completed_at_ms = Some(now);
         updated.updated_at_ms = now;
         updated.version = existing.version.saturating_add(1);
-        return repo.update_conditional_order(&updated).await;
+        let saved = repo.update_conditional_order(&updated).await?;
+        emit_conditional_lifecycle(state, std::slice::from_ref(&saved));
+        return Ok(saved);
     }
     let mut store = state
         .options_store
         .lock()
         .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?;
-    cancel_conditional_order_in_store(&mut store, id, requesting_account, now)
+    let cancelled = cancel_conditional_order_in_store(&mut store, id, requesting_account, now)?;
+    drop(store);
+    emit_conditional_lifecycle(state, std::slice::from_ref(&cancelled));
+    Ok(cancelled)
 }
 
 // ---- Worker (Phase 6) -----------------------------------------------
@@ -1403,6 +1509,11 @@ pub async fn recover_stranded_triggering(
         match persist_recovered(state, &recovered_row).await {
             Ok(()) => {
                 count += 1;
+                // ORDER-LIFECYCLE-OBSERVABILITY-WORKER-V1 — emit the
+                // recovery transition. We only reach this arm when the
+                // persistence call actually committed the new status,
+                // so no event is emitted for a no-op recovery.
+                emit_conditional_lifecycle(state, std::slice::from_ref(&recovered_row));
             }
             Err(BackendError::InvalidConditionalOrderId) => {
                 tracing::debug!(
@@ -1461,13 +1572,24 @@ async fn trigger_one(
         transitioned
     };
 
+    // ORDER-LIFECYCLE-OBSERVABILITY-WORKER-V1 — claim succeeded; emit
+    // `ConditionalOrderUpdated(status="triggering")` AFTER persistence.
+    emit_conditional_lifecycle(state, std::slice::from_ref(&claimed));
+
     // 2. Cancel OCO siblings atomically (DB) or inline (in-memory).
     if let Some(group) = claimed.oco_group_id {
         if let Some(repo) = state.repository.clone() {
-            repo.cancel_oco_siblings(group, claimed.id, now).await?;
+            // V1 → V2: `cancel_oco_siblings` now returns the actual
+            // cancelled rows so we can emit one lifecycle event per
+            // sibling without a second round-trip.
+            let siblings = repo.cancel_oco_siblings(group, claimed.id, now).await?;
+            if !siblings.is_empty() {
+                emit_conditional_lifecycle(state, &siblings);
+            }
         }
         // In-memory mode lets `execute_triggered_in_store` handle the
-        // sibling sweep inside the same critical section.
+        // sibling sweep inside the same critical section AND emit the
+        // matching lifecycle events for each cancelled sibling.
     }
 
     // 3. Execute the child order.
@@ -1479,7 +1601,17 @@ async fn trigger_one(
             .options_store
             .lock()
             .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?;
-        execute_triggered_in_store(&mut store, &series, claimed.id, now)
+        // Collect pending events from inside the store mutation, then
+        // emit AFTER the lock is dropped so a WS send error never
+        // poisons the store lock. See `WorkerLifecycleBatch` below.
+        let mut batch = WorkerLifecycleBatch::default();
+        let result =
+            execute_triggered_in_store(&mut store, &series, claimed.id, now, Some(&mut batch));
+        drop(store);
+        if result.is_ok() {
+            batch.emit(state);
+        }
+        result
     }
 }
 
@@ -1511,7 +1643,9 @@ async fn execute_triggered_via_repo(
         closed.completed_at_ms = Some(now);
         closed.updated_at_ms = now;
         closed.version = claimed.version.saturating_add(1);
-        return repo.update_conditional_order(&closed).await;
+        let saved = repo.update_conditional_order(&closed).await?;
+        emit_conditional_lifecycle(state, std::slice::from_ref(&saved));
+        return Ok(saved);
     };
     if live_pos.side != claimed.position_side {
         let mut failed = claimed.clone();
@@ -1522,7 +1656,9 @@ async fn execute_triggered_via_repo(
         failed.completed_at_ms = Some(now);
         failed.updated_at_ms = now;
         failed.version = claimed.version.saturating_add(1);
-        return repo.update_conditional_order(&failed).await;
+        let saved = repo.update_conditional_order(&failed).await?;
+        emit_conditional_lifecycle(state, std::slice::from_ref(&saved));
+        return Ok(saved);
     }
     let child_qty = claimed.quantity_1e8.min(live_pos.size_1e8);
     if child_qty == 0 {
@@ -1532,7 +1668,9 @@ async fn execute_triggered_via_repo(
         closed.completed_at_ms = Some(now);
         closed.updated_at_ms = now;
         closed.version = claimed.version.saturating_add(1);
-        return repo.update_conditional_order(&closed).await;
+        let saved = repo.update_conditional_order(&closed).await?;
+        emit_conditional_lifecycle(state, std::slice::from_ref(&saved));
+        return Ok(saved);
     }
 
     // Submit through the existing options order service — same TIF
@@ -1583,7 +1721,12 @@ async fn execute_triggered_via_repo(
                     child_qty
                 ));
             }
-            repo.update_conditional_order(&completed).await
+            let saved = repo.update_conditional_order(&completed).await?;
+            // Child order + per-fill events were already emitted by
+            // `submit_option_order` inside `submit_option_order` itself —
+            // we only need to emit the conditional terminal update here.
+            emit_conditional_lifecycle(state, std::slice::from_ref(&saved));
+            Ok(saved)
         }
         Err(e) => {
             let mut failed = claimed.clone();
@@ -1593,7 +1736,9 @@ async fn execute_triggered_via_repo(
             failed.completed_at_ms = Some(now);
             failed.updated_at_ms = now;
             failed.version = claimed.version.saturating_add(1);
-            repo.update_conditional_order(&failed).await
+            let saved = repo.update_conditional_order(&failed).await?;
+            emit_conditional_lifecycle(state, std::slice::from_ref(&saved));
+            Ok(saved)
         }
     }
 }

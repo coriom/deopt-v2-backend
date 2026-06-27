@@ -13,6 +13,17 @@ use crate::api::AppState;
 use axum::extract::{Query, State};
 use serde_json::Value;
 
+// ORDER-LIFECYCLE-OBSERVABILITY-V1 — REST handler imports for the
+// `account.orders`, `account.fills`, `account.conditional_orders`
+// snapshot generators. Calling the service functions in-process keeps
+// the WS and REST surfaces in lock-step.
+use crate::options::service::{
+    list_option_fills as list_option_fills_service,
+    list_option_orders as list_option_orders_service,
+};
+use crate::options::{OptionFillFilter, OptionOrderFilter};
+use crate::types::AccountId;
+
 #[derive(Debug)]
 pub enum SnapshotError {
     /// The underlying source returned an upstream error or has no data.
@@ -34,6 +45,7 @@ pub async fn build_snapshot(state: &AppState, channel: Channel) -> Result<Value,
         | Channel::AccountBalances
         | Channel::AccountOrders
         | Channel::AccountFills
+        | Channel::AccountConditionalOrders
         | Channel::AccountHistory
         | Channel::AccountIntentStatus
         | Channel::AccountSettlements
@@ -59,8 +71,14 @@ pub async fn build_snapshot_for_address(
         Channel::AccountPortfolio => snapshot_account_portfolio(state, address).await,
         Channel::AccountBalances => snapshot_account_balances(state, address).await,
         Channel::AccountHistory => snapshot_account_history(state, address).await,
-        Channel::AccountOrders => Ok(empty_account_collection("orders", address)),
-        Channel::AccountFills => Ok(empty_account_collection("fills", address)),
+        // ORDER-LIFECYCLE-OBSERVABILITY-V1 — three account channels now
+        // call their REST service in-process, returning the same DB-backed
+        // collections the HTTP surface returns.
+        Channel::AccountOrders => snapshot_account_orders(state, address).await,
+        Channel::AccountFills => snapshot_account_fills(state, address).await,
+        Channel::AccountConditionalOrders => {
+            snapshot_account_conditional_orders(state, address).await
+        }
         Channel::AccountIntentStatus => Ok(empty_account_collection("intents", address)),
         Channel::AccountSettlements => Ok(empty_account_collection("settlements", address)),
         Channel::AccountLiquidations => Ok(empty_account_collection("liquidations", address)),
@@ -68,6 +86,64 @@ pub async fn build_snapshot_for_address(
         Channel::TradingHealth | Channel::OptionsProducts | Channel::Leaderboard => {
             Err(SnapshotError::NotImplemented)
         }
+    }
+}
+
+async fn snapshot_account_orders(state: &AppState, address: &str) -> Result<Value, SnapshotError> {
+    let filter = OptionOrderFilter {
+        option_series_id: None,
+        account: Some(AccountId::new(address.to_lowercase())),
+        status: None,
+        side: None,
+    };
+    match list_option_orders_service(state, filter).await {
+        Ok(orders) => Ok(serde_json::json!({
+            "address": address,
+            "source": "option_orders",
+            "orders": orders,
+        })),
+        Err(err) => Err(SnapshotError::SourceUnavailable(format!(
+            "account.orders upstream error: {err}"
+        ))),
+    }
+}
+
+async fn snapshot_account_fills(state: &AppState, address: &str) -> Result<Value, SnapshotError> {
+    let filter = OptionFillFilter {
+        option_series_id: None,
+        account: Some(AccountId::new(address.to_lowercase())),
+        order_id: None,
+    };
+    match list_option_fills_service(state, filter).await {
+        Ok(fills) => Ok(serde_json::json!({
+            "address": address,
+            "source": "option_fills",
+            "fills": fills,
+        })),
+        Err(err) => Err(SnapshotError::SourceUnavailable(format!(
+            "account.fills upstream error: {err}"
+        ))),
+    }
+}
+
+async fn snapshot_account_conditional_orders(
+    state: &AppState,
+    address: &str,
+) -> Result<Value, SnapshotError> {
+    use crate::options::conditional_orders as cond;
+    let filter = cond::ConditionalOrderFilter {
+        account: Some(AccountId::new(address.to_lowercase())),
+        ..Default::default()
+    };
+    match cond::list_conditional_orders(state, filter).await {
+        Ok(orders) => Ok(serde_json::json!({
+            "address": address,
+            "source": "options_conditional_orders",
+            "conditional_orders": orders,
+        })),
+        Err(err) => Err(SnapshotError::SourceUnavailable(format!(
+            "account.conditional_orders upstream error: {err}"
+        ))),
     }
 }
 
@@ -245,6 +321,7 @@ mod tests {
             Channel::AccountBalances,
             Channel::AccountOrders,
             Channel::AccountFills,
+            Channel::AccountConditionalOrders,
             Channel::AccountHistory,
             Channel::AccountIntentStatus,
             Channel::AccountSettlements,
@@ -294,9 +371,11 @@ mod tests {
 
     #[tokio::test]
     async fn deferred_account_channels_return_honest_empty_arrays() {
+        // ORDER-LIFECYCLE-OBSERVABILITY-V1 moved orders/fills/conditional_orders
+        // off the empty-sentinel path; they now have real DB-backed sources
+        // (see the dedicated tests below). The three remaining channels
+        // still surface honest empty arrays until their sources land.
         for (channel, key) in [
-            (Channel::AccountOrders, "orders"),
-            (Channel::AccountFills, "fills"),
             (Channel::AccountIntentStatus, "intents"),
             (Channel::AccountSettlements, "settlements"),
             (Channel::AccountLiquidations, "liquidations"),
@@ -308,6 +387,37 @@ mod tests {
             assert_eq!(v["source"], "empty");
             assert_eq!(v[key].as_array().expect("array").len(), 0);
         }
+    }
+
+    #[tokio::test]
+    async fn account_orders_snapshot_is_real_db_backed_collection() {
+        let v = build_snapshot_for_address(&test_state(), Channel::AccountOrders, TEST_ADDR)
+            .await
+            .expect("orders ok");
+        assert_eq!(v["address"], TEST_ADDR);
+        assert_eq!(v["source"], "option_orders");
+        assert!(v["orders"].is_array());
+    }
+
+    #[tokio::test]
+    async fn account_fills_snapshot_is_real_db_backed_collection() {
+        let v = build_snapshot_for_address(&test_state(), Channel::AccountFills, TEST_ADDR)
+            .await
+            .expect("fills ok");
+        assert_eq!(v["address"], TEST_ADDR);
+        assert_eq!(v["source"], "option_fills");
+        assert!(v["fills"].is_array());
+    }
+
+    #[tokio::test]
+    async fn account_conditional_orders_snapshot_is_real_db_backed_collection() {
+        let v =
+            build_snapshot_for_address(&test_state(), Channel::AccountConditionalOrders, TEST_ADDR)
+                .await
+                .expect("conditional ok");
+        assert_eq!(v["address"], TEST_ADDR);
+        assert_eq!(v["source"], "options_conditional_orders");
+        assert!(v["conditional_orders"].is_array());
     }
 
     #[tokio::test]

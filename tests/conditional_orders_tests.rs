@@ -366,7 +366,11 @@ async fn oco_winner_completes_and_cancels_sibling_via_in_store_execute() {
     // Fire the TP leg directly.
     let series = get_option_series(&state, &series_id).await.unwrap();
     let mut store = state.options_store.lock().unwrap();
-    let completed = execute_triggered_in_store(&mut store, &series, tp.id, now_ms()).unwrap();
+    // ORDER-LIFECYCLE-OBSERVABILITY-WORKER-V1: the 5th arg is the
+    // optional `WorkerLifecycleBatch` used by `trigger_one` to collect
+    // emit-after-commit events. Pure unit tests don't observe the WS
+    // surface so `None` is the right value here.
+    let completed = execute_triggered_in_store(&mut store, &series, tp.id, now_ms(), None).unwrap();
     assert_eq!(completed.status, ConditionalOrderStatus::Completed);
     assert!(completed.child_order_id.is_some());
 
