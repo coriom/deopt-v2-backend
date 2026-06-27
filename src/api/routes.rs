@@ -10673,6 +10673,7 @@ impl From<BackendError> for ApiError {
                 crate::auth::WriteAuthError::TooManyOutstandingChallenges => {
                     StatusCode::TOO_MANY_REQUESTS
                 }
+                crate::auth::WriteAuthError::AmbiguousPriorClaim => StatusCode::CONFLICT,
             },
         };
         Self {

@@ -124,6 +124,11 @@ pub struct WriteAuthVerified {
     pub account: AccountId,
     pub nonce_bytes: [u8; 32],
     pub idempotency_key: Option<String>,
+    /// True iff this is the first time the nonce was claimed (i.e.
+    /// `ClaimOutcome::Fresh`). False for any flavour of IdempotentReplay.
+    /// Used by the verifier to reject a replay whose prior attempt
+    /// left no `resource_id` linked (see `AmbiguousPriorClaim`).
+    pub was_fresh: bool,
     /// If non-None, the canonical payload was already consumed by an
     /// earlier identical request and resulted in `resource_id`. The
     /// route handler MUST return the existing resource (idempotent
@@ -194,6 +199,17 @@ pub enum WriteAuthError {
     Persistence,
     #[error("too many outstanding write challenges")]
     TooManyOutstandingChallenges,
+    /// ACCOUNT-WRITE-AUTH-LIVE-PG-PROOF-V1 — emitted when a prior
+    /// attempt at this nonce was claimed (status='consumed') but no
+    /// `resource_id` was ever linked. This means a prior request
+    /// either crashed between the mutation and the resource-link
+    /// step, or the mutation itself failed AFTER the nonce was
+    /// consumed. Replaying the same envelope cannot safely tell
+    /// "mutation succeeded but link broke" apart from "mutation
+    /// silently failed" — both surfaces force the caller to request
+    /// a fresh challenge so the next attempt is unambiguous.
+    #[error("write authorization prior claim is ambiguous; request a new challenge")]
+    AmbiguousPriorClaim,
 }
 
 // `BackendError::WriteAuth` is auto-derived via `#[from]` on the
@@ -394,6 +410,14 @@ pub enum ClaimOutcome {
     Expired,
     /// Nonce was never issued (or already pruned).
     NotFound,
+    /// ACCOUNT-WRITE-AUTH-LIVE-PG-PROOF-V1 — another (different) nonce
+    /// with the same `(account, action, idempotency_key)` was already
+    /// consumed. The current nonce row stays in `issued` status; the
+    /// caller is rejected with `WriteAuthError::IdempotencyConflict`
+    /// so they cannot smuggle a second mutation under one idempotency
+    /// key. Only fires when the envelope supplies a non-null
+    /// idempotency key.
+    IdempotencyKeyConflict,
 }
 
 /// Storage abstraction for write-auth challenges. In production this
@@ -529,12 +553,13 @@ pub async fn verify_and_claim(
         )
         .await?;
 
-    let mut idempotent_resource_id = match claim {
-        ClaimOutcome::Fresh => None,
-        ClaimOutcome::IdempotentReplay { resource_id } => resource_id,
+    let (was_fresh, mut idempotent_resource_id) = match claim {
+        ClaimOutcome::Fresh => (true, None),
+        ClaimOutcome::IdempotentReplay { resource_id } => (false, resource_id),
         ClaimOutcome::PayloadMismatch => return Err(WriteAuthError::PayloadMismatch),
         ClaimOutcome::Expired => return Err(WriteAuthError::Expired),
         ClaimOutcome::NotFound => return Err(WriteAuthError::NonceNotFound),
+        ClaimOutcome::IdempotencyKeyConflict => return Err(WriteAuthError::IdempotencyConflict),
     };
 
     // Idempotency key check (separate from nonce-binding). If the
@@ -550,11 +575,24 @@ pub async fn verify_and_claim(
         }
     }
 
+    // ACCOUNT-WRITE-AUTH-LIVE-PG-PROOF-V1 — defence-in-depth against
+    // partial prior state. If the nonce was already consumed but no
+    // resource_id is linked (and the idempotency-key fallback did not
+    // resolve one either), the prior attempt is ambiguous: we cannot
+    // tell from the store alone whether the business mutation actually
+    // ran. Re-executing risks a duplicate; silently returning success
+    // risks a phantom resource. Fail loud and force the caller to
+    // request a fresh challenge so the next attempt is unambiguous.
+    if !was_fresh && idempotent_resource_id.is_none() {
+        return Err(WriteAuthError::AmbiguousPriorClaim);
+    }
+
     Ok(WriteAuthVerified {
         action: expected_action,
         account: expected_account.clone(),
         nonce_bytes,
         idempotency_key: envelope.idempotency_key.clone(),
+        was_fresh,
         idempotent_resource_id,
     })
 }
@@ -628,10 +666,29 @@ pub mod memory_store {
             action: WriteAuthAction,
             chain_id: u64,
             request_digest: [u8; 32],
-            _idempotency_key: Option<&str>,
+            idempotency_key: Option<&str>,
             now_ms: TimestampMs,
         ) -> std::result::Result<ClaimOutcome, WriteAuthError> {
             let mut guard = self.inner.lock().expect("InMemoryChallengeStore poisoned");
+            // ACCOUNT-WRITE-AUTH-LIVE-PG-PROOF-V1 — symmetric idempotency
+            // partial-unique-index enforcement. Before promoting this
+            // nonce row to 'consumed', check that no OTHER consumed row
+            // already owns (account, action, idempotency_key). The PG
+            // store enforces this via `write_auth_challenges_idempotency`;
+            // the in-memory store enforces it here so dev/test behaviour
+            // matches production.
+            if let Some(key) = idempotency_key {
+                let already_consumed = guard.values().any(|r| {
+                    r.account.0.eq_ignore_ascii_case(&account.0)
+                        && r.action == action
+                        && r.status == ChallengeStatus::Consumed
+                        && r.idempotency_key.as_deref() == Some(key)
+                        && r.nonce_bytes != nonce_bytes
+                });
+                if already_consumed {
+                    return Ok(ClaimOutcome::IdempotencyKeyConflict);
+                }
+            }
             let Some(record) = guard.get_mut(&nonce_bytes) else {
                 return Ok(ClaimOutcome::NotFound);
             };

@@ -17,7 +17,6 @@ use deopt_v2_backend::options::service::{create_option_series, CreateOptionSerie
 use deopt_v2_backend::options::OptionsConfig;
 use deopt_v2_backend::types::{now_ms, AccountId};
 use k256::ecdsa::SigningKey;
-use k256::elliptic_curve::sec1::ToEncodedPoint as _;
 use serde_json::json;
 use sha3::{Digest, Keccak256};
 use tower::ServiceExt;

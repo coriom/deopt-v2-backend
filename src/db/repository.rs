@@ -4027,7 +4027,17 @@ impl PgRepository {
 
         match status.as_str() {
             "issued" => {
-                sqlx::query(
+                // ACCOUNT-WRITE-AUTH-LIVE-PG-PROOF-V1 — detect the
+                // partial unique-index violation on
+                // `write_auth_challenges_idempotency`. When a previous
+                // consumed nonce already owns (lower(account), action,
+                // idempotency_key), this UPDATE raises SQLSTATE 23505.
+                // Map it to `IdempotencyKeyConflict` so the verifier
+                // returns a stable 409 instead of an opaque 500. The
+                // current nonce row stays `issued` (transaction rolled
+                // back), so the caller can retry with a different
+                // idempotency key without losing the challenge.
+                let update_result = sqlx::query(
                     "UPDATE write_auth_challenges
                      SET status = 'consumed',
                          request_digest = $2,
@@ -4039,12 +4049,23 @@ impl PgRepository {
                 .bind(request_digest.to_vec())
                 .bind(now_ms)
                 .execute(&mut *tx)
-                .await
-                .map_err(|_| crate::auth::WriteAuthError::Persistence)?;
-                tx.commit()
-                    .await
-                    .map_err(|_| crate::auth::WriteAuthError::Persistence)?;
-                Ok(ClaimOutcome::Fresh)
+                .await;
+                match update_result {
+                    Ok(_) => {
+                        tx.commit()
+                            .await
+                            .map_err(|_| crate::auth::WriteAuthError::Persistence)?;
+                        Ok(ClaimOutcome::Fresh)
+                    }
+                    Err(err) if is_unique_violation(&err) => {
+                        let _ = tx.rollback().await;
+                        Ok(ClaimOutcome::IdempotencyKeyConflict)
+                    }
+                    Err(_) => {
+                        let _ = tx.rollback().await;
+                        Err(crate::auth::WriteAuthError::Persistence)
+                    }
+                }
             }
             "consumed" => {
                 tx.commit()
