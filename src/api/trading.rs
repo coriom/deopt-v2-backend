@@ -360,6 +360,12 @@ pub struct HistoryV2Item {
     pub liquidation_price: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub penalty: Option<String>,
+    /// HISTORY-V2-FAILURE-REASONS-V1 — surfaces the persisted
+    /// `option_orders.post_only` flag so the frontend can derive a
+    /// human-readable "Post-only would immediately match" reason for
+    /// rejected post-only orders. Only set on the Orders tab.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub post_only: Option<bool>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -2232,6 +2238,7 @@ async fn orders_rows_for(
             limit_price: Some(o.price_1e8.to_string()),
             filled: Some(filled_amount_1e8.to_string()),
             status: Some(o.status.as_str().to_string()),
+            post_only: Some(o.post_only),
             role: None,
             tx_hash: None,
             ..HistoryV2Item::default()
