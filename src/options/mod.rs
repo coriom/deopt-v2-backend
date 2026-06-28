@@ -85,6 +85,7 @@ pub use signing::{
     OPTION_RFQ_QUOTE_TYPE,
 };
 pub use store::OptionSeriesStore;
+pub use types::terminal_reason;
 pub use types::{
     OptionEventIndexerState, OptionExecutionConfirmationStatus, OptionExecutionEvent,
     OptionExecutionEventLink, OptionExecutionGasCheckStatus, OptionExecutionIntent,

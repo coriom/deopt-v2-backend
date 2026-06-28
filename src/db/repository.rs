@@ -15,8 +15,10 @@ use crate::indexer::IndexedPerpTrade;
 use crate::mm::{MmAccountPermissions, MmProductPermission};
 use crate::monitoring::FeeEventLabels;
 use crate::options::store::{
-    build_option_match_plan, enforce_tif_plan, final_status_for_tif, status_for_remaining,
+    build_option_match_plan, enforce_tif_plan, final_status_for_tif, stamp_insert_terminal_reason,
+    status_for_remaining,
 };
+use crate::options::terminal_reason;
 use crate::options::{
     OptionEventIndexerState, OptionExecutionConfirmationStatus, OptionExecutionEvent,
     OptionExecutionEventLink, OptionExecutionGasCheckStatus, OptionExecutionIntent,
@@ -1991,8 +1993,11 @@ impl PgRepository {
                 "INSERT INTO option_orders (
                 order_id, option_series_id, account, side, price_1e8, size_1e8,
                 remaining_size_1e8, time_in_force, post_only, client_order_id, nonce,
-                deadline_ms, signature, status, created_at_ms, updated_at_ms
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
+                deadline_ms, signature, status,
+                terminal_reason_code, terminal_reason_message, terminal_reason_source,
+                created_at_ms, updated_at_ms
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+                      $15, $16, $17, $18, $19)",
             ),
             order,
         )
@@ -2016,7 +2021,9 @@ impl PgRepository {
         let rows = sqlx::query(
             "SELECT order_id, option_series_id, account, side, price_1e8, size_1e8,
                     remaining_size_1e8, time_in_force, post_only, client_order_id, nonce,
-                    deadline_ms, signature, status, created_at_ms, updated_at_ms
+                    deadline_ms, signature, status,
+                    terminal_reason_code, terminal_reason_message, terminal_reason_source,
+                    created_at_ms, updated_at_ms
              FROM option_orders
              WHERE option_series_id = $1
                AND side = $2
@@ -2055,6 +2062,7 @@ impl PgRepository {
             staged.remaining_size_1e8 = staged.size_1e8 - plan.total_fill_size_1e8;
             staged.updated_at_ms = updated_at_ms;
             staged.status = final_status_for_tif(&staged);
+            stamp_insert_terminal_reason(&mut staged);
             staged
         };
         insert_option_order_tx(&mut tx, &final_taker).await?;
@@ -2094,7 +2102,9 @@ impl PgRepository {
         let rows = sqlx::query(
             "SELECT order_id, option_series_id, account, side, price_1e8, size_1e8,
                     remaining_size_1e8, time_in_force, post_only, client_order_id, nonce,
-                    deadline_ms, signature, status, created_at_ms, updated_at_ms
+                    deadline_ms, signature, status,
+                    terminal_reason_code, terminal_reason_message, terminal_reason_source,
+                    created_at_ms, updated_at_ms
              FROM option_orders
              ORDER BY created_at_ms ASC, order_id ASC",
         )
@@ -2108,7 +2118,9 @@ impl PgRepository {
         let row = sqlx::query(
             "SELECT order_id, option_series_id, account, side, price_1e8, size_1e8,
                     remaining_size_1e8, time_in_force, post_only, client_order_id, nonce,
-                    deadline_ms, signature, status, created_at_ms, updated_at_ms
+                    deadline_ms, signature, status,
+                    terminal_reason_code, terminal_reason_message, terminal_reason_source,
+                    created_at_ms, updated_at_ms
              FROM option_orders
              WHERE order_id = $1",
         )
@@ -2126,14 +2138,22 @@ impl PgRepository {
     ) -> Result<OptionOrder> {
         let row = sqlx::query(
             "UPDATE option_orders
-             SET status = 'cancelled', updated_at_ms = $2
+             SET status = 'cancelled',
+                 updated_at_ms = $2,
+                 terminal_reason_code = $3,
+                 terminal_reason_message = NULL,
+                 terminal_reason_source = $4
              WHERE order_id = $1 AND status IN ('open', 'partially_filled')
              RETURNING order_id, option_series_id, account, side, price_1e8, size_1e8,
                        remaining_size_1e8, time_in_force, post_only, client_order_id, nonce,
-                       deadline_ms, signature, status, created_at_ms, updated_at_ms",
+                       deadline_ms, signature, status,
+                       terminal_reason_code, terminal_reason_message, terminal_reason_source,
+                       created_at_ms, updated_at_ms",
         )
         .bind(order_id.to_string())
         .bind(timestamp_to_i64(updated_at_ms))
+        .bind(terminal_reason::USER_CANCELLED)
+        .bind(terminal_reason::SOURCE_USER)
         .fetch_optional(&self.pool)
         .await
         .map_err(|error| BackendError::Persistence(error.to_string()))?;
@@ -2358,7 +2378,9 @@ impl PgRepository {
         let rows = sqlx::query(
             "SELECT order_id, option_series_id, account, side, price_1e8, size_1e8,
                     remaining_size_1e8, time_in_force, post_only, client_order_id, nonce,
-                    deadline_ms, signature, status, created_at_ms, updated_at_ms
+                    deadline_ms, signature, status,
+                    terminal_reason_code, terminal_reason_message, terminal_reason_source,
+                    created_at_ms, updated_at_ms
              FROM option_orders
              WHERE option_series_id = $1 AND status IN ('open', 'partially_filled')
              ORDER BY created_at_ms ASC, order_id ASC",
@@ -4802,6 +4824,9 @@ fn option_order_from_row(row: PgRow) -> Result<OptionOrder> {
         deadline_ms: row_get(&row, "deadline_ms")?,
         signature: row_get(&row, "signature")?,
         status: OptionOrderStatus::parse(&status)?,
+        terminal_reason_code: row_get(&row, "terminal_reason_code")?,
+        terminal_reason_message: row_get(&row, "terminal_reason_message")?,
+        terminal_reason_source: row_get(&row, "terminal_reason_source")?,
         created_at_ms: row_get(&row, "created_at_ms")?,
         updated_at_ms: row_get(&row, "updated_at_ms")?,
     })
@@ -5404,6 +5429,9 @@ fn insert_option_order_query<'q>(
         .bind(order.deadline_ms.map(timestamp_to_i64))
         .bind(&order.signature)
         .bind(order.status.as_str())
+        .bind(&order.terminal_reason_code)
+        .bind(&order.terminal_reason_message)
+        .bind(&order.terminal_reason_source)
         .bind(timestamp_to_i64(order.created_at_ms))
         .bind(timestamp_to_i64(order.updated_at_ms))
 }
@@ -5417,8 +5445,11 @@ async fn insert_option_order_tx(
             "INSERT INTO option_orders (
                 order_id, option_series_id, account, side, price_1e8, size_1e8,
                 remaining_size_1e8, time_in_force, post_only, client_order_id, nonce,
-                deadline_ms, signature, status, created_at_ms, updated_at_ms
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
+                deadline_ms, signature, status,
+                terminal_reason_code, terminal_reason_message, terminal_reason_source,
+                created_at_ms, updated_at_ms
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+                      $15, $16, $17, $18, $19)",
         ),
         order,
     )

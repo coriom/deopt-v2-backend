@@ -2318,6 +2318,13 @@ struct OptionOrderResponse {
     deadline_ms: Option<i64>,
     signature: Option<String>,
     status: OptionOrderStatus,
+    // HISTORY-V2-TERMINAL-REASONS-V1
+    #[serde(skip_serializing_if = "Option::is_none")]
+    terminal_reason_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    terminal_reason_message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    terminal_reason_source: Option<String>,
     created_at_ms: i64,
     updated_at_ms: i64,
 }
@@ -2346,6 +2353,9 @@ impl From<OptionOrder> for OptionOrderResponse {
             deadline_ms: order.deadline_ms,
             signature: order.signature,
             status: order.status,
+            terminal_reason_code: order.terminal_reason_code,
+            terminal_reason_message: order.terminal_reason_message,
+            terminal_reason_source: order.terminal_reason_source,
             created_at_ms: order.created_at_ms,
             updated_at_ms: order.updated_at_ms,
         }

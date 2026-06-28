@@ -1,6 +1,6 @@
 use super::{
-    OptionEventIndexerState, OptionExecutionConfirmationStatus, OptionExecutionEvent,
-    OptionExecutionEventLink, OptionExecutionIntent, OptionExecutionIntentId,
+    terminal_reason, OptionEventIndexerState, OptionExecutionConfirmationStatus,
+    OptionExecutionEvent, OptionExecutionEventLink, OptionExecutionIntent, OptionExecutionIntentId,
     OptionExecutionIntentStatus, OptionExecutionReceiptCost, OptionExecutionReconciliation,
     OptionExecutionSimulationResult, OptionExecutionSourceType, OptionExecutionTransaction,
     OptionFill, OptionFillFilter, OptionFillId, OptionOrder, OptionOrderFilter, OptionOrderId,
@@ -147,6 +147,7 @@ impl OptionSeriesStore {
 
         incoming.updated_at_ms = updated_at_ms;
         incoming.status = final_status_for_tif(&incoming);
+        stamp_insert_terminal_reason(&mut incoming);
         self.orders.insert(incoming.order_id, incoming.clone());
         Ok((incoming, fills))
     }
@@ -187,6 +188,9 @@ impl OptionSeriesStore {
         }
         order.status = OptionOrderStatus::Cancelled;
         order.updated_at_ms = updated_at_ms;
+        order.terminal_reason_code = Some(terminal_reason::USER_CANCELLED.to_string());
+        order.terminal_reason_message = None;
+        order.terminal_reason_source = Some(terminal_reason::SOURCE_USER.to_string());
         Ok(order.clone())
     }
 
@@ -1297,6 +1301,23 @@ pub(crate) fn final_status_for_tif(order: &OptionOrder) -> OptionOrderStatus {
             other => other,
         },
         TimeInForce::Fok => base,
+    }
+}
+
+/// HISTORY-V2-TERMINAL-REASONS-V1 — stamp the persisted reason on the
+/// staged taker right before insert. The only insert-time terminal
+/// reason today is `ioc_remainder_cancelled` (IOC that did not fully
+/// fill). FOK rejection and post-only rejection are pre-persistence
+/// (`enforce_tif_plan` errors before any row is written) and never
+/// reach this point.
+pub(crate) fn stamp_insert_terminal_reason(order: &mut OptionOrder) {
+    if matches!(order.status, OptionOrderStatus::Cancelled)
+        && matches!(order.time_in_force, TimeInForce::Ioc)
+        && order.remaining_size_1e8 > 0
+    {
+        order.terminal_reason_code = Some(terminal_reason::IOC_REMAINDER_CANCELLED.to_string());
+        order.terminal_reason_message = None;
+        order.terminal_reason_source = Some(terminal_reason::SOURCE_TIF_POLICY.to_string());
     }
 }
 

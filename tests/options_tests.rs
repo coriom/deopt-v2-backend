@@ -1063,6 +1063,145 @@ async fn cancel_option_order_and_reject_second_cancel() {
         .contains("option order is cancelled"));
 }
 
+// HISTORY-V2-TERMINAL-REASONS-V1 — user cancel stamps the persisted
+// reason (`user_cancelled`, source `user`). This is the only signal
+// from which the frontend can honestly distinguish a user cancel from
+// a system / TIF-policy cancel.
+#[tokio::test]
+async fn user_cancel_persists_terminal_reason_user_cancelled() {
+    let state = state();
+    let option_series_id = active_series_id(&state).await;
+    let order = submit_option_order(
+        &state,
+        order_input(option_series_id, Side::Buy, "cancel-reason-user"),
+    )
+    .await
+    .unwrap();
+
+    let cancelled = cancel_option_order(&state, order.order.order_id)
+        .await
+        .unwrap();
+
+    assert_eq!(cancelled.status, OptionOrderStatus::Cancelled);
+    assert_eq!(
+        cancelled.terminal_reason_code.as_deref(),
+        Some("user_cancelled")
+    );
+    assert_eq!(cancelled.terminal_reason_source.as_deref(), Some("user"));
+    assert_eq!(cancelled.terminal_reason_message, None);
+}
+
+// HISTORY-V2-TERMINAL-REASONS-V1 — an IOC that partially fills and
+// has its remainder cancelled at insert time MUST carry the
+// `ioc_remainder_cancelled` reason (source `tif_policy`). This is the
+// only persisted-at-insert terminal reason today; fully-filled IOCs
+// terminate as `filled` (success → no reason).
+#[tokio::test]
+async fn ioc_remainder_persists_terminal_reason_ioc_remainder_cancelled() {
+    let state = state();
+    let series = active_series_id(&state).await;
+    submit_seeded_resting(
+        &state,
+        &series,
+        Side::Sell,
+        "ask",
+        1_000_000_000,
+        30_000_000,
+    )
+    .await;
+
+    let mut taker = order_input(series, Side::Buy, "ioc-reason");
+    taker.time_in_force = TimeInForce::Ioc;
+    taker.size_1e8 = 100_000_000;
+    let outcome = submit_option_order(&state, taker).await.unwrap();
+
+    assert_eq!(outcome.order.status, OptionOrderStatus::Cancelled);
+    assert_eq!(outcome.order.remaining_size_1e8, 70_000_000);
+    assert_eq!(
+        outcome.order.terminal_reason_code.as_deref(),
+        Some("ioc_remainder_cancelled")
+    );
+    assert_eq!(
+        outcome.order.terminal_reason_source.as_deref(),
+        Some("tif_policy")
+    );
+    assert_eq!(outcome.order.terminal_reason_message, None);
+}
+
+// HISTORY-V2-TERMINAL-REASONS-V1 — a fully-filled IOC is a SUCCESS;
+// it must not carry a terminal reason (no fabricated reasons for
+// successful orders).
+#[tokio::test]
+async fn ioc_full_fill_does_not_persist_terminal_reason() {
+    let state = state();
+    let series = active_series_id(&state).await;
+    submit_seeded_resting(
+        &state,
+        &series,
+        Side::Sell,
+        "ask-full",
+        1_000_000_000,
+        100_000_000,
+    )
+    .await;
+
+    let mut taker = order_input(series, Side::Buy, "ioc-full");
+    taker.time_in_force = TimeInForce::Ioc;
+    taker.size_1e8 = 100_000_000;
+    let outcome = submit_option_order(&state, taker).await.unwrap();
+
+    assert_eq!(outcome.order.status, OptionOrderStatus::Filled);
+    assert_eq!(outcome.order.terminal_reason_code, None);
+    assert_eq!(outcome.order.terminal_reason_source, None);
+    assert_eq!(outcome.order.terminal_reason_message, None);
+}
+
+// HISTORY-V2-TERMINAL-REASONS-V1 — pre-persistence rejections
+// (post-only would cross, FOK not fillable) error synchronously and
+// never insert an order row, so they leave no terminal reason behind.
+// This test pins the invariant: after a post-only rejection, the
+// orderbook has no row at all (no fake reason / no fake row).
+#[tokio::test]
+async fn post_only_rejection_creates_no_order_row_and_no_terminal_reason() {
+    let state = state();
+    let series = active_series_id(&state).await;
+    submit_seeded_resting(
+        &state,
+        &series,
+        Side::Sell,
+        "ask",
+        1_000_000_000,
+        50_000_000,
+    )
+    .await;
+
+    // Crossable post-only buy → matching-engine rejects synchronously.
+    let mut taker = order_input(series.clone(), Side::Buy, "post-only-cross");
+    taker.post_only = true;
+    taker.price_1e8 = 1_500_000_000;
+    let err = submit_option_order(&state, taker).await.unwrap_err();
+    assert!(
+        format!("{err}").to_lowercase().contains("post"),
+        "expected post-only error, got: {err}"
+    );
+
+    // No "rejected" row landed; only the seeded ask exists.
+    let all = list_option_orders(
+        &state,
+        OptionOrderFilter {
+            option_series_id: Some(series),
+            account: None,
+            status: None,
+            side: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].status, OptionOrderStatus::Open);
+    assert_eq!(all[0].terminal_reason_code, None);
+}
+
 #[tokio::test]
 async fn option_orderbook_aggregates_and_sorts_levels() {
     let state = state();

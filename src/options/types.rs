@@ -870,8 +870,30 @@ pub struct OptionOrder {
     pub deadline_ms: Option<TimestampMs>,
     pub signature: Option<String>,
     pub status: OptionOrderStatus,
+    // HISTORY-V2-TERMINAL-REASONS-V1: optional persisted reason stamped
+    // at terminal transitions where the cause is known (user cancel,
+    // IOC remainder). NULL for live rows and for pre-existing rows from
+    // before migration 0030.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_reason_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_reason_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_reason_source: Option<String>,
     pub created_at_ms: TimestampMs,
     pub updated_at_ms: TimestampMs,
+}
+
+// HISTORY-V2-TERMINAL-REASONS-V1: stable token table for the two
+// terminal causes the backend can persist honestly today. Anything
+// not in this list is a pre-persistence rejection (PostOnlyWouldMatch,
+// FokNotFillable, matching rejections) and never reaches the DB.
+pub mod terminal_reason {
+    pub const USER_CANCELLED: &str = "user_cancelled";
+    pub const IOC_REMAINDER_CANCELLED: &str = "ioc_remainder_cancelled";
+
+    pub const SOURCE_USER: &str = "user";
+    pub const SOURCE_TIF_POLICY: &str = "tif_policy";
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

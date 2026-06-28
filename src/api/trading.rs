@@ -366,6 +366,21 @@ pub struct HistoryV2Item {
     /// rejected post-only orders. Only set on the Orders tab.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub post_only: Option<bool>,
+    /// HISTORY-V2-TERMINAL-REASONS-V1 — persisted terminal reason
+    /// fields. `terminal_reason_code` is a snake_case token (e.g.
+    /// `user_cancelled`, `ioc_remainder_cancelled`); the frontend
+    /// prefers this over TIF-derived inference. `terminal_reason_source`
+    /// disambiguates intent (`user` vs `tif_policy` vs `system`).
+    /// All three are only set on the Orders tab for rows whose
+    /// terminal transition was authored by a code path that knows the
+    /// cause — pre-persistence rejections (post-only / FOK / matching)
+    /// never create a DB row and therefore cannot surface here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_reason_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_reason_message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_reason_source: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -2239,6 +2254,9 @@ async fn orders_rows_for(
             filled: Some(filled_amount_1e8.to_string()),
             status: Some(o.status.as_str().to_string()),
             post_only: Some(o.post_only),
+            terminal_reason_code: o.terminal_reason_code.clone(),
+            terminal_reason_message: o.terminal_reason_message.clone(),
+            terminal_reason_source: o.terminal_reason_source.clone(),
             role: None,
             tx_hash: None,
             ..HistoryV2Item::default()
@@ -3182,6 +3200,137 @@ mod tests {
         .await
         .expect("history v2 ok");
         assert_eq!(env.0.data.page, 1);
+    }
+
+    // HISTORY-V2-TERMINAL-REASONS-V1 — wire-shape check: when an
+    // OptionOrder has the persisted terminal_reason_* fields, the
+    // HistoryV2Item produced by `orders_rows_for` MUST serialize them
+    // (and the frontend then prefers them over TIF-derived inference).
+    #[tokio::test]
+    async fn history_v2_orders_tab_surfaces_persisted_terminal_reason() {
+        use crate::options::{OptionOrder, OptionOrderStatus};
+        use crate::types::{AccountId, OrderId, Side, TimeInForce};
+        let s = seeded_state(true);
+        let acct = AccountId::new("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string());
+        let now = now_ms();
+        // IOC partial fill that landed with terminal_reason populated.
+        let ioc = OptionOrder {
+            order_id: OrderId::new(),
+            option_series_id: "S-1".to_string(),
+            account: acct.clone(),
+            side: Side::Buy,
+            price_1e8: 1_000_000_000,
+            size_1e8: 100_000_000,
+            remaining_size_1e8: 70_000_000,
+            time_in_force: TimeInForce::Ioc,
+            post_only: false,
+            client_order_id: Some("ioc-row".to_string()),
+            nonce: None,
+            deadline_ms: None,
+            signature: None,
+            status: OptionOrderStatus::Cancelled,
+            terminal_reason_code: Some("ioc_remainder_cancelled".to_string()),
+            terminal_reason_message: None,
+            terminal_reason_source: Some("tif_policy".to_string()),
+            created_at_ms: now,
+            updated_at_ms: now,
+        };
+        // User-cancelled GTC.
+        let user_cancel = OptionOrder {
+            order_id: OrderId::new(),
+            option_series_id: "S-1".to_string(),
+            account: acct.clone(),
+            side: Side::Sell,
+            price_1e8: 1_100_000_000,
+            size_1e8: 50_000_000,
+            remaining_size_1e8: 50_000_000,
+            time_in_force: TimeInForce::Gtc,
+            post_only: false,
+            client_order_id: Some("user-cancel-row".to_string()),
+            nonce: None,
+            deadline_ms: None,
+            signature: None,
+            status: OptionOrderStatus::Cancelled,
+            terminal_reason_code: Some("user_cancelled".to_string()),
+            terminal_reason_message: None,
+            terminal_reason_source: Some("user".to_string()),
+            created_at_ms: now,
+            updated_at_ms: now,
+        };
+        // Live row — must NOT surface a terminal reason even if
+        // somehow set (the helper's contract is success/active never
+        // carry a reason, and live rows shouldn't have one anyway).
+        let live = OptionOrder {
+            order_id: OrderId::new(),
+            option_series_id: "S-1".to_string(),
+            account: acct.clone(),
+            side: Side::Buy,
+            price_1e8: 900_000_000,
+            size_1e8: 25_000_000,
+            remaining_size_1e8: 25_000_000,
+            time_in_force: TimeInForce::Gtc,
+            post_only: false,
+            client_order_id: Some("live-row".to_string()),
+            nonce: None,
+            deadline_ms: None,
+            signature: None,
+            status: OptionOrderStatus::Open,
+            terminal_reason_code: None,
+            terminal_reason_message: None,
+            terminal_reason_source: None,
+            created_at_ms: now,
+            updated_at_ms: now,
+        };
+        {
+            let mut store = s.options_store.lock().unwrap();
+            store.insert_order(ioc).expect("seed ioc");
+            store.insert_order(user_cancel).expect("seed user_cancel");
+            store.insert_order(live).expect("seed live");
+        }
+
+        let mut q = default_history_query();
+        q.tab = Some("orders".to_string());
+        let env = account_history_v2(State(s.clone()), Path(acct.0.clone()), Query(q))
+            .await
+            .expect("history v2 orders ok");
+        let items = &env.0.data.items;
+        assert_eq!(items.len(), 3);
+
+        // Each terminal row MUST carry the persisted reason on the
+        // wire; the live row MUST NOT.
+        let ioc_item = items
+            .iter()
+            .find(|it| {
+                it.status.as_deref() == Some("cancelled") && it.order_type.as_deref() == Some("ioc")
+            })
+            .expect("ioc row present");
+        assert_eq!(
+            ioc_item.terminal_reason_code.as_deref(),
+            Some("ioc_remainder_cancelled")
+        );
+        assert_eq!(
+            ioc_item.terminal_reason_source.as_deref(),
+            Some("tif_policy")
+        );
+
+        let user_item = items
+            .iter()
+            .find(|it| {
+                it.status.as_deref() == Some("cancelled") && it.order_type.as_deref() == Some("gtc")
+            })
+            .expect("user cancel row present");
+        assert_eq!(
+            user_item.terminal_reason_code.as_deref(),
+            Some("user_cancelled")
+        );
+        assert_eq!(user_item.terminal_reason_source.as_deref(), Some("user"));
+
+        let live_item = items
+            .iter()
+            .find(|it| it.status.as_deref() == Some("open"))
+            .expect("open row present");
+        assert_eq!(live_item.terminal_reason_code, None);
+        assert_eq!(live_item.terminal_reason_source, None);
     }
 
     // FRONTEND-BACKEND-LEADERBOARD-V1 tests.

@@ -839,6 +839,9 @@ pub fn execute_triggered_in_store(
         deadline_ms: None,
         signature: None,
         status: OptionOrderStatus::Open,
+        terminal_reason_code: None,
+        terminal_reason_message: None,
+        terminal_reason_source: None,
         created_at_ms: now_ms_signed,
         updated_at_ms: now_ms_signed,
     };

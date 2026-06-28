@@ -387,6 +387,9 @@ pub async fn submit_option_order(
         deadline_ms: input.deadline_ms,
         signature: input.signature,
         status: OptionOrderStatus::Open,
+        terminal_reason_code: None,
+        terminal_reason_message: None,
+        terminal_reason_source: None,
         created_at_ms: now,
         updated_at_ms: now,
     };
