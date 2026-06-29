@@ -1993,9 +1993,29 @@ fn compact_option_execution_intent(intent: &OptionExecutionIntent) -> serde_json
     })
 }
 
+// BACKEND-MARKETS-OPTIONS-ONLY-FILTER-V1 — the public `/markets`
+// endpoint exposes the live, tradable market catalogue. While perps
+// are non-live (`submit_order` / `cancel_order` / `create_rfq` /
+// `submit_quote` / `accept_quote` / `cancel_rfq` all return
+// `BackendError::PerpsNotLive`) the engine's perp markets MUST NOT be
+// surfaced here — listing them would imply they are tradable, which
+// is the precise opposite of the fail-closed posture enforced by the
+// mutation handlers above.
+//
+// When `ACCOUNT-WRITE-AUTH-HARDENING-PERPS-V1` lands and the perp
+// mutation routes are re-enabled, the filter below should be revisited
+// (most likely flipped to allow perps with `kind == "perp"`).
+//
+// Response shape is preserved: a JSON array of `Market` records.
+// Empty array is the honest answer when no live markets are seeded.
 async fn markets(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
     let engine = state.engine.lock().map_err(|_| ApiError::internal())?;
-    Ok(Json(serde_json::json!(engine.markets())))
+    let live_markets: Vec<&crate::types::Market> = engine
+        .markets()
+        .iter()
+        .filter(|market| market.kind != "perp")
+        .collect();
+    Ok(Json(serde_json::json!(live_markets)))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -5397,6 +5417,113 @@ mod tests {
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         let json = response_json(response).await;
         assert_eq!(json["error"], "metrics endpoint is disabled");
+    }
+
+    // ── BACKEND-MARKETS-OPTIONS-ONLY-FILTER-V1 ─────────────────────
+    //
+    // Public `/markets` MUST NOT list perp markets while perps are
+    // non-live (mutation routes return `PerpsNotLive`). Listing them
+    // would imply they are tradable, contradicting the fail-closed
+    // posture. When `ACCOUNT-WRITE-AUTH-HARDENING-PERPS-V1` re-enables
+    // perp mutations, the filter in `async fn markets()` should be
+    // revisited and these tests updated accordingly.
+
+    #[tokio::test]
+    async fn markets_default_state_returns_empty_array_no_perps() {
+        // EngineState::with_default_markets() seeds two perp markets
+        // (ETH-PERP, BTC-PERP). With perps non-live, the public
+        // `/markets` MUST hide both.
+        let response = router(AppState::new(EngineState::with_default_markets()))
+            .oneshot(get_request("/markets", None))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert!(
+            json.is_array(),
+            "/markets must keep the array response shape, got {json}"
+        );
+        assert_eq!(
+            json.as_array().unwrap().len(),
+            0,
+            "/markets must hide non-live perp markets; got {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn markets_no_markets_at_all_returns_empty_array() {
+        let response = router(AppState::new(EngineState::new(Vec::new())))
+            .oneshot(get_request("/markets", None))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert!(json.is_array());
+        assert_eq!(json.as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn markets_filters_perps_keeps_options() {
+        // A mixed market list: perps must be filtered, anything else
+        // (an `option`-kind market, if ever surfaced this way) passes
+        // through. The filter contract is `kind != "perp"`, not
+        // `kind == "option"`, so any future non-perp `kind` would
+        // also be surfaced.
+        let markets = vec![
+            crate::types::Market {
+                market_id: 1,
+                symbol: "ETH-PERP".to_string(),
+                kind: "perp".to_string(),
+            },
+            crate::types::Market {
+                market_id: 9001,
+                symbol: "ETH-CALL-3000".to_string(),
+                kind: "option".to_string(),
+            },
+            crate::types::Market {
+                market_id: 2,
+                symbol: "BTC-PERP".to_string(),
+                kind: "perp".to_string(),
+            },
+        ];
+        let response = router(AppState::new(EngineState::new(markets)))
+            .oneshot(get_request("/markets", None))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        let arr = json.as_array().expect("array");
+        assert_eq!(arr.len(), 1, "only the option-kind market survives: {json}");
+        let only = &arr[0];
+        assert_eq!(only["kind"], "option");
+        assert_eq!(only["symbol"], "ETH-CALL-3000");
+        // Per the `Market` struct's serde rename.
+        assert_eq!(only["marketId"], 9001);
+    }
+
+    #[tokio::test]
+    async fn perp_submit_order_route_still_fails_closed() {
+        // Cross-check: the filter on `/markets` does not alter the
+        // mutation-route fail-closed posture. POST /orders MUST still
+        // return PerpsNotLive (503 SERVICE_UNAVAILABLE per the
+        // `BackendError::PerpsNotLive` status mapping).
+        let response = router(AppState::new(EngineState::with_default_markets()))
+            .oneshot(post_request("/orders"))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "perps mutation must remain rejected with PerpsNotLive"
+        );
+        let json = response_json(response).await;
+        assert!(
+            json.to_string().to_lowercase().contains("perp"),
+            "expected a perps-not-live signal in body, got {json}"
+        );
     }
 
     #[tokio::test]
