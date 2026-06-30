@@ -64,7 +64,8 @@ use crate::options::service::{
     simulate_prepared_option_execution_intent,
     submit_option_execution_signatures as submit_option_execution_signatures_service,
     submit_option_order as submit_option_order_service,
-    submit_option_rfq_quote as submit_option_rfq_quote_service, CreateOptionRfqInput,
+    submit_option_rfq_quote as submit_option_rfq_quote_service,
+    sweep_expired_option_orders as sweep_expired_option_orders_service, CreateOptionRfqInput,
     CreateOptionSeriesInput, OptionRfqQuoteSigningPayloadInput,
     SubmitOptionExecutionSignaturesInput, SubmitOptionOrderInput, SubmitOptionRfqQuoteInput,
 };
@@ -315,6 +316,11 @@ pub fn router(state: AppState) -> Router {
             "/accounts/:address/conditional-orders/:id",
             get(get_conditional_order_route).delete(cancel_conditional_order_route),
         )
+        // ATTACHED-TP-SL-PLAN-OBSERVABILITY-V1
+        .route(
+            "/accounts/:address/option-order-attachment-plans",
+            get(list_option_order_attachment_plans_route),
+        )
         // GET /options/execution-intents is wired further below alongside
         // the M-P2f POST handler so both verbs share a single route entry.
         .route(
@@ -427,6 +433,10 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/admin/options/events", get(admin_option_events))
         .route("/admin/options/events/tick", post(admin_option_events_tick))
+        .route(
+            "/admin/options/orders/expire/tick",
+            post(admin_option_orders_expire_tick),
+        )
         .route(
             "/admin/options/reconciliations",
             get(admin_option_reconciliations),
@@ -991,6 +1001,30 @@ async fn admin_option_events_tick(
     let provider = HttpJsonRpcProvider::new(rpc_url);
     let result = crate::options::index_option_events_with_provider(&state, &provider).await?;
     Ok(Json(result))
+}
+
+/// OPTION-ORDER-EXPIRY-SWEEP-V1 — one-shot operator-driven sweep
+/// over the option orderbook. Mirrors the other `/admin/options/*/tick`
+/// endpoints (admin-token-gated) and returns the count + ids of every
+/// order it terminalized so an operator can observe the impact of a
+/// run. Safe to invoke from a cron / scheduled task; idempotent on
+/// repeated calls.
+async fn admin_option_orders_expire_tick(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    ensure_admin_access(&state, &headers)?;
+    let now = now_ms();
+    let expired = sweep_expired_option_orders_service(&state, now).await?;
+    let expired_order_ids: Vec<String> = expired
+        .iter()
+        .map(|order| order.order_id.to_string())
+        .collect();
+    Ok(Json(serde_json::json!({
+        "now_ms": now,
+        "expired_count": expired.len(),
+        "expired_order_ids": expired_order_ids,
+    })))
 }
 
 async fn admin_option_reconciliations(
@@ -2098,6 +2132,32 @@ struct SubmitOptionOrderRequest {
     deadline_ms: Option<i64>,
     signature: Option<String>,
     authorization: AuthorizationEnvelope,
+    /// ATTACHED-TP-SL-ON-ENTRY-V1 — optional TP/SL intent
+    /// recorded with the parent order and materialized into
+    /// `options_conditional_orders` on the first fill batch.
+    #[serde(default)]
+    attached_tp_sl: Option<AttachedTpSlBody>,
+}
+
+/// ATTACHED-TP-SL-ON-ENTRY-V1 — wire-level body for the attached
+/// TP/SL intent. Prices are stringified u128 1e8 (matching the
+/// parent order's `price_1e8` / `size_1e8` convention).
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+struct AttachedTpSlBody {
+    #[serde(default)]
+    take_profit: Option<AttachedLegBody>,
+    #[serde(default)]
+    stop_loss: Option<AttachedLegBody>,
+    #[serde(default)]
+    link_as_oco: bool,
+    #[serde(default)]
+    expires_at_ms: Option<i64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+struct AttachedLegBody {
+    trigger_price_1e8: String,
+    limit_price_1e8: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
@@ -2794,6 +2854,39 @@ async fn submit_option_order(
             fills: fills.into_iter().map(OptionFillResponse::from).collect(),
         }));
     }
+    let attached_tp_sl = match request.attached_tp_sl {
+        Some(body) => Some(crate::options::service::AttachedTpSlInput {
+            take_profit: match body.take_profit {
+                Some(leg) => Some(crate::options::service::AttachedLegInput {
+                    trigger_price_1e8: parse_fixed_u128(
+                        "attached_tp_sl.take_profit.trigger_price_1e8",
+                        &leg.trigger_price_1e8,
+                    )?,
+                    limit_price_1e8: parse_fixed_u128(
+                        "attached_tp_sl.take_profit.limit_price_1e8",
+                        &leg.limit_price_1e8,
+                    )?,
+                }),
+                None => None,
+            },
+            stop_loss: match body.stop_loss {
+                Some(leg) => Some(crate::options::service::AttachedLegInput {
+                    trigger_price_1e8: parse_fixed_u128(
+                        "attached_tp_sl.stop_loss.trigger_price_1e8",
+                        &leg.trigger_price_1e8,
+                    )?,
+                    limit_price_1e8: parse_fixed_u128(
+                        "attached_tp_sl.stop_loss.limit_price_1e8",
+                        &leg.limit_price_1e8,
+                    )?,
+                }),
+                None => None,
+            },
+            link_as_oco: body.link_as_oco,
+            expires_at_ms: body.expires_at_ms,
+        }),
+        None => None,
+    };
     let outcome = submit_option_order_service(
         &state,
         SubmitOptionOrderInput {
@@ -2808,6 +2901,7 @@ async fn submit_option_order(
             nonce: request.nonce,
             deadline_ms: request.deadline_ms,
             signature: request.signature,
+            attached_tp_sl,
         },
     )
     .await?;
@@ -2988,6 +3082,137 @@ async fn list_conditional_orders_route(
             .map(ConditionalOrderResponseDto::from)
             .collect(),
     ))
+}
+
+/// ATTACHED-TP-SL-PLAN-OBSERVABILITY-V1 — read-only listing of
+/// attachment plans (`option_order_attachment_plans`) for the given
+/// account. Mirrors the cancellation-feed/`/options/orders` posture:
+/// no auth required for reads, no signatures or raw authorization
+/// envelopes returned, account-scoped, newest first. The optional
+/// `since_ms` query param drops rows older than that wall-clock
+/// floor and matches the service-function signature.
+#[derive(Clone, Debug, Deserialize)]
+struct ListAttachmentPlansQuery {
+    #[serde(default)]
+    since_ms: Option<i64>,
+}
+
+async fn list_option_order_attachment_plans_route(
+    State(state): State<AppState>,
+    Path(address): Path<String>,
+    Query(query): Query<ListAttachmentPlansQuery>,
+) -> Result<Json<AttachmentPlanListResponseDto>, ApiError> {
+    use crate::options::service::list_option_order_attachment_plans_for_account;
+    let account = AccountId::new(address);
+    let plans =
+        list_option_order_attachment_plans_for_account(&state, &account, query.since_ms).await?;
+    let plans_dto: Vec<OptionOrderAttachmentPlanDto> = plans
+        .into_iter()
+        .map(OptionOrderAttachmentPlanDto::from)
+        .collect();
+    Ok(Json(AttachmentPlanListResponseDto { plans: plans_dto }))
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct AttachmentPlanListResponseDto {
+    plans: Vec<OptionOrderAttachmentPlanDto>,
+}
+
+/// ATTACHED-TP-SL-PLAN-OBSERVABILITY-V1 — wire-level shape of a
+/// single attachment plan. Mirrors the `OptionOrderAttachmentPlan`
+/// domain struct but stringifies BigInt-style fields (`Price1e8`,
+/// `Size1e8`) and Uuid fields for JSON compatibility, and emits
+/// trader-meaningful fields ONLY (no signature, no authorization
+/// envelope — the plan row never stored them).
+#[derive(Clone, Debug, Serialize)]
+struct OptionOrderAttachmentPlanDto {
+    plan_id: String,
+    parent_order_id: String,
+    account: String,
+    option_series_id: String,
+    /// `pending` | `active` | `cancelled` | `failed`.
+    status: String,
+    /// Whether OCO was requested at submit time (only meaningful
+    /// when both legs are present).
+    link_as_oco: bool,
+    /// Optional trader-supplied deadline for the materialised
+    /// conditional rows. NULL means "use service defaults".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expires_at_ms: Option<i64>,
+    /// Take-profit leg prices, when requested. NULL when only SL
+    /// was requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    take_profit_trigger_price_1e8: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    take_profit_limit_price_1e8: Option<String>,
+    /// Stop-loss leg prices, when requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stop_loss_trigger_price_1e8: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stop_loss_limit_price_1e8: Option<String>,
+    /// Size the plan was materialised at (= the parent's filled
+    /// exposure when the conditional rows were created). NULL while
+    /// the plan is still `pending`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    materialized_size_1e8: Option<String>,
+    /// IDs of the materialised conditional rows (when `status =
+    /// active`); look up via
+    /// `GET /accounts/:address/conditional-orders/:id`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    take_profit_conditional_order_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stop_loss_conditional_order_id: Option<String>,
+    /// Shared OCO group id linking the two materialised rows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    oco_group_id: Option<String>,
+    /// Snake_case stable token (`parent_terminal_before_fill` |
+    /// `conditional_create_failed`); NULL on `pending` / `active`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failure_code: Option<String>,
+    /// Trader-meaningful detail for the failure. NEVER carries
+    /// secrets — only the existing BackendError Display string.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failure_message: Option<String>,
+    created_at_ms: i64,
+    updated_at_ms: i64,
+}
+
+impl From<crate::options::OptionOrderAttachmentPlan> for OptionOrderAttachmentPlanDto {
+    fn from(p: crate::options::OptionOrderAttachmentPlan) -> Self {
+        Self {
+            plan_id: p.plan_id.to_string(),
+            parent_order_id: p.parent_order_id.to_string(),
+            account: p.account.0,
+            option_series_id: p.option_series_id,
+            status: p.status.as_str().to_string(),
+            link_as_oco: p.link_as_oco,
+            expires_at_ms: p.expires_at_ms,
+            take_profit_trigger_price_1e8: p
+                .take_profit
+                .as_ref()
+                .map(|leg| leg.trigger_price_1e8.to_string()),
+            take_profit_limit_price_1e8: p
+                .take_profit
+                .as_ref()
+                .map(|leg| leg.limit_price_1e8.to_string()),
+            stop_loss_trigger_price_1e8: p
+                .stop_loss
+                .as_ref()
+                .map(|leg| leg.trigger_price_1e8.to_string()),
+            stop_loss_limit_price_1e8: p
+                .stop_loss
+                .as_ref()
+                .map(|leg| leg.limit_price_1e8.to_string()),
+            materialized_size_1e8: p.materialized_size_1e8.map(|s| s.to_string()),
+            take_profit_conditional_order_id: p.tp_conditional_order_id.map(|id| id.to_string()),
+            stop_loss_conditional_order_id: p.sl_conditional_order_id.map(|id| id.to_string()),
+            oco_group_id: p.oco_group_id.map(|id| id.to_string()),
+            failure_code: p.failure_code,
+            failure_message: p.failure_message,
+            created_at_ms: p.created_at_ms,
+            updated_at_ms: p.updated_at_ms,
+        }
+    }
 }
 
 async fn get_conditional_order_route(
@@ -7835,6 +8060,277 @@ mod tests {
         assert!(state.trade_signatures.lock().unwrap().is_empty());
     }
 
+    // OPTION-ORDER-EXPIRY-SWEEP-V1 — HTTP smoke for the admin tick.
+    // (The service-level semantic tests live in tests/options_tests.rs;
+    // this test only asserts the wiring: route registration, admin
+    // gating, JSON shape, and idempotent 0-count behaviour on an
+    // empty book.)
+    fn options_enabled_admin_state(require_token: bool) -> AppState {
+        let options_config = crate::options::OptionsConfig::enabled_in_memory_for_tests();
+        let mut state =
+            AppState::with_options_config(EngineState::with_default_markets(), options_config);
+        state.admin_config = AdminConfig::new(
+            true,
+            require_token,
+            require_token.then(|| "test-admin-token".to_string()),
+        );
+        state.network_name = "admin-test".to_string();
+        state
+    }
+
+    #[tokio::test]
+    async fn admin_option_orders_expire_tick_returns_zero_count_on_empty_book() {
+        let state = options_enabled_admin_state(false);
+        let response = router(state)
+            .oneshot(post_request("/admin/options/orders/expire/tick"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["expired_count"], 0);
+        assert!(json["expired_order_ids"].as_array().unwrap().is_empty());
+        assert!(json["now_ms"].is_i64());
+    }
+
+    #[tokio::test]
+    async fn admin_option_orders_expire_tick_refuses_without_admin_token() {
+        let state = options_enabled_admin_state(true);
+        let response = router(state)
+            .oneshot(post_request("/admin/options/orders/expire/tick"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let json = response_json(response).await;
+        assert_eq!(json["error"], "admin token is required");
+    }
+
+    // ATTACHED-TP-SL-PLAN-OBSERVABILITY-V1 — HTTP wiring smoke tests
+    // for the new attachment-plans listing route. Service-level
+    // semantics are covered by tests/options_tests.rs; these tests
+    // only assert the route is registered, returns the documented
+    // JSON shape, never leaks signatures, and isolates accounts.
+    fn options_enabled_no_token_state() -> AppState {
+        let options_config = crate::options::OptionsConfig::enabled_in_memory_for_tests();
+        let mut state =
+            AppState::with_options_config(EngineState::with_default_markets(), options_config);
+        state.network_name = "attachment-plans-test".to_string();
+        state
+    }
+
+    fn seed_attachment_plan(state: &AppState, plan: crate::options::OptionOrderAttachmentPlan) {
+        state
+            .options_store
+            .lock()
+            .unwrap()
+            .insert_option_order_attachment_plan(plan)
+            .unwrap();
+    }
+
+    fn make_plan(
+        parent_order_id: crate::options::OptionOrderId,
+        account: &str,
+        status: crate::options::AttachmentPlanStatus,
+        now_ms: i64,
+    ) -> crate::options::OptionOrderAttachmentPlan {
+        crate::options::OptionOrderAttachmentPlan {
+            plan_id: uuid::Uuid::new_v4(),
+            parent_order_id,
+            account: AccountId::new(account.to_string()),
+            option_series_id: "0xfeedface".to_string(),
+            take_profit: Some(crate::options::AttachmentLegSpec {
+                trigger_price_1e8: 1_500_000_000,
+                limit_price_1e8: 1_500_000_000,
+            }),
+            stop_loss: None,
+            link_as_oco: false,
+            expires_at_ms: None,
+            status,
+            materialized_size_1e8: None,
+            tp_conditional_order_id: None,
+            sl_conditional_order_id: None,
+            oco_group_id: None,
+            failure_code: None,
+            failure_message: None,
+            created_at_ms: now_ms,
+            updated_at_ms: now_ms,
+        }
+    }
+
+    #[tokio::test]
+    async fn list_attachment_plans_returns_empty_array_when_none_exist() {
+        let state = options_enabled_no_token_state();
+        let response = router(state)
+            .oneshot(get_request(
+                "/accounts/0x0000000000000000000000000000000000000001/option-order-attachment-plans",
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert!(json["plans"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_attachment_plans_returns_pending_active_failed_cancelled_for_account() {
+        let state = options_enabled_no_token_state();
+        let account = "0x0000000000000000000000000000000000000010";
+        let parent_pending = crate::types::OrderId::new();
+        let parent_active = crate::types::OrderId::new();
+        let parent_failed = crate::types::OrderId::new();
+        let parent_cancelled = crate::types::OrderId::new();
+        seed_attachment_plan(
+            &state,
+            make_plan(
+                parent_pending,
+                account,
+                crate::options::AttachmentPlanStatus::Pending,
+                1_000,
+            ),
+        );
+        let mut active = make_plan(
+            parent_active,
+            account,
+            crate::options::AttachmentPlanStatus::Active,
+            2_000,
+        );
+        active.materialized_size_1e8 = Some(100_000_000);
+        active.tp_conditional_order_id = Some(uuid::Uuid::new_v4());
+        seed_attachment_plan(&state, active);
+        let mut failed = make_plan(
+            parent_failed,
+            account,
+            crate::options::AttachmentPlanStatus::Failed,
+            3_000,
+        );
+        failed.failure_code = Some("conditional_create_failed".to_string());
+        failed.failure_message = Some("no reducible option position".to_string());
+        seed_attachment_plan(&state, failed);
+        seed_attachment_plan(
+            &state,
+            make_plan(
+                parent_cancelled,
+                account,
+                crate::options::AttachmentPlanStatus::Cancelled,
+                4_000,
+            ),
+        );
+
+        let response = router(state)
+            .oneshot(get_request(
+                &format!("/accounts/{account}/option-order-attachment-plans"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        let arr = json["plans"].as_array().unwrap();
+        assert_eq!(arr.len(), 4);
+        // Newest-first ordering.
+        assert_eq!(arr[0]["status"], "cancelled");
+        assert_eq!(arr[1]["status"], "failed");
+        assert_eq!(arr[2]["status"], "active");
+        assert_eq!(arr[3]["status"], "pending");
+        // Active row exposes the materialised size + the conditional id.
+        assert_eq!(arr[2]["materialized_size_1e8"], "100000000");
+        assert!(arr[2]["take_profit_conditional_order_id"].is_string());
+        // Failed row exposes the failure triple.
+        assert_eq!(arr[1]["failure_code"], "conditional_create_failed");
+        assert!(arr[1]["failure_message"].is_string());
+        // No signature/authorization fields anywhere in the DTO.
+        for row in arr {
+            assert!(row.get("signature").is_none());
+            assert!(row.get("authorization").is_none());
+            assert!(row.get("nonce").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn list_attachment_plans_isolates_accounts() {
+        let state = options_enabled_no_token_state();
+        let alice = "0x000000000000000000000000000000000000aaaa";
+        let bob = "0x000000000000000000000000000000000000bbbb";
+        seed_attachment_plan(
+            &state,
+            make_plan(
+                crate::types::OrderId::new(),
+                alice,
+                crate::options::AttachmentPlanStatus::Pending,
+                1_000,
+            ),
+        );
+        seed_attachment_plan(
+            &state,
+            make_plan(
+                crate::types::OrderId::new(),
+                bob,
+                crate::options::AttachmentPlanStatus::Pending,
+                2_000,
+            ),
+        );
+
+        let alice_resp = router(state.clone())
+            .oneshot(get_request(
+                &format!("/accounts/{alice}/option-order-attachment-plans"),
+                None,
+            ))
+            .await
+            .unwrap();
+        let alice_json = response_json(alice_resp).await;
+        let alice_plans = alice_json["plans"].as_array().unwrap();
+        assert_eq!(alice_plans.len(), 1);
+        assert_eq!(alice_plans[0]["account"], alice);
+
+        let bob_resp = router(state)
+            .oneshot(get_request(
+                &format!("/accounts/{bob}/option-order-attachment-plans"),
+                None,
+            ))
+            .await
+            .unwrap();
+        let bob_json = response_json(bob_resp).await;
+        let bob_plans = bob_json["plans"].as_array().unwrap();
+        assert_eq!(bob_plans.len(), 1);
+        assert_eq!(bob_plans[0]["account"], bob);
+    }
+
+    #[tokio::test]
+    async fn list_attachment_plans_since_ms_filter_drops_old_rows() {
+        let state = options_enabled_no_token_state();
+        let account = "0x000000000000000000000000000000000000cccc";
+        seed_attachment_plan(
+            &state,
+            make_plan(
+                crate::types::OrderId::new(),
+                account,
+                crate::options::AttachmentPlanStatus::Pending,
+                1_000,
+            ),
+        );
+        seed_attachment_plan(
+            &state,
+            make_plan(
+                crate::types::OrderId::new(),
+                account,
+                crate::options::AttachmentPlanStatus::Pending,
+                5_000,
+            ),
+        );
+
+        let response = router(state)
+            .oneshot(get_request(
+                &format!("/accounts/{account}/option-order-attachment-plans?since_ms=3000"),
+                None,
+            ))
+            .await
+            .unwrap();
+        let json = response_json(response).await;
+        let plans = json["plans"].as_array().unwrap();
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0]["created_at_ms"], 5_000);
+    }
+
     #[tokio::test]
     async fn admin_recent_respects_limit_cap() {
         let response = router(admin_state(false))
@@ -10751,6 +11247,7 @@ impl From<BackendError> for ApiError {
             | BackendError::OptionRfqDisabled
             | BackendError::InvalidOptionSeriesState(_)
             | BackendError::InvalidOptionOrderState(_)
+            | BackendError::InvalidAttachedTpSl(_)
             | BackendError::InvalidOptionExecutionIntentState(_)
             | BackendError::InvalidOptionRfqState(_)
             | BackendError::InvalidOptionRfqQuoteState(_)

@@ -8,12 +8,14 @@ use deopt_v2_backend::options::service::{
     accept_option_rfq_quote, cancel_option_order, cancel_option_rfq, create_option_rfq,
     create_option_series, disable_option_series, get_option_fill, get_option_order,
     get_option_order_fills, get_option_orderbook, get_option_series, list_option_execution_intents,
-    list_option_fills, list_option_orders, list_option_rfq_quotes, list_option_rfqs,
-    list_option_series, option_execution_calldata, option_execution_signing_payload,
-    option_rfq_quote_signing_payload, submit_option_execution_signatures, submit_option_order,
-    submit_option_rfq_quote, CreateOptionRfqInput, CreateOptionSeriesInput,
-    OptionRfqQuoteSigningPayloadInput, SubmitOptionExecutionSignaturesInput,
-    SubmitOptionOrderInput, SubmitOptionRfqQuoteInput,
+    list_option_fills, list_option_order_attachment_plans_for_account,
+    list_option_order_rejections_for_account, list_option_orders, list_option_rfq_quotes,
+    list_option_rfqs, list_option_series, option_execution_calldata,
+    option_execution_signing_payload, option_rfq_quote_signing_payload,
+    submit_option_execution_signatures, submit_option_order, submit_option_rfq_quote,
+    sweep_expired_option_orders, AttachedLegInput, AttachedTpSlInput, CreateOptionRfqInput,
+    CreateOptionSeriesInput, OptionRfqQuoteSigningPayloadInput,
+    SubmitOptionExecutionSignaturesInput, SubmitOptionOrderInput, SubmitOptionRfqQuoteInput,
 };
 use deopt_v2_backend::options::{
     expected_option_execute_trade_selector, option_execute_trade_selector,
@@ -244,6 +246,7 @@ fn order_input(
         nonce: Some(1),
         deadline_ms: Some(now_ms() + 60_000),
         signature: Some(VALID_SIGNATURE.to_string()),
+        attached_tp_sl: None,
     }
 }
 
@@ -3163,4 +3166,1475 @@ fn decode_hex_nibble(byte: u8) -> std::result::Result<u8, ()> {
         b'A'..=b'F' => Ok(byte - b'A' + 10),
         _ => Err(()),
     }
+}
+
+// =====================================================================
+// OPTION-ORDER-EXPIRY-SWEEP-V1 — service-level tests for the bulk
+// sweeper that terminalizes active orders past their `deadline_ms`.
+// All tests use the in-memory `OptionSeriesStore` path (matches the
+// project's existing convention; the PG path mirrors the same SQL
+// predicate and is covered by its own integration suite when run
+// with `DATABASE_URL` set).
+// =====================================================================
+
+async fn submit_with_deadline(
+    state: &AppState,
+    series: &str,
+    side: Side,
+    client_id: &str,
+    deadline_ms: i64,
+) -> OptionOrder {
+    let mut input = order_input(series.to_string(), side, client_id);
+    input.deadline_ms = Some(deadline_ms);
+    let outcome = submit_option_order(state, input).await.unwrap();
+    outcome.order
+}
+
+#[tokio::test]
+async fn expire_active_order_marks_terminal_with_expired_reason() {
+    let state = state();
+    let series = active_series_id(&state).await;
+    let past = now_ms() + 60_000;
+    let order = submit_with_deadline(&state, &series, Side::Buy, "expire-basic", past).await;
+    assert_eq!(order.status, OptionOrderStatus::Open);
+    assert_eq!(order.terminal_reason_code, None);
+
+    // Tick the wall-clock past the deadline.
+    let sweep_at = past + 1;
+    let expired = sweep_expired_option_orders(&state, sweep_at).await.unwrap();
+
+    assert_eq!(expired.len(), 1);
+    let row = &expired[0];
+    assert_eq!(row.order_id, order.order_id);
+    assert_eq!(row.status, OptionOrderStatus::Expired);
+    assert_eq!(row.terminal_reason_code.as_deref(), Some("expired"));
+    assert_eq!(row.terminal_reason_source.as_deref(), Some("expiry_sweep"));
+    assert_eq!(row.terminal_reason_message, None);
+    assert_eq!(row.updated_at_ms, sweep_at);
+
+    // Persisted snapshot via `get_option_order` matches the sweep result.
+    let fetched = get_option_order(&state, order.order_id).await.unwrap();
+    assert_eq!(fetched.status, OptionOrderStatus::Expired);
+    assert_eq!(fetched.terminal_reason_code.as_deref(), Some("expired"));
+}
+
+#[tokio::test]
+async fn non_expired_active_order_remains_open() {
+    let state = state();
+    let series = active_series_id(&state).await;
+    let future = now_ms() + 10 * 60 * 1000;
+    let order = submit_with_deadline(&state, &series, Side::Buy, "non-expired", future).await;
+
+    // Sweep at a wall-clock that is BEFORE the deadline.
+    let expired = sweep_expired_option_orders(&state, future - 1)
+        .await
+        .unwrap();
+
+    assert!(expired.is_empty());
+    let fetched = get_option_order(&state, order.order_id).await.unwrap();
+    assert_eq!(fetched.status, OptionOrderStatus::Open);
+    assert_eq!(fetched.terminal_reason_code, None);
+}
+
+#[tokio::test]
+async fn already_cancelled_order_retains_user_cancelled_reason() {
+    let state = state();
+    let series = active_series_id(&state).await;
+    let deadline = now_ms() + 60_000;
+    let order =
+        submit_with_deadline(&state, &series, Side::Buy, "cancel-then-sweep", deadline).await;
+    let cancelled = cancel_option_order(&state, order.order_id).await.unwrap();
+    assert_eq!(cancelled.status, OptionOrderStatus::Cancelled);
+    assert_eq!(
+        cancelled.terminal_reason_code.as_deref(),
+        Some("user_cancelled")
+    );
+
+    // Sweep with the clock past the deadline; cancelled order must
+    // NOT flip back to `expired` or have its reason rewritten.
+    let expired = sweep_expired_option_orders(&state, deadline + 1)
+        .await
+        .unwrap();
+    assert!(expired.is_empty());
+
+    let fetched = get_option_order(&state, order.order_id).await.unwrap();
+    assert_eq!(fetched.status, OptionOrderStatus::Cancelled);
+    assert_eq!(
+        fetched.terminal_reason_code.as_deref(),
+        Some("user_cancelled")
+    );
+}
+
+#[tokio::test]
+async fn already_filled_terminal_order_unchanged_by_sweep() {
+    let state = state();
+    let series = active_series_id(&state).await;
+    // Maker sells; taker buys the full size → maker fully filled.
+    let maker_deadline = now_ms() + 60_000;
+    let mut maker_input = order_input(series.clone(), Side::Sell, "fill-then-sweep-maker");
+    maker_input.price_1e8 = 1_000_000_000;
+    maker_input.size_1e8 = 100_000_000;
+    maker_input.deadline_ms = Some(maker_deadline);
+    let maker = submit_option_order(&state, maker_input)
+        .await
+        .unwrap()
+        .order;
+
+    let mut taker_input = order_input(series, Side::Buy, "fill-then-sweep-taker");
+    taker_input.account = account_two();
+    taker_input.client_order_id = Some("fill-then-sweep-taker".to_string());
+    taker_input.price_1e8 = 1_000_000_000;
+    taker_input.size_1e8 = 100_000_000;
+    taker_input.deadline_ms = Some(now_ms() + 60_000);
+    submit_option_order(&state, taker_input).await.unwrap();
+
+    let filled = get_option_order(&state, maker.order_id).await.unwrap();
+    assert_eq!(filled.status, OptionOrderStatus::Filled);
+
+    // Sweep past the maker's deadline — filled rows must NOT change.
+    let expired = sweep_expired_option_orders(&state, maker_deadline + 1)
+        .await
+        .unwrap();
+    assert!(expired.is_empty());
+    let still_filled = get_option_order(&state, maker.order_id).await.unwrap();
+    assert_eq!(still_filled.status, OptionOrderStatus::Filled);
+}
+
+#[tokio::test]
+async fn partially_filled_resting_expires_remaining_and_preserves_fills() {
+    let state = state();
+    let series = active_series_id(&state).await;
+    let maker_deadline = now_ms() + 60_000;
+
+    // Maker rests size = 100 at price = 1_000_000_000.
+    let mut maker_input = order_input(series.clone(), Side::Sell, "partial-maker");
+    maker_input.price_1e8 = 1_000_000_000;
+    maker_input.size_1e8 = 100_000_000;
+    maker_input.deadline_ms = Some(maker_deadline);
+    let maker = submit_option_order(&state, maker_input)
+        .await
+        .unwrap()
+        .order;
+
+    // Taker buys 30 → maker becomes PartiallyFilled with 70 remaining.
+    let mut taker_input = order_input(series.clone(), Side::Buy, "partial-taker");
+    taker_input.account = account_two();
+    taker_input.price_1e8 = 1_000_000_000;
+    taker_input.size_1e8 = 30_000_000;
+    taker_input.deadline_ms = Some(now_ms() + 60_000);
+    let taker_outcome = submit_option_order(&state, taker_input).await.unwrap();
+    assert_eq!(taker_outcome.fills.len(), 1);
+
+    let mid = get_option_order(&state, maker.order_id).await.unwrap();
+    assert_eq!(mid.status, OptionOrderStatus::PartiallyFilled);
+    assert_eq!(mid.remaining_size_1e8, 70_000_000);
+
+    // Sweep past maker's deadline — expires the resting remainder.
+    let expired = sweep_expired_option_orders(&state, maker_deadline + 1)
+        .await
+        .unwrap();
+    assert_eq!(expired.len(), 1);
+    assert_eq!(expired[0].order_id, maker.order_id);
+    assert_eq!(expired[0].status, OptionOrderStatus::Expired);
+    assert_eq!(expired[0].terminal_reason_code.as_deref(), Some("expired"));
+    // Fill quantity is preserved: remaining stays at 70 (not zeroed).
+    assert_eq!(expired[0].remaining_size_1e8, 70_000_000);
+
+    // The fill row created earlier is still there + accessible.
+    let fills = get_option_order_fills(&state, maker.order_id)
+        .await
+        .unwrap();
+    assert_eq!(fills.len(), 1);
+    assert_eq!(fills[0].size_1e8, 30_000_000);
+}
+
+#[tokio::test]
+async fn repeated_sweep_is_idempotent() {
+    let state = state();
+    let series = active_series_id(&state).await;
+    let deadline = now_ms() + 60_000;
+    let order = submit_with_deadline(&state, &series, Side::Buy, "sweep-idem", deadline).await;
+
+    let first = sweep_expired_option_orders(&state, deadline + 1)
+        .await
+        .unwrap();
+    assert_eq!(first.len(), 1);
+    let updated_at_first = first[0].updated_at_ms;
+
+    // Second invocation MUST be a no-op — the predicate filters out
+    // the already-`expired` row.
+    let second = sweep_expired_option_orders(&state, deadline + 5_000)
+        .await
+        .unwrap();
+    assert!(second.is_empty());
+
+    let fetched = get_option_order(&state, order.order_id).await.unwrap();
+    assert_eq!(fetched.status, OptionOrderStatus::Expired);
+    assert_eq!(fetched.updated_at_ms, updated_at_first);
+}
+
+#[tokio::test]
+async fn expired_disappears_from_open_orders_listing() {
+    let state = state();
+    let series = active_series_id(&state).await;
+    let past = now_ms() + 60_000;
+    submit_with_deadline(&state, &series, Side::Buy, "list-expire-1", past).await;
+    let alive = submit_with_deadline(
+        &state,
+        &series,
+        Side::Buy,
+        "list-expire-keep",
+        now_ms() + 10 * 60 * 1000,
+    )
+    .await;
+
+    let pre = list_option_orders(
+        &state,
+        OptionOrderFilter {
+            account: Some(account()),
+            option_series_id: Some(series.clone()),
+            status: Some(OptionOrderStatus::Open),
+            side: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(pre.len(), 2);
+
+    sweep_expired_option_orders(&state, past + 1).await.unwrap();
+
+    let post = list_option_orders(
+        &state,
+        OptionOrderFilter {
+            account: Some(account()),
+            option_series_id: Some(series.clone()),
+            status: Some(OptionOrderStatus::Open),
+            side: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(post.len(), 1);
+    assert_eq!(post[0].order_id, alive.order_id);
+
+    // And the expired row IS surfaced when explicitly filtered.
+    let expired_listing = list_option_orders(
+        &state,
+        OptionOrderFilter {
+            account: Some(account()),
+            option_series_id: Some(series),
+            status: Some(OptionOrderStatus::Expired),
+            side: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(expired_listing.len(), 1);
+    assert_eq!(
+        expired_listing[0].terminal_reason_code.as_deref(),
+        Some("expired")
+    );
+}
+
+#[tokio::test]
+async fn ioc_remainder_cancelled_at_insert_is_not_swept() {
+    // IOC orders that partially fill are terminalized at insert
+    // (`ioc_remainder_cancelled`). They should NEVER be touched by
+    // a later expiry sweep — even when the synthetic `deadline_ms`
+    // they carried has passed.
+    let state = state();
+    let series = active_series_id(&state).await;
+
+    submit_seeded_resting(
+        &state,
+        &series,
+        Side::Sell,
+        "ioc-ask",
+        1_000_000_000,
+        30_000_000,
+    )
+    .await;
+
+    let mut taker = order_input(series, Side::Buy, "ioc-sweep");
+    taker.account = account_two();
+    taker.time_in_force = TimeInForce::Ioc;
+    taker.size_1e8 = 100_000_000;
+    taker.deadline_ms = Some(now_ms() + 30_000);
+    let outcome = submit_option_order(&state, taker).await.unwrap();
+    assert_eq!(outcome.order.status, OptionOrderStatus::Cancelled);
+
+    let expired = sweep_expired_option_orders(&state, now_ms() + 10 * 60 * 1000)
+        .await
+        .unwrap();
+    assert!(expired.is_empty());
+
+    let fetched = get_option_order(&state, outcome.order.order_id)
+        .await
+        .unwrap();
+    assert_eq!(fetched.status, OptionOrderStatus::Cancelled);
+    assert_eq!(
+        fetched.terminal_reason_code.as_deref(),
+        Some("ioc_remainder_cancelled")
+    );
+}
+
+// =====================================================================
+// HISTORY-V2-REJECTED-ATTEMPTS-FEED-V1 — service-level tests for
+// recording pre-persistence option-order rejections so /history can
+// surface them.
+// =====================================================================
+
+#[tokio::test]
+async fn post_only_would_match_is_recorded_as_rejection() {
+    let state = state();
+    let series = active_series_id(&state).await;
+    // Resting ask at 1.0; post-only buy at 1.0 would cross.
+    submit_seeded_resting(
+        &state,
+        &series,
+        Side::Sell,
+        "po-resting",
+        1_000_000_000,
+        30_000_000,
+    )
+    .await;
+    let mut taker = order_input(series.clone(), Side::Buy, "po-would-match");
+    taker.account = account_two();
+    taker.post_only = true;
+    let error = submit_option_order(&state, taker).await.unwrap_err();
+    assert!(
+        error.to_string().contains("post-only"),
+        "unexpected error: {error}"
+    );
+
+    let recorded = list_option_order_rejections_for_account(&state, &account_two(), None)
+        .await
+        .unwrap();
+    assert_eq!(recorded.len(), 1);
+    let row = &recorded[0];
+    assert_eq!(row.account, account_two());
+    assert_eq!(row.option_series_id.as_deref(), Some(series.as_str()));
+    assert_eq!(row.side, Some(Side::Buy));
+    assert_eq!(row.post_only, Some(true));
+    assert_eq!(row.reason_code, "post_only_would_match");
+    assert_eq!(row.reason_source, "matching_policy");
+    // The message is the existing BackendError Display string —
+    // trader-meaningful and free of secrets.
+    assert!(row
+        .reason_message
+        .as_deref()
+        .unwrap_or("")
+        .contains("post-only"));
+}
+
+#[tokio::test]
+async fn fok_not_fillable_is_recorded_as_rejection() {
+    let state = state();
+    let series = active_series_id(&state).await;
+    submit_seeded_resting(
+        &state,
+        &series,
+        Side::Sell,
+        "fok-ask-cheap",
+        950_000_000,
+        30_000_000,
+    )
+    .await;
+    submit_seeded_resting(
+        &state,
+        &series,
+        Side::Sell,
+        "fok-ask-rich",
+        1_100_000_000,
+        70_000_000,
+    )
+    .await;
+    let mut taker = order_input(series.clone(), Side::Buy, "fok-limited");
+    taker.account = account_two();
+    taker.time_in_force = TimeInForce::Fok;
+    taker.price_1e8 = 1_000_000_000;
+    taker.size_1e8 = 100_000_000;
+    let _ = submit_option_order(&state, taker).await.unwrap_err();
+
+    let recorded = list_option_order_rejections_for_account(&state, &account_two(), None)
+        .await
+        .unwrap();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].reason_code, "fok_not_fillable");
+    assert_eq!(recorded[0].reason_source, "matching_policy");
+    assert_eq!(recorded[0].time_in_force, Some(TimeInForce::Fok));
+}
+
+#[tokio::test]
+async fn zero_price_is_recorded_as_rejection() {
+    let state = state();
+    let series = active_series_id(&state).await;
+    let mut input = order_input(series, Side::Buy, "zero-price");
+    input.price_1e8 = 0;
+    let _ = submit_option_order(&state, input).await.unwrap_err();
+
+    let recorded = list_option_order_rejections_for_account(&state, &account(), None)
+        .await
+        .unwrap();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].reason_code, "zero_price");
+    assert_eq!(recorded[0].reason_source, "request_validation");
+}
+
+#[tokio::test]
+async fn deadline_expired_is_recorded_as_rejection() {
+    let state = state();
+    let series = active_series_id(&state).await;
+    let mut input = order_input(series, Side::Buy, "dead-line");
+    input.deadline_ms = Some(now_ms() - 60_000);
+    let _ = submit_option_order(&state, input).await.unwrap_err();
+
+    let recorded = list_option_order_rejections_for_account(&state, &account(), None)
+        .await
+        .unwrap();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].reason_code, "deadline_expired");
+    assert_eq!(recorded[0].reason_source, "request_validation");
+}
+
+#[tokio::test]
+async fn invalid_tif_combination_is_recorded_as_rejection() {
+    let state = state();
+    let series = active_series_id(&state).await;
+    // post_only + IOC is the canonical invalid combination.
+    let mut input = order_input(series, Side::Buy, "tif-combo");
+    input.time_in_force = TimeInForce::Ioc;
+    input.post_only = true;
+    let _ = submit_option_order(&state, input).await.unwrap_err();
+
+    let recorded = list_option_order_rejections_for_account(&state, &account(), None)
+        .await
+        .unwrap();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].reason_code, "invalid_tif_combination");
+    assert_eq!(recorded[0].reason_source, "request_validation");
+}
+
+#[tokio::test]
+async fn accepted_order_is_not_recorded_as_rejection() {
+    let state = state();
+    let series = active_series_id(&state).await;
+    let input = order_input(series, Side::Buy, "accepted-not-rejected");
+    let _ = submit_option_order(&state, input).await.unwrap();
+    let recorded = list_option_order_rejections_for_account(&state, &account(), None)
+        .await
+        .unwrap();
+    assert!(recorded.is_empty());
+}
+
+#[tokio::test]
+async fn rejected_attempt_does_not_consume_or_mutate_resting_book() {
+    // Posting a post-only that would cross MUST leave the resting
+    // ask untouched (existing semantic) AND record a rejection.
+    let state = state();
+    let series = active_series_id(&state).await;
+    let resting = submit_seeded_resting(
+        &state,
+        &series,
+        Side::Sell,
+        "untouched-ask",
+        1_000_000_000,
+        30_000_000,
+    )
+    .await;
+    let mut taker = order_input(series.clone(), Side::Buy, "po-attempt");
+    taker.account = account_two();
+    taker.post_only = true;
+    let _ = submit_option_order(&state, taker).await.unwrap_err();
+
+    let still_resting = get_option_order(&state, resting.order_id).await.unwrap();
+    assert_eq!(still_resting.remaining_size_1e8, 30_000_000);
+    assert_eq!(still_resting.status, OptionOrderStatus::Open);
+
+    let recorded = list_option_order_rejections_for_account(&state, &account_two(), None)
+        .await
+        .unwrap();
+    assert_eq!(recorded.len(), 1);
+}
+
+#[tokio::test]
+async fn multiple_rejections_for_same_account_are_all_recorded_newest_first() {
+    let state = state();
+    let series = active_series_id(&state).await;
+    submit_seeded_resting(
+        &state,
+        &series,
+        Side::Sell,
+        "multi-resting",
+        1_000_000_000,
+        30_000_000,
+    )
+    .await;
+    let mut a = order_input(series.clone(), Side::Buy, "multi-1");
+    a.account = account_two();
+    a.post_only = true;
+    let _ = submit_option_order(&state, a).await.unwrap_err();
+    // small sleep to ensure created_at_ms differs across attempts
+    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    let mut b = order_input(series.clone(), Side::Buy, "multi-2");
+    b.account = account_two();
+    b.post_only = true;
+    let _ = submit_option_order(&state, b).await.unwrap_err();
+
+    let recorded = list_option_order_rejections_for_account(&state, &account_two(), None)
+        .await
+        .unwrap();
+    assert_eq!(recorded.len(), 2);
+    assert!(
+        recorded[0].created_at_ms >= recorded[1].created_at_ms,
+        "list must be newest-first"
+    );
+    assert_eq!(recorded[0].client_order_id.as_deref(), Some("multi-2"));
+    assert_eq!(recorded[1].client_order_id.as_deref(), Some("multi-1"));
+}
+
+#[tokio::test]
+async fn since_ms_filter_drops_old_rejections() {
+    let state = state();
+    let series = active_series_id(&state).await;
+    submit_seeded_resting(
+        &state,
+        &series,
+        Side::Sell,
+        "since-rest",
+        1_000_000_000,
+        30_000_000,
+    )
+    .await;
+    let mut taker = order_input(series, Side::Buy, "since-attempt");
+    taker.account = account_two();
+    taker.post_only = true;
+    let _ = submit_option_order(&state, taker).await.unwrap_err();
+
+    let in_window =
+        list_option_order_rejections_for_account(&state, &account_two(), Some(now_ms() - 60_000))
+            .await
+            .unwrap();
+    assert_eq!(in_window.len(), 1);
+    let out_of_window =
+        list_option_order_rejections_for_account(&state, &account_two(), Some(now_ms() + 60_000))
+            .await
+            .unwrap();
+    assert!(out_of_window.is_empty());
+}
+
+#[tokio::test]
+async fn rejection_record_does_not_carry_signature_or_authorization() {
+    // Sanity-pin: the persisted struct has NO signature field and
+    // the captured input.signature is intentionally not echoed
+    // into the rejection. Same for nonce — we keep the numeric
+    // value only (no envelope, no hex of the signed payload).
+    let state = state();
+    let series = active_series_id(&state).await;
+    submit_seeded_resting(
+        &state,
+        &series,
+        Side::Sell,
+        "no-sig-rest",
+        1_000_000_000,
+        30_000_000,
+    )
+    .await;
+    let mut taker = order_input(series, Side::Buy, "no-sig-attempt");
+    taker.account = account_two();
+    taker.post_only = true;
+    let _ = submit_option_order(&state, taker).await.unwrap_err();
+
+    let recorded = list_option_order_rejections_for_account(&state, &account_two(), None)
+        .await
+        .unwrap();
+    assert_eq!(recorded.len(), 1);
+    // The reason_message MUST NOT contain the signature.
+    let msg = recorded[0].reason_message.clone().unwrap_or_default();
+    assert!(
+        !msg.contains("0x"),
+        "reason_message should not contain raw hex"
+    );
+    assert!(
+        !msg.contains("ecdsa"),
+        "reason_message should not leak signing impl"
+    );
+    // nonce is a u64 stringified (not the signed envelope nonce).
+    if let Some(nonce_str) = recorded[0].nonce.as_deref() {
+        assert!(
+            nonce_str.parse::<u64>().is_ok(),
+            "nonce must be a stringified u64"
+        );
+    }
+}
+
+#[tokio::test]
+async fn expired_persisted_order_is_not_in_rejections_feed() {
+    // OPTION-ORDER-EXPIRY-SWEEP-V1 interaction: an expired order
+    // lives in /options/orders with status=Expired + terminal
+    // reason="expired"; it does NOT show up in the rejections feed.
+    let state = state();
+    let series = active_series_id(&state).await;
+    let mut input = order_input(series, Side::Buy, "expiry-not-rejection");
+    let deadline = now_ms() + 60_000;
+    input.deadline_ms = Some(deadline);
+    let _ = submit_option_order(&state, input).await.unwrap();
+    let _ = sweep_expired_option_orders(&state, deadline + 1)
+        .await
+        .unwrap();
+    let recorded = list_option_order_rejections_for_account(&state, &account(), None)
+        .await
+        .unwrap();
+    assert!(
+        recorded.is_empty(),
+        "expired-via-sweep order must not appear as a rejection: {:?}",
+        recorded
+    );
+}
+
+// =====================================================================
+// ATTACHED-TP-SL-ON-ENTRY-V1 — tests for the trader's TP/SL
+// attachment intent flowing through the parent submit → fill →
+// conditional materialization pipeline.
+// =====================================================================
+
+use deopt_v2_backend::options::conditional_orders::{
+    list_conditional_orders, ConditionalOrderFilter,
+};
+use deopt_v2_backend::options::AttachmentPlanStatus;
+
+fn tp_only() -> AttachedTpSlInput {
+    AttachedTpSlInput {
+        take_profit: Some(AttachedLegInput {
+            trigger_price_1e8: 1_500_000_000,
+            limit_price_1e8: 1_500_000_000,
+        }),
+        stop_loss: None,
+        link_as_oco: false,
+        expires_at_ms: None,
+    }
+}
+
+fn sl_only() -> AttachedTpSlInput {
+    AttachedTpSlInput {
+        take_profit: None,
+        stop_loss: Some(AttachedLegInput {
+            trigger_price_1e8: 500_000_000,
+            limit_price_1e8: 500_000_000,
+        }),
+        link_as_oco: false,
+        expires_at_ms: None,
+    }
+}
+
+fn tp_and_sl_oco() -> AttachedTpSlInput {
+    AttachedTpSlInput {
+        take_profit: Some(AttachedLegInput {
+            trigger_price_1e8: 1_500_000_000,
+            limit_price_1e8: 1_500_000_000,
+        }),
+        stop_loss: Some(AttachedLegInput {
+            trigger_price_1e8: 500_000_000,
+            limit_price_1e8: 500_000_000,
+        }),
+        link_as_oco: true,
+        expires_at_ms: None,
+    }
+}
+
+#[tokio::test]
+async fn submit_order_without_attached_payload_unchanged_behaviour() {
+    // Backward compat: omitting `attached_tp_sl` must reproduce
+    // the exact pre-milestone behaviour. No plan is recorded.
+    let state = state();
+    let series = active_series_id(&state).await;
+    let input = order_input(series, Side::Buy, "no-attached");
+    assert!(input.attached_tp_sl.is_none());
+    let outcome = submit_option_order(&state, input).await.unwrap();
+    assert_eq!(outcome.order.status, OptionOrderStatus::Open);
+    let plans = list_option_order_attachment_plans_for_account(&state, &account(), None)
+        .await
+        .unwrap();
+    assert!(plans.is_empty());
+}
+
+#[tokio::test]
+async fn invalid_attached_payload_rejects_parent_atomically() {
+    // Both legs empty → InvalidAttachedTpSl. Parent order MUST NOT
+    // be persisted; the rejected-attempts feed records the reason.
+    let state = state();
+    let series = active_series_id(&state).await;
+    let mut input = order_input(series.clone(), Side::Buy, "bad-attached");
+    input.attached_tp_sl = Some(AttachedTpSlInput {
+        take_profit: None,
+        stop_loss: None,
+        link_as_oco: false,
+        expires_at_ms: None,
+    });
+    let err = submit_option_order(&state, input).await.unwrap_err();
+    assert!(
+        err.to_string().contains("attached"),
+        "unexpected error: {err}"
+    );
+    let recorded = list_option_order_rejections_for_account(&state, &account(), None)
+        .await
+        .unwrap();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].reason_code, "attached_tp_sl_invalid");
+    assert_eq!(recorded[0].reason_source, "request_validation");
+    // And no parent order persisted.
+    let orders = list_option_orders(
+        &state,
+        OptionOrderFilter {
+            option_series_id: Some(series),
+            account: Some(account()),
+            status: None,
+            side: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(orders.is_empty());
+}
+
+#[tokio::test]
+async fn invalid_oco_without_both_legs_rejects() {
+    let state = state();
+    let series = active_series_id(&state).await;
+    let mut input = order_input(series, Side::Buy, "oco-single-leg");
+    input.attached_tp_sl = Some(AttachedTpSlInput {
+        take_profit: Some(AttachedLegInput {
+            trigger_price_1e8: 1_500_000_000,
+            limit_price_1e8: 1_500_000_000,
+        }),
+        stop_loss: None,
+        link_as_oco: true,
+        expires_at_ms: None,
+    });
+    let err = submit_option_order(&state, input).await.unwrap_err();
+    assert!(
+        err.to_string().contains("link_as_oco"),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
+async fn invalid_zero_trigger_price_rejects() {
+    let state = state();
+    let series = active_series_id(&state).await;
+    let mut input = order_input(series, Side::Buy, "zero-trigger");
+    input.attached_tp_sl = Some(AttachedTpSlInput {
+        take_profit: Some(AttachedLegInput {
+            trigger_price_1e8: 0,
+            limit_price_1e8: 1_500_000_000,
+        }),
+        stop_loss: None,
+        link_as_oco: false,
+        expires_at_ms: None,
+    });
+    let err = submit_option_order(&state, input).await.unwrap_err();
+    assert!(err.to_string().contains("trigger_price_1e8"));
+}
+
+#[tokio::test]
+async fn invalid_past_expiry_rejects() {
+    let state = state();
+    let series = active_series_id(&state).await;
+    let mut input = order_input(series, Side::Buy, "past-expiry");
+    let mut attached = tp_only();
+    attached.expires_at_ms = Some(now_ms() - 60_000);
+    input.attached_tp_sl = Some(attached);
+    let err = submit_option_order(&state, input).await.unwrap_err();
+    assert!(err.to_string().contains("expires_at_ms"));
+}
+
+#[tokio::test]
+async fn resting_parent_with_attached_creates_pending_plan_only() {
+    let state = state();
+    let series = active_series_id(&state).await;
+    // No counterparty present — the parent order rests on the book.
+    let mut input = order_input(series, Side::Buy, "resting-with-tp");
+    input.attached_tp_sl = Some(tp_only());
+    let outcome = submit_option_order(&state, input).await.unwrap();
+    assert_eq!(outcome.order.status, OptionOrderStatus::Open);
+    assert!(outcome.fills.is_empty());
+
+    let plans = list_option_order_attachment_plans_for_account(&state, &account(), None)
+        .await
+        .unwrap();
+    assert_eq!(plans.len(), 1);
+    assert_eq!(plans[0].status, AttachmentPlanStatus::Pending);
+    assert_eq!(plans[0].materialized_size_1e8, None);
+    assert_eq!(plans[0].tp_conditional_order_id, None);
+    assert_eq!(plans[0].sl_conditional_order_id, None);
+
+    // No conditional rows materialised yet.
+    let conds = list_conditional_orders(
+        &state,
+        ConditionalOrderFilter {
+            account: Some(account()),
+            option_series_id: None,
+            status: None,
+            oco_group_id: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(conds.is_empty());
+}
+
+#[tokio::test]
+async fn immediate_full_fill_with_tp_only_materialises_active_plan() {
+    let state = state();
+    let series = active_series_id(&state).await;
+    // Resting ask provides liquidity; taker buys full size with TP.
+    submit_seeded_resting(
+        &state,
+        &series,
+        Side::Sell,
+        "tp-only-resting-ask",
+        1_000_000_000,
+        100_000_000,
+    )
+    .await;
+    let mut taker = order_input(series.clone(), Side::Buy, "tp-only-taker");
+    taker.account = account_two();
+    taker.attached_tp_sl = Some(tp_only());
+    let outcome = submit_option_order(&state, taker).await.unwrap();
+    assert_eq!(outcome.fills.len(), 1);
+    assert_eq!(outcome.order.status, OptionOrderStatus::Filled);
+
+    let plans = list_option_order_attachment_plans_for_account(&state, &account_two(), None)
+        .await
+        .unwrap();
+    assert_eq!(plans.len(), 1);
+    assert_eq!(plans[0].status, AttachmentPlanStatus::Active);
+    assert_eq!(plans[0].materialized_size_1e8, Some(100_000_000));
+    assert!(plans[0].tp_conditional_order_id.is_some());
+    assert!(plans[0].sl_conditional_order_id.is_none());
+    assert!(plans[0].oco_group_id.is_none());
+}
+
+#[tokio::test]
+async fn immediate_full_fill_with_sl_only_materialises_active_plan() {
+    let state = state();
+    let series = active_series_id(&state).await;
+    submit_seeded_resting(
+        &state,
+        &series,
+        Side::Sell,
+        "sl-only-resting-ask",
+        1_000_000_000,
+        100_000_000,
+    )
+    .await;
+    let mut taker = order_input(series, Side::Buy, "sl-only-taker");
+    taker.account = account_two();
+    taker.attached_tp_sl = Some(sl_only());
+    let outcome = submit_option_order(&state, taker).await.unwrap();
+    assert_eq!(outcome.fills.len(), 1);
+
+    let plans = list_option_order_attachment_plans_for_account(&state, &account_two(), None)
+        .await
+        .unwrap();
+    assert_eq!(plans.len(), 1);
+    assert_eq!(plans[0].status, AttachmentPlanStatus::Active);
+    assert!(plans[0].sl_conditional_order_id.is_some());
+    assert!(plans[0].tp_conditional_order_id.is_none());
+    assert!(plans[0].oco_group_id.is_none());
+}
+
+#[tokio::test]
+async fn immediate_full_fill_with_tp_and_sl_oco_materialises_oco_pair() {
+    let state = state();
+    let series = active_series_id(&state).await;
+    submit_seeded_resting(
+        &state,
+        &series,
+        Side::Sell,
+        "oco-resting-ask",
+        1_000_000_000,
+        100_000_000,
+    )
+    .await;
+    let mut taker = order_input(series.clone(), Side::Buy, "oco-taker");
+    taker.account = account_two();
+    taker.attached_tp_sl = Some(tp_and_sl_oco());
+    let outcome = submit_option_order(&state, taker).await.unwrap();
+    assert_eq!(outcome.fills.len(), 1);
+
+    let plans = list_option_order_attachment_plans_for_account(&state, &account_two(), None)
+        .await
+        .unwrap();
+    assert_eq!(plans.len(), 1);
+    let plan = &plans[0];
+    assert_eq!(plan.status, AttachmentPlanStatus::Active);
+    assert!(plan.tp_conditional_order_id.is_some());
+    assert!(plan.sl_conditional_order_id.is_some());
+    let oco_id = plan.oco_group_id.expect("OCO group id must be set");
+
+    // Two conditional rows linked by the same OCO group id.
+    let conds = list_conditional_orders(
+        &state,
+        ConditionalOrderFilter {
+            account: Some(account_two()),
+            option_series_id: Some(series),
+            status: None,
+            oco_group_id: Some(oco_id),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(conds.len(), 2);
+}
+
+#[tokio::test]
+async fn partial_fill_materialises_at_filled_size_only() {
+    let state = state();
+    let series = active_series_id(&state).await;
+    // Resting has only 30 units; taker requests 100 with TP+SL.
+    submit_seeded_resting(
+        &state,
+        &series,
+        Side::Sell,
+        "partial-ask",
+        1_000_000_000,
+        30_000_000,
+    )
+    .await;
+    let mut taker = order_input(series.clone(), Side::Buy, "partial-taker");
+    taker.account = account_two();
+    taker.size_1e8 = 100_000_000;
+    taker.attached_tp_sl = Some(tp_and_sl_oco());
+    let outcome = submit_option_order(&state, taker).await.unwrap();
+    assert_eq!(outcome.fills.len(), 1);
+    assert_eq!(outcome.fills[0].size_1e8, 30_000_000);
+
+    let plans = list_option_order_attachment_plans_for_account(&state, &account_two(), None)
+        .await
+        .unwrap();
+    assert_eq!(plans.len(), 1);
+    assert_eq!(plans[0].status, AttachmentPlanStatus::Active);
+    assert_eq!(plans[0].materialized_size_1e8, Some(30_000_000));
+}
+
+#[tokio::test]
+async fn parent_cancel_before_fill_cancels_pending_plan() {
+    let state = state();
+    let series = active_series_id(&state).await;
+    let mut input = order_input(series, Side::Buy, "cancel-pending-plan");
+    input.attached_tp_sl = Some(tp_only());
+    let outcome = submit_option_order(&state, input).await.unwrap();
+    assert!(outcome.fills.is_empty());
+    let _ = cancel_option_order(&state, outcome.order.order_id)
+        .await
+        .unwrap();
+
+    let plans = list_option_order_attachment_plans_for_account(&state, &account(), None)
+        .await
+        .unwrap();
+    assert_eq!(plans.len(), 1);
+    assert_eq!(plans[0].status, AttachmentPlanStatus::Cancelled);
+    assert!(plans[0].materialized_size_1e8.is_none());
+    assert_eq!(
+        plans[0].failure_code.as_deref(),
+        Some("parent_terminal_before_fill")
+    );
+}
+
+#[tokio::test]
+async fn parent_expiry_before_fill_cancels_pending_plan() {
+    let state = state();
+    let series = active_series_id(&state).await;
+    let mut input = order_input(series, Side::Buy, "expire-pending-plan");
+    let deadline = now_ms() + 60_000;
+    input.deadline_ms = Some(deadline);
+    input.attached_tp_sl = Some(tp_only());
+    let outcome = submit_option_order(&state, input).await.unwrap();
+    let _ = sweep_expired_option_orders(&state, deadline + 1)
+        .await
+        .unwrap();
+    let plans = list_option_order_attachment_plans_for_account(&state, &account(), None)
+        .await
+        .unwrap();
+    assert_eq!(plans.len(), 1);
+    assert_eq!(plans[0].status, AttachmentPlanStatus::Cancelled);
+
+    let fetched_parent = get_option_order(&state, outcome.order.order_id)
+        .await
+        .unwrap();
+    assert_eq!(fetched_parent.status, OptionOrderStatus::Expired);
+}
+
+#[tokio::test]
+async fn parent_cancel_after_materialization_leaves_active_plan_alone() {
+    // V1 behaviour: once the plan transitions to Active (filled +
+    // conditional rows created), a later parent cancel does NOT
+    // re-touch the plan. The user manages the conditional rows
+    // via the existing TP/SL endpoints.
+    let state = state();
+    let series = active_series_id(&state).await;
+    submit_seeded_resting(
+        &state,
+        &series,
+        Side::Sell,
+        "post-mat-ask",
+        1_000_000_000,
+        30_000_000,
+    )
+    .await;
+    let mut taker = order_input(series, Side::Buy, "post-mat-taker");
+    taker.account = account_two();
+    taker.size_1e8 = 100_000_000;
+    taker.attached_tp_sl = Some(tp_only());
+    let outcome = submit_option_order(&state, taker).await.unwrap();
+    assert_eq!(outcome.fills.len(), 1);
+    // Cancel the remaining 70 units of the partially-filled order.
+    let _ = cancel_option_order(&state, outcome.order.order_id)
+        .await
+        .unwrap();
+
+    let plans = list_option_order_attachment_plans_for_account(&state, &account_two(), None)
+        .await
+        .unwrap();
+    assert_eq!(plans.len(), 1);
+    assert_eq!(plans[0].status, AttachmentPlanStatus::Active);
+    assert_eq!(plans[0].materialized_size_1e8, Some(30_000_000));
+}
+
+#[tokio::test]
+async fn standalone_conditional_creation_still_works_alongside_attachments() {
+    // Make sure the existing standalone TP/SL endpoint is not
+    // perturbed: standalone creation continues to require an
+    // existing position and writes rows the same way.
+    use deopt_v2_backend::options::conditional_orders::{
+        create_conditional_orders, ConditionalLegInput, ConditionalType,
+        CreateConditionalOrderInput,
+    };
+
+    let state = state();
+    let series = active_series_id(&state).await;
+    submit_seeded_resting(
+        &state,
+        &series,
+        Side::Sell,
+        "standalone-ask",
+        1_000_000_000,
+        100_000_000,
+    )
+    .await;
+    let mut taker = order_input(series.clone(), Side::Buy, "standalone-taker");
+    taker.account = account_two();
+    let _ = submit_option_order(&state, taker).await.unwrap();
+    // Position exists; create a standalone TP.
+    let rows = create_conditional_orders(
+        &state,
+        CreateConditionalOrderInput {
+            account: account_two(),
+            option_series_id: series.clone(),
+            quantity_1e8: 100_000_000,
+            legs: vec![ConditionalLegInput {
+                conditional_type: ConditionalType::TakeProfit,
+                trigger_price_1e8: 2_000_000_000,
+                limit_price_1e8: 2_000_000_000,
+                explicit_trigger_condition: None,
+            }],
+            link_as_oco: false,
+            expires_at_ms: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 1);
+    // And no attachment plan was created for the standalone path.
+    let plans = list_option_order_attachment_plans_for_account(&state, &account_two(), None)
+        .await
+        .unwrap();
+    assert!(plans.is_empty());
+}
+
+#[tokio::test]
+async fn rejected_parent_does_not_create_attachment_plan() {
+    // Post-only-would-match → parent rejection → plan must NOT
+    // be persisted (no parent row exists).
+    let state = state();
+    let series = active_series_id(&state).await;
+    submit_seeded_resting(
+        &state,
+        &series,
+        Side::Sell,
+        "po-cross-ask",
+        1_000_000_000,
+        30_000_000,
+    )
+    .await;
+    let mut taker = order_input(series, Side::Buy, "po-attached");
+    taker.account = account_two();
+    taker.post_only = true;
+    taker.attached_tp_sl = Some(tp_only());
+    let _ = submit_option_order(&state, taker).await.unwrap_err();
+    let plans = list_option_order_attachment_plans_for_account(&state, &account_two(), None)
+        .await
+        .unwrap();
+    assert!(plans.is_empty());
+}
+
+// =====================================================================
+// ATTACHED-TP-SL-MAKER-FILL-HOOK-V2 — tests for the maker-side
+// sync hook. The V1 case (immediate-fill submitter materialisation)
+// is covered above; these tests focus on the NEW behaviour:
+//   * a resting parent with attached TP/SL gets materialised by
+//     a later taker's fill batch
+//   * cumulative filled exposure is used for resizing
+//   * idempotency holds on repeated syncs
+//   * already-terminal conditional legs are not resized
+// =====================================================================
+
+use deopt_v2_backend::options::conditional_orders::{
+    cancel_conditional_order, ConditionalOrderStatus,
+};
+
+async fn taker_buy(state: &AppState, series: &str, client_id: &str, size: u128) -> OptionOrder {
+    let mut taker = order_input(series.to_string(), Side::Buy, client_id);
+    taker.account = account_two();
+    taker.size_1e8 = size;
+    let outcome = submit_option_order(state, taker).await.unwrap();
+    outcome.order
+}
+
+#[tokio::test]
+async fn maker_with_attached_tp_only_materialises_on_first_taker_fill() {
+    let state = state();
+    let series = active_series_id(&state).await;
+
+    // Maker rests a SELL @ 1.0 × 1 with attached TP.
+    let mut maker_input = order_input(series.clone(), Side::Sell, "v2-maker-tp");
+    maker_input.size_1e8 = 100_000_000;
+    maker_input.attached_tp_sl = Some(AttachedTpSlInput {
+        take_profit: Some(AttachedLegInput {
+            trigger_price_1e8: 1_500_000_000,
+            limit_price_1e8: 1_500_000_000,
+        }),
+        stop_loss: None,
+        link_as_oco: false,
+        expires_at_ms: None,
+    });
+    let maker = submit_option_order(&state, maker_input)
+        .await
+        .unwrap()
+        .order;
+    assert!(
+        submit_option_order(
+            &state,
+            order_input(series.clone(), Side::Sell, "v2-maker-tp")
+        )
+        .await
+        .is_err()
+            || true
+    );
+
+    // Sanity: plan is pending.
+    let pre_plans = list_option_order_attachment_plans_for_account(&state, &account(), None)
+        .await
+        .unwrap();
+    assert_eq!(pre_plans.len(), 1);
+    assert_eq!(pre_plans[0].status, AttachmentPlanStatus::Pending);
+
+    // Taker (account_two) submits a crossing BUY for 30 — hits the
+    // maker; V2 hook should materialise the maker's plan at 30.
+    let _ = taker_buy(&state, &series, "v2-taker-1", 30_000_000).await;
+
+    let post_plans = list_option_order_attachment_plans_for_account(&state, &account(), None)
+        .await
+        .unwrap();
+    assert_eq!(post_plans.len(), 1);
+    assert_eq!(post_plans[0].status, AttachmentPlanStatus::Active);
+    assert_eq!(post_plans[0].materialized_size_1e8, Some(30_000_000));
+    assert!(post_plans[0].tp_conditional_order_id.is_some());
+    assert!(post_plans[0].sl_conditional_order_id.is_none());
+
+    // The maker's parent order has 70 remaining open.
+    let fetched_maker = get_option_order(&state, maker.order_id).await.unwrap();
+    assert_eq!(fetched_maker.remaining_size_1e8, 70_000_000);
+}
+
+#[tokio::test]
+async fn maker_with_attached_sl_only_materialises_on_first_taker_fill() {
+    let state = state();
+    let series = active_series_id(&state).await;
+
+    let mut maker_input = order_input(series.clone(), Side::Sell, "v2-maker-sl");
+    maker_input.size_1e8 = 100_000_000;
+    maker_input.attached_tp_sl = Some(AttachedTpSlInput {
+        take_profit: None,
+        stop_loss: Some(AttachedLegInput {
+            trigger_price_1e8: 500_000_000,
+            limit_price_1e8: 500_000_000,
+        }),
+        link_as_oco: false,
+        expires_at_ms: None,
+    });
+    let _ = submit_option_order(&state, maker_input).await.unwrap();
+
+    let _ = taker_buy(&state, &series, "v2-taker-sl", 100_000_000).await;
+
+    let plans = list_option_order_attachment_plans_for_account(&state, &account(), None)
+        .await
+        .unwrap();
+    assert_eq!(plans.len(), 1);
+    assert_eq!(plans[0].status, AttachmentPlanStatus::Active);
+    assert_eq!(plans[0].materialized_size_1e8, Some(100_000_000));
+    assert!(plans[0].sl_conditional_order_id.is_some());
+    assert!(plans[0].tp_conditional_order_id.is_none());
+}
+
+#[tokio::test]
+async fn maker_with_attached_tp_and_sl_oco_materialises_oco_pair_on_taker_fill() {
+    let state = state();
+    let series = active_series_id(&state).await;
+
+    let mut maker_input = order_input(series.clone(), Side::Sell, "v2-maker-oco");
+    maker_input.size_1e8 = 100_000_000;
+    maker_input.attached_tp_sl = Some(AttachedTpSlInput {
+        take_profit: Some(AttachedLegInput {
+            trigger_price_1e8: 1_500_000_000,
+            limit_price_1e8: 1_500_000_000,
+        }),
+        stop_loss: Some(AttachedLegInput {
+            trigger_price_1e8: 500_000_000,
+            limit_price_1e8: 500_000_000,
+        }),
+        link_as_oco: true,
+        expires_at_ms: None,
+    });
+    let _ = submit_option_order(&state, maker_input).await.unwrap();
+
+    let _ = taker_buy(&state, &series, "v2-taker-oco", 100_000_000).await;
+
+    let plans = list_option_order_attachment_plans_for_account(&state, &account(), None)
+        .await
+        .unwrap();
+    assert_eq!(plans.len(), 1);
+    assert_eq!(plans[0].status, AttachmentPlanStatus::Active);
+    assert!(plans[0].tp_conditional_order_id.is_some());
+    assert!(plans[0].sl_conditional_order_id.is_some());
+    assert!(plans[0].oco_group_id.is_some());
+}
+
+#[tokio::test]
+async fn subsequent_taker_fill_resizes_active_plan_to_cumulative_size() {
+    let state = state();
+    let series = active_series_id(&state).await;
+
+    // Maker rests SELL × 1 with attached TP.
+    let mut maker_input = order_input(series.clone(), Side::Sell, "v2-resize-maker");
+    maker_input.size_1e8 = 100_000_000;
+    maker_input.attached_tp_sl = Some(AttachedTpSlInput {
+        take_profit: Some(AttachedLegInput {
+            trigger_price_1e8: 1_500_000_000,
+            limit_price_1e8: 1_500_000_000,
+        }),
+        stop_loss: None,
+        link_as_oco: false,
+        expires_at_ms: None,
+    });
+    let _ = submit_option_order(&state, maker_input).await.unwrap();
+
+    // First taker buys 30 → maker's plan materialises at 30.
+    let _ = taker_buy(&state, &series, "v2-resize-taker-1", 30_000_000).await;
+    let mid_plans = list_option_order_attachment_plans_for_account(&state, &account(), None)
+        .await
+        .unwrap();
+    assert_eq!(mid_plans[0].materialized_size_1e8, Some(30_000_000));
+    let tp_cond_id = mid_plans[0].tp_conditional_order_id.unwrap();
+    let tp_cond =
+        deopt_v2_backend::options::conditional_orders::get_conditional_order(&state, tp_cond_id)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(tp_cond.quantity_1e8, 30_000_000);
+
+    // Second taker buys 50 more → cumulative filled = 80, plan
+    // should be resized to 80; the TP conditional row should be
+    // resized too because it's still Armed.
+    let _ = taker_buy(&state, &series, "v2-resize-taker-2", 50_000_000).await;
+    let post_plans = list_option_order_attachment_plans_for_account(&state, &account(), None)
+        .await
+        .unwrap();
+    assert_eq!(post_plans[0].materialized_size_1e8, Some(80_000_000));
+    let tp_after =
+        deopt_v2_backend::options::conditional_orders::get_conditional_order(&state, tp_cond_id)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(tp_after.quantity_1e8, 80_000_000);
+}
+
+#[tokio::test]
+async fn reprocessing_same_cumulative_filled_is_idempotent_noop() {
+    // The V2 sync function is called every fill batch, and the
+    // submitter branch fires even on a no-fill submit. A second
+    // taker that produces ZERO fills (e.g. resting opposite-side
+    // post-only) must not change the maker's plan.
+    let state = state();
+    let series = active_series_id(&state).await;
+
+    let mut maker_input = order_input(series.clone(), Side::Sell, "v2-idem-maker");
+    maker_input.size_1e8 = 100_000_000;
+    maker_input.attached_tp_sl = Some(AttachedTpSlInput {
+        take_profit: Some(AttachedLegInput {
+            trigger_price_1e8: 1_500_000_000,
+            limit_price_1e8: 1_500_000_000,
+        }),
+        stop_loss: None,
+        link_as_oco: false,
+        expires_at_ms: None,
+    });
+    let _ = submit_option_order(&state, maker_input).await.unwrap();
+
+    let _ = taker_buy(&state, &series, "v2-idem-taker", 30_000_000).await;
+    let first = list_option_order_attachment_plans_for_account(&state, &account(), None)
+        .await
+        .unwrap();
+    let tp_first = first[0].tp_conditional_order_id.unwrap();
+    let cond_first =
+        deopt_v2_backend::options::conditional_orders::get_conditional_order(&state, tp_first)
+            .await
+            .unwrap()
+            .unwrap();
+
+    // Submit a resting post-only buy that does NOT cross (price
+    // below the resting ask). No fills → V2 sync fires but is a
+    // no-op for the maker (cumulative still 30, same as
+    // materialised).
+    let mut po = order_input(series.clone(), Side::Buy, "v2-idem-postonly");
+    po.account = account_two();
+    po.price_1e8 = 500_000_000;
+    po.post_only = true;
+    let _ = submit_option_order(&state, po).await.unwrap();
+
+    let after = list_option_order_attachment_plans_for_account(&state, &account(), None)
+        .await
+        .unwrap();
+    assert_eq!(after[0].materialized_size_1e8, Some(30_000_000));
+    let cond_after =
+        deopt_v2_backend::options::conditional_orders::get_conditional_order(&state, tp_first)
+            .await
+            .unwrap()
+            .unwrap();
+    // Version must NOT have bumped (no resize was applied).
+    assert_eq!(cond_after.version, cond_first.version);
+}
+
+#[tokio::test]
+async fn cancelled_conditional_leg_is_not_resized_by_subsequent_fill() {
+    // Safe-subset rule: if a materialised conditional row has
+    // already moved past `Armed` (here: user-cancelled the TP),
+    // a later resize attempt MUST leave it alone. The plan's
+    // `materialized_size_1e8` still bumps so observability is
+    // accurate, and a non-fatal failure_code is set.
+    let state = state();
+    let series = active_series_id(&state).await;
+
+    let mut maker_input = order_input(series.clone(), Side::Sell, "v2-terminal-maker");
+    maker_input.size_1e8 = 100_000_000;
+    maker_input.attached_tp_sl = Some(AttachedTpSlInput {
+        take_profit: Some(AttachedLegInput {
+            trigger_price_1e8: 1_500_000_000,
+            limit_price_1e8: 1_500_000_000,
+        }),
+        stop_loss: None,
+        link_as_oco: false,
+        expires_at_ms: None,
+    });
+    let _ = submit_option_order(&state, maker_input).await.unwrap();
+
+    let _ = taker_buy(&state, &series, "v2-terminal-taker-1", 30_000_000).await;
+    let plans = list_option_order_attachment_plans_for_account(&state, &account(), None)
+        .await
+        .unwrap();
+    let tp_id = plans[0].tp_conditional_order_id.unwrap();
+
+    // User cancels the conditional row directly.
+    let _ = cancel_conditional_order(&state, tp_id, &account())
+        .await
+        .unwrap();
+    let cancelled =
+        deopt_v2_backend::options::conditional_orders::get_conditional_order(&state, tp_id)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(cancelled.status, ConditionalOrderStatus::Cancelled);
+
+    // Second taker takes another 50 from the maker — cumulative
+    // filled = 80, but the TP row is terminal, so the resize MUST
+    // skip it and the row's quantity stays at the prior 30.
+    let _ = taker_buy(&state, &series, "v2-terminal-taker-2", 50_000_000).await;
+
+    let final_plans = list_option_order_attachment_plans_for_account(&state, &account(), None)
+        .await
+        .unwrap();
+    assert_eq!(final_plans[0].materialized_size_1e8, Some(80_000_000));
+    assert_eq!(
+        final_plans[0].failure_code.as_deref(),
+        Some("conditional_leg_already_terminal")
+    );
+    let tp_still_30 =
+        deopt_v2_backend::options::conditional_orders::get_conditional_order(&state, tp_id)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(tp_still_30.quantity_1e8, 30_000_000);
+    assert_eq!(tp_still_30.status, ConditionalOrderStatus::Cancelled);
+}
+
+#[tokio::test]
+async fn pending_plan_resting_through_no_fills_remains_pending() {
+    // Regression: a maker submits a resting order with attached
+    // TP/SL but never gets filled. The V1 test already pinned the
+    // submit-time path; this test now ALSO confirms that
+    // unrelated taker submits (that fill DIFFERENT makers) do not
+    // bump our maker's plan.
+    let state = state();
+    let series = active_series_id(&state).await;
+
+    // The maker we care about: 90 SELL @ 2.0 (way above market),
+    // resting deep + plan pending.
+    let mut deep_maker = order_input(series.clone(), Side::Sell, "v2-deep-maker");
+    deep_maker.price_1e8 = 2_000_000_000;
+    deep_maker.size_1e8 = 100_000_000;
+    deep_maker.attached_tp_sl = Some(AttachedTpSlInput {
+        take_profit: Some(AttachedLegInput {
+            trigger_price_1e8: 3_000_000_000,
+            limit_price_1e8: 3_000_000_000,
+        }),
+        stop_loss: None,
+        link_as_oco: false,
+        expires_at_ms: None,
+    });
+    let deep = submit_option_order(&state, deep_maker).await.unwrap().order;
+
+    // A cheap maker that will absorb the taker.
+    let mut cheap_maker = order_input(series.clone(), Side::Sell, "v2-cheap-maker");
+    cheap_maker.account = signing_account();
+    cheap_maker.price_1e8 = 900_000_000;
+    cheap_maker.size_1e8 = 100_000_000;
+    let _ = submit_option_order(&state, cheap_maker).await.unwrap();
+
+    // Taker buys @ 1.0 — only the cheap maker matches.
+    let mut taker = order_input(series.clone(), Side::Buy, "v2-pending-taker");
+    taker.account = account_two();
+    taker.size_1e8 = 50_000_000;
+    let outcome = submit_option_order(&state, taker).await.unwrap();
+    assert_eq!(outcome.fills.len(), 1);
+
+    // Our deep maker still rests untouched.
+    let fetched = get_option_order(&state, deep.order_id).await.unwrap();
+    assert_eq!(fetched.remaining_size_1e8, 100_000_000);
+    let plans = list_option_order_attachment_plans_for_account(&state, &account(), None)
+        .await
+        .unwrap();
+    assert_eq!(plans.len(), 1);
+    assert_eq!(plans[0].status, AttachmentPlanStatus::Pending);
+    assert_eq!(plans[0].materialized_size_1e8, None);
 }

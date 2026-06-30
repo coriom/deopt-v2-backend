@@ -3,14 +3,14 @@ use super::{
     OptionExecutionEvent, OptionExecutionEventLink, OptionExecutionIntent, OptionExecutionIntentId,
     OptionExecutionIntentStatus, OptionExecutionReceiptCost, OptionExecutionReconciliation,
     OptionExecutionSimulationResult, OptionExecutionSourceType, OptionExecutionTransaction,
-    OptionFill, OptionFillFilter, OptionFillId, OptionOrder, OptionOrderFilter, OptionOrderId,
-    OptionOrderStatus, OptionRfqFill, OptionRfqId, OptionRfqQuote, OptionRfqQuoteId,
-    OptionRfqQuoteStatus, OptionRfqRequest, OptionRfqStatus, OptionSeries, OptionSeriesFilter,
-    OptionSeriesId, OptionSeriesStatus,
+    OptionFill, OptionFillFilter, OptionFillId, OptionOrder, OptionOrderAttachmentPlan,
+    OptionOrderFilter, OptionOrderId, OptionOrderRejection, OptionOrderStatus, OptionRfqFill,
+    OptionRfqId, OptionRfqQuote, OptionRfqQuoteId, OptionRfqQuoteStatus, OptionRfqRequest,
+    OptionRfqStatus, OptionSeries, OptionSeriesFilter, OptionSeriesId, OptionSeriesStatus,
 };
 use crate::error::{BackendError, Result};
 use crate::execution::ExecutionTransactionStatus;
-use crate::types::{Price1e8, Side, TimeInForce, TimestampMs};
+use crate::types::{AccountId, Price1e8, Side, TimeInForce, TimestampMs};
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -30,6 +30,15 @@ pub struct OptionSeriesStore {
     option_execution_reconciliations: HashMap<String, OptionExecutionReconciliation>,
     // OPTIONS-CONDITIONAL-ORDERS-TP-SL-V1
     conditional_orders: HashMap<uuid::Uuid, crate::options::conditional_orders::ConditionalOrder>,
+    // HISTORY-V2-REJECTED-ATTEMPTS-FEED-V1 — pre-persistence
+    // rejections (post-only/FOK/series-inactive/…). Keyed by
+    // rejection_id (a fresh UUID per attempt — we deliberately do
+    // not dedupe on client_order_id or nonce so the operator sees
+    // every retry).
+    option_order_rejections: HashMap<uuid::Uuid, OptionOrderRejection>,
+    // ATTACHED-TP-SL-ON-ENTRY-V1 — TP/SL attachment plans keyed
+    // by parent order id (each parent has at most one plan).
+    option_order_attachment_plans: HashMap<OptionOrderId, OptionOrderAttachmentPlan>,
 }
 
 impl OptionSeriesStore {
@@ -194,6 +203,187 @@ impl OptionSeriesStore {
         Ok(order.clone())
     }
 
+    /// OPTION-ORDER-EXPIRY-SWEEP-V1 — terminalize every active option
+    /// order whose `deadline_ms` has passed.
+    ///
+    /// Predicate matches the PG path in `Repository::expire_option_orders_due`:
+    /// only `Open` and `PartiallyFilled` rows with a non-null
+    /// `deadline_ms <= now_ms` are swept. Terminal orders (Cancelled /
+    /// Filled / Rejected / already-Expired) are never mutated, so a
+    /// repeated sweep is idempotent. Returns the post-mutation
+    /// snapshots so the service layer can emit lifecycle events.
+    pub fn expire_orders_due(&mut self, now_ms: i64) -> Vec<OptionOrder> {
+        let mut expired = Vec::new();
+        for order in self.orders.values_mut() {
+            if !order.status.is_live() {
+                continue;
+            }
+            let Some(deadline) = order.deadline_ms else {
+                continue;
+            };
+            if deadline > now_ms {
+                continue;
+            }
+            order.status = OptionOrderStatus::Expired;
+            order.updated_at_ms = now_ms;
+            order.terminal_reason_code = Some(terminal_reason::EXPIRED.to_string());
+            order.terminal_reason_message = None;
+            order.terminal_reason_source = Some(terminal_reason::SOURCE_EXPIRY_SWEEP.to_string());
+            // Partial-fill quantity is preserved: we do NOT zero
+            // `remaining_size_1e8`. The filled portion is already
+            // recorded as `OptionFill` rows; the remainder is simply
+            // forfeit at the expired status.
+            expired.push(order.clone());
+        }
+        expired
+    }
+
+    /// HISTORY-V2-REJECTED-ATTEMPTS-FEED-V1 — append a rejection
+    /// record (in-memory). The caller has already verified the
+    /// `account` matches the authenticated signer; this is just a
+    /// store-side persistence sink.
+    pub fn record_option_order_rejection(&mut self, rejection: OptionOrderRejection) {
+        self.option_order_rejections
+            .insert(rejection.rejection_id, rejection);
+    }
+
+    /// ATTACHED-TP-SL-ON-ENTRY-V1 — insert the trader's TP/SL
+    /// attachment plan. Idempotent on `parent_order_id`: a second
+    /// insert with the same parent returns an error so we don't
+    /// silently shadow existing plans.
+    pub fn insert_option_order_attachment_plan(
+        &mut self,
+        plan: OptionOrderAttachmentPlan,
+    ) -> Result<OptionOrderAttachmentPlan> {
+        if self
+            .option_order_attachment_plans
+            .contains_key(&plan.parent_order_id)
+        {
+            return Err(BackendError::InvalidOptionOrderState(format!(
+                "duplicate attachment plan for parent_order_id {}",
+                plan.parent_order_id
+            )));
+        }
+        self.option_order_attachment_plans
+            .insert(plan.parent_order_id, plan.clone());
+        Ok(plan)
+    }
+
+    /// ATTACHED-TP-SL-ON-ENTRY-V1 — fetch the attachment plan for
+    /// a given parent order (None if no attachment was requested
+    /// at submit time).
+    pub fn get_option_order_attachment_plan(
+        &self,
+        parent_order_id: OptionOrderId,
+    ) -> Option<OptionOrderAttachmentPlan> {
+        self.option_order_attachment_plans
+            .get(&parent_order_id)
+            .cloned()
+    }
+
+    /// ATTACHED-TP-SL-ON-ENTRY-V1 — apply a status transition +
+    /// optional materialization snapshot. Used both by the fill
+    /// materializer (Pending → Active) and the cancel/expire
+    /// hooks (Pending → Cancelled). Idempotent: if the plan is
+    /// already in the requested status, the function is a no-op
+    /// (returns `Ok` with the existing row).
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_option_order_attachment_plan(
+        &mut self,
+        parent_order_id: OptionOrderId,
+        status: super::AttachmentPlanStatus,
+        materialized_size_1e8: Option<crate::types::Size1e8>,
+        tp_conditional_order_id: Option<uuid::Uuid>,
+        sl_conditional_order_id: Option<uuid::Uuid>,
+        oco_group_id: Option<uuid::Uuid>,
+        failure_code: Option<String>,
+        failure_message: Option<String>,
+        updated_at_ms: TimestampMs,
+    ) -> Result<OptionOrderAttachmentPlan> {
+        let plan = self
+            .option_order_attachment_plans
+            .get_mut(&parent_order_id)
+            .ok_or_else(|| {
+                BackendError::InvalidOptionOrderState(format!(
+                    "no attachment plan for parent_order_id {parent_order_id}"
+                ))
+            })?;
+        plan.status = status;
+        if materialized_size_1e8.is_some() {
+            plan.materialized_size_1e8 = materialized_size_1e8;
+        }
+        if tp_conditional_order_id.is_some() {
+            plan.tp_conditional_order_id = tp_conditional_order_id;
+        }
+        if sl_conditional_order_id.is_some() {
+            plan.sl_conditional_order_id = sl_conditional_order_id;
+        }
+        if oco_group_id.is_some() {
+            plan.oco_group_id = oco_group_id;
+        }
+        plan.failure_code = failure_code;
+        plan.failure_message = failure_message;
+        plan.updated_at_ms = updated_at_ms;
+        Ok(plan.clone())
+    }
+
+    /// ATTACHED-TP-SL-ON-ENTRY-V1 — list a given account's
+    /// attachment plans, newest first, optionally bounded by a
+    /// `since_ms` floor.
+    pub fn list_option_order_attachment_plans_for_account(
+        &self,
+        account: &AccountId,
+        since_ms: Option<TimestampMs>,
+    ) -> Vec<OptionOrderAttachmentPlan> {
+        let needle = account.0.to_lowercase();
+        let mut rows: Vec<OptionOrderAttachmentPlan> = self
+            .option_order_attachment_plans
+            .values()
+            .filter(|p| p.account.0.to_lowercase() == needle)
+            .filter(|p| match since_ms {
+                Some(min) => p.created_at_ms >= min,
+                None => true,
+            })
+            .cloned()
+            .collect();
+        rows.sort_by(|left, right| {
+            right
+                .created_at_ms
+                .cmp(&left.created_at_ms)
+                .then_with(|| right.plan_id.cmp(&left.plan_id))
+        });
+        rows
+    }
+
+    /// HISTORY-V2-REJECTED-ATTEMPTS-FEED-V1 — return all recorded
+    /// rejections for a given account, newest first. If `since_ms`
+    /// is set, drops rows older than that wall-clock floor (matches
+    /// the existing history v2 since-filter pattern).
+    pub fn list_option_order_rejections_for_account(
+        &self,
+        account: &AccountId,
+        since_ms: Option<TimestampMs>,
+    ) -> Vec<OptionOrderRejection> {
+        let needle = account.0.to_lowercase();
+        let mut rows: Vec<OptionOrderRejection> = self
+            .option_order_rejections
+            .values()
+            .filter(|r| r.account.0.to_lowercase() == needle)
+            .filter(|r| match since_ms {
+                Some(min) => r.created_at_ms >= min,
+                None => true,
+            })
+            .cloned()
+            .collect();
+        rows.sort_by(|left, right| {
+            right
+                .created_at_ms
+                .cmp(&left.created_at_ms)
+                .then_with(|| right.rejection_id.cmp(&left.rejection_id))
+        });
+        rows
+    }
+
     pub fn open_orders_for_series(&self, option_series_id: &str) -> Vec<OptionOrder> {
         self.orders
             .values()
@@ -274,6 +464,30 @@ impl OptionSeriesStore {
         }
         self.conditional_orders.insert(order.id, order);
         Ok(())
+    }
+
+    /// ATTACHED-TP-SL-MAKER-FILL-HOOK-V2 — resize a conditional
+    /// order's `quantity_1e8` ONLY IF the row is still `Armed`.
+    /// Returns `Some(row)` with the post-update state, or `None`
+    /// when the row has moved past `Armed` (triggered, completed,
+    /// cancelled, failed, expired) — in which case the caller
+    /// MUST skip the resize and leave the row alone (safe-subset
+    /// rule: never blindly resize a terminal/in-flight leg).
+    pub fn update_conditional_order_quantity_if_armed(
+        &mut self,
+        id: uuid::Uuid,
+        new_quantity_1e8: crate::types::Size1e8,
+        updated_at_ms: TimestampMs,
+    ) -> Option<crate::options::conditional_orders::ConditionalOrder> {
+        use crate::options::conditional_orders::ConditionalOrderStatus;
+        let order = self.conditional_orders.get_mut(&id)?;
+        if order.status != ConditionalOrderStatus::Armed {
+            return None;
+        }
+        order.quantity_1e8 = new_quantity_1e8;
+        order.updated_at_ms = updated_at_ms;
+        order.version = order.version.saturating_add(1);
+        Some(order.clone())
     }
 
     /// Snapshot of resting orders on the OPPOSITE side of `taker`

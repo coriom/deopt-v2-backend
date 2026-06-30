@@ -1,0 +1,31 @@
+# Keep the build context small + avoid leaking local-only files.
+target/
+**/target/
+node_modules/
+**/node_modules/
+
+# Real env files MUST NOT enter the image. Only .env.example
+# variants ship.
+.env
+.env.local
+.env.local.*
+.env.production
+.env.production.local
+.env.base-sepolia
+.env.base-sepolia.private
+
+# Build artefacts + editor noise
+.vscode/
+.idea/
+*.log
+.DS_Store
+
+# Git internals (not needed in the image)
+.git/
+.github/
+
+# Tests + fixtures aren't needed at runtime; sqlx::migrate!()
+# embeds migrations at compile time so the `migrations/` dir is
+# read only at runtime via the COPY above.
+tests/
+docs/

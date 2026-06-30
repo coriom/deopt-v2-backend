@@ -19,6 +19,9 @@ pub enum BackendError {
     FokNotFillable,
     #[error("invalid time-in-force combination: {0}")]
     InvalidTimeInForceCombination(String),
+    // ATTACHED-TP-SL-ON-ENTRY-V1
+    #[error("invalid attached TP/SL: {0}")]
+    InvalidAttachedTpSl(String),
     // OPTIONS-CONDITIONAL-ORDERS-TP-SL-V1
     #[error("invalid conditional order id")]
     InvalidConditionalOrderId,

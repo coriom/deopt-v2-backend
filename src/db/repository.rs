@@ -20,15 +20,16 @@ use crate::options::store::{
 };
 use crate::options::terminal_reason;
 use crate::options::{
-    OptionEventIndexerState, OptionExecutionConfirmationStatus, OptionExecutionEvent,
-    OptionExecutionEventLink, OptionExecutionGasCheckStatus, OptionExecutionIntent,
-    OptionExecutionIntentId, OptionExecutionIntentStatus, OptionExecutionReceiptCost,
-    OptionExecutionReconciliation, OptionExecutionSimulationResult,
-    OptionExecutionSimulationStatus, OptionExecutionSourceType, OptionExecutionTransaction,
-    OptionFill, OptionFillId, OptionOrder, OptionOrderId, OptionOrderStatus,
-    OptionReconciliationStatus, OptionRfqFill, OptionRfqFillId, OptionRfqId, OptionRfqQuote,
-    OptionRfqQuoteId, OptionRfqQuoteSignatureStatus, OptionRfqQuoteStatus, OptionRfqRequest,
-    OptionRfqStatus, OptionSeries, OptionSeriesSource, OptionSeriesStatus,
+    AttachmentLegSpec, AttachmentPlanStatus, OptionEventIndexerState,
+    OptionExecutionConfirmationStatus, OptionExecutionEvent, OptionExecutionEventLink,
+    OptionExecutionGasCheckStatus, OptionExecutionIntent, OptionExecutionIntentId,
+    OptionExecutionIntentStatus, OptionExecutionReceiptCost, OptionExecutionReconciliation,
+    OptionExecutionSimulationResult, OptionExecutionSimulationStatus, OptionExecutionSourceType,
+    OptionExecutionTransaction, OptionFill, OptionFillId, OptionOrder, OptionOrderAttachmentPlan,
+    OptionOrderId, OptionOrderRejection, OptionOrderStatus, OptionReconciliationStatus,
+    OptionRfqFill, OptionRfqFillId, OptionRfqId, OptionRfqQuote, OptionRfqQuoteId,
+    OptionRfqQuoteSignatureStatus, OptionRfqQuoteStatus, OptionRfqRequest, OptionRfqStatus,
+    OptionSeries, OptionSeriesSource, OptionSeriesStatus,
 };
 use crate::reconciliation::{
     normalize_onchain_intent_id, ExecutionReconciliation, ReconciliationCounts,
@@ -2169,6 +2170,295 @@ impl PgRepository {
         )))
     }
 
+    /// OPTION-ORDER-EXPIRY-SWEEP-V1 — bulk-terminalize every active
+    /// option order whose `deadline_ms` has passed. Predicate matches
+    /// the in-memory path (`OptionSeriesStore::expire_orders_due`):
+    /// only `open` and `partially_filled` rows with a non-null
+    /// `deadline_ms <= now_ms` are swept. The `RETURNING` clause
+    /// hands back full snapshots so the service can emit one
+    /// lifecycle event per row.
+    ///
+    /// Idempotent: a second invocation with the same `now_ms` returns
+    /// an empty `Vec` because the predicate filters on the active
+    /// statuses that this call has already flipped to `expired`.
+    pub async fn expire_option_orders_due(&self, now_ms: TimestampMs) -> Result<Vec<OptionOrder>> {
+        let rows = sqlx::query(
+            "UPDATE option_orders
+             SET status = 'expired',
+                 updated_at_ms = $1,
+                 terminal_reason_code = $2,
+                 terminal_reason_message = NULL,
+                 terminal_reason_source = $3
+             WHERE status IN ('open', 'partially_filled')
+               AND deadline_ms IS NOT NULL
+               AND deadline_ms <= $1
+             RETURNING order_id, option_series_id, account, side, price_1e8, size_1e8,
+                       remaining_size_1e8, time_in_force, post_only, client_order_id, nonce,
+                       deadline_ms, signature, status,
+                       terminal_reason_code, terminal_reason_message, terminal_reason_source,
+                       created_at_ms, updated_at_ms",
+        )
+        .bind(timestamp_to_i64(now_ms))
+        .bind(terminal_reason::EXPIRED)
+        .bind(terminal_reason::SOURCE_EXPIRY_SWEEP)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        rows.into_iter().map(option_order_from_row).collect()
+    }
+
+    // ===== HISTORY-V2-REJECTED-ATTEMPTS-FEED-V1 ====================
+
+    /// Persist a pre-persistence option order rejection. Caller has
+    /// verified that `rejection.account` matches the authenticated
+    /// signer.
+    pub async fn insert_option_order_rejection(
+        &self,
+        rejection: &OptionOrderRejection,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO option_order_rejections (
+                rejection_id, account, option_series_id, side, price_1e8,
+                size_1e8, time_in_force, post_only, client_order_id, nonce,
+                reason_code, reason_message, reason_source, created_at_ms
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+        )
+        .bind(rejection.rejection_id.to_string())
+        .bind(&rejection.account.0)
+        .bind(rejection.option_series_id.as_ref())
+        .bind(rejection.side.map(|s| match s {
+            crate::types::Side::Buy => "buy",
+            crate::types::Side::Sell => "sell",
+        }))
+        .bind(rejection.price_1e8.map(|p| p.to_string()))
+        .bind(rejection.size_1e8.map(|s| s.to_string()))
+        .bind(rejection.time_in_force.map(|tif| match tif {
+            crate::types::TimeInForce::Gtc => "gtc",
+            crate::types::TimeInForce::Ioc => "ioc",
+            crate::types::TimeInForce::Fok => "fok",
+        }))
+        .bind(rejection.post_only)
+        .bind(rejection.client_order_id.as_ref())
+        .bind(rejection.nonce.as_ref())
+        .bind(&rejection.reason_code)
+        .bind(rejection.reason_message.as_ref())
+        .bind(&rejection.reason_source)
+        .bind(timestamp_to_i64(rejection.created_at_ms))
+        .execute(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        Ok(())
+    }
+
+    /// List rejected option-order attempts for a given account,
+    /// newest first, optionally filtered by a `since_ms` floor.
+    pub async fn list_option_order_rejections_for_account(
+        &self,
+        account: &crate::types::AccountId,
+        since_ms: Option<TimestampMs>,
+    ) -> Result<Vec<OptionOrderRejection>> {
+        let rows = sqlx::query(
+            "SELECT rejection_id, account, option_series_id, side, price_1e8,
+                    size_1e8, time_in_force, post_only, client_order_id, nonce,
+                    reason_code, reason_message, reason_source, created_at_ms
+             FROM option_order_rejections
+             WHERE lower(account) = lower($1)
+               AND ($2::BIGINT IS NULL OR created_at_ms >= $2)
+             ORDER BY created_at_ms DESC, rejection_id DESC",
+        )
+        .bind(&account.0)
+        .bind(since_ms.map(timestamp_to_i64))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        rows.into_iter()
+            .map(option_order_rejection_from_row)
+            .collect()
+    }
+
+    // ===== ATTACHED-TP-SL-ON-ENTRY-V1 ==============================
+
+    /// Insert a new attachment plan. The DB's unique index on
+    /// `parent_order_id` rejects duplicates with a constraint
+    /// violation; we translate that into `InvalidOptionOrderState`
+    /// for consistency with the in-memory path.
+    pub async fn insert_option_order_attachment_plan(
+        &self,
+        plan: &OptionOrderAttachmentPlan,
+    ) -> Result<()> {
+        let res = sqlx::query(
+            "INSERT INTO option_order_attachment_plans (
+                plan_id, parent_order_id, account, option_series_id,
+                tp_trigger_price_1e8, tp_limit_price_1e8,
+                sl_trigger_price_1e8, sl_limit_price_1e8,
+                link_as_oco, expires_at_ms, status,
+                materialized_size_1e8,
+                tp_conditional_order_id, sl_conditional_order_id,
+                oco_group_id, failure_code, failure_message,
+                created_at_ms, updated_at_ms
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                      $13, $14, $15, $16, $17, $18, $19)",
+        )
+        .bind(plan.plan_id)
+        .bind(plan.parent_order_id.to_string())
+        .bind(&plan.account.0)
+        .bind(&plan.option_series_id)
+        .bind(
+            plan.take_profit
+                .as_ref()
+                .map(|l| l.trigger_price_1e8.to_string()),
+        )
+        .bind(
+            plan.take_profit
+                .as_ref()
+                .map(|l| l.limit_price_1e8.to_string()),
+        )
+        .bind(
+            plan.stop_loss
+                .as_ref()
+                .map(|l| l.trigger_price_1e8.to_string()),
+        )
+        .bind(
+            plan.stop_loss
+                .as_ref()
+                .map(|l| l.limit_price_1e8.to_string()),
+        )
+        .bind(plan.link_as_oco)
+        .bind(plan.expires_at_ms.map(timestamp_to_i64))
+        .bind(plan.status.as_str())
+        .bind(plan.materialized_size_1e8.map(|s| s.to_string()))
+        .bind(plan.tp_conditional_order_id)
+        .bind(plan.sl_conditional_order_id)
+        .bind(plan.oco_group_id)
+        .bind(plan.failure_code.as_ref())
+        .bind(plan.failure_message.as_ref())
+        .bind(timestamp_to_i64(plan.created_at_ms))
+        .bind(timestamp_to_i64(plan.updated_at_ms))
+        .execute(&self.pool)
+        .await;
+        match res {
+            Ok(_) => Ok(()),
+            Err(sqlx::Error::Database(db_err)) if db_err.is_unique_violation() => {
+                Err(BackendError::InvalidOptionOrderState(format!(
+                    "duplicate attachment plan for parent_order_id {}",
+                    plan.parent_order_id
+                )))
+            }
+            Err(other) => Err(BackendError::Persistence(other.to_string())),
+        }
+    }
+
+    /// Fetch an attachment plan by parent order id. Used by the
+    /// fill-time materializer (look up before deciding to spawn
+    /// conditional orders) and by the cancel/expire hooks.
+    pub async fn get_option_order_attachment_plan(
+        &self,
+        parent_order_id: OptionOrderId,
+    ) -> Result<Option<OptionOrderAttachmentPlan>> {
+        let row = sqlx::query(
+            "SELECT plan_id, parent_order_id, account, option_series_id,
+                    tp_trigger_price_1e8, tp_limit_price_1e8,
+                    sl_trigger_price_1e8, sl_limit_price_1e8,
+                    link_as_oco, expires_at_ms, status,
+                    materialized_size_1e8,
+                    tp_conditional_order_id, sl_conditional_order_id,
+                    oco_group_id, failure_code, failure_message,
+                    created_at_ms, updated_at_ms
+             FROM option_order_attachment_plans
+             WHERE parent_order_id = $1",
+        )
+        .bind(parent_order_id.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        row.map(option_order_attachment_plan_from_row).transpose()
+    }
+
+    /// Apply a status transition + optional materialization
+    /// snapshot. Idempotent on a no-op status; returns the
+    /// post-update row.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_option_order_attachment_plan(
+        &self,
+        parent_order_id: OptionOrderId,
+        status: AttachmentPlanStatus,
+        materialized_size_1e8: Option<crate::types::Size1e8>,
+        tp_conditional_order_id: Option<Uuid>,
+        sl_conditional_order_id: Option<Uuid>,
+        oco_group_id: Option<Uuid>,
+        failure_code: Option<String>,
+        failure_message: Option<String>,
+        updated_at_ms: TimestampMs,
+    ) -> Result<OptionOrderAttachmentPlan> {
+        let row = sqlx::query(
+            "UPDATE option_order_attachment_plans
+             SET status = $2,
+                 materialized_size_1e8 = COALESCE($3, materialized_size_1e8),
+                 tp_conditional_order_id = COALESCE($4, tp_conditional_order_id),
+                 sl_conditional_order_id = COALESCE($5, sl_conditional_order_id),
+                 oco_group_id = COALESCE($6, oco_group_id),
+                 failure_code = $7,
+                 failure_message = $8,
+                 updated_at_ms = $9
+             WHERE parent_order_id = $1
+             RETURNING plan_id, parent_order_id, account, option_series_id,
+                       tp_trigger_price_1e8, tp_limit_price_1e8,
+                       sl_trigger_price_1e8, sl_limit_price_1e8,
+                       link_as_oco, expires_at_ms, status,
+                       materialized_size_1e8,
+                       tp_conditional_order_id, sl_conditional_order_id,
+                       oco_group_id, failure_code, failure_message,
+                       created_at_ms, updated_at_ms",
+        )
+        .bind(parent_order_id.to_string())
+        .bind(status.as_str())
+        .bind(materialized_size_1e8.map(|s| s.to_string()))
+        .bind(tp_conditional_order_id)
+        .bind(sl_conditional_order_id)
+        .bind(oco_group_id)
+        .bind(failure_code.as_ref())
+        .bind(failure_message.as_ref())
+        .bind(timestamp_to_i64(updated_at_ms))
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        match row {
+            Some(row) => option_order_attachment_plan_from_row(row),
+            None => Err(BackendError::InvalidOptionOrderState(format!(
+                "no attachment plan for parent_order_id {parent_order_id}"
+            ))),
+        }
+    }
+
+    pub async fn list_option_order_attachment_plans_for_account(
+        &self,
+        account: &crate::types::AccountId,
+        since_ms: Option<TimestampMs>,
+    ) -> Result<Vec<OptionOrderAttachmentPlan>> {
+        let rows = sqlx::query(
+            "SELECT plan_id, parent_order_id, account, option_series_id,
+                    tp_trigger_price_1e8, tp_limit_price_1e8,
+                    sl_trigger_price_1e8, sl_limit_price_1e8,
+                    link_as_oco, expires_at_ms, status,
+                    materialized_size_1e8,
+                    tp_conditional_order_id, sl_conditional_order_id,
+                    oco_group_id, failure_code, failure_message,
+                    created_at_ms, updated_at_ms
+             FROM option_order_attachment_plans
+             WHERE lower(account) = lower($1)
+               AND ($2::BIGINT IS NULL OR created_at_ms >= $2)
+             ORDER BY created_at_ms DESC, plan_id DESC",
+        )
+        .bind(&account.0)
+        .bind(since_ms.map(timestamp_to_i64))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        rows.into_iter()
+            .map(option_order_attachment_plan_from_row)
+            .collect()
+    }
+
     // ===== OPTIONS-CONDITIONAL-ORDERS-TP-SL-V1 =====================
 
     pub async fn insert_conditional_order(
@@ -2300,6 +2590,42 @@ impl PgRepository {
             Some(r) => conditional_order_from_row(r),
             None => Err(BackendError::InvalidConditionalOrderId),
         }
+    }
+
+    /// ATTACHED-TP-SL-MAKER-FILL-HOOK-V2 — atomic resize of a
+    /// conditional order's `quantity_1e8` predicated on the row
+    /// still being `Armed`. Returns the post-update row, or `None`
+    /// when the row has moved past `Armed`. The caller's V2 sync
+    /// hook uses this to leave triggered/terminal legs alone.
+    pub async fn update_conditional_order_quantity_if_armed(
+        &self,
+        id: uuid::Uuid,
+        new_quantity_1e8: crate::types::Size1e8,
+        updated_at_ms: TimestampMs,
+    ) -> Result<Option<crate::options::conditional_orders::ConditionalOrder>> {
+        let row = sqlx::query(
+            "UPDATE options_conditional_orders
+             SET quantity_1e8 = $2,
+                 updated_at_ms = $3,
+                 version = version + 1
+             WHERE id = $1 AND status = 'armed'
+             RETURNING id, account, option_series_id, position_side, option_kind,
+                       conditional_type, trigger_source, trigger_condition, trigger_price_1e8,
+                       quantity_1e8, execution_type, limit_price_1e8, reduce_only,
+                       oco_group_id, status, child_order_id, failure_code, failure_message,
+                       expires_at_ms, triggered_at_ms, completed_at_ms,
+                       created_at_ms, updated_at_ms, version",
+        )
+        .bind(id)
+        .bind(new_quantity_1e8.to_string())
+        .bind(timestamp_to_i64(updated_at_ms))
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| BackendError::Persistence(e.to_string()))?;
+        Ok(match row {
+            Some(r) => Some(conditional_order_from_row(r)?),
+            None => None,
+        })
     }
 
     /// Atomic claim — transitions `armed → triggering` (or `armed →
@@ -4827,6 +5153,103 @@ fn option_order_from_row(row: PgRow) -> Result<OptionOrder> {
         terminal_reason_code: row_get(&row, "terminal_reason_code")?,
         terminal_reason_message: row_get(&row, "terminal_reason_message")?,
         terminal_reason_source: row_get(&row, "terminal_reason_source")?,
+        created_at_ms: row_get(&row, "created_at_ms")?,
+        updated_at_ms: row_get(&row, "updated_at_ms")?,
+    })
+}
+
+// HISTORY-V2-REJECTED-ATTEMPTS-FEED-V1
+fn option_order_rejection_from_row(row: PgRow) -> Result<OptionOrderRejection> {
+    let rejection_id: String = row_get(&row, "rejection_id")?;
+    let side: Option<String> = row_get(&row, "side")?;
+    let time_in_force: Option<String> = row_get(&row, "time_in_force")?;
+    let price: Option<String> = row_get(&row, "price_1e8")?;
+    let size: Option<String> = row_get(&row, "size_1e8")?;
+    Ok(OptionOrderRejection {
+        rejection_id: Uuid::parse_str(&rejection_id)
+            .map_err(|error| BackendError::Persistence(error.to_string()))?,
+        account: AccountId::new(row_get::<String>(&row, "account")?),
+        option_series_id: row_get(&row, "option_series_id")?,
+        side: side.map(|s| parse_side(&s)).transpose()?,
+        price_1e8: price
+            .map(|s| {
+                s.parse().map_err(|error| {
+                    BackendError::Persistence(format!("invalid rejection price: {error}"))
+                })
+            })
+            .transpose()?,
+        size_1e8: size
+            .map(|s| {
+                s.parse().map_err(|error| {
+                    BackendError::Persistence(format!("invalid rejection size: {error}"))
+                })
+            })
+            .transpose()?,
+        time_in_force: time_in_force.map(|s| parse_time_in_force(&s)).transpose()?,
+        post_only: row_get(&row, "post_only")?,
+        client_order_id: row_get(&row, "client_order_id")?,
+        nonce: row_get(&row, "nonce")?,
+        reason_code: row_get(&row, "reason_code")?,
+        reason_message: row_get(&row, "reason_message")?,
+        reason_source: row_get(&row, "reason_source")?,
+        created_at_ms: row_get(&row, "created_at_ms")?,
+    })
+}
+
+// ATTACHED-TP-SL-ON-ENTRY-V1
+fn option_order_attachment_plan_from_row(row: PgRow) -> Result<OptionOrderAttachmentPlan> {
+    let parent_id: String = row_get(&row, "parent_order_id")?;
+    let status: String = row_get(&row, "status")?;
+    let tp_trigger: Option<String> = row_get(&row, "tp_trigger_price_1e8")?;
+    let tp_limit: Option<String> = row_get(&row, "tp_limit_price_1e8")?;
+    let sl_trigger: Option<String> = row_get(&row, "sl_trigger_price_1e8")?;
+    let sl_limit: Option<String> = row_get(&row, "sl_limit_price_1e8")?;
+    let materialized: Option<String> = row_get(&row, "materialized_size_1e8")?;
+    let parse_leg = |trigger: Option<String>,
+                     limit: Option<String>|
+     -> Result<Option<AttachmentLegSpec>> {
+        match (trigger, limit) {
+            (Some(t), Some(l)) => {
+                let trigger = t.parse().map_err(|err| {
+                    BackendError::Persistence(format!("invalid attachment trigger price: {err}"))
+                })?;
+                let limit = l.parse().map_err(|err| {
+                    BackendError::Persistence(format!("invalid attachment limit price: {err}"))
+                })?;
+                Ok(Some(AttachmentLegSpec {
+                    trigger_price_1e8: trigger,
+                    limit_price_1e8: limit,
+                }))
+            }
+            _ => Ok(None),
+        }
+    };
+    Ok(OptionOrderAttachmentPlan {
+        plan_id: row_get(&row, "plan_id")?,
+        parent_order_id: parent_id
+            .parse()
+            .map_err(|err| BackendError::Persistence(format!("invalid parent_order_id: {err}")))?,
+        account: AccountId::new(row_get::<String>(&row, "account")?),
+        option_series_id: row_get(&row, "option_series_id")?,
+        take_profit: parse_leg(tp_trigger, tp_limit)?,
+        stop_loss: parse_leg(sl_trigger, sl_limit)?,
+        link_as_oco: row_get(&row, "link_as_oco")?,
+        expires_at_ms: row_get(&row, "expires_at_ms")?,
+        status: AttachmentPlanStatus::parse(&status)?,
+        materialized_size_1e8: materialized
+            .map(|s| {
+                s.parse().map_err(|err| {
+                    BackendError::Persistence(format!(
+                        "invalid attachment materialized size: {err}"
+                    ))
+                })
+            })
+            .transpose()?,
+        tp_conditional_order_id: row_get(&row, "tp_conditional_order_id")?,
+        sl_conditional_order_id: row_get(&row, "sl_conditional_order_id")?,
+        oco_group_id: row_get(&row, "oco_group_id")?,
+        failure_code: row_get(&row, "failure_code")?,
+        failure_message: row_get(&row, "failure_message")?,
         created_at_ms: row_get(&row, "created_at_ms")?,
         updated_at_ms: row_get(&row, "updated_at_ms")?,
     })

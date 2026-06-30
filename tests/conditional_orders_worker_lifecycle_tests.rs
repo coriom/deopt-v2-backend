@@ -86,6 +86,7 @@ async fn seed_long_position(state: &AppState, series: &str, tag: &str) {
             nonce: None,
             deadline_ms: None,
             signature: None,
+            attached_tp_sl: None,
         },
     )
     .await
@@ -104,6 +105,7 @@ async fn seed_long_position(state: &AppState, series: &str, tag: &str) {
             nonce: None,
             deadline_ms: None,
             signature: None,
+            attached_tp_sl: None,
         },
     )
     .await
@@ -128,6 +130,7 @@ async fn seed_closing_liquidity(state: &AppState, series: &str, tag: &str, price
             nonce: None,
             deadline_ms: None,
             signature: None,
+            attached_tp_sl: None,
         },
     )
     .await
@@ -460,6 +463,7 @@ async fn position_closed_emits_cancelled_with_failure_code() {
             nonce: None,
             deadline_ms: None,
             signature: None,
+            attached_tp_sl: None,
         },
     )
     .await

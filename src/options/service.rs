@@ -18,16 +18,16 @@ use super::{
     option_execution_simulation_pending, option_execution_simulation_unavailable,
     option_trade_digest, option_trade_digest_bytes, perform_option_broadcast_gas_safety_check,
     simulate_option_execution_intent, validate_simulation_intent, validate_simulation_target,
-    OptionExecutionConfirmationStatus, OptionExecutionGasSafetyCheck, OptionExecutionIntent,
-    OptionExecutionIntentId, OptionExecutionIntentStatus, OptionExecutionSignatureMode,
-    OptionExecutionSimulationResult, OptionExecutionSimulationStatus, OptionExecutionSourceType,
-    OptionExecutionTransaction, OptionFill, OptionFillFilter, OptionFillId, OptionOrder,
-    OptionOrderFilter, OptionOrderId, OptionOrderStatus, OptionOrderbookLevel,
-    OptionOrderbookSnapshot, OptionRfqFill, OptionRfqFillId, OptionRfqId, OptionRfqQuote,
-    OptionRfqQuoteId, OptionRfqQuoteSignatureMode, OptionRfqQuoteSignatureStatus,
-    OptionRfqQuoteStatus, OptionRfqRequest, OptionRfqStatus, OptionSeries, OptionSeriesFilter,
-    OptionSeriesId, OptionSeriesSource, OptionSeriesStatus, OptionTradePayload,
-    OptionTradeSignatureBundle,
+    AttachmentLegSpec, OptionExecutionConfirmationStatus, OptionExecutionGasSafetyCheck,
+    OptionExecutionIntent, OptionExecutionIntentId, OptionExecutionIntentStatus,
+    OptionExecutionSignatureMode, OptionExecutionSimulationResult, OptionExecutionSimulationStatus,
+    OptionExecutionSourceType, OptionExecutionTransaction, OptionFill, OptionFillFilter,
+    OptionFillId, OptionOrder, OptionOrderAttachmentPlan, OptionOrderFilter, OptionOrderId,
+    OptionOrderRejection, OptionOrderStatus, OptionOrderbookLevel, OptionOrderbookSnapshot,
+    OptionRfqFill, OptionRfqFillId, OptionRfqId, OptionRfqQuote, OptionRfqQuoteId,
+    OptionRfqQuoteSignatureMode, OptionRfqQuoteSignatureStatus, OptionRfqQuoteStatus,
+    OptionRfqRequest, OptionRfqStatus, OptionSeries, OptionSeriesFilter, OptionSeriesId,
+    OptionSeriesSource, OptionSeriesStatus, OptionTradePayload, OptionTradeSignatureBundle,
 };
 use crate::api::AppState;
 use crate::error::{BackendError, Result};
@@ -84,6 +84,32 @@ pub struct SubmitOptionOrderInput {
     pub nonce: Option<u64>,
     pub deadline_ms: Option<TimestampMs>,
     pub signature: Option<String>,
+    /// ATTACHED-TP-SL-ON-ENTRY-V1 — optional trader intent to
+    /// attach TP/SL legs to the parent order. Validated up front;
+    /// invalid attachments reject the whole submit (and surface in
+    /// the rejected-attempts feed for honesty).
+    pub attached_tp_sl: Option<AttachedTpSlInput>,
+}
+
+/// ATTACHED-TP-SL-ON-ENTRY-V1 — the trader's TP/SL intent on the
+/// service input.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct AttachedTpSlInput {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub take_profit: Option<AttachedLegInput>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_loss: Option<AttachedLegInput>,
+    #[serde(default)]
+    pub link_as_oco: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_ms: Option<TimestampMs>,
+}
+
+/// ATTACHED-TP-SL-ON-ENTRY-V1 — a single TP or SL leg.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct AttachedLegInput {
+    pub trigger_price_1e8: Price1e8,
+    pub limit_price_1e8: Price1e8,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -345,6 +371,25 @@ pub async fn submit_option_order(
     state: &AppState,
     input: SubmitOptionOrderInput,
 ) -> Result<SubmitOptionOrderOutcome> {
+    let snapshot = input.clone();
+    let outcome = submit_option_order_inner(state, input).await;
+    if let Err(ref error) = outcome {
+        // HISTORY-V2-REJECTED-ATTEMPTS-FEED-V1 — opportunistically
+        // persist a rejection record so /history can show the
+        // attempt. The caller's identity (`snapshot.account`) was
+        // already verified at the HTTP layer before this service
+        // function was invoked, so it is safe to attribute. If
+        // recording itself fails we log + swallow it; the trader
+        // still sees the original HTTP error.
+        record_submit_rejection_if_applicable(state, &snapshot, error).await;
+    }
+    outcome
+}
+
+async fn submit_option_order_inner(
+    state: &AppState,
+    input: SubmitOptionOrderInput,
+) -> Result<SubmitOptionOrderOutcome> {
     ensure_enabled(state)?;
     validate_account(&input.account)?;
     if input.price_1e8 == 0 {
@@ -362,6 +407,12 @@ pub async fn submit_option_order(
     if let Some(signature) = &input.signature {
         validate_signature_shape(signature)?;
     }
+    // ATTACHED-TP-SL-ON-ENTRY-V1 — fail fast on bad TP/SL spec
+    // BEFORE we persist the parent order so the rejection-attempts
+    // feed records the failure cleanly with `attached_tp_sl_invalid`.
+    if let Some(attached) = &input.attached_tp_sl {
+        validate_attached_tp_sl(attached)?;
+    }
 
     let series = get_option_series(state, &input.option_series_id).await?;
     if series.effective_status(now_sec(now_ms())?) != OptionSeriesStatus::Active {
@@ -372,6 +423,10 @@ pub async fn submit_option_order(
     validate_option_order_execution_preflight(state, &series, &input).await?;
 
     let now = now_ms();
+    // Stash the attached payload BEFORE moving the rest of the
+    // input into `order` so we can run the post-fill materializer
+    // without re-fetching it from the request body.
+    let attached_tp_sl = input.attached_tp_sl.clone();
     let order = OptionOrder {
         order_id: OrderId::new(),
         option_series_id: input.option_series_id,
@@ -394,23 +449,684 @@ pub async fn submit_option_order(
         updated_at_ms: now,
     };
 
-    if let Some(repository) = state.repository.clone() {
-        let (order, fills) = repository.submit_option_order_and_match(order, now).await?;
-        create_option_orderbook_execution_intents(state, &fills).await?;
-        crate::fees::service::record_option_order_fills(state, &fills).await?;
-        emit_option_order_lifecycle(state, &order, &fills);
-        return Ok(SubmitOptionOrderOutcome { order, fills });
+    let (order, fills) = if let Some(repository) = state.repository.clone() {
+        repository.submit_option_order_and_match(order, now).await?
+    } else {
+        state
+            .options_store
+            .lock()
+            .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?
+            .submit_order_and_match(order, now)?
+    };
+    create_option_orderbook_execution_intents(state, &fills).await?;
+    crate::fees::service::record_option_order_fills(state, &fills).await?;
+    // ATTACHED-TP-SL-ON-ENTRY-V1 — after the parent + fills are
+    // committed, persist the attachment plan if the submitter
+    // requested one. ATTACHED-TP-SL-MAKER-FILL-HOOK-V2 — then sync
+    // the submitter's plan AND every maker plan from this fill
+    // batch to the cumulative filled exposure of each parent order.
+    if let Some(attached) = attached_tp_sl {
+        record_submitter_attachment_plan(state, &order, attached, now).await;
     }
+    sync_attached_plans_after_fills(state, &order, &fills, now).await;
+    emit_option_order_lifecycle(state, &order, &fills);
+    Ok(SubmitOptionOrderOutcome { order, fills })
+}
 
-    let (order, fills) = state
+/// ATTACHED-TP-SL-ON-ENTRY-V1 — validation. Enforces:
+///   * at least one of TP / SL is present
+///   * each present leg has trigger_price > 0 AND limit_price > 0
+///   * `link_as_oco=true` requires BOTH legs
+///   * `expires_at_ms`, if present, is in the future
+fn validate_attached_tp_sl(attached: &AttachedTpSlInput) -> Result<()> {
+    if attached.take_profit.is_none() && attached.stop_loss.is_none() {
+        return Err(BackendError::InvalidAttachedTpSl(
+            "at least one of take_profit / stop_loss must be present".to_string(),
+        ));
+    }
+    if let Some(tp) = &attached.take_profit {
+        if tp.trigger_price_1e8 == 0 {
+            return Err(BackendError::InvalidAttachedTpSl(
+                "take_profit.trigger_price_1e8 must be > 0".to_string(),
+            ));
+        }
+        if tp.limit_price_1e8 == 0 {
+            return Err(BackendError::InvalidAttachedTpSl(
+                "take_profit.limit_price_1e8 must be > 0".to_string(),
+            ));
+        }
+    }
+    if let Some(sl) = &attached.stop_loss {
+        if sl.trigger_price_1e8 == 0 {
+            return Err(BackendError::InvalidAttachedTpSl(
+                "stop_loss.trigger_price_1e8 must be > 0".to_string(),
+            ));
+        }
+        if sl.limit_price_1e8 == 0 {
+            return Err(BackendError::InvalidAttachedTpSl(
+                "stop_loss.limit_price_1e8 must be > 0".to_string(),
+            ));
+        }
+    }
+    if attached.link_as_oco && (attached.take_profit.is_none() || attached.stop_loss.is_none()) {
+        return Err(BackendError::InvalidAttachedTpSl(
+            "link_as_oco=true requires BOTH take_profit and stop_loss".to_string(),
+        ));
+    }
+    if let Some(expires_at_ms) = attached.expires_at_ms {
+        if expires_at_ms <= now_ms() {
+            return Err(BackendError::InvalidAttachedTpSl(
+                "expires_at_ms must be in the future".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// ATTACHED-TP-SL-ON-ENTRY-V1 — persist a new attachment plan
+/// (status=pending). The actual materialisation happens via
+/// `sync_attached_plans_after_fills` which fires for both the
+/// submitter and every maker involved in the fill batch.
+async fn record_submitter_attachment_plan(
+    state: &AppState,
+    parent: &OptionOrder,
+    attached: AttachedTpSlInput,
+    now: TimestampMs,
+) {
+    let plan = OptionOrderAttachmentPlan {
+        plan_id: uuid::Uuid::new_v4(),
+        parent_order_id: parent.order_id,
+        account: parent.account.clone(),
+        option_series_id: parent.option_series_id.clone(),
+        take_profit: attached.take_profit.as_ref().map(|leg| AttachmentLegSpec {
+            trigger_price_1e8: leg.trigger_price_1e8,
+            limit_price_1e8: leg.limit_price_1e8,
+        }),
+        stop_loss: attached.stop_loss.as_ref().map(|leg| AttachmentLegSpec {
+            trigger_price_1e8: leg.trigger_price_1e8,
+            limit_price_1e8: leg.limit_price_1e8,
+        }),
+        link_as_oco: attached.link_as_oco,
+        expires_at_ms: attached.expires_at_ms,
+        status: super::AttachmentPlanStatus::Pending,
+        materialized_size_1e8: None,
+        tp_conditional_order_id: None,
+        sl_conditional_order_id: None,
+        oco_group_id: None,
+        failure_code: None,
+        failure_message: None,
+        created_at_ms: now,
+        updated_at_ms: now,
+    };
+    if let Err(err) = persist_attachment_plan(state, &plan).await {
+        tracing::warn!(
+            target: "deopt.options.attachment",
+            parent_order_id = %parent.order_id,
+            error = %err,
+            "failed to persist attachment plan; trader still sees the original submit response"
+        );
+    }
+}
+
+/// ATTACHED-TP-SL-MAKER-FILL-HOOK-V2 — for every order that
+/// participated in `fills` (the submitter + every distinct maker),
+/// look up its attachment plan and sync it to the parent's current
+/// cumulative filled exposure. This is the unified entry that V1
+/// also depends on: an immediate-fill submit walks through the
+/// submitter branch; a maker that later picks up fills walks
+/// through the maker branch.
+///
+/// Idempotent: re-running with the same cumulative filled exposure
+/// is a no-op (plan status guards each branch). Safe on terminal
+/// child legs: the resize path uses
+/// `update_conditional_order_quantity_if_armed`, which returns
+/// `None` and leaves the row alone when the leg has moved past
+/// `Armed`.
+async fn sync_attached_plans_after_fills(
+    state: &AppState,
+    submitter: &OptionOrder,
+    fills: &[OptionFill],
+    now: TimestampMs,
+) {
+    // Always sync the submitter (covers the immediate-fill case
+    // that V1 owned). Then walk the distinct maker order ids from
+    // this batch and sync each one — that's the V2 maker hook.
+    if let Err(err) = sync_attachment_plan_for_parent(state, submitter.order_id, now).await {
+        tracing::warn!(
+            target: "deopt.options.attachment",
+            parent_order_id = %submitter.order_id,
+            error = %err,
+            "submitter attachment plan sync failed"
+        );
+    }
+    use std::collections::HashSet;
+    let mut seen: HashSet<OptionOrderId> = HashSet::new();
+    seen.insert(submitter.order_id);
+    for fill in fills {
+        let maker_id = fill.maker_order_id;
+        if !seen.insert(maker_id) {
+            continue;
+        }
+        if let Err(err) = sync_attachment_plan_for_parent(state, maker_id, now).await {
+            tracing::warn!(
+                target: "deopt.options.attachment",
+                parent_order_id = %maker_id,
+                error = %err,
+                "maker attachment plan sync failed"
+            );
+        }
+    }
+}
+
+/// ATTACHED-TP-SL-MAKER-FILL-HOOK-V2 — sync a single parent
+/// order's plan to that parent's current cumulative filled
+/// exposure. No-op when:
+///   * no plan exists (the parent never had attached TP/SL)
+///   * the plan is in a terminal status (cancelled / failed)
+///   * the parent's cumulative filled is zero (resting, no fills)
+///   * the parent's cumulative filled does not exceed
+///     `plan.materialized_size_1e8` (idempotent)
+///
+/// Transitions:
+///   * pending → active when first non-zero filled exposure
+///     materialises the conditional rows via the existing
+///     `create_conditional_orders` service.
+///   * active → active with a larger `materialized_size_1e8` when
+///     additional fills land; the underlying conditional rows are
+///     resized via `update_conditional_order_quantity_if_armed`.
+///     Triggered/terminal legs are skipped (safe subset).
+async fn sync_attachment_plan_for_parent(
+    state: &AppState,
+    parent_order_id: OptionOrderId,
+    now: TimestampMs,
+) -> Result<()> {
+    let Some(plan) = fetch_attachment_plan(state, parent_order_id).await? else {
+        return Ok(());
+    };
+    if plan.status.is_terminal() && plan.status != super::AttachmentPlanStatus::Active {
+        // Cancelled / Failed → leave alone.
+        return Ok(());
+    }
+    let Some(parent_order) = get_option_order(state, parent_order_id).await.ok() else {
+        return Ok(());
+    };
+    let cumulative_filled = parent_order
+        .size_1e8
+        .saturating_sub(parent_order.remaining_size_1e8);
+    if cumulative_filled == 0 {
+        return Ok(()); // resting, nothing to do
+    }
+    match plan.status {
+        super::AttachmentPlanStatus::Pending => {
+            materialize_attachment_plan(state, &parent_order, &plan, cumulative_filled, now).await;
+        }
+        super::AttachmentPlanStatus::Active => {
+            let already = plan.materialized_size_1e8.unwrap_or(0);
+            if cumulative_filled > already {
+                resize_active_attachment_plan(state, &plan, cumulative_filled, now).await;
+            }
+        }
+        super::AttachmentPlanStatus::Cancelled | super::AttachmentPlanStatus::Failed => {
+            // Already handled by the early-return above.
+        }
+    }
+    Ok(())
+}
+
+/// ATTACHED-TP-SL-MAKER-FILL-HOOK-V2 — bump an active plan's
+/// materialised conditional rows to `new_size`. Triggered or
+/// terminal legs are skipped via the `_if_armed` resize method;
+/// the plan's `materialized_size_1e8` is then bumped to reflect
+/// the new exposure regardless (so observability shows the
+/// current cumulative filled), but a non-fatal warning is set
+/// when one or more legs were skipped so the trader sees what
+/// happened.
+async fn resize_active_attachment_plan(
+    state: &AppState,
+    plan: &OptionOrderAttachmentPlan,
+    new_size: crate::types::Size1e8,
+    now: TimestampMs,
+) {
+    let mut skipped: Vec<&'static str> = Vec::new();
+    if let Some(tp_id) = plan.tp_conditional_order_id {
+        let updated = resize_conditional_if_armed(state, tp_id, new_size, now).await;
+        if let Ok(None) = updated {
+            skipped.push("tp");
+        }
+        if let Err(err) = updated {
+            tracing::warn!(
+                target: "deopt.options.attachment",
+                tp_conditional_order_id = %tp_id,
+                error = %err,
+                "tp conditional resize failed; plan size still bumped for observability"
+            );
+        }
+    }
+    if let Some(sl_id) = plan.sl_conditional_order_id {
+        let updated = resize_conditional_if_armed(state, sl_id, new_size, now).await;
+        if let Ok(None) = updated {
+            skipped.push("sl");
+        }
+        if let Err(err) = updated {
+            tracing::warn!(
+                target: "deopt.options.attachment",
+                sl_conditional_order_id = %sl_id,
+                error = %err,
+                "sl conditional resize failed; plan size still bumped for observability"
+            );
+        }
+    }
+    let (failure_code, failure_message) = if skipped.is_empty() {
+        (plan.failure_code.clone(), plan.failure_message.clone())
+    } else {
+        (
+            Some("conditional_leg_already_terminal".to_string()),
+            Some(format!(
+                "skipped resize on legs: {} (already triggered/completed/cancelled/failed)",
+                skipped.join(", ")
+            )),
+        )
+    };
+    if let Err(err) = update_attachment_plan_status(
+        state,
+        plan.parent_order_id,
+        super::AttachmentPlanStatus::Active,
+        Some(new_size),
+        None,
+        None,
+        None,
+        failure_code,
+        failure_message,
+        now,
+    )
+    .await
+    {
+        tracing::warn!(
+            target: "deopt.options.attachment",
+            parent_order_id = %plan.parent_order_id,
+            error = %err,
+            "failed to bump attachment plan materialised size after resize"
+        );
+    }
+}
+
+async fn resize_conditional_if_armed(
+    state: &AppState,
+    id: uuid::Uuid,
+    new_size: crate::types::Size1e8,
+    now: TimestampMs,
+) -> Result<Option<crate::options::conditional_orders::ConditionalOrder>> {
+    if let Some(repository) = state.repository.clone() {
+        return repository
+            .update_conditional_order_quantity_if_armed(id, new_size, now)
+            .await;
+    }
+    Ok(state
         .options_store
         .lock()
         .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?
-        .submit_order_and_match(order, now)?;
-    create_option_orderbook_execution_intents(state, &fills).await?;
-    crate::fees::service::record_option_order_fills(state, &fills).await?;
-    emit_option_order_lifecycle(state, &order, &fills);
-    Ok(SubmitOptionOrderOutcome { order, fills })
+        .update_conditional_order_quantity_if_armed(id, new_size, now))
+}
+
+async fn persist_attachment_plan(state: &AppState, plan: &OptionOrderAttachmentPlan) -> Result<()> {
+    if let Some(repository) = state.repository.clone() {
+        return repository.insert_option_order_attachment_plan(plan).await;
+    }
+    state
+        .options_store
+        .lock()
+        .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?
+        .insert_option_order_attachment_plan(plan.clone())?;
+    Ok(())
+}
+
+async fn materialize_attachment_plan(
+    state: &AppState,
+    parent: &OptionOrder,
+    plan: &OptionOrderAttachmentPlan,
+    filled_size_1e8: u128,
+    now: TimestampMs,
+) {
+    use crate::options::conditional_orders::{
+        create_conditional_orders, ConditionalLegInput, ConditionalType,
+        CreateConditionalOrderInput, TriggerCondition,
+    };
+    // The existing conditional service computes side + trigger
+    // direction from the position; we pass the prices verbatim
+    // and let the service do the rest.
+    let mut legs: Vec<ConditionalLegInput> = Vec::new();
+    if let Some(tp) = plan.take_profit.as_ref() {
+        legs.push(ConditionalLegInput {
+            conditional_type: ConditionalType::TakeProfit,
+            trigger_price_1e8: tp.trigger_price_1e8,
+            limit_price_1e8: tp.limit_price_1e8,
+            explicit_trigger_condition: None::<TriggerCondition>,
+        });
+    }
+    if let Some(sl) = plan.stop_loss.as_ref() {
+        legs.push(ConditionalLegInput {
+            conditional_type: ConditionalType::StopLoss,
+            trigger_price_1e8: sl.trigger_price_1e8,
+            limit_price_1e8: sl.limit_price_1e8,
+            explicit_trigger_condition: None::<TriggerCondition>,
+        });
+    }
+    let link_as_oco = plan.link_as_oco && legs.len() == 2;
+    let input = CreateConditionalOrderInput {
+        account: parent.account.clone(),
+        option_series_id: parent.option_series_id.clone(),
+        quantity_1e8: filled_size_1e8,
+        legs,
+        link_as_oco,
+        expires_at_ms: plan.expires_at_ms,
+    };
+    let result = create_conditional_orders(state, input).await;
+    let (status, materialized, tp_id, sl_id, oco_id, fail_code, fail_msg) = match result {
+        Ok(rows) => {
+            let mut tp_id: Option<uuid::Uuid> = None;
+            let mut sl_id: Option<uuid::Uuid> = None;
+            let mut oco_id: Option<uuid::Uuid> = None;
+            for row in &rows {
+                match row.conditional_type {
+                    ConditionalType::TakeProfit => tp_id = Some(row.id),
+                    ConditionalType::StopLoss => sl_id = Some(row.id),
+                }
+                if oco_id.is_none() {
+                    oco_id = row.oco_group_id;
+                }
+            }
+            (
+                super::AttachmentPlanStatus::Active,
+                Some(filled_size_1e8),
+                tp_id,
+                sl_id,
+                oco_id,
+                None,
+                None,
+            )
+        }
+        Err(err) => {
+            tracing::warn!(
+                target: "deopt.options.attachment",
+                parent_order_id = %parent.order_id,
+                error = %err,
+                "failed to materialize attached TP/SL; plan marked failed (parent order unaffected)"
+            );
+            (
+                super::AttachmentPlanStatus::Failed,
+                None,
+                None,
+                None,
+                None,
+                Some("conditional_create_failed".to_string()),
+                Some(err.to_string()),
+            )
+        }
+    };
+    if let Err(err) = update_attachment_plan_status(
+        state,
+        parent.order_id,
+        status,
+        materialized,
+        tp_id,
+        sl_id,
+        oco_id,
+        fail_code,
+        fail_msg,
+        now,
+    )
+    .await
+    {
+        tracing::warn!(
+            target: "deopt.options.attachment",
+            parent_order_id = %parent.order_id,
+            error = %err,
+            "failed to update attachment plan post-materialization (state may be inconsistent)"
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn update_attachment_plan_status(
+    state: &AppState,
+    parent_order_id: OptionOrderId,
+    status: super::AttachmentPlanStatus,
+    materialized: Option<crate::types::Size1e8>,
+    tp_id: Option<uuid::Uuid>,
+    sl_id: Option<uuid::Uuid>,
+    oco_id: Option<uuid::Uuid>,
+    failure_code: Option<String>,
+    failure_message: Option<String>,
+    updated_at_ms: TimestampMs,
+) -> Result<OptionOrderAttachmentPlan> {
+    if let Some(repository) = state.repository.clone() {
+        return repository
+            .update_option_order_attachment_plan(
+                parent_order_id,
+                status,
+                materialized,
+                tp_id,
+                sl_id,
+                oco_id,
+                failure_code,
+                failure_message,
+                updated_at_ms,
+            )
+            .await;
+    }
+    state
+        .options_store
+        .lock()
+        .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?
+        .update_option_order_attachment_plan(
+            parent_order_id,
+            status,
+            materialized,
+            tp_id,
+            sl_id,
+            oco_id,
+            failure_code,
+            failure_message,
+            updated_at_ms,
+        )
+}
+
+/// ATTACHED-TP-SL-ON-ENTRY-V1 — terminal helper for the
+/// cancel/expire hooks: flips a still-pending plan to Cancelled.
+/// Idempotent: a plan already in a terminal state is left alone.
+pub(crate) async fn cancel_attachment_plan_if_pending(
+    state: &AppState,
+    parent_order_id: OptionOrderId,
+    now: TimestampMs,
+) {
+    let plan = match fetch_attachment_plan(state, parent_order_id).await {
+        Ok(Some(p)) => p,
+        Ok(None) => return,
+        Err(err) => {
+            tracing::warn!(
+                target: "deopt.options.attachment",
+                parent_order_id = %parent_order_id,
+                error = %err,
+                "failed to fetch attachment plan for cancel/expire hook"
+            );
+            return;
+        }
+    };
+    if plan.status != super::AttachmentPlanStatus::Pending {
+        return;
+    }
+    if let Err(err) = update_attachment_plan_status(
+        state,
+        parent_order_id,
+        super::AttachmentPlanStatus::Cancelled,
+        None,
+        None,
+        None,
+        None,
+        Some("parent_terminal_before_fill".to_string()),
+        Some("parent order reached a terminal state with no fill".to_string()),
+        now,
+    )
+    .await
+    {
+        tracing::warn!(
+            target: "deopt.options.attachment",
+            parent_order_id = %parent_order_id,
+            error = %err,
+            "failed to cancel pending attachment plan"
+        );
+    }
+}
+
+async fn fetch_attachment_plan(
+    state: &AppState,
+    parent_order_id: OptionOrderId,
+) -> Result<Option<OptionOrderAttachmentPlan>> {
+    if let Some(repository) = state.repository.clone() {
+        return repository
+            .get_option_order_attachment_plan(parent_order_id)
+            .await;
+    }
+    Ok(state
+        .options_store
+        .lock()
+        .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?
+        .get_option_order_attachment_plan(parent_order_id))
+}
+
+/// ATTACHED-TP-SL-ON-ENTRY-V1 — list attachment plans for the
+/// given account, newest first.
+pub async fn list_option_order_attachment_plans_for_account(
+    state: &AppState,
+    account: &crate::types::AccountId,
+    since_ms: Option<TimestampMs>,
+) -> Result<Vec<OptionOrderAttachmentPlan>> {
+    if let Some(repository) = state.repository.clone() {
+        return repository
+            .list_option_order_attachment_plans_for_account(account, since_ms)
+            .await;
+    }
+    Ok(state
+        .options_store
+        .lock()
+        .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?
+        .list_option_order_attachment_plans_for_account(account, since_ms))
+}
+
+/// HISTORY-V2-REJECTED-ATTEMPTS-FEED-V1 — given an input that was
+/// rejected and the resulting `BackendError`, classify the error
+/// and persist a rejection row if the cause is in the recordable
+/// set. Returns `Some(reason_code, reason_source)` if classified
+/// (recorded), `None` if intentionally skipped.
+async fn record_submit_rejection_if_applicable(
+    state: &AppState,
+    input: &SubmitOptionOrderInput,
+    error: &BackendError,
+) -> Option<(&'static str, &'static str)> {
+    let (reason_code, reason_source) = classify_rejection(error)?;
+    let now = now_ms();
+    let rejection = OptionOrderRejection {
+        rejection_id: uuid::Uuid::new_v4(),
+        account: input.account.clone(),
+        option_series_id: Some(input.option_series_id.clone()),
+        side: Some(input.side),
+        price_1e8: Some(input.price_1e8),
+        size_1e8: Some(input.size_1e8),
+        time_in_force: Some(input.time_in_force),
+        post_only: Some(input.post_only),
+        client_order_id: input.client_order_id.clone(),
+        nonce: input.nonce.map(|n| n.to_string()),
+        reason_code: reason_code.to_string(),
+        // We use the BackendError's Display string as the message —
+        // never the raw signature/envelope/etc. The Display strings
+        // are static + trader-meaningful (see error.rs).
+        reason_message: Some(error.to_string()),
+        reason_source: reason_source.to_string(),
+        created_at_ms: now,
+    };
+    if let Some(repository) = state.repository.clone() {
+        if let Err(err) = repository.insert_option_order_rejection(&rejection).await {
+            tracing::warn!(
+                target: "deopt.options.rejection",
+                reason = %reason_code,
+                error = %err,
+                "failed to persist option order rejection to PG; trader still saw the original error"
+            );
+            return None;
+        }
+    } else {
+        match state.options_store.lock() {
+            Ok(mut store) => store.record_option_order_rejection(rejection),
+            Err(_) => {
+                tracing::warn!(
+                    target: "deopt.options.rejection",
+                    reason = %reason_code,
+                    "options store lock poisoned; rejection not recorded"
+                );
+                return None;
+            }
+        }
+    }
+    Some((reason_code, reason_source))
+}
+
+/// Maps a `BackendError` to a `(reason_code, reason_source)` pair
+/// IFF the error is a pre-persistence option-order rejection that
+/// (a) the caller's identity is already proven for, and (b) the
+/// cause is trader-meaningful.
+///
+/// Auth-level errors (`SignatureSignerMismatch`, `WriteAuth(...)`,
+/// `SignatureRecoveryFailed`) are intentionally not in the table:
+/// they fire BEFORE the service function in the HTTP handler and
+/// the account is not safely attributable. Returns `None` for
+/// anything outside the recordable set (e.g. internal errors,
+/// matching errors that are not in our policy list).
+fn classify_rejection(error: &BackendError) -> Option<(&'static str, &'static str)> {
+    use crate::options::rejection_reason as r;
+    match error {
+        BackendError::PostOnlyWouldMatch => {
+            Some((r::POST_ONLY_WOULD_MATCH, r::SOURCE_MATCHING_POLICY))
+        }
+        BackendError::FokNotFillable => Some((r::FOK_NOT_FILLABLE, r::SOURCE_MATCHING_POLICY)),
+        BackendError::SelfTrade => Some((r::SELF_TRADE, r::SOURCE_MATCHING_POLICY)),
+        BackendError::DeadlineExpired => Some((r::DEADLINE_EXPIRED, r::SOURCE_REQUEST_VALIDATION)),
+        BackendError::ZeroPrice => Some((r::ZERO_PRICE, r::SOURCE_REQUEST_VALIDATION)),
+        BackendError::ZeroSize => Some((r::ZERO_SIZE, r::SOURCE_REQUEST_VALIDATION)),
+        BackendError::UnsupportedTimeInForce(_) => {
+            Some((r::UNSUPPORTED_TIF, r::SOURCE_REQUEST_VALIDATION))
+        }
+        BackendError::InvalidTimeInForceCombination(_) => {
+            Some((r::INVALID_TIF_COMBINATION, r::SOURCE_REQUEST_VALIDATION))
+        }
+        BackendError::InvalidOptionOrderState(msg) if msg == "option series is not active" => {
+            Some((r::OPTION_SERIES_INACTIVE, r::SOURCE_SERIES_STATE))
+        }
+        BackendError::InvalidAttachedTpSl(_) => {
+            Some((r::ATTACHED_TP_SL_INVALID, r::SOURCE_REQUEST_VALIDATION))
+        }
+        _ => None,
+    }
+}
+
+/// HISTORY-V2-REJECTED-ATTEMPTS-FEED-V1 — list the rejected
+/// option-order submit attempts persisted for `account`,
+/// optionally restricted to rows newer than `since_ms`. Newest
+/// first; mirrors the `/history` ordering convention.
+pub async fn list_option_order_rejections_for_account(
+    state: &AppState,
+    account: &crate::types::AccountId,
+    since_ms: Option<crate::types::TimestampMs>,
+) -> Result<Vec<OptionOrderRejection>> {
+    if let Some(repository) = state.repository.clone() {
+        return repository
+            .list_option_order_rejections_for_account(account, since_ms)
+            .await;
+    }
+    Ok(state
+        .options_store
+        .lock()
+        .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?
+        .list_option_order_rejections_for_account(account, since_ms))
 }
 
 /// ORDER-LIFECYCLE-OBSERVABILITY-V1 — emit `OrderUpdated` for the
@@ -511,6 +1227,13 @@ pub async fn cancel_option_order(state: &AppState, order_id: OptionOrderId) -> R
             .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?
             .cancel_order(order_id, now)?
     };
+    // ATTACHED-TP-SL-ON-ENTRY-V1 — if the cancelled parent had a
+    // pending attachment plan (no fills landed before cancel), the
+    // plan is moved to Cancelled. If the plan is already Active
+    // (parent partially-filled then user cancelled remainder), the
+    // already-materialized conditional rows stay live and are
+    // user-managed via the existing TP/SL endpoints.
+    cancel_attachment_plan_if_pending(state, order_id, now).await;
     // ORDER-LIFECYCLE-OBSERVABILITY-V1 — emit AFTER successful mutation.
     use crate::api::public_ws::{LifecycleChannel, LifecycleEvent, LifecyclePayload};
     state.lifecycle_events.emit(LifecycleEvent {
@@ -526,6 +1249,54 @@ pub async fn cancel_option_order(state: &AppState, order_id: OptionOrderId) -> R
         emitted_at_ms: now,
     });
     Ok(cancelled)
+}
+
+/// OPTION-ORDER-EXPIRY-SWEEP-V1 — terminalize every active option
+/// order whose `deadline_ms` has passed. Dispatches to the PG
+/// repository when persistence is wired; otherwise sweeps the
+/// in-memory store. One `OrderUpdated` lifecycle event is emitted
+/// per expired order (account-scoped), mirroring `cancel_option_order`
+/// so /history and Open-Orders refresh paths see the new state.
+///
+/// Idempotent: a second call with no further-elapsed time returns an
+/// empty `Vec` because the predicate only matches active rows.
+pub async fn sweep_expired_option_orders(
+    state: &AppState,
+    now_ms: TimestampMs,
+) -> Result<Vec<OptionOrder>> {
+    ensure_enabled(state)?;
+    let expired = if let Some(repository) = state.repository.clone() {
+        repository.expire_option_orders_due(now_ms).await?
+    } else {
+        state
+            .options_store
+            .lock()
+            .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?
+            .expire_orders_due(now_ms)
+    };
+    if expired.is_empty() {
+        return Ok(expired);
+    }
+    use crate::api::public_ws::{LifecycleChannel, LifecycleEvent, LifecyclePayload};
+    for order in &expired {
+        state.lifecycle_events.emit(LifecycleEvent {
+            account: order.account.clone(),
+            channel: LifecycleChannel::AccountOrders,
+            payload: LifecyclePayload::OrderUpdated {
+                order_id: order.order_id.to_string(),
+                option_series_id: order.option_series_id.clone(),
+                status: order.status.as_str().to_string(),
+                remaining_size_1e8: order.remaining_size_1e8.to_string(),
+                size_1e8: order.size_1e8.to_string(),
+            },
+            emitted_at_ms: now_ms,
+        });
+        // ATTACHED-TP-SL-ON-ENTRY-V1 — same posture as cancel:
+        // pending plans on an expired parent go to Cancelled;
+        // already-materialized conditional rows stay live.
+        cancel_attachment_plan_if_pending(state, order.order_id, now_ms).await;
+    }
+    Ok(expired)
 }
 
 pub async fn list_option_fills(

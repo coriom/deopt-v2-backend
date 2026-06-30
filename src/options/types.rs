@@ -884,16 +884,144 @@ pub struct OptionOrder {
     pub updated_at_ms: TimestampMs,
 }
 
-// HISTORY-V2-TERMINAL-REASONS-V1: stable token table for the two
+// HISTORY-V2-TERMINAL-REASONS-V1: stable token table for the
 // terminal causes the backend can persist honestly today. Anything
 // not in this list is a pre-persistence rejection (PostOnlyWouldMatch,
 // FokNotFillable, matching rejections) and never reaches the DB.
+//
+// OPTION-ORDER-EXPIRY-SWEEP-V1: extended with `EXPIRED` (status flip
+// driver) + `SOURCE_EXPIRY_SWEEP` (the sweeper that flipped it).
 pub mod terminal_reason {
     pub const USER_CANCELLED: &str = "user_cancelled";
     pub const IOC_REMAINDER_CANCELLED: &str = "ioc_remainder_cancelled";
+    pub const EXPIRED: &str = "expired";
 
     pub const SOURCE_USER: &str = "user";
     pub const SOURCE_TIF_POLICY: &str = "tif_policy";
+    pub const SOURCE_EXPIRY_SWEEP: &str = "expiry_sweep";
+}
+
+// HISTORY-V2-REJECTED-ATTEMPTS-FEED-V1: stable token table for
+// pre-persistence rejection causes that DO get recorded in the new
+// `option_order_rejections` table. The set is intentionally narrow:
+// the caller's identity must be safely verified at the rejection
+// point (write-auth passed) and the reason must be deterministic +
+// trader-meaningful.
+pub mod rejection_reason {
+    // matching_policy
+    pub const POST_ONLY_WOULD_MATCH: &str = "post_only_would_match";
+    pub const FOK_NOT_FILLABLE: &str = "fok_not_fillable";
+    pub const SELF_TRADE: &str = "self_trade";
+    // request_validation
+    pub const DEADLINE_EXPIRED: &str = "deadline_expired";
+    pub const ZERO_PRICE: &str = "zero_price";
+    pub const ZERO_SIZE: &str = "zero_size";
+    pub const UNSUPPORTED_TIF: &str = "unsupported_tif";
+    pub const INVALID_TIF_COMBINATION: &str = "invalid_tif_combination";
+    // series_state
+    pub const OPTION_SERIES_INACTIVE: &str = "option_series_inactive";
+
+    pub const SOURCE_MATCHING_POLICY: &str = "matching_policy";
+    pub const SOURCE_REQUEST_VALIDATION: &str = "request_validation";
+    pub const SOURCE_SERIES_STATE: &str = "series_state";
+
+    // ATTACHED-TP-SL-ON-ENTRY-V1
+    pub const ATTACHED_TP_SL_INVALID: &str = "attached_tp_sl_invalid";
+}
+
+/// HISTORY-V2-REJECTED-ATTEMPTS-FEED-V1 — a recorded option order
+/// submit attempt that the backend rejected before any
+/// `option_orders` row was created. Stored verbatim from the
+/// captured submit input (sanitized — no signature, no raw
+/// authorization envelope, no headers, no body).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OptionOrderRejection {
+    pub rejection_id: Uuid,
+    pub account: AccountId,
+    pub option_series_id: Option<OptionSeriesId>,
+    pub side: Option<Side>,
+    pub price_1e8: Option<Price1e8>,
+    pub size_1e8: Option<Size1e8>,
+    pub time_in_force: Option<TimeInForce>,
+    pub post_only: Option<bool>,
+    pub client_order_id: Option<String>,
+    pub nonce: Option<String>,
+    pub reason_code: String,
+    pub reason_message: Option<String>,
+    pub reason_source: String,
+    pub created_at_ms: TimestampMs,
+}
+
+/// ATTACHED-TP-SL-ON-ENTRY-V1 — status of a trader's TP/SL
+/// attachment spec for a parent option order. Lifecycle:
+/// `Pending` (recorded but no materialization yet) → either
+/// `Active` (materialization succeeded), `Cancelled` (parent
+/// order terminated with no fill), or `Failed` (materialization
+/// errored, parent order unaffected).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachmentPlanStatus {
+    Pending,
+    Active,
+    Cancelled,
+    Failed,
+}
+
+impl AttachmentPlanStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Active => "active",
+            Self::Cancelled => "cancelled",
+            Self::Failed => "failed",
+        }
+    }
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "active" => Ok(Self::Active),
+            "cancelled" => Ok(Self::Cancelled),
+            "failed" => Ok(Self::Failed),
+            other => Err(BackendError::Persistence(format!(
+                "invalid attachment plan status: {other}"
+            ))),
+        }
+    }
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Active | Self::Cancelled | Self::Failed)
+    }
+}
+
+/// ATTACHED-TP-SL-ON-ENTRY-V1 — a single TP or SL leg request.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AttachmentLegSpec {
+    pub trigger_price_1e8: Price1e8,
+    pub limit_price_1e8: Price1e8,
+}
+
+/// ATTACHED-TP-SL-ON-ENTRY-V1 — the trader's TP/SL intent
+/// attached to a parent option order. Materialized into
+/// `options_conditional_orders` rows on the first fill batch
+/// where the parent has reducible position.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OptionOrderAttachmentPlan {
+    pub plan_id: Uuid,
+    pub parent_order_id: OptionOrderId,
+    pub account: AccountId,
+    pub option_series_id: OptionSeriesId,
+    pub take_profit: Option<AttachmentLegSpec>,
+    pub stop_loss: Option<AttachmentLegSpec>,
+    pub link_as_oco: bool,
+    pub expires_at_ms: Option<TimestampMs>,
+    pub status: AttachmentPlanStatus,
+    pub materialized_size_1e8: Option<Size1e8>,
+    pub tp_conditional_order_id: Option<Uuid>,
+    pub sl_conditional_order_id: Option<Uuid>,
+    pub oco_group_id: Option<Uuid>,
+    pub failure_code: Option<String>,
+    pub failure_message: Option<String>,
+    pub created_at_ms: TimestampMs,
+    pub updated_at_ms: TimestampMs,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

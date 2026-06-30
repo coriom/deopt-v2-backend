@@ -79,6 +79,7 @@ async fn seed_long_position(state: &AppState, series: &str) {
             nonce: None,
             deadline_ms: None,
             signature: None,
+            attached_tp_sl: None,
         },
     )
     .await
@@ -98,6 +99,7 @@ async fn seed_long_position(state: &AppState, series: &str) {
             nonce: None,
             deadline_ms: None,
             signature: None,
+            attached_tp_sl: None,
         },
     )
     .await
@@ -358,6 +360,7 @@ async fn oco_winner_completes_and_cancels_sibling_via_in_store_execute() {
             nonce: None,
             deadline_ms: None,
             signature: None,
+            attached_tp_sl: None,
         },
     )
     .await

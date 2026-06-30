@@ -167,6 +167,7 @@ async fn seed_long_position(state: &AppState, series: &str, size_1e8: u128, tag:
             nonce: None,
             deadline_ms: None,
             signature: None,
+            attached_tp_sl: None,
         },
     )
     .await
@@ -185,6 +186,7 @@ async fn seed_long_position(state: &AppState, series: &str, size_1e8: u128, tag:
             nonce: None,
             deadline_ms: None,
             signature: None,
+            attached_tp_sl: None,
         },
     )
     .await
@@ -215,6 +217,7 @@ async fn seed_closing_bid(
             nonce: None,
             deadline_ms: None,
             signature: None,
+            attached_tp_sl: None,
         },
     )
     .await
@@ -602,6 +605,7 @@ pg_test!(
                 nonce: None,
                 deadline_ms: None,
                 signature: None,
+                attached_tp_sl: None,
             },
         )
         .await

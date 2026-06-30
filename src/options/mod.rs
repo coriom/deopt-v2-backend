@@ -85,18 +85,21 @@ pub use signing::{
     OPTION_RFQ_QUOTE_TYPE,
 };
 pub use store::OptionSeriesStore;
+pub use types::rejection_reason;
 pub use types::terminal_reason;
 pub use types::{
-    OptionEventIndexerState, OptionExecutionConfirmationStatus, OptionExecutionEvent,
-    OptionExecutionEventLink, OptionExecutionGasCheckStatus, OptionExecutionIntent,
-    OptionExecutionIntentId, OptionExecutionIntentStatus, OptionExecutionReceiptCost,
-    OptionExecutionReconciliation, OptionExecutionSignatureMode, OptionExecutionSimulationResult,
-    OptionExecutionSimulationStatus, OptionExecutionSourceType, OptionExecutionTransaction,
-    OptionFill, OptionFillFilter, OptionFillId, OptionOrder, OptionOrderFilter, OptionOrderId,
-    OptionOrderStatus, OptionOrderbookLevel, OptionOrderbookSnapshot, OptionReconciliationStatus,
-    OptionRfqFill, OptionRfqFillId, OptionRfqId, OptionRfqQuote, OptionRfqQuoteId,
-    OptionRfqQuoteSignatureMode, OptionRfqQuoteSignatureStatus, OptionRfqQuoteStatus,
-    OptionRfqRequest, OptionRfqStatus, OptionSeries, OptionSeriesFilter, OptionSeriesId,
-    OptionSeriesSource, OptionSeriesStatus, OptionsConfig, OPTION_EXECUTION_GAS_SAFETY_BPS_DEFAULT,
-    OPTION_EXECUTION_GAS_SAFETY_BPS_MAX, OPTION_EXECUTION_GAS_SAFETY_BPS_MIN,
+    AttachmentLegSpec, AttachmentPlanStatus, OptionEventIndexerState,
+    OptionExecutionConfirmationStatus, OptionExecutionEvent, OptionExecutionEventLink,
+    OptionExecutionGasCheckStatus, OptionExecutionIntent, OptionExecutionIntentId,
+    OptionExecutionIntentStatus, OptionExecutionReceiptCost, OptionExecutionReconciliation,
+    OptionExecutionSignatureMode, OptionExecutionSimulationResult, OptionExecutionSimulationStatus,
+    OptionExecutionSourceType, OptionExecutionTransaction, OptionFill, OptionFillFilter,
+    OptionFillId, OptionOrder, OptionOrderAttachmentPlan, OptionOrderFilter, OptionOrderId,
+    OptionOrderRejection, OptionOrderStatus, OptionOrderbookLevel, OptionOrderbookSnapshot,
+    OptionReconciliationStatus, OptionRfqFill, OptionRfqFillId, OptionRfqId, OptionRfqQuote,
+    OptionRfqQuoteId, OptionRfqQuoteSignatureMode, OptionRfqQuoteSignatureStatus,
+    OptionRfqQuoteStatus, OptionRfqRequest, OptionRfqStatus, OptionSeries, OptionSeriesFilter,
+    OptionSeriesId, OptionSeriesSource, OptionSeriesStatus, OptionsConfig,
+    OPTION_EXECUTION_GAS_SAFETY_BPS_DEFAULT, OPTION_EXECUTION_GAS_SAFETY_BPS_MAX,
+    OPTION_EXECUTION_GAS_SAFETY_BPS_MIN,
 };

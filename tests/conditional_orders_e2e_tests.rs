@@ -91,6 +91,7 @@ async fn seed_long_position(state: &AppState, series: &str, size_1e8: u128) {
             nonce: None,
             deadline_ms: None,
             signature: None,
+            attached_tp_sl: None,
         },
     )
     .await
@@ -109,6 +110,7 @@ async fn seed_long_position(state: &AppState, series: &str, size_1e8: u128) {
             nonce: None,
             deadline_ms: None,
             signature: None,
+            attached_tp_sl: None,
         },
     )
     .await
@@ -136,6 +138,7 @@ async fn seed_closing_bid(state: &AppState, series: &str, bid_size_1e8: u128, pr
             nonce: None,
             deadline_ms: None,
             signature: None,
+            attached_tp_sl: None,
         },
     )
     .await
@@ -594,6 +597,7 @@ async fn position_closed_between_arm_and_trigger_marks_cancelled() {
             nonce: None,
             deadline_ms: None,
             signature: None,
+            attached_tp_sl: None,
         },
     )
     .await
@@ -652,6 +656,7 @@ async fn reduced_position_caps_child_quantity() {
             nonce: None,
             deadline_ms: None,
             signature: None,
+            attached_tp_sl: None,
         },
     )
     .await

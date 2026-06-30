@@ -1696,6 +1696,7 @@ async fn execute_triggered_via_repo(
             nonce: None,
             deadline_ms: None,
             signature: None,
+            attached_tp_sl: None,
         },
     )
     .await;

@@ -2208,6 +2208,7 @@ async fn orders_rows_for(
     acct: &AccountId,
     since_ms: Option<i64>,
 ) -> Result<Vec<HistoryV2Item>, TradingApiError> {
+    use crate::options::service::list_option_order_rejections_for_account as list_option_order_rejections_service;
     use crate::options::service::list_option_orders as list_option_orders_service;
     let orders = list_option_orders_service(
         state,
@@ -2226,8 +2227,22 @@ async fn orders_rows_for(
             MetaBlock::new(state, "internal"),
         )
     })?;
+    // HISTORY-V2-REJECTED-ATTEMPTS-FEED-V1 — pre-persistence
+    // rejections (post-only-would-match, FOK-not-fillable, …) live
+    // in a separate sink and are merged here so /history shows
+    // both accepted-and-now-terminal orders AND attempts that
+    // never made it to the orderbook.
+    let rejections = list_option_order_rejections_service(state, acct, since_ms)
+        .await
+        .map_err(|_| {
+            TradingApiError::new(
+                TradingErrorCode::InternalError,
+                "unable to list option order rejections",
+                MetaBlock::new(state, "internal"),
+            )
+        })?;
 
-    let mut out = Vec::with_capacity(orders.len());
+    let mut out = Vec::with_capacity(orders.len() + rejections.len());
     for o in orders {
         if let Some(min) = since_ms {
             if o.created_at_ms < min {
@@ -2262,6 +2277,47 @@ async fn orders_rows_for(
             ..HistoryV2Item::default()
         });
     }
+    for r in rejections {
+        // since_ms was already applied at the repository layer;
+        // double-check in case the in-memory list returned
+        // pre-filtered rows in an older revision.
+        if let Some(min) = since_ms {
+            if r.created_at_ms < min {
+                continue;
+            }
+        }
+        let side_str = r.side.map(|s| match s {
+            crate::types::Side::Buy => "buy".to_string(),
+            crate::types::Side::Sell => "sell".to_string(),
+        });
+        let tif_str = r.time_in_force.map(|tif| match tif {
+            crate::types::TimeInForce::Gtc => "gtc".to_string(),
+            crate::types::TimeInForce::Ioc => "ioc".to_string(),
+            crate::types::TimeInForce::Fok => "fok".to_string(),
+        });
+        out.push(HistoryV2Item {
+            time_ms: r.created_at_ms,
+            instrument: r.option_series_id.clone(),
+            side: side_str,
+            order_type: tif_str,
+            amount: r.size_1e8.map(|n| n.to_string()),
+            limit_price: r.price_1e8.map(|n| n.to_string()),
+            // No fills for a rejection. Reusing the existing
+            // `filled` field would be misleading; leave it unset.
+            filled: None,
+            status: Some("rejected".to_string()),
+            post_only: r.post_only,
+            terminal_reason_code: Some(r.reason_code.clone()),
+            terminal_reason_message: r.reason_message.clone(),
+            terminal_reason_source: Some(r.reason_source.clone()),
+            role: None,
+            tx_hash: None,
+            ..HistoryV2Item::default()
+        });
+    }
+    // Stable order: by time_ms desc, then status (so multiple
+    // rejections at the same instant stay together in the feed).
+    out.sort_by(|left, right| right.time_ms.cmp(&left.time_ms));
     Ok(out)
 }
 
