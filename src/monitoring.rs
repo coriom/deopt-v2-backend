@@ -32,6 +32,21 @@ pub async fn readiness(state: &AppState) -> ReadinessResponse {
             ok: true,
             status: "valid",
         },
+        // PERPS-FRONTEND-TICKET-ENABLEMENT-V1 — surface the Perps
+        // public-route gate so ops tooling can observe whether the
+        // opt-in flag has been flipped. `ok=true` because the readiness
+        // probe cares about *serviceability*, not whether Perps
+        // trading is on; a `false` public-route state is the safe
+        // default posture, not an error.
+        ReadinessCheck {
+            name: "perps_public_routes",
+            ok: true,
+            status: if state.perps_public_trading_enabled {
+                "enabled_flagged_closed_test"
+            } else {
+                "fail_closed"
+            },
+        },
     ];
 
     if state.persistence_enabled {
@@ -127,6 +142,14 @@ pub async fn render_metrics(state: &AppState) -> Result<String> {
         "deopt_perp_nonce_sync_enabled",
         "Perp on-chain nonce sync enabled.",
         bool_value(state.perp_nonce_sync_config.enabled),
+    );
+    // PERPS-FRONTEND-TICKET-ENABLEMENT-V1 — strict opt-in gate for
+    // the /perps/orders + /perps/orders/:id mutation routes. Default
+    // 0 (fail-closed). Legacy /orders, /rfqs* etc remain 0 always.
+    metrics.gauge(
+        "deopt_perps_public_routes_enabled",
+        "Perps public mutation routes (POST /perps/orders, DELETE /perps/orders/:id) opt-in flag. Default 0 = fail-closed. Legacy /orders, /rfqs*, /execution-intents/*/signatures remain permanently fail-closed regardless.",
+        bool_value(state.perps_public_trading_enabled),
     );
     metrics.gauge(
         "deopt_option_nonce_sync_enabled",

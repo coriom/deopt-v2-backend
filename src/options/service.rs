@@ -565,7 +565,38 @@ async fn record_submitter_attachment_plan(
             error = %err,
             "failed to persist attachment plan; trader still sees the original submit response"
         );
+        return;
     }
+    // ACCOUNT-LIFECYCLE-REALTIME-GAPS-V2 — emit AFTER durable persistence.
+    emit_attachment_plan_lifecycle(state, &plan);
+}
+
+/// ACCOUNT-LIFECYCLE-REALTIME-GAPS-V2 — publish `AttachmentPlanUpdated`
+/// on `account.conditional_orders`. Called AFTER a plan row has been
+/// durably persisted or updated (never before). Emits the plan's
+/// current status, materialized size, child conditional-order ids,
+/// oco group and failure fields — nothing else.
+fn emit_attachment_plan_lifecycle(state: &AppState, plan: &OptionOrderAttachmentPlan) {
+    use crate::api::public_ws::{LifecycleChannel, LifecycleEvent, LifecyclePayload};
+    let now = now_ms();
+    state.lifecycle_events.emit(LifecycleEvent {
+        account: plan.account.clone(),
+        channel: LifecycleChannel::AccountConditionalOrders,
+        payload: LifecyclePayload::AttachmentPlanUpdated {
+            plan_id: plan.plan_id.to_string(),
+            parent_order_id: plan.parent_order_id.to_string(),
+            option_series_id: plan.option_series_id.to_string(),
+            status: plan.status.as_str().to_string(),
+            materialized_size_1e8: plan.materialized_size_1e8.map(|s| s.to_string()),
+            tp_conditional_order_id: plan.tp_conditional_order_id.map(|u| u.to_string()),
+            sl_conditional_order_id: plan.sl_conditional_order_id.map(|u| u.to_string()),
+            oco_group_id: plan.oco_group_id.map(|u| u.to_string()),
+            failure_code: plan.failure_code.clone(),
+            failure_message: plan.failure_message.clone(),
+            updated_at_ms: plan.updated_at_ms,
+        },
+        emitted_at_ms: now,
+    });
 }
 
 /// ATTACHED-TP-SL-MAKER-FILL-HOOK-V2 — for every order that
@@ -727,7 +758,7 @@ async fn resize_active_attachment_plan(
             )),
         )
     };
-    if let Err(err) = update_attachment_plan_status(
+    match update_attachment_plan_status(
         state,
         plan.parent_order_id,
         super::AttachmentPlanStatus::Active,
@@ -741,12 +772,15 @@ async fn resize_active_attachment_plan(
     )
     .await
     {
-        tracing::warn!(
-            target: "deopt.options.attachment",
-            parent_order_id = %plan.parent_order_id,
-            error = %err,
-            "failed to bump attachment plan materialised size after resize"
-        );
+        Ok(updated) => emit_attachment_plan_lifecycle(state, &updated),
+        Err(err) => {
+            tracing::warn!(
+                target: "deopt.options.attachment",
+                parent_order_id = %plan.parent_order_id,
+                error = %err,
+                "failed to bump attachment plan materialised size after resize"
+            );
+        }
     }
 }
 
@@ -863,7 +897,7 @@ async fn materialize_attachment_plan(
             )
         }
     };
-    if let Err(err) = update_attachment_plan_status(
+    match update_attachment_plan_status(
         state,
         parent.order_id,
         status,
@@ -877,12 +911,15 @@ async fn materialize_attachment_plan(
     )
     .await
     {
-        tracing::warn!(
-            target: "deopt.options.attachment",
-            parent_order_id = %parent.order_id,
-            error = %err,
-            "failed to update attachment plan post-materialization (state may be inconsistent)"
-        );
+        Ok(updated) => emit_attachment_plan_lifecycle(state, &updated),
+        Err(err) => {
+            tracing::warn!(
+                target: "deopt.options.attachment",
+                parent_order_id = %parent.order_id,
+                error = %err,
+                "failed to update attachment plan post-materialization (state may be inconsistent)"
+            );
+        }
     }
 }
 
@@ -955,7 +992,7 @@ pub(crate) async fn cancel_attachment_plan_if_pending(
     if plan.status != super::AttachmentPlanStatus::Pending {
         return;
     }
-    if let Err(err) = update_attachment_plan_status(
+    match update_attachment_plan_status(
         state,
         parent_order_id,
         super::AttachmentPlanStatus::Cancelled,
@@ -969,12 +1006,15 @@ pub(crate) async fn cancel_attachment_plan_if_pending(
     )
     .await
     {
-        tracing::warn!(
-            target: "deopt.options.attachment",
-            parent_order_id = %parent_order_id,
-            error = %err,
-            "failed to cancel pending attachment plan"
-        );
+        Ok(updated) => emit_attachment_plan_lifecycle(state, &updated),
+        Err(err) => {
+            tracing::warn!(
+                target: "deopt.options.attachment",
+                parent_order_id = %parent_order_id,
+                error = %err,
+                "failed to cancel pending attachment plan"
+            );
+        }
     }
 }
 
@@ -1056,7 +1096,7 @@ async fn record_submit_rejection_if_applicable(
         }
     } else {
         match state.options_store.lock() {
-            Ok(mut store) => store.record_option_order_rejection(rejection),
+            Ok(mut store) => store.record_option_order_rejection(rejection.clone()),
             Err(_) => {
                 tracing::warn!(
                     target: "deopt.options.rejection",
@@ -1067,7 +1107,46 @@ async fn record_submit_rejection_if_applicable(
             }
         }
     }
+    // ACCOUNT-LIFECYCLE-REALTIME-GAPS-V2 — emit AFTER durable persistence
+    // so that a receiver observing this event can trust the row is on disk.
+    emit_option_order_rejection_lifecycle(state, &rejection);
     Some((reason_code, reason_source))
+}
+
+/// ACCOUNT-LIFECYCLE-REALTIME-GAPS-V2 — publish `OrderRejected` on
+/// `account.orders`. Called AFTER `record_submit_rejection_if_applicable`
+/// has persisted the row (never before). Never carries signatures,
+/// nonces, auth envelopes, headers or bearer tokens — only the same
+/// scalar fields already surfaced by the rejected-attempts feed.
+fn emit_option_order_rejection_lifecycle(state: &AppState, rejection: &OptionOrderRejection) {
+    use crate::api::public_ws::{LifecycleChannel, LifecycleEvent, LifecyclePayload};
+    let now = now_ms();
+    state.lifecycle_events.emit(LifecycleEvent {
+        account: rejection.account.clone(),
+        channel: LifecycleChannel::AccountOrders,
+        payload: LifecyclePayload::OrderRejected {
+            rejection_id: rejection.rejection_id.to_string(),
+            option_series_id: rejection.option_series_id.as_ref().map(|s| s.to_string()),
+            side: rejection.side.map(|s| match s {
+                crate::types::Side::Buy => "buy".to_string(),
+                crate::types::Side::Sell => "sell".to_string(),
+            }),
+            price_1e8: rejection.price_1e8.map(|p| p.to_string()),
+            size_1e8: rejection.size_1e8.map(|s| s.to_string()),
+            time_in_force: rejection.time_in_force.map(|tif| match tif {
+                crate::types::TimeInForce::Gtc => "gtc".to_string(),
+                crate::types::TimeInForce::Ioc => "ioc".to_string(),
+                crate::types::TimeInForce::Fok => "fok".to_string(),
+            }),
+            post_only: rejection.post_only,
+            client_order_id: rejection.client_order_id.clone(),
+            reason_code: rejection.reason_code.clone(),
+            reason_message: rejection.reason_message.clone(),
+            reason_source: rejection.reason_source.clone(),
+            created_at_ms: rejection.created_at_ms,
+        },
+        emitted_at_ms: now,
+    });
 }
 
 /// Maps a `BackendError` to a `(reason_code, reason_source)` pair

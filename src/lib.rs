@@ -17,6 +17,7 @@ pub mod nonce_sync;
 pub mod options;
 pub mod orderbook;
 pub mod orders;
+pub mod perps;
 pub mod reconciliation;
 pub mod rfq;
 pub mod signing;

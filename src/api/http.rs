@@ -97,6 +97,50 @@ pub struct AppState {
     /// capacity (256) — laggy receivers get `RecvError::Lagged` and
     /// resync via the canonical REST snapshot.
     pub lifecycle_events: LifecycleEventSender,
+    /// PERPS-MINIMAL-MARKET-AND-PRICE-V1 — read-only Perps market
+    /// registry + OracleRouter configuration. Defaults to
+    /// `PerpsReadConfig::disabled()` in every builder — the new
+    /// `/perps/markets*` read routes return 503 `PerpsReadDisabled`
+    /// until an operator explicitly turns them on via env. This has
+    /// NO effect on the Perps mutation-route fail-closed gate; those
+    /// remain unconditional `Err(PerpsNotLive)` at handler entry.
+    pub perps_read_config: crate::perps::PerpsReadConfig,
+    /// PERPS-ISOLATED-MARGIN-POSITION-ENGINE-V1 — in-memory Perps
+    /// positions ledger. Populated by the internal
+    /// `apply_perp_fill_for_account` helper (unit tests + future
+    /// order-execution code). Never mutated by a public HTTP handler.
+    /// The read-only `/accounts/:address/perps/positions` endpoint
+    /// listing is the ONLY public consumer.
+    pub perp_positions_store: std::sync::Arc<std::sync::Mutex<crate::perps::PerpPositionsStore>>,
+    /// PERPS-ORDER-EXECUTION-INTERNAL-V1 — in-memory Perps order + fill
+    /// ledger. Written by `submit_perp_order_internal` /
+    /// `cancel_perp_order_internal` (internal service; no public
+    /// route reaches these functions in V1). Public Perps mutation
+    /// routes STILL return 503 `PerpsNotLive` at handler entry.
+    pub perp_order_store: std::sync::Arc<std::sync::Mutex<crate::perps::PerpOrderStore>>,
+    /// PERPS-LIQUIDATION-AND-RISK-V1 — in-memory Perps liquidation
+    /// events ledger. Written by the admin-gated liquidation tick +
+    /// the internal `liquidate_perp_position_internal` service. Read
+    /// by `GET /accounts/:address/perps/liquidations`.
+    pub perp_liquidations_store:
+        std::sync::Arc<std::sync::Mutex<crate::perps::PerpLiquidationsStore>>,
+    /// PERPS-FUNDING-V1 — in-memory Perps funding events ledger.
+    /// Written by the admin-gated funding tick. Read by
+    /// `GET /accounts/:address/perps/funding`. Public Perps mutation
+    /// routes remain fail-closed regardless.
+    pub perp_funding_events_store:
+        std::sync::Arc<std::sync::Mutex<crate::perps::PerpFundingEventsStore>>,
+    /// PERPS-FRONTEND-TICKET-ENABLEMENT-V1 — strict opt-in flag for
+    /// the new `POST /perps/orders` and `DELETE /perps/orders/:id`
+    /// mutation routes. **Default: `false`.** Every existing legacy
+    /// Perps mutation route (`/orders`, `/orders/:id`, `/rfqs`,
+    /// `/rfqs/:rfq_id/quotes`, `/rfqs/:rfq_id/accept/:quote_id`,
+    /// `/rfqs/:rfq_id/cancel`, `/execution-intents/:intent_id/signatures`)
+    /// stays permanently fail-closed regardless of this flag.
+    ///
+    /// Enabling this on a mainnet chain id is refused at startup by
+    /// `validate_startup`. Env: `PERPS_PUBLIC_TRADING_ENABLED=true`.
+    pub perps_public_trading_enabled: bool,
 }
 
 impl AppState {
@@ -281,6 +325,20 @@ impl AppState {
             local_test_intents: crate::api::local_test_fixtures::shared_store(),
             write_auth_challenges,
             lifecycle_events: LifecycleEventSender::default(),
+            perps_read_config: crate::perps::PerpsReadConfig::disabled(),
+            perp_positions_store: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::perps::PerpPositionsStore::new(),
+            )),
+            perp_order_store: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::perps::PerpOrderStore::new(),
+            )),
+            perp_liquidations_store: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::perps::PerpLiquidationsStore::new(),
+            )),
+            perp_funding_events_store: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::perps::PerpFundingEventsStore::new(),
+            )),
+            perps_public_trading_enabled: false,
         }
     }
 

@@ -49,7 +49,11 @@ pub async fn build_snapshot(state: &AppState, channel: Channel) -> Result<Value,
         | Channel::AccountHistory
         | Channel::AccountIntentStatus
         | Channel::AccountSettlements
-        | Channel::AccountLiquidations => Err(SnapshotError::NotImplemented),
+        | Channel::AccountLiquidations
+        | Channel::AccountPerpOrders
+        | Channel::AccountPerpFills
+        | Channel::AccountPerpPositions
+        | Channel::AccountPerpFunding => Err(SnapshotError::NotImplemented),
     }
 }
 
@@ -82,6 +86,17 @@ pub async fn build_snapshot_for_address(
         Channel::AccountIntentStatus => Ok(empty_account_collection("intents", address)),
         Channel::AccountSettlements => Ok(empty_account_collection("settlements", address)),
         Channel::AccountLiquidations => Ok(empty_account_collection("liquidations", address)),
+        // PERPS-PERSISTENCE-HISTORY-LIFECYCLE-V1 — snapshot the
+        // account's in-memory perp orders / fills / positions. The
+        // REST endpoints exposed under `/accounts/:address/perps/*`
+        // return the same shape.
+        Channel::AccountPerpOrders => snapshot_account_perp_orders(state, address),
+        Channel::AccountPerpFills => snapshot_account_perp_fills(state, address),
+        Channel::AccountPerpPositions => Ok(empty_account_collection("perp_positions", address)),
+        // PERPS-FUNDING-V1 — honest empty snapshot; the REST endpoint
+        // under `/accounts/:address/perps/funding` returns the
+        // durable/in-memory ledger.
+        Channel::AccountPerpFunding => Ok(empty_account_collection("perp_funding", address)),
         // Public channels never route through this path.
         Channel::TradingHealth | Channel::OptionsProducts | Channel::Leaderboard => {
             Err(SnapshotError::NotImplemented)
@@ -153,6 +168,43 @@ fn empty_account_collection(key: &'static str, address: &str) -> Value {
         "source": "empty",
         key: [],
     })
+}
+
+// PERPS-PERSISTENCE-HISTORY-LIFECYCLE-V1 — read the account's perp
+// orders/fills from the in-memory store and hand the same shape back
+// to the WS snapshot path that REST returns.
+fn snapshot_account_perp_orders(state: &AppState, address: &str) -> Result<Value, SnapshotError> {
+    let account = AccountId::new(address.to_string());
+    let store = state
+        .perp_order_store
+        .lock()
+        .map_err(|_| {
+            SnapshotError::SourceUnavailable("perp_order_store lock poisoned".to_string())
+        })?
+        .clone();
+    let response = crate::perps::service::list_perp_orders_for_account_view(
+        &state.perps_read_config,
+        &store,
+        &account,
+    );
+    serde_json::to_value(response).map_err(|e| SnapshotError::SourceUnavailable(e.to_string()))
+}
+
+fn snapshot_account_perp_fills(state: &AppState, address: &str) -> Result<Value, SnapshotError> {
+    let account = AccountId::new(address.to_string());
+    let store = state
+        .perp_order_store
+        .lock()
+        .map_err(|_| {
+            SnapshotError::SourceUnavailable("perp_order_store lock poisoned".to_string())
+        })?
+        .clone();
+    let response = crate::perps::service::list_perp_fills_for_account_view(
+        &state.perps_read_config,
+        &store,
+        &account,
+    );
+    serde_json::to_value(response).map_err(|e| SnapshotError::SourceUnavailable(e.to_string()))
 }
 
 async fn snapshot_account_positions(

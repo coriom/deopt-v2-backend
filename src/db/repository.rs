@@ -1466,6 +1466,394 @@ impl PgRepository {
         rows.into_iter().map(indexed_perp_trade_from_row).collect()
     }
 
+    // =================================================================
+    // PERPS-PG-WRITE-PATH-V1 — perp_positions / perp_orders / perp_fills
+    // =================================================================
+
+    /// Insert a fresh perp position row. Fails with
+    /// `PerpMarketPaused` on the partial-unique-index violation
+    /// (one open position per account/market).
+    pub async fn insert_perp_position(&self, position: &crate::perps::PerpPosition) -> Result<()> {
+        let res = sqlx::query(
+            "INSERT INTO perp_positions (
+                id, account, market_id, side,
+                size_1e8, entry_price_1e8, margin_1e8, realized_pnl_1e8,
+                status, opened_at_ms, updated_at_ms, closed_at_ms, version,
+                last_funding_index_1e18, cumulative_funding_payment_1e8
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
+        )
+        .bind(position.id)
+        .bind(&position.account.0)
+        .bind(&position.market_id)
+        .bind(position.side.as_str())
+        .bind(position.size_1e8.to_string())
+        .bind(position.entry_price_1e8.to_string())
+        .bind(position.margin_1e8.to_string())
+        .bind(position.realized_pnl_1e8.to_string())
+        .bind(position.status.as_str())
+        .bind(timestamp_to_i64(position.opened_at_ms))
+        .bind(timestamp_to_i64(position.updated_at_ms))
+        .bind(position.closed_at_ms.map(timestamp_to_i64))
+        .bind(position.version as i64)
+        .bind(position.last_funding_index_1e18.to_string())
+        .bind(position.cumulative_funding_payment_1e8.to_string())
+        .execute(&self.pool)
+        .await;
+        match res {
+            Ok(_) => Ok(()),
+            Err(sqlx::Error::Database(db_err)) if db_err.is_unique_violation() => {
+                Err(BackendError::PerpMarketPaused(format!(
+                    "duplicate open perp position for account/market {}",
+                    position.market_id
+                )))
+            }
+            Err(other) => Err(BackendError::Persistence(other.to_string())),
+        }
+    }
+
+    /// Update a perp position row in place. Bumps `version` client-side.
+    pub async fn update_perp_position(
+        &self,
+        position: &crate::perps::PerpPosition,
+    ) -> Result<crate::perps::PerpPosition> {
+        let row = sqlx::query(PERP_POSITION_SELECT_BY_ID_UPDATE)
+            .bind(position.id)
+            .bind(position.side.as_str())
+            .bind(position.size_1e8.to_string())
+            .bind(position.entry_price_1e8.to_string())
+            .bind(position.margin_1e8.to_string())
+            .bind(position.realized_pnl_1e8.to_string())
+            .bind(position.status.as_str())
+            .bind(timestamp_to_i64(position.updated_at_ms))
+            .bind(position.closed_at_ms.map(timestamp_to_i64))
+            .bind(position.version as i64)
+            .bind(position.last_funding_index_1e18.to_string())
+            .bind(position.cumulative_funding_payment_1e8.to_string())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| BackendError::Persistence(e.to_string()))?;
+        match row {
+            Some(row) => perp_position_from_row(row),
+            None => Err(BackendError::PerpPositionNotFound),
+        }
+    }
+
+    /// Upsert active position: insert if absent for `(account, market_id)`
+    /// with `status='open'`, otherwise update the existing row.
+    pub async fn upsert_active_perp_position(
+        &self,
+        position: &crate::perps::PerpPosition,
+    ) -> Result<crate::perps::PerpPosition> {
+        // Use ON CONFLICT against the partial unique index by
+        // querying-then-inserting-or-updating. sqlx doesn't offer a
+        // `ON CONFLICT (partial-index)` shortcut, so we branch on the
+        // existence of an active row first.
+        let existing = self
+            .get_active_perp_position(&position.account, &position.market_id)
+            .await?;
+        if existing.is_some() {
+            self.update_perp_position(position).await
+        } else {
+            self.insert_perp_position(position).await?;
+            Ok(position.clone())
+        }
+    }
+
+    pub async fn get_active_perp_position(
+        &self,
+        account: &AccountId,
+        market_id: &str,
+    ) -> Result<Option<crate::perps::PerpPosition>> {
+        let row = sqlx::query(&format!(
+            "{PERP_POSITION_SELECT_ALL}
+             WHERE lower(account) = lower($1) AND market_id = $2 AND status = 'open'
+             LIMIT 1",
+        ))
+        .bind(&account.0)
+        .bind(market_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| BackendError::Persistence(e.to_string()))?;
+        row.map(perp_position_from_row).transpose()
+    }
+
+    /// Close the active position for `(account, market_id)`, flipping
+    /// its status and stamping `closed_at_ms`.
+    pub async fn close_active_perp_position(
+        &self,
+        account: &AccountId,
+        market_id: &str,
+        now_ms: TimestampMs,
+    ) -> Result<crate::perps::PerpPosition> {
+        let row = sqlx::query(&format!(
+            "UPDATE perp_positions
+             SET status = 'closed',
+                 closed_at_ms = $3,
+                 updated_at_ms = $3,
+                 version = version + 1
+             WHERE lower(account) = lower($1) AND market_id = $2 AND status = 'open'
+             RETURNING {PERP_POSITION_COLUMNS}",
+        ))
+        .bind(&account.0)
+        .bind(market_id)
+        .bind(timestamp_to_i64(now_ms))
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| BackendError::Persistence(e.to_string()))?;
+        match row {
+            Some(row) => perp_position_from_row(row),
+            None => Err(BackendError::PerpPositionNotFound),
+        }
+    }
+
+    /// List all positions (open + closed) for one account, newest-first.
+    pub async fn list_perp_positions_for_account(
+        &self,
+        account: &AccountId,
+    ) -> Result<Vec<crate::perps::PerpPosition>> {
+        let rows = sqlx::query(&format!(
+            "{PERP_POSITION_SELECT_ALL}
+             WHERE lower(account) = lower($1)
+             ORDER BY updated_at_ms DESC, id ASC",
+        ))
+        .bind(&account.0)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| BackendError::Persistence(e.to_string()))?;
+        rows.into_iter().map(perp_position_from_row).collect()
+    }
+
+    // ------------- perp_orders -------------
+
+    /// Insert a fresh perp order. Fails with `PerpDuplicateClientOrderId`
+    /// on unique-index violation on `client_order_id`.
+    pub async fn insert_perp_order(&self, order: &crate::perps::PerpOrder) -> Result<()> {
+        let res = sqlx::query(
+            "INSERT INTO perp_orders (
+                id, account, market_id, side, order_type,
+                price_1e8, size_1e8, remaining_size_1e8, filled_size_1e8,
+                time_in_force, post_only, reduce_only, isolated_margin_1e8,
+                status, client_order_id,
+                terminal_reason_code, terminal_reason_message, terminal_reason_source,
+                created_at_ms, updated_at_ms
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+                      $14, $15, $16, $17, $18, $19, $20)",
+        )
+        .bind(order.id)
+        .bind(&order.account.0)
+        .bind(&order.market_id)
+        .bind(order.side.as_str())
+        .bind(order.order_type.as_str())
+        .bind(order.price_1e8.to_string())
+        .bind(order.size_1e8.to_string())
+        .bind(order.remaining_size_1e8.to_string())
+        .bind(order.filled_size_1e8.to_string())
+        .bind(order.time_in_force.as_str())
+        .bind(order.post_only)
+        .bind(order.reduce_only)
+        .bind(order.isolated_margin_1e8.to_string())
+        .bind(order.status.as_str())
+        .bind(&order.client_order_id)
+        .bind(&order.terminal_reason_code)
+        .bind(&order.terminal_reason_message)
+        .bind(&order.terminal_reason_source)
+        .bind(timestamp_to_i64(order.created_at_ms))
+        .bind(timestamp_to_i64(order.updated_at_ms))
+        .execute(&self.pool)
+        .await;
+        match res {
+            Ok(_) => Ok(()),
+            Err(sqlx::Error::Database(db_err)) if db_err.is_unique_violation() => {
+                Err(BackendError::PerpDuplicateClientOrderId(
+                    order.client_order_id.clone().unwrap_or_default(),
+                ))
+            }
+            Err(other) => Err(BackendError::Persistence(other.to_string())),
+        }
+    }
+
+    pub async fn update_perp_order(
+        &self,
+        order: &crate::perps::PerpOrder,
+    ) -> Result<crate::perps::PerpOrder> {
+        let row = sqlx::query(&format!(
+            "UPDATE perp_orders
+             SET remaining_size_1e8 = $2,
+                 filled_size_1e8 = $3,
+                 status = $4,
+                 terminal_reason_code = $5,
+                 terminal_reason_message = $6,
+                 terminal_reason_source = $7,
+                 updated_at_ms = $8
+             WHERE id = $1
+             RETURNING {PERP_ORDER_COLUMNS}",
+        ))
+        .bind(order.id)
+        .bind(order.remaining_size_1e8.to_string())
+        .bind(order.filled_size_1e8.to_string())
+        .bind(order.status.as_str())
+        .bind(&order.terminal_reason_code)
+        .bind(&order.terminal_reason_message)
+        .bind(&order.terminal_reason_source)
+        .bind(timestamp_to_i64(order.updated_at_ms))
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| BackendError::Persistence(e.to_string()))?;
+        match row {
+            Some(row) => perp_order_from_row(row),
+            None => Err(BackendError::PerpOrderNotFound(order.id.to_string())),
+        }
+    }
+
+    pub async fn get_perp_order(
+        &self,
+        order_id: uuid::Uuid,
+    ) -> Result<Option<crate::perps::PerpOrder>> {
+        let row = sqlx::query(&format!(
+            "{PERP_ORDER_SELECT_ALL}
+             WHERE id = $1
+             LIMIT 1",
+        ))
+        .bind(order_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| BackendError::Persistence(e.to_string()))?;
+        row.map(perp_order_from_row).transpose()
+    }
+
+    /// Active orders for a market — used by the matcher.
+    /// Sorted by (price ASC, created_at ASC) for asks; caller sorts
+    /// again if bids are wanted high-to-low.
+    pub async fn list_open_perp_orders(
+        &self,
+        market_id: &str,
+    ) -> Result<Vec<crate::perps::PerpOrder>> {
+        let rows = sqlx::query(&format!(
+            "{PERP_ORDER_SELECT_ALL}
+             WHERE market_id = $1 AND status IN ('open', 'partially_filled')
+             ORDER BY price_1e8::numeric ASC, created_at_ms ASC, id ASC",
+        ))
+        .bind(market_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| BackendError::Persistence(e.to_string()))?;
+        rows.into_iter().map(perp_order_from_row).collect()
+    }
+
+    pub async fn list_perp_orders_for_account(
+        &self,
+        account: &AccountId,
+    ) -> Result<Vec<crate::perps::PerpOrder>> {
+        let rows = sqlx::query(&format!(
+            "{PERP_ORDER_SELECT_ALL}
+             WHERE lower(account) = lower($1)
+             ORDER BY created_at_ms DESC, id ASC",
+        ))
+        .bind(&account.0)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| BackendError::Persistence(e.to_string()))?;
+        rows.into_iter().map(perp_order_from_row).collect()
+    }
+
+    // ------------- perp_fills -------------
+
+    pub async fn insert_perp_fill(&self, fill: &crate::perps::PerpFill) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO perp_fills (
+                id, market_id, taker_order_id, maker_order_id,
+                taker_account, maker_account, taker_side,
+                price_1e8, size_1e8, created_at_ms
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+        )
+        .bind(fill.id)
+        .bind(&fill.market_id)
+        .bind(fill.taker_order_id)
+        .bind(fill.maker_order_id)
+        .bind(&fill.taker_account.0)
+        .bind(&fill.maker_account.0)
+        .bind(fill.taker_side.as_str())
+        .bind(fill.price_1e8.to_string())
+        .bind(fill.size_1e8.to_string())
+        .bind(timestamp_to_i64(fill.created_at_ms))
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|e| BackendError::Persistence(e.to_string()))
+    }
+
+    pub async fn list_perp_fills_for_account(
+        &self,
+        account: &AccountId,
+    ) -> Result<Vec<crate::perps::PerpFill>> {
+        let rows = sqlx::query(&format!(
+            "{PERP_FILL_SELECT_ALL}
+             WHERE lower(taker_account) = lower($1) OR lower(maker_account) = lower($1)
+             ORDER BY created_at_ms DESC, id ASC",
+        ))
+        .bind(&account.0)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| BackendError::Persistence(e.to_string()))?;
+        rows.into_iter().map(perp_fill_from_row).collect()
+    }
+
+    pub async fn list_perp_fills_for_order(
+        &self,
+        order_id: uuid::Uuid,
+    ) -> Result<Vec<crate::perps::PerpFill>> {
+        let rows = sqlx::query(&format!(
+            "{PERP_FILL_SELECT_ALL}
+             WHERE taker_order_id = $1 OR maker_order_id = $1
+             ORDER BY created_at_ms ASC, id ASC",
+        ))
+        .bind(order_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| BackendError::Persistence(e.to_string()))?;
+        rows.into_iter().map(perp_fill_from_row).collect()
+    }
+
+    // ------------- perp_liquidation_events -------------
+
+    /// PERPS-LIQUIDATION-PG-EXECUTION-V1 — newest-first list of every
+    /// durable liquidation event for one account.
+    pub async fn list_perp_liquidation_events_for_account(
+        &self,
+        account: &AccountId,
+    ) -> Result<Vec<crate::perps::PerpLiquidationEvent>> {
+        list_perp_liquidation_events_for_account(&self.pool, account).await
+    }
+
+    // ------------- perp_funding_events -------------
+
+    /// PERPS-FUNDING-V1 — newest-first list of every durable funding
+    /// event for one account.
+    pub async fn list_perp_funding_events_for_account(
+        &self,
+        account: &AccountId,
+    ) -> Result<Vec<crate::perps::PerpFundingEvent>> {
+        list_perp_funding_events_for_account(&self.pool, account).await
+    }
+
+    pub async fn find_perp_order_by_client_order_id(
+        &self,
+        account: &AccountId,
+        client_order_id: &str,
+    ) -> Result<Option<crate::perps::PerpOrder>> {
+        let row = sqlx::query(&format!(
+            "{PERP_ORDER_SELECT_ALL}
+             WHERE lower(account) = lower($1) AND client_order_id = $2
+             LIMIT 1",
+        ))
+        .bind(&account.0)
+        .bind(client_order_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| BackendError::Persistence(e.to_string()))?;
+        row.map(perp_order_from_row).transpose()
+    }
+
     pub async fn find_execution_intents_by_onchain_intent_id(
         &self,
         onchain_intent_id: &str,
@@ -5029,6 +5417,763 @@ fn indexed_perp_trade_from_row(row: PgRow) -> Result<IndexedPerpTrade> {
         seller_nonce: row_get(&row, "seller_nonce")?,
         created_at_ms: row_get(&row, "created_at_ms")?,
     })
+}
+
+// =====================================================================
+// PERPS-PG-WRITE-PATH-V1 — SELECT column lists + row decoders.
+// =====================================================================
+
+const PERP_POSITION_COLUMNS: &str = "id, account, market_id, side,
+    size_1e8, entry_price_1e8, margin_1e8, realized_pnl_1e8,
+    status, opened_at_ms, updated_at_ms, closed_at_ms, version,
+    last_funding_index_1e18, cumulative_funding_payment_1e8";
+
+const PERP_POSITION_SELECT_ALL: &str = "SELECT id, account, market_id, side,
+            size_1e8, entry_price_1e8, margin_1e8, realized_pnl_1e8,
+            status, opened_at_ms, updated_at_ms, closed_at_ms, version,
+            last_funding_index_1e18, cumulative_funding_payment_1e8
+     FROM perp_positions";
+
+const PERP_POSITION_SELECT_BY_ID_UPDATE: &str = "UPDATE perp_positions
+    SET side = $2,
+        size_1e8 = $3,
+        entry_price_1e8 = $4,
+        margin_1e8 = $5,
+        realized_pnl_1e8 = $6,
+        status = $7,
+        updated_at_ms = $8,
+        closed_at_ms = $9,
+        last_funding_index_1e18 = $11,
+        cumulative_funding_payment_1e8 = $12,
+        version = version + 1
+    WHERE id = $1 AND version = $10
+    RETURNING id, account, market_id, side,
+              size_1e8, entry_price_1e8, margin_1e8, realized_pnl_1e8,
+              status, opened_at_ms, updated_at_ms, closed_at_ms, version,
+              last_funding_index_1e18, cumulative_funding_payment_1e8";
+
+const PERP_ORDER_COLUMNS: &str = "id, account, market_id, side, order_type,
+    price_1e8, size_1e8, remaining_size_1e8, filled_size_1e8,
+    time_in_force, post_only, reduce_only, isolated_margin_1e8,
+    status, client_order_id,
+    terminal_reason_code, terminal_reason_message, terminal_reason_source,
+    created_at_ms, updated_at_ms";
+
+const PERP_ORDER_SELECT_ALL: &str = "SELECT id, account, market_id, side, order_type,
+            price_1e8, size_1e8, remaining_size_1e8, filled_size_1e8,
+            time_in_force, post_only, reduce_only, isolated_margin_1e8,
+            status, client_order_id,
+            terminal_reason_code, terminal_reason_message, terminal_reason_source,
+            created_at_ms, updated_at_ms
+     FROM perp_orders";
+
+const PERP_FILL_SELECT_ALL: &str = "SELECT id, market_id,
+            taker_order_id, maker_order_id,
+            taker_account, maker_account, taker_side,
+            price_1e8, size_1e8, created_at_ms
+     FROM perp_fills";
+
+fn perp_position_from_row(row: PgRow) -> Result<crate::perps::PerpPosition> {
+    let side_str: String = row_get(&row, "side")?;
+    let status_str: String = row_get(&row, "status")?;
+    let size_str: String = row_get(&row, "size_1e8")?;
+    let entry_str: String = row_get(&row, "entry_price_1e8")?;
+    let margin_str: String = row_get(&row, "margin_1e8")?;
+    let realized_str: String = row_get(&row, "realized_pnl_1e8")?;
+    let funding_index_str: String = row_get(&row, "last_funding_index_1e18")?;
+    let funding_paid_str: String = row_get(&row, "cumulative_funding_payment_1e8")?;
+    let version: i64 = row_get(&row, "version")?;
+    Ok(crate::perps::PerpPosition {
+        id: row_get(&row, "id")?,
+        account: AccountId::new(row_get::<String>(&row, "account")?),
+        market_id: row_get(&row, "market_id")?,
+        side: crate::perps::PerpSide::parse(&side_str)?,
+        size_1e8: size_str
+            .parse()
+            .map_err(|e| BackendError::Persistence(format!("invalid perp size: {e}")))?,
+        entry_price_1e8: entry_str
+            .parse()
+            .map_err(|e| BackendError::Persistence(format!("invalid perp entry: {e}")))?,
+        margin_1e8: margin_str
+            .parse()
+            .map_err(|e| BackendError::Persistence(format!("invalid perp margin: {e}")))?,
+        realized_pnl_1e8: realized_str
+            .parse()
+            .map_err(|e| BackendError::Persistence(format!("invalid perp realized pnl: {e}")))?,
+        status: crate::perps::PerpPositionStatus::parse(&status_str)?,
+        opened_at_ms: row_get(&row, "opened_at_ms")?,
+        updated_at_ms: row_get(&row, "updated_at_ms")?,
+        closed_at_ms: row_get(&row, "closed_at_ms")?,
+        version: i64_to_u64_persistence("version", version)?,
+        last_funding_index_1e18: funding_index_str
+            .parse()
+            .map_err(|e| BackendError::Persistence(format!("invalid perp funding index: {e}")))?,
+        cumulative_funding_payment_1e8: funding_paid_str.parse().map_err(|e| {
+            BackendError::Persistence(format!("invalid perp cumulative funding payment: {e}"))
+        })?,
+    })
+}
+
+fn perp_order_from_row(row: PgRow) -> Result<crate::perps::PerpOrder> {
+    let side_str: String = row_get(&row, "side")?;
+    let order_type_str: String = row_get(&row, "order_type")?;
+    let tif_str: String = row_get(&row, "time_in_force")?;
+    let status_str: String = row_get(&row, "status")?;
+    let price_str: String = row_get(&row, "price_1e8")?;
+    let size_str: String = row_get(&row, "size_1e8")?;
+    let remaining_str: String = row_get(&row, "remaining_size_1e8")?;
+    let filled_str: String = row_get(&row, "filled_size_1e8")?;
+    let margin_str: String = row_get(&row, "isolated_margin_1e8")?;
+    Ok(crate::perps::PerpOrder {
+        id: row_get(&row, "id")?,
+        account: AccountId::new(row_get::<String>(&row, "account")?),
+        market_id: row_get(&row, "market_id")?,
+        side: crate::perps::PerpOrderSide::parse(&side_str)?,
+        order_type: crate::perps::PerpOrderType::parse(&order_type_str)?,
+        price_1e8: price_str
+            .parse()
+            .map_err(|e| BackendError::Persistence(format!("invalid perp order price: {e}")))?,
+        size_1e8: size_str
+            .parse()
+            .map_err(|e| BackendError::Persistence(format!("invalid perp order size: {e}")))?,
+        remaining_size_1e8: remaining_str.parse().map_err(|e| {
+            BackendError::Persistence(format!("invalid perp order remaining size: {e}"))
+        })?,
+        filled_size_1e8: filled_str.parse().map_err(|e| {
+            BackendError::Persistence(format!("invalid perp order filled size: {e}"))
+        })?,
+        time_in_force: crate::perps::PerpTimeInForce::parse(&tif_str)?,
+        post_only: row_get(&row, "post_only")?,
+        reduce_only: row_get(&row, "reduce_only")?,
+        isolated_margin_1e8: margin_str.parse().map_err(|e| {
+            BackendError::Persistence(format!("invalid perp order isolated margin: {e}"))
+        })?,
+        status: crate::perps::PerpOrderStatus::parse(&status_str)?,
+        client_order_id: row_get(&row, "client_order_id")?,
+        terminal_reason_code: row_get(&row, "terminal_reason_code")?,
+        terminal_reason_message: row_get(&row, "terminal_reason_message")?,
+        terminal_reason_source: row_get(&row, "terminal_reason_source")?,
+        created_at_ms: row_get(&row, "created_at_ms")?,
+        updated_at_ms: row_get(&row, "updated_at_ms")?,
+    })
+}
+
+fn perp_fill_from_row(row: PgRow) -> Result<crate::perps::PerpFill> {
+    let side_str: String = row_get(&row, "taker_side")?;
+    let price_str: String = row_get(&row, "price_1e8")?;
+    let size_str: String = row_get(&row, "size_1e8")?;
+    Ok(crate::perps::PerpFill {
+        id: row_get(&row, "id")?,
+        market_id: row_get(&row, "market_id")?,
+        taker_order_id: row_get(&row, "taker_order_id")?,
+        maker_order_id: row_get(&row, "maker_order_id")?,
+        taker_account: AccountId::new(row_get::<String>(&row, "taker_account")?),
+        maker_account: AccountId::new(row_get::<String>(&row, "maker_account")?),
+        taker_side: crate::perps::PerpOrderSide::parse(&side_str)?,
+        price_1e8: price_str
+            .parse()
+            .map_err(|e| BackendError::Persistence(format!("invalid perp fill price: {e}")))?,
+        size_1e8: size_str
+            .parse()
+            .map_err(|e| BackendError::Persistence(format!("invalid perp fill size: {e}")))?,
+        created_at_ms: row_get(&row, "created_at_ms")?,
+    })
+}
+
+// =====================================================================
+// PERPS-PG-EXECUTION-INTEGRATION-V1 — transaction-scoped write helpers.
+// =====================================================================
+//
+// Free functions taking `&mut Transaction<'_, Postgres>` so a single
+// caller can group order + fill + position writes into one atomic
+// commit. Public-visible from `super::` so the perps execution module
+// can drive them directly.
+
+pub(crate) async fn insert_perp_order_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    order: &crate::perps::PerpOrder,
+) -> Result<()> {
+    let res = sqlx::query(
+        "INSERT INTO perp_orders (
+            id, account, market_id, side, order_type,
+            price_1e8, size_1e8, remaining_size_1e8, filled_size_1e8,
+            time_in_force, post_only, reduce_only, isolated_margin_1e8,
+            status, client_order_id,
+            terminal_reason_code, terminal_reason_message, terminal_reason_source,
+            created_at_ms, updated_at_ms
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+                  $14, $15, $16, $17, $18, $19, $20)",
+    )
+    .bind(order.id)
+    .bind(&order.account.0)
+    .bind(&order.market_id)
+    .bind(order.side.as_str())
+    .bind(order.order_type.as_str())
+    .bind(order.price_1e8.to_string())
+    .bind(order.size_1e8.to_string())
+    .bind(order.remaining_size_1e8.to_string())
+    .bind(order.filled_size_1e8.to_string())
+    .bind(order.time_in_force.as_str())
+    .bind(order.post_only)
+    .bind(order.reduce_only)
+    .bind(order.isolated_margin_1e8.to_string())
+    .bind(order.status.as_str())
+    .bind(&order.client_order_id)
+    .bind(&order.terminal_reason_code)
+    .bind(&order.terminal_reason_message)
+    .bind(&order.terminal_reason_source)
+    .bind(timestamp_to_i64(order.created_at_ms))
+    .bind(timestamp_to_i64(order.updated_at_ms))
+    .execute(&mut **tx)
+    .await;
+    match res {
+        Ok(_) => Ok(()),
+        Err(sqlx::Error::Database(db_err)) if db_err.is_unique_violation() => {
+            Err(BackendError::PerpDuplicateClientOrderId(
+                order.client_order_id.clone().unwrap_or_default(),
+            ))
+        }
+        Err(other) => Err(BackendError::Persistence(other.to_string())),
+    }
+}
+
+pub(crate) async fn update_perp_order_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    order: &crate::perps::PerpOrder,
+) -> Result<crate::perps::PerpOrder> {
+    let row = sqlx::query(&format!(
+        "UPDATE perp_orders
+         SET remaining_size_1e8 = $2,
+             filled_size_1e8 = $3,
+             status = $4,
+             terminal_reason_code = $5,
+             terminal_reason_message = $6,
+             terminal_reason_source = $7,
+             updated_at_ms = $8
+         WHERE id = $1
+         RETURNING {PERP_ORDER_COLUMNS}",
+    ))
+    .bind(order.id)
+    .bind(order.remaining_size_1e8.to_string())
+    .bind(order.filled_size_1e8.to_string())
+    .bind(order.status.as_str())
+    .bind(&order.terminal_reason_code)
+    .bind(&order.terminal_reason_message)
+    .bind(&order.terminal_reason_source)
+    .bind(timestamp_to_i64(order.updated_at_ms))
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|e| BackendError::Persistence(e.to_string()))?;
+    match row {
+        Some(row) => perp_order_from_row(row),
+        None => Err(BackendError::PerpOrderNotFound(order.id.to_string())),
+    }
+}
+
+pub(crate) async fn get_perp_order_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    order_id: uuid::Uuid,
+) -> Result<Option<crate::perps::PerpOrder>> {
+    let row = sqlx::query(&format!("{PERP_ORDER_SELECT_ALL} WHERE id = $1 LIMIT 1",))
+        .bind(order_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|e| BackendError::Persistence(e.to_string()))?;
+    row.map(perp_order_from_row).transpose()
+}
+
+pub(crate) async fn list_open_perp_orders_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    market_id: &str,
+) -> Result<Vec<crate::perps::PerpOrder>> {
+    let rows = sqlx::query(&format!(
+        "{PERP_ORDER_SELECT_ALL}
+         WHERE market_id = $1 AND status IN ('open', 'partially_filled')
+         ORDER BY price_1e8::numeric ASC, created_at_ms ASC, id ASC",
+    ))
+    .bind(market_id)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(|e| BackendError::Persistence(e.to_string()))?;
+    rows.into_iter().map(perp_order_from_row).collect()
+}
+
+pub(crate) async fn insert_perp_fill_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    fill: &crate::perps::PerpFill,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO perp_fills (
+            id, market_id, taker_order_id, maker_order_id,
+            taker_account, maker_account, taker_side,
+            price_1e8, size_1e8, created_at_ms
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+    )
+    .bind(fill.id)
+    .bind(&fill.market_id)
+    .bind(fill.taker_order_id)
+    .bind(fill.maker_order_id)
+    .bind(&fill.taker_account.0)
+    .bind(&fill.maker_account.0)
+    .bind(fill.taker_side.as_str())
+    .bind(fill.price_1e8.to_string())
+    .bind(fill.size_1e8.to_string())
+    .bind(timestamp_to_i64(fill.created_at_ms))
+    .execute(&mut **tx)
+    .await
+    .map(|_| ())
+    .map_err(|e| BackendError::Persistence(e.to_string()))
+}
+
+pub(crate) async fn get_active_perp_position_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    account: &AccountId,
+    market_id: &str,
+) -> Result<Option<crate::perps::PerpPosition>> {
+    let row = sqlx::query(&format!(
+        "{PERP_POSITION_SELECT_ALL}
+         WHERE lower(account) = lower($1) AND market_id = $2 AND status = 'open'
+         LIMIT 1",
+    ))
+    .bind(&account.0)
+    .bind(market_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|e| BackendError::Persistence(e.to_string()))?;
+    row.map(perp_position_from_row).transpose()
+}
+
+pub(crate) async fn insert_perp_position_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    position: &crate::perps::PerpPosition,
+) -> Result<()> {
+    let res = sqlx::query(
+        "INSERT INTO perp_positions (
+            id, account, market_id, side,
+            size_1e8, entry_price_1e8, margin_1e8, realized_pnl_1e8,
+            status, opened_at_ms, updated_at_ms, closed_at_ms, version,
+            last_funding_index_1e18, cumulative_funding_payment_1e8
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
+    )
+    .bind(position.id)
+    .bind(&position.account.0)
+    .bind(&position.market_id)
+    .bind(position.side.as_str())
+    .bind(position.size_1e8.to_string())
+    .bind(position.entry_price_1e8.to_string())
+    .bind(position.margin_1e8.to_string())
+    .bind(position.realized_pnl_1e8.to_string())
+    .bind(position.status.as_str())
+    .bind(timestamp_to_i64(position.opened_at_ms))
+    .bind(timestamp_to_i64(position.updated_at_ms))
+    .bind(position.closed_at_ms.map(timestamp_to_i64))
+    .bind(position.version as i64)
+    .bind(position.last_funding_index_1e18.to_string())
+    .bind(position.cumulative_funding_payment_1e8.to_string())
+    .execute(&mut **tx)
+    .await;
+    match res {
+        Ok(_) => Ok(()),
+        Err(sqlx::Error::Database(db_err)) if db_err.is_unique_violation() => {
+            Err(BackendError::PerpMarketPaused(format!(
+                "duplicate open perp position for account/market {}",
+                position.market_id
+            )))
+        }
+        Err(other) => Err(BackendError::Persistence(other.to_string())),
+    }
+}
+
+pub(crate) async fn update_perp_position_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    position: &crate::perps::PerpPosition,
+) -> Result<crate::perps::PerpPosition> {
+    let row = sqlx::query(PERP_POSITION_SELECT_BY_ID_UPDATE)
+        .bind(position.id)
+        .bind(position.side.as_str())
+        .bind(position.size_1e8.to_string())
+        .bind(position.entry_price_1e8.to_string())
+        .bind(position.margin_1e8.to_string())
+        .bind(position.realized_pnl_1e8.to_string())
+        .bind(position.status.as_str())
+        .bind(timestamp_to_i64(position.updated_at_ms))
+        .bind(position.closed_at_ms.map(timestamp_to_i64))
+        .bind(position.version as i64)
+        .bind(position.last_funding_index_1e18.to_string())
+        .bind(position.cumulative_funding_payment_1e8.to_string())
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|e| BackendError::Persistence(e.to_string()))?;
+    match row {
+        Some(row) => perp_position_from_row(row),
+        None => Err(BackendError::PerpPositionNotFound),
+    }
+}
+
+pub(crate) async fn close_active_perp_position_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    account: &AccountId,
+    market_id: &str,
+    now_ms: TimestampMs,
+) -> Result<crate::perps::PerpPosition> {
+    let row = sqlx::query(&format!(
+        "UPDATE perp_positions
+         SET status = 'closed',
+             closed_at_ms = $3,
+             updated_at_ms = $3,
+             version = version + 1
+         WHERE lower(account) = lower($1) AND market_id = $2 AND status = 'open'
+         RETURNING {PERP_POSITION_COLUMNS}",
+    ))
+    .bind(&account.0)
+    .bind(market_id)
+    .bind(timestamp_to_i64(now_ms))
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|e| BackendError::Persistence(e.to_string()))?;
+    match row {
+        Some(row) => perp_position_from_row(row),
+        None => Err(BackendError::PerpPositionNotFound),
+    }
+}
+
+// =====================================================================
+// PERPS-LIQUIDATION-PG-EXECUTION-V1 — durable liquidation execution.
+// =====================================================================
+//
+// Free `_tx` helpers so the admin tick can group a single account's
+// order cancels + position status flip + event insert into one atomic
+// commit. Lifecycle frames fire only AFTER `tx.commit().await?` in the
+// tick orchestrator (see `crate::perps::liquidation_pg`).
+
+const PERP_LIQUIDATION_SELECT_ALL: &str = "SELECT id, account, market_id, position_id, side,
+            size_1e8, entry_price_1e8, mark_price_1e8, margin_1e8,
+            unrealized_pnl_1e8, equity_1e8, maintenance_margin_requirement_1e8,
+            margin_ratio_bps, realized_pnl_1e8, bad_debt_1e8, liquidation_fee_1e8,
+            status, reason_code, created_at_ms
+     FROM perp_liquidation_events";
+
+fn perp_liquidation_event_from_row(row: PgRow) -> Result<crate::perps::PerpLiquidationEvent> {
+    let side_str: String = row_get(&row, "side")?;
+    let status_str: String = row_get(&row, "status")?;
+    let size_str: String = row_get(&row, "size_1e8")?;
+    let entry_str: String = row_get(&row, "entry_price_1e8")?;
+    let mark_str: String = row_get(&row, "mark_price_1e8")?;
+    let margin_str: String = row_get(&row, "margin_1e8")?;
+    let unrealized_str: String = row_get(&row, "unrealized_pnl_1e8")?;
+    let equity_str: String = row_get(&row, "equity_1e8")?;
+    let mm_str: String = row_get(&row, "maintenance_margin_requirement_1e8")?;
+    let ratio_str: String = row_get(&row, "margin_ratio_bps")?;
+    let realized_str: String = row_get(&row, "realized_pnl_1e8")?;
+    let bad_debt_str: String = row_get(&row, "bad_debt_1e8")?;
+    let fee_str: String = row_get(&row, "liquidation_fee_1e8")?;
+    let status = match status_str.as_str() {
+        "completed" => crate::perps::PerpLiquidationStatus::Completed,
+        "price_unavailable" => crate::perps::PerpLiquidationStatus::PriceUnavailable,
+        other => {
+            return Err(BackendError::Persistence(format!(
+                "invalid perp liquidation status: {other}"
+            )))
+        }
+    };
+    Ok(crate::perps::PerpLiquidationEvent {
+        id: row_get(&row, "id")?,
+        account: AccountId::new(row_get::<String>(&row, "account")?),
+        market_id: row_get(&row, "market_id")?,
+        position_id: row_get(&row, "position_id")?,
+        side: crate::perps::PerpSide::parse(&side_str)?,
+        size_1e8: size_str
+            .parse()
+            .map_err(|e| BackendError::Persistence(format!("invalid perp liq size: {e}")))?,
+        entry_price_1e8: entry_str
+            .parse()
+            .map_err(|e| BackendError::Persistence(format!("invalid perp liq entry: {e}")))?,
+        mark_price_1e8: mark_str
+            .parse()
+            .map_err(|e| BackendError::Persistence(format!("invalid perp liq mark: {e}")))?,
+        margin_1e8: margin_str
+            .parse()
+            .map_err(|e| BackendError::Persistence(format!("invalid perp liq margin: {e}")))?,
+        unrealized_pnl_1e8: unrealized_str
+            .parse()
+            .map_err(|e| BackendError::Persistence(format!("invalid perp liq unrealized: {e}")))?,
+        equity_1e8: equity_str
+            .parse()
+            .map_err(|e| BackendError::Persistence(format!("invalid perp liq equity: {e}")))?,
+        maintenance_margin_requirement_1e8: mm_str
+            .parse()
+            .map_err(|e| BackendError::Persistence(format!("invalid perp liq mm: {e}")))?,
+        margin_ratio_bps: ratio_str
+            .parse()
+            .map_err(|e| BackendError::Persistence(format!("invalid perp liq ratio: {e}")))?,
+        realized_pnl_1e8: realized_str
+            .parse()
+            .map_err(|e| BackendError::Persistence(format!("invalid perp liq realized: {e}")))?,
+        bad_debt_1e8: bad_debt_str
+            .parse()
+            .map_err(|e| BackendError::Persistence(format!("invalid perp liq bad debt: {e}")))?,
+        liquidation_fee_1e8: fee_str
+            .parse()
+            .map_err(|e| BackendError::Persistence(format!("invalid perp liq fee: {e}")))?,
+        status,
+        reason_code: row_get(&row, "reason_code")?,
+        created_at_ms: row_get(&row, "created_at_ms")?,
+    })
+}
+
+pub(crate) async fn insert_perp_liquidation_event_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    event: &crate::perps::PerpLiquidationEvent,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO perp_liquidation_events (
+            id, account, market_id, position_id, side,
+            size_1e8, entry_price_1e8, mark_price_1e8, margin_1e8,
+            unrealized_pnl_1e8, equity_1e8, maintenance_margin_requirement_1e8,
+            margin_ratio_bps, realized_pnl_1e8, bad_debt_1e8, liquidation_fee_1e8,
+            status, reason_code, created_at_ms
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)",
+    )
+    .bind(event.id)
+    .bind(&event.account.0)
+    .bind(&event.market_id)
+    .bind(event.position_id)
+    .bind(event.side.as_str())
+    .bind(event.size_1e8.to_string())
+    .bind(event.entry_price_1e8.to_string())
+    .bind(event.mark_price_1e8.to_string())
+    .bind(event.margin_1e8.to_string())
+    .bind(event.unrealized_pnl_1e8.to_string())
+    .bind(event.equity_1e8.to_string())
+    .bind(event.maintenance_margin_requirement_1e8.to_string())
+    .bind(event.margin_ratio_bps.to_string())
+    .bind(event.realized_pnl_1e8.to_string())
+    .bind(event.bad_debt_1e8.to_string())
+    .bind(event.liquidation_fee_1e8.to_string())
+    .bind(event.status.as_str())
+    .bind(&event.reason_code)
+    .bind(timestamp_to_i64(event.created_at_ms))
+    .execute(&mut **tx)
+    .await
+    .map(|_| ())
+    .map_err(|e| BackendError::Persistence(e.to_string()))
+}
+
+/// Newest-first list of every liquidation event for one account. Empty
+/// vec is a valid result — the caller must not fabricate rows.
+pub(crate) async fn list_perp_liquidation_events_for_account(
+    pool: &PgPool,
+    account: &AccountId,
+) -> Result<Vec<crate::perps::PerpLiquidationEvent>> {
+    let rows = sqlx::query(&format!(
+        "{PERP_LIQUIDATION_SELECT_ALL}
+         WHERE lower(account) = lower($1)
+         ORDER BY created_at_ms DESC, id ASC",
+    ))
+    .bind(&account.0)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| BackendError::Persistence(e.to_string()))?;
+    rows.into_iter()
+        .map(perp_liquidation_event_from_row)
+        .collect()
+}
+
+/// Scan every currently-open perp position. Used by the admin
+/// liquidation tick to gather candidates before evaluating them
+/// against the current oracle mark. Ordered by `id` for a stable
+/// iteration across concurrent ticks.
+pub(crate) async fn list_open_perp_positions_tx(
+    tx: &mut Transaction<'_, Postgres>,
+) -> Result<Vec<crate::perps::PerpPosition>> {
+    let rows = sqlx::query(&format!(
+        "{PERP_POSITION_SELECT_ALL}
+         WHERE status = 'open'
+         ORDER BY id ASC",
+    ))
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(|e| BackendError::Persistence(e.to_string()))?;
+    rows.into_iter().map(perp_position_from_row).collect()
+}
+
+/// Flip an active position to `status='liquidated'`, adding the
+/// realized PnL delta and stamping `closed_at_ms`. Returns the
+/// post-update row; `PerpPositionNotFound` if no active row exists.
+pub(crate) async fn liquidate_active_perp_position_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    account: &AccountId,
+    market_id: &str,
+    realized_pnl_delta_1e8: i128,
+    now_ms: TimestampMs,
+) -> Result<crate::perps::PerpPosition> {
+    let row = sqlx::query(&format!(
+        "UPDATE perp_positions
+         SET status = 'liquidated',
+             realized_pnl_1e8 = (realized_pnl_1e8::numeric + $3::numeric)::text,
+             closed_at_ms = $4,
+             updated_at_ms = $4,
+             version = version + 1
+         WHERE lower(account) = lower($1) AND market_id = $2 AND status = 'open'
+         RETURNING {PERP_POSITION_COLUMNS}",
+    ))
+    .bind(&account.0)
+    .bind(market_id)
+    .bind(realized_pnl_delta_1e8.to_string())
+    .bind(timestamp_to_i64(now_ms))
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|e| BackendError::Persistence(e.to_string()))?;
+    match row {
+        Some(row) => perp_position_from_row(row),
+        None => Err(BackendError::PerpPositionNotFound),
+    }
+}
+
+/// Mass-cancel every currently-active order (`open` or
+/// `partially_filled`) for one `(account, market_id)`. Stamps the
+/// supplied terminal reason on every cancelled row. Returns the
+/// updated rows so the caller can emit `PerpOrderUpdated` lifecycle
+/// frames after commit.
+///
+/// Idempotent: returns an empty vec when the account has no active
+/// orders on the market.
+pub(crate) async fn cancel_open_perp_orders_for_account_market_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    account: &AccountId,
+    market_id: &str,
+    reason_code: &str,
+    reason_source: &str,
+    now_ms: TimestampMs,
+) -> Result<Vec<crate::perps::PerpOrder>> {
+    let rows = sqlx::query(&format!(
+        "UPDATE perp_orders
+         SET status = 'cancelled',
+             terminal_reason_code = $3,
+             terminal_reason_source = $4,
+             updated_at_ms = $5
+         WHERE lower(account) = lower($1)
+           AND market_id = $2
+           AND status IN ('open', 'partially_filled')
+         RETURNING {PERP_ORDER_COLUMNS}",
+    ))
+    .bind(&account.0)
+    .bind(market_id)
+    .bind(reason_code)
+    .bind(reason_source)
+    .bind(timestamp_to_i64(now_ms))
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(|e| BackendError::Persistence(e.to_string()))?;
+    rows.into_iter().map(perp_order_from_row).collect()
+}
+
+// =====================================================================
+// PERPS-FUNDING-V1 — durable funding-event write + read helpers.
+// =====================================================================
+
+const PERP_FUNDING_SELECT_ALL: &str = "SELECT id, account, market_id, position_id, side,
+            position_size_1e8, funding_index_before_1e18, funding_index_after_1e18,
+            funding_delta_1e18, payment_1e8,
+            margin_before_1e8, margin_after_1e8, bad_debt_1e8,
+            reason_code, created_at_ms
+     FROM perp_funding_events";
+
+fn perp_funding_event_from_row(row: PgRow) -> Result<crate::perps::PerpFundingEvent> {
+    let side_str: String = row_get(&row, "side")?;
+    let size_str: String = row_get(&row, "position_size_1e8")?;
+    let idx_before_str: String = row_get(&row, "funding_index_before_1e18")?;
+    let idx_after_str: String = row_get(&row, "funding_index_after_1e18")?;
+    let delta_str: String = row_get(&row, "funding_delta_1e18")?;
+    let payment_str: String = row_get(&row, "payment_1e8")?;
+    let margin_before_str: String = row_get(&row, "margin_before_1e8")?;
+    let margin_after_str: String = row_get(&row, "margin_after_1e8")?;
+    let bad_debt_str: String = row_get(&row, "bad_debt_1e8")?;
+    Ok(crate::perps::PerpFundingEvent {
+        id: row_get(&row, "id")?,
+        account: AccountId::new(row_get::<String>(&row, "account")?),
+        market_id: row_get(&row, "market_id")?,
+        position_id: row_get(&row, "position_id")?,
+        side: crate::perps::PerpSide::parse(&side_str)?,
+        position_size_1e8: size_str
+            .parse()
+            .map_err(|e| BackendError::Persistence(format!("invalid perp funding size: {e}")))?,
+        funding_index_before_1e18: idx_before_str.parse().map_err(|e| {
+            BackendError::Persistence(format!("invalid perp funding idx before: {e}"))
+        })?,
+        funding_index_after_1e18: idx_after_str.parse().map_err(|e| {
+            BackendError::Persistence(format!("invalid perp funding idx after: {e}"))
+        })?,
+        funding_delta_1e18: delta_str
+            .parse()
+            .map_err(|e| BackendError::Persistence(format!("invalid perp funding delta: {e}")))?,
+        payment_1e8: payment_str
+            .parse()
+            .map_err(|e| BackendError::Persistence(format!("invalid perp funding payment: {e}")))?,
+        margin_before_1e8: margin_before_str.parse().map_err(|e| {
+            BackendError::Persistence(format!("invalid perp funding margin before: {e}"))
+        })?,
+        margin_after_1e8: margin_after_str.parse().map_err(|e| {
+            BackendError::Persistence(format!("invalid perp funding margin after: {e}"))
+        })?,
+        bad_debt_1e8: bad_debt_str.parse().map_err(|e| {
+            BackendError::Persistence(format!("invalid perp funding bad debt: {e}"))
+        })?,
+        reason_code: row_get(&row, "reason_code")?,
+        created_at_ms: row_get(&row, "created_at_ms")?,
+    })
+}
+
+pub(crate) async fn insert_perp_funding_event_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    event: &crate::perps::PerpFundingEvent,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO perp_funding_events (
+            id, account, market_id, position_id, side,
+            position_size_1e8, funding_index_before_1e18, funding_index_after_1e18,
+            funding_delta_1e18, payment_1e8,
+            margin_before_1e8, margin_after_1e8, bad_debt_1e8,
+            reason_code, created_at_ms
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
+    )
+    .bind(event.id)
+    .bind(&event.account.0)
+    .bind(&event.market_id)
+    .bind(event.position_id)
+    .bind(event.side.as_str())
+    .bind(event.position_size_1e8.to_string())
+    .bind(event.funding_index_before_1e18.to_string())
+    .bind(event.funding_index_after_1e18.to_string())
+    .bind(event.funding_delta_1e18.to_string())
+    .bind(event.payment_1e8.to_string())
+    .bind(event.margin_before_1e8.to_string())
+    .bind(event.margin_after_1e8.to_string())
+    .bind(event.bad_debt_1e8.to_string())
+    .bind(&event.reason_code)
+    .bind(timestamp_to_i64(event.created_at_ms))
+    .execute(&mut **tx)
+    .await
+    .map(|_| ())
+    .map_err(|e| BackendError::Persistence(e.to_string()))
+}
+
+/// Newest-first list of every funding event for one account. Empty
+/// vec is a valid result — the caller must not fabricate rows.
+pub(crate) async fn list_perp_funding_events_for_account(
+    pool: &PgPool,
+    account: &AccountId,
+) -> Result<Vec<crate::perps::PerpFundingEvent>> {
+    let rows = sqlx::query(&format!(
+        "{PERP_FUNDING_SELECT_ALL}
+         WHERE lower(account) = lower($1)
+         ORDER BY created_at_ms DESC, id ASC",
+    ))
+    .bind(&account.0)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| BackendError::Persistence(e.to_string()))?;
+    rows.into_iter().map(perp_funding_event_from_row).collect()
 }
 
 fn execution_reconciliation_from_row(row: PgRow) -> Result<ExecutionReconciliation> {

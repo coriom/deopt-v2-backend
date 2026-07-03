@@ -268,6 +268,53 @@ pub fn router(state: AppState) -> Router {
         .route("/ready", get(ready))
         .route("/metrics", get(metrics))
         .route("/markets", get(markets))
+        // PERPS-MINIMAL-MARKET-AND-PRICE-V1 — read-only market catalogue
+        // and oracle price snapshot. Mutation routes elsewhere in this
+        // router remain fail-closed with `PerpsNotLive`; these read
+        // routes surface 503 `PerpsReadDisabled` until an operator sets
+        // `PERPS_READ_ENABLED=true` and wires the addresses.
+        .route("/perps/markets", get(perps_markets))
+        .route("/perps/markets/:market_id", get(perps_market))
+        .route("/perps/markets/:market_id/price", get(perps_market_price))
+        // PERPS-ISOLATED-MARGIN-POSITION-ENGINE-V1 — read-only
+        // account positions. Returns [] when no rows exist. Public
+        // Perps mutation routes remain fail-closed regardless.
+        .route(
+            "/accounts/:address/perps/positions",
+            get(perps_account_positions),
+        )
+        // PERPS-PERSISTENCE-HISTORY-LIFECYCLE-V1 — account-scoped
+        // Perps history reads. Both endpoints branch to PG when
+        // `state.repository.is_some()` (deferred write path — reads
+        // return empty), else read the in-memory ledger populated by
+        // the internal execution service.
+        .route("/accounts/:address/perps/orders", get(perps_account_orders))
+        .route("/accounts/:address/perps/fills", get(perps_account_fills))
+        // PERPS-LIQUIDATION-AND-RISK-V1
+        .route(
+            "/accounts/:address/perps/liquidations",
+            get(perps_account_liquidations),
+        )
+        .route(
+            "/admin/perps/liquidations/tick",
+            post(admin_perps_liquidations_tick),
+        )
+        // PERPS-FUNDING-V1 — admin-gated funding tick + account read.
+        .route(
+            "/accounts/:address/perps/funding",
+            get(perps_account_funding),
+        )
+        .route("/admin/perps/funding/tick", post(admin_perps_funding_tick))
+        // PERPS-FRONTEND-TICKET-ENABLEMENT-V1 — strict opt-in
+        // Perps mutation routes. Default (`PERPS_PUBLIC_TRADING_ENABLED=false`)
+        // → 503 `PerpsNotLive` at handler entry, matching every other
+        // public Perps mutation route. When the flag is on, the
+        // handlers dispatch to the internal execution service. Legacy
+        // `/orders`, `/orders/:id`, `/rfqs*`,
+        // `/execution-intents/:id/signatures` routes remain
+        // permanently fail-closed regardless of this flag.
+        .route("/perps/orders", post(perps_submit_order))
+        .route("/perps/orders/:order_id", delete(perps_cancel_order))
         .route("/orderbook/:market_id", get(orderbook))
         .route(
             "/options/series",
@@ -2050,6 +2097,591 @@ async fn markets(State(state): State<AppState>) -> Result<Json<serde_json::Value
         .filter(|market| market.kind != "perp")
         .collect();
     Ok(Json(serde_json::json!(live_markets)))
+}
+
+// PERPS-MINIMAL-MARKET-AND-PRICE-V1 — read-only /perps/markets*.
+// These handlers are DISTINCT from the Perps mutation surface. Mutation
+// routes elsewhere in this router still return `Err(PerpsNotLive)` at
+// handler entry (`submit_order`, `cancel_order`, `create_rfq`, etc.);
+// nothing in these read handlers can flip that gate.
+//
+// On disabled config → `PerpsReadDisabled` (503).
+// On RPC transport failure → `PerpsPriceUnavailable` (503).
+// On unknown market id → `PerpsMarketNotFound` (404).
+// Never returns a fabricated price or status.
+fn build_perp_market_registry_reader(
+    state: &AppState,
+) -> Result<
+    crate::perps::PerpMarketRegistryRpcReader<crate::execution::rpc::HttpJsonRpcProvider>,
+    ApiError,
+> {
+    let rpc_url = state
+        .perps_read_config
+        .rpc_url
+        .clone()
+        .ok_or_else(|| ApiError::from(BackendError::PerpsReadDisabled))?;
+    let provider = crate::execution::rpc::HttpJsonRpcProvider::new(rpc_url);
+    Ok(crate::perps::PerpMarketRegistryRpcReader::new(
+        provider,
+        &state.perps_read_config,
+    )?)
+}
+
+fn build_perp_oracle_price_reader(
+    state: &AppState,
+) -> Result<
+    crate::perps::PerpOracleRouterRpcReader<crate::execution::rpc::HttpJsonRpcProvider>,
+    ApiError,
+> {
+    let rpc_url = state
+        .perps_read_config
+        .rpc_url
+        .clone()
+        .ok_or_else(|| ApiError::from(BackendError::PerpsReadDisabled))?;
+    let provider = crate::execution::rpc::HttpJsonRpcProvider::new(rpc_url);
+    Ok(crate::perps::PerpOracleRouterRpcReader::new(
+        provider,
+        &state.perps_read_config,
+    )?)
+}
+
+async fn perps_markets(
+    State(state): State<AppState>,
+) -> Result<Json<crate::perps::PerpMarketListing>, ApiError> {
+    crate::perps::service::ensure_read_enabled(&state.perps_read_config)?;
+    let reader = build_perp_market_registry_reader(&state)?;
+    let listing = crate::perps::list_perp_markets(&state.perps_read_config, &reader).await?;
+    Ok(Json(listing))
+}
+
+async fn perps_market(
+    State(state): State<AppState>,
+    Path(market_id): Path<String>,
+) -> Result<Json<crate::perps::PerpMarket>, ApiError> {
+    crate::perps::service::ensure_read_enabled(&state.perps_read_config)?;
+    let reader = build_perp_market_registry_reader(&state)?;
+    let market =
+        crate::perps::get_perp_market(&state.perps_read_config, &reader, &market_id).await?;
+    Ok(Json(market))
+}
+
+async fn perps_market_price(
+    State(state): State<AppState>,
+    Path(market_id): Path<String>,
+) -> Result<Json<crate::perps::PerpMarketPriceResponse>, ApiError> {
+    crate::perps::service::ensure_read_enabled(&state.perps_read_config)?;
+    let reader = build_perp_oracle_price_reader(&state)?;
+    let resp =
+        crate::perps::get_perp_market_price(&state.perps_read_config, &reader, &market_id).await?;
+    Ok(Json(resp))
+}
+
+// PERPS-ISOLATED-MARGIN-POSITION-ENGINE-V1 — read-only account
+// positions listing. Empty list is the honest default answer; when
+// the internal ledger has rows the response includes risk fields
+// derived from the live mark (or `null`s when the mark is
+// unavailable). Public mutation routes REMAIN fail-closed.
+async fn perps_account_positions(
+    State(state): State<AppState>,
+    Path(address): Path<String>,
+) -> Result<Json<crate::perps::PerpPositionListResponse>, ApiError> {
+    let account = crate::types::AccountId::new(address);
+    // PERPS-PG-WRITE-PATH-V1 — branch to PG when persistence is enabled.
+    if let Some(repository) = state.repository.clone() {
+        let rows = repository.list_perp_positions_for_account(&account).await?;
+        let cfg = &state.perps_read_config;
+        let price_reader = build_perp_oracle_price_reader(&state).ok();
+        let mut views = Vec::with_capacity(rows.len());
+        for position in &rows {
+            let market = cfg.market_by_symbol(&position.market_id);
+            let Some(market) = market else { continue };
+            let (mark, stale) = match &price_reader {
+                Some(reader) => {
+                    // Reuse the private mark helper via the service layer's
+                    // list function is heavier; keep it simple here.
+                    use crate::perps::price_reader::PerpOraclePriceReader;
+                    match reader.read_price(market).await {
+                        Ok(read) if read.ok && read.price_1e8 > 0 => (Some(read.price_1e8), false),
+                        _ => (None, true),
+                    }
+                }
+                None => (None, true),
+            };
+            views.push(crate::perps::service::build_perp_position_view(
+                cfg, market, position, mark, stale,
+            ));
+        }
+        return Ok(Json(crate::perps::PerpPositionListResponse {
+            positions: views,
+            chain_id: cfg.chain_id,
+            trading_enabled: false,
+        }));
+    }
+    let store = state
+        .perp_positions_store
+        .lock()
+        .map_err(|_| ApiError::internal())?
+        .clone();
+    let price_reader = build_perp_oracle_price_reader(&state).ok();
+    let listing = match price_reader {
+        Some(reader) => {
+            crate::perps::list_perp_positions_for_account(
+                &state.perps_read_config,
+                &store,
+                &reader,
+                &account,
+            )
+            .await?
+        }
+        None => {
+            let cfg = &state.perps_read_config;
+            let positions = store.list_for_account(&account);
+            let mut views = Vec::with_capacity(positions.len());
+            for position in &positions {
+                // If the position is on a market not in the current
+                // config, we still surface it (it was persisted by
+                // the internal ledger) with a synthetic market row
+                // that carries the market symbol only — status,
+                // labels, and risk parameters are unknowable without
+                // the config. In practice this branch only fires in
+                // tests that seed positions before wiring markets.
+                let market = cfg.market_by_symbol(&position.market_id);
+                if let Some(market) = market {
+                    views.push(crate::perps::service::build_perp_position_view(
+                        cfg, market, position, None, true,
+                    ));
+                }
+            }
+            crate::perps::PerpPositionListResponse {
+                positions: views,
+                chain_id: cfg.chain_id,
+                trading_enabled: false,
+            }
+        }
+    };
+    Ok(Json(listing))
+}
+
+// PERPS-PERSISTENCE-HISTORY-LIFECYCLE-V1 — read-only Perps orders +
+// fills history. Public Perps mutation routes remain fail-closed;
+// these read routes serve the internal execution ledger.
+async fn perps_account_orders(
+    State(state): State<AppState>,
+    Path(address): Path<String>,
+) -> Result<Json<crate::perps::PerpOrderListResponse>, ApiError> {
+    let account = crate::types::AccountId::new(address);
+    // PERPS-PG-WRITE-PATH-V1 — branch to PG when persistence is
+    // enabled, else read the in-memory ledger.
+    if let Some(repository) = state.repository.clone() {
+        let rows = repository.list_perp_orders_for_account(&account).await?;
+        let orders: Vec<crate::perps::PerpOrderView> = rows
+            .iter()
+            .map(crate::perps::service::build_perp_order_view)
+            .collect();
+        return Ok(Json(crate::perps::PerpOrderListResponse {
+            orders,
+            chain_id: state.perps_read_config.chain_id,
+            trading_enabled: false,
+        }));
+    }
+    let store = state
+        .perp_order_store
+        .lock()
+        .map_err(|_| ApiError::internal())?
+        .clone();
+    let response = crate::perps::service::list_perp_orders_for_account_view(
+        &state.perps_read_config,
+        &store,
+        &account,
+    );
+    Ok(Json(response))
+}
+
+async fn perps_account_fills(
+    State(state): State<AppState>,
+    Path(address): Path<String>,
+) -> Result<Json<crate::perps::PerpFillListResponse>, ApiError> {
+    let account = crate::types::AccountId::new(address);
+    if let Some(repository) = state.repository.clone() {
+        let rows = repository.list_perp_fills_for_account(&account).await?;
+        let fills: Vec<crate::perps::PerpFillView> = rows
+            .iter()
+            .map(|f| crate::perps::service::build_perp_fill_view(f, &account))
+            .collect();
+        return Ok(Json(crate::perps::PerpFillListResponse {
+            fills,
+            chain_id: state.perps_read_config.chain_id,
+            trading_enabled: false,
+        }));
+    }
+    let store = state
+        .perp_order_store
+        .lock()
+        .map_err(|_| ApiError::internal())?
+        .clone();
+    let response = crate::perps::service::list_perp_fills_for_account_view(
+        &state.perps_read_config,
+        &store,
+        &account,
+    );
+    Ok(Json(response))
+}
+
+// PERPS-LIQUIDATION-AND-RISK-V1 — read-only account liquidations.
+//
+// PERPS-LIQUIDATION-PG-EXECUTION-V1 — when `state.repository.is_some()`,
+// read events from the durable `perp_liquidation_events` table.
+// Otherwise fall back to the in-memory ledger. Empty list is a valid
+// result; no fake rows are ever fabricated.
+async fn perps_account_liquidations(
+    State(state): State<AppState>,
+    Path(address): Path<String>,
+) -> Result<Json<crate::perps::PerpLiquidationListResponse>, ApiError> {
+    let account = crate::types::AccountId::new(address);
+    if let Some(repository) = state.repository.clone() {
+        let events = repository
+            .list_perp_liquidation_events_for_account(&account)
+            .await?;
+        let liquidations: Vec<crate::perps::PerpLiquidationEventView> = events
+            .iter()
+            .map(crate::perps::build_perp_liquidation_view)
+            .collect();
+        return Ok(Json(crate::perps::PerpLiquidationListResponse {
+            liquidations,
+            chain_id: state.perps_read_config.chain_id,
+            trading_enabled: false,
+        }));
+    }
+    let store = state
+        .perp_liquidations_store
+        .lock()
+        .map_err(|_| ApiError::internal())?
+        .clone();
+    let response = crate::perps::list_perp_liquidations_for_account_view(
+        &state.perps_read_config,
+        &store,
+        &account,
+    );
+    Ok(Json(response))
+}
+
+// PERPS-LIQUIDATION-AND-RISK-V1 — admin-gated liquidation tick.
+// Scans every active Perps position, evaluates against the current
+// oracle mark, and liquidates the unhealthy ones internally. NEVER
+// unlocks any public Perps mutation route — the 6 fail-closed
+// handlers stay unchanged.
+// PERPS-FUNDING-V1 — read-only account funding history.
+//
+// Branches on `state.repository.is_some()`:
+//   * PG mode → durable events from `perp_funding_events`.
+//   * in-memory mode → in-memory ledger.
+// Empty list is the honest default; no fake rows.
+async fn perps_account_funding(
+    State(state): State<AppState>,
+    Path(address): Path<String>,
+) -> Result<Json<crate::perps::PerpFundingListResponse>, ApiError> {
+    let account = crate::types::AccountId::new(address);
+    if let Some(repository) = state.repository.clone() {
+        let events = repository
+            .list_perp_funding_events_for_account(&account)
+            .await?;
+        let funding_events: Vec<crate::perps::PerpFundingEventView> = events
+            .iter()
+            .map(crate::perps::build_perp_funding_view)
+            .collect();
+        return Ok(Json(crate::perps::PerpFundingListResponse {
+            funding_events,
+            chain_id: state.perps_read_config.chain_id,
+            trading_enabled: false,
+        }));
+    }
+    let store = state
+        .perp_funding_events_store
+        .lock()
+        .map_err(|_| ApiError::internal())?
+        .clone();
+    let response = crate::perps::list_perp_funding_events_for_account_view(
+        &state.perps_read_config,
+        &store,
+        &account,
+    );
+    Ok(Json(response))
+}
+
+// PERPS-FUNDING-V1 — admin-gated funding tick.
+//
+// Scans every active Perps position, evaluates against the on-chain
+// cumulative funding index, and settles a signed payment where a delta
+// exists. NEVER unlocks any public Perps mutation route — the fail-
+// closed handlers stay unchanged.
+//
+// V1 funding-index reader is honest: without an on-chain source wired
+// (or when the source is stale/unavailable per market), the tick skips
+// those markets and increments `skipped_source_unavailable_count`.
+async fn admin_perps_funding_tick(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<Json<crate::perps::PerpFundingTickResponse>, ApiError> {
+    ensure_admin_access(&state, &headers)?;
+    let now = now_ms();
+    // V1: the funding-index reader is a stub that reports every market
+    // as source-unavailable. When a full on-chain reader lands, swap
+    // this call for the RPC-backed reader; the tick logic is
+    // unchanged.
+    let reader = crate::perps::InMemoryPerpFundingIndexReader::new();
+    let indices =
+        crate::perps::prefetch_funding_indices(&state.perps_read_config, &reader, now).await;
+
+    if let Some(repository) = state.repository.clone() {
+        let response = crate::perps::run_perp_funding_tick_via_repository(
+            &state.perps_read_config,
+            &repository,
+            &indices,
+            &state.lifecycle_events,
+            now,
+        )
+        .await?;
+        return Ok(Json(response));
+    }
+
+    let mut positions = state
+        .perp_positions_store
+        .lock()
+        .map_err(|_| ApiError::internal())?;
+    let mut events = state
+        .perp_funding_events_store
+        .lock()
+        .map_err(|_| ApiError::internal())?;
+    let response = crate::perps::run_perp_funding_tick(
+        &state.perps_read_config,
+        &mut positions,
+        &mut events,
+        &indices,
+        &state.lifecycle_events,
+        now,
+    )?;
+    Ok(Json(response))
+}
+
+async fn admin_perps_liquidations_tick(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<Json<crate::perps::PerpLiquidationTickResponse>, ApiError> {
+    ensure_admin_access(&state, &headers)?;
+    let now = now_ms();
+    // Two-phase to avoid holding MutexGuards or PG borrows across
+    // unrelated async work:
+    //   1) async: prefetch mark prices for every configured market.
+    //   2) sync (in-memory) or per-candidate tx (PG): run the tick.
+    let reader = build_perp_oracle_price_reader(&state)?;
+    let marks = crate::perps::prefetch_mark_prices(&state.perps_read_config, &reader, now).await;
+
+    // PERPS-LIQUIDATION-PG-EXECUTION-V1 — PG branch.
+    if let Some(repository) = state.repository.clone() {
+        let response = crate::perps::run_perp_liquidation_tick_via_repository(
+            &state.perps_read_config,
+            &repository,
+            &marks,
+            &state.lifecycle_events,
+            now,
+        )
+        .await?;
+        return Ok(Json(response));
+    }
+
+    // In-memory branch.
+    let mut positions = state
+        .perp_positions_store
+        .lock()
+        .map_err(|_| ApiError::internal())?;
+    let mut orders = state
+        .perp_order_store
+        .lock()
+        .map_err(|_| ApiError::internal())?;
+    let mut liquidations = state
+        .perp_liquidations_store
+        .lock()
+        .map_err(|_| ApiError::internal())?;
+    let response = crate::perps::run_perp_liquidation_tick(
+        &state.perps_read_config,
+        &mut positions,
+        &mut orders,
+        &mut liquidations,
+        &marks,
+        &state.lifecycle_events,
+        now,
+    )?;
+    Ok(Json(response))
+}
+
+// =====================================================================
+// PERPS-FRONTEND-TICKET-ENABLEMENT-V1 — public Perps mutation routes.
+//
+// Both handlers are STRICTLY OPT-IN via `PERPS_PUBLIC_TRADING_ENABLED`
+// (default `false`). When the flag is off, every request returns
+// `PerpsNotLive` (503) at handler entry — matching the fail-closed
+// posture of every legacy Perps mutation route. When the flag is on,
+// the handlers dispatch to the internal execution service
+// (`submit_perp_order_via_state` / `cancel_perp_order_via_state`).
+//
+// **Legacy** Perps mutation routes (`/orders`, `/orders/:id`,
+// `/rfqs`, `/rfqs/:rfq_id/quotes`, `/rfqs/:rfq_id/accept/:quote_id`,
+// `/rfqs/:rfq_id/cancel`, `/execution-intents/:intent_id/signatures`)
+// remain permanently fail-closed regardless of this flag; their
+// request DTOs are Options-shape and cannot carry Perps fields such
+// as `isolated_margin_1e8`.
+// =====================================================================
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+struct PerpsSubmitOrderHttpRequest {
+    market_id: String,
+    account: String,
+    side: String,
+    price_1e8: String,
+    size_1e8: String,
+    time_in_force: String,
+    #[serde(default)]
+    post_only: bool,
+    #[serde(default)]
+    reduce_only: bool,
+    isolated_margin_1e8: String,
+    #[serde(default)]
+    client_order_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct PerpsSubmitOrderHttpResponse {
+    status: &'static str,
+    order: crate::perps::PerpOrderView,
+    fills: Vec<crate::perps::PerpFillView>,
+    chain_id: u64,
+    trading_enabled: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct PerpsCancelOrderHttpResponse {
+    status: &'static str,
+    order: crate::perps::PerpOrderView,
+    chain_id: u64,
+    trading_enabled: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+struct PerpsCancelOrderQuery {
+    account: String,
+}
+
+fn parse_u128_field(field: &str, raw: &str) -> Result<u128, ApiError> {
+    raw.parse::<u128>().map_err(|_| {
+        ApiError::from(BackendError::Config(format!(
+            "perps submit: {field} must be a base-10 u128 in 1e8 units; got `{raw}`"
+        )))
+    })
+}
+
+async fn perps_submit_order(
+    State(state): State<AppState>,
+    Json(req): Json<PerpsSubmitOrderHttpRequest>,
+) -> Result<Json<PerpsSubmitOrderHttpResponse>, ApiError> {
+    // Fail-closed default. NEVER auto-flipped.
+    if !state.perps_public_trading_enabled {
+        return Err(BackendError::PerpsNotLive.into());
+    }
+    // V1: enabled-mode submit requires a durable PG repository. The
+    // in-memory dispatcher holds `std::sync::MutexGuard`s across
+    // `.await` and produces a non-`Send` future which axum cannot
+    // accept as a handler. Callers with only in-memory state should
+    // continue to use the internal execution unit tests.
+    let Some(repository) = state.repository.clone() else {
+        return Err(BackendError::PerpsNotLive.into());
+    };
+
+    let side = match req.side.as_str() {
+        "buy" => crate::perps::PerpOrderSide::Buy,
+        "sell" => crate::perps::PerpOrderSide::Sell,
+        other => {
+            return Err(BackendError::Config(format!(
+                "perps submit: invalid side `{other}` (expected `buy` or `sell`)"
+            ))
+            .into());
+        }
+    };
+    let tif = crate::perps::PerpTimeInForce::parse(&req.time_in_force)?;
+    let price_1e8 = parse_u128_field("price_1e8", &req.price_1e8)?;
+    let size_1e8 = parse_u128_field("size_1e8", &req.size_1e8)?;
+    let isolated_margin_1e8 = parse_u128_field("isolated_margin_1e8", &req.isolated_margin_1e8)?;
+
+    let account = crate::types::AccountId::new(req.account);
+
+    let reader = build_perp_oracle_price_reader(&state)?;
+    let outcome = crate::perps::submit_perp_order_via_repository(
+        &state.perps_read_config,
+        &repository,
+        &reader,
+        &state.lifecycle_events,
+        crate::perps::SubmitPerpOrderInput {
+            account: account.clone(),
+            market_id: req.market_id,
+            side,
+            price_1e8,
+            size_1e8,
+            time_in_force: tif,
+            post_only: req.post_only,
+            reduce_only: req.reduce_only,
+            isolated_margin_1e8,
+            client_order_id: req.client_order_id,
+        },
+    )
+    .await?;
+
+    let order_view = crate::perps::service::build_perp_order_view(&outcome.order);
+    let fills: Vec<crate::perps::PerpFillView> = outcome
+        .fills
+        .iter()
+        .map(|f| crate::perps::service::build_perp_fill_view(f, &account))
+        .collect();
+    Ok(Json(PerpsSubmitOrderHttpResponse {
+        status: "ok",
+        order: order_view,
+        fills,
+        chain_id: state.perps_read_config.chain_id,
+        // V1: `trading_enabled` reports the flag state at the moment of
+        // response so the frontend can align with read endpoints. When
+        // flag is off, this handler already returned `PerpsNotLive`
+        // above, so we always emit `true` here.
+        trading_enabled: true,
+    }))
+}
+
+async fn perps_cancel_order(
+    State(state): State<AppState>,
+    Path(order_id): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<PerpsCancelOrderQuery>,
+) -> Result<Json<PerpsCancelOrderHttpResponse>, ApiError> {
+    if !state.perps_public_trading_enabled {
+        return Err(BackendError::PerpsNotLive.into());
+    }
+    // V1: enabled-mode cancel requires PG for the same posture as
+    // submit — the enabled surface is durable-only.
+    let Some(repository) = state.repository.clone() else {
+        return Err(BackendError::PerpsNotLive.into());
+    };
+    let order_uuid = uuid::Uuid::parse_str(&order_id)
+        .map_err(|_| ApiError::from(BackendError::PerpOrderNotFound(order_id.clone())))?;
+    let caller = crate::types::AccountId::new(query.account);
+    let order = crate::perps::cancel_perp_order_via_repository(
+        &repository,
+        &state.lifecycle_events,
+        order_uuid,
+        &caller,
+    )
+    .await?;
+    Ok(Json(PerpsCancelOrderHttpResponse {
+        status: "ok",
+        order: crate::perps::service::build_perp_order_view(&order),
+        chain_id: state.perps_read_config.chain_id,
+        trading_enabled: true,
+    }))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -7259,8 +7891,12 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let json = response_json(response).await;
         assert_eq!(json["ready"], true);
-        assert_eq!(json["checks"][2]["name"], "database");
-        assert_eq!(json["checks"][2]["status"], "persistence_disabled");
+        // Index 2 is `perps_public_routes` (added in
+        // PERPS-FRONTEND-TICKET-ENABLEMENT-V1); index 3 is `database`.
+        assert_eq!(json["checks"][2]["name"], "perps_public_routes");
+        assert_eq!(json["checks"][2]["status"], "fail_closed");
+        assert_eq!(json["checks"][3]["name"], "database");
+        assert_eq!(json["checks"][3]["status"], "persistence_disabled");
     }
 
     #[tokio::test]
@@ -7278,8 +7914,10 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         let json = response_json(response).await;
         assert_eq!(json["ready"], false);
-        assert_eq!(json["checks"][2]["name"], "database");
-        assert_eq!(json["checks"][2]["status"], "repository_unavailable");
+        assert_eq!(json["checks"][2]["name"], "perps_public_routes");
+        assert_eq!(json["checks"][2]["status"], "fail_closed");
+        assert_eq!(json["checks"][3]["name"], "database");
+        assert_eq!(json["checks"][3]["status"], "repository_unavailable");
     }
 
     #[tokio::test]
@@ -11291,6 +11929,33 @@ impl From<BackendError> for ApiError {
             BackendError::Persistence(_) => StatusCode::INTERNAL_SERVER_ERROR,
             // ACCOUNT-WRITE-AUTH-HARDENING-V1
             BackendError::PerpsNotLive => StatusCode::SERVICE_UNAVAILABLE,
+            // PERPS-MINIMAL-MARKET-AND-PRICE-V1
+            BackendError::PerpsReadDisabled => StatusCode::SERVICE_UNAVAILABLE,
+            BackendError::PerpsChainIdMismatch { .. } => StatusCode::BAD_REQUEST,
+            BackendError::PerpsMarketNotFound(_) => StatusCode::NOT_FOUND,
+            BackendError::PerpsPriceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+            // PERPS-ISOLATED-MARGIN-POSITION-ENGINE-V1
+            BackendError::PerpsPositionsDisabled => StatusCode::SERVICE_UNAVAILABLE,
+            BackendError::PerpMarketPaused(_) => StatusCode::CONFLICT,
+            BackendError::PerpZeroSize
+            | BackendError::PerpZeroPrice
+            | BackendError::PerpZeroMargin
+            | BackendError::PerpPositionFlip
+            | BackendError::PerpReduceExceedsPosition
+            | BackendError::PerpInsufficientMargin(_)
+            | BackendError::PerpLeverageExceeded { .. } => StatusCode::UNPROCESSABLE_ENTITY,
+            BackendError::PerpPositionNotFound => StatusCode::NOT_FOUND,
+            BackendError::PerpMarkPriceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+            // PERPS-ORDER-EXECUTION-INTERNAL-V1
+            BackendError::PerpOrderNotFound(_) => StatusCode::NOT_FOUND,
+            BackendError::PerpInvalidOrderState(_)
+            | BackendError::PerpPostOnlyWouldMatch
+            | BackendError::PerpFokNotFillable
+            | BackendError::PerpReduceOnlyViolation
+            | BackendError::PerpUnsupportedTif(_)
+            | BackendError::PerpInvalidTifCombination(_)
+            | BackendError::PerpSelfTrade => StatusCode::UNPROCESSABLE_ENTITY,
+            BackendError::PerpDuplicateClientOrderId(_) => StatusCode::CONFLICT,
             BackendError::WriteAuth(ref err) => match err {
                 crate::auth::WriteAuthError::AuthorizationRequired => StatusCode::UNAUTHORIZED,
                 crate::auth::WriteAuthError::InvalidSignature => StatusCode::UNAUTHORIZED,

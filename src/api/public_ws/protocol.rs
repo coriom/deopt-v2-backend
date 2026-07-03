@@ -45,6 +45,12 @@ pub enum Channel {
     AccountIntentStatus,
     AccountSettlements,
     AccountLiquidations,
+    // PERPS-PERSISTENCE-HISTORY-LIFECYCLE-V1
+    AccountPerpOrders,
+    AccountPerpFills,
+    AccountPerpPositions,
+    // PERPS-FUNDING-V1
+    AccountPerpFunding,
 }
 
 impl Channel {
@@ -63,6 +69,10 @@ impl Channel {
             Self::AccountIntentStatus => "account.intent_status",
             Self::AccountSettlements => "account.settlements",
             Self::AccountLiquidations => "account.liquidations",
+            Self::AccountPerpOrders => "account.perp_orders",
+            Self::AccountPerpFills => "account.perp_fills",
+            Self::AccountPerpPositions => "account.perp_positions",
+            Self::AccountPerpFunding => "account.perp_funding",
         }
     }
 
@@ -81,6 +91,10 @@ impl Channel {
             "account.intent_status" => Some(Self::AccountIntentStatus),
             "account.settlements" => Some(Self::AccountSettlements),
             "account.liquidations" => Some(Self::AccountLiquidations),
+            "account.perp_orders" => Some(Self::AccountPerpOrders),
+            "account.perp_fills" => Some(Self::AccountPerpFills),
+            "account.perp_positions" => Some(Self::AccountPerpPositions),
+            "account.perp_funding" => Some(Self::AccountPerpFunding),
             _ => None,
         }
     }
@@ -99,6 +113,10 @@ impl Channel {
                 | Self::AccountIntentStatus
                 | Self::AccountSettlements
                 | Self::AccountLiquidations
+                | Self::AccountPerpOrders
+                | Self::AccountPerpFills
+                | Self::AccountPerpPositions
+                | Self::AccountPerpFunding
         )
     }
 }

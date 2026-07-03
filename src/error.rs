@@ -144,4 +144,58 @@ pub enum BackendError {
     WriteAuth(#[from] crate::auth::WriteAuthError),
     #[error("perps not live")]
     PerpsNotLive,
+    // PERPS-MINIMAL-MARKET-AND-PRICE-V1 — read-only Perps market/price
+    // errors. Distinct from `PerpsNotLive` (mutation gate) so a
+    // 503 SERVICE_UNAVAILABLE on a *read* endpoint doesn't spoof the
+    // mutation gate and vice versa.
+    #[error("perps read layer is disabled or not configured")]
+    PerpsReadDisabled,
+    #[error("perps chain id mismatch: expected {expected}, got {got}")]
+    PerpsChainIdMismatch { expected: u64, got: u64 },
+    #[error("perps market not found: {0}")]
+    PerpsMarketNotFound(String),
+    #[error("perps oracle price unavailable: {0}")]
+    PerpsPriceUnavailable(String),
+    // PERPS-ISOLATED-MARGIN-POSITION-ENGINE-V1
+    #[error("perps position engine is disabled or not configured")]
+    PerpsPositionsDisabled,
+    #[error("perp market is paused for new position operations: {0}")]
+    PerpMarketPaused(String),
+    #[error("perp position size must be > 0")]
+    PerpZeroSize,
+    #[error("perp fill price must be > 0")]
+    PerpZeroPrice,
+    #[error("perp isolated margin must be > 0")]
+    PerpZeroMargin,
+    #[error("perp position flip is not supported in V1 — close first, then re-open")]
+    PerpPositionFlip,
+    #[error("perp reduce exceeds existing position size")]
+    PerpReduceExceedsPosition,
+    #[error("perp isolated margin is insufficient: {0}")]
+    PerpInsufficientMargin(String),
+    #[error("perp leverage exceeds the configured cap for {market}: {reason}")]
+    PerpLeverageExceeded { market: String, reason: String },
+    #[error("perp position not found for account/market")]
+    PerpPositionNotFound,
+    #[error("perp mark price is unavailable for risk computation: {0}")]
+    PerpMarkPriceUnavailable(String),
+    // PERPS-ORDER-EXECUTION-INTERNAL-V1
+    #[error("perp order not found: {0}")]
+    PerpOrderNotFound(String),
+    #[error("perp order state is invalid: {0}")]
+    PerpInvalidOrderState(String),
+    #[error("perp post-only order would immediately match")]
+    PerpPostOnlyWouldMatch,
+    #[error("perp fill-or-kill order is not fully fillable")]
+    PerpFokNotFillable,
+    #[error("perp reduce-only order would increase exposure")]
+    PerpReduceOnlyViolation,
+    #[error("perp time-in-force is unsupported: {0}")]
+    PerpUnsupportedTif(String),
+    #[error("perp time-in-force combination is invalid: {0}")]
+    PerpInvalidTifCombination(String),
+    #[error("perp client order id already used for account: {0}")]
+    PerpDuplicateClientOrderId(String),
+    #[error("perp self-trade rejected")]
+    PerpSelfTrade,
 }

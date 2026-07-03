@@ -54,6 +54,18 @@ pub struct AppConfig {
     /// Malformed addresses fail config validation at startup with a
     /// clear `BackendError::Config`.
     pub trading_views: TradingViewsConfig,
+    /// PERPS-MINIMAL-MARKET-AND-PRICE-V1 — read-only Perps market
+    /// registry + oracle price configuration. Defaults to
+    /// `PerpsReadConfig::disabled()`; operator wires `PERPS_*` env vars
+    /// to turn the new `/perps/markets*` read routes on. Never affects
+    /// the Perps mutation fail-closed gate.
+    pub perps_read: crate::perps::PerpsReadConfig,
+    /// PERPS-FRONTEND-TICKET-ENABLEMENT-V1 — strict opt-in flag for
+    /// the new `POST /perps/orders` + `DELETE /perps/orders/:id`
+    /// mutation routes. Default: `false`. Enabling on any mainnet
+    /// chain id is refused at startup by `validate_startup`.
+    /// Env: `PERPS_PUBLIC_TRADING_ENABLED=true` (default `false`).
+    pub perps_public_trading_enabled: bool,
 }
 
 impl AppConfig {
@@ -66,7 +78,7 @@ impl AppConfig {
         let host = get_env(&mut lookup, "HOST", "127.0.0.1");
         let port = parse_env(&mut lookup, "PORT", "8080")?;
         let rust_log = get_env(&mut lookup, "RUST_LOG", "info");
-        let chain_id = parse_env(&mut lookup, "CHAIN_ID", "84532")?;
+        let chain_id: u64 = parse_env(&mut lookup, "CHAIN_ID", "84532")?;
         let network_name = get_env(&mut lookup, "NETWORK_NAME", "base-sepolia");
         let execution = ExecutionConfig {
             execution_enabled: parse_env(&mut lookup, "EXECUTION_ENABLED", "false")?,
@@ -628,6 +640,85 @@ impl AppConfig {
                 "OPTION_MARGIN_ENGINE_ADDRESS",
             )?,
         };
+        // PERPS-MINIMAL-MARKET-AND-PRICE-V1 — read-only Perps market
+        // registry + oracle price config. Off by default. Reuses
+        // `execution.rpc_url` for the JSON-RPC endpoint; adding a
+        // separate `PERPS_RPC_URL` would fragment the operator's
+        // network wiring for no gain.
+        let perps_read = {
+            let enabled = parse_env(&mut lookup, "PERPS_READ_ENABLED", "false")?;
+            let perps_chain_id = parse_env(&mut lookup, "PERPS_CHAIN_ID", &chain_id.to_string())?;
+            let market_registry_address =
+                parse_optional_address_env(&mut lookup, "PERPS_MARKET_REGISTRY_ADDRESS")?;
+            let oracle_router_address =
+                parse_optional_address_env(&mut lookup, "PERPS_ORACLE_ROUTER_ADDRESS")?;
+            let stale_after_sec = parse_env(&mut lookup, "PERPS_STALE_AFTER_SEC", "60")?;
+            let mut markets: Vec<crate::perps::config::PerpsReadMarket> = Vec::new();
+            // ETH-PERP row: enrol only when both asset addresses are
+            // configured. Missing addresses → row skipped (we do NOT
+            // fabricate). Onchain market id defaults to 1 (Base Sepolia
+            // seed).
+            if let (Some(base), Some(quote)) = (
+                parse_optional_address_env(&mut lookup, "PERPS_ETH_BASE_ADDRESS")?,
+                parse_optional_address_env(&mut lookup, "PERPS_ETH_QUOTE_ADDRESS")?,
+            ) {
+                markets.push(crate::perps::config::PerpsReadMarket {
+                    symbol: get_env(&mut lookup, "PERPS_ETH_SYMBOL", "ETH-PERP"),
+                    onchain_market_id: parse_env(&mut lookup, "PERPS_ETH_ONCHAIN_MARKET_ID", "1")?,
+                    base_asset_label: get_env(&mut lookup, "PERPS_ETH_BASE_LABEL", "ETH"),
+                    quote_asset_label: get_env(&mut lookup, "PERPS_ETH_QUOTE_LABEL", "mUSDC"),
+                    base_asset_address: base,
+                    quote_asset_address: quote,
+                    max_leverage: parse_env(&mut lookup, "PERPS_ETH_MAX_LEVERAGE", "10")?,
+                    maintenance_margin_bps: parse_env(
+                        &mut lookup,
+                        "PERPS_ETH_MAINTENANCE_MARGIN_BPS",
+                        "500",
+                    )?,
+                });
+            }
+            if let (Some(base), Some(quote)) = (
+                parse_optional_address_env(&mut lookup, "PERPS_BTC_BASE_ADDRESS")?,
+                parse_optional_address_env(&mut lookup, "PERPS_BTC_QUOTE_ADDRESS")?,
+            ) {
+                markets.push(crate::perps::config::PerpsReadMarket {
+                    symbol: get_env(&mut lookup, "PERPS_BTC_SYMBOL", "BTC-PERP"),
+                    onchain_market_id: parse_env(&mut lookup, "PERPS_BTC_ONCHAIN_MARKET_ID", "2")?,
+                    base_asset_label: get_env(&mut lookup, "PERPS_BTC_BASE_LABEL", "BTC"),
+                    quote_asset_label: get_env(&mut lookup, "PERPS_BTC_QUOTE_LABEL", "mUSDC"),
+                    base_asset_address: base,
+                    quote_asset_address: quote,
+                    max_leverage: parse_env(&mut lookup, "PERPS_BTC_MAX_LEVERAGE", "5")?,
+                    maintenance_margin_bps: parse_env(
+                        &mut lookup,
+                        "PERPS_BTC_MAINTENANCE_MARGIN_BPS",
+                        "750",
+                    )?,
+                });
+            }
+            let cfg = crate::perps::PerpsReadConfig {
+                enabled,
+                chain_id: perps_chain_id,
+                rpc_url: execution.rpc_url.clone(),
+                market_registry_address,
+                oracle_router_address,
+                markets,
+                stale_after_sec,
+            };
+            cfg.validate_startup()?;
+            cfg
+        };
+
+        // PERPS-FRONTEND-TICKET-ENABLEMENT-V1 — strict opt-in flag for
+        // the new /perps/orders + /perps/orders/:id mutation routes.
+        // Default false. Never enable on any mainnet chain id.
+        let perps_public_trading_enabled: bool =
+            parse_env(&mut lookup, "PERPS_PUBLIC_TRADING_ENABLED", "false")?;
+        if perps_public_trading_enabled && (chain_id == 1 || chain_id == 8453) {
+            return Err(BackendError::Config(format!(
+                "PERPS_PUBLIC_TRADING_ENABLED=true is refused on mainnet chain id {chain_id}"
+            )));
+        }
 
         Ok(Self {
             host,
@@ -657,6 +748,8 @@ impl AppConfig {
             persistence_enabled,
             database_url,
             trading_views,
+            perps_read,
+            perps_public_trading_enabled,
         })
     }
 
@@ -2585,5 +2678,62 @@ mod tests {
         assert_eq!(lo.execution.backend_signer_timeout_ms, 100);
         let hi = config_from_pairs([("BACKEND_SIGNER_TIMEOUT_MS", "30000")]).unwrap();
         assert_eq!(hi.execution.backend_signer_timeout_ms, 30000);
+    }
+
+    // ----------------------------------------------------------------------------
+    // PERPS-PUBLIC-ROUTE-UNLOCK-V1 — mainnet guard for the strict opt-in
+    // `PERPS_PUBLIC_TRADING_ENABLED` flag. Enabling on any mainnet chain
+    // id must fail startup with a clear config error. Base Sepolia
+    // (84532) must succeed.
+    // ----------------------------------------------------------------------------
+
+    #[test]
+    fn perps_public_trading_enabled_default_is_false() {
+        let cfg = config_from_pairs([]).unwrap();
+        assert!(!cfg.perps_public_trading_enabled);
+    }
+
+    #[test]
+    fn perps_public_trading_enabled_ok_on_base_sepolia() {
+        let cfg = config_from_pairs([
+            ("CHAIN_ID", "84532"),
+            ("PERPS_PUBLIC_TRADING_ENABLED", "true"),
+        ])
+        .unwrap();
+        assert!(cfg.perps_public_trading_enabled);
+        assert_eq!(cfg.chain_id, 84532);
+    }
+
+    #[test]
+    fn perps_public_trading_enabled_refused_on_eth_mainnet() {
+        let err = config_from_pairs([("CHAIN_ID", "1"), ("PERPS_PUBLIC_TRADING_ENABLED", "true")])
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("PERPS_PUBLIC_TRADING_ENABLED"), "got: {msg}");
+        assert!(msg.contains("mainnet"), "got: {msg}");
+        assert!(msg.contains(" 1"), "got: {msg}");
+    }
+
+    #[test]
+    fn perps_public_trading_enabled_refused_on_base_mainnet() {
+        let err = config_from_pairs([
+            ("CHAIN_ID", "8453"),
+            ("PERPS_PUBLIC_TRADING_ENABLED", "true"),
+        ])
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("PERPS_PUBLIC_TRADING_ENABLED"), "got: {msg}");
+        assert!(msg.contains("8453"), "got: {msg}");
+    }
+
+    #[test]
+    fn perps_public_trading_flag_false_on_mainnet_is_ok() {
+        // The mainnet guard is only tripped when the flag is `true` —
+        // an operator who did NOT flip the flag can still run against
+        // any chain id (though the safety envelope higher up in
+        // `main.rs` will independently refuse mainnet).
+        let cfg = config_from_pairs([("CHAIN_ID", "1")]).unwrap();
+        assert!(!cfg.perps_public_trading_enabled);
+        assert_eq!(cfg.chain_id, 1);
     }
 }

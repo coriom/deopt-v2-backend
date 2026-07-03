@@ -95,6 +95,10 @@ async fn main() -> deopt_v2_backend::Result<()> {
     state.admin_config = config.admin.clone();
     state.metrics_config = config.metrics.clone();
     state.trading_views = config.trading_views.clone();
+    state.perps_read_config = config.perps_read.clone();
+    // PERPS-FRONTEND-TICKET-ENABLEMENT-V1 — propagate the strict
+    // opt-in flag from env to `AppState`. Default remains false.
+    state.perps_public_trading_enabled = config.perps_public_trading_enabled;
     // OPTIONS-CONDITIONAL-ORDERS-PERSISTENT-E2E-V1 — read worker env
     // vars. Defaults are safe (enabled=false) so this is a no-op for
     // any operator who has not opted in.
