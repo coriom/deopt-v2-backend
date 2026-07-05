@@ -54,6 +54,7 @@ use crate::options::service::{
     list_option_execution_intents as list_option_execution_intents_service,
     list_option_fills as list_option_fills_service,
     list_option_orders as list_option_orders_service,
+    list_option_rfq_fills as list_option_rfq_fills_service,
     list_option_rfq_quotes as list_option_rfq_quotes_service,
     list_option_rfqs as list_option_rfqs_service, list_option_series as list_option_series_service,
     option_execution_calldata as option_execution_calldata_service,
@@ -78,9 +79,10 @@ use crate::options::{
     OptionExecutionIntent, OptionExecutionIntentId, OptionExecutionIntentStatus,
     OptionExecutionSimulationResult, OptionExecutionSimulationStatus, OptionFill, OptionFillFilter,
     OptionFillId, OptionOrder, OptionOrderFilter, OptionOrderStatus, OptionOrderbookSnapshot,
-    OptionRfqFill, OptionRfqId, OptionRfqQuote, OptionRfqQuoteId, OptionRfqQuoteSignatureStatus,
-    OptionRfqQuoteStatus, OptionRfqRequest, OptionRfqStatus, OptionSeries, OptionSeriesFilter,
-    OptionSeriesStatus, OPTION_EVENT_INDEXER_STATE_ID, OPTION_RFQ_QUOTE_TYPE, OPTION_TRADE_TYPE,
+    OptionRfqFill, OptionRfqFillFilter, OptionRfqId, OptionRfqQuote, OptionRfqQuoteId,
+    OptionRfqQuoteSignatureStatus, OptionRfqQuoteStatus, OptionRfqRequest, OptionRfqStatus,
+    OptionSeries, OptionSeriesFilter, OptionSeriesStatus, OPTION_EVENT_INDEXER_STATE_ID,
+    OPTION_RFQ_QUOTE_TYPE, OPTION_TRADE_TYPE,
 };
 // ACCOUNT-WRITE-AUTH-HARDENING-V1: perp order service is gated until perps go live.
 use crate::reconciliation::{
@@ -346,6 +348,11 @@ pub fn router(state: AppState) -> Router {
             "/options/rfqs/:option_rfq_id/accept/:quote_id",
             post(accept_option_rfq_quote),
         )
+        // OPTIONS-RFQ-TRADES-FEED-V1 — public read of accepted RFQ
+        // fills, optionally filtered by `?account=` (matches any of
+        // buyer/seller/taker/mm_account), `?option_rfq_id=`, and
+        // `?limit=`. Newest-first ordering.
+        .route("/options/rfq-fills", get(list_option_rfq_fills))
         .route(
             "/options/rfqs/:option_rfq_id/cancel",
             post(cancel_option_rfq),
@@ -2807,6 +2814,15 @@ struct ListOptionFillsQuery {
     order_id: Option<String>,
 }
 
+/// OPTIONS-RFQ-TRADES-FEED-V1 — public listing filter for the
+/// `GET /options/rfq-fills` endpoint. All fields are optional.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+struct ListOptionRfqFillsQuery {
+    account: Option<AccountId>,
+    option_rfq_id: Option<String>,
+    limit: Option<u32>,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 struct CreateOptionRfqRequest {
     taker: AccountId,
@@ -4370,6 +4386,37 @@ async fn list_option_rfq_quotes(
             .into_iter()
             .map(OptionRfqQuoteResponse::from)
             .collect(),
+    ))
+}
+
+/// OPTIONS-RFQ-TRADES-FEED-V1 — public read of accepted RFQ fills.
+///
+/// Filters:
+/// * `account` — matches when the address is any of the fill's
+///   `buyer`, `seller`, `taker`, or `mm_account` (case-insensitive).
+/// * `option_rfq_id` — narrows to a single RFQ's fills.
+/// * `limit` — clamped by the service to the caller-supplied cap.
+///
+/// Newest-first ordering. Response carries **no** signatures, no
+/// write-auth envelopes, no admin-only fields — just the same
+/// `OptionRfqFillResponse` shape returned inline by the accept
+/// endpoint.
+async fn list_option_rfq_fills(
+    State(state): State<AppState>,
+    Query(query): Query<ListOptionRfqFillsQuery>,
+) -> Result<Json<Vec<OptionRfqFillResponse>>, ApiError> {
+    let option_rfq_id = query
+        .option_rfq_id
+        .as_deref()
+        .map(parse_option_rfq_id)
+        .transpose()?;
+    let filter = OptionRfqFillFilter {
+        option_rfq_id,
+        account: query.account,
+    };
+    let fills = list_option_rfq_fills_service(&state, filter, query.limit).await?;
+    Ok(Json(
+        fills.into_iter().map(OptionRfqFillResponse::from).collect(),
     ))
 }
 

@@ -2615,6 +2615,187 @@ async fn option_rfq_create_quote_accept_buy_creates_offchain_fill_only() {
     assert_eq!(state.engine.lock().unwrap().execution_intents().len(), 0);
 }
 
+// -------------------------------------------------------------------
+// OPTIONS-RFQ-TRADES-FEED-V1 — public GET /options/rfq-fills tests.
+// -------------------------------------------------------------------
+
+/// Helper: end-to-end create → quote → accept, returning the fill.
+async fn seed_accepted_rfq_fill(
+    state: &AppState,
+    option_series_id: String,
+    side: Side,
+    maker: AccountId,
+) -> deopt_v2_backend::options::OptionRfqFill {
+    let rfq = create_option_rfq(state, option_rfq_input(option_series_id, side))
+        .await
+        .unwrap();
+    let quote = submit_option_rfq_quote(
+        state,
+        rfq.option_rfq_id,
+        option_rfq_quote_input(maker, "trades-feed-seed"),
+    )
+    .await
+    .unwrap();
+    accept_option_rfq_quote(state, rfq.option_rfq_id, quote.quote_id)
+        .await
+        .unwrap()
+        .fill
+}
+
+#[tokio::test]
+async fn public_rfq_fills_endpoint_returns_empty_by_default() {
+    let state = option_rfq_state();
+    let response = router(state.clone())
+        .oneshot(get_request("/options/rfq-fills"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert_eq!(body.as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn public_rfq_fills_endpoint_lists_backend_confirmed_row() {
+    let state = option_rfq_state();
+    let option_series_id = active_series_id(&state).await;
+    let fill = seed_accepted_rfq_fill(&state, option_series_id, Side::Buy, account_two()).await;
+
+    let response = router(state.clone())
+        .oneshot(get_request("/options/rfq-fills"))
+        .await
+        .unwrap();
+    let body = response_json(response).await;
+    let rows = body.as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0]["fill_id"].as_str().unwrap(),
+        &fill.fill_id.to_string()
+    );
+    assert_eq!(
+        rows[0]["option_rfq_id"].as_str().unwrap(),
+        &fill.option_rfq_id.to_string()
+    );
+    assert_eq!(rows[0]["taker_side"].as_str().unwrap(), "buy");
+    // Response must NOT leak signature / auth / secret fields.
+    assert!(rows[0].get("signature").is_none());
+    assert!(rows[0].get("authorization").is_none());
+    assert!(rows[0].get("recovered_signer").is_none());
+}
+
+#[tokio::test]
+async fn public_rfq_fills_endpoint_filters_by_taker_account() {
+    let state = option_rfq_state();
+    let option_series_id = active_series_id(&state).await;
+    let fill = seed_accepted_rfq_fill(&state, option_series_id, Side::Buy, account_two()).await;
+
+    // taker query returns the row (account() is the RFQ taker).
+    let response = router(state.clone())
+        .oneshot(get_request(&format!(
+            "/options/rfq-fills?account={}",
+            fill.taker.0
+        )))
+        .await
+        .unwrap();
+    let rows = response_json(response).await;
+    assert_eq!(rows.as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn public_rfq_fills_endpoint_filters_by_mm_account() {
+    let state = option_rfq_state();
+    let option_series_id = active_series_id(&state).await;
+    let fill = seed_accepted_rfq_fill(&state, option_series_id, Side::Buy, account_two()).await;
+
+    let response = router(state.clone())
+        .oneshot(get_request(&format!(
+            "/options/rfq-fills?account={}",
+            fill.mm_account.0
+        )))
+        .await
+        .unwrap();
+    let rows = response_json(response).await;
+    assert_eq!(rows.as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn public_rfq_fills_endpoint_omits_unrelated_account() {
+    let state = option_rfq_state();
+    let option_series_id = active_series_id(&state).await;
+    let _fill = seed_accepted_rfq_fill(&state, option_series_id, Side::Buy, account_two()).await;
+
+    let response = router(state.clone())
+        .oneshot(get_request(
+            "/options/rfq-fills?account=0x000000000000000000000000000000000000dead",
+        ))
+        .await
+        .unwrap();
+    let rows = response_json(response).await;
+    assert_eq!(rows.as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn public_rfq_fills_endpoint_filters_by_rfq_id() {
+    let state = option_rfq_state();
+    let option_series_id = active_series_id(&state).await;
+    // Both fills use Buy side (option_rfq_input defaults are tuned
+    // for Buy); the two RFQs still have distinct ids so the filter
+    // is exercised without tripping the sell-side limit check.
+    let fill_one =
+        seed_accepted_rfq_fill(&state, option_series_id.clone(), Side::Buy, account_two()).await;
+    let _fill_two =
+        seed_accepted_rfq_fill(&state, option_series_id, Side::Buy, account_two()).await;
+
+    let response = router(state.clone())
+        .oneshot(get_request(&format!(
+            "/options/rfq-fills?option_rfq_id={}",
+            fill_one.option_rfq_id
+        )))
+        .await
+        .unwrap();
+    let rows = response_json(response).await;
+    let rows = rows.as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0]["option_rfq_id"].as_str().unwrap(),
+        &fill_one.option_rfq_id.to_string()
+    );
+}
+
+#[tokio::test]
+async fn public_rfq_fills_endpoint_respects_limit_and_newest_first() {
+    let state = option_rfq_state();
+    let option_series_id = active_series_id(&state).await;
+    let _older =
+        seed_accepted_rfq_fill(&state, option_series_id.clone(), Side::Buy, account_two()).await;
+    // Introduce a small pause so `created_at_ms` differs deterministically.
+    sleep(Duration::from_millis(2)).await;
+    let newer = seed_accepted_rfq_fill(&state, option_series_id, Side::Buy, account_two()).await;
+
+    let response = router(state.clone())
+        .oneshot(get_request("/options/rfq-fills?limit=1"))
+        .await
+        .unwrap();
+    let rows = response_json(response).await;
+    let rows = rows.as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0]["fill_id"].as_str().unwrap(),
+        &newer.fill_id.to_string()
+    );
+}
+
+#[tokio::test]
+async fn public_rfq_fills_endpoint_returns_empty_when_rfq_disabled() {
+    // RFQ disabled → service returns BackendError::OptionRfqDisabled.
+    // The router maps this to a 5xx; the endpoint MUST NOT leak fills.
+    let state = state();
+    let response = router(state.clone())
+        .oneshot(get_request("/options/rfq-fills"))
+        .await
+        .unwrap();
+    assert!(!response.status().is_success());
+}
+
 #[tokio::test]
 async fn option_rfq_fill_records_discounted_taker_fee_for_high_volume_tier() {
     let state = fee_state(false);

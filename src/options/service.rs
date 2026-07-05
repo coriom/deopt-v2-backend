@@ -24,10 +24,11 @@ use super::{
     OptionExecutionSourceType, OptionExecutionTransaction, OptionFill, OptionFillFilter,
     OptionFillId, OptionOrder, OptionOrderAttachmentPlan, OptionOrderFilter, OptionOrderId,
     OptionOrderRejection, OptionOrderStatus, OptionOrderbookLevel, OptionOrderbookSnapshot,
-    OptionRfqFill, OptionRfqFillId, OptionRfqId, OptionRfqQuote, OptionRfqQuoteId,
-    OptionRfqQuoteSignatureMode, OptionRfqQuoteSignatureStatus, OptionRfqQuoteStatus,
-    OptionRfqRequest, OptionRfqStatus, OptionSeries, OptionSeriesFilter, OptionSeriesId,
-    OptionSeriesSource, OptionSeriesStatus, OptionTradePayload, OptionTradeSignatureBundle,
+    OptionRfqFill, OptionRfqFillFilter, OptionRfqFillId, OptionRfqId, OptionRfqQuote,
+    OptionRfqQuoteId, OptionRfqQuoteSignatureMode, OptionRfqQuoteSignatureStatus,
+    OptionRfqQuoteStatus, OptionRfqRequest, OptionRfqStatus, OptionSeries, OptionSeriesFilter,
+    OptionSeriesId, OptionSeriesSource, OptionSeriesStatus, OptionTradePayload,
+    OptionTradeSignatureBundle,
 };
 use crate::api::AppState;
 use crate::error::{BackendError, Result};
@@ -1669,6 +1670,38 @@ pub async fn list_option_rfq_quotes(
         .lock()
         .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?
         .list_option_rfq_quotes(option_rfq_id))
+}
+
+/// OPTIONS-RFQ-TRADES-FEED-V1 — public list of accepted RFQ fills.
+/// Newest-first ordering. `filter.account` matches when the address
+/// equals any of buyer / seller / taker / mm_account. The service
+/// applies `limit` after filtering so a lightweight limit still
+/// bounds the response size for busy accounts.
+pub async fn list_option_rfq_fills(
+    state: &AppState,
+    filter: OptionRfqFillFilter,
+    limit: Option<u32>,
+) -> Result<Vec<OptionRfqFill>> {
+    ensure_option_rfq_enabled(state)?;
+    let mut fills = if let Some(repository) = state.repository.clone() {
+        repository.list_option_rfq_fills().await?
+    } else {
+        let mut store_fills = state
+            .options_store
+            .lock()
+            .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?
+            .list_option_rfq_fills();
+        // The in-memory store returns fills oldest-first for
+        // determinism; reverse to newest-first to match the SQL
+        // path's `ORDER BY created_at_ms DESC`.
+        store_fills.reverse();
+        store_fills
+    };
+    fills.retain(|fill| filter.matches(fill));
+    if let Some(cap) = limit {
+        fills.truncate(cap as usize);
+    }
+    Ok(fills)
 }
 
 pub async fn accept_option_rfq_quote(

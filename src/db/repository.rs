@@ -4234,6 +4234,24 @@ impl PgRepository {
         row.map(option_rfq_fill_from_row).transpose()
     }
 
+    /// OPTIONS-RFQ-TRADES-FEED-V1 — public list of accepted RFQ
+    /// fills. Newest-first at the SQL layer so a small
+    /// `limit` yields the most recent trades without paging the
+    /// whole table. Filter matching (by account or RFQ id) happens
+    /// in the service layer so the repository stays index-friendly.
+    pub async fn list_option_rfq_fills(&self) -> Result<Vec<OptionRfqFill>> {
+        let rows = sqlx::query(
+            "SELECT fill_id, option_rfq_id, quote_id, option_series_id, buyer, seller,
+                    taker, mm_account, taker_side, price_1e8, size_1e8, created_at_ms
+             FROM option_rfq_fills
+             ORDER BY created_at_ms DESC, fill_id DESC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        rows.into_iter().map(option_rfq_fill_from_row).collect()
+    }
+
     pub async fn accept_option_rfq_quote_and_insert_fill(
         &self,
         option_rfq_id: OptionRfqId,

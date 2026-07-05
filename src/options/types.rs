@@ -1230,6 +1230,38 @@ pub struct OptionFillFilter {
     pub order_id: Option<OptionOrderId>,
 }
 
+/// OPTIONS-RFQ-TRADES-FEED-V1 — filter for the public
+/// `GET /options/rfq-fills` endpoint. `account` matches when the
+/// supplied address equals any of `buyer`, `seller`, `taker`, or
+/// `mm_account` (case-insensitive) — all four are stakeholders in
+/// the fill. `option_rfq_id` narrows to a single RFQ's fills.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct OptionRfqFillFilter {
+    pub option_rfq_id: Option<OptionRfqId>,
+    pub account: Option<AccountId>,
+}
+
+impl OptionRfqFillFilter {
+    pub fn matches(&self, fill: &OptionRfqFill) -> bool {
+        if let Some(option_rfq_id) = &self.option_rfq_id {
+            if &fill.option_rfq_id != option_rfq_id {
+                return false;
+            }
+        }
+        if let Some(account) = &self.account {
+            let acct = &account.0;
+            if !fill.buyer.0.eq_ignore_ascii_case(acct)
+                && !fill.seller.0.eq_ignore_ascii_case(acct)
+                && !fill.taker.0.eq_ignore_ascii_case(acct)
+                && !fill.mm_account.0.eq_ignore_ascii_case(acct)
+            {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 impl OptionFillFilter {
     pub fn matches(&self, fill: &OptionFill) -> bool {
         if let Some(option_series_id) = &self.option_series_id {
