@@ -1482,6 +1482,7 @@ pub async fn create_option_rfq(
             .await?
             .ok_or(BackendError::InvalidOptionRfqId)?;
         broadcast_option_rfq_request(state, &rfq);
+        emit_option_rfq_created_lifecycle(state, &rfq);
         return Ok(rfq);
     }
 
@@ -1491,7 +1492,35 @@ pub async fn create_option_rfq(
         .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?
         .insert_option_rfq(rfq);
     broadcast_option_rfq_request(state, &rfq);
+    emit_option_rfq_created_lifecycle(state, &rfq);
     Ok(rfq)
+}
+
+/// OPTIONS-RFQ-LIFECYCLE-WS-V1 — emit an `OptionRfqCreated`
+/// lifecycle event routed on `account.rfqs` to the taker.
+/// Best-effort: dispatch failure never propagates to the caller.
+fn emit_option_rfq_created_lifecycle(state: &AppState, rfq: &OptionRfqRequest) {
+    use crate::api::public_ws::{LifecycleChannel, LifecycleEvent, LifecyclePayload};
+    let now = now_ms();
+    state.lifecycle_events.emit(LifecycleEvent {
+        account: rfq.taker.clone(),
+        channel: LifecycleChannel::AccountRfqs,
+        payload: LifecyclePayload::OptionRfqCreated {
+            option_rfq_id: rfq.option_rfq_id.to_string(),
+            option_series_id: rfq.option_series_id.clone(),
+            taker: rfq.taker.0.clone(),
+            side: match rfq.side {
+                Side::Buy => "buy".to_string(),
+                Side::Sell => "sell".to_string(),
+            },
+            size_1e8: rfq.size_1e8.to_string(),
+            limit_price_1e8: rfq.limit_price_1e8.map(|value| value.to_string()),
+            status: rfq.status.as_str().to_string(),
+            created_at_ms: rfq.created_at_ms,
+            expires_at_ms: rfq.expires_at_ms,
+        },
+        emitted_at_ms: now,
+    });
 }
 
 pub async fn list_option_rfqs(state: &AppState) -> Result<Vec<OptionRfqRequest>> {
@@ -1643,17 +1672,52 @@ pub async fn submit_option_rfq_quote(
 
     if let Some(repository) = state.repository.clone() {
         repository.insert_option_rfq_quote(&quote).await?;
-        return repository
+        let persisted = repository
             .get_option_rfq_quote(quote.quote_id)
             .await?
-            .ok_or(BackendError::InvalidOptionRfqQuoteId);
+            .ok_or(BackendError::InvalidOptionRfqQuoteId)?;
+        emit_option_rfq_quote_submitted_lifecycle(state, &rfq, &persisted);
+        return Ok(persisted);
     }
 
-    state
+    let persisted = state
         .options_store
         .lock()
         .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?
-        .insert_option_rfq_quote(quote)
+        .insert_option_rfq_quote(quote)?;
+    emit_option_rfq_quote_submitted_lifecycle(state, &rfq, &persisted);
+    Ok(persisted)
+}
+
+/// OPTIONS-RFQ-LIFECYCLE-WS-V1 — emit an `OptionRfqQuoteSubmitted`
+/// lifecycle event routed on `account.rfqs` to BOTH the taker and
+/// the maker. Best-effort: dispatch failure never propagates.
+fn emit_option_rfq_quote_submitted_lifecycle(
+    state: &AppState,
+    rfq: &OptionRfqRequest,
+    quote: &OptionRfqQuote,
+) {
+    use crate::api::public_ws::{LifecycleChannel, LifecycleEvent, LifecyclePayload};
+    let now = now_ms();
+    for account in [rfq.taker.clone(), quote.mm_account.clone()] {
+        state.lifecycle_events.emit(LifecycleEvent {
+            account,
+            channel: LifecycleChannel::AccountRfqs,
+            payload: LifecyclePayload::OptionRfqQuoteSubmitted {
+                option_rfq_id: rfq.option_rfq_id.to_string(),
+                quote_id: quote.quote_id.to_string(),
+                option_series_id: rfq.option_series_id.clone(),
+                taker: rfq.taker.0.clone(),
+                mm_account: quote.mm_account.0.clone(),
+                price_1e8: quote.price_1e8.to_string(),
+                size_1e8: quote.size_1e8.to_string(),
+                status: quote.status.as_str().to_string(),
+                created_at_ms: quote.created_at_ms,
+                expires_at_ms: quote.expires_at_ms,
+            },
+            emitted_at_ms: now,
+        });
+    }
 }
 
 pub async fn list_option_rfq_quotes(
@@ -1787,6 +1851,7 @@ pub async fn accept_option_rfq_quote(
         crate::fees::service::record_option_rfq_fill(state, &fill, &quote).await?;
         let (mm_notification_sent, mm_notification_warning) =
             notify_option_rfq_quote_acceptance(state, &quote, &quotes_before_accept, fill.fill_id);
+        emit_option_rfq_accept_lifecycle(state, &rfq, &quote, &fill);
         return Ok(AcceptOptionRfqQuoteOutcome {
             rfq,
             quote,
@@ -1805,6 +1870,7 @@ pub async fn accept_option_rfq_quote(
     crate::fees::service::record_option_rfq_fill(state, &fill, &quote).await?;
     let (mm_notification_sent, mm_notification_warning) =
         notify_option_rfq_quote_acceptance(state, &quote, &quotes_before_accept, fill.fill_id);
+    emit_option_rfq_accept_lifecycle(state, &rfq, &quote, &fill);
     Ok(AcceptOptionRfqQuoteOutcome {
         rfq,
         quote,
@@ -1814,19 +1880,99 @@ pub async fn accept_option_rfq_quote(
     })
 }
 
+/// OPTIONS-RFQ-LIFECYCLE-WS-V1 — emit BOTH `OptionRfqAccepted` and
+/// `OptionRfqFillCreated` lifecycle events, ONE frame per interested
+/// account (buyer + seller), routed on `account.rfqs`. Best-effort.
+fn emit_option_rfq_accept_lifecycle(
+    state: &AppState,
+    rfq: &OptionRfqRequest,
+    quote: &OptionRfqQuote,
+    fill: &OptionRfqFill,
+) {
+    use crate::api::public_ws::{LifecycleChannel, LifecycleEvent, LifecyclePayload};
+    let now = now_ms();
+    // Emit to both buyer AND seller. In an RFQ flow buyer/seller are
+    // always {taker, mm_account} in some order — but derive from the
+    // fill row so the mapping stays canonical regardless of side.
+    let accounts = [fill.buyer.clone(), fill.seller.clone()];
+    for account in &accounts {
+        state.lifecycle_events.emit(LifecycleEvent {
+            account: account.clone(),
+            channel: LifecycleChannel::AccountRfqs,
+            payload: LifecyclePayload::OptionRfqAccepted {
+                option_rfq_id: rfq.option_rfq_id.to_string(),
+                quote_id: quote.quote_id.to_string(),
+                option_series_id: rfq.option_series_id.clone(),
+                taker: rfq.taker.0.clone(),
+                mm_account: quote.mm_account.0.clone(),
+                rfq_status: rfq.status.as_str().to_string(),
+                quote_status: quote.status.as_str().to_string(),
+                option_fill_id: fill.fill_id.to_string(),
+                accepted_at_ms: fill.created_at_ms,
+            },
+            emitted_at_ms: now,
+        });
+    }
+    for account in &accounts {
+        state.lifecycle_events.emit(LifecycleEvent {
+            account: account.clone(),
+            channel: LifecycleChannel::AccountRfqs,
+            payload: LifecyclePayload::OptionRfqFillCreated {
+                option_rfq_id: rfq.option_rfq_id.to_string(),
+                quote_id: quote.quote_id.to_string(),
+                fill_id: fill.fill_id.to_string(),
+                option_series_id: fill.option_series_id.clone(),
+                taker: fill.taker.0.clone(),
+                mm_account: fill.mm_account.0.clone(),
+                taker_side: match fill.taker_side {
+                    Side::Buy => "buy".to_string(),
+                    Side::Sell => "sell".to_string(),
+                },
+                price_1e8: fill.price_1e8.to_string(),
+                size_1e8: fill.size_1e8.to_string(),
+                created_at_ms: fill.created_at_ms,
+            },
+            emitted_at_ms: now,
+        });
+    }
+}
+
 pub async fn cancel_option_rfq(
     state: &AppState,
     option_rfq_id: OptionRfqId,
 ) -> Result<OptionRfqRequest> {
     ensure_option_rfq_enabled(state)?;
-    if let Some(repository) = state.repository.clone() {
-        return repository.cancel_option_rfq(option_rfq_id).await;
-    }
-    state
-        .options_store
-        .lock()
-        .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?
-        .cancel_option_rfq(option_rfq_id)
+    let rfq = if let Some(repository) = state.repository.clone() {
+        repository.cancel_option_rfq(option_rfq_id).await?
+    } else {
+        state
+            .options_store
+            .lock()
+            .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?
+            .cancel_option_rfq(option_rfq_id)?
+    };
+    emit_option_rfq_cancelled_lifecycle(state, &rfq);
+    Ok(rfq)
+}
+
+/// OPTIONS-RFQ-LIFECYCLE-WS-V1 — emit an `OptionRfqCancelled`
+/// lifecycle event routed on `account.rfqs` to the taker.
+/// Best-effort: dispatch failure never propagates.
+fn emit_option_rfq_cancelled_lifecycle(state: &AppState, rfq: &OptionRfqRequest) {
+    use crate::api::public_ws::{LifecycleChannel, LifecycleEvent, LifecyclePayload};
+    let now = now_ms();
+    state.lifecycle_events.emit(LifecycleEvent {
+        account: rfq.taker.clone(),
+        channel: LifecycleChannel::AccountRfqs,
+        payload: LifecyclePayload::OptionRfqCancelled {
+            option_rfq_id: rfq.option_rfq_id.to_string(),
+            option_series_id: rfq.option_series_id.clone(),
+            taker: rfq.taker.0.clone(),
+            status: rfq.status.as_str().to_string(),
+            cancelled_at_ms: now,
+        },
+        emitted_at_ms: now,
+    });
 }
 
 pub async fn list_option_execution_intents(state: &AppState) -> Result<Vec<OptionExecutionIntent>> {

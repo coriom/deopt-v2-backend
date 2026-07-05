@@ -1,5 +1,6 @@
 use axum::body::{to_bytes, Body};
 use axum::http::{header, Request, StatusCode};
+use deopt_v2_backend::api::public_ws::{LifecycleChannel, LifecycleEvent, LifecyclePayload};
 use deopt_v2_backend::api::{router, AppState};
 use deopt_v2_backend::engine::EngineState;
 use deopt_v2_backend::fees::{FeeMarketType, FeesConfig};
@@ -2794,6 +2795,249 @@ async fn public_rfq_fills_endpoint_returns_empty_when_rfq_disabled() {
         .await
         .unwrap();
     assert!(!response.status().is_success());
+}
+
+// -------------------------------------------------------------------
+// OPTIONS-RFQ-LIFECYCLE-WS-V1 — WS lifecycle emit tests.
+// -------------------------------------------------------------------
+
+fn drain_lifecycle(
+    rx: &mut tokio::sync::broadcast::Receiver<LifecycleEvent>,
+) -> Vec<LifecycleEvent> {
+    let mut out = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        out.push(ev);
+    }
+    out
+}
+
+#[tokio::test]
+async fn option_rfq_created_emits_lifecycle_to_taker() {
+    let state = option_rfq_state();
+    let option_series_id = active_series_id(&state).await;
+    let mut rx = state.lifecycle_events.subscribe();
+    let rfq = create_option_rfq(&state, option_rfq_input(option_series_id, Side::Buy))
+        .await
+        .unwrap();
+
+    let events = drain_lifecycle(&mut rx);
+    let created: Vec<_> = events
+        .iter()
+        .filter(|e| matches!(e.payload, LifecyclePayload::OptionRfqCreated { .. }))
+        .collect();
+    assert_eq!(created.len(), 1);
+    let ev = created[0];
+    assert!(matches!(ev.channel, LifecycleChannel::AccountRfqs));
+    assert_eq!(ev.account, account());
+    match &ev.payload {
+        LifecyclePayload::OptionRfqCreated {
+            option_rfq_id,
+            taker,
+            side,
+            status,
+            ..
+        } => {
+            assert_eq!(option_rfq_id, &rfq.option_rfq_id.to_string());
+            assert!(taker.eq_ignore_ascii_case(&account().0));
+            assert_eq!(side, "buy");
+            assert_eq!(status, "open");
+        }
+        _ => unreachable!(),
+    }
+}
+
+#[tokio::test]
+async fn option_rfq_quote_submitted_emits_to_both_taker_and_mm_account() {
+    let state = option_rfq_state();
+    let option_series_id = active_series_id(&state).await;
+    let rfq = create_option_rfq(&state, option_rfq_input(option_series_id, Side::Buy))
+        .await
+        .unwrap();
+    let mut rx = state.lifecycle_events.subscribe();
+    let quote = submit_option_rfq_quote(
+        &state,
+        rfq.option_rfq_id,
+        option_rfq_quote_input(account_two(), "ws-quote-emit"),
+    )
+    .await
+    .unwrap();
+
+    let events = drain_lifecycle(&mut rx);
+    let submitted: Vec<_> = events
+        .iter()
+        .filter(|e| matches!(e.payload, LifecyclePayload::OptionRfqQuoteSubmitted { .. }))
+        .collect();
+    // ONE frame per interested account: taker + mm_account.
+    assert_eq!(submitted.len(), 2);
+    let recipients: std::collections::HashSet<_> = submitted
+        .iter()
+        .map(|e| e.account.0.to_lowercase())
+        .collect();
+    assert!(recipients.contains(&account().0.to_lowercase()));
+    assert!(recipients.contains(&account_two().0.to_lowercase()));
+    match &submitted[0].payload {
+        LifecyclePayload::OptionRfqQuoteSubmitted {
+            option_rfq_id,
+            quote_id,
+            price_1e8,
+            size_1e8,
+            status,
+            ..
+        } => {
+            assert_eq!(option_rfq_id, &rfq.option_rfq_id.to_string());
+            assert_eq!(quote_id, &quote.quote_id.to_string());
+            assert_eq!(price_1e8, &quote.price_1e8.to_string());
+            assert_eq!(size_1e8, &quote.size_1e8.to_string());
+            assert_eq!(status, "active");
+        }
+        _ => unreachable!(),
+    }
+}
+
+#[tokio::test]
+async fn option_rfq_accept_emits_accepted_and_fill_to_buyer_and_seller() {
+    let state = option_rfq_state();
+    let option_series_id = active_series_id(&state).await;
+    let rfq = create_option_rfq(&state, option_rfq_input(option_series_id, Side::Buy))
+        .await
+        .unwrap();
+    let quote = submit_option_rfq_quote(
+        &state,
+        rfq.option_rfq_id,
+        option_rfq_quote_input(account_two(), "ws-accept-emit"),
+    )
+    .await
+    .unwrap();
+    let mut rx = state.lifecycle_events.subscribe();
+    let outcome = accept_option_rfq_quote(&state, rfq.option_rfq_id, quote.quote_id)
+        .await
+        .unwrap();
+
+    let events = drain_lifecycle(&mut rx);
+    let accepted: Vec<_> = events
+        .iter()
+        .filter(|e| matches!(e.payload, LifecyclePayload::OptionRfqAccepted { .. }))
+        .collect();
+    let fills: Vec<_> = events
+        .iter()
+        .filter(|e| matches!(e.payload, LifecyclePayload::OptionRfqFillCreated { .. }))
+        .collect();
+    // Each event goes to buyer + seller (two frames each).
+    assert_eq!(accepted.len(), 2);
+    assert_eq!(fills.len(), 2);
+    let accepted_accounts: std::collections::HashSet<_> = accepted
+        .iter()
+        .map(|e| e.account.0.to_lowercase())
+        .collect();
+    assert!(accepted_accounts.contains(&outcome.fill.buyer.0.to_lowercase()));
+    assert!(accepted_accounts.contains(&outcome.fill.seller.0.to_lowercase()));
+    match &fills[0].payload {
+        LifecyclePayload::OptionRfqFillCreated {
+            fill_id,
+            option_rfq_id,
+            quote_id,
+            taker_side,
+            price_1e8,
+            size_1e8,
+            ..
+        } => {
+            assert_eq!(fill_id, &outcome.fill.fill_id.to_string());
+            assert_eq!(option_rfq_id, &rfq.option_rfq_id.to_string());
+            assert_eq!(quote_id, &quote.quote_id.to_string());
+            assert_eq!(taker_side, "buy");
+            assert_eq!(price_1e8, &outcome.fill.price_1e8.to_string());
+            assert_eq!(size_1e8, &outcome.fill.size_1e8.to_string());
+        }
+        _ => unreachable!(),
+    }
+}
+
+#[tokio::test]
+async fn option_rfq_cancel_emits_lifecycle_to_taker() {
+    let state = option_rfq_state();
+    let option_series_id = active_series_id(&state).await;
+    let rfq = create_option_rfq(&state, option_rfq_input(option_series_id, Side::Buy))
+        .await
+        .unwrap();
+    let mut rx = state.lifecycle_events.subscribe();
+    cancel_option_rfq(&state, rfq.option_rfq_id).await.unwrap();
+
+    let events = drain_lifecycle(&mut rx);
+    let cancelled: Vec<_> = events
+        .iter()
+        .filter(|e| matches!(e.payload, LifecyclePayload::OptionRfqCancelled { .. }))
+        .collect();
+    assert_eq!(cancelled.len(), 1);
+    assert_eq!(cancelled[0].account, account());
+    assert!(matches!(
+        cancelled[0].channel,
+        LifecycleChannel::AccountRfqs
+    ));
+    match &cancelled[0].payload {
+        LifecyclePayload::OptionRfqCancelled {
+            option_rfq_id,
+            status,
+            ..
+        } => {
+            assert_eq!(option_rfq_id, &rfq.option_rfq_id.to_string());
+            assert_eq!(status, "cancelled");
+        }
+        _ => unreachable!(),
+    }
+}
+
+#[tokio::test]
+async fn option_rfq_lifecycle_events_carry_no_signature_or_auth_fields() {
+    let state = strict_option_rfq_state();
+    let option_series_id = active_series_id(&state).await;
+    let mut rx = state.lifecycle_events.subscribe();
+
+    // Exercise the full loop under strict signature mode — this is
+    // the branch most likely to accidentally include a signature
+    // field in a lifecycle payload if the emit site were sloppy.
+    let rfq = create_option_rfq(&state, option_rfq_input(option_series_id, Side::Buy))
+        .await
+        .unwrap();
+    let mut input = option_rfq_quote_input(signing_account(), "ws-no-secret-leak");
+    input.quote_nonce = Some(77);
+    input.signature = Some(sign_option_quote_digest(
+        &option_quote_payload_digest(&state, &rfq, &input).await,
+        test_signing_key(),
+    ));
+    let quote = submit_option_rfq_quote(&state, rfq.option_rfq_id, input)
+        .await
+        .unwrap();
+    let _ = accept_option_rfq_quote(&state, rfq.option_rfq_id, quote.quote_id)
+        .await
+        .unwrap();
+
+    let events = drain_lifecycle(&mut rx);
+    assert!(!events.is_empty());
+    for ev in &events {
+        // Serialize every emitted event and grep the JSON for known
+        // secret / auth field names. This freezes the "safe fields
+        // only" invariant across future payload additions.
+        let json = serde_json::to_string(ev).unwrap().to_lowercase();
+        for forbidden in [
+            "signature",
+            "authorization",
+            "auth_envelope",
+            "nonce",
+            "quote_digest",
+            "recovered_signer",
+            "private_key",
+            "bearer",
+            "db_url",
+            "rpc_url",
+        ] {
+            assert!(
+                !json.contains(forbidden),
+                "lifecycle event JSON contains forbidden field `{}`: {}",
+                forbidden,
+                json,
+            );
+        }
+    }
 }
 
 #[tokio::test]

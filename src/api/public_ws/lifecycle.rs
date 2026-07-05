@@ -62,6 +62,17 @@ pub enum LifecycleChannel {
     /// `PerpPositionUpdated` on `AccountPerpPositions` when margin
     /// changed.
     AccountPerpFunding,
+    /// OPTIONS-RFQ-LIFECYCLE-WS-V1 — Options RFQ lifecycle. Emitted
+    /// AFTER the corresponding Options RFQ service call has
+    /// persisted its state change (create, quote-submit, accept,
+    /// cancel) or, in the accept path, AFTER the fill row has been
+    /// written. Consumers can drive `/rfq-strategy` refetches from
+    /// this single channel — quote deltas, RFQ status deltas, and
+    /// fill deltas all land here so the workspace only needs one
+    /// subscription. Privacy: events are per-account (`taker` and,
+    /// where relevant, `mm_account`); the WS session filter
+    /// forwards only events matching the authenticated address.
+    AccountRfqs,
 }
 
 impl LifecycleChannel {
@@ -74,6 +85,7 @@ impl LifecycleChannel {
             Self::AccountPerpFills => "account.perp_fills",
             Self::AccountPerpPositions => "account.perp_positions",
             Self::AccountPerpFunding => "account.perp_funding",
+            Self::AccountRfqs => "account.rfqs",
         }
     }
 }
@@ -277,6 +289,86 @@ pub enum LifecyclePayload {
         bad_debt_1e8: String,
         reason_code: String,
         created_at_ms: TimestampMs,
+    },
+    /// OPTIONS-RFQ-LIFECYCLE-WS-V1 — a taker created a new Options
+    /// RFQ. Emitted AFTER the RFQ has been persisted. Routed on
+    /// `account.rfqs` to the taker's authenticated session.
+    ///
+    /// Never carries signatures, write-auth nonces, envelopes,
+    /// headers, or bearer tokens.
+    OptionRfqCreated {
+        option_rfq_id: String,
+        option_series_id: String,
+        taker: String,
+        side: String,
+        size_1e8: String,
+        limit_price_1e8: Option<String>,
+        status: String,
+        created_at_ms: TimestampMs,
+        expires_at_ms: TimestampMs,
+    },
+    /// OPTIONS-RFQ-LIFECYCLE-WS-V1 — a maker submitted a quote on
+    /// an open RFQ. Emitted AFTER the quote has been persisted.
+    /// The service emits ONE frame per interested account (taker
+    /// AND mm_account); the per-session handler filter routes
+    /// each frame to the correct authenticated session.
+    OptionRfqQuoteSubmitted {
+        option_rfq_id: String,
+        quote_id: String,
+        option_series_id: String,
+        taker: String,
+        mm_account: String,
+        price_1e8: String,
+        size_1e8: String,
+        status: String,
+        created_at_ms: TimestampMs,
+        expires_at_ms: TimestampMs,
+    },
+    /// OPTIONS-RFQ-LIFECYCLE-WS-V1 — a taker accepted a maker
+    /// quote. Emitted AFTER the RFQ + quote status transitions
+    /// and the fill row have been persisted. One frame per
+    /// interested account (buyer + seller).
+    OptionRfqAccepted {
+        option_rfq_id: String,
+        quote_id: String,
+        option_series_id: String,
+        taker: String,
+        mm_account: String,
+        rfq_status: String,
+        quote_status: String,
+        option_fill_id: String,
+        accepted_at_ms: TimestampMs,
+    },
+    /// OPTIONS-RFQ-LIFECYCLE-WS-V1 — the fill created by an
+    /// accepted quote landed in `option_rfq_fills`. Emitted AFTER
+    /// persistence, ONE frame per interested account
+    /// (buyer + seller). Consumers already subscribed to
+    /// `account.rfqs` see this on the same subscription as the
+    /// preceding `OptionRfqAccepted`.
+    OptionRfqFillCreated {
+        option_rfq_id: String,
+        quote_id: String,
+        fill_id: String,
+        option_series_id: String,
+        taker: String,
+        mm_account: String,
+        taker_side: String,
+        price_1e8: String,
+        size_1e8: String,
+        created_at_ms: TimestampMs,
+    },
+    /// OPTIONS-RFQ-LIFECYCLE-WS-V1 — a taker cancelled their open
+    /// RFQ. Emitted AFTER persistence, routed on `account.rfqs`
+    /// to the taker's authenticated session. Makers that had
+    /// quoted this RFQ receive a subsequent quote-status
+    /// transition through their next quote refresh; V1 does not
+    /// fan out per-maker cancel events.
+    OptionRfqCancelled {
+        option_rfq_id: String,
+        option_series_id: String,
+        taker: String,
+        status: String,
+        cancelled_at_ms: TimestampMs,
     },
 }
 

@@ -53,7 +53,8 @@ pub async fn build_snapshot(state: &AppState, channel: Channel) -> Result<Value,
         | Channel::AccountPerpOrders
         | Channel::AccountPerpFills
         | Channel::AccountPerpPositions
-        | Channel::AccountPerpFunding => Err(SnapshotError::NotImplemented),
+        | Channel::AccountPerpFunding
+        | Channel::AccountRfqs => Err(SnapshotError::NotImplemented),
     }
 }
 
@@ -97,6 +98,11 @@ pub async fn build_snapshot_for_address(
         // under `/accounts/:address/perps/funding` returns the
         // durable/in-memory ledger.
         Channel::AccountPerpFunding => Ok(empty_account_collection("perp_funding", address)),
+        // OPTIONS-RFQ-LIFECYCLE-WS-V1 — honest empty snapshot; the
+        // frontend calls `GET /options/rfqs`, `GET /options/rfqs/{id}/quotes`,
+        // and `GET /options/rfq-fills?account=…` on each resync bump so
+        // this channel is used purely for delta notifications.
+        Channel::AccountRfqs => Ok(empty_account_collection("rfqs", address)),
         // Public channels never route through this path.
         Channel::TradingHealth | Channel::OptionsProducts | Channel::Leaderboard => {
             Err(SnapshotError::NotImplemented)

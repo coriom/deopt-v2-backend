@@ -51,6 +51,10 @@ pub enum Channel {
     AccountPerpPositions,
     // PERPS-FUNDING-V1
     AccountPerpFunding,
+    /// OPTIONS-RFQ-LIFECYCLE-WS-V1 — Options RFQ lifecycle deltas
+    /// for `/rfq-strategy` (RFQ created/quote-submitted/accepted/
+    /// cancelled + fill_created). Authenticated + account-scoped.
+    AccountRfqs,
 }
 
 impl Channel {
@@ -73,6 +77,7 @@ impl Channel {
             Self::AccountPerpFills => "account.perp_fills",
             Self::AccountPerpPositions => "account.perp_positions",
             Self::AccountPerpFunding => "account.perp_funding",
+            Self::AccountRfqs => "account.rfqs",
         }
     }
 
@@ -95,6 +100,7 @@ impl Channel {
             "account.perp_fills" => Some(Self::AccountPerpFills),
             "account.perp_positions" => Some(Self::AccountPerpPositions),
             "account.perp_funding" => Some(Self::AccountPerpFunding),
+            "account.rfqs" => Some(Self::AccountRfqs),
             _ => None,
         }
     }
@@ -117,6 +123,7 @@ impl Channel {
                 | Self::AccountPerpFills
                 | Self::AccountPerpPositions
                 | Self::AccountPerpFunding
+                | Self::AccountRfqs
         )
     }
 }

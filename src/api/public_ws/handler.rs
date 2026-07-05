@@ -230,6 +230,7 @@ async fn forward_lifecycle_event(
         LifecycleChannel::AccountPerpFills => Channel::AccountPerpFills,
         LifecycleChannel::AccountPerpPositions => Channel::AccountPerpPositions,
         LifecycleChannel::AccountPerpFunding => Channel::AccountPerpFunding,
+        LifecycleChannel::AccountRfqs => Channel::AccountRfqs,
     };
     // Privacy gate 2: session must have an active subscription for that channel.
     let Some(sub_id) = session
