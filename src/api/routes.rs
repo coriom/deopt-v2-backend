@@ -42,21 +42,26 @@ use crate::options::service::{
     broadcast_option_execution_intent as broadcast_option_execution_intent_service,
     cancel_option_order as cancel_option_order_service,
     cancel_option_rfq as cancel_option_rfq_service,
+    cancel_option_twap_order as cancel_option_twap_order_service,
     confirm_option_execution_intent as confirm_option_execution_intent_service,
     create_option_rfq as create_option_rfq_service,
     create_option_series as create_option_series_service,
+    create_option_twap_order as create_option_twap_order_service,
     disable_option_series as disable_option_series_service,
     get_option_execution_intent as get_option_execution_intent_service,
     get_option_fill as get_option_fill_service, get_option_order as get_option_order_service,
     get_option_order_fills as get_option_order_fills_service,
     get_option_orderbook as get_option_orderbook_service, get_option_rfq as get_option_rfq_service,
     get_option_series as get_option_series_service,
+    get_option_twap_order as get_option_twap_order_service,
     list_option_execution_intents as list_option_execution_intents_service,
     list_option_fills as list_option_fills_service,
     list_option_orders as list_option_orders_service,
     list_option_rfq_fills as list_option_rfq_fills_service,
     list_option_rfq_quotes as list_option_rfq_quotes_service,
     list_option_rfqs as list_option_rfqs_service, list_option_series as list_option_series_service,
+    list_option_twap_children as list_option_twap_children_service,
+    list_option_twap_orders as list_option_twap_orders_service,
     option_execution_calldata as option_execution_calldata_service,
     option_execution_signing_payload as option_execution_signing_payload_service,
     option_execution_simulation_status as option_execution_simulation_status_service,
@@ -66,8 +71,9 @@ use crate::options::service::{
     submit_option_execution_signatures as submit_option_execution_signatures_service,
     submit_option_order as submit_option_order_service,
     submit_option_rfq_quote as submit_option_rfq_quote_service,
-    sweep_expired_option_orders as sweep_expired_option_orders_service, CreateOptionRfqInput,
-    CreateOptionSeriesInput, OptionRfqQuoteSigningPayloadInput,
+    sweep_expired_option_orders as sweep_expired_option_orders_service,
+    tick_option_twap_orders as tick_option_twap_orders_service, CreateOptionRfqInput,
+    CreateOptionSeriesInput, CreateOptionTwapInput, OptionRfqQuoteSigningPayloadInput,
     SubmitOptionExecutionSignaturesInput, SubmitOptionOrderInput, SubmitOptionRfqQuoteInput,
 };
 use crate::options::{
@@ -81,8 +87,9 @@ use crate::options::{
     OptionFillId, OptionOrder, OptionOrderFilter, OptionOrderStatus, OptionOrderbookSnapshot,
     OptionRfqFill, OptionRfqFillFilter, OptionRfqId, OptionRfqQuote, OptionRfqQuoteId,
     OptionRfqQuoteSignatureStatus, OptionRfqQuoteStatus, OptionRfqRequest, OptionRfqStatus,
-    OptionSeries, OptionSeriesFilter, OptionSeriesStatus, OPTION_EVENT_INDEXER_STATE_ID,
-    OPTION_RFQ_QUOTE_TYPE, OPTION_TRADE_TYPE,
+    OptionSeries, OptionSeriesFilter, OptionSeriesStatus, OptionTwapChildOrder, OptionTwapOrder,
+    OptionTwapOrderFilter, OptionTwapOrderId, OPTION_EVENT_INDEXER_STATE_ID, OPTION_RFQ_QUOTE_TYPE,
+    OPTION_TRADE_TYPE,
 };
 // ACCOUNT-WRITE-AUTH-HARDENING-V1: perp order service is gated until perps go live.
 use crate::reconciliation::{
@@ -353,6 +360,29 @@ pub fn router(state: AppState) -> Router {
         // buyer/seller/taker/mm_account), `?option_rfq_id=`, and
         // `?limit=`. Newest-first ordering.
         .route("/options/rfq-fills", get(list_option_rfq_fills))
+        // OPTIONS-TWAP-ORDERS-V1 — TWAP parent + child routes,
+        // Options-only, guarded by OPTION_TWAP_ENABLED. Perps
+        // TWAP is out of scope for V1 and remains absent.
+        .route(
+            "/options/twap-orders",
+            post(create_option_twap_order).get(list_option_twap_orders),
+        )
+        .route(
+            "/options/twap-orders/:option_twap_id",
+            get(get_option_twap_order),
+        )
+        .route(
+            "/options/twap-orders/:option_twap_id/children",
+            get(list_option_twap_children),
+        )
+        .route(
+            "/options/twap-orders/:option_twap_id/cancel",
+            post(cancel_option_twap_order),
+        )
+        .route(
+            "/admin/options/twap/tick",
+            post(admin_tick_option_twap_orders),
+        )
         .route(
             "/options/rfqs/:option_rfq_id/cancel",
             post(cancel_option_rfq),
@@ -4418,6 +4448,228 @@ async fn list_option_rfq_fills(
     Ok(Json(
         fills.into_iter().map(OptionRfqFillResponse::from).collect(),
     ))
+}
+
+// ---------------------------------------------------------------------
+// OPTIONS-TWAP-ORDERS-V1 — DTOs + handlers.
+// ---------------------------------------------------------------------
+
+#[derive(Clone, Debug, Deserialize)]
+struct CreateOptionTwapRequest {
+    account: AccountId,
+    option_series_id: String,
+    side: Side,
+    size_1e8: String,
+    limit_price_1e8: String,
+    running_time_ms: u64,
+    child_count: u32,
+    #[serde(default)]
+    client_order_id: Option<String>,
+    authorization: AuthorizationEnvelope,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct OptionTwapOrderResponse {
+    option_twap_id: String,
+    account: AccountId,
+    option_series_id: String,
+    side: Side,
+    size_1e8: String,
+    remaining_size_1e8: String,
+    limit_price_1e8: String,
+    running_time_ms: u64,
+    child_count: u32,
+    child_interval_ms: u64,
+    next_execution_at_ms: i64,
+    started_at_ms: i64,
+    ends_at_ms: i64,
+    status: String,
+    created_child_count: u32,
+    filled_size_1e8: String,
+    failed_child_count: u32,
+    client_order_id: Option<String>,
+    last_error: Option<String>,
+    created_at_ms: i64,
+    updated_at_ms: i64,
+}
+
+impl From<OptionTwapOrder> for OptionTwapOrderResponse {
+    fn from(t: OptionTwapOrder) -> Self {
+        Self {
+            option_twap_id: t.option_twap_id.to_string(),
+            account: t.account,
+            option_series_id: t.option_series_id,
+            side: t.side,
+            size_1e8: t.size_1e8.to_string(),
+            remaining_size_1e8: t.remaining_size_1e8.to_string(),
+            limit_price_1e8: t.limit_price_1e8.to_string(),
+            running_time_ms: t.running_time_ms,
+            child_count: t.child_count,
+            child_interval_ms: t.child_interval_ms,
+            next_execution_at_ms: t.next_execution_at_ms,
+            started_at_ms: t.started_at_ms,
+            ends_at_ms: t.ends_at_ms,
+            status: t.status.as_str().to_string(),
+            created_child_count: t.created_child_count,
+            filled_size_1e8: t.filled_size_1e8.to_string(),
+            failed_child_count: t.failed_child_count,
+            client_order_id: t.client_order_id,
+            last_error: t.last_error,
+            created_at_ms: t.created_at_ms,
+            updated_at_ms: t.updated_at_ms,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct OptionTwapChildResponse {
+    option_twap_child_id: String,
+    option_twap_id: String,
+    sequence: u32,
+    scheduled_at_ms: i64,
+    submitted_at_ms: Option<i64>,
+    child_order_id: Option<String>,
+    status: String,
+    requested_size_1e8: String,
+    filled_size_1e8: String,
+    limit_price_1e8: String,
+    error_message: Option<String>,
+}
+
+impl From<OptionTwapChildOrder> for OptionTwapChildResponse {
+    fn from(c: OptionTwapChildOrder) -> Self {
+        Self {
+            option_twap_child_id: c.option_twap_child_id.to_string(),
+            option_twap_id: c.option_twap_id.to_string(),
+            sequence: c.sequence,
+            scheduled_at_ms: c.scheduled_at_ms,
+            submitted_at_ms: c.submitted_at_ms,
+            child_order_id: c.child_order_id.map(|id| id.to_string()),
+            status: c.status.as_str().to_string(),
+            requested_size_1e8: c.requested_size_1e8.to_string(),
+            filled_size_1e8: c.filled_size_1e8.to_string(),
+            limit_price_1e8: c.limit_price_1e8.to_string(),
+            error_message: c.error_message,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ListOptionTwapOrdersQuery {
+    account: Option<AccountId>,
+}
+
+fn parse_option_twap_id(v: &str) -> std::result::Result<OptionTwapOrderId, ApiError> {
+    v.parse().map_err(|_| ApiError {
+        status: StatusCode::NOT_FOUND,
+        message: "invalid option TWAP id".to_string(),
+    })
+}
+
+async fn create_option_twap_order(
+    State(state): State<AppState>,
+    Json(request): Json<CreateOptionTwapRequest>,
+) -> Result<Json<OptionTwapOrderResponse>, ApiError> {
+    let canonical = canonical_option_twap_create(&request);
+    let _verified = require_write_auth(
+        &state,
+        WriteAuthAction::OptionTwapCreate,
+        &request.account,
+        &canonical,
+        &request.authorization,
+    )
+    .await?;
+    let twap = create_option_twap_order_service(
+        &state,
+        CreateOptionTwapInput {
+            account: request.account,
+            option_series_id: request.option_series_id,
+            side: request.side,
+            size_1e8: parse_fixed_u128("size_1e8", &request.size_1e8)?,
+            limit_price_1e8: parse_fixed_u128("limit_price_1e8", &request.limit_price_1e8)?,
+            running_time_ms: request.running_time_ms,
+            child_count: request.child_count,
+            client_order_id: request.client_order_id,
+        },
+    )
+    .await?;
+    Ok(Json(twap.into()))
+}
+
+async fn list_option_twap_orders(
+    State(state): State<AppState>,
+    Query(query): Query<ListOptionTwapOrdersQuery>,
+) -> Result<Json<Vec<OptionTwapOrderResponse>>, ApiError> {
+    let filter = OptionTwapOrderFilter {
+        account: query.account,
+        option_twap_id: None,
+    };
+    let out = list_option_twap_orders_service(&state, filter).await?;
+    Ok(Json(
+        out.into_iter().map(OptionTwapOrderResponse::from).collect(),
+    ))
+}
+
+async fn get_option_twap_order(
+    State(state): State<AppState>,
+    Path(option_twap_id): Path<String>,
+) -> Result<Json<OptionTwapOrderResponse>, ApiError> {
+    let id = parse_option_twap_id(&option_twap_id)?;
+    Ok(Json(
+        get_option_twap_order_service(&state, id).await?.into(),
+    ))
+}
+
+async fn list_option_twap_children(
+    State(state): State<AppState>,
+    Path(option_twap_id): Path<String>,
+) -> Result<Json<Vec<OptionTwapChildResponse>>, ApiError> {
+    let id = parse_option_twap_id(&option_twap_id)?;
+    let out = list_option_twap_children_service(&state, id).await?;
+    Ok(Json(
+        out.into_iter().map(OptionTwapChildResponse::from).collect(),
+    ))
+}
+
+async fn cancel_option_twap_order(
+    State(state): State<AppState>,
+    Path(option_twap_id): Path<String>,
+    Json(body): Json<AuthorizationOnlyBody>,
+) -> Result<Json<OptionTwapOrderResponse>, ApiError> {
+    let id = parse_option_twap_id(&option_twap_id)?;
+    let twap = get_option_twap_order_service(&state, id).await?;
+    let canonical = canonical_option_twap_cancel(&twap.account, &option_twap_id);
+    let _verified = require_write_auth(
+        &state,
+        WriteAuthAction::OptionTwapCancel,
+        &twap.account,
+        &canonical,
+        &body.authorization,
+    )
+    .await?;
+    Ok(Json(
+        cancel_option_twap_order_service(&state, id).await?.into(),
+    ))
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct TickOptionTwapResponse {
+    children_created: u32,
+    children_failed: u32,
+    parents_completed: u32,
+}
+
+async fn admin_tick_option_twap_orders(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<TickOptionTwapResponse>, ApiError> {
+    ensure_admin_access(&state, &headers)?;
+    let outcome = tick_option_twap_orders_service(&state).await?;
+    Ok(Json(TickOptionTwapResponse {
+        children_created: outcome.children_created,
+        children_failed: outcome.children_failed,
+        parents_completed: outcome.parents_completed,
+    }))
 }
 
 async fn accept_option_rfq_quote(
@@ -11856,6 +12108,56 @@ fn canonical_option_rfq_accept(taker: &AccountId, option_rfq_id: &str, quote_id:
     )
 }
 
+// OPTIONS-TWAP-ORDERS-V1 — canonical builders (byte-identical to frontend
+// `canonical.optionTwapCreate` / `canonical.optionTwapCancel`).
+
+fn canonical_option_twap_create(req: &CreateOptionTwapRequest) -> Vec<u8> {
+    crate::auth::write_authorization::canonical_payload_bytes(
+        WriteAuthAction::OptionTwapCreate,
+        &[
+            ("account", CanonicalValue::Address(req.account.clone())),
+            (
+                "option_series_id",
+                CanonicalValue::Str(req.option_series_id.clone()),
+            ),
+            (
+                "side",
+                CanonicalValue::Str(match req.side {
+                    Side::Buy => "buy".to_string(),
+                    Side::Sell => "sell".to_string(),
+                }),
+            ),
+            ("size_1e8", CanonicalValue::Str(req.size_1e8.clone())),
+            (
+                "limit_price_1e8",
+                CanonicalValue::Str(req.limit_price_1e8.clone()),
+            ),
+            ("running_time_ms", CanonicalValue::U64(req.running_time_ms)),
+            ("child_count", CanonicalValue::U64(req.child_count as u64)),
+            (
+                "client_order_id",
+                req.client_order_id
+                    .as_ref()
+                    .map(|v| CanonicalValue::Str(v.clone()))
+                    .unwrap_or(CanonicalValue::Null),
+            ),
+        ],
+    )
+}
+
+fn canonical_option_twap_cancel(account: &AccountId, option_twap_id: &str) -> Vec<u8> {
+    crate::auth::write_authorization::canonical_payload_bytes(
+        WriteAuthAction::OptionTwapCancel,
+        &[
+            ("account", CanonicalValue::Address(account.clone())),
+            (
+                "option_twap_id",
+                CanonicalValue::Str(option_twap_id.to_string()),
+            ),
+        ],
+    )
+}
+
 fn canonical_option_rfq_cancel(taker: &AccountId, option_rfq_id: &str) -> Vec<u8> {
     crate::auth::write_authorization::canonical_payload_bytes(
         WriteAuthAction::OptionRfqCancel,
@@ -11919,6 +12221,12 @@ impl From<BackendError> for ApiError {
             BackendError::InvalidOptionRfqId | BackendError::InvalidOptionRfqQuoteId => {
                 StatusCode::NOT_FOUND
             }
+            BackendError::InvalidOptionTwapOrderId | BackendError::InvalidOptionTwapChildId => {
+                StatusCode::NOT_FOUND
+            }
+            BackendError::OptionTwapDisabled => StatusCode::BAD_REQUEST,
+            BackendError::InvalidOptionTwapState(_) => StatusCode::BAD_REQUEST,
+            BackendError::InvalidOptionTwapParams(_) => StatusCode::BAD_REQUEST,
             BackendError::OrderNotFound(_) | BackendError::OrderNotOpen(_) => StatusCode::NOT_FOUND,
             BackendError::MmPermissionDenied(_) => StatusCode::FORBIDDEN,
             BackendError::InvalidFixedPoint { .. } => StatusCode::BAD_REQUEST,

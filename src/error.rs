@@ -93,6 +93,17 @@ pub enum BackendError {
     InvalidOptionRfqState(String),
     #[error("invalid option RFQ quote state: {0}")]
     InvalidOptionRfqQuoteState(String),
+    // OPTIONS-TWAP-ORDERS-V1
+    #[error("option TWAP is disabled")]
+    OptionTwapDisabled,
+    #[error("invalid option TWAP id")]
+    InvalidOptionTwapOrderId,
+    #[error("invalid option TWAP child id")]
+    InvalidOptionTwapChildId,
+    #[error("invalid option TWAP state: {0}")]
+    InvalidOptionTwapState(String),
+    #[error("invalid option TWAP parameters: {0}")]
+    InvalidOptionTwapParams(String),
     #[error("invalid PerpTrade intentId")]
     InvalidPerpTradeIntentId,
     #[error("invalid fixed-point value for {field}: {reason}")]

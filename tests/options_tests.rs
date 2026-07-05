@@ -6,17 +6,19 @@ use deopt_v2_backend::engine::EngineState;
 use deopt_v2_backend::fees::{FeeMarketType, FeesConfig};
 use deopt_v2_backend::mm::{MmAccountPermissions, MmPermissionsConfig};
 use deopt_v2_backend::options::service::{
-    accept_option_rfq_quote, cancel_option_order, cancel_option_rfq, create_option_rfq,
-    create_option_series, disable_option_series, get_option_fill, get_option_order,
-    get_option_order_fills, get_option_orderbook, get_option_series, list_option_execution_intents,
-    list_option_fills, list_option_order_attachment_plans_for_account,
-    list_option_order_rejections_for_account, list_option_orders, list_option_rfq_quotes,
-    list_option_rfqs, list_option_series, option_execution_calldata,
+    accept_option_rfq_quote, cancel_option_order, cancel_option_rfq, cancel_option_twap_order,
+    create_option_rfq, create_option_series, create_option_twap_order, disable_option_series,
+    get_option_fill, get_option_order, get_option_order_fills, get_option_orderbook,
+    get_option_series, get_option_twap_order, list_option_execution_intents, list_option_fills,
+    list_option_order_attachment_plans_for_account, list_option_order_rejections_for_account,
+    list_option_orders, list_option_rfq_quotes, list_option_rfqs, list_option_series,
+    list_option_twap_children, list_option_twap_orders, option_execution_calldata,
     option_execution_signing_payload, option_rfq_quote_signing_payload,
     submit_option_execution_signatures, submit_option_order, submit_option_rfq_quote,
-    sweep_expired_option_orders, AttachedLegInput, AttachedTpSlInput, CreateOptionRfqInput,
-    CreateOptionSeriesInput, OptionRfqQuoteSigningPayloadInput,
-    SubmitOptionExecutionSignaturesInput, SubmitOptionOrderInput, SubmitOptionRfqQuoteInput,
+    sweep_expired_option_orders, tick_option_twap_orders, AttachedLegInput, AttachedTpSlInput,
+    CreateOptionRfqInput, CreateOptionSeriesInput, CreateOptionTwapInput,
+    OptionRfqQuoteSigningPayloadInput, SubmitOptionExecutionSignaturesInput,
+    SubmitOptionOrderInput, SubmitOptionRfqQuoteInput,
 };
 use deopt_v2_backend::options::{
     expected_option_execute_trade_selector, option_execute_trade_selector,
@@ -5062,4 +5064,318 @@ async fn pending_plan_resting_through_no_fills_remains_pending() {
     assert_eq!(plans.len(), 1);
     assert_eq!(plans[0].status, AttachmentPlanStatus::Pending);
     assert_eq!(plans[0].materialized_size_1e8, None);
+}
+
+// -------------------------------------------------------------------
+// OPTIONS-TWAP-ORDERS-V1 — TWAP parent + child tick tests.
+// -------------------------------------------------------------------
+
+fn option_twap_state() -> AppState {
+    let mut config = OptionsConfig::enabled_in_memory_for_tests();
+    config.twap_enabled = true;
+    AppState::with_options_config(EngineState::with_default_markets(), config)
+}
+
+fn twap_input(option_series_id: String, side: Side) -> CreateOptionTwapInput {
+    CreateOptionTwapInput {
+        account: account(),
+        option_series_id,
+        side,
+        size_1e8: 4 * ONE_1E8, // 4 contracts split into N children
+        limit_price_1e8: 1_000_000_000,
+        running_time_ms: 60_000,
+        child_count: 4,
+        client_order_id: Some("twap-1".to_string()),
+    }
+}
+
+#[tokio::test]
+async fn twap_create_is_disabled_by_default() {
+    let state = state(); // twap_enabled = false
+    let option_series_id = active_series_id(&state).await;
+    let err = create_option_twap_order(&state, twap_input(option_series_id, Side::Buy))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        deopt_v2_backend::error::BackendError::OptionTwapDisabled
+    ));
+}
+
+#[tokio::test]
+async fn twap_create_succeeds_when_enabled_with_valid_params() {
+    let state = option_twap_state();
+    let option_series_id = active_series_id(&state).await;
+    let twap = create_option_twap_order(&state, twap_input(option_series_id, Side::Buy))
+        .await
+        .unwrap();
+    assert_eq!(
+        twap.status,
+        deopt_v2_backend::options::OptionTwapStatus::Pending
+    );
+    assert_eq!(twap.child_count, 4);
+    assert_eq!(twap.child_interval_ms, 15_000); // 60_000 / 4
+    assert_eq!(twap.remaining_size_1e8, 4 * ONE_1E8);
+    assert_eq!(twap.created_child_count, 0);
+}
+
+#[tokio::test]
+async fn twap_create_rejects_zero_size() {
+    let state = option_twap_state();
+    let option_series_id = active_series_id(&state).await;
+    let mut input = twap_input(option_series_id, Side::Buy);
+    input.size_1e8 = 0;
+    let err = create_option_twap_order(&state, input).await.unwrap_err();
+    assert!(matches!(
+        err,
+        deopt_v2_backend::error::BackendError::InvalidOptionTwapParams(_)
+    ));
+}
+
+#[tokio::test]
+async fn twap_create_rejects_child_count_over_cap() {
+    let state = option_twap_state();
+    let option_series_id = active_series_id(&state).await;
+    let mut input = twap_input(option_series_id, Side::Buy);
+    input.child_count = 999;
+    let err = create_option_twap_order(&state, input).await.unwrap_err();
+    assert!(matches!(
+        err,
+        deopt_v2_backend::error::BackendError::InvalidOptionTwapParams(_)
+    ));
+}
+
+#[tokio::test]
+async fn twap_create_rejects_interval_below_minimum() {
+    let state = option_twap_state();
+    let option_series_id = active_series_id(&state).await;
+    // running=1000ms / child=50 = 20ms interval, well below the 10s min.
+    let mut input = twap_input(option_series_id, Side::Buy);
+    input.running_time_ms = 1_000;
+    input.child_count = 50;
+    let err = create_option_twap_order(&state, input).await.unwrap_err();
+    assert!(matches!(
+        err,
+        deopt_v2_backend::error::BackendError::InvalidOptionTwapParams(_)
+    ));
+}
+
+#[tokio::test]
+async fn twap_cancel_by_owner_transitions_to_cancelled() {
+    let state = option_twap_state();
+    let option_series_id = active_series_id(&state).await;
+    let twap = create_option_twap_order(&state, twap_input(option_series_id, Side::Buy))
+        .await
+        .unwrap();
+    let cancelled = cancel_option_twap_order(&state, twap.option_twap_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        cancelled.status,
+        deopt_v2_backend::options::OptionTwapStatus::Cancelled
+    );
+    // A second cancel is a no-op that errors honestly (not silently ok).
+    let err = cancel_option_twap_order(&state, twap.option_twap_id)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        deopt_v2_backend::error::BackendError::InvalidOptionTwapState(_)
+    ));
+}
+
+#[tokio::test]
+async fn twap_list_filters_by_account() {
+    let state = option_twap_state();
+    let option_series_id = active_series_id(&state).await;
+    let _t1 = create_option_twap_order(&state, twap_input(option_series_id.clone(), Side::Buy))
+        .await
+        .unwrap();
+    // Under a different account:
+    let mut other = twap_input(option_series_id, Side::Buy);
+    other.account = account_two();
+    let _t2 = create_option_twap_order(&state, other).await.unwrap();
+
+    let by_account = list_option_twap_orders(
+        &state,
+        deopt_v2_backend::options::OptionTwapOrderFilter {
+            account: Some(account()),
+            option_twap_id: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(by_account.len(), 1);
+    assert_eq!(by_account[0].account, account());
+}
+
+#[tokio::test]
+async fn twap_tick_creates_one_child_when_due() {
+    let state = option_twap_state();
+    let option_series_id = active_series_id(&state).await;
+    // Seed a resting sell so an IOC buy child can actually fill (proves
+    // the child uses the existing matcher path, not a fake fill).
+    let mut maker = order_input(option_series_id.clone(), Side::Sell, "twap-maker");
+    maker.account = account_two();
+    maker.size_1e8 = 4 * ONE_1E8;
+    let _ = submit_option_order(&state, maker).await.unwrap();
+
+    let mut input = twap_input(option_series_id.clone(), Side::Buy);
+    // 40s / 4 children = 10s interval (== minimum).
+    input.running_time_ms = 40_000;
+    let created = create_option_twap_order(&state, input).await.unwrap();
+
+    // Force the parent's next_execution_at_ms into the past so the
+    // first child is due on the next tick. This is the safe way to
+    // exercise tick logic in unit tests without sleeping.
+    {
+        let mut store = state.options_store.lock().unwrap();
+        let mut twap = store.get_option_twap_order(created.option_twap_id).unwrap();
+        twap.next_execution_at_ms -= 60_000;
+        store.insert_option_twap_order(twap);
+    }
+    let outcome_second = tick_option_twap_orders(&state).await.unwrap();
+    assert_eq!(outcome_second.children_created, 1);
+
+    let children = list_option_twap_children(&state, created.option_twap_id)
+        .await
+        .unwrap();
+    assert_eq!(children.len(), 1);
+    // Child must reference a real option order id (existing matcher).
+    assert!(children[0].child_order_id.is_some());
+    // Repeated tick without advancing the timer must NOT create another
+    // child — the parent's `next_execution_at_ms` was pushed forward
+    // by one interval when the first child fired.
+    let outcome_third = tick_option_twap_orders(&state).await.unwrap();
+    assert_eq!(outcome_third.children_created, 0);
+}
+
+#[tokio::test]
+async fn twap_tick_splits_size_including_remainder_on_last_child() {
+    let state = option_twap_state();
+    let option_series_id = active_series_id(&state).await;
+    // Seed enough resting sells to cover the whole TWAP.
+    let mut maker = order_input(option_series_id.clone(), Side::Sell, "twap-maker-remain");
+    maker.account = account_two();
+    // size = 3 * 1e8 with child_count = 2 → base = 1.5e8 floored to 1e8, final child gets remainder.
+    maker.size_1e8 = 3 * ONE_1E8;
+    let _ = submit_option_order(&state, maker).await.unwrap();
+
+    let mut input = twap_input(option_series_id, Side::Buy);
+    input.child_count = 2;
+    input.running_time_ms = 20_000; // 10s interval
+    input.size_1e8 = 3 * ONE_1E8;
+    let twap = create_option_twap_order(&state, input).await.unwrap();
+
+    // Force two ticks into the past so both children come due.
+    {
+        let mut store = state.options_store.lock().unwrap();
+        let mut t = store.get_option_twap_order(twap.option_twap_id).unwrap();
+        t.next_execution_at_ms -= 60_000;
+        store.insert_option_twap_order(t);
+    }
+    let _ = tick_option_twap_orders(&state).await.unwrap();
+    // After the first tick, advance again.
+    {
+        let mut store = state.options_store.lock().unwrap();
+        let mut t = store.get_option_twap_order(twap.option_twap_id).unwrap();
+        t.next_execution_at_ms -= 60_000;
+        store.insert_option_twap_order(t);
+    }
+    let _ = tick_option_twap_orders(&state).await.unwrap();
+
+    let children = list_option_twap_children(&state, twap.option_twap_id)
+        .await
+        .unwrap();
+    assert_eq!(children.len(), 2);
+    let total: u128 = children.iter().map(|c| c.requested_size_1e8).sum();
+    assert_eq!(total, 3 * ONE_1E8); // no size lost to floor division
+                                    // The last child should carry the remainder (or equal share).
+    assert!(children[1].requested_size_1e8 >= children[0].requested_size_1e8);
+}
+
+#[tokio::test]
+async fn twap_tick_does_not_create_children_for_cancelled_parent() {
+    let state = option_twap_state();
+    let option_series_id = active_series_id(&state).await;
+    let twap = create_option_twap_order(&state, twap_input(option_series_id, Side::Buy))
+        .await
+        .unwrap();
+    // Cancel first.
+    let _ = cancel_option_twap_order(&state, twap.option_twap_id)
+        .await
+        .unwrap();
+    // Even if we force the timer into the past, tick must produce
+    // nothing for a cancelled parent.
+    {
+        let mut store = state.options_store.lock().unwrap();
+        let mut t = store.get_option_twap_order(twap.option_twap_id).unwrap();
+        t.next_execution_at_ms -= 60_000;
+        store.insert_option_twap_order(t);
+    }
+    let outcome = tick_option_twap_orders(&state).await.unwrap();
+    assert_eq!(outcome.children_created, 0);
+    let children = list_option_twap_children(&state, twap.option_twap_id)
+        .await
+        .unwrap();
+    assert_eq!(children.len(), 0);
+}
+
+#[tokio::test]
+async fn twap_completes_after_last_scheduled_child() {
+    let state = option_twap_state();
+    let option_series_id = active_series_id(&state).await;
+    let mut maker = order_input(option_series_id.clone(), Side::Sell, "twap-maker-done");
+    maker.account = account_two();
+    maker.size_1e8 = 2 * ONE_1E8;
+    let _ = submit_option_order(&state, maker).await.unwrap();
+
+    let mut input = twap_input(option_series_id, Side::Buy);
+    input.child_count = 2;
+    input.running_time_ms = 20_000;
+    input.size_1e8 = 2 * ONE_1E8;
+    let twap = create_option_twap_order(&state, input).await.unwrap();
+    for _ in 0..2 {
+        {
+            let mut store = state.options_store.lock().unwrap();
+            let mut t = store.get_option_twap_order(twap.option_twap_id).unwrap();
+            t.next_execution_at_ms -= 60_000;
+            store.insert_option_twap_order(t);
+        }
+        let _ = tick_option_twap_orders(&state).await.unwrap();
+    }
+    let final_state = get_option_twap_order(&state, twap.option_twap_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        final_state.status,
+        deopt_v2_backend::options::OptionTwapStatus::Completed
+    );
+    assert_eq!(final_state.created_child_count, 2);
+}
+
+#[tokio::test]
+async fn twap_response_carries_no_signature_or_auth_fields() {
+    let state = option_twap_state();
+    let option_series_id = active_series_id(&state).await;
+    let twap = create_option_twap_order(&state, twap_input(option_series_id, Side::Buy))
+        .await
+        .unwrap();
+    let json = serde_json::to_string(&twap).unwrap().to_lowercase();
+    for forbidden in [
+        "signature",
+        "authorization",
+        "auth_envelope",
+        "quote_digest",
+        "recovered_signer",
+        "private_key",
+        "bearer",
+        "db_url",
+        "rpc_url",
+    ] {
+        assert!(
+            !json.contains(forbidden),
+            "twap response contains forbidden field `{forbidden}`: {json}",
+        );
+    }
 }

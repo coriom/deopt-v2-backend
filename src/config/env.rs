@@ -391,6 +391,18 @@ impl AppConfig {
                 "OPTION_EXECUTION_GAS_SAFETY_BPS",
                 &crate::options::OPTION_EXECUTION_GAS_SAFETY_BPS_DEFAULT.to_string(),
             )?,
+            twap_enabled: parse_env(&mut lookup, "OPTION_TWAP_ENABLED", "false")?,
+            twap_max_child_count: parse_env(&mut lookup, "OPTION_TWAP_MAX_CHILD_COUNT", "50")?,
+            twap_max_running_time_ms: parse_env(
+                &mut lookup,
+                "OPTION_TWAP_MAX_RUNNING_TIME_MS",
+                "86400000",
+            )?,
+            twap_min_child_interval_ms: parse_env(
+                &mut lookup,
+                "OPTION_TWAP_MIN_CHILD_INTERVAL_MS",
+                "10000",
+            )?,
         };
         let perp_nonce_sync = PerpNonceSyncConfig {
             enabled: parse_env(&mut lookup, "PERP_NONCE_SYNC_ENABLED", "false")?,

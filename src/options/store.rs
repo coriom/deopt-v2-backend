@@ -7,6 +7,8 @@ use super::{
     OptionOrderFilter, OptionOrderId, OptionOrderRejection, OptionOrderStatus, OptionRfqFill,
     OptionRfqId, OptionRfqQuote, OptionRfqQuoteId, OptionRfqQuoteStatus, OptionRfqRequest,
     OptionRfqStatus, OptionSeries, OptionSeriesFilter, OptionSeriesId, OptionSeriesStatus,
+    OptionTwapChildOrder, OptionTwapChildStatus, OptionTwapOrder, OptionTwapOrderFilter,
+    OptionTwapOrderId, OptionTwapStatus,
 };
 use crate::error::{BackendError, Result};
 use crate::execution::ExecutionTransactionStatus;
@@ -39,6 +41,11 @@ pub struct OptionSeriesStore {
     // ATTACHED-TP-SL-ON-ENTRY-V1 — TP/SL attachment plans keyed
     // by parent order id (each parent has at most one plan).
     option_order_attachment_plans: HashMap<OptionOrderId, OptionOrderAttachmentPlan>,
+    // OPTIONS-TWAP-ORDERS-V1 — TWAP parent orders keyed by twap id.
+    option_twap_orders: HashMap<OptionTwapOrderId, OptionTwapOrder>,
+    // OPTIONS-TWAP-ORDERS-V1 — TWAP child rows keyed by child id;
+    // one row is materialised per due tick, never fabricated ahead.
+    option_twap_child_orders: HashMap<Uuid, OptionTwapChildOrder>,
 }
 
 impl OptionSeriesStore {
@@ -1378,6 +1385,165 @@ impl OptionSeriesStore {
                 && quote.client_quote_id.as_deref() == Some(client_quote_id)
         })
     }
+
+    // ---------------------------------------------------------------
+    // OPTIONS-TWAP-ORDERS-V1 — TWAP parent + child store methods.
+    // ---------------------------------------------------------------
+
+    pub fn insert_option_twap_order(&mut self, twap: OptionTwapOrder) -> OptionTwapOrder {
+        self.option_twap_orders
+            .insert(twap.option_twap_id, twap.clone());
+        twap
+    }
+
+    pub fn get_option_twap_order(&self, id: OptionTwapOrderId) -> Option<OptionTwapOrder> {
+        self.option_twap_orders.get(&id).cloned()
+    }
+
+    pub fn list_option_twap_orders(&self, filter: &OptionTwapOrderFilter) -> Vec<OptionTwapOrder> {
+        let mut out: Vec<OptionTwapOrder> = self
+            .option_twap_orders
+            .values()
+            .filter(|t| filter.matches(t))
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| {
+            b.created_at_ms
+                .cmp(&a.created_at_ms)
+                .then_with(|| a.option_twap_id.cmp(&b.option_twap_id))
+        });
+        out
+    }
+
+    pub fn list_due_option_twap_orders(&self, now_ms: TimestampMs) -> Vec<OptionTwapOrder> {
+        let mut out: Vec<OptionTwapOrder> = self
+            .option_twap_orders
+            .values()
+            .filter(|t| {
+                matches!(
+                    t.status,
+                    OptionTwapStatus::Pending | OptionTwapStatus::Running
+                ) && t.next_execution_at_ms <= now_ms
+                    && t.created_child_count < t.child_count
+            })
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| {
+            a.next_execution_at_ms
+                .cmp(&b.next_execution_at_ms)
+                .then_with(|| a.option_twap_id.cmp(&b.option_twap_id))
+        });
+        out
+    }
+
+    pub fn cancel_option_twap_order(
+        &mut self,
+        id: OptionTwapOrderId,
+        now_ms: TimestampMs,
+    ) -> Result<OptionTwapOrder> {
+        let twap = self
+            .option_twap_orders
+            .get_mut(&id)
+            .ok_or(BackendError::InvalidOptionTwapOrderId)?;
+        match twap.status {
+            OptionTwapStatus::Pending | OptionTwapStatus::Running => {
+                twap.status = OptionTwapStatus::Cancelled;
+                twap.updated_at_ms = now_ms;
+                Ok(twap.clone())
+            }
+            _ => Err(BackendError::InvalidOptionTwapState(
+                "TWAP order is not cancellable".to_string(),
+            )),
+        }
+    }
+
+    pub fn insert_option_twap_child(
+        &mut self,
+        child: OptionTwapChildOrder,
+    ) -> OptionTwapChildOrder {
+        self.option_twap_child_orders
+            .insert(child.option_twap_child_id, child.clone());
+        child
+    }
+
+    pub fn list_option_twap_children(
+        &self,
+        twap_id: OptionTwapOrderId,
+    ) -> Vec<OptionTwapChildOrder> {
+        let mut out: Vec<OptionTwapChildOrder> = self
+            .option_twap_child_orders
+            .values()
+            .filter(|c| c.option_twap_id == twap_id)
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| a.sequence.cmp(&b.sequence));
+        out
+    }
+
+    pub fn child_exists_for_sequence(&self, twap_id: OptionTwapOrderId, sequence: u32) -> bool {
+        self.option_twap_child_orders
+            .values()
+            .any(|c| c.option_twap_id == twap_id && c.sequence == sequence)
+    }
+
+    /// Apply a post-child-submit patch atomically to the parent
+    /// (remaining/filled/created counters + status + next_execution).
+    pub fn apply_option_twap_parent_patch(
+        &mut self,
+        id: OptionTwapOrderId,
+        patch: OptionTwapParentPatch,
+    ) -> Result<OptionTwapOrder> {
+        let twap = self
+            .option_twap_orders
+            .get_mut(&id)
+            .ok_or(BackendError::InvalidOptionTwapOrderId)?;
+        twap.created_child_count = patch.created_child_count;
+        twap.remaining_size_1e8 = patch.remaining_size_1e8;
+        twap.filled_size_1e8 = patch.filled_size_1e8;
+        twap.failed_child_count = patch.failed_child_count;
+        twap.next_execution_at_ms = patch.next_execution_at_ms;
+        twap.status = patch.status;
+        twap.last_error = patch.last_error;
+        twap.updated_at_ms = patch.updated_at_ms;
+        Ok(twap.clone())
+    }
+
+    pub fn apply_option_twap_child_update(
+        &mut self,
+        child_id: Uuid,
+        status: OptionTwapChildStatus,
+        submitted_at_ms: Option<TimestampMs>,
+        child_order_id: Option<OptionOrderId>,
+        filled_size_1e8: crate::types::Size1e8,
+        error_message: Option<String>,
+    ) -> Result<OptionTwapChildOrder> {
+        let child = self
+            .option_twap_child_orders
+            .get_mut(&child_id)
+            .ok_or(BackendError::InvalidOptionTwapChildId)?;
+        child.status = status;
+        child.submitted_at_ms = submitted_at_ms;
+        child.child_order_id = child_order_id;
+        child.filled_size_1e8 = filled_size_1e8;
+        child.error_message = error_message;
+        Ok(child.clone())
+    }
+}
+
+/// Compact patch applied to a TWAP parent after a child is created
+/// or a tick decides no more work is due. Kept as a struct so the
+/// Postgres path and the in-memory path share the exact same set of
+/// mutable fields.
+#[derive(Clone, Debug)]
+pub struct OptionTwapParentPatch {
+    pub created_child_count: u32,
+    pub remaining_size_1e8: crate::types::Size1e8,
+    pub filled_size_1e8: crate::types::Size1e8,
+    pub failed_child_count: u32,
+    pub next_execution_at_ms: TimestampMs,
+    pub status: OptionTwapStatus,
+    pub last_error: Option<String>,
+    pub updated_at_ms: TimestampMs,
 }
 
 fn option_execution_source_key(

@@ -1,6 +1,6 @@
 use super::models::{
-    execution_status_to_str, order_status_to_str, timestamp_to_i64, u64_to_i64, DbExecutionIntent,
-    DbExecutionSimulation, DbOrder, DbTrade,
+    execution_status_to_str, order_status_to_str, timestamp_to_i64, u32_to_i32, u64_to_i64,
+    DbExecutionIntent, DbExecutionSimulation, DbOrder, DbTrade,
 };
 use super::pool;
 use crate::confirmation::{ConfirmationDecision, ConfirmationStatus};
@@ -29,7 +29,8 @@ use crate::options::{
     OptionOrderId, OptionOrderRejection, OptionOrderStatus, OptionReconciliationStatus,
     OptionRfqFill, OptionRfqFillId, OptionRfqId, OptionRfqQuote, OptionRfqQuoteId,
     OptionRfqQuoteSignatureStatus, OptionRfqQuoteStatus, OptionRfqRequest, OptionRfqStatus,
-    OptionSeries, OptionSeriesSource, OptionSeriesStatus,
+    OptionSeries, OptionSeriesSource, OptionSeriesStatus, OptionTwapChildOrder,
+    OptionTwapChildStatus, OptionTwapOrder, OptionTwapOrderId, OptionTwapStatus,
 };
 use crate::reconciliation::{
     normalize_onchain_intent_id, ExecutionReconciliation, ReconciliationCounts,
@@ -4252,6 +4253,215 @@ impl PgRepository {
         rows.into_iter().map(option_rfq_fill_from_row).collect()
     }
 
+    // -----------------------------------------------------------------
+    // OPTIONS-TWAP-ORDERS-V1 — TWAP parent + child persistence.
+    // -----------------------------------------------------------------
+
+    pub async fn insert_option_twap_order(&self, twap: &OptionTwapOrder) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO option_twap_orders (
+                option_twap_id, account, option_series_id, side, size_1e8,
+                remaining_size_1e8, limit_price_1e8, running_time_ms, child_count,
+                child_interval_ms, next_execution_at_ms, started_at_ms, ends_at_ms,
+                status, created_child_count, filled_size_1e8, failed_child_count,
+                client_order_id, last_error, created_at_ms, updated_at_ms
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+                      $14, $15, $16, $17, $18, $19, $20, $21)",
+        )
+        .bind(twap.option_twap_id.to_string())
+        .bind(&twap.account.0)
+        .bind(&twap.option_series_id)
+        .bind(match twap.side {
+            Side::Buy => "buy",
+            Side::Sell => "sell",
+        })
+        .bind(twap.size_1e8.to_string())
+        .bind(twap.remaining_size_1e8.to_string())
+        .bind(twap.limit_price_1e8.to_string())
+        .bind(u64_to_i64("running_time_ms", twap.running_time_ms)?)
+        .bind(u32_to_i32("child_count", twap.child_count)?)
+        .bind(u64_to_i64("child_interval_ms", twap.child_interval_ms)?)
+        .bind(timestamp_to_i64(twap.next_execution_at_ms))
+        .bind(timestamp_to_i64(twap.started_at_ms))
+        .bind(timestamp_to_i64(twap.ends_at_ms))
+        .bind(twap.status.as_str())
+        .bind(u32_to_i32("created_child_count", twap.created_child_count)?)
+        .bind(twap.filled_size_1e8.to_string())
+        .bind(u32_to_i32("failed_child_count", twap.failed_child_count)?)
+        .bind(twap.client_order_id.as_deref())
+        .bind(twap.last_error.as_deref())
+        .bind(timestamp_to_i64(twap.created_at_ms))
+        .bind(timestamp_to_i64(twap.updated_at_ms))
+        .execute(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        Ok(())
+    }
+
+    pub async fn get_option_twap_order(
+        &self,
+        id: OptionTwapOrderId,
+    ) -> Result<Option<OptionTwapOrder>> {
+        let row = sqlx::query(
+            "SELECT option_twap_id, account, option_series_id, side, size_1e8,
+                    remaining_size_1e8, limit_price_1e8, running_time_ms, child_count,
+                    child_interval_ms, next_execution_at_ms, started_at_ms, ends_at_ms,
+                    status, created_child_count, filled_size_1e8, failed_child_count,
+                    client_order_id, last_error, created_at_ms, updated_at_ms
+             FROM option_twap_orders WHERE option_twap_id = $1",
+        )
+        .bind(id.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        row.map(option_twap_order_from_row).transpose()
+    }
+
+    pub async fn list_option_twap_orders(&self) -> Result<Vec<OptionTwapOrder>> {
+        let rows = sqlx::query(
+            "SELECT option_twap_id, account, option_series_id, side, size_1e8,
+                    remaining_size_1e8, limit_price_1e8, running_time_ms, child_count,
+                    child_interval_ms, next_execution_at_ms, started_at_ms, ends_at_ms,
+                    status, created_child_count, filled_size_1e8, failed_child_count,
+                    client_order_id, last_error, created_at_ms, updated_at_ms
+             FROM option_twap_orders
+             ORDER BY created_at_ms DESC, option_twap_id DESC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        rows.into_iter().map(option_twap_order_from_row).collect()
+    }
+
+    pub async fn list_due_option_twap_orders(
+        &self,
+        now_ms: TimestampMs,
+    ) -> Result<Vec<OptionTwapOrder>> {
+        let rows = sqlx::query(
+            "SELECT option_twap_id, account, option_series_id, side, size_1e8,
+                    remaining_size_1e8, limit_price_1e8, running_time_ms, child_count,
+                    child_interval_ms, next_execution_at_ms, started_at_ms, ends_at_ms,
+                    status, created_child_count, filled_size_1e8, failed_child_count,
+                    client_order_id, last_error, created_at_ms, updated_at_ms
+             FROM option_twap_orders
+             WHERE status IN ('pending', 'running')
+               AND next_execution_at_ms <= $1
+               AND created_child_count < child_count
+             ORDER BY next_execution_at_ms ASC, option_twap_id ASC",
+        )
+        .bind(timestamp_to_i64(now_ms))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        rows.into_iter().map(option_twap_order_from_row).collect()
+    }
+
+    pub async fn cancel_option_twap_order(
+        &self,
+        id: OptionTwapOrderId,
+        now_ms: TimestampMs,
+    ) -> Result<OptionTwapOrder> {
+        let result = sqlx::query(
+            "UPDATE option_twap_orders
+             SET status = 'cancelled', updated_at_ms = $2
+             WHERE option_twap_id = $1 AND status IN ('pending', 'running')",
+        )
+        .bind(id.to_string())
+        .bind(timestamp_to_i64(now_ms))
+        .execute(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        if result.rows_affected() != 1 {
+            return Err(BackendError::InvalidOptionTwapState(
+                "TWAP order is not cancellable".to_string(),
+            ));
+        }
+        self.get_option_twap_order(id)
+            .await?
+            .ok_or(BackendError::InvalidOptionTwapOrderId)
+    }
+
+    pub async fn insert_option_twap_child(&self, child: &OptionTwapChildOrder) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO option_twap_child_orders (
+                option_twap_child_id, option_twap_id, sequence, scheduled_at_ms,
+                submitted_at_ms, child_order_id, status, requested_size_1e8,
+                filled_size_1e8, limit_price_1e8, error_message
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+        )
+        .bind(child.option_twap_child_id.to_string())
+        .bind(child.option_twap_id.to_string())
+        .bind(u32_to_i32("sequence", child.sequence)?)
+        .bind(timestamp_to_i64(child.scheduled_at_ms))
+        .bind(child.submitted_at_ms.map(timestamp_to_i64))
+        .bind(child.child_order_id.as_ref().map(|id| id.to_string()))
+        .bind(child.status.as_str())
+        .bind(child.requested_size_1e8.to_string())
+        .bind(child.filled_size_1e8.to_string())
+        .bind(child.limit_price_1e8.to_string())
+        .bind(child.error_message.as_deref())
+        .execute(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        Ok(())
+    }
+
+    pub async fn list_option_twap_children(
+        &self,
+        twap_id: OptionTwapOrderId,
+    ) -> Result<Vec<OptionTwapChildOrder>> {
+        let rows = sqlx::query(
+            "SELECT option_twap_child_id, option_twap_id, sequence, scheduled_at_ms,
+                    submitted_at_ms, child_order_id, status, requested_size_1e8,
+                    filled_size_1e8, limit_price_1e8, error_message
+             FROM option_twap_child_orders
+             WHERE option_twap_id = $1
+             ORDER BY sequence ASC",
+        )
+        .bind(twap_id.to_string())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        rows.into_iter().map(option_twap_child_from_row).collect()
+    }
+
+    pub async fn update_option_twap_parent(
+        &self,
+        id: OptionTwapOrderId,
+        patch: &crate::options::store::OptionTwapParentPatch,
+    ) -> Result<OptionTwapOrder> {
+        sqlx::query(
+            "UPDATE option_twap_orders SET
+                created_child_count = $2,
+                remaining_size_1e8 = $3,
+                filled_size_1e8 = $4,
+                failed_child_count = $5,
+                next_execution_at_ms = $6,
+                status = $7,
+                last_error = $8,
+                updated_at_ms = $9
+             WHERE option_twap_id = $1",
+        )
+        .bind(id.to_string())
+        .bind(u32_to_i32(
+            "created_child_count",
+            patch.created_child_count,
+        )?)
+        .bind(patch.remaining_size_1e8.to_string())
+        .bind(patch.filled_size_1e8.to_string())
+        .bind(u32_to_i32("failed_child_count", patch.failed_child_count)?)
+        .bind(timestamp_to_i64(patch.next_execution_at_ms))
+        .bind(patch.status.as_str())
+        .bind(patch.last_error.as_deref())
+        .bind(timestamp_to_i64(patch.updated_at_ms))
+        .execute(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        self.get_option_twap_order(id)
+            .await?
+            .ok_or(BackendError::InvalidOptionTwapOrderId)
+    }
+
     pub async fn accept_option_rfq_quote_and_insert_fill(
         &self,
         option_rfq_id: OptionRfqId,
@@ -6928,6 +7138,99 @@ fn option_rfq_fill_from_row(row: PgRow) -> Result<OptionRfqFill> {
                 BackendError::Persistence(format!("invalid option RFQ fill size: {error}"))
             })?,
         created_at_ms: row_get(&row, "created_at_ms")?,
+    })
+}
+
+fn option_twap_order_from_row(row: PgRow) -> Result<OptionTwapOrder> {
+    let option_twap_id: String = row_get(&row, "option_twap_id")?;
+    let side: String = row_get(&row, "side")?;
+    let status: String = row_get(&row, "status")?;
+    let running_time_ms: i64 = row_get(&row, "running_time_ms")?;
+    let child_interval_ms: i64 = row_get(&row, "child_interval_ms")?;
+    let child_count: i32 = row_get(&row, "child_count")?;
+    let created_child_count: i32 = row_get(&row, "created_child_count")?;
+    let failed_child_count: i32 = row_get(&row, "failed_child_count")?;
+    Ok(OptionTwapOrder {
+        option_twap_id: option_twap_id
+            .parse()
+            .map_err(|e| BackendError::Persistence(format!("invalid TWAP id: {e}")))?,
+        account: AccountId::new(row_get::<String>(&row, "account")?),
+        option_series_id: row_get(&row, "option_series_id")?,
+        side: parse_side(&side)?,
+        size_1e8: row_get::<String>(&row, "size_1e8")?
+            .parse()
+            .map_err(|e| BackendError::Persistence(format!("invalid TWAP size: {e}")))?,
+        remaining_size_1e8: row_get::<String>(&row, "remaining_size_1e8")?
+            .parse()
+            .map_err(|e| BackendError::Persistence(format!("invalid TWAP remaining: {e}")))?,
+        limit_price_1e8: row_get::<String>(&row, "limit_price_1e8")?
+            .parse()
+            .map_err(|e| BackendError::Persistence(format!("invalid TWAP price: {e}")))?,
+        running_time_ms: u64::try_from(running_time_ms)
+            .map_err(|_| BackendError::Persistence("negative TWAP running_time_ms".to_string()))?,
+        child_count: u32::try_from(child_count)
+            .map_err(|_| BackendError::Persistence("negative TWAP child_count".to_string()))?,
+        child_interval_ms: u64::try_from(child_interval_ms).map_err(|_| {
+            BackendError::Persistence("negative TWAP child_interval_ms".to_string())
+        })?,
+        next_execution_at_ms: row_get(&row, "next_execution_at_ms")?,
+        started_at_ms: row_get(&row, "started_at_ms")?,
+        ends_at_ms: row_get(&row, "ends_at_ms")?,
+        status: OptionTwapStatus::parse(&status)
+            .ok_or_else(|| BackendError::Persistence(format!("invalid TWAP status: {status}")))?,
+        created_child_count: u32::try_from(created_child_count).map_err(|_| {
+            BackendError::Persistence("negative TWAP created_child_count".to_string())
+        })?,
+        filled_size_1e8: row_get::<String>(&row, "filled_size_1e8")?
+            .parse()
+            .map_err(|e| BackendError::Persistence(format!("invalid TWAP filled: {e}")))?,
+        failed_child_count: u32::try_from(failed_child_count).map_err(|_| {
+            BackendError::Persistence("negative TWAP failed_child_count".to_string())
+        })?,
+        client_order_id: row_get(&row, "client_order_id")?,
+        last_error: row_get(&row, "last_error")?,
+        created_at_ms: row_get(&row, "created_at_ms")?,
+        updated_at_ms: row_get(&row, "updated_at_ms")?,
+    })
+}
+
+fn option_twap_child_from_row(row: PgRow) -> Result<OptionTwapChildOrder> {
+    let child_id: String = row_get(&row, "option_twap_child_id")?;
+    let parent_id: String = row_get(&row, "option_twap_id")?;
+    let status: String = row_get(&row, "status")?;
+    let sequence: i32 = row_get(&row, "sequence")?;
+    let child_order_id: Option<String> = row_get(&row, "child_order_id")?;
+    Ok(OptionTwapChildOrder {
+        option_twap_child_id: child_id
+            .parse()
+            .map_err(|e| BackendError::Persistence(format!("invalid TWAP child id: {e}")))?,
+        option_twap_id: parent_id
+            .parse()
+            .map_err(|e| BackendError::Persistence(format!("invalid TWAP parent id: {e}")))?,
+        sequence: u32::try_from(sequence)
+            .map_err(|_| BackendError::Persistence("negative TWAP child sequence".to_string()))?,
+        scheduled_at_ms: row_get(&row, "scheduled_at_ms")?,
+        submitted_at_ms: row_get(&row, "submitted_at_ms")?,
+        child_order_id: child_order_id
+            .map(|id| {
+                id.parse().map_err(|e: uuid::Error| {
+                    BackendError::Persistence(format!("invalid child order id: {e}"))
+                })
+            })
+            .transpose()?,
+        status: OptionTwapChildStatus::parse(&status).ok_or_else(|| {
+            BackendError::Persistence(format!("invalid TWAP child status: {status}"))
+        })?,
+        requested_size_1e8: row_get::<String>(&row, "requested_size_1e8")?
+            .parse()
+            .map_err(|e| BackendError::Persistence(format!("invalid TWAP child size: {e}")))?,
+        filled_size_1e8: row_get::<String>(&row, "filled_size_1e8")?
+            .parse()
+            .map_err(|e| BackendError::Persistence(format!("invalid TWAP child filled: {e}")))?,
+        limit_price_1e8: row_get::<String>(&row, "limit_price_1e8")?
+            .parse()
+            .map_err(|e| BackendError::Persistence(format!("invalid TWAP child price: {e}")))?,
+        error_message: row_get(&row, "error_message")?,
     })
 }
 

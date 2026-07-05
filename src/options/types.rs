@@ -45,6 +45,18 @@ pub struct OptionsConfig {
     pub execution_require_simulation_ok: bool,
     pub execution_broadcast_gas_limit: u64,
     pub execution_gas_safety_bps: u32,
+    /// OPTIONS-TWAP-ORDERS-V1 — master gate for the Options TWAP
+    /// parent-order + child-tick flow. Default off; every TWAP
+    /// service function checks this before touching state.
+    pub twap_enabled: bool,
+    /// Maximum number of child orders per TWAP parent (safety cap).
+    pub twap_max_child_count: u32,
+    /// Maximum running time in milliseconds (safety cap).
+    pub twap_max_running_time_ms: u64,
+    /// Minimum interval between child ticks in milliseconds
+    /// (safety cap; child_interval = running_time / child_count
+    /// must be >= this).
+    pub twap_min_child_interval_ms: u64,
 }
 
 pub const OPTION_EXECUTION_GAS_SAFETY_BPS_MIN: u32 = 10_000;
@@ -93,6 +105,10 @@ impl OptionsConfig {
             execution_require_simulation_ok: true,
             execution_broadcast_gas_limit: 0,
             execution_gas_safety_bps: OPTION_EXECUTION_GAS_SAFETY_BPS_DEFAULT,
+            twap_enabled: false,
+            twap_max_child_count: 50,
+            twap_max_running_time_ms: 24 * 60 * 60 * 1_000, // 24 hours
+            twap_min_child_interval_ms: 10_000,             // 10 seconds
         }
     }
 
@@ -1353,4 +1369,152 @@ pub struct OptionOrderbookSnapshot {
 pub struct OptionOrderbookLevel {
     pub price_1e8: String,
     pub size_1e8: String,
+}
+
+// ---------------------------------------------------------------------
+// OPTIONS-TWAP-ORDERS-V1 — TWAP parent + child domain types.
+// ---------------------------------------------------------------------
+
+pub type OptionTwapOrderId = Uuid;
+pub type OptionTwapChildId = Uuid;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OptionTwapStatus {
+    Pending,
+    Running,
+    Completed,
+    Cancelled,
+    Failed,
+    Expired,
+}
+
+impl OptionTwapStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Cancelled => "cancelled",
+            Self::Failed => "failed",
+            Self::Expired => "expired",
+        }
+    }
+
+    pub fn parse(v: &str) -> Option<Self> {
+        Some(match v {
+            "pending" => Self::Pending,
+            "running" => Self::Running,
+            "completed" => Self::Completed,
+            "cancelled" => Self::Cancelled,
+            "failed" => Self::Failed,
+            "expired" => Self::Expired,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OptionTwapChildStatus {
+    Scheduled,
+    Submitted,
+    Filled,
+    PartiallyFilled,
+    Rejected,
+    Expired,
+    Failed,
+}
+
+impl OptionTwapChildStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Scheduled => "scheduled",
+            Self::Submitted => "submitted",
+            Self::Filled => "filled",
+            Self::PartiallyFilled => "partially_filled",
+            Self::Rejected => "rejected",
+            Self::Expired => "expired",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub fn parse(v: &str) -> Option<Self> {
+        Some(match v {
+            "scheduled" => Self::Scheduled,
+            "submitted" => Self::Submitted,
+            "filled" => Self::Filled,
+            "partially_filled" => Self::PartiallyFilled,
+            "rejected" => Self::Rejected,
+            "expired" => Self::Expired,
+            "failed" => Self::Failed,
+            _ => return None,
+        })
+    }
+}
+
+/// OPTIONS-TWAP-ORDERS-V1 — persisted TWAP parent order.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OptionTwapOrder {
+    pub option_twap_id: OptionTwapOrderId,
+    pub account: AccountId,
+    pub option_series_id: OptionSeriesId,
+    pub side: Side,
+    pub size_1e8: Size1e8,
+    pub remaining_size_1e8: Size1e8,
+    pub limit_price_1e8: Price1e8,
+    pub running_time_ms: u64,
+    pub child_count: u32,
+    pub child_interval_ms: u64,
+    pub next_execution_at_ms: TimestampMs,
+    pub started_at_ms: TimestampMs,
+    pub ends_at_ms: TimestampMs,
+    pub status: OptionTwapStatus,
+    pub created_child_count: u32,
+    pub filled_size_1e8: Size1e8,
+    pub failed_child_count: u32,
+    pub client_order_id: Option<String>,
+    pub last_error: Option<String>,
+    pub created_at_ms: TimestampMs,
+    pub updated_at_ms: TimestampMs,
+}
+
+/// OPTIONS-TWAP-ORDERS-V1 — persisted TWAP child record. One row per
+/// scheduled child; the child_order_id is populated after the
+/// underlying options order is submitted successfully.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OptionTwapChildOrder {
+    pub option_twap_child_id: OptionTwapChildId,
+    pub option_twap_id: OptionTwapOrderId,
+    pub sequence: u32,
+    pub scheduled_at_ms: TimestampMs,
+    pub submitted_at_ms: Option<TimestampMs>,
+    pub child_order_id: Option<OptionOrderId>,
+    pub status: OptionTwapChildStatus,
+    pub requested_size_1e8: Size1e8,
+    pub filled_size_1e8: Size1e8,
+    pub limit_price_1e8: Price1e8,
+    pub error_message: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct OptionTwapOrderFilter {
+    pub account: Option<AccountId>,
+    pub option_twap_id: Option<OptionTwapOrderId>,
+}
+
+impl OptionTwapOrderFilter {
+    pub fn matches(&self, twap: &OptionTwapOrder) -> bool {
+        if let Some(account) = &self.account {
+            if !twap.account.0.eq_ignore_ascii_case(&account.0) {
+                return false;
+            }
+        }
+        if let Some(id) = self.option_twap_id {
+            if twap.option_twap_id != id {
+                return false;
+            }
+        }
+        true
+    }
 }

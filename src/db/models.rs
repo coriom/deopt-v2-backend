@@ -284,6 +284,11 @@ pub fn u64_to_i64(field: &str, value: u64) -> Result<i64> {
         .map_err(|_| BackendError::Persistence(format!("{field} exceeds BIGINT range")))
 }
 
+pub fn u32_to_i32(field: &str, value: u32) -> Result<i32> {
+    i32::try_from(value)
+        .map_err(|_| BackendError::Persistence(format!("{field} exceeds INT range")))
+}
+
 fn i64_to_u64(field: &str, value: i64) -> Result<u64> {
     u64::try_from(value)
         .map_err(|_| BackendError::Persistence(format!("{field} cannot be negative")))

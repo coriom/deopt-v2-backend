@@ -99,7 +99,8 @@ pub use types::{
     OptionReconciliationStatus, OptionRfqFill, OptionRfqFillFilter, OptionRfqFillId, OptionRfqId,
     OptionRfqQuote, OptionRfqQuoteId, OptionRfqQuoteSignatureMode, OptionRfqQuoteSignatureStatus,
     OptionRfqQuoteStatus, OptionRfqRequest, OptionRfqStatus, OptionSeries, OptionSeriesFilter,
-    OptionSeriesId, OptionSeriesSource, OptionSeriesStatus, OptionsConfig,
-    OPTION_EXECUTION_GAS_SAFETY_BPS_DEFAULT, OPTION_EXECUTION_GAS_SAFETY_BPS_MAX,
-    OPTION_EXECUTION_GAS_SAFETY_BPS_MIN,
+    OptionSeriesId, OptionSeriesSource, OptionSeriesStatus, OptionTwapChildId,
+    OptionTwapChildOrder, OptionTwapChildStatus, OptionTwapOrder, OptionTwapOrderFilter,
+    OptionTwapOrderId, OptionTwapStatus, OptionsConfig, OPTION_EXECUTION_GAS_SAFETY_BPS_DEFAULT,
+    OPTION_EXECUTION_GAS_SAFETY_BPS_MAX, OPTION_EXECUTION_GAS_SAFETY_BPS_MIN,
 };

@@ -58,6 +58,9 @@ pub enum WriteAuthAction {
     OptionRfqAccept,
     OptionRfqCancel,
     OptionExecutionIntentSignatureSubmit,
+    /// OPTIONS-TWAP-ORDERS-V1 — taker create/cancel of a parent TWAP order.
+    OptionTwapCreate,
+    OptionTwapCancel,
 }
 
 impl WriteAuthAction {
@@ -74,6 +77,8 @@ impl WriteAuthAction {
             Self::OptionExecutionIntentSignatureSubmit => {
                 "OPTION_EXECUTION_INTENT_SIGNATURE_SUBMIT"
             }
+            Self::OptionTwapCreate => "OPTION_TWAP_CREATE",
+            Self::OptionTwapCancel => "OPTION_TWAP_CANCEL",
         }
     }
 
@@ -90,6 +95,8 @@ impl WriteAuthAction {
             "OPTION_EXECUTION_INTENT_SIGNATURE_SUBMIT" => {
                 Self::OptionExecutionIntentSignatureSubmit
             }
+            "OPTION_TWAP_CREATE" => Self::OptionTwapCreate,
+            "OPTION_TWAP_CANCEL" => Self::OptionTwapCancel,
             _ => return None,
         })
     }

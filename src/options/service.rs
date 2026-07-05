@@ -4545,6 +4545,412 @@ fn aggregate_levels(orders: &[OptionOrder], side: Side) -> Vec<OptionOrderbookLe
     .collect()
 }
 
+// =====================================================================
+// OPTIONS-TWAP-ORDERS-V1 — TWAP parent + child service.
+// =====================================================================
+
+fn ensure_option_twap_enabled(state: &AppState) -> Result<()> {
+    if !state.options_config.twap_enabled {
+        return Err(BackendError::OptionTwapDisabled);
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CreateOptionTwapInput {
+    pub account: AccountId,
+    pub option_series_id: OptionSeriesId,
+    pub side: Side,
+    pub size_1e8: crate::types::Size1e8,
+    pub limit_price_1e8: crate::types::Price1e8,
+    pub running_time_ms: u64,
+    pub child_count: u32,
+    pub client_order_id: Option<String>,
+}
+
+pub async fn create_option_twap_order(
+    state: &AppState,
+    input: CreateOptionTwapInput,
+) -> Result<crate::options::OptionTwapOrder> {
+    ensure_option_twap_enabled(state)?;
+    validate_account(&input.account)?;
+    if input.size_1e8 == 0 {
+        return Err(BackendError::InvalidOptionTwapParams(
+            "size must be > 0".to_string(),
+        ));
+    }
+    if input.limit_price_1e8 == 0 {
+        return Err(BackendError::InvalidOptionTwapParams(
+            "limit price must be > 0".to_string(),
+        ));
+    }
+    if input.running_time_ms == 0 {
+        return Err(BackendError::InvalidOptionTwapParams(
+            "running_time_ms must be > 0".to_string(),
+        ));
+    }
+    if input.child_count == 0 {
+        return Err(BackendError::InvalidOptionTwapParams(
+            "child_count must be > 0".to_string(),
+        ));
+    }
+    if input.child_count > state.options_config.twap_max_child_count {
+        return Err(BackendError::InvalidOptionTwapParams(format!(
+            "child_count exceeds max ({})",
+            state.options_config.twap_max_child_count
+        )));
+    }
+    if input.running_time_ms > state.options_config.twap_max_running_time_ms {
+        return Err(BackendError::InvalidOptionTwapParams(format!(
+            "running_time_ms exceeds max ({}ms)",
+            state.options_config.twap_max_running_time_ms
+        )));
+    }
+    let child_interval_ms = input.running_time_ms / (input.child_count as u64);
+    if child_interval_ms < state.options_config.twap_min_child_interval_ms {
+        return Err(BackendError::InvalidOptionTwapParams(format!(
+            "child_interval too short (min {}ms)",
+            state.options_config.twap_min_child_interval_ms
+        )));
+    }
+    // Verify the option series exists + is active.
+    let series = get_option_series(state, &input.option_series_id).await?;
+    if series.effective_status(now_sec(now_ms())?) != crate::options::OptionSeriesStatus::Active {
+        return Err(BackendError::InvalidOptionSeriesState(
+            "option series is not active".to_string(),
+        ));
+    }
+
+    let now = now_ms();
+    let twap = crate::options::OptionTwapOrder {
+        option_twap_id: uuid::Uuid::new_v4(),
+        account: input.account,
+        option_series_id: input.option_series_id,
+        side: input.side,
+        size_1e8: input.size_1e8,
+        remaining_size_1e8: input.size_1e8,
+        limit_price_1e8: input.limit_price_1e8,
+        running_time_ms: input.running_time_ms,
+        child_count: input.child_count,
+        child_interval_ms,
+        // First child fires one interval after creation for a
+        // clean spread across the running window.
+        next_execution_at_ms: now + (child_interval_ms as i64),
+        started_at_ms: now,
+        ends_at_ms: now + (input.running_time_ms as i64),
+        status: crate::options::OptionTwapStatus::Pending,
+        created_child_count: 0,
+        filled_size_1e8: 0,
+        failed_child_count: 0,
+        client_order_id: input.client_order_id,
+        last_error: None,
+        created_at_ms: now,
+        updated_at_ms: now,
+    };
+
+    if let Some(repository) = state.repository.clone() {
+        repository.insert_option_twap_order(&twap).await?;
+        return repository
+            .get_option_twap_order(twap.option_twap_id)
+            .await?
+            .ok_or(BackendError::InvalidOptionTwapOrderId);
+    }
+    let stored = state
+        .options_store
+        .lock()
+        .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?
+        .insert_option_twap_order(twap);
+    Ok(stored)
+}
+
+pub async fn get_option_twap_order(
+    state: &AppState,
+    id: crate::options::OptionTwapOrderId,
+) -> Result<crate::options::OptionTwapOrder> {
+    ensure_option_twap_enabled(state)?;
+    if let Some(repository) = state.repository.clone() {
+        return repository
+            .get_option_twap_order(id)
+            .await?
+            .ok_or(BackendError::InvalidOptionTwapOrderId);
+    }
+    state
+        .options_store
+        .lock()
+        .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?
+        .get_option_twap_order(id)
+        .ok_or(BackendError::InvalidOptionTwapOrderId)
+}
+
+pub async fn list_option_twap_orders(
+    state: &AppState,
+    filter: crate::options::OptionTwapOrderFilter,
+) -> Result<Vec<crate::options::OptionTwapOrder>> {
+    ensure_option_twap_enabled(state)?;
+    if let Some(repository) = state.repository.clone() {
+        return Ok(repository
+            .list_option_twap_orders()
+            .await?
+            .into_iter()
+            .filter(|t| filter.matches(t))
+            .collect());
+    }
+    Ok(state
+        .options_store
+        .lock()
+        .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?
+        .list_option_twap_orders(&filter))
+}
+
+pub async fn list_option_twap_children(
+    state: &AppState,
+    twap_id: crate::options::OptionTwapOrderId,
+) -> Result<Vec<crate::options::OptionTwapChildOrder>> {
+    ensure_option_twap_enabled(state)?;
+    if let Some(repository) = state.repository.clone() {
+        return repository.list_option_twap_children(twap_id).await;
+    }
+    Ok(state
+        .options_store
+        .lock()
+        .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?
+        .list_option_twap_children(twap_id))
+}
+
+pub async fn cancel_option_twap_order(
+    state: &AppState,
+    id: crate::options::OptionTwapOrderId,
+) -> Result<crate::options::OptionTwapOrder> {
+    ensure_option_twap_enabled(state)?;
+    let now = now_ms();
+    if let Some(repository) = state.repository.clone() {
+        return repository.cancel_option_twap_order(id, now).await;
+    }
+    state
+        .options_store
+        .lock()
+        .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?
+        .cancel_option_twap_order(id, now)
+}
+
+/// OPTIONS-TWAP-ORDERS-V1 — admin tick. Scans due Pending/Running
+/// TWAP parents whose next_execution_at_ms is in the past, materialises
+/// one child per parent, submits it as a real Options order via
+/// `submit_option_order` (TIF=IOC), records the outcome, advances
+/// `next_execution_at_ms`, and finalises Completed after the last
+/// scheduled child. Idempotent: the sequence-uniqueness check prevents
+/// duplicate child creation on repeated ticks.
+///
+/// Returns the number of children created in this tick (for admin
+/// observability).
+pub async fn tick_option_twap_orders(state: &AppState) -> Result<TickOptionTwapOutcome> {
+    ensure_option_twap_enabled(state)?;
+    let now = now_ms();
+
+    let due: Vec<crate::options::OptionTwapOrder> =
+        if let Some(repository) = state.repository.clone() {
+            repository.list_due_option_twap_orders(now).await?
+        } else {
+            state
+                .options_store
+                .lock()
+                .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?
+                .list_due_option_twap_orders(now)
+        };
+
+    let mut children_created: u32 = 0;
+    let mut children_failed: u32 = 0;
+    let mut parents_completed: u32 = 0;
+
+    for twap in due {
+        // Cancelled parents can slip in if a cancel raced with tick;
+        // the store filter excludes them, but guard defensively.
+        if !matches!(
+            twap.status,
+            crate::options::OptionTwapStatus::Pending | crate::options::OptionTwapStatus::Running
+        ) {
+            continue;
+        }
+        let sequence = twap.created_child_count;
+        if sequence >= twap.child_count {
+            continue;
+        }
+
+        // Idempotency guard: skip if a child for this sequence already
+        // exists (repeated tick or crash-recovery scenario).
+        let existing_children = if let Some(repository) = state.repository.clone() {
+            repository
+                .list_option_twap_children(twap.option_twap_id)
+                .await?
+        } else {
+            state
+                .options_store
+                .lock()
+                .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?
+                .list_option_twap_children(twap.option_twap_id)
+        };
+        if existing_children.iter().any(|c| c.sequence == sequence) {
+            continue;
+        }
+
+        // Deterministic child size: floor(size / child_count) each,
+        // with any remainder rolled into the final child so the
+        // total dispatched equals the parent size exactly.
+        let base_size = twap.size_1e8 / (twap.child_count as u128);
+        let is_last = sequence + 1 == twap.child_count;
+        let child_size = if is_last {
+            twap.remaining_size_1e8
+        } else {
+            base_size
+        };
+
+        let child_row = crate::options::OptionTwapChildOrder {
+            option_twap_child_id: uuid::Uuid::new_v4(),
+            option_twap_id: twap.option_twap_id,
+            sequence,
+            scheduled_at_ms: twap.next_execution_at_ms,
+            submitted_at_ms: Some(now),
+            child_order_id: None,
+            status: crate::options::OptionTwapChildStatus::Scheduled,
+            requested_size_1e8: child_size,
+            filled_size_1e8: 0,
+            limit_price_1e8: twap.limit_price_1e8,
+            error_message: None,
+        };
+
+        // Submit the child as a real Options order — TIF=IOC keeps
+        // any unfilled remainder from resting as a stale hidden order.
+        let submit_input = SubmitOptionOrderInput {
+            option_series_id: twap.option_series_id.clone(),
+            account: twap.account.clone(),
+            side: twap.side,
+            price_1e8: twap.limit_price_1e8,
+            size_1e8: child_size,
+            time_in_force: crate::types::TimeInForce::Ioc,
+            post_only: false,
+            client_order_id: twap.client_order_id.clone(),
+            nonce: None,
+            deadline_ms: None,
+            signature: None,
+            attached_tp_sl: None,
+        };
+
+        let (final_child_status, child_order_id_opt, filled_this_child, err_msg) =
+            match submit_option_order(state, submit_input).await {
+                Ok(outcome) => {
+                    let filled: crate::types::Size1e8 =
+                        outcome.fills.iter().map(|f| f.size_1e8).sum();
+                    let final_status = if filled == 0 {
+                        crate::options::OptionTwapChildStatus::Rejected
+                    } else if filled >= child_size {
+                        crate::options::OptionTwapChildStatus::Filled
+                    } else {
+                        crate::options::OptionTwapChildStatus::PartiallyFilled
+                    };
+                    (final_status, Some(outcome.order.order_id), filled, None)
+                }
+                Err(error) => (
+                    crate::options::OptionTwapChildStatus::Failed,
+                    None,
+                    0,
+                    Some(error.to_string()),
+                ),
+            };
+
+        // Persist the child row + final status update.
+        if let Some(repository) = state.repository.clone() {
+            let mut persisted = child_row.clone();
+            persisted.status = final_child_status;
+            persisted.child_order_id = child_order_id_opt;
+            persisted.filled_size_1e8 = filled_this_child;
+            persisted.error_message = err_msg.clone();
+            repository.insert_option_twap_child(&persisted).await?;
+        } else {
+            let mut store = state
+                .options_store
+                .lock()
+                .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?;
+            let mut inserted = store.insert_option_twap_child(child_row.clone());
+            inserted = store.apply_option_twap_child_update(
+                inserted.option_twap_child_id,
+                final_child_status,
+                Some(now),
+                child_order_id_opt,
+                filled_this_child,
+                err_msg.clone(),
+            )?;
+            let _ = inserted;
+        }
+
+        let is_terminal_failure = matches!(
+            final_child_status,
+            crate::options::OptionTwapChildStatus::Failed
+        );
+        let new_created = sequence + 1;
+        let new_remaining = twap.remaining_size_1e8.saturating_sub(filled_this_child);
+        let new_filled = twap.filled_size_1e8 + filled_this_child;
+        let new_failed = twap.failed_child_count + if is_terminal_failure { 1 } else { 0 };
+        let all_done = new_created >= twap.child_count;
+        let new_status = if all_done {
+            crate::options::OptionTwapStatus::Completed
+        } else {
+            crate::options::OptionTwapStatus::Running
+        };
+        // Advance next_execution_at_ms by exactly one interval — but
+        // never leave it in the past. If ticks fell behind (or a test
+        // forced the timer back), clamp to `now + interval` so the
+        // next child fires after a full interval instead of firing
+        // immediately on the very next tick.
+        let strict_advance = twap.next_execution_at_ms + (twap.child_interval_ms as i64);
+        let now_advance = now + (twap.child_interval_ms as i64);
+        let new_next = strict_advance.max(now_advance);
+
+        let patch = crate::options::store::OptionTwapParentPatch {
+            created_child_count: new_created,
+            remaining_size_1e8: new_remaining,
+            filled_size_1e8: new_filled,
+            failed_child_count: new_failed,
+            next_execution_at_ms: new_next,
+            status: new_status,
+            last_error: err_msg,
+            updated_at_ms: now,
+        };
+
+        if let Some(repository) = state.repository.clone() {
+            repository
+                .update_option_twap_parent(twap.option_twap_id, &patch)
+                .await?;
+        } else {
+            state
+                .options_store
+                .lock()
+                .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?
+                .apply_option_twap_parent_patch(twap.option_twap_id, patch)?;
+        }
+
+        if is_terminal_failure {
+            children_failed += 1;
+        }
+        children_created += 1;
+        if all_done {
+            parents_completed += 1;
+        }
+    }
+
+    Ok(TickOptionTwapOutcome {
+        children_created,
+        children_failed,
+        parents_completed,
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TickOptionTwapOutcome {
+    pub children_created: u32,
+    pub children_failed: u32,
+    pub parents_completed: u32,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
