@@ -7454,6 +7454,8 @@ mod tests {
             sell_order_id: OrderId(Uuid::from_u128(202)),
             buyer: AccountId::new("0x0000000000000000000000000000000000000001"),
             seller: AccountId::new("0x0000000000000000000000000000000000000002"),
+            buyer_subaccount_id: 1,
+            seller_subaccount_id: 1,
             maker_order_id: OrderId(Uuid::from_u128(202)),
             taker_order_id: OrderId(Uuid::from_u128(201)),
             taker_side: Side::Buy,

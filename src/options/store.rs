@@ -1718,6 +1718,12 @@ fn option_fill_from_match(
         sell_order_id: sell_order.order_id,
         buyer: buy_order.account.clone(),
         seller: sell_order.account.clone(),
+        // SUBACCOUNTS-OPTIONS-ROUTING-V2 — thread each side's
+        // subaccount from its owning order. When a v1 counterparty
+        // trades against a v2 counterparty, this preserves each
+        // side's identity independently.
+        buyer_subaccount_id: buy_order.subaccount_id,
+        seller_subaccount_id: sell_order.subaccount_id,
         maker_order_id: maker.order_id,
         taker_order_id: incoming.order_id,
         taker_side: incoming.side,

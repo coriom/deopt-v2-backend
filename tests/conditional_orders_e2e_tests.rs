@@ -685,6 +685,7 @@ async fn reduced_position_caps_child_quantity() {
             option_series_id: Some(series.clone()),
             account: Some(account(HOLDER)),
             order_id: None,
+            subaccount_id: None,
         });
     let signed: i128 = fills.iter().fold(0i128, |acc, f| {
         if f.buyer == account(HOLDER) {
@@ -748,6 +749,7 @@ async fn ioc_no_liquidity_marks_failed_with_no_liquidity_reason() {
             option_series_id: Some(series.clone()),
             account: Some(account(HOLDER)),
             order_id: None,
+            subaccount_id: None,
         });
     let signed: i128 = fills.iter().fold(0i128, |acc, f| {
         if f.buyer == account(HOLDER) {

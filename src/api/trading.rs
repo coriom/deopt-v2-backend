@@ -768,6 +768,7 @@ where
             option_series_id: Some(series.option_series_id.clone()),
             account: None,
             order_id: None,
+            subaccount_id: None,
         };
         list_option_fills_service(state, filter)
             .await
@@ -1259,6 +1260,7 @@ where
             option_series_id: None,
             account: Some(acct.clone()),
             order_id: None,
+            subaccount_id: None,
         },
     )
     .await
@@ -1430,6 +1432,7 @@ where
             option_series_id: None,
             account: Some(acct.clone()),
             order_id: None,
+            subaccount_id: None,
         },
     )
     .await
@@ -1900,6 +1903,7 @@ pub async fn account_history(
             option_series_id: None,
             account: Some(acct.clone()),
             order_id: None,
+            subaccount_id: None,
         },
     )
     .await
@@ -2157,6 +2161,7 @@ async fn trades_rows_for(
             option_series_id: None,
             account: Some(acct.clone()),
             order_id: None,
+            subaccount_id: None,
         },
     )
     .await
@@ -2448,6 +2453,7 @@ pub async fn leaderboard(
             option_series_id: None,
             account: None,
             order_id: None,
+            subaccount_id: None,
         },
     )
     .await
@@ -2568,6 +2574,7 @@ where
             option_series_id: Some(series.option_series_id.clone()),
             account: Some(acct.clone()),
             order_id: None,
+            subaccount_id: None,
         },
     )
     .await
@@ -3476,6 +3483,8 @@ mod tests {
                 sell_order_id: oid(),
                 buyer: alice.clone(),
                 seller: bob.clone(),
+                buyer_subaccount_id: 1,
+                seller_subaccount_id: 1,
                 maker_order_id: oid(),
                 taker_order_id: oid(),
                 taker_side: Side::Buy,
@@ -3490,6 +3499,8 @@ mod tests {
                 sell_order_id: oid(),
                 buyer: carol.clone(),
                 seller: alice.clone(),
+                buyer_subaccount_id: 1,
+                seller_subaccount_id: 1,
                 maker_order_id: oid(),
                 taker_order_id: oid(),
                 taker_side: Side::Buy,

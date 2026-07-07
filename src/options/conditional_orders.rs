@@ -502,6 +502,7 @@ pub fn create_conditional_orders_in_store(
         option_series_id: Some(series.option_series_id.clone()),
         account: Some(input.account.clone()),
         order_id: None,
+        subaccount_id: None,
     });
     let signed = compute_position_signed_1e8(&fills, &input.account);
     let position = classify_reducible(signed)
@@ -764,6 +765,7 @@ pub fn execute_triggered_in_store(
         option_series_id: Some(order.option_series_id.clone()),
         account: Some(order.account.clone()),
         order_id: None,
+        subaccount_id: None,
     });
     let signed = compute_position_signed_1e8(&fills, &order.account);
     let live = classify_reducible(signed);

@@ -1060,6 +1060,18 @@ pub struct OptionFill {
     pub sell_order_id: OptionOrderId,
     pub buyer: AccountId,
     pub seller: AccountId,
+    /// SUBACCOUNTS-OPTIONS-ROUTING-V2 — the buyer's `(owner,
+    /// subaccount_id)` at match time. Defaults to `1` for every
+    /// pre-migration row (via DB DEFAULT 1 from migration
+    /// `0039_options_subaccounts.sql`) and for every wallet-only
+    /// (v1) counterparty.
+    #[serde(default = "one_subaccount_id")]
+    pub buyer_subaccount_id: u32,
+    /// SUBACCOUNTS-OPTIONS-ROUTING-V2 — the seller's `(owner,
+    /// subaccount_id)` at match time. Same default semantics as
+    /// `buyer_subaccount_id`.
+    #[serde(default = "one_subaccount_id")]
+    pub seller_subaccount_id: u32,
     pub maker_order_id: OptionOrderId,
     pub taker_order_id: OptionOrderId,
     pub taker_side: Side,
@@ -1264,6 +1276,14 @@ pub struct OptionFillFilter {
     pub option_series_id: Option<OptionSeriesId>,
     pub account: Option<AccountId>,
     pub order_id: Option<OptionOrderId>,
+    /// SUBACCOUNTS-OPTIONS-ROUTING-V2 — subaccount filter. Applied
+    /// side-by-side with `account`: if the caller is looking at
+    /// `(account=X, subaccount_id=N)`, the fill matches when:
+    ///   * `buyer == X && buyer_subaccount_id == N`, OR
+    ///   * `seller == X && seller_subaccount_id == N`.
+    /// When `account` is provided and `subaccount_id` is `None`, the
+    /// route layer defaults to `Some(1)` for backward compatibility.
+    pub subaccount_id: Option<u32>,
 }
 
 /// OPTIONS-RFQ-TRADES-FEED-V1 — filter for the public
@@ -1306,10 +1326,22 @@ impl OptionFillFilter {
             }
         }
         if let Some(account) = &self.account {
-            if !fill.buyer.0.eq_ignore_ascii_case(&account.0)
-                && !fill.seller.0.eq_ignore_ascii_case(&account.0)
-            {
+            let account_lc = &account.0;
+            let is_buyer = fill.buyer.0.eq_ignore_ascii_case(account_lc);
+            let is_seller = fill.seller.0.eq_ignore_ascii_case(account_lc);
+            if !is_buyer && !is_seller {
                 return false;
+            }
+            // SUBACCOUNTS-OPTIONS-ROUTING-V2 — enforce subaccount on
+            // whichever side matched `account`. If both sides match
+            // (a self-trade), either side's subaccount id may satisfy
+            // the filter.
+            if let Some(subaccount_id) = self.subaccount_id {
+                let buyer_matches = is_buyer && fill.buyer_subaccount_id == subaccount_id;
+                let seller_matches = is_seller && fill.seller_subaccount_id == subaccount_id;
+                if !buyer_matches && !seller_matches {
+                    return false;
+                }
             }
         }
         if let Some(order_id) = self.order_id {

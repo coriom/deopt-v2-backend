@@ -139,6 +139,7 @@ async fn snapshot_account_fills(state: &AppState, address: &str) -> Result<Value
         option_series_id: None,
         account: Some(AccountId::new(address.to_lowercase())),
         order_id: None,
+        subaccount_id: None,
     };
     match list_option_fills_service(state, filter).await {
         Ok(fills) => Ok(serde_json::json!({

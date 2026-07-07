@@ -3110,6 +3110,7 @@ impl PgRepository {
     pub async fn list_option_fills(&self) -> Result<Vec<OptionFill>> {
         let rows = sqlx::query(
             "SELECT fill_id, option_series_id, buy_order_id, sell_order_id, buyer, seller,
+                    buyer_subaccount_id, seller_subaccount_id,
                     maker_order_id, taker_order_id, taker_side, price_1e8, size_1e8,
                     created_at_ms
              FROM option_fills
@@ -3131,6 +3132,7 @@ impl PgRepository {
     ) -> Result<Vec<OptionFill>> {
         let rows = sqlx::query(
             "SELECT fill_id, option_series_id, buy_order_id, sell_order_id, buyer, seller,
+                    buyer_subaccount_id, seller_subaccount_id,
                     maker_order_id, taker_order_id, taker_side, price_1e8, size_1e8,
                     created_at_ms
              FROM option_fills
@@ -3149,6 +3151,7 @@ impl PgRepository {
     pub async fn get_option_fill(&self, fill_id: OptionFillId) -> Result<Option<OptionFill>> {
         let row = sqlx::query(
             "SELECT fill_id, option_series_id, buy_order_id, sell_order_id, buyer, seller,
+                    buyer_subaccount_id, seller_subaccount_id,
                     maker_order_id, taker_order_id, taker_side, price_1e8, size_1e8,
                     created_at_ms
              FROM option_fills
@@ -3164,6 +3167,7 @@ impl PgRepository {
     pub async fn option_fills_for_order(&self, order_id: OptionOrderId) -> Result<Vec<OptionFill>> {
         let rows = sqlx::query(
             "SELECT fill_id, option_series_id, buy_order_id, sell_order_id, buyer, seller,
+                    buyer_subaccount_id, seller_subaccount_id,
                     maker_order_id, taker_order_id, taker_side, price_1e8, size_1e8,
                     created_at_ms
              FROM option_fills
@@ -6717,6 +6721,26 @@ fn option_fill_from_row(row: PgRow) -> Result<OptionFill> {
         })?,
         buyer: AccountId::new(row_get::<String>(&row, "buyer")?),
         seller: AccountId::new(row_get::<String>(&row, "seller")?),
+        // SUBACCOUNTS-OPTIONS-ROUTING-V2 — columns added by migration
+        // 0039_options_subaccounts.sql with `DEFAULT 1`.
+        buyer_subaccount_id: {
+            let id: i32 = row_get(&row, "buyer_subaccount_id")?;
+            if id < 1 {
+                return Err(BackendError::Persistence(
+                    "option fill buyer_subaccount_id must be >= 1".to_string(),
+                ));
+            }
+            id as u32
+        },
+        seller_subaccount_id: {
+            let id: i32 = row_get(&row, "seller_subaccount_id")?;
+            if id < 1 {
+                return Err(BackendError::Persistence(
+                    "option fill seller_subaccount_id must be >= 1".to_string(),
+                ));
+            }
+            id as u32
+        },
         maker_order_id: maker_order_id.parse().map_err(|error| {
             BackendError::Persistence(format!("invalid option fill maker order id: {error}"))
         })?,
@@ -7388,8 +7412,9 @@ async fn insert_option_fill_tx(
     sqlx::query(
         "INSERT INTO option_fills (
             fill_id, option_series_id, buy_order_id, sell_order_id, buyer, seller,
-            maker_order_id, taker_order_id, taker_side, price_1e8, size_1e8, created_at_ms
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+            maker_order_id, taker_order_id, taker_side, price_1e8, size_1e8, created_at_ms,
+            buyer_subaccount_id, seller_subaccount_id
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
     )
     .bind(fill.fill_id.to_string())
     .bind(&fill.option_series_id)
@@ -7403,6 +7428,8 @@ async fn insert_option_fill_tx(
     .bind(fill.price_1e8.to_string())
     .bind(fill.size_1e8.to_string())
     .bind(timestamp_to_i64(fill.created_at_ms))
+    .bind(u32_to_i32("buyer_subaccount_id", fill.buyer_subaccount_id).unwrap_or(1))
+    .bind(u32_to_i32("seller_subaccount_id", fill.seller_subaccount_id).unwrap_or(1))
     .execute(&mut **tx)
     .await
     .map_err(|error| BackendError::Persistence(error.to_string()))?;
@@ -7487,6 +7514,12 @@ fn option_fill_from_match(
         sell_order_id: sell_order.order_id,
         buyer: buy_order.account.clone(),
         seller: sell_order.account.clone(),
+        // SUBACCOUNTS-OPTIONS-ROUTING-V2 — repository-level match
+        // helper mirrors `option_fill_from_match` in
+        // `src/options/store.rs`. Each side's subaccount comes from
+        // its own owning order.
+        buyer_subaccount_id: buy_order.subaccount_id,
+        seller_subaccount_id: sell_order.subaccount_id,
         maker_order_id: maker.order_id,
         taker_order_id: incoming.order_id,
         taker_side: incoming.side,

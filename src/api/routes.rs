@@ -2873,6 +2873,13 @@ struct ListOptionFillsQuery {
     option_series_id: Option<String>,
     account: Option<AccountId>,
     order_id: Option<String>,
+    /// SUBACCOUNTS-OPTIONS-ROUTING-V2 — when `account` is set and
+    /// `subaccount_id` omitted, defaults to `1`. `?all=true` opts
+    /// into the wallet-aggregate view.
+    #[serde(default)]
+    subaccount_id: Option<u32>,
+    #[serde(default)]
+    all: Option<bool>,
 }
 
 /// OPTIONS-RFQ-TRADES-FEED-V1 — public listing filter for the
@@ -3164,6 +3171,10 @@ struct OptionFillResponse {
     sell_order_id: String,
     buyer: AccountId,
     seller: AccountId,
+    /// SUBACCOUNTS-OPTIONS-ROUTING-V2 — persisted per-side subaccount
+    /// scope. Both are `1` for wallet-only (v1) counterparties.
+    buyer_subaccount_id: u32,
+    seller_subaccount_id: u32,
     maker_order_id: String,
     taker_order_id: String,
     taker_side: Side,
@@ -3181,6 +3192,8 @@ impl From<OptionFill> for OptionFillResponse {
             sell_order_id: fill.sell_order_id.to_string(),
             buyer: fill.buyer,
             seller: fill.seller,
+            buyer_subaccount_id: fill.buyer_subaccount_id,
+            seller_subaccount_id: fill.seller_subaccount_id,
             maker_order_id: fill.maker_order_id.to_string(),
             taker_order_id: fill.taker_order_id.to_string(),
             taker_side: fill.taker_side,
@@ -3550,7 +3563,7 @@ async fn submit_option_order(
     State(state): State<AppState>,
     Json(request): Json<SubmitOptionOrderRequest>,
 ) -> Result<Json<SubmitOptionOrderResponse>, ApiError> {
-    let resolved_subaccount_id = resolve_options_submit_subaccount(
+    let resolved_subaccount_id = resolve_options_v2_subaccount(
         &state,
         &request.authorization,
         request.subaccount_id,
@@ -4050,12 +4063,23 @@ async fn list_option_fills(
         .as_deref()
         .map(parse_option_order_id)
         .transpose()?;
+    // SUBACCOUNTS-OPTIONS-ROUTING-V2 — mirror the orders list
+    // default-to-subaccount-1 behavior. When `account` is set and
+    // `subaccount_id` is omitted (and `all` is not true), scope to
+    // subaccount 1 so a wallet-only client sees byte-identical
+    // pre-migration results.
+    let effective_subaccount_id = if query.account.is_some() && !query.all.unwrap_or(false) {
+        Some(query.subaccount_id.unwrap_or(1))
+    } else {
+        query.subaccount_id
+    };
     let fills = list_option_fills_service(
         &state,
         OptionFillFilter {
             option_series_id: query.option_series_id,
             account: query.account,
             order_id,
+            subaccount_id: effective_subaccount_id,
         },
     )
     .await?;
@@ -4090,11 +4114,31 @@ async fn cancel_option_order(
     Path(order_id): Path<String>,
     Json(body): Json<AuthorizationOnlyBody>,
 ) -> Result<Json<OptionOrderResponse>, ApiError> {
-    enforce_v1_default_subaccount(&body.authorization, body.subaccount_id)?;
     let parsed_id = parse_option_order_id(&order_id)?;
     // Bind the cancel to the order owner; reject if signer != owner.
     let order = get_option_order_service(&state, parsed_id).await?;
-    let canonical = canonical_option_order_cancel(&order.account, &order_id);
+    // SUBACCOUNTS-OPTIONS-ROUTING-V2 — real subaccount routing for
+    // cancel. v1 keeps default (1); v2 requires body.subaccount_id
+    // and validates against the identity store. The additional
+    // cross-subaccount ownership check below ensures a caller
+    // signing for subaccount X cannot cancel an order that belongs
+    // to subaccount Y of the same wallet.
+    let resolved_subaccount_id = resolve_options_v2_subaccount(
+        &state,
+        &body.authorization,
+        body.subaccount_id,
+        &order.account,
+    )
+    .await?;
+    if order.subaccount_id != resolved_subaccount_id {
+        return Err(ApiError::from(BackendError::SubaccountNotFound));
+    }
+    let canonical = match body.authorization.version {
+        Some(2) => {
+            canonical_option_order_cancel_v2(&order.account, resolved_subaccount_id, &order_id)
+        }
+        _ => canonical_option_order_cancel(&order.account, &order_id),
+    };
     let _verified = require_write_auth(
         &state,
         WriteAuthAction::OptionOrderCancel,
@@ -11988,12 +12032,12 @@ async fn require_write_auth(
     authorize_or_log(expected_action, expected_account, result)
 }
 
-/// SUBACCOUNTS-OPTIONS-ROUTING-V1 — real runtime resolution for the
-/// two Options actions that have flipped from foundation to routing
-/// in this milestone: `OPTION_ORDER_SUBMIT` and its `?subaccount_id=`
-/// list filter. Other Options actions (`OPTION_ORDER_CANCEL`,
-/// conditional create/cancel, TWAP create/cancel) still route
-/// through the foundation gate `enforce_v1_default_subaccount`.
+/// SUBACCOUNTS-OPTIONS-ROUTING-V2 — shared runtime resolver for every
+/// Options action that has flipped from foundation to real routing.
+/// Currently used by `OPTION_ORDER_SUBMIT` (V1), `OPTION_ORDER_CANCEL`
+/// (V2), and Options fills-list filtering. Conditional create/cancel
+/// and TWAP create/cancel still route through the foundation gate
+/// `enforce_v1_default_subaccount`.
 ///
 /// * v1 auth (`envelope.version = None | Some(1)`) + body
 ///   `subaccount_id = None | Some(1)`: returns `1`. v1 clients
@@ -12009,7 +12053,7 @@ async fn require_write_auth(
 ///
 /// The v2 path never returns `SubaccountsRoutingNotLive` — that
 /// error is reserved for actions where routing hasn't yet landed.
-async fn resolve_options_submit_subaccount(
+async fn resolve_options_v2_subaccount(
     state: &AppState,
     envelope: &AuthorizationEnvelope,
     body_subaccount_id: Option<u32>,
