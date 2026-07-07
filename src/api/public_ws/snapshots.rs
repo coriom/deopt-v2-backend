@@ -116,6 +116,11 @@ async fn snapshot_account_orders(state: &AppState, address: &str) -> Result<Valu
         account: Some(AccountId::new(address.to_lowercase())),
         status: None,
         side: None,
+        // SUBACCOUNTS-OPTIONS-ROUTING-V1 — WS account snapshot keeps
+        // wallet-aggregate for now; the frontend still consumes
+        // subaccount 1 only. Subaccount-scoped WS scoping is
+        // deferred to the follow-up routing milestone.
+        subaccount_id: None,
     };
     match list_option_orders_service(state, filter).await {
         Ok(orders) => Ok(serde_json::json!({

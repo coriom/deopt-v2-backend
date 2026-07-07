@@ -828,6 +828,13 @@ pub fn execute_triggered_in_store(
         order_id: OrderId::new(),
         option_series_id: order.option_series_id.clone(),
         account: order.account.clone(),
+        // SUBACCOUNTS-OPTIONS-ROUTING-V1 — conditional standalone
+        // orders still route via the wallet-only path in this
+        // milestone (v2 for `ConditionalOrderCreate` remains gated at
+        // 503). Follow-up milestone will thread the parent
+        // conditional's subaccount into the child once conditional
+        // v2 routing lands.
+        subaccount_id: 1,
         side: order.position_side.closing_side(),
         price_1e8: order.limit_price_1e8,
         size_1e8: child_qty,
@@ -1687,6 +1694,13 @@ async fn execute_triggered_via_repo(
         SubmitOptionOrderInput {
             option_series_id: claimed.option_series_id.clone(),
             account: claimed.account.clone(),
+            // SUBACCOUNTS-OPTIONS-ROUTING-V1 — conditional standalone
+            // orders still route via the wallet-only path in this
+            // milestone (v2 for `ConditionalOrderCreate` remains gated
+            // at 503 by `enforce_v1_default_subaccount`). Follow-up
+            // milestone will thread the parent conditional's
+            // subaccount id once conditional v2 routing lands.
+            subaccount_id: 1,
             side: claimed.position_side.closing_side(),
             price_1e8: claimed.limit_price_1e8,
             size_1e8: child_qty,

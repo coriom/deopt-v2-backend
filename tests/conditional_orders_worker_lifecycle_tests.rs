@@ -77,6 +77,7 @@ async fn seed_long_position(state: &AppState, series: &str, tag: &str) {
         SubmitOptionOrderInput {
             option_series_id: series.to_string(),
             account: account(MAKER),
+            subaccount_id: 1,
             side: Side::Sell,
             price_1e8: PREMIUM_1E8,
             size_1e8: ONE_1E8,
@@ -96,6 +97,7 @@ async fn seed_long_position(state: &AppState, series: &str, tag: &str) {
         SubmitOptionOrderInput {
             option_series_id: series.to_string(),
             account: account(HOLDER),
+            subaccount_id: 1,
             side: Side::Buy,
             price_1e8: PREMIUM_1E8,
             size_1e8: ONE_1E8,
@@ -121,6 +123,7 @@ async fn seed_closing_liquidity(state: &AppState, series: &str, tag: &str, price
         SubmitOptionOrderInput {
             option_series_id: series.to_string(),
             account: account(MAKER),
+            subaccount_id: 1,
             side: Side::Buy,
             price_1e8,
             size_1e8: ONE_1E8,
@@ -454,6 +457,7 @@ async fn position_closed_emits_cancelled_with_failure_code() {
         SubmitOptionOrderInput {
             option_series_id: series.clone(),
             account: account(HOLDER),
+            subaccount_id: 1,
             side: Side::Sell,
             price_1e8: 900_000_000,
             size_1e8: ONE_1E8,

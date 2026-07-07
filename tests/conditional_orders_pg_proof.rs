@@ -158,6 +158,7 @@ async fn seed_long_position(state: &AppState, series: &str, size_1e8: u128, tag:
         SubmitOptionOrderInput {
             option_series_id: series.to_string(),
             account: per_test_maker(tag),
+            subaccount_id: 1,
             side: Side::Sell,
             price_1e8: PREMIUM_1E8,
             size_1e8,
@@ -177,6 +178,7 @@ async fn seed_long_position(state: &AppState, series: &str, size_1e8: u128, tag:
         SubmitOptionOrderInput {
             option_series_id: series.to_string(),
             account: per_test_holder(tag),
+            subaccount_id: 1,
             side: Side::Buy,
             price_1e8: PREMIUM_1E8,
             size_1e8,
@@ -208,6 +210,7 @@ async fn seed_closing_bid(
         SubmitOptionOrderInput {
             option_series_id: series.to_string(),
             account: per_test_maker(tag),
+            subaccount_id: 1,
             side: Side::Buy,
             price_1e8,
             size_1e8,
@@ -596,6 +599,7 @@ pg_test!(
             SubmitOptionOrderInput {
                 option_series_id: series.clone(),
                 account: per_test_holder("reduced"),
+                subaccount_id: 1,
                 side: Side::Sell,
                 price_1e8: PREMIUM_1E8,
                 size_1e8: ONE_1E8 * 4 / 10,

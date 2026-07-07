@@ -240,6 +240,7 @@ fn order_input(
     SubmitOptionOrderInput {
         option_series_id,
         account: account(),
+        subaccount_id: 1,
         side,
         price_1e8: 1_000_000_000,
         size_1e8: 100_000_000,
@@ -752,6 +753,7 @@ async fn ioc_partial_fill_cancels_remainder_without_resting() {
             account: None,
             status: Some(OptionOrderStatus::Open),
             side: None,
+            subaccount_id: None,
         },
     )
     .await
@@ -871,6 +873,7 @@ async fn fok_price_outside_limit_is_not_counted_as_fillable() {
             account: None,
             status: None,
             side: Some(Side::Sell),
+            subaccount_id: None,
         },
     )
     .await
@@ -1199,6 +1202,7 @@ async fn post_only_rejection_creates_no_order_row_and_no_terminal_reason() {
             account: None,
             status: None,
             side: None,
+            subaccount_id: None,
         },
     )
     .await
@@ -3822,6 +3826,7 @@ async fn expired_disappears_from_open_orders_listing() {
             option_series_id: Some(series.clone()),
             status: Some(OptionOrderStatus::Open),
             side: None,
+            subaccount_id: None,
         },
     )
     .await
@@ -3837,6 +3842,7 @@ async fn expired_disappears_from_open_orders_listing() {
             option_series_id: Some(series.clone()),
             status: Some(OptionOrderStatus::Open),
             side: None,
+            subaccount_id: None,
         },
     )
     .await
@@ -3852,6 +3858,7 @@ async fn expired_disappears_from_open_orders_listing() {
             option_series_id: Some(series),
             status: Some(OptionOrderStatus::Expired),
             side: None,
+            subaccount_id: None,
         },
     )
     .await
@@ -4317,6 +4324,7 @@ async fn invalid_attached_payload_rejects_parent_atomically() {
             account: Some(account()),
             status: None,
             side: None,
+            subaccount_id: None,
         },
     )
     .await

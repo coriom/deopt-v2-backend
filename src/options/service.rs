@@ -76,6 +76,10 @@ pub struct CreateOptionSeriesInput {
 pub struct SubmitOptionOrderInput {
     pub option_series_id: OptionSeriesId,
     pub account: AccountId,
+    /// SUBACCOUNTS-OPTIONS-ROUTING-V1 — resolved at the route
+    /// boundary via `resolve_options_submit_subaccount`. Defaults to
+    /// 1 for v1 auth and for every legacy caller.
+    pub subaccount_id: u32,
     pub side: Side,
     pub price_1e8: Price1e8,
     pub size_1e8: Size1e8,
@@ -432,6 +436,7 @@ async fn submit_option_order_inner(
         order_id: OrderId::new(),
         option_series_id: input.option_series_id,
         account: input.account,
+        subaccount_id: input.subaccount_id,
         side: input.side,
         price_1e8: input.price_1e8,
         size_1e8: input.size_1e8,
@@ -4823,6 +4828,11 @@ pub async fn tick_option_twap_orders(state: &AppState) -> Result<TickOptionTwapO
         let submit_input = SubmitOptionOrderInput {
             option_series_id: twap.option_series_id.clone(),
             account: twap.account.clone(),
+            // SUBACCOUNTS-OPTIONS-ROUTING-V1 — TWAP still routes via
+            // the wallet-only path in this milestone (v2 for
+            // `OPTION_TWAP_CREATE` remains gated at 503). Follow-up
+            // milestone will thread parent TWAP's subaccount id.
+            subaccount_id: 1,
             side: twap.side,
             price_1e8: twap.limit_price_1e8,
             size_1e8: child_size,

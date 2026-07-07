@@ -874,6 +874,14 @@ pub struct OptionOrder {
     pub order_id: OptionOrderId,
     pub option_series_id: OptionSeriesId,
     pub account: AccountId,
+    /// SUBACCOUNTS-OPTIONS-ROUTING-V1 — the (owner, subaccount_id)
+    /// tuple that scopes this order. Defaults to `1` for v1 auth and
+    /// for every pre-migration row (via DB DEFAULT 1 from
+    /// migration `0039_options_subaccounts.sql`). Non-default values
+    /// require a v2 authorization envelope; see
+    /// `resolve_options_submit_subaccount` at the route boundary.
+    #[serde(default = "one_subaccount_id")]
+    pub subaccount_id: u32,
     pub side: Side,
     pub price_1e8: Price1e8,
     pub size_1e8: Size1e8,
@@ -898,6 +906,10 @@ pub struct OptionOrder {
     pub terminal_reason_source: Option<String>,
     pub created_at_ms: TimestampMs,
     pub updated_at_ms: TimestampMs,
+}
+
+fn one_subaccount_id() -> u32 {
+    1
 }
 
 // HISTORY-V2-TERMINAL-REASONS-V1: stable token table for the
@@ -1237,6 +1249,14 @@ pub struct OptionOrderFilter {
     pub account: Option<AccountId>,
     pub status: Option<OptionOrderStatus>,
     pub side: Option<Side>,
+    /// SUBACCOUNTS-OPTIONS-ROUTING-V1 — filter by `(account,
+    /// subaccount_id)`. When `account` is `Some` and this field is
+    /// `None`, callers historically saw all subaccounts of that
+    /// wallet. The list route now defaults an omitted filter to
+    /// `Some(1)` for account-scoped queries so an unmigrated client
+    /// keeps seeing subaccount 1 only. Explicit `None` here still
+    /// means "all subaccounts" for internal/admin callers.
+    pub subaccount_id: Option<u32>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -1324,6 +1344,11 @@ impl OptionOrderFilter {
         }
         if let Some(side) = self.side {
             if order.side != side {
+                return false;
+            }
+        }
+        if let Some(subaccount_id) = self.subaccount_id {
+            if order.subaccount_id != subaccount_id {
                 return false;
             }
         }

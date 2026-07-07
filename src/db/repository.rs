@@ -2385,9 +2385,9 @@ impl PgRepository {
                 remaining_size_1e8, time_in_force, post_only, client_order_id, nonce,
                 deadline_ms, signature, status,
                 terminal_reason_code, terminal_reason_message, terminal_reason_source,
-                created_at_ms, updated_at_ms
+                created_at_ms, updated_at_ms, subaccount_id
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-                      $15, $16, $17, $18, $19)",
+                      $15, $16, $17, $18, $19, $20)",
             ),
             order,
         )
@@ -2413,7 +2413,7 @@ impl PgRepository {
                     remaining_size_1e8, time_in_force, post_only, client_order_id, nonce,
                     deadline_ms, signature, status,
                     terminal_reason_code, terminal_reason_message, terminal_reason_source,
-                    created_at_ms, updated_at_ms
+                    created_at_ms, updated_at_ms, subaccount_id
              FROM option_orders
              WHERE option_series_id = $1
                AND side = $2
@@ -2494,7 +2494,7 @@ impl PgRepository {
                     remaining_size_1e8, time_in_force, post_only, client_order_id, nonce,
                     deadline_ms, signature, status,
                     terminal_reason_code, terminal_reason_message, terminal_reason_source,
-                    created_at_ms, updated_at_ms
+                    created_at_ms, updated_at_ms, subaccount_id
              FROM option_orders
              ORDER BY created_at_ms ASC, order_id ASC",
         )
@@ -2510,7 +2510,7 @@ impl PgRepository {
                     remaining_size_1e8, time_in_force, post_only, client_order_id, nonce,
                     deadline_ms, signature, status,
                     terminal_reason_code, terminal_reason_message, terminal_reason_source,
-                    created_at_ms, updated_at_ms
+                    created_at_ms, updated_at_ms, subaccount_id
              FROM option_orders
              WHERE order_id = $1",
         )
@@ -3095,7 +3095,7 @@ impl PgRepository {
                     remaining_size_1e8, time_in_force, post_only, client_order_id, nonce,
                     deadline_ms, signature, status,
                     terminal_reason_code, terminal_reason_message, terminal_reason_source,
-                    created_at_ms, updated_at_ms
+                    created_at_ms, updated_at_ms, subaccount_id
              FROM option_orders
              WHERE option_series_id = $1 AND status IN ('open', 'partially_filled')
              ORDER BY created_at_ms ASC, order_id ASC",
@@ -6494,6 +6494,19 @@ fn option_order_from_row(row: PgRow) -> Result<OptionOrder> {
         })?,
         option_series_id: row_get(&row, "option_series_id")?,
         account: AccountId::new(row_get::<String>(&row, "account")?),
+        // SUBACCOUNTS-OPTIONS-ROUTING-V1 — column added by migration
+        // 0039_options_subaccounts.sql with `DEFAULT 1`. Existing
+        // rows land on subaccount 1; new rows come through the
+        // v2-aware submit path.
+        subaccount_id: {
+            let id: i32 = row_get(&row, "subaccount_id")?;
+            if id < 1 {
+                return Err(BackendError::Persistence(
+                    "option order subaccount_id must be >= 1".to_string(),
+                ));
+            }
+            id as u32
+        },
         side: parse_side(&side)?,
         price_1e8: row_get::<String>(&row, "price_1e8")?
             .parse()
@@ -7323,6 +7336,7 @@ fn insert_option_order_query<'q>(
         .bind(&order.terminal_reason_source)
         .bind(timestamp_to_i64(order.created_at_ms))
         .bind(timestamp_to_i64(order.updated_at_ms))
+        .bind(u32_to_i32("subaccount_id", order.subaccount_id).unwrap_or(1))
 }
 
 async fn insert_option_order_tx(
@@ -7336,9 +7350,9 @@ async fn insert_option_order_tx(
                 remaining_size_1e8, time_in_force, post_only, client_order_id, nonce,
                 deadline_ms, signature, status,
                 terminal_reason_code, terminal_reason_message, terminal_reason_source,
-                created_at_ms, updated_at_ms
+                created_at_ms, updated_at_ms, subaccount_id
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-                      $15, $16, $17, $18, $19)",
+                      $15, $16, $17, $18, $19, $20)",
         ),
         order,
     )

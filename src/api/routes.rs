@@ -2858,6 +2858,14 @@ struct ListOptionOrdersQuery {
     account: Option<AccountId>,
     status: Option<OptionOrderStatus>,
     side: Option<Side>,
+    /// SUBACCOUNTS-OPTIONS-ROUTING-V1 — when `account` is set and
+    /// this is omitted, the list route defaults to subaccount `1`
+    /// (preserves pre-migration semantics for wallet-only clients).
+    /// Pass `all=true` to see every subaccount of the wallet.
+    #[serde(default)]
+    subaccount_id: Option<u32>,
+    #[serde(default)]
+    all: Option<bool>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
@@ -3088,6 +3096,10 @@ struct OptionOrderResponse {
     order_id: String,
     option_series_id: String,
     account: AccountId,
+    /// SUBACCOUNTS-OPTIONS-ROUTING-V1 — persisted `(owner,
+    /// subaccount_id)` scope. `1` for every v1 flow and every
+    /// pre-migration row.
+    subaccount_id: u32,
     side: Side,
     price_1e8: String,
     size_1e8: String,
@@ -3123,6 +3135,7 @@ impl From<OptionOrder> for OptionOrderResponse {
             order_id: order.order_id.to_string(),
             option_series_id: order.option_series_id,
             account: order.account,
+            subaccount_id: order.subaccount_id,
             side: order.side,
             price_1e8: order.price_1e8.to_string(),
             size_1e8: order.size_1e8.to_string(),
@@ -3537,8 +3550,31 @@ async fn submit_option_order(
     State(state): State<AppState>,
     Json(request): Json<SubmitOptionOrderRequest>,
 ) -> Result<Json<SubmitOptionOrderResponse>, ApiError> {
-    enforce_v1_default_subaccount(&request.authorization, request.subaccount_id)?;
-    let canonical = canonical_option_order_submit(&request);
+    let resolved_subaccount_id = resolve_options_submit_subaccount(
+        &state,
+        &request.authorization,
+        request.subaccount_id,
+        &request.account,
+    )
+    .await?;
+    // SUBACCOUNTS-OPTIONS-ROUTING-V1 — v2 canonical embeds
+    // `subaccount_id` right after `account` so the signature commits
+    // to the specific subaccount. v1 canonical remains byte-identical
+    // to the pre-milestone shape.
+    let canonical = match request.authorization.version {
+        Some(2) => canonical_option_order_submit_v2(
+            &request.account,
+            resolved_subaccount_id,
+            &request.option_series_id,
+            request.side,
+            &request.price_1e8,
+            &request.size_1e8,
+            request.time_in_force,
+            request.post_only,
+            request.client_order_id.as_deref(),
+        ),
+        _ => canonical_option_order_submit(&request),
+    };
     let verified = require_write_auth(
         &state,
         WriteAuthAction::OptionOrderSubmit,
@@ -3594,6 +3630,7 @@ async fn submit_option_order(
         SubmitOptionOrderInput {
             option_series_id: request.option_series_id,
             account: request.account,
+            subaccount_id: resolved_subaccount_id,
             side: request.side,
             price_1e8: parse_fixed_u128("price_1e8", &request.price_1e8)?,
             size_1e8: parse_fixed_u128("size_1e8", &request.size_1e8)?,
@@ -3623,6 +3660,17 @@ async fn list_option_orders(
     State(state): State<AppState>,
     Query(query): Query<ListOptionOrdersQuery>,
 ) -> Result<Json<Vec<OptionOrderResponse>>, ApiError> {
+    // SUBACCOUNTS-OPTIONS-ROUTING-V1 — default subaccount scoping.
+    // When the caller passes `account` but no `subaccount_id` and
+    // does NOT opt into `all=true`, we scope the query to subaccount
+    // 1 so a wallet-only client sees byte-identical results to the
+    // pre-migration behaviour. Passing `all=true` explicitly opts
+    // into the aggregate view.
+    let effective_subaccount_id = if query.account.is_some() && !query.all.unwrap_or(false) {
+        Some(query.subaccount_id.unwrap_or(1))
+    } else {
+        query.subaccount_id
+    };
     let orders = list_option_orders_service(
         &state,
         OptionOrderFilter {
@@ -3630,6 +3678,7 @@ async fn list_option_orders(
             account: query.account,
             status: query.status,
             side: query.side,
+            subaccount_id: effective_subaccount_id,
         },
     )
     .await?;
@@ -11937,6 +11986,65 @@ async fn require_write_auth(
     )
     .await;
     authorize_or_log(expected_action, expected_account, result)
+}
+
+/// SUBACCOUNTS-OPTIONS-ROUTING-V1 — real runtime resolution for the
+/// two Options actions that have flipped from foundation to routing
+/// in this milestone: `OPTION_ORDER_SUBMIT` and its `?subaccount_id=`
+/// list filter. Other Options actions (`OPTION_ORDER_CANCEL`,
+/// conditional create/cancel, TWAP create/cancel) still route
+/// through the foundation gate `enforce_v1_default_subaccount`.
+///
+/// * v1 auth (`envelope.version = None | Some(1)`) + body
+///   `subaccount_id = None | Some(1)`: returns `1`. v1 clients
+///   continue to see byte-identical behaviour.
+/// * v1 auth + body `Some(n)` where n ≠ 1: 400
+///   `InvalidSubaccountRequest("v1 auth cannot route to subaccount N")`.
+/// * v2 auth (`envelope.version = Some(2)`) + missing body
+///   `subaccount_id`: 400 `InvalidSubaccountRequest("v2 auth requires
+///   subaccount_id in body")`.
+/// * v2 auth + body `Some(n)`: validates the subaccount exists via
+///   `crate::subaccounts::get_subaccount`; missing owner subaccount
+///   → 404 `SubaccountNotFound`. Returns `n`.
+///
+/// The v2 path never returns `SubaccountsRoutingNotLive` — that
+/// error is reserved for actions where routing hasn't yet landed.
+async fn resolve_options_submit_subaccount(
+    state: &AppState,
+    envelope: &AuthorizationEnvelope,
+    body_subaccount_id: Option<u32>,
+    owner: &AccountId,
+) -> Result<u32, ApiError> {
+    match envelope.version {
+        None | Some(1) => match body_subaccount_id {
+            None | Some(1) => Ok(1),
+            Some(other) => Err(ApiError::from(BackendError::InvalidSubaccountRequest(
+                format!(
+                    "v1 auth cannot route to subaccount {other}; use a v2 authorization envelope"
+                ),
+            ))),
+        },
+        Some(2) => {
+            let subaccount_id = body_subaccount_id.ok_or_else(|| {
+                ApiError::from(BackendError::InvalidSubaccountRequest(
+                    "v2 auth requires subaccount_id in body".to_string(),
+                ))
+            })?;
+            // Validate the subaccount exists for this owner. Missing
+            // rows return 404 `SubaccountNotFound`, matching the
+            // dedicated CRUD-route contract.
+            let _ = crate::subaccounts::get_subaccount(
+                state.subaccounts.as_ref(),
+                owner,
+                subaccount_id,
+            )
+            .await?;
+            Ok(subaccount_id)
+        }
+        Some(v) => Err(ApiError::from(BackendError::InvalidSubaccountRequest(
+            format!("unsupported authorization version: {v}"),
+        ))),
+    }
 }
 
 /// SUBACCOUNTS-OPTIONS-ORDERS-HISTORY-V1 — foundation-posture gate.

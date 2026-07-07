@@ -358,7 +358,12 @@ fn envelope_v2(account: &AccountId) -> AuthorizationEnvelope {
 }
 
 #[tokio::test]
-async fn v2_order_submit_rejects_503() {
+async fn v2_order_submit_unknown_subaccount_returns_404() {
+    // SUBACCOUNTS-OPTIONS-ROUTING-V1 — v2 auth for OPTION_ORDER_SUBMIT
+    // no longer fails-closed with SubaccountsRoutingNotLive; it
+    // resolves the subaccount against the identity store. A missing
+    // subaccount is honestly reported as 404 SubaccountNotFound —
+    // NOT silently persisted to subaccount 1.
     let state = build_state();
     let (_sk, account) = test_keypair(0xD1);
     let mut env = envelope_v2(&account);
@@ -372,19 +377,19 @@ async fn v2_order_submit_rejects_503() {
         "time_in_force": "gtc",
         "post_only": false,
         "client_order_id": null,
-        "subaccount_id": 2,
+        "subaccount_id": 42,
         "authorization": env,
     });
     let response = router(state)
         .oneshot(json_post("/options/orders", body))
         .await
         .expect("submit");
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
     let body = body_json(response).await;
     assert!(body["error"]
         .as_str()
         .unwrap_or("")
-        .contains("subaccount routing is not live"));
+        .contains("subaccount not found"));
 }
 
 #[tokio::test]
@@ -514,6 +519,110 @@ async fn v2_twap_cancel_rejects_503() {
         ),
         "expected 503 or 404, got: {}",
         response.status()
+    );
+}
+
+// ===========================================================================
+// SUBACCOUNTS-OPTIONS-ROUTING-V1 — real v2 submit routing tests.
+// These prove that once the subaccount identity exists for the owner,
+// v2 auth resolves to the requested subaccount and downstream errors
+// come from series/state/nonce checks, NOT from the routing gate.
+// ===========================================================================
+
+async fn ensure_subaccount(state: &AppState, owner: &AccountId, subaccount_id: u32) {
+    // Prime Account 1 first via list; then allocate Account 2/3/... via
+    // the identity service. This is a test-only shortcut (bypasses
+    // write-auth for subaccount create) so we can exercise the routing
+    // gate without also exercising the CRUD auth flow.
+    let _ = deopt_v2_backend::subaccounts::list_subaccounts(state.subaccounts.as_ref(), owner)
+        .await
+        .expect("list");
+    while deopt_v2_backend::subaccounts::get_subaccount(
+        state.subaccounts.as_ref(),
+        owner,
+        subaccount_id,
+    )
+    .await
+    .is_err()
+    {
+        deopt_v2_backend::subaccounts::create_subaccount(
+            state.subaccounts.as_ref(),
+            owner,
+            Some("Test".to_string()),
+        )
+        .await
+        .expect("create subaccount");
+    }
+}
+
+#[tokio::test]
+async fn v2_order_submit_missing_subaccount_id_field_rejected_400() {
+    let state = build_state();
+    let (_sk, account) = test_keypair(0xE1);
+    let mut env = envelope_v2(&account);
+    env.action = WriteAuthAction::OptionOrderSubmit.as_str().to_string();
+    // No `subaccount_id` field in the body — v2 must reject.
+    let body = json!({
+        "option_series_id": DUMMY_SERIES_ID,
+        "account": account.0,
+        "side": "buy",
+        "price_1e8": "1000000000",
+        "size_1e8": "100000000",
+        "time_in_force": "gtc",
+        "post_only": false,
+        "client_order_id": null,
+        "authorization": env,
+    });
+    let response = router(state)
+        .oneshot(json_post("/options/orders", body))
+        .await
+        .expect("submit");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(response).await;
+    let msg = body["error"].as_str().unwrap_or("");
+    assert!(msg.contains("v2 auth requires subaccount_id"), "got: {msg}");
+}
+
+#[tokio::test]
+async fn v2_order_submit_valid_subaccount_reaches_write_auth() {
+    // Once the subaccount exists, `resolve_options_submit_subaccount`
+    // returns Ok(2), the handler moves on to write-auth verification,
+    // and the response reflects the downstream failure (unknown
+    // nonce). Crucially, it must NOT return 503
+    // `SubaccountsRoutingNotLive` or 404 `SubaccountNotFound`.
+    let state = build_state();
+    let (_sk, account) = test_keypair(0xE2);
+    ensure_subaccount(&state, &account, 2).await;
+    let mut env = envelope_v2(&account);
+    env.action = WriteAuthAction::OptionOrderSubmit.as_str().to_string();
+    let body = json!({
+        "option_series_id": DUMMY_SERIES_ID,
+        "account": account.0,
+        "side": "buy",
+        "price_1e8": "1000000000",
+        "size_1e8": "100000000",
+        "time_in_force": "gtc",
+        "post_only": false,
+        "client_order_id": null,
+        "subaccount_id": 2,
+        "authorization": env,
+    });
+    let response = router(state)
+        .oneshot(json_post("/options/orders", body))
+        .await
+        .expect("submit");
+    // The write-auth check rejects (nonce is all-zeros, never
+    // issued). Any 4xx/5xx error is fine here — the point is the
+    // routing gate PASSED. Verify we did NOT get 503 with
+    // SubaccountsRoutingNotLive and did NOT get 404
+    // SubaccountNotFound (the two negative signals).
+    assert_ne!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let status = response.status();
+    let body = body_json(response).await;
+    let msg = body["error"].as_str().unwrap_or("");
+    assert!(
+        !msg.contains("subaccount routing is not live") && !msg.contains("subaccount not found"),
+        "expected routing gate to pass, status={status} msg={msg}"
     );
 }
 

@@ -68,6 +68,7 @@ fn base_input(
     SubmitOptionOrderInput {
         option_series_id: series.to_string(),
         account,
+        subaccount_id: 1,
         side,
         price_1e8: PREMIUM_1E8,
         size_1e8: ONE_1E8,

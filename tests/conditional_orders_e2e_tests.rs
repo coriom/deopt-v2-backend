@@ -82,6 +82,7 @@ async fn seed_long_position(state: &AppState, series: &str, size_1e8: u128) {
         SubmitOptionOrderInput {
             option_series_id: series.to_string(),
             account: account(MAKER),
+            subaccount_id: 1,
             side: Side::Sell,
             price_1e8: PREMIUM_1E8,
             size_1e8,
@@ -101,6 +102,7 @@ async fn seed_long_position(state: &AppState, series: &str, size_1e8: u128) {
         SubmitOptionOrderInput {
             option_series_id: series.to_string(),
             account: account(HOLDER),
+            subaccount_id: 1,
             side: Side::Buy,
             price_1e8: PREMIUM_1E8,
             size_1e8,
@@ -129,6 +131,7 @@ async fn seed_closing_bid(state: &AppState, series: &str, bid_size_1e8: u128, pr
         SubmitOptionOrderInput {
             option_series_id: series.to_string(),
             account: account(MAKER),
+            subaccount_id: 1,
             side: Side::Buy,
             price_1e8,
             size_1e8: bid_size_1e8,
@@ -588,6 +591,7 @@ async fn position_closed_between_arm_and_trigger_marks_cancelled() {
         SubmitOptionOrderInput {
             option_series_id: series.clone(),
             account: account(HOLDER),
+            subaccount_id: 1,
             side: Side::Sell,
             price_1e8: PREMIUM_1E8,
             size_1e8: ONE_1E8,
@@ -647,6 +651,7 @@ async fn reduced_position_caps_child_quantity() {
         SubmitOptionOrderInput {
             option_series_id: series.clone(),
             account: account(HOLDER),
+            subaccount_id: 1,
             side: Side::Sell,
             price_1e8: PREMIUM_1E8,
             size_1e8: ONE_1E8 * 4 / 10,

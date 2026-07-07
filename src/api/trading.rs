@@ -2217,6 +2217,12 @@ async fn orders_rows_for(
             account: Some(acct.clone()),
             status: None,
             side: None,
+            // SUBACCOUNTS-OPTIONS-ROUTING-V1 — internal listing keeps
+            // wallet-aggregate behavior (all subaccounts) since this
+            // is not a public HTTP handler; the follow-up milestone
+            // that migrates portfolio views will thread subaccount
+            // filtering here explicitly.
+            subaccount_id: None,
         },
     )
     .await
@@ -3274,6 +3280,7 @@ mod tests {
             order_id: OrderId::new(),
             option_series_id: "S-1".to_string(),
             account: acct.clone(),
+            subaccount_id: 1,
             side: Side::Buy,
             price_1e8: 1_000_000_000,
             size_1e8: 100_000_000,
@@ -3296,6 +3303,7 @@ mod tests {
             order_id: OrderId::new(),
             option_series_id: "S-1".to_string(),
             account: acct.clone(),
+            subaccount_id: 1,
             side: Side::Sell,
             price_1e8: 1_100_000_000,
             size_1e8: 50_000_000,
@@ -3320,6 +3328,7 @@ mod tests {
             order_id: OrderId::new(),
             option_series_id: "S-1".to_string(),
             account: acct.clone(),
+            subaccount_id: 1,
             side: Side::Buy,
             price_1e8: 900_000_000,
             size_1e8: 25_000_000,
