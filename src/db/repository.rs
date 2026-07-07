@@ -7657,3 +7657,179 @@ fn i64_to_u64_persistence(field: &str, value: i64) -> Result<u64> {
     u64::try_from(value)
         .map_err(|_| BackendError::Persistence(format!("{field} cannot be negative")))
 }
+
+// ===========================================================================
+// SUBACCOUNTS-CORE-BACKEND-V1 — PgRepository implementation of the
+// subaccount identity store. Backed by migration 0038_subaccounts.sql.
+// ===========================================================================
+
+impl PgRepository {
+    async fn subaccounts_list_by_owner(
+        &self,
+        owner: &AccountId,
+    ) -> Result<Vec<crate::subaccounts::Subaccount>> {
+        let rows = sqlx::query(
+            "SELECT owner_address, subaccount_id, name, created_at_ms, updated_at_ms, archived_at_ms
+             FROM subaccounts
+             WHERE LOWER(owner_address) = LOWER($1)
+             ORDER BY subaccount_id ASC",
+        )
+        .bind(&owner.0)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        rows.into_iter().map(row_to_subaccount).collect()
+    }
+
+    async fn subaccounts_get(
+        &self,
+        owner: &AccountId,
+        subaccount_id: u32,
+    ) -> Result<Option<crate::subaccounts::Subaccount>> {
+        let row = sqlx::query(
+            "SELECT owner_address, subaccount_id, name, created_at_ms, updated_at_ms, archived_at_ms
+             FROM subaccounts
+             WHERE LOWER(owner_address) = LOWER($1) AND subaccount_id = $2",
+        )
+        .bind(&owner.0)
+        .bind(u32_to_i32("subaccount_id", subaccount_id)?)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        match row {
+            Some(r) => Ok(Some(row_to_subaccount(r)?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn subaccounts_insert(&self, record: crate::subaccounts::Subaccount) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO subaccounts (
+                 owner_address, subaccount_id, name, created_at_ms, updated_at_ms, archived_at_ms
+             ) VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(&record.owner_address.0)
+        .bind(u32_to_i32("subaccount_id", record.subaccount_id)?)
+        .bind(&record.name)
+        .bind(timestamp_to_i64(record.created_at_ms))
+        .bind(timestamp_to_i64(record.updated_at_ms))
+        .bind(record.archived_at_ms.map(timestamp_to_i64))
+        .execute(&self.pool)
+        .await
+        .map_err(|error| {
+            if is_unique_violation(&error) {
+                BackendError::Persistence(format!(
+                    "subaccount {} already exists for owner",
+                    record.subaccount_id
+                ))
+            } else {
+                BackendError::Persistence(error.to_string())
+            }
+        })?;
+        Ok(())
+    }
+
+    async fn subaccounts_max_id_for_owner(&self, owner: &AccountId) -> Result<Option<u32>> {
+        let row = sqlx::query(
+            "SELECT MAX(subaccount_id) AS max_id
+             FROM subaccounts
+             WHERE LOWER(owner_address) = LOWER($1)",
+        )
+        .bind(&owner.0)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        let max_id: Option<i32> = row_get(&row, "max_id")?;
+        match max_id {
+            None => Ok(None),
+            Some(v) if v >= 0 => Ok(Some(v as u32)),
+            Some(_) => Err(BackendError::Persistence(
+                "negative subaccount_id in max query".to_string(),
+            )),
+        }
+    }
+
+    async fn subaccounts_rename(
+        &self,
+        owner: &AccountId,
+        subaccount_id: u32,
+        new_name: Option<String>,
+        updated_at_ms: TimestampMs,
+    ) -> Result<()> {
+        let result = sqlx::query(
+            "UPDATE subaccounts
+             SET name = $3, updated_at_ms = $4
+             WHERE LOWER(owner_address) = LOWER($1) AND subaccount_id = $2",
+        )
+        .bind(&owner.0)
+        .bind(u32_to_i32("subaccount_id", subaccount_id)?)
+        .bind(&new_name)
+        .bind(timestamp_to_i64(updated_at_ms))
+        .execute(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        if result.rows_affected() == 0 {
+            return Err(crate::subaccounts::SubaccountError::NotFound.into());
+        }
+        Ok(())
+    }
+}
+
+fn row_to_subaccount(row: PgRow) -> Result<crate::subaccounts::Subaccount> {
+    let owner_address: String = row_get(&row, "owner_address")?;
+    let subaccount_id: i32 = row_get(&row, "subaccount_id")?;
+    let name: Option<String> = row_get(&row, "name")?;
+    let created_at_ms: i64 = row_get(&row, "created_at_ms")?;
+    let updated_at_ms: i64 = row_get(&row, "updated_at_ms")?;
+    let archived_at_ms: Option<i64> = row_get(&row, "archived_at_ms")?;
+    if subaccount_id < 1 {
+        return Err(BackendError::Persistence(
+            "subaccount_id must be >= 1".to_string(),
+        ));
+    }
+    Ok(crate::subaccounts::Subaccount {
+        owner_address: AccountId::new(owner_address),
+        subaccount_id: subaccount_id as u32,
+        name,
+        created_at_ms,
+        updated_at_ms,
+        archived_at_ms,
+    })
+}
+
+#[async_trait::async_trait]
+impl crate::subaccounts::SubaccountStore for PgRepository {
+    async fn list_by_owner(
+        &self,
+        owner: &AccountId,
+    ) -> Result<Vec<crate::subaccounts::Subaccount>> {
+        self.subaccounts_list_by_owner(owner).await
+    }
+
+    async fn get(
+        &self,
+        owner: &AccountId,
+        subaccount_id: u32,
+    ) -> Result<Option<crate::subaccounts::Subaccount>> {
+        self.subaccounts_get(owner, subaccount_id).await
+    }
+
+    async fn insert(&self, record: crate::subaccounts::Subaccount) -> Result<()> {
+        self.subaccounts_insert(record).await
+    }
+
+    async fn max_id_for_owner(&self, owner: &AccountId) -> Result<Option<u32>> {
+        self.subaccounts_max_id_for_owner(owner).await
+    }
+
+    async fn rename(
+        &self,
+        owner: &AccountId,
+        subaccount_id: u32,
+        new_name: Option<String>,
+        updated_at_ms: TimestampMs,
+    ) -> Result<()> {
+        self.subaccounts_rename(owner, subaccount_id, new_name, updated_at_ms)
+            .await
+    }
+}

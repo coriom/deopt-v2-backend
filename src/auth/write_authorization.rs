@@ -61,6 +61,15 @@ pub enum WriteAuthAction {
     /// OPTIONS-TWAP-ORDERS-V1 — taker create/cancel of a parent TWAP order.
     OptionTwapCreate,
     OptionTwapCancel,
+    /// SUBACCOUNTS-CORE-BACKEND-V1 — owner allocates a new subaccount.
+    /// Canonical payload embeds `account` (owner) and optional `name`
+    /// only; `subaccount_id` is server-assigned so it cannot be signed
+    /// ahead of insertion.
+    SubaccountCreate,
+    /// SUBACCOUNTS-CORE-BACKEND-V1 — owner renames an existing
+    /// subaccount. Canonical payload embeds `account`, `subaccount_id`,
+    /// and the new `name`.
+    SubaccountRename,
 }
 
 impl WriteAuthAction {
@@ -79,6 +88,8 @@ impl WriteAuthAction {
             }
             Self::OptionTwapCreate => "OPTION_TWAP_CREATE",
             Self::OptionTwapCancel => "OPTION_TWAP_CANCEL",
+            Self::SubaccountCreate => "SUBACCOUNT_CREATE",
+            Self::SubaccountRename => "SUBACCOUNT_RENAME",
         }
     }
 
@@ -97,6 +108,8 @@ impl WriteAuthAction {
             }
             "OPTION_TWAP_CREATE" => Self::OptionTwapCreate,
             "OPTION_TWAP_CANCEL" => Self::OptionTwapCancel,
+            "SUBACCOUNT_CREATE" => Self::SubaccountCreate,
+            "SUBACCOUNT_RENAME" => Self::SubaccountRename,
             _ => return None,
         })
     }
@@ -111,6 +124,14 @@ impl fmt::Display for WriteAuthAction {
 /// Authorization envelope attached to every protected write request.
 /// `nonce` is the hex (0x-prefixed, 64-char) value returned by
 /// `POST /auth/write-challenges`.
+///
+/// SUBACCOUNTS-CORE-BACKEND-V1 — the optional `version` field is
+/// reserved for a future subaccount-aware canonical payload variant.
+/// It is deserialised for forward compatibility but is NOT yet
+/// incorporated into the EIP-712 digest computation, so existing v1
+/// byte-freeze tests remain green. The follow-up milestone
+/// `SUBACCOUNTS-WRITE-AUTH-V2-MIGRATION-V1` will branch the digest on
+/// this field once existing trading actions migrate.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AuthorizationEnvelope {
     pub action: String,
@@ -120,6 +141,9 @@ pub struct AuthorizationEnvelope {
     pub signature: String,
     #[serde(default)]
     pub idempotency_key: Option<String>,
+    /// Reserved — see the struct-level doc comment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<u16>,
 }
 
 /// Result of a successful verification + nonce claim. Returned to the
@@ -828,6 +852,7 @@ mod tests {
             deadline_ms,
             signature,
             idempotency_key: idempotency_key.map(|s| s.to_string()),
+            version: None,
         }
     }
 
@@ -1249,6 +1274,7 @@ mod tests {
             deadline_ms: 100_000,
             signature: "not-a-signature".to_string(),
             idempotency_key: None,
+            version: None,
         };
         let payload = canonical_payload_bytes(WriteAuthAction::OptionOrderSubmit, &[]);
         let err = verify_and_claim(

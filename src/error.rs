@@ -209,4 +209,9 @@ pub enum BackendError {
     PerpDuplicateClientOrderId(String),
     #[error("perp self-trade rejected")]
     PerpSelfTrade,
+    // SUBACCOUNTS-CORE-BACKEND-V1
+    #[error("subaccount not found")]
+    SubaccountNotFound,
+    #[error("invalid subaccount request: {0}")]
+    InvalidSubaccountRequest(String),
 }

@@ -18,6 +18,7 @@ use crate::options::{
 use crate::reconciliation::ReconciliationConfig;
 use crate::rfq::{RfqConfig, RfqStore};
 use crate::signing::{Eip712Domain, NonceStore, SignatureVerificationMode};
+use crate::subaccounts::{InMemorySubaccountStore, SubaccountStore};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
@@ -141,6 +142,13 @@ pub struct AppState {
     /// Enabling this on a mainnet chain id is refused at startup by
     /// `validate_startup`. Env: `PERPS_PUBLIC_TRADING_ENABLED=true`.
     pub perps_public_trading_enabled: bool,
+    /// SUBACCOUNTS-CORE-BACKEND-V1 — real Derive-like subaccount
+    /// identity store. When `repository` is `Some`, the PgRepository
+    /// is wired here so rows survive restarts. Otherwise an in-memory
+    /// store is used (unit-test only). `Account 1` is lazily created
+    /// on the first authenticated interaction with any listed owner
+    /// (see `crate::subaccounts::ensure_default_subaccount`).
+    pub subaccounts: Arc<dyn SubaccountStore + Send + Sync>,
 }
 
 impl AppState {
@@ -280,6 +288,10 @@ impl AppState {
                 Some(repo) => Arc::new(repo.clone()),
                 None => Arc::new(InMemoryChallengeStore::new()),
             };
+        let subaccounts: Arc<dyn SubaccountStore + Send + Sync> = match repository.as_ref() {
+            Some(repo) => Arc::new(repo.clone()),
+            None => Arc::new(InMemorySubaccountStore::new()),
+        };
         Self {
             engine: Arc::new(Mutex::new(engine)),
             nonces: Arc::new(Mutex::new(NonceStore::new())),
@@ -339,6 +351,7 @@ impl AppState {
                 crate::perps::PerpFundingEventsStore::new(),
             )),
             perps_public_trading_enabled: false,
+            subaccounts,
         }
     }
 
@@ -408,6 +421,7 @@ impl AppState {
         state.persistence_enabled = true;
         state.database_configured = true;
         state.write_auth_challenges = Arc::new(repository.clone());
+        state.subaccounts = Arc::new(repository.clone());
         state.repository = Some(repository);
         state
     }

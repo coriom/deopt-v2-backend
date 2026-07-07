@@ -405,6 +405,22 @@ pub fn router(state: AppState) -> Router {
             "/accounts/:address/option-order-attachment-plans",
             get(list_option_order_attachment_plans_route),
         )
+        // SUBACCOUNTS-CORE-BACKEND-V1 — identity CRUD. Reads are open
+        // (mirrors other /accounts/:address reads). Create / rename
+        // are gated by write-auth actions SUBACCOUNT_CREATE and
+        // SUBACCOUNT_RENAME. Trading routes are UNCHANGED and still
+        // resolve orders against the wallet address only; wiring
+        // `subaccount_id` into Options / RFQ / TWAP / Perps requests
+        // is deferred to the follow-up milestones documented in
+        // docs/SUBACCOUNTS_READINESS_AUDIT_AND_SCOPE_V1_RESULT.md.
+        .route(
+            "/accounts/:address/subaccounts",
+            get(list_subaccounts_route).post(create_subaccount_route),
+        )
+        .route(
+            "/accounts/:address/subaccounts/:subaccount_id",
+            get(get_subaccount_route).patch(rename_subaccount_route),
+        )
         // GET /options/execution-intents is wired further below alongside
         // the M-P2f POST handler so both verbs share a single route entry.
         .route(
@@ -12186,6 +12202,175 @@ fn canonical_option_execution_intent_signature_submit(
     )
 }
 
+// === SUBACCOUNTS-CORE-BACKEND-V1 — DTOs, canonical builders, handlers ===
+
+#[derive(Clone, Debug, Serialize)]
+struct SubaccountDto {
+    owner_address: String,
+    subaccount_id: u32,
+    /// Persisted name. `None` means the frontend renders the default
+    /// `Account N` label derived from `subaccount_id`.
+    name: Option<String>,
+    /// Server-computed display label — either the user-set name or
+    /// `"Account {subaccount_id}"`. Included so the frontend does not
+    /// have to re-implement the fallback.
+    display_name: String,
+    created_at_ms: i64,
+    updated_at_ms: i64,
+    archived_at_ms: Option<i64>,
+}
+
+impl From<crate::subaccounts::Subaccount> for SubaccountDto {
+    fn from(s: crate::subaccounts::Subaccount) -> Self {
+        let display_name = s.display_name();
+        Self {
+            owner_address: s.owner_address.0.clone(),
+            subaccount_id: s.subaccount_id,
+            name: s.name,
+            display_name,
+            created_at_ms: s.created_at_ms,
+            updated_at_ms: s.updated_at_ms,
+            archived_at_ms: s.archived_at_ms,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ListSubaccountsResponse {
+    owner_address: String,
+    subaccounts: Vec<SubaccountDto>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct CreateSubaccountBody {
+    #[serde(default)]
+    name: Option<String>,
+    authorization: AuthorizationEnvelope,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct RenameSubaccountBody {
+    name: String,
+    authorization: AuthorizationEnvelope,
+}
+
+fn canonical_subaccount_create(owner: &AccountId, name: Option<&str>) -> Vec<u8> {
+    crate::auth::write_authorization::canonical_payload_bytes(
+        WriteAuthAction::SubaccountCreate,
+        &[
+            ("account", CanonicalValue::Address(owner.clone())),
+            (
+                "name",
+                match name {
+                    Some(s) => CanonicalValue::Str(s.to_string()),
+                    None => CanonicalValue::Null,
+                },
+            ),
+        ],
+    )
+}
+
+fn canonical_subaccount_rename(owner: &AccountId, subaccount_id: u32, name: &str) -> Vec<u8> {
+    crate::auth::write_authorization::canonical_payload_bytes(
+        WriteAuthAction::SubaccountRename,
+        &[
+            ("account", CanonicalValue::Address(owner.clone())),
+            ("subaccount_id", CanonicalValue::U64(subaccount_id as u64)),
+            ("name", CanonicalValue::Str(name.to_string())),
+        ],
+    )
+}
+
+async fn list_subaccounts_route(
+    State(state): State<AppState>,
+    Path(address): Path<String>,
+) -> Result<Json<ListSubaccountsResponse>, ApiError> {
+    let owner = AccountId::new(address);
+    let rows = crate::subaccounts::list_subaccounts(state.subaccounts.as_ref(), &owner).await?;
+    Ok(Json(ListSubaccountsResponse {
+        owner_address: owner.0.clone(),
+        subaccounts: rows.into_iter().map(SubaccountDto::from).collect(),
+    }))
+}
+
+async fn get_subaccount_route(
+    State(state): State<AppState>,
+    Path((address, subaccount_id)): Path<(String, u32)>,
+) -> Result<Json<SubaccountDto>, ApiError> {
+    let owner = AccountId::new(address);
+    let row = crate::subaccounts::get_subaccount(state.subaccounts.as_ref(), &owner, subaccount_id)
+        .await?;
+    Ok(Json(SubaccountDto::from(row)))
+}
+
+async fn create_subaccount_route(
+    State(state): State<AppState>,
+    Path(address): Path<String>,
+    Json(body): Json<CreateSubaccountBody>,
+) -> Result<Json<SubaccountDto>, ApiError> {
+    let owner = AccountId::new(address);
+    // Normalize + validate the requested name before signing check so
+    // an invalid name burns the client's clock, not their nonce.
+    let normalized_name = match body.name.as_deref() {
+        Some(raw) => {
+            Some(crate::subaccounts::normalize_subaccount_name(raw).map_err(BackendError::from)?)
+        }
+        None => None,
+    };
+    let canonical = canonical_subaccount_create(&owner, normalized_name.as_deref());
+    let _verified = require_write_auth(
+        &state,
+        WriteAuthAction::SubaccountCreate,
+        &owner,
+        &canonical,
+        &body.authorization,
+    )
+    .await?;
+    let created =
+        crate::subaccounts::create_subaccount(state.subaccounts.as_ref(), &owner, normalized_name)
+            .await?;
+    attach_resource_best_effort(
+        &state,
+        &body.authorization.nonce,
+        &format!("{}:{}", owner.0, created.subaccount_id),
+    )
+    .await;
+    Ok(Json(SubaccountDto::from(created)))
+}
+
+async fn rename_subaccount_route(
+    State(state): State<AppState>,
+    Path((address, subaccount_id)): Path<(String, u32)>,
+    Json(body): Json<RenameSubaccountBody>,
+) -> Result<Json<SubaccountDto>, ApiError> {
+    let owner = AccountId::new(address);
+    let normalized_name =
+        crate::subaccounts::normalize_subaccount_name(&body.name).map_err(BackendError::from)?;
+    let canonical = canonical_subaccount_rename(&owner, subaccount_id, &normalized_name);
+    let _verified = require_write_auth(
+        &state,
+        WriteAuthAction::SubaccountRename,
+        &owner,
+        &canonical,
+        &body.authorization,
+    )
+    .await?;
+    let renamed = crate::subaccounts::rename_subaccount(
+        state.subaccounts.as_ref(),
+        &owner,
+        subaccount_id,
+        normalized_name,
+    )
+    .await?;
+    attach_resource_best_effort(
+        &state,
+        &body.authorization.nonce,
+        &format!("{}:{}", owner.0, renamed.subaccount_id),
+    )
+    .await;
+    Ok(Json(SubaccountDto::from(renamed)))
+}
+
 #[derive(Debug)]
 pub struct ApiError {
     status: StatusCode,
@@ -12311,6 +12496,9 @@ impl From<BackendError> for ApiError {
             | BackendError::PerpInvalidTifCombination(_)
             | BackendError::PerpSelfTrade => StatusCode::UNPROCESSABLE_ENTITY,
             BackendError::PerpDuplicateClientOrderId(_) => StatusCode::CONFLICT,
+            // SUBACCOUNTS-CORE-BACKEND-V1
+            BackendError::SubaccountNotFound => StatusCode::NOT_FOUND,
+            BackendError::InvalidSubaccountRequest(_) => StatusCode::BAD_REQUEST,
             BackendError::WriteAuth(ref err) => match err {
                 crate::auth::WriteAuthError::AuthorizationRequired => StatusCode::UNAUTHORIZED,
                 crate::auth::WriteAuthError::InvalidSignature => StatusCode::UNAUTHORIZED,

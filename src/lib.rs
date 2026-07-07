@@ -21,6 +21,7 @@ pub mod perps;
 pub mod reconciliation;
 pub mod rfq;
 pub mod signing;
+pub mod subaccounts;
 pub mod types;
 
 pub use error::{BackendError, Result};

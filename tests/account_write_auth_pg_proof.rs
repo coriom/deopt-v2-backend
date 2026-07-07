@@ -181,6 +181,7 @@ fn sign_envelope(
         deadline_ms,
         signature: signature_hex,
         idempotency_key: idempotency_key.map(|s| s.to_string()),
+        version: None,
     }
 }
 
