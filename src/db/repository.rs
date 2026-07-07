@@ -4082,11 +4082,13 @@ impl PgRepository {
     }
 
     pub async fn insert_option_rfq(&self, rfq: &OptionRfqRequest) -> Result<()> {
+        let taker_subaccount_id = u32_to_i32("taker_subaccount_id", rfq.taker_subaccount_id)?;
         sqlx::query(
             "INSERT INTO option_rfqs (
                 option_rfq_id, taker, option_series_id, side, size_1e8, limit_price_1e8,
-                status, created_at_ms, expires_at_ms, accepted_quote_id, option_fill_id
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+                status, created_at_ms, expires_at_ms, accepted_quote_id, option_fill_id,
+                taker_subaccount_id
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
         )
         .bind(rfq.option_rfq_id.to_string())
         .bind(&rfq.taker.0)
@@ -4099,6 +4101,7 @@ impl PgRepository {
         .bind(timestamp_to_i64(rfq.expires_at_ms))
         .bind(rfq.accepted_quote_id.map(|id| id.to_string()))
         .bind(rfq.option_fill_id.map(|id| id.to_string()))
+        .bind(taker_subaccount_id)
         .execute(&self.pool)
         .await
         .map_err(|error| BackendError::Persistence(error.to_string()))?;
@@ -4108,7 +4111,8 @@ impl PgRepository {
     pub async fn list_option_rfqs(&self) -> Result<Vec<OptionRfqRequest>> {
         let rows = sqlx::query(
             "SELECT option_rfq_id, taker, option_series_id, side, size_1e8, limit_price_1e8,
-                    status, created_at_ms, expires_at_ms, accepted_quote_id, option_fill_id
+                    status, created_at_ms, expires_at_ms, accepted_quote_id, option_fill_id,
+                    taker_subaccount_id
              FROM option_rfqs
              ORDER BY created_at_ms ASC, option_rfq_id ASC",
         )
@@ -4124,7 +4128,8 @@ impl PgRepository {
     ) -> Result<Option<OptionRfqRequest>> {
         let row = sqlx::query(
             "SELECT option_rfq_id, taker, option_series_id, side, size_1e8, limit_price_1e8,
-                    status, created_at_ms, expires_at_ms, accepted_quote_id, option_fill_id
+                    status, created_at_ms, expires_at_ms, accepted_quote_id, option_fill_id,
+                    taker_subaccount_id
              FROM option_rfqs
              WHERE option_rfq_id = $1",
         )
@@ -4136,12 +4141,14 @@ impl PgRepository {
     }
 
     pub async fn insert_option_rfq_quote(&self, quote: &OptionRfqQuote) -> Result<()> {
+        let maker_subaccount_id = u32_to_i32("maker_subaccount_id", quote.maker_subaccount_id)?;
         let result = sqlx::query(
             "INSERT INTO option_rfq_quotes (
                 quote_id, option_rfq_id, mm_account, session_id, client_quote_id,
                 price_1e8, size_1e8, status, created_at_ms, expires_at_ms,
-                signature, quote_digest, quote_nonce, signature_status, recovered_signer
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
+                signature, quote_digest, quote_nonce, signature_status, recovered_signer,
+                maker_subaccount_id
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
         )
         .bind(quote.quote_id.to_string())
         .bind(quote.option_rfq_id.to_string())
@@ -4158,6 +4165,7 @@ impl PgRepository {
         .bind(&quote.quote_nonce)
         .bind(quote.signature_status.as_str())
         .bind(quote.recovered_signer.as_ref().map(|account| &account.0))
+        .bind(maker_subaccount_id)
         .execute(&self.pool)
         .await;
 
@@ -4193,7 +4201,8 @@ impl PgRepository {
         let rows = sqlx::query(
             "SELECT quote_id, option_rfq_id, mm_account, session_id, client_quote_id,
                     price_1e8, size_1e8, status, created_at_ms, expires_at_ms,
-                    signature, quote_digest, quote_nonce, signature_status, recovered_signer
+                    signature, quote_digest, quote_nonce, signature_status, recovered_signer,
+                    maker_subaccount_id
              FROM option_rfq_quotes
              WHERE option_rfq_id = $1
              ORDER BY created_at_ms ASC, quote_id ASC",
@@ -4212,7 +4221,8 @@ impl PgRepository {
         let row = sqlx::query(
             "SELECT quote_id, option_rfq_id, mm_account, session_id, client_quote_id,
                     price_1e8, size_1e8, status, created_at_ms, expires_at_ms,
-                    signature, quote_digest, quote_nonce, signature_status, recovered_signer
+                    signature, quote_digest, quote_nonce, signature_status, recovered_signer,
+                    maker_subaccount_id
              FROM option_rfq_quotes
              WHERE quote_id = $1",
         )
@@ -4229,7 +4239,8 @@ impl PgRepository {
     ) -> Result<Option<OptionRfqFill>> {
         let row = sqlx::query(
             "SELECT fill_id, option_rfq_id, quote_id, option_series_id, buyer, seller,
-                    taker, mm_account, taker_side, price_1e8, size_1e8, created_at_ms
+                    taker, mm_account, taker_side, price_1e8, size_1e8, created_at_ms,
+                    taker_subaccount_id, maker_subaccount_id
              FROM option_rfq_fills
              WHERE fill_id = $1",
         )
@@ -4248,7 +4259,8 @@ impl PgRepository {
     pub async fn list_option_rfq_fills(&self) -> Result<Vec<OptionRfqFill>> {
         let rows = sqlx::query(
             "SELECT fill_id, option_rfq_id, quote_id, option_series_id, buyer, seller,
-                    taker, mm_account, taker_side, price_1e8, size_1e8, created_at_ms
+                    taker, mm_account, taker_side, price_1e8, size_1e8, created_at_ms,
+                    taker_subaccount_id, maker_subaccount_id
              FROM option_rfq_fills
              ORDER BY created_at_ms DESC, fill_id DESC",
         )
@@ -7079,6 +7091,18 @@ fn option_rfq_from_row(row: PgRow) -> Result<OptionRfqRequest> {
             BackendError::Persistence(format!("invalid option RFQ id: {error}"))
         })?,
         taker: AccountId::new(row_get::<String>(&row, "taker")?),
+        // SUBACCOUNTS-RFQ-INTEGRATION-V1 — column added by migration
+        // 0040_rfq_subaccounts.sql with `DEFAULT 1`. Existing rows
+        // land on subaccount 1; new rows come through the v2 handler.
+        taker_subaccount_id: {
+            let id: i32 = row_get(&row, "taker_subaccount_id")?;
+            if id < 1 {
+                return Err(BackendError::Persistence(
+                    "option RFQ taker_subaccount_id must be >= 1".to_string(),
+                ));
+            }
+            id as u32
+        },
         option_series_id: row_get(&row, "option_series_id")?,
         side: parse_side(&side)?,
         size_1e8: row_get::<String>(&row, "size_1e8")?
@@ -7129,6 +7153,17 @@ fn option_rfq_quote_from_row(row: PgRow) -> Result<OptionRfqQuote> {
             BackendError::Persistence(format!("invalid option RFQ quote RFQ id: {error}"))
         })?,
         mm_account: AccountId::new(row_get::<String>(&row, "mm_account")?),
+        // SUBACCOUNTS-RFQ-INTEGRATION-V1 — column added by 0040 with
+        // `DEFAULT 1`. New quotes come through the v2 handler.
+        maker_subaccount_id: {
+            let id: i32 = row_get(&row, "maker_subaccount_id")?;
+            if id < 1 {
+                return Err(BackendError::Persistence(
+                    "option RFQ quote maker_subaccount_id must be >= 1".to_string(),
+                ));
+            }
+            id as u32
+        },
         session_id: row_get(&row, "session_id")?,
         client_quote_id: row_get(&row, "client_quote_id")?,
         price_1e8: row_get::<String>(&row, "price_1e8")?
@@ -7176,6 +7211,26 @@ fn option_rfq_fill_from_row(row: PgRow) -> Result<OptionRfqFill> {
         seller: AccountId::new(row_get::<String>(&row, "seller")?),
         taker: AccountId::new(row_get::<String>(&row, "taker")?),
         mm_account: AccountId::new(row_get::<String>(&row, "mm_account")?),
+        // SUBACCOUNTS-RFQ-INTEGRATION-V1 — both sides captured on the
+        // fill for side-aware filtering.
+        taker_subaccount_id: {
+            let id: i32 = row_get(&row, "taker_subaccount_id")?;
+            if id < 1 {
+                return Err(BackendError::Persistence(
+                    "option RFQ fill taker_subaccount_id must be >= 1".to_string(),
+                ));
+            }
+            id as u32
+        },
+        maker_subaccount_id: {
+            let id: i32 = row_get(&row, "maker_subaccount_id")?;
+            if id < 1 {
+                return Err(BackendError::Persistence(
+                    "option RFQ fill maker_subaccount_id must be >= 1".to_string(),
+                ));
+            }
+            id as u32
+        },
         taker_side: parse_side(&taker_side)?,
         price_1e8: row_get::<String>(&row, "price_1e8")?
             .parse()
@@ -7464,11 +7519,16 @@ async fn insert_option_rfq_fill_tx(
     tx: &mut Transaction<'_, Postgres>,
     fill: &OptionRfqFill,
 ) -> Result<()> {
+    let taker_subaccount_id =
+        u32_to_i32("taker_subaccount_id", fill.taker_subaccount_id).unwrap_or(1);
+    let maker_subaccount_id =
+        u32_to_i32("maker_subaccount_id", fill.maker_subaccount_id).unwrap_or(1);
     sqlx::query(
         "INSERT INTO option_rfq_fills (
             fill_id, option_rfq_id, quote_id, option_series_id, buyer, seller, taker,
-            mm_account, taker_side, price_1e8, size_1e8, created_at_ms
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+            mm_account, taker_side, price_1e8, size_1e8, created_at_ms,
+            taker_subaccount_id, maker_subaccount_id
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
     )
     .bind(fill.fill_id.to_string())
     .bind(fill.option_rfq_id.to_string())
@@ -7482,6 +7542,8 @@ async fn insert_option_rfq_fill_tx(
     .bind(fill.price_1e8.to_string())
     .bind(fill.size_1e8.to_string())
     .bind(timestamp_to_i64(fill.created_at_ms))
+    .bind(taker_subaccount_id)
+    .bind(maker_subaccount_id)
     .execute(&mut **tx)
     .await
     .map_err(|error| BackendError::Persistence(error.to_string()))?;

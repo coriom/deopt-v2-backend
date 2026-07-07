@@ -300,6 +300,10 @@ pub enum LifecyclePayload {
         option_rfq_id: String,
         option_series_id: String,
         taker: String,
+        /// SUBACCOUNTS-RFQ-INTEGRATION-V1 — subaccount the taker
+        /// signed for. `1` for pre-migration data.
+        #[serde(default = "crate::options::types::one_subaccount_id")]
+        taker_subaccount_id: u32,
         side: String,
         size_1e8: String,
         limit_price_1e8: Option<String>,
@@ -317,7 +321,11 @@ pub enum LifecyclePayload {
         quote_id: String,
         option_series_id: String,
         taker: String,
+        #[serde(default = "crate::options::types::one_subaccount_id")]
+        taker_subaccount_id: u32,
         mm_account: String,
+        #[serde(default = "crate::options::types::one_subaccount_id")]
+        maker_subaccount_id: u32,
         price_1e8: String,
         size_1e8: String,
         status: String,
@@ -333,7 +341,11 @@ pub enum LifecyclePayload {
         quote_id: String,
         option_series_id: String,
         taker: String,
+        #[serde(default = "crate::options::types::one_subaccount_id")]
+        taker_subaccount_id: u32,
         mm_account: String,
+        #[serde(default = "crate::options::types::one_subaccount_id")]
+        maker_subaccount_id: u32,
         rfq_status: String,
         quote_status: String,
         option_fill_id: String,
@@ -351,7 +363,11 @@ pub enum LifecyclePayload {
         fill_id: String,
         option_series_id: String,
         taker: String,
+        #[serde(default = "crate::options::types::one_subaccount_id")]
+        taker_subaccount_id: u32,
         mm_account: String,
+        #[serde(default = "crate::options::types::one_subaccount_id")]
+        maker_subaccount_id: u32,
         taker_side: String,
         price_1e8: String,
         size_1e8: String,
@@ -367,6 +383,8 @@ pub enum LifecyclePayload {
         option_rfq_id: String,
         option_series_id: String,
         taker: String,
+        #[serde(default = "crate::options::types::one_subaccount_id")]
+        taker_subaccount_id: u32,
         status: String,
         cancelled_at_ms: TimestampMs,
     },

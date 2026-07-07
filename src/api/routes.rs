@@ -2884,11 +2884,20 @@ struct ListOptionFillsQuery {
 
 /// OPTIONS-RFQ-TRADES-FEED-V1 — public listing filter for the
 /// `GET /options/rfq-fills` endpoint. All fields are optional.
+///
+/// SUBACCOUNTS-RFQ-INTEGRATION-V1 — `subaccount_id` opts in to the
+/// side-aware match on the filter; when `account` is provided and
+/// this is omitted, the handler defaults to `Some(1)` for backward
+/// compatibility. `all=true` opts into the wallet-aggregate view.
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
 struct ListOptionRfqFillsQuery {
     account: Option<AccountId>,
     option_rfq_id: Option<String>,
     limit: Option<u32>,
+    #[serde(default)]
+    subaccount_id: Option<u32>,
+    #[serde(default)]
+    all: Option<bool>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -2899,6 +2908,12 @@ struct CreateOptionRfqRequest {
     size_1e8: String,
     limit_price_1e8: Option<String>,
     ttl_ms: Option<u64>,
+    /// SUBACCOUNTS-RFQ-INTEGRATION-V1 — taker subaccount. Absent or
+    /// `Some(1)` is v1-compatible; `Some(>1)` requires the
+    /// `authorization` envelope to carry `version = 2` and matching
+    /// v2 canonical bytes.
+    #[serde(default)]
+    subaccount_id: Option<u32>,
     authorization: AuthorizationEnvelope,
 }
 
@@ -2912,6 +2927,11 @@ struct SubmitOptionRfqQuoteRequest {
     quote_nonce: Option<u64>,
     quote_ttl_ms: Option<u64>,
     signature: Option<String>,
+    /// SUBACCOUNTS-RFQ-INTEGRATION-V1 — maker subaccount, same
+    /// contract as `CreateOptionRfqRequest.subaccount_id` but bound
+    /// to the maker (`mm_account`) party.
+    #[serde(default)]
+    subaccount_id: Option<u32>,
     authorization: AuthorizationEnvelope,
 }
 
@@ -2938,6 +2958,9 @@ struct OptionSeriesResponse {
 struct OptionRfqResponse {
     option_rfq_id: String,
     taker: AccountId,
+    /// SUBACCOUNTS-RFQ-INTEGRATION-V1 — subaccount the taker signed
+    /// for. Pre-migration rows land on `1` via the DB DEFAULT.
+    taker_subaccount_id: u32,
     option_series_id: String,
     side: Side,
     size_1e8: String,
@@ -2955,6 +2978,7 @@ impl From<OptionRfqRequest> for OptionRfqResponse {
         Self {
             option_rfq_id: rfq.option_rfq_id.to_string(),
             taker: rfq.taker,
+            taker_subaccount_id: rfq.taker_subaccount_id,
             option_series_id: rfq.option_series_id,
             side: rfq.side,
             size_1e8: rfq.size_1e8.to_string(),
@@ -2973,6 +2997,10 @@ struct OptionRfqQuoteResponse {
     quote_id: String,
     option_rfq_id: String,
     mm_account: AccountId,
+    /// SUBACCOUNTS-RFQ-INTEGRATION-V1 — maker subaccount the quote
+    /// was signed for. Pre-migration rows land on `1` via the DB
+    /// DEFAULT.
+    maker_subaccount_id: u32,
     session_id: Option<String>,
     client_quote_id: Option<String>,
     price_1e8: String,
@@ -2994,6 +3022,7 @@ impl From<OptionRfqQuote> for OptionRfqQuoteResponse {
             quote_id: quote.quote_id.to_string(),
             option_rfq_id: quote.option_rfq_id.to_string(),
             mm_account: quote.mm_account,
+            maker_subaccount_id: quote.maker_subaccount_id,
             session_id: quote.session_id,
             client_quote_id: quote.client_quote_id,
             price_1e8: quote.price_1e8.to_string(),
@@ -3061,6 +3090,10 @@ struct OptionRfqFillResponse {
     seller: AccountId,
     taker: AccountId,
     mm_account: AccountId,
+    /// SUBACCOUNTS-RFQ-INTEGRATION-V1 — both sides captured on the
+    /// fill so per-subaccount fills feeds can filter side-aware.
+    taker_subaccount_id: u32,
+    maker_subaccount_id: u32,
     taker_side: Side,
     price_1e8: String,
     size_1e8: String,
@@ -3078,6 +3111,8 @@ impl From<OptionRfqFill> for OptionRfqFillResponse {
             seller: fill.seller,
             taker: fill.taker,
             mm_account: fill.mm_account,
+            taker_subaccount_id: fill.taker_subaccount_id,
+            maker_subaccount_id: fill.maker_subaccount_id,
             taker_side: fill.taker_side,
             price_1e8: fill.price_1e8.to_string(),
             size_1e8: fill.size_1e8.to_string(),
@@ -4423,7 +4458,20 @@ async fn create_option_rfq(
     State(state): State<AppState>,
     Json(request): Json<CreateOptionRfqRequest>,
 ) -> Result<Json<OptionRfqResponse>, ApiError> {
-    let canonical = canonical_option_rfq_create(&request);
+    // SUBACCOUNTS-RFQ-INTEGRATION-V1 — resolve the taker subaccount
+    // (v1 defaults to 1; v2 requires an owned id) before picking
+    // canonical bytes so the challenge digest matches the wire form.
+    let resolved_subaccount_id = resolve_options_v2_subaccount(
+        &state,
+        &request.authorization,
+        request.subaccount_id,
+        &request.taker,
+    )
+    .await?;
+    let canonical = match request.authorization.version {
+        Some(2) => canonical_option_rfq_create_v2(&request, resolved_subaccount_id),
+        _ => canonical_option_rfq_create(&request),
+    };
     let _verified = require_write_auth(
         &state,
         WriteAuthAction::OptionRfqCreate,
@@ -4436,6 +4484,7 @@ async fn create_option_rfq(
         &state,
         CreateOptionRfqInput {
             taker: request.taker,
+            taker_subaccount_id: resolved_subaccount_id,
             option_series_id: request.option_series_id,
             side: request.side,
             size_1e8: parse_fixed_u128("size_1e8", &request.size_1e8)?,
@@ -4529,7 +4578,21 @@ async fn submit_option_rfq_quote(
     Json(request): Json<SubmitOptionRfqQuoteRequest>,
 ) -> Result<Json<OptionRfqQuoteResponse>, ApiError> {
     let parsed_rfq_id = parse_option_rfq_id(&option_rfq_id)?;
-    let canonical = canonical_option_rfq_quote_submit(&option_rfq_id, &request);
+    // SUBACCOUNTS-RFQ-INTEGRATION-V1 — resolve the maker subaccount
+    // against the mm_account owner before selecting canonical bytes.
+    let resolved_subaccount_id = resolve_options_v2_subaccount(
+        &state,
+        &request.authorization,
+        request.subaccount_id,
+        &request.mm_account,
+    )
+    .await?;
+    let canonical = match request.authorization.version {
+        Some(2) => {
+            canonical_option_rfq_quote_submit_v2(&option_rfq_id, &request, resolved_subaccount_id)
+        }
+        _ => canonical_option_rfq_quote_submit(&option_rfq_id, &request),
+    };
     let _verified = require_write_auth(
         &state,
         WriteAuthAction::OptionRfqQuoteSubmit,
@@ -4543,6 +4606,7 @@ async fn submit_option_rfq_quote(
         parsed_rfq_id,
         SubmitOptionRfqQuoteInput {
             mm_account: request.mm_account,
+            maker_subaccount_id: resolved_subaccount_id,
             session_id: request.session_id,
             client_quote_id: request.client_quote_id,
             price_1e8: parse_fixed_u128("price_1e8", &request.price_1e8)?,
@@ -4597,9 +4661,22 @@ async fn list_option_rfq_fills(
         .as_deref()
         .map(parse_option_rfq_id)
         .transpose()?;
+    // SUBACCOUNTS-RFQ-INTEGRATION-V1 — side-aware subaccount filter.
+    // Default to `Some(1)` when the caller passes an account without
+    // opting into wallet-aggregate; explicit `all=true` clears the
+    // subaccount filter so mixed views can still be requested.
+    let subaccount_id = if query.all == Some(true) {
+        None
+    } else {
+        match query.account.as_ref() {
+            Some(_) => Some(query.subaccount_id.unwrap_or(1)),
+            None => query.subaccount_id,
+        }
+    };
     let filter = OptionRfqFillFilter {
         option_rfq_id,
         account: query.account,
+        subaccount_id,
     };
     let fills = list_option_rfq_fills_service(&state, filter, query.limit).await?;
     Ok(Json(
@@ -4872,7 +4949,31 @@ async fn accept_option_rfq_quote(
     let parsed_quote_id = parse_option_rfq_quote_id(&quote_id)?;
     // Resolve taker from the RFQ and require their signature.
     let rfq = get_option_rfq_service(&state, parsed_rfq_id).await?;
-    let canonical = canonical_option_rfq_accept(&rfq.taker, &option_rfq_id, &quote_id);
+    // SUBACCOUNTS-RFQ-INTEGRATION-V1 — resolve the taker's subaccount
+    // for this request and refuse cross-subaccount accepts. A v1
+    // envelope on a v2-owned RFQ is rejected by `resolve_options_v2_
+    // subaccount` because the body's `subaccount_id` (defaulted to 1)
+    // won't match the RFQ's actual `taker_subaccount_id` check below.
+    let resolved_subaccount_id =
+        resolve_options_v2_subaccount(&state, &body.authorization, body.subaccount_id, &rfq.taker)
+            .await?;
+    if resolved_subaccount_id != rfq.taker_subaccount_id {
+        return Err(ApiError::from(BackendError::InvalidSubaccountRequest(
+            format!(
+                "RFQ belongs to subaccount {}, cannot accept from subaccount {}",
+                rfq.taker_subaccount_id, resolved_subaccount_id
+            ),
+        )));
+    }
+    let canonical = match body.authorization.version {
+        Some(2) => canonical_option_rfq_accept_v2(
+            &rfq.taker,
+            resolved_subaccount_id,
+            &option_rfq_id,
+            &quote_id,
+        ),
+        _ => canonical_option_rfq_accept(&rfq.taker, &option_rfq_id, &quote_id),
+    };
     let _verified = require_write_auth(
         &state,
         WriteAuthAction::OptionRfqAccept,
@@ -4902,7 +5003,26 @@ async fn cancel_option_rfq(
 ) -> Result<Json<OptionRfqResponse>, ApiError> {
     let parsed_rfq_id = parse_option_rfq_id(&option_rfq_id)?;
     let rfq = get_option_rfq_service(&state, parsed_rfq_id).await?;
-    let canonical = canonical_option_rfq_cancel(&rfq.taker, &option_rfq_id);
+    // SUBACCOUNTS-RFQ-INTEGRATION-V1 — same cross-subaccount refusal
+    // as accept: a wallet cannot cancel an RFQ belonging to a
+    // subaccount it hasn't signed for.
+    let resolved_subaccount_id =
+        resolve_options_v2_subaccount(&state, &body.authorization, body.subaccount_id, &rfq.taker)
+            .await?;
+    if resolved_subaccount_id != rfq.taker_subaccount_id {
+        return Err(ApiError::from(BackendError::InvalidSubaccountRequest(
+            format!(
+                "RFQ belongs to subaccount {}, cannot cancel from subaccount {}",
+                rfq.taker_subaccount_id, resolved_subaccount_id
+            ),
+        )));
+    }
+    let canonical = match body.authorization.version {
+        Some(2) => {
+            canonical_option_rfq_cancel_v2(&rfq.taker, resolved_subaccount_id, &option_rfq_id)
+        }
+        _ => canonical_option_rfq_cancel(&rfq.taker, &option_rfq_id),
+    };
     let _verified = require_write_auth(
         &state,
         WriteAuthAction::OptionRfqCancel,
@@ -12680,6 +12800,153 @@ fn canonical_option_rfq_cancel(taker: &AccountId, option_rfq_id: &str) -> Vec<u8
         WriteAuthAction::OptionRfqCancel,
         &[
             ("taker", CanonicalValue::Address(taker.clone())),
+            (
+                "option_rfq_id",
+                CanonicalValue::Str(option_rfq_id.to_string()),
+            ),
+        ],
+    )
+}
+
+// ---------------------------------------------------------------------
+// SUBACCOUNTS-RFQ-INTEGRATION-V1 — v2 canonical builders.
+//
+// Each v2 builder mirrors its v1 counterpart with `subaccount_id`
+// emitted immediately after the party identifier (`taker` for taker-
+// side actions; `mm_account` for the maker quote submit). The signed
+// key is uniformly `subaccount_id`; the backend maps it to
+// `taker_subaccount_id` or `maker_subaccount_id` by route context.
+//
+// v1 bytes stay byte-identical (see the `v1_option_rfq_*` byte-freeze
+// tests). Every other field is preserved in the same order as v1 so
+// only the digest for a non-default subaccount diverges — that
+// divergence is what enforces cross-subaccount replay resistance at
+// the challenge verifier while the formal `used_nonces_v2` table is
+// still deferred.
+// ---------------------------------------------------------------------
+
+fn canonical_option_rfq_create_v2(
+    req: &CreateOptionRfqRequest,
+    taker_subaccount_id: u32,
+) -> Vec<u8> {
+    crate::auth::write_authorization::canonical_payload_bytes(
+        WriteAuthAction::OptionRfqCreate,
+        &[
+            ("taker", CanonicalValue::Address(req.taker.clone())),
+            (
+                "subaccount_id",
+                CanonicalValue::U64(taker_subaccount_id as u64),
+            ),
+            (
+                "option_series_id",
+                CanonicalValue::Str(req.option_series_id.clone()),
+            ),
+            (
+                "side",
+                CanonicalValue::Str(match req.side {
+                    Side::Buy => "buy".to_string(),
+                    Side::Sell => "sell".to_string(),
+                }),
+            ),
+            ("size_1e8", CanonicalValue::Str(req.size_1e8.clone())),
+            (
+                "limit_price_1e8",
+                req.limit_price_1e8
+                    .as_ref()
+                    .map(|v| CanonicalValue::Str(v.clone()))
+                    .unwrap_or(CanonicalValue::Null),
+            ),
+            (
+                "ttl_ms",
+                req.ttl_ms
+                    .map(CanonicalValue::U64)
+                    .unwrap_or(CanonicalValue::Null),
+            ),
+        ],
+    )
+}
+
+fn canonical_option_rfq_quote_submit_v2(
+    option_rfq_id: &str,
+    req: &SubmitOptionRfqQuoteRequest,
+    maker_subaccount_id: u32,
+) -> Vec<u8> {
+    crate::auth::write_authorization::canonical_payload_bytes(
+        WriteAuthAction::OptionRfqQuoteSubmit,
+        &[
+            (
+                "option_rfq_id",
+                CanonicalValue::Str(option_rfq_id.to_string()),
+            ),
+            (
+                "mm_account",
+                CanonicalValue::Address(req.mm_account.clone()),
+            ),
+            (
+                "subaccount_id",
+                CanonicalValue::U64(maker_subaccount_id as u64),
+            ),
+            ("price_1e8", CanonicalValue::Str(req.price_1e8.clone())),
+            ("size_1e8", CanonicalValue::Str(req.size_1e8.clone())),
+            (
+                "client_quote_id",
+                req.client_quote_id
+                    .as_ref()
+                    .map(|v| CanonicalValue::Str(v.clone()))
+                    .unwrap_or(CanonicalValue::Null),
+            ),
+            (
+                "quote_nonce",
+                req.quote_nonce
+                    .map(CanonicalValue::U64)
+                    .unwrap_or(CanonicalValue::Null),
+            ),
+            (
+                "quote_ttl_ms",
+                req.quote_ttl_ms
+                    .map(CanonicalValue::U64)
+                    .unwrap_or(CanonicalValue::Null),
+            ),
+        ],
+    )
+}
+
+pub(crate) fn canonical_option_rfq_accept_v2(
+    taker: &AccountId,
+    taker_subaccount_id: u32,
+    option_rfq_id: &str,
+    quote_id: &str,
+) -> Vec<u8> {
+    crate::auth::write_authorization::canonical_payload_bytes(
+        WriteAuthAction::OptionRfqAccept,
+        &[
+            ("taker", CanonicalValue::Address(taker.clone())),
+            (
+                "subaccount_id",
+                CanonicalValue::U64(taker_subaccount_id as u64),
+            ),
+            (
+                "option_rfq_id",
+                CanonicalValue::Str(option_rfq_id.to_string()),
+            ),
+            ("quote_id", CanonicalValue::Str(quote_id.to_string())),
+        ],
+    )
+}
+
+pub(crate) fn canonical_option_rfq_cancel_v2(
+    taker: &AccountId,
+    taker_subaccount_id: u32,
+    option_rfq_id: &str,
+) -> Vec<u8> {
+    crate::auth::write_authorization::canonical_payload_bytes(
+        WriteAuthAction::OptionRfqCancel,
+        &[
+            ("taker", CanonicalValue::Address(taker.clone())),
+            (
+                "subaccount_id",
+                CanonicalValue::U64(taker_subaccount_id as u64),
+            ),
             (
                 "option_rfq_id",
                 CanonicalValue::Str(option_rfq_id.to_string()),

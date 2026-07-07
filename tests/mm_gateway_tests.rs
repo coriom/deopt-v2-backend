@@ -2144,6 +2144,7 @@ fn option_series_input() -> CreateOptionSeriesInput {
 fn option_rfq_input(option_series_id: String, side: Side) -> CreateOptionRfqInput {
     CreateOptionRfqInput {
         taker: AccountId::new("0x0000000000000000000000000000000000000003"),
+        taker_subaccount_id: 1,
         option_series_id,
         side,
         size_1e8: 100_000_000,
@@ -2159,6 +2160,7 @@ fn option_rfq_quote_input(
 ) -> SubmitOptionRfqQuoteInput {
     SubmitOptionRfqQuoteInput {
         mm_account,
+        maker_subaccount_id: 1,
         session_id: Some(session_id.to_string()),
         client_quote_id: Some(client_quote_id.to_string()),
         price_1e8: 1_000_000_000,

@@ -1189,6 +1189,10 @@ impl OptionRfqQuoteSignatureStatus {
 pub struct OptionRfqRequest {
     pub option_rfq_id: OptionRfqId,
     pub taker: AccountId,
+    /// SUBACCOUNTS-RFQ-INTEGRATION-V1 — subaccount the taker signed
+    /// for. `1` for pre-migration rows via DB DEFAULT.
+    #[serde(default = "one_subaccount_id")]
+    pub taker_subaccount_id: u32,
     pub option_series_id: OptionSeriesId,
     pub side: Side,
     pub size_1e8: Size1e8,
@@ -1215,6 +1219,10 @@ pub struct OptionRfqQuote {
     pub quote_id: OptionRfqQuoteId,
     pub option_rfq_id: OptionRfqId,
     pub mm_account: AccountId,
+    /// SUBACCOUNTS-RFQ-INTEGRATION-V1 — subaccount the maker signed
+    /// for. `1` for pre-migration rows via DB DEFAULT.
+    #[serde(default = "one_subaccount_id")]
+    pub maker_subaccount_id: u32,
     pub session_id: Option<String>,
     pub client_quote_id: Option<String>,
     pub price_1e8: Price1e8,
@@ -1249,6 +1257,12 @@ pub struct OptionRfqFill {
     pub seller: AccountId,
     pub taker: AccountId,
     pub mm_account: AccountId,
+    /// SUBACCOUNTS-RFQ-INTEGRATION-V1 — both sides captured on the
+    /// fill so the RFQ fills feed can filter side-aware.
+    #[serde(default = "one_subaccount_id")]
+    pub taker_subaccount_id: u32,
+    #[serde(default = "one_subaccount_id")]
+    pub maker_subaccount_id: u32,
     pub taker_side: Side,
     pub price_1e8: Price1e8,
     pub size_1e8: Size1e8,
@@ -1291,10 +1305,22 @@ pub struct OptionFillFilter {
 /// supplied address equals any of `buyer`, `seller`, `taker`, or
 /// `mm_account` (case-insensitive) — all four are stakeholders in
 /// the fill. `option_rfq_id` narrows to a single RFQ's fills.
+///
+/// SUBACCOUNTS-RFQ-INTEGRATION-V1 — `subaccount_id` opts in to the
+/// side-aware matcher: given `(account=X, subaccount_id=N)`, the
+/// fill matches only when:
+///   * `taker == X && taker_subaccount_id == N`, OR
+///   * `mm_account == X && maker_subaccount_id == N`.
+/// (`buyer` and `seller` are derived from taker/mm_account by
+/// `taker_side` — checking taker + mm_account covers every path
+/// through which the wallet ended up on the fill.) When `account`
+/// is provided and `subaccount_id` is `None`, the route layer
+/// defaults to `Some(1)` for backward compatibility.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct OptionRfqFillFilter {
     pub option_rfq_id: Option<OptionRfqId>,
     pub account: Option<AccountId>,
+    pub subaccount_id: Option<u32>,
 }
 
 impl OptionRfqFillFilter {
@@ -1306,12 +1332,24 @@ impl OptionRfqFillFilter {
         }
         if let Some(account) = &self.account {
             let acct = &account.0;
-            if !fill.buyer.0.eq_ignore_ascii_case(acct)
-                && !fill.seller.0.eq_ignore_ascii_case(acct)
-                && !fill.taker.0.eq_ignore_ascii_case(acct)
-                && !fill.mm_account.0.eq_ignore_ascii_case(acct)
-            {
+            let taker_hit = fill.taker.0.eq_ignore_ascii_case(acct);
+            let maker_hit = fill.mm_account.0.eq_ignore_ascii_case(acct);
+            let buyer_hit = fill.buyer.0.eq_ignore_ascii_case(acct);
+            let seller_hit = fill.seller.0.eq_ignore_ascii_case(acct);
+            if !taker_hit && !maker_hit && !buyer_hit && !seller_hit {
                 return false;
+            }
+            if let Some(subaccount_id) = self.subaccount_id {
+                // Side-aware: the account matches on the taker seat
+                // only if the taker subaccount matches; same for the
+                // maker seat. `buyer` / `seller` are derived from
+                // `taker` + `mm_account` by `taker_side`, so either
+                // taker or maker being an ok hit is sufficient.
+                let taker_side_ok = taker_hit && fill.taker_subaccount_id == subaccount_id;
+                let maker_side_ok = maker_hit && fill.maker_subaccount_id == subaccount_id;
+                if !taker_side_ok && !maker_side_ok {
+                    return false;
+                }
             }
         }
         true

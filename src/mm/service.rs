@@ -789,6 +789,13 @@ impl MmGatewayService {
             payload.option_rfq_id,
             SubmitOptionRfqQuoteInput {
                 mm_account,
+                // SUBACCOUNTS-RFQ-INTEGRATION-V1 — MM Gateway sessions
+                // are wallet-level today; subaccount routing over the
+                // WebTransport surface is a follow-up (out of scope
+                // for the public HTTP path this milestone targets).
+                // Default to Account 1 so the existing MM smoke keeps
+                // working byte-identically.
+                maker_subaccount_id: 1,
                 session_id: Some(session.session_id.clone()),
                 client_quote_id: payload.client_quote_id,
                 price_1e8,

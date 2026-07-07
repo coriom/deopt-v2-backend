@@ -126,6 +126,10 @@ pub struct SubmitOptionOrderOutcome {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CreateOptionRfqInput {
     pub taker: AccountId,
+    /// SUBACCOUNTS-RFQ-INTEGRATION-V1 — subaccount the taker signed
+    /// for. Handler resolves this via `resolve_options_v2_subaccount`
+    /// before invoking the service.
+    pub taker_subaccount_id: u32,
     pub option_series_id: OptionSeriesId,
     pub side: Side,
     pub size_1e8: Size1e8,
@@ -136,6 +140,9 @@ pub struct CreateOptionRfqInput {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SubmitOptionRfqQuoteInput {
     pub mm_account: AccountId,
+    /// SUBACCOUNTS-RFQ-INTEGRATION-V1 — subaccount the maker signed
+    /// for. Same contract as `CreateOptionRfqInput.taker_subaccount_id`.
+    pub maker_subaccount_id: u32,
     pub session_id: Option<String>,
     pub client_quote_id: Option<String>,
     pub price_1e8: Price1e8,
@@ -1474,6 +1481,7 @@ pub async fn create_option_rfq(
     let rfq = OptionRfqRequest {
         option_rfq_id: Uuid::new_v4(),
         taker: input.taker,
+        taker_subaccount_id: input.taker_subaccount_id,
         option_series_id: input.option_series_id,
         side: input.side,
         size_1e8: input.size_1e8,
@@ -1519,6 +1527,7 @@ fn emit_option_rfq_created_lifecycle(state: &AppState, rfq: &OptionRfqRequest) {
             option_rfq_id: rfq.option_rfq_id.to_string(),
             option_series_id: rfq.option_series_id.clone(),
             taker: rfq.taker.0.clone(),
+            taker_subaccount_id: rfq.taker_subaccount_id,
             side: match rfq.side {
                 Side::Buy => "buy".to_string(),
                 Side::Sell => "sell".to_string(),
@@ -1666,6 +1675,7 @@ pub async fn submit_option_rfq_quote(
         quote_id: Uuid::new_v4(),
         option_rfq_id,
         mm_account: input.mm_account,
+        maker_subaccount_id: input.maker_subaccount_id,
         session_id: input.session_id,
         client_quote_id: input.client_quote_id,
         price_1e8: input.price_1e8,
@@ -1718,7 +1728,9 @@ fn emit_option_rfq_quote_submitted_lifecycle(
                 quote_id: quote.quote_id.to_string(),
                 option_series_id: rfq.option_series_id.clone(),
                 taker: rfq.taker.0.clone(),
+                taker_subaccount_id: rfq.taker_subaccount_id,
                 mm_account: quote.mm_account.0.clone(),
+                maker_subaccount_id: quote.maker_subaccount_id,
                 price_1e8: quote.price_1e8.to_string(),
                 size_1e8: quote.size_1e8.to_string(),
                 status: quote.status.as_str().to_string(),
@@ -1836,6 +1848,8 @@ pub async fn accept_option_rfq_quote(
         seller,
         taker: rfq.taker.clone(),
         mm_account: quote.mm_account.clone(),
+        taker_subaccount_id: rfq.taker_subaccount_id,
+        maker_subaccount_id: quote.maker_subaccount_id,
         taker_side: rfq.side,
         price_1e8: quote.price_1e8,
         size_1e8: quote.size_1e8,
@@ -1914,7 +1928,9 @@ fn emit_option_rfq_accept_lifecycle(
                 quote_id: quote.quote_id.to_string(),
                 option_series_id: rfq.option_series_id.clone(),
                 taker: rfq.taker.0.clone(),
+                taker_subaccount_id: rfq.taker_subaccount_id,
                 mm_account: quote.mm_account.0.clone(),
+                maker_subaccount_id: quote.maker_subaccount_id,
                 rfq_status: rfq.status.as_str().to_string(),
                 quote_status: quote.status.as_str().to_string(),
                 option_fill_id: fill.fill_id.to_string(),
@@ -1933,7 +1949,9 @@ fn emit_option_rfq_accept_lifecycle(
                 fill_id: fill.fill_id.to_string(),
                 option_series_id: fill.option_series_id.clone(),
                 taker: fill.taker.0.clone(),
+                taker_subaccount_id: fill.taker_subaccount_id,
                 mm_account: fill.mm_account.0.clone(),
+                maker_subaccount_id: fill.maker_subaccount_id,
                 taker_side: match fill.taker_side {
                     Side::Buy => "buy".to_string(),
                     Side::Sell => "sell".to_string(),
@@ -1978,6 +1996,7 @@ fn emit_option_rfq_cancelled_lifecycle(state: &AppState, rfq: &OptionRfqRequest)
             option_rfq_id: rfq.option_rfq_id.to_string(),
             option_series_id: rfq.option_series_id.clone(),
             taker: rfq.taker.0.clone(),
+            taker_subaccount_id: rfq.taker_subaccount_id,
             status: rfq.status.as_str().to_string(),
             cancelled_at_ms: now,
         },

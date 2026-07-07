@@ -257,6 +257,7 @@ fn order_input(
 fn option_rfq_input(option_series_id: String, side: Side) -> CreateOptionRfqInput {
     CreateOptionRfqInput {
         taker: account(),
+        taker_subaccount_id: 1,
         option_series_id,
         side,
         size_1e8: 100_000_000,
@@ -271,6 +272,7 @@ fn option_rfq_quote_input(
 ) -> SubmitOptionRfqQuoteInput {
     SubmitOptionRfqQuoteInput {
         mm_account,
+        maker_subaccount_id: 1,
         session_id: Some("test-mm-session".to_string()),
         client_quote_id: Some(client_quote_id.to_string()),
         price_1e8: 1_000_000_000,
@@ -2519,6 +2521,7 @@ async fn strict_acceptance_requires_active_verified_option_rfq_quote() {
         quote_id: uuid::Uuid::new_v4(),
         option_rfq_id: rfq.option_rfq_id,
         mm_account: signing_account(),
+        maker_subaccount_id: 1,
         session_id: None,
         client_quote_id: Some("forced-unverified-option-rfq-quote".to_string()),
         price_1e8: 1_000_000_000,
