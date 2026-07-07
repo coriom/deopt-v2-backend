@@ -4666,6 +4666,7 @@ async fn standalone_conditional_creation_still_works_alongside_attachments() {
         &state,
         CreateConditionalOrderInput {
             account: account_two(),
+            subaccount_id: 1,
             option_series_id: series.clone(),
             quantity_1e8: 100_000_000,
             legs: vec![ConditionalLegInput {
@@ -5087,6 +5088,7 @@ fn option_twap_state() -> AppState {
 fn twap_input(option_series_id: String, side: Side) -> CreateOptionTwapInput {
     CreateOptionTwapInput {
         account: account(),
+        subaccount_id: 1,
         option_series_id,
         side,
         size_1e8: 4 * ONE_1E8, // 4 contracts split into N children

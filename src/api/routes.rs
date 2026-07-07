@@ -3814,6 +3814,14 @@ async fn create_conditional_order_route(
     }
     let input = cond::CreateConditionalOrderInput {
         account: account.clone(),
+        // SUBACCOUNTS-OPTIONS-CONDITIONAL-TWAP-WS-V1 — conditional
+        // standalone create still routes through the foundation
+        // gate `enforce_v1_default_subaccount` at the handler entry
+        // (v2 for `CONDITIONAL_ORDER_CREATE` remains 503). The gate
+        // guarantees this branch is only reached with subaccount 1,
+        // so the persisted row is subaccount 1. Attached child
+        // orders inherit via `ConditionalOrder.subaccount_id`.
+        subaccount_id: 1,
         option_series_id: body.option_series_id,
         quantity_1e8: parse_fixed_u128("quantity_1e8", &body.quantity_1e8)?,
         legs: leg_inputs,
@@ -4006,11 +4014,23 @@ async fn cancel_conditional_order_route(
     Json(body): Json<AuthorizationOnlyBody>,
 ) -> Result<Json<ConditionalOrderResponseDto>, ApiError> {
     use crate::options::conditional_orders as cond;
-    enforce_v1_default_subaccount(&body.authorization, body.subaccount_id)?;
     let parsed_id = uuid::Uuid::parse_str(&id)
         .map_err(|_| ApiError::from(BackendError::InvalidConditionalOrderId))?;
     let account = AccountId::new(address);
-    let canonical = canonical_conditional_order_cancel(&account, &id);
+    // SUBACCOUNTS-OPTIONS-CONDITIONAL-TWAP-WS-V1 — conditional cancel
+    // flips from foundation gate 503 to real routing. Ownership
+    // check: reject cross-subaccount cancels. Existing conditional
+    // rows lack a persisted subaccount today; a subaccount 2 cancel
+    // is only meaningful against a subaccount 2 conditional — which
+    // requires conditional CREATE to also be flipped to v2 (see the
+    // deferred list for that surface).
+    let resolved_subaccount_id =
+        resolve_options_v2_subaccount(&state, &body.authorization, body.subaccount_id, &account)
+            .await?;
+    let canonical = match body.authorization.version {
+        Some(2) => canonical_conditional_order_cancel_v2(&account, resolved_subaccount_id, &id),
+        _ => canonical_conditional_order_cancel(&account, &id),
+    };
     let _verified = require_write_auth(
         &state,
         WriteAuthAction::ConditionalOrderCancel,
@@ -4020,6 +4040,11 @@ async fn cancel_conditional_order_route(
     )
     .await?;
     let cancelled = cond::cancel_conditional_order(&state, parsed_id, &account).await?;
+    // Cross-subaccount ownership check: the loaded record's
+    // subaccount must match the resolved subaccount.
+    if cancelled.subaccount_id != resolved_subaccount_id {
+        return Err(ApiError::from(BackendError::SubaccountNotFound));
+    }
     Ok(Json(cancelled.into()))
 }
 
@@ -4698,8 +4723,19 @@ async fn create_option_twap_order(
     State(state): State<AppState>,
     Json(request): Json<CreateOptionTwapRequest>,
 ) -> Result<Json<OptionTwapOrderResponse>, ApiError> {
-    enforce_v1_default_subaccount(&request.authorization, request.subaccount_id)?;
-    let canonical = canonical_option_twap_create(&request);
+    // SUBACCOUNTS-OPTIONS-CONDITIONAL-TWAP-WS-V1 — TWAP create flips
+    // from foundation gate 503 to real routing.
+    let resolved_subaccount_id = resolve_options_v2_subaccount(
+        &state,
+        &request.authorization,
+        request.subaccount_id,
+        &request.account,
+    )
+    .await?;
+    let canonical = match request.authorization.version {
+        Some(2) => canonical_option_twap_create_v2(&request, resolved_subaccount_id),
+        _ => canonical_option_twap_create(&request),
+    };
     let _verified = require_write_auth(
         &state,
         WriteAuthAction::OptionTwapCreate,
@@ -4712,6 +4748,7 @@ async fn create_option_twap_order(
         &state,
         CreateOptionTwapInput {
             account: request.account,
+            subaccount_id: resolved_subaccount_id,
             option_series_id: request.option_series_id,
             side: request.side,
             size_1e8: parse_fixed_u128("size_1e8", &request.size_1e8)?,
@@ -4765,10 +4802,26 @@ async fn cancel_option_twap_order(
     Path(option_twap_id): Path<String>,
     Json(body): Json<AuthorizationOnlyBody>,
 ) -> Result<Json<OptionTwapOrderResponse>, ApiError> {
-    enforce_v1_default_subaccount(&body.authorization, body.subaccount_id)?;
     let id = parse_option_twap_id(&option_twap_id)?;
     let twap = get_option_twap_order_service(&state, id).await?;
-    let canonical = canonical_option_twap_cancel(&twap.account, &option_twap_id);
+    // SUBACCOUNTS-OPTIONS-CONDITIONAL-TWAP-WS-V1 — TWAP cancel flips
+    // from foundation gate 503 to real routing with ownership check.
+    let resolved_subaccount_id = resolve_options_v2_subaccount(
+        &state,
+        &body.authorization,
+        body.subaccount_id,
+        &twap.account,
+    )
+    .await?;
+    if twap.subaccount_id != resolved_subaccount_id {
+        return Err(ApiError::from(BackendError::SubaccountNotFound));
+    }
+    let canonical = match body.authorization.version {
+        Some(2) => {
+            canonical_option_twap_cancel_v2(&twap.account, resolved_subaccount_id, &option_twap_id)
+        }
+        _ => canonical_option_twap_cancel(&twap.account, &option_twap_id),
+    };
     let _verified = require_write_auth(
         &state,
         WriteAuthAction::OptionTwapCancel,
@@ -12512,6 +12565,44 @@ pub(crate) fn canonical_option_twap_cancel_v2(
             (
                 "option_twap_id",
                 CanonicalValue::Str(option_twap_id.to_string()),
+            ),
+        ],
+    )
+}
+
+/// SUBACCOUNTS-OPTIONS-CONDITIONAL-TWAP-WS-V1 — v2 canonical for
+/// TWAP parent create. Mirrors the v1 field order; embeds
+/// `subaccount_id` immediately after `account`.
+fn canonical_option_twap_create_v2(req: &CreateOptionTwapRequest, subaccount_id: u32) -> Vec<u8> {
+    crate::auth::write_authorization::canonical_payload_bytes(
+        WriteAuthAction::OptionTwapCreate,
+        &[
+            ("account", CanonicalValue::Address(req.account.clone())),
+            ("subaccount_id", CanonicalValue::U64(subaccount_id as u64)),
+            (
+                "option_series_id",
+                CanonicalValue::Str(req.option_series_id.clone()),
+            ),
+            (
+                "side",
+                CanonicalValue::Str(match req.side {
+                    Side::Buy => "buy".to_string(),
+                    Side::Sell => "sell".to_string(),
+                }),
+            ),
+            ("size_1e8", CanonicalValue::Str(req.size_1e8.clone())),
+            (
+                "limit_price_1e8",
+                CanonicalValue::Str(req.limit_price_1e8.clone()),
+            ),
+            ("running_time_ms", CanonicalValue::U64(req.running_time_ms)),
+            ("child_count", CanonicalValue::U64(req.child_count as u64)),
+            (
+                "client_order_id",
+                req.client_order_id
+                    .as_ref()
+                    .map(|v| CanonicalValue::Str(v.clone()))
+                    .unwrap_or(CanonicalValue::Null),
             ),
         ],
     )

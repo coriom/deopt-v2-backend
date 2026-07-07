@@ -2861,9 +2861,9 @@ impl PgRepository {
                 quantity_1e8, execution_type, limit_price_1e8, reduce_only,
                 oco_group_id, status, child_order_id, failure_code, failure_message,
                 expires_at_ms, triggered_at_ms, completed_at_ms,
-                created_at_ms, updated_at_ms, version
+                created_at_ms, updated_at_ms, version, subaccount_id
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-                      $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)",
+                      $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)",
         )
         .bind(order.id)
         .bind(&order.account.0)
@@ -2889,6 +2889,7 @@ impl PgRepository {
         .bind(timestamp_to_i64(order.created_at_ms))
         .bind(timestamp_to_i64(order.updated_at_ms))
         .bind(order.version)
+        .bind(u32_to_i32("subaccount_id", order.subaccount_id).unwrap_or(1))
         .execute(&self.pool)
         .await
         .map(|_| ())
@@ -2917,7 +2918,7 @@ impl PgRepository {
                     quantity_1e8, execution_type, limit_price_1e8, reduce_only,
                     oco_group_id, status, child_order_id, failure_code, failure_message,
                     expires_at_ms, triggered_at_ms, completed_at_ms,
-                    created_at_ms, updated_at_ms, version
+                    created_at_ms, updated_at_ms, version, subaccount_id
              FROM options_conditional_orders
              ORDER BY created_at_ms ASC, id ASC",
         )
@@ -4268,9 +4269,9 @@ impl PgRepository {
                 remaining_size_1e8, limit_price_1e8, running_time_ms, child_count,
                 child_interval_ms, next_execution_at_ms, started_at_ms, ends_at_ms,
                 status, created_child_count, filled_size_1e8, failed_child_count,
-                client_order_id, last_error, created_at_ms, updated_at_ms
+                client_order_id, last_error, created_at_ms, updated_at_ms, subaccount_id
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-                      $14, $15, $16, $17, $18, $19, $20, $21)",
+                      $14, $15, $16, $17, $18, $19, $20, $21, $22)",
         )
         .bind(twap.option_twap_id.to_string())
         .bind(&twap.account.0)
@@ -4296,6 +4297,7 @@ impl PgRepository {
         .bind(twap.last_error.as_deref())
         .bind(timestamp_to_i64(twap.created_at_ms))
         .bind(timestamp_to_i64(twap.updated_at_ms))
+        .bind(u32_to_i32("subaccount_id", twap.subaccount_id).unwrap_or(1))
         .execute(&self.pool)
         .await
         .map_err(|error| BackendError::Persistence(error.to_string()))?;
@@ -4311,7 +4313,7 @@ impl PgRepository {
                     remaining_size_1e8, limit_price_1e8, running_time_ms, child_count,
                     child_interval_ms, next_execution_at_ms, started_at_ms, ends_at_ms,
                     status, created_child_count, filled_size_1e8, failed_child_count,
-                    client_order_id, last_error, created_at_ms, updated_at_ms
+                    client_order_id, last_error, created_at_ms, updated_at_ms, subaccount_id
              FROM option_twap_orders WHERE option_twap_id = $1",
         )
         .bind(id.to_string())
@@ -4327,7 +4329,7 @@ impl PgRepository {
                     remaining_size_1e8, limit_price_1e8, running_time_ms, child_count,
                     child_interval_ms, next_execution_at_ms, started_at_ms, ends_at_ms,
                     status, created_child_count, filled_size_1e8, failed_child_count,
-                    client_order_id, last_error, created_at_ms, updated_at_ms
+                    client_order_id, last_error, created_at_ms, updated_at_ms, subaccount_id
              FROM option_twap_orders
              ORDER BY created_at_ms DESC, option_twap_id DESC",
         )
@@ -4346,7 +4348,7 @@ impl PgRepository {
                     remaining_size_1e8, limit_price_1e8, running_time_ms, child_count,
                     child_interval_ms, next_execution_at_ms, started_at_ms, ends_at_ms,
                     status, created_child_count, filled_size_1e8, failed_child_count,
-                    client_order_id, last_error, created_at_ms, updated_at_ms
+                    client_order_id, last_error, created_at_ms, updated_at_ms, subaccount_id
              FROM option_twap_orders
              WHERE status IN ('pending', 'running')
                AND next_execution_at_ms <= $1
@@ -6652,7 +6654,7 @@ const CONDITIONAL_ORDER_SELECT: &str =
             quantity_1e8, execution_type, limit_price_1e8, reduce_only,
             oco_group_id, status, child_order_id, failure_code, failure_message,
             expires_at_ms, triggered_at_ms, completed_at_ms,
-            created_at_ms, updated_at_ms, version
+            created_at_ms, updated_at_ms, version, subaccount_id
      FROM options_conditional_orders
      WHERE id = $1";
 
@@ -6670,6 +6672,17 @@ fn conditional_order_from_row(
     Ok(cond::ConditionalOrder {
         id: row_get(&row, "id")?,
         account: AccountId::new(row_get::<String>(&row, "account")?),
+        // SUBACCOUNTS-OPTIONS-CONDITIONAL-TWAP-WS-V1 — column added
+        // by migration 0039 with DEFAULT 1.
+        subaccount_id: {
+            let id: i32 = row_get(&row, "subaccount_id")?;
+            if id < 1 {
+                return Err(BackendError::Persistence(
+                    "conditional order subaccount_id must be >= 1".to_string(),
+                ));
+            }
+            id as u32
+        },
         option_series_id: row_get(&row, "option_series_id")?,
         position_side: cond::PositionSide::parse(&position_side)?,
         option_kind: cond::OptionKind::parse(&option_kind)?,
@@ -7192,6 +7205,17 @@ fn option_twap_order_from_row(row: PgRow) -> Result<OptionTwapOrder> {
             .parse()
             .map_err(|e| BackendError::Persistence(format!("invalid TWAP id: {e}")))?,
         account: AccountId::new(row_get::<String>(&row, "account")?),
+        // SUBACCOUNTS-OPTIONS-CONDITIONAL-TWAP-WS-V1 — column added
+        // by migration 0039 with DEFAULT 1.
+        subaccount_id: {
+            let id: i32 = row_get(&row, "subaccount_id")?;
+            if id < 1 {
+                return Err(BackendError::Persistence(
+                    "option TWAP subaccount_id must be >= 1".to_string(),
+                ));
+            }
+            id as u32
+        },
         option_series_id: row_get(&row, "option_series_id")?,
         side: parse_side(&side)?,
         size_1e8: row_get::<String>(&row, "size_1e8")?

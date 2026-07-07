@@ -854,6 +854,11 @@ async fn materialize_attachment_plan(
     let link_as_oco = plan.link_as_oco && legs.len() == 2;
     let input = CreateConditionalOrderInput {
         account: parent.account.clone(),
+        // SUBACCOUNTS-OPTIONS-CONDITIONAL-TWAP-WS-V1 — the attached
+        // TP/SL child conditional inherits the parent order's
+        // subaccount. Fixes the previous "silent fallback to
+        // subaccount 1" from V1/V2.
+        subaccount_id: parent.subaccount_id,
         option_series_id: parent.option_series_id.clone(),
         quantity_1e8: filled_size_1e8,
         legs,
@@ -4564,6 +4569,10 @@ fn ensure_option_twap_enabled(state: &AppState) -> Result<()> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CreateOptionTwapInput {
     pub account: AccountId,
+    /// SUBACCOUNTS-OPTIONS-CONDITIONAL-TWAP-WS-V1 — resolved
+    /// subaccount that scopes this TWAP parent. Child orders emitted
+    /// by the tick loop inherit this value.
+    pub subaccount_id: u32,
     pub option_series_id: OptionSeriesId,
     pub side: Side,
     pub size_1e8: crate::types::Size1e8,
@@ -4630,6 +4639,7 @@ pub async fn create_option_twap_order(
     let twap = crate::options::OptionTwapOrder {
         option_twap_id: uuid::Uuid::new_v4(),
         account: input.account,
+        subaccount_id: input.subaccount_id,
         option_series_id: input.option_series_id,
         side: input.side,
         size_1e8: input.size_1e8,
@@ -4828,11 +4838,10 @@ pub async fn tick_option_twap_orders(state: &AppState) -> Result<TickOptionTwapO
         let submit_input = SubmitOptionOrderInput {
             option_series_id: twap.option_series_id.clone(),
             account: twap.account.clone(),
-            // SUBACCOUNTS-OPTIONS-ROUTING-V1 — TWAP still routes via
-            // the wallet-only path in this milestone (v2 for
-            // `OPTION_TWAP_CREATE` remains gated at 503). Follow-up
-            // milestone will thread parent TWAP's subaccount id.
-            subaccount_id: 1,
+            // SUBACCOUNTS-OPTIONS-CONDITIONAL-TWAP-WS-V1 — TWAP
+            // child order inherits the parent TWAP's subaccount so
+            // subaccount 2 parents never emit subaccount 1 children.
+            subaccount_id: twap.subaccount_id,
             side: twap.side,
             price_1e8: twap.limit_price_1e8,
             size_1e8: child_size,

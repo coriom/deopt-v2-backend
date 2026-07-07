@@ -264,6 +264,7 @@ async fn arm_oco_tp_sl(
         state,
         CreateConditionalOrderInput {
             account: per_test_holder(tag),
+            subaccount_id: 1,
             option_series_id: series.to_string(),
             quantity_1e8: qty,
             legs: vec![

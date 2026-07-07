@@ -120,6 +120,7 @@ async fn create_long_call_tp_is_armed_with_gte_comparator() {
         &state,
         CreateConditionalOrderInput {
             account: account(HOLDER),
+            subaccount_id: 1,
             option_series_id: series.clone(),
             quantity_1e8: ONE_1E8,
             legs: vec![ConditionalLegInput {
@@ -152,6 +153,7 @@ async fn create_long_call_sl_is_armed_with_lte_comparator() {
         &state,
         CreateConditionalOrderInput {
             account: account(HOLDER),
+            subaccount_id: 1,
             option_series_id: series,
             quantity_1e8: ONE_1E8,
             legs: vec![ConditionalLegInput {
@@ -178,6 +180,7 @@ async fn missing_position_rejected_with_no_reducible_position() {
         &state,
         CreateConditionalOrderInput {
             account: account(HOLDER),
+            subaccount_id: 1,
             option_series_id: series,
             quantity_1e8: ONE_1E8,
             legs: vec![ConditionalLegInput {
@@ -207,6 +210,7 @@ async fn excessive_quantity_rejected() {
         &state,
         CreateConditionalOrderInput {
             account: account(HOLDER),
+            subaccount_id: 1,
             option_series_id: series,
             quantity_1e8: ONE_1E8 * 5, // more than the seeded 1.00
             legs: vec![ConditionalLegInput {
@@ -234,6 +238,7 @@ async fn explicit_inconsistent_comparator_rejected() {
         &state,
         CreateConditionalOrderInput {
             account: account(HOLDER),
+            subaccount_id: 1,
             option_series_id: series,
             quantity_1e8: ONE_1E8,
             legs: vec![ConditionalLegInput {
@@ -260,6 +265,7 @@ async fn oco_pair_shares_group_and_assigns_both_legs() {
         &state,
         CreateConditionalOrderInput {
             account: account(HOLDER),
+            subaccount_id: 1,
             option_series_id: series,
             quantity_1e8: ONE_1E8,
             legs: vec![
@@ -313,6 +319,7 @@ async fn oco_winner_completes_and_cancels_sibling_via_in_store_execute() {
         &state,
         CreateConditionalOrderInput {
             account: account(HOLDER),
+            subaccount_id: 1,
             option_series_id: series_id.clone(),
             quantity_1e8: ONE_1E8,
             legs: vec![
@@ -414,6 +421,7 @@ async fn cancel_armed_order_transitions_to_cancelled() {
         &state,
         CreateConditionalOrderInput {
             account: account(HOLDER),
+            subaccount_id: 1,
             option_series_id: series,
             quantity_1e8: ONE_1E8,
             legs: vec![ConditionalLegInput {
@@ -451,6 +459,7 @@ async fn cross_wallet_cancel_rejected_as_invalid_id() {
         &state,
         CreateConditionalOrderInput {
             account: account(HOLDER),
+            subaccount_id: 1,
             option_series_id: series,
             quantity_1e8: ONE_1E8,
             legs: vec![ConditionalLegInput {
@@ -484,6 +493,7 @@ async fn list_returns_only_owner_account_rows() {
         &state,
         CreateConditionalOrderInput {
             account: account(HOLDER),
+            subaccount_id: 1,
             option_series_id: series,
             quantity_1e8: ONE_1E8,
             legs: vec![ConditionalLegInput {

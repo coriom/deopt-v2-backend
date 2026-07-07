@@ -447,14 +447,15 @@ async fn v2_conditional_create_rejects_503() {
 }
 
 #[tokio::test]
-async fn v2_conditional_cancel_rejects_503() {
+async fn v2_conditional_cancel_no_longer_503() {
+    // SUBACCOUNTS-OPTIONS-CONDITIONAL-TWAP-WS-V1 — conditional cancel
+    // flipped from foundation gate 503 to real routing. The unknown
+    // subaccount 42 now returns 404 SubaccountNotFound (via the
+    // resolver's identity-store lookup). MUST NOT be 503.
     let state = build_state();
     let (_sk, account) = test_keypair(0xD4);
     let mut env = envelope_v2(&account);
     env.action = WriteAuthAction::ConditionalOrderCancel.as_str().to_string();
-    // The route is DELETE with a body — matching the existing test
-    // pattern used in conditional_orders_tests.rs. Use axum
-    // DELETE-with-body.
     let request = Request::builder()
         .method("DELETE")
         .uri(&format!(
@@ -463,15 +464,20 @@ async fn v2_conditional_cancel_rejects_503() {
         ))
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(
-            serde_json::to_vec(&json!({ "authorization": env, "subaccount_id": 2 })).unwrap(),
+            serde_json::to_vec(&json!({ "authorization": env, "subaccount_id": 42 })).unwrap(),
         ))
         .expect("build request");
     let response = router(state).oneshot(request).await.expect("cancel");
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_ne!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
 
 #[tokio::test]
-async fn v2_twap_create_rejects_503() {
+async fn v2_twap_create_no_longer_503() {
+    // SUBACCOUNTS-OPTIONS-CONDITIONAL-TWAP-WS-V1 — TWAP create flipped
+    // from foundation gate 503 to real routing. Since the subaccount
+    // 42 doesn't exist in this test's identity store, the resolver
+    // returns 404 SubaccountNotFound (or the TWAP-disabled flag
+    // returns 400). MUST NOT be 503.
     let state = build_state();
     let (_sk, account) = test_keypair(0xD5);
     let mut env = envelope_v2(&account);
@@ -485,29 +491,22 @@ async fn v2_twap_create_rejects_503() {
         "running_time_ms": 60_000_u64,
         "child_count": 4_u32,
         "client_order_id": null,
-        "subaccount_id": 2,
+        "subaccount_id": 42,
         "authorization": env,
     });
     let response = router(state)
         .oneshot(json_post("/options/twap-orders", body))
         .await
         .expect("twap create");
-    // TWAP is behind a feature flag. Whether the flag is off or the
-    // subaccount gate fires first, the point is the request MUST NOT
-    // silently persist to subaccount 1. Accept 503 (subaccount gate)
-    // or 400 (twap disabled) — both are honest failure modes.
-    assert!(
-        matches!(
-            response.status(),
-            StatusCode::SERVICE_UNAVAILABLE | StatusCode::BAD_REQUEST
-        ),
-        "expected 503 or 400, got: {}",
-        response.status()
-    );
+    assert_ne!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
 
 #[tokio::test]
-async fn v2_twap_cancel_rejects_503() {
+async fn v2_twap_cancel_no_longer_503() {
+    // SUBACCOUNTS-OPTIONS-CONDITIONAL-TWAP-WS-V1 — TWAP cancel flipped
+    // from foundation gate 503 to real routing with ownership check.
+    // The TWAP id doesn't exist so the handler returns 404
+    // InvalidOptionTwapOrderId. MUST NOT be 503.
     let state = build_state();
     let (_sk, account) = test_keypair(0xD6);
     let mut env = envelope_v2(&account);
@@ -520,18 +519,7 @@ async fn v2_twap_cancel_rejects_503() {
         ))
         .await
         .expect("twap cancel");
-    // Either 503 (subaccount gate) or 404 (twap not found — gate
-    // fires after TWAP lookup for cancel). Accept both — the honest
-    // posture is that a v2 envelope for this subaccount NEVER
-    // silently succeeds.
-    assert!(
-        matches!(
-            response.status(),
-            StatusCode::SERVICE_UNAVAILABLE | StatusCode::NOT_FOUND
-        ),
-        "expected 503 or 404, got: {}",
-        response.status()
-    );
+    assert_ne!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
 
 // ===========================================================================

@@ -160,6 +160,7 @@ async fn arm_tp_sl(
         state,
         CreateConditionalOrderInput {
             account: account(HOLDER),
+            subaccount_id: 1,
             option_series_id: series_id.to_string(),
             quantity_1e8: qty_1e8,
             legs: vec![

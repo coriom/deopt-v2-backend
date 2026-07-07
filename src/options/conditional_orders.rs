@@ -266,6 +266,12 @@ impl ConditionalOrderStatus {
 pub struct ConditionalOrder {
     pub id: ConditionalOrderId,
     pub account: AccountId,
+    /// SUBACCOUNTS-OPTIONS-CONDITIONAL-TWAP-WS-V1 — the parent's
+    /// `(owner, subaccount_id)` scope. Attached TP/SL orders emitted
+    /// by the conditional-orders worker inherit this value so a
+    /// subaccount 2 parent never emits subaccount 1 children.
+    #[serde(default = "crate::options::types::one_subaccount_id")]
+    pub subaccount_id: u32,
     pub option_series_id: String,
     pub position_side: PositionSide,
     pub option_kind: OptionKind,
@@ -308,6 +314,10 @@ pub struct ConditionalLegInput {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CreateConditionalOrderInput {
     pub account: AccountId,
+    /// SUBACCOUNTS-OPTIONS-CONDITIONAL-TWAP-WS-V1 — resolved
+    /// subaccount that scopes this standalone conditional (and any
+    /// attached child order emitted by the worker).
+    pub subaccount_id: u32,
     pub option_series_id: String,
     pub quantity_1e8: Size1e8,
     pub legs: Vec<ConditionalLegInput>,
@@ -549,6 +559,7 @@ pub fn create_conditional_orders_in_store(
         let order = ConditionalOrder {
             id: Uuid::new_v4(),
             account: input.account.clone(),
+            subaccount_id: input.subaccount_id,
             option_series_id: series.option_series_id.clone(),
             position_side: position.side,
             option_kind: kind,
@@ -830,13 +841,11 @@ pub fn execute_triggered_in_store(
         order_id: OrderId::new(),
         option_series_id: order.option_series_id.clone(),
         account: order.account.clone(),
-        // SUBACCOUNTS-OPTIONS-ROUTING-V1 — conditional standalone
-        // orders still route via the wallet-only path in this
-        // milestone (v2 for `ConditionalOrderCreate` remains gated at
-        // 503). Follow-up milestone will thread the parent
-        // conditional's subaccount into the child once conditional
-        // v2 routing lands.
-        subaccount_id: 1,
+        // SUBACCOUNTS-OPTIONS-CONDITIONAL-TWAP-WS-V1 — child order
+        // inherits the parent conditional's subaccount so a
+        // subaccount 2 parent never silently emits subaccount 1
+        // children.
+        subaccount_id: order.subaccount_id,
         side: order.position_side.closing_side(),
         price_1e8: order.limit_price_1e8,
         size_1e8: child_qty,
@@ -1133,6 +1142,7 @@ fn build_conditional_rows(
         rows.push(ConditionalOrder {
             id: Uuid::new_v4(),
             account: input.account.clone(),
+            subaccount_id: input.subaccount_id,
             option_series_id: series.option_series_id.clone(),
             position_side,
             option_kind: kind,
@@ -1696,13 +1706,9 @@ async fn execute_triggered_via_repo(
         SubmitOptionOrderInput {
             option_series_id: claimed.option_series_id.clone(),
             account: claimed.account.clone(),
-            // SUBACCOUNTS-OPTIONS-ROUTING-V1 — conditional standalone
-            // orders still route via the wallet-only path in this
-            // milestone (v2 for `ConditionalOrderCreate` remains gated
-            // at 503 by `enforce_v1_default_subaccount`). Follow-up
-            // milestone will thread the parent conditional's
-            // subaccount id once conditional v2 routing lands.
-            subaccount_id: 1,
+            // SUBACCOUNTS-OPTIONS-CONDITIONAL-TWAP-WS-V1 — child
+            // order inherits the parent conditional's subaccount.
+            subaccount_id: claimed.subaccount_id,
             side: claimed.position_side.closing_side(),
             price_1e8: claimed.limit_price_1e8,
             size_1e8: child_qty,

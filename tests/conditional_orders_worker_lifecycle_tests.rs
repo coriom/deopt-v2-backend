@@ -145,6 +145,7 @@ async fn arm_tp(state: &AppState, series: &str, tag: &str) -> uuid::Uuid {
         state,
         CreateConditionalOrderInput {
             account: account(HOLDER),
+            subaccount_id: 1,
             option_series_id: series.to_string(),
             quantity_1e8: ONE_1E8,
             legs: vec![ConditionalLegInput {
@@ -168,6 +169,7 @@ async fn arm_oco_tp_sl(state: &AppState, series: &str, _tag: &str) -> (uuid::Uui
         state,
         CreateConditionalOrderInput {
             account: account(HOLDER),
+            subaccount_id: 1,
             option_series_id: series.to_string(),
             quantity_1e8: ONE_1E8,
             legs: vec![

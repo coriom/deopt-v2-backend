@@ -908,7 +908,7 @@ pub struct OptionOrder {
     pub updated_at_ms: TimestampMs,
 }
 
-fn one_subaccount_id() -> u32 {
+pub fn one_subaccount_id() -> u32 {
     1
 }
 
@@ -1515,6 +1515,12 @@ impl OptionTwapChildStatus {
 pub struct OptionTwapOrder {
     pub option_twap_id: OptionTwapOrderId,
     pub account: AccountId,
+    /// SUBACCOUNTS-OPTIONS-CONDITIONAL-TWAP-WS-V1 — parent-owned
+    /// subaccount that scopes this TWAP. Every child order emitted
+    /// by the tick loop inherits this value so subaccount 2 TWAPs
+    /// never silently emit subaccount 1 children.
+    #[serde(default = "one_subaccount_id")]
+    pub subaccount_id: u32,
     pub option_series_id: OptionSeriesId,
     pub side: Side,
     pub size_1e8: Size1e8,
