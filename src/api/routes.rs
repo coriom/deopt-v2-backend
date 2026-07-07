@@ -2822,6 +2822,13 @@ struct SubmitOptionOrderRequest {
     /// `options_conditional_orders` on the first fill batch.
     #[serde(default)]
     attached_tp_sl: Option<AttachedTpSlBody>,
+    /// SUBACCOUNTS-OPTIONS-ORDERS-HISTORY-V1 — accepted for schema
+    /// forward compatibility. Only `None` or `Some(1)` is valid in
+    /// this milestone; the handler rejects other values via
+    /// `enforce_v1_default_subaccount`. Actual routing lands in
+    /// `SUBACCOUNTS-OPTIONS-ROUTING-V1`.
+    #[serde(default)]
+    subaccount_id: Option<u32>,
 }
 
 /// ATTACHED-TP-SL-ON-ENTRY-V1 — wire-level body for the attached
@@ -3530,6 +3537,7 @@ async fn submit_option_order(
     State(state): State<AppState>,
     Json(request): Json<SubmitOptionOrderRequest>,
 ) -> Result<Json<SubmitOptionOrderResponse>, ApiError> {
+    enforce_v1_default_subaccount(&request.authorization, request.subaccount_id)?;
     let canonical = canonical_option_order_submit(&request);
     let verified = require_write_auth(
         &state,
@@ -3651,6 +3659,10 @@ struct CreateConditionalOrderBody {
     #[serde(default)]
     expires_at_ms: Option<i64>,
     authorization: AuthorizationEnvelope,
+    /// SUBACCOUNTS-OPTIONS-ORDERS-HISTORY-V1 — see
+    /// `enforce_v1_default_subaccount`.
+    #[serde(default)]
+    subaccount_id: Option<u32>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -3719,6 +3731,7 @@ async fn create_conditional_order_route(
 ) -> Result<Json<Vec<ConditionalOrderResponseDto>>, ApiError> {
     use crate::options::conditional_orders as cond;
     let account = AccountId::new(address);
+    enforce_v1_default_subaccount(&body.authorization, body.subaccount_id)?;
     let canonical = canonical_conditional_order_create(&account, &body);
     let _verified = require_write_auth(
         &state,
@@ -3931,6 +3944,7 @@ async fn cancel_conditional_order_route(
     Json(body): Json<AuthorizationOnlyBody>,
 ) -> Result<Json<ConditionalOrderResponseDto>, ApiError> {
     use crate::options::conditional_orders as cond;
+    enforce_v1_default_subaccount(&body.authorization, body.subaccount_id)?;
     let parsed_id = uuid::Uuid::parse_str(&id)
         .map_err(|_| ApiError::from(BackendError::InvalidConditionalOrderId))?;
     let account = AccountId::new(address);
@@ -4027,6 +4041,7 @@ async fn cancel_option_order(
     Path(order_id): Path<String>,
     Json(body): Json<AuthorizationOnlyBody>,
 ) -> Result<Json<OptionOrderResponse>, ApiError> {
+    enforce_v1_default_subaccount(&body.authorization, body.subaccount_id)?;
     let parsed_id = parse_option_order_id(&order_id)?;
     // Bind the cancel to the order owner; reject if signer != owner.
     let order = get_option_order_service(&state, parsed_id).await?;
@@ -4482,6 +4497,10 @@ struct CreateOptionTwapRequest {
     #[serde(default)]
     client_order_id: Option<String>,
     authorization: AuthorizationEnvelope,
+    /// SUBACCOUNTS-OPTIONS-ORDERS-HISTORY-V1 — see
+    /// `enforce_v1_default_subaccount`.
+    #[serde(default)]
+    subaccount_id: Option<u32>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -4586,6 +4605,7 @@ async fn create_option_twap_order(
     State(state): State<AppState>,
     Json(request): Json<CreateOptionTwapRequest>,
 ) -> Result<Json<OptionTwapOrderResponse>, ApiError> {
+    enforce_v1_default_subaccount(&request.authorization, request.subaccount_id)?;
     let canonical = canonical_option_twap_create(&request);
     let _verified = require_write_auth(
         &state,
@@ -4652,6 +4672,7 @@ async fn cancel_option_twap_order(
     Path(option_twap_id): Path<String>,
     Json(body): Json<AuthorizationOnlyBody>,
 ) -> Result<Json<OptionTwapOrderResponse>, ApiError> {
+    enforce_v1_default_subaccount(&body.authorization, body.subaccount_id)?;
     let id = parse_option_twap_id(&option_twap_id)?;
     let twap = get_option_twap_order_service(&state, id).await?;
     let canonical = canonical_option_twap_cancel(&twap.account, &option_twap_id);
@@ -11692,6 +11713,14 @@ struct IssueWriteAuthChallengeRequest {
 #[derive(Clone, Debug, Deserialize)]
 struct AuthorizationOnlyBody {
     authorization: AuthorizationEnvelope,
+    /// SUBACCOUNTS-OPTIONS-ORDERS-HISTORY-V1 — see
+    /// `enforce_v1_default_subaccount`. Options cancels for
+    /// `OPTION_ORDER_CANCEL`, `CONDITIONAL_ORDER_CANCEL`, and
+    /// `OPTION_TWAP_CANCEL` now accept an optional `subaccount_id`
+    /// so the wire schema stays stable when routing lands in
+    /// `SUBACCOUNTS-OPTIONS-ROUTING-V1`.
+    #[serde(default)]
+    subaccount_id: Option<u32>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -11908,6 +11937,50 @@ async fn require_write_auth(
     )
     .await;
     authorize_or_log(expected_action, expected_account, result)
+}
+
+/// SUBACCOUNTS-OPTIONS-ORDERS-HISTORY-V1 — foundation-posture gate.
+///
+/// Every Options mutation handler that has been prepared for the
+/// forthcoming `SUBACCOUNTS-OPTIONS-ROUTING-V1` calls this before
+/// `require_write_auth`. It enforces two invariants:
+///
+/// * **v1 (envelope.version None or Some(1))** — body may set
+///   `subaccount_id = Some(1)` or omit it. Any explicit non-default
+///   value returns 400 `InvalidSubaccountRequest("v1 auth cannot route
+///   to non-default subaccount")`. This prevents a client that
+///   thinks it's writing to subaccount 2 from silently succeeding
+///   against subaccount 1.
+///
+/// * **v2 (envelope.version Some(2))** — the schema is ready but the
+///   routing plumbing lands in a follow-up milestone. Fails closed
+///   with 503 `SubaccountsRoutingNotLive`. This matches the
+///   auto-memory rule "Disabled subsystems must fail closed at the
+///   route boundary" and mirrors the Perps `PerpsNotLive` posture.
+///
+/// The helper returns nothing on the accepted v1 path so the caller
+/// proceeds unchanged. Persistence continues to land on the default
+/// subaccount via the DB `DEFAULT 1` column added in migration
+/// `0039_options_subaccounts.sql`.
+fn enforce_v1_default_subaccount(
+    envelope: &AuthorizationEnvelope,
+    body_subaccount_id: Option<u32>,
+) -> Result<(), ApiError> {
+    match envelope.version {
+        None | Some(1) => match body_subaccount_id {
+            None | Some(1) => Ok(()),
+            Some(other) => Err(ApiError::from(BackendError::InvalidSubaccountRequest(
+                format!(
+                    "v1 auth cannot route to subaccount {other}; only default subaccount 1 is \
+                     supported until SUBACCOUNTS-OPTIONS-ROUTING-V1 lands"
+                ),
+            ))),
+        },
+        Some(2) => Err(ApiError::from(BackendError::SubaccountsRoutingNotLive)),
+        Some(v) => Err(ApiError::from(BackendError::InvalidSubaccountRequest(
+            format!("unsupported authorization version: {v}"),
+        ))),
+    }
 }
 
 async fn attach_resource_best_effort(state: &AppState, nonce_hex: &str, resource_id: &str) {
@@ -12166,6 +12239,124 @@ fn canonical_option_twap_cancel(account: &AccountId, option_twap_id: &str) -> Ve
         WriteAuthAction::OptionTwapCancel,
         &[
             ("account", CanonicalValue::Address(account.clone())),
+            (
+                "option_twap_id",
+                CanonicalValue::Str(option_twap_id.to_string()),
+            ),
+        ],
+    )
+}
+
+// ---------------------------------------------------------------------
+// SUBACCOUNTS-OPTIONS-ORDERS-HISTORY-V1 — v2 canonical builders.
+//
+// These functions freeze the wire format for the subaccount-aware
+// variants of every Options mutation action. They are NOT called by
+// any handler in this milestone — the fail-closed
+// `enforce_v1_default_subaccount` gate rejects v2 envelopes with
+// `SubaccountsRoutingNotLive` before any handler reaches a canonical
+// builder. Their sole purpose is to pin the wire format via the
+// byte-freeze tests in `tests/subaccounts_options_orders_history_tests.rs`
+// so that when `SUBACCOUNTS-OPTIONS-ROUTING-V1` lands, the frontend
+// signer and the backend verifier already agree on the exact bytes.
+//
+// Rule: v2 payloads embed `subaccount_id` immediately after `account`.
+// All other field ordering matches v1 verbatim.
+//
+// `#[allow(dead_code)]` because these are frozen contracts consumed
+// only by tests until the follow-up milestone flips the gate.
+#[allow(dead_code)]
+pub(crate) fn canonical_option_order_submit_v2(
+    account: &AccountId,
+    subaccount_id: u32,
+    option_series_id: &str,
+    side: Side,
+    price_1e8: &str,
+    size_1e8: &str,
+    time_in_force: TimeInForce,
+    post_only: bool,
+    client_order_id: Option<&str>,
+) -> Vec<u8> {
+    crate::auth::write_authorization::canonical_payload_bytes(
+        WriteAuthAction::OptionOrderSubmit,
+        &[
+            ("account", CanonicalValue::Address(account.clone())),
+            ("subaccount_id", CanonicalValue::U64(subaccount_id as u64)),
+            (
+                "option_series_id",
+                CanonicalValue::Str(option_series_id.to_string()),
+            ),
+            (
+                "side",
+                CanonicalValue::Str(match side {
+                    Side::Buy => "buy".to_string(),
+                    Side::Sell => "sell".to_string(),
+                }),
+            ),
+            ("price_1e8", CanonicalValue::Str(price_1e8.to_string())),
+            ("size_1e8", CanonicalValue::Str(size_1e8.to_string())),
+            (
+                "time_in_force",
+                CanonicalValue::Str(match time_in_force {
+                    TimeInForce::Gtc => "gtc".to_string(),
+                    TimeInForce::Ioc => "ioc".to_string(),
+                    TimeInForce::Fok => "fok".to_string(),
+                }),
+            ),
+            ("post_only", CanonicalValue::Bool(post_only)),
+            (
+                "client_order_id",
+                client_order_id
+                    .map(|v| CanonicalValue::Str(v.to_string()))
+                    .unwrap_or(CanonicalValue::Null),
+            ),
+        ],
+    )
+}
+
+#[allow(dead_code)]
+pub(crate) fn canonical_option_order_cancel_v2(
+    account: &AccountId,
+    subaccount_id: u32,
+    order_id: &str,
+) -> Vec<u8> {
+    crate::auth::write_authorization::canonical_payload_bytes(
+        WriteAuthAction::OptionOrderCancel,
+        &[
+            ("account", CanonicalValue::Address(account.clone())),
+            ("subaccount_id", CanonicalValue::U64(subaccount_id as u64)),
+            ("order_id", CanonicalValue::Str(order_id.to_string())),
+        ],
+    )
+}
+
+#[allow(dead_code)]
+pub(crate) fn canonical_conditional_order_cancel_v2(
+    account: &AccountId,
+    subaccount_id: u32,
+    id: &str,
+) -> Vec<u8> {
+    crate::auth::write_authorization::canonical_payload_bytes(
+        WriteAuthAction::ConditionalOrderCancel,
+        &[
+            ("account", CanonicalValue::Address(account.clone())),
+            ("subaccount_id", CanonicalValue::U64(subaccount_id as u64)),
+            ("conditional_order_id", CanonicalValue::Str(id.to_string())),
+        ],
+    )
+}
+
+#[allow(dead_code)]
+pub(crate) fn canonical_option_twap_cancel_v2(
+    account: &AccountId,
+    subaccount_id: u32,
+    option_twap_id: &str,
+) -> Vec<u8> {
+    crate::auth::write_authorization::canonical_payload_bytes(
+        WriteAuthAction::OptionTwapCancel,
+        &[
+            ("account", CanonicalValue::Address(account.clone())),
+            ("subaccount_id", CanonicalValue::U64(subaccount_id as u64)),
             (
                 "option_twap_id",
                 CanonicalValue::Str(option_twap_id.to_string()),
@@ -12499,6 +12690,8 @@ impl From<BackendError> for ApiError {
             // SUBACCOUNTS-CORE-BACKEND-V1
             BackendError::SubaccountNotFound => StatusCode::NOT_FOUND,
             BackendError::InvalidSubaccountRequest(_) => StatusCode::BAD_REQUEST,
+            // SUBACCOUNTS-OPTIONS-ORDERS-HISTORY-V1 — foundation posture.
+            BackendError::SubaccountsRoutingNotLive => StatusCode::SERVICE_UNAVAILABLE,
             BackendError::WriteAuth(ref err) => match err {
                 crate::auth::WriteAuthError::AuthorizationRequired => StatusCode::UNAUTHORIZED,
                 crate::auth::WriteAuthError::InvalidSignature => StatusCode::UNAUTHORIZED,

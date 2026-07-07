@@ -214,4 +214,11 @@ pub enum BackendError {
     SubaccountNotFound,
     #[error("invalid subaccount request: {0}")]
     InvalidSubaccountRequest(String),
+    // SUBACCOUNTS-OPTIONS-ORDERS-HISTORY-V1 — foundation posture.
+    // Emitted when a client sends `authorization.version == 2`
+    // (v2 subaccount-aware envelope) against an Options mutation
+    // route in this milestone. The schema is ready but the actual
+    // routing lands in `SUBACCOUNTS-OPTIONS-ROUTING-V1`.
+    #[error("subaccount routing is not live yet for this action")]
+    SubaccountsRoutingNotLive,
 }
