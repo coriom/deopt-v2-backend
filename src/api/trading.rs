@@ -2029,6 +2029,15 @@ pub struct HistoryV2Query {
     pub range: Option<String>,
     pub page: Option<u32>,
     pub page_size: Option<u32>,
+    /// SUBACCOUNTS-OPTIONS-CONDITIONAL-CREATE-HISTORY-WS-V1 — scope
+    /// history to `(account, subaccount_id)`. When omitted defaults
+    /// to `1` (preserves pre-migration semantics for wallet-only
+    /// clients). Pass `all=true` to see every subaccount of the
+    /// wallet.
+    #[serde(default)]
+    pub subaccount_id: Option<u32>,
+    #[serde(default)]
+    pub all: Option<bool>,
 }
 
 const MAX_HISTORY_PAGE_SIZE: u32 = 10_000;
@@ -2115,10 +2124,28 @@ pub async fn account_history_v2(
 
     let since = range.since_ms(now_ms());
 
+    // SUBACCOUNTS-OPTIONS-CONDITIONAL-CREATE-HISTORY-WS-V1 — scope
+    // history to the requested subaccount. Defaults to 1 for
+    // wallet-only clients; `?all=true` opts into aggregate.
+    let effective_subaccount_id: Option<u32> = if q.all.unwrap_or(false) {
+        None
+    } else {
+        Some(q.subaccount_id.unwrap_or(1))
+    };
+
     let mut items: Vec<HistoryV2Item> = match tab {
-        HistoryTab::Trades => trades_rows_for(&state, &acct, since).await?,
-        HistoryTab::Orders => orders_rows_for(&state, &acct, since).await?,
-        HistoryTab::Transactions => transactions_rows_for(&state, &acct, since).await?,
+        HistoryTab::Trades => {
+            trades_rows_for(&state, &acct, since, effective_subaccount_id).await?
+        }
+        HistoryTab::Orders => {
+            orders_rows_for(&state, &acct, since, effective_subaccount_id).await?
+        }
+        HistoryTab::Transactions => {
+            // Transactions come from option_execution_intents which
+            // don't yet carry subaccount_id; kept wallet-aggregate.
+            // Documented in the result doc as a follow-up.
+            transactions_rows_for(&state, &acct, since).await?
+        }
         _ => Vec::new(),
     };
     items.sort_by(|a, b| b.time_ms.cmp(&a.time_ms));
@@ -2154,6 +2181,7 @@ async fn trades_rows_for(
     state: &AppState,
     acct: &AccountId,
     since_ms: Option<i64>,
+    subaccount_id: Option<u32>,
 ) -> Result<Vec<HistoryV2Item>, TradingApiError> {
     let fills = list_option_fills_service(
         state,
@@ -2161,7 +2189,11 @@ async fn trades_rows_for(
             option_series_id: None,
             account: Some(acct.clone()),
             order_id: None,
-            subaccount_id: None,
+            // SUBACCOUNTS-OPTIONS-CONDITIONAL-CREATE-HISTORY-WS-V1 —
+            // The filter already enforces side-specific subaccount
+            // (buyer→buyer_subaccount_id, seller→seller_subaccount_id)
+            // via OptionFillFilter::matches. Pass through directly.
+            subaccount_id,
         },
     )
     .await
@@ -2212,6 +2244,7 @@ async fn orders_rows_for(
     state: &AppState,
     acct: &AccountId,
     since_ms: Option<i64>,
+    subaccount_id: Option<u32>,
 ) -> Result<Vec<HistoryV2Item>, TradingApiError> {
     use crate::options::service::list_option_order_rejections_for_account as list_option_order_rejections_service;
     use crate::options::service::list_option_orders as list_option_orders_service;
@@ -2222,12 +2255,10 @@ async fn orders_rows_for(
             account: Some(acct.clone()),
             status: None,
             side: None,
-            // SUBACCOUNTS-OPTIONS-ROUTING-V1 — internal listing keeps
-            // wallet-aggregate behavior (all subaccounts) since this
-            // is not a public HTTP handler; the follow-up milestone
-            // that migrates portfolio views will thread subaccount
-            // filtering here explicitly.
-            subaccount_id: None,
+            // SUBACCOUNTS-OPTIONS-CONDITIONAL-CREATE-HISTORY-WS-V1 —
+            // filter by subaccount so history views default to
+            // subaccount 1 for wallet-only clients.
+            subaccount_id,
         },
     )
     .await

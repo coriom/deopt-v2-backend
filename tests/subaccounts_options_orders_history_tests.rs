@@ -422,7 +422,12 @@ async fn v2_order_cancel_no_longer_503() {
 }
 
 #[tokio::test]
-async fn v2_conditional_create_rejects_503() {
+async fn v2_conditional_create_no_longer_503() {
+    // SUBACCOUNTS-OPTIONS-CONDITIONAL-CREATE-HISTORY-WS-V1 —
+    // conditional standalone create flipped from foundation gate
+    // 503 to real routing. Since subaccount 42 doesn't exist in
+    // this test's identity store, the resolver returns 404
+    // SubaccountNotFound. MUST NOT be 503.
     let state = build_state();
     let (_sk, account) = test_keypair(0xD3);
     let mut env = envelope_v2(&account);
@@ -433,7 +438,7 @@ async fn v2_conditional_create_rejects_503() {
         "legs": [],
         "link_as_oco": false,
         "expires_at_ms": null,
-        "subaccount_id": 2,
+        "subaccount_id": 42,
         "authorization": env,
     });
     let response = router(state)
@@ -443,7 +448,7 @@ async fn v2_conditional_create_rejects_503() {
         ))
         .await
         .expect("conditional create");
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_ne!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
 
 #[tokio::test]
@@ -886,4 +891,131 @@ fn v2_option_twap_cancel_canonical_bytes_are_frozen() {
          option_twap_id=\"{DUMMY_TWAP_ID}\""
     );
     assert_eq!(std::str::from_utf8(&payload).unwrap(), expected);
+}
+
+#[test]
+fn v2_conditional_order_create_canonical_bytes_are_frozen() {
+    // SUBACCOUNTS-OPTIONS-CONDITIONAL-CREATE-HISTORY-WS-V1 — freeze
+    // the v2 canonical for a two-leg (TP + SL) conditional order.
+    // `subaccount_id` sits immediately after `account`; every other
+    // v1 field ordering is preserved verbatim, including the
+    // deterministic `leg{idx}_*` fan-out.
+    let owner = AccountId::new("0xABCDEF0000000000000000000000000000000001");
+    let payload = canonical_payload_bytes(
+        WriteAuthAction::ConditionalOrderCreate,
+        &[
+            ("account", CanonicalValue::Address(owner)),
+            ("subaccount_id", CanonicalValue::U64(2)),
+            (
+                "option_series_id",
+                CanonicalValue::Str(DUMMY_SERIES_ID.to_string()),
+            ),
+            ("quantity_1e8", CanonicalValue::Str("100000000".to_string())),
+            ("link_as_oco", CanonicalValue::Bool(true)),
+            ("expires_at_ms", CanonicalValue::Null),
+            ("leg_count", CanonicalValue::U64(2)),
+            (
+                "leg0_conditional_type",
+                CanonicalValue::Str("take_profit".to_string()),
+            ),
+            (
+                "leg0_trigger_price_1e8",
+                CanonicalValue::Str("2000000000".to_string()),
+            ),
+            (
+                "leg0_limit_price_1e8",
+                CanonicalValue::Str("2000000000".to_string()),
+            ),
+            ("leg0_trigger_condition", CanonicalValue::Null),
+            (
+                "leg1_conditional_type",
+                CanonicalValue::Str("stop_loss".to_string()),
+            ),
+            (
+                "leg1_trigger_price_1e8",
+                CanonicalValue::Str("500000000".to_string()),
+            ),
+            (
+                "leg1_limit_price_1e8",
+                CanonicalValue::Str("500000000".to_string()),
+            ),
+            ("leg1_trigger_condition", CanonicalValue::Null),
+        ],
+    );
+    let expected = format!(
+        "CONDITIONAL_ORDER_CREATE|account=\"{FROZEN_OWNER_ADDR}\"|subaccount_id=2|\
+         option_series_id=\"{DUMMY_SERIES_ID}\"|quantity_1e8=\"100000000\"|link_as_oco=true|\
+         expires_at_ms=null|leg_count=2|leg0_conditional_type=\"take_profit\"|\
+         leg0_trigger_price_1e8=\"2000000000\"|leg0_limit_price_1e8=\"2000000000\"|\
+         leg0_trigger_condition=null|leg1_conditional_type=\"stop_loss\"|\
+         leg1_trigger_price_1e8=\"500000000\"|leg1_limit_price_1e8=\"500000000\"|\
+         leg1_trigger_condition=null"
+    );
+    assert_eq!(std::str::from_utf8(&payload).unwrap(), expected);
+}
+
+// ===========================================================================
+// SUBACCOUNTS-OPTIONS-CONDITIONAL-CREATE-HISTORY-WS-V1 — history v2
+// filter unit tests. Prove the OptionFillFilter / OptionOrderFilter
+// respect the requested subaccount so the history endpoint's default
+// (subaccount 1) never leaks subaccount 2 activity into the wallet
+// view.
+// ===========================================================================
+
+#[test]
+fn history_orders_filter_defaults_to_subaccount_one() {
+    // The orders-rows helper in trading.rs threads
+    // subaccount_id: Some(1) into the filter when the caller omits
+    // ?subaccount_id and does not set ?all=true. This test proves the
+    // filter drops subaccount 2 orders in that scenario.
+    use deopt_v2_backend::options::{OptionOrder, OptionOrderFilter, OptionOrderStatus};
+    use deopt_v2_backend::types::{AccountId, OrderId, Side, TimeInForce};
+
+    let account = AccountId::new("0xE1E1E10000000000000000000000000000000000");
+    let mut order_sub_two = OptionOrder {
+        order_id: OrderId(uuid::Uuid::new_v4()),
+        option_series_id: "S".to_string(),
+        account: account.clone(),
+        subaccount_id: 2,
+        side: Side::Buy,
+        price_1e8: 1_000_000_000,
+        size_1e8: 100_000_000,
+        remaining_size_1e8: 100_000_000,
+        time_in_force: TimeInForce::Gtc,
+        post_only: false,
+        client_order_id: None,
+        nonce: None,
+        deadline_ms: None,
+        signature: None,
+        status: OptionOrderStatus::Open,
+        terminal_reason_code: None,
+        terminal_reason_message: None,
+        terminal_reason_source: None,
+        created_at_ms: 0,
+        updated_at_ms: 0,
+    };
+    let filter_default = OptionOrderFilter {
+        account: Some(account.clone()),
+        subaccount_id: Some(1),
+        ..Default::default()
+    };
+    assert!(
+        !filter_default.matches(&order_sub_two),
+        "default filter must drop subaccount 2 orders"
+    );
+
+    order_sub_two.subaccount_id = 1;
+    assert!(
+        filter_default.matches(&order_sub_two),
+        "default filter must match subaccount 1 orders"
+    );
+
+    // Explicit ?all=true → subaccount_id: None → aggregate view.
+    let filter_all = OptionOrderFilter {
+        account: Some(account),
+        subaccount_id: None,
+        ..Default::default()
+    };
+    order_sub_two.subaccount_id = 2;
+    assert!(filter_all.matches(&order_sub_two));
 }

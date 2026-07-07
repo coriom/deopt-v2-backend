@@ -3793,8 +3793,18 @@ async fn create_conditional_order_route(
 ) -> Result<Json<Vec<ConditionalOrderResponseDto>>, ApiError> {
     use crate::options::conditional_orders as cond;
     let account = AccountId::new(address);
-    enforce_v1_default_subaccount(&body.authorization, body.subaccount_id)?;
-    let canonical = canonical_conditional_order_create(&account, &body);
+    // SUBACCOUNTS-OPTIONS-CONDITIONAL-CREATE-HISTORY-WS-V1 —
+    // conditional standalone create flips from foundation gate 503
+    // to real routing. v1 (None|Some(1)) persists subaccount 1; v2
+    // resolves + validates against the identity store and persists
+    // the requested subaccount.
+    let resolved_subaccount_id =
+        resolve_options_v2_subaccount(&state, &body.authorization, body.subaccount_id, &account)
+            .await?;
+    let canonical = match body.authorization.version {
+        Some(2) => canonical_conditional_order_create_v2(&account, resolved_subaccount_id, &body),
+        _ => canonical_conditional_order_create(&account, &body),
+    };
     let _verified = require_write_auth(
         &state,
         WriteAuthAction::ConditionalOrderCreate,
@@ -3814,14 +3824,12 @@ async fn create_conditional_order_route(
     }
     let input = cond::CreateConditionalOrderInput {
         account: account.clone(),
-        // SUBACCOUNTS-OPTIONS-CONDITIONAL-TWAP-WS-V1 — conditional
-        // standalone create still routes through the foundation
-        // gate `enforce_v1_default_subaccount` at the handler entry
-        // (v2 for `CONDITIONAL_ORDER_CREATE` remains 503). The gate
-        // guarantees this branch is only reached with subaccount 1,
-        // so the persisted row is subaccount 1. Attached child
-        // orders inherit via `ConditionalOrder.subaccount_id`.
-        subaccount_id: 1,
+        // SUBACCOUNTS-OPTIONS-CONDITIONAL-CREATE-HISTORY-WS-V1 —
+        // resolved via the shared v2 resolver. v1 flows still land
+        // on subaccount 1; v2 persists the requested subaccount.
+        // Any child orders emitted by the conditional-orders worker
+        // inherit via `ConditionalOrder.subaccount_id`.
+        subaccount_id: resolved_subaccount_id,
         option_series_id: body.option_series_id,
         quantity_1e8: parse_fixed_u128("quantity_1e8", &body.quantity_1e8)?,
         legs: leg_inputs,
@@ -12167,6 +12175,7 @@ async fn resolve_options_v2_subaccount(
 /// proceeds unchanged. Persistence continues to land on the default
 /// subaccount via the DB `DEFAULT 1` column added in migration
 /// `0039_options_subaccounts.sql`.
+#[allow(dead_code)]
 fn enforce_v1_default_subaccount(
     envelope: &AuthorizationEnvelope,
     body_subaccount_id: Option<u32>,
@@ -12260,6 +12269,64 @@ fn canonical_conditional_order_create(
 ) -> Vec<u8> {
     let mut fields: Vec<(&'static str, CanonicalValue)> = vec![
         ("account", CanonicalValue::Address(account.clone())),
+        (
+            "option_series_id",
+            CanonicalValue::Str(body.option_series_id.clone()),
+        ),
+        (
+            "quantity_1e8",
+            CanonicalValue::Str(body.quantity_1e8.clone()),
+        ),
+        ("link_as_oco", CanonicalValue::Bool(body.link_as_oco)),
+        (
+            "expires_at_ms",
+            body.expires_at_ms
+                .map(|v| CanonicalValue::U128(u128::from(v.max(0) as u64)))
+                .unwrap_or(CanonicalValue::Null),
+        ),
+        ("leg_count", CanonicalValue::U64(body.legs.len() as u64)),
+    ];
+    for (idx, leg) in body.legs.iter().enumerate() {
+        let prefix = format!("leg{idx}_");
+        fields.push((
+            Box::leak(format!("{prefix}conditional_type").into_boxed_str()),
+            CanonicalValue::Str(leg.conditional_type.as_str().to_string()),
+        ));
+        fields.push((
+            Box::leak(format!("{prefix}trigger_price_1e8").into_boxed_str()),
+            CanonicalValue::Str(leg.trigger_price_1e8.clone()),
+        ));
+        fields.push((
+            Box::leak(format!("{prefix}limit_price_1e8").into_boxed_str()),
+            CanonicalValue::Str(leg.limit_price_1e8.clone()),
+        ));
+        fields.push((
+            Box::leak(format!("{prefix}trigger_condition").into_boxed_str()),
+            leg.trigger_condition
+                .map(|c| CanonicalValue::Str(c.as_str().to_string()))
+                .unwrap_or(CanonicalValue::Null),
+        ));
+    }
+    crate::auth::write_authorization::canonical_payload_bytes(
+        WriteAuthAction::ConditionalOrderCreate,
+        &fields,
+    )
+}
+
+/// SUBACCOUNTS-OPTIONS-CONDITIONAL-CREATE-HISTORY-WS-V1 — v2 canonical
+/// for standalone conditional create. Mirrors v1 field order exactly
+/// and embeds `subaccount_id` right after `account`. All per-leg
+/// fields (`leg{idx}_conditional_type`, `_trigger_price_1e8`,
+/// `_limit_price_1e8`, `_trigger_condition`) are preserved verbatim
+/// so a v1→v2 upgrade only prepends one field to the signed digest.
+fn canonical_conditional_order_create_v2(
+    account: &AccountId,
+    subaccount_id: u32,
+    body: &CreateConditionalOrderBody,
+) -> Vec<u8> {
+    let mut fields: Vec<(&'static str, CanonicalValue)> = vec![
+        ("account", CanonicalValue::Address(account.clone())),
+        ("subaccount_id", CanonicalValue::U64(subaccount_id as u64)),
         (
             "option_series_id",
             CanonicalValue::Str(body.option_series_id.clone()),

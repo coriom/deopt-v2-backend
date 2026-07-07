@@ -282,6 +282,8 @@ async fn snapshot_account_history(state: &AppState, address: &str) -> Result<Val
         range: Some("last_month".to_string()),
         page: Some(1),
         page_size: Some(100),
+        subaccount_id: None,
+        all: None,
     };
     match crate::api::trading::account_history_v2(
         State(state.clone()),
