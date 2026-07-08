@@ -589,9 +589,18 @@ async fn record_submitter_attachment_plan(
 /// durably persisted or updated (never before). Emits the plan's
 /// current status, materialized size, child conditional-order ids,
 /// oco group and failure fields — nothing else.
+///
+/// SUBACCOUNTS-OPTIONS-WS-PAYLOAD-V1 — the plan inherits its parent
+/// order's `subaccount_id`. `OptionOrderAttachmentPlan` does not yet
+/// carry the field in its own struct/DB row (deferred to keep this
+/// milestone additive-only on WS), so we look the parent up at emit
+/// time. If the parent has already scrolled out of memory / retention
+/// window, we fall back to `1` — this matches the wire default for
+/// pre-migration rows and mirrors the RFQ pattern.
 fn emit_attachment_plan_lifecycle(state: &AppState, plan: &OptionOrderAttachmentPlan) {
     use crate::api::public_ws::{LifecycleChannel, LifecycleEvent, LifecyclePayload};
     let now = now_ms();
+    let subaccount_id = lookup_parent_order_subaccount(state, plan);
     state.lifecycle_events.emit(LifecycleEvent {
         account: plan.account.clone(),
         channel: LifecycleChannel::AccountConditionalOrders,
@@ -599,6 +608,7 @@ fn emit_attachment_plan_lifecycle(state: &AppState, plan: &OptionOrderAttachment
             plan_id: plan.plan_id.to_string(),
             parent_order_id: plan.parent_order_id.to_string(),
             option_series_id: plan.option_series_id.to_string(),
+            subaccount_id,
             status: plan.status.as_str().to_string(),
             materialized_size_1e8: plan.materialized_size_1e8.map(|s| s.to_string()),
             tp_conditional_order_id: plan.tp_conditional_order_id.map(|u| u.to_string()),
@@ -610,6 +620,22 @@ fn emit_attachment_plan_lifecycle(state: &AppState, plan: &OptionOrderAttachment
         },
         emitted_at_ms: now,
     });
+}
+
+/// Best-effort in-memory lookup of the parent order's subaccount so
+/// `AttachmentPlanUpdated` and other attached-child events can inherit
+/// it without a DB round-trip in the hot path. Returns `1` on any
+/// miss — matches the pre-migration default and never fabricates a
+/// non-default value.
+fn lookup_parent_order_subaccount(state: &AppState, plan: &OptionOrderAttachmentPlan) -> u32 {
+    let guard = match state.options_store.lock() {
+        Ok(g) => g,
+        Err(_) => return 1,
+    };
+    guard
+        .get_order(plan.parent_order_id)
+        .map(|o| o.subaccount_id)
+        .unwrap_or(1)
 }
 
 /// ATTACHED-TP-SL-MAKER-FILL-HOOK-V2 — for every order that
@@ -1250,6 +1276,11 @@ pub(crate) fn emit_option_order_lifecycle(
         payload: LifecyclePayload::OrderUpdated {
             order_id: order.order_id.to_string(),
             option_series_id: order.option_series_id.clone(),
+            // SUBACCOUNTS-OPTIONS-WS-PAYLOAD-V1 — sourced directly
+            // from `option_orders.subaccount_id` so the receiver can
+            // scope the delta to the active subaccount view without
+            // an HTTP round-trip.
+            subaccount_id: order.subaccount_id,
             status: order.status.as_str().to_string(),
             remaining_size_1e8: order.remaining_size_1e8.to_string(),
             size_1e8: order.size_1e8.to_string(),
@@ -1269,6 +1300,11 @@ pub(crate) fn emit_option_order_lifecycle(
                     price_1e8: fill.price_1e8.to_string(),
                     size_1e8: fill.size_1e8.to_string(),
                     created_at_ms: fill.created_at_ms,
+                    // SUBACCOUNTS-OPTIONS-WS-PAYLOAD-V1 — both sides
+                    // captured so a wallet that owned both legs
+                    // (rare but possible) can filter side-aware.
+                    buyer_subaccount_id: fill.buyer_subaccount_id,
+                    seller_subaccount_id: fill.seller_subaccount_id,
                 },
                 emitted_at_ms: now,
             });
@@ -1339,6 +1375,7 @@ pub async fn cancel_option_order(state: &AppState, order_id: OptionOrderId) -> R
         payload: LifecyclePayload::OrderUpdated {
             order_id: cancelled.order_id.to_string(),
             option_series_id: cancelled.option_series_id.clone(),
+            subaccount_id: cancelled.subaccount_id,
             status: cancelled.status.as_str().to_string(),
             remaining_size_1e8: cancelled.remaining_size_1e8.to_string(),
             size_1e8: cancelled.size_1e8.to_string(),
@@ -1382,6 +1419,7 @@ pub async fn sweep_expired_option_orders(
             payload: LifecyclePayload::OrderUpdated {
                 order_id: order.order_id.to_string(),
                 option_series_id: order.option_series_id.clone(),
+                subaccount_id: order.subaccount_id,
                 status: order.status.as_str().to_string(),
                 remaining_size_1e8: order.remaining_size_1e8.to_string(),
                 size_1e8: order.size_1e8.to_string(),

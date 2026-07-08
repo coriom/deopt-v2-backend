@@ -1014,6 +1014,12 @@ pub(crate) fn emit_conditional_lifecycle(state: &AppState, rows: &[ConditionalOr
             payload: LifecyclePayload::ConditionalOrderUpdated {
                 conditional_order_id: row.id.to_string(),
                 option_series_id: row.option_series_id.clone(),
+                // SUBACCOUNTS-OPTIONS-WS-PAYLOAD-V1 — sourced from
+                // `options_conditional_orders.subaccount_id`.
+                // Attached TP/SL rows inherit the parent's value at
+                // materialisation time, so this is the correct value
+                // for both standalone conditionals and TP/SL legs.
+                subaccount_id: row.subaccount_id,
                 status: row.status.as_str().to_string(),
                 child_order_id: row.child_order_id.clone(),
                 oco_group_id: row.oco_group_id.map(|g| g.to_string()),

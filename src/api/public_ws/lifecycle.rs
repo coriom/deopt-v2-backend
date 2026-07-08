@@ -101,14 +101,28 @@ pub enum LifecyclePayload {
     /// A direct option order's status moved. `status` is the
     /// `OptionOrderStatusValue` wire string (e.g. `"open"`,
     /// `"partially_filled"`, `"filled"`, `"cancelled"`, `"rejected"`).
+    ///
+    /// SUBACCOUNTS-OPTIONS-WS-PAYLOAD-V1 — `subaccount_id` sourced
+    /// from `option_orders.subaccount_id`. `#[serde(default)]`
+    /// preserves wire-compat: consumers reading an older payload
+    /// see `1` for pre-migration rows.
     OrderUpdated {
         order_id: String,
         option_series_id: String,
+        #[serde(default = "crate::options::types::one_subaccount_id")]
+        subaccount_id: u32,
         status: String,
         remaining_size_1e8: String,
         size_1e8: String,
     },
     /// A new option fill landed for this account (as buyer or seller).
+    ///
+    /// SUBACCOUNTS-OPTIONS-WS-PAYLOAD-V1 — carries BOTH sides'
+    /// subaccount ids so a wallet that owned both legs can filter
+    /// side-aware. The recipient reads `buyer_subaccount_id` when
+    /// they were the buyer and `seller_subaccount_id` when they
+    /// were the seller. Emitter fires ONE frame per interested
+    /// account (buyer + seller); routing is per session identity.
     FillCreated {
         fill_id: String,
         option_series_id: String,
@@ -117,11 +131,20 @@ pub enum LifecyclePayload {
         price_1e8: String,
         size_1e8: String,
         created_at_ms: TimestampMs,
+        #[serde(default = "crate::options::types::one_subaccount_id")]
+        buyer_subaccount_id: u32,
+        #[serde(default = "crate::options::types::one_subaccount_id")]
+        seller_subaccount_id: u32,
     },
     /// A conditional order (TP/SL) state changed.
+    ///
+    /// SUBACCOUNTS-OPTIONS-WS-PAYLOAD-V1 — `subaccount_id` sourced
+    /// from `options_conditional_orders.subaccount_id`.
     ConditionalOrderUpdated {
         conditional_order_id: String,
         option_series_id: String,
+        #[serde(default = "crate::options::types::one_subaccount_id")]
+        subaccount_id: u32,
         status: String,
         child_order_id: Option<String>,
         oco_group_id: Option<String>,
@@ -163,10 +186,16 @@ pub enum LifecyclePayload {
     /// the container of the conditional-order legs; consumers that
     /// already track the conditional-orders channel get both leg
     /// deltas and plan transitions on one subscription.
+    ///
+    /// SUBACCOUNTS-OPTIONS-WS-PAYLOAD-V1 — `subaccount_id` is
+    /// inherited from the parent Options order that owns the plan
+    /// (attached TP/SL always shares the parent's subaccount).
     AttachmentPlanUpdated {
         plan_id: String,
         parent_order_id: String,
         option_series_id: String,
+        #[serde(default = "crate::options::types::one_subaccount_id")]
+        subaccount_id: u32,
         status: String,
         materialized_size_1e8: Option<String>,
         tp_conditional_order_id: Option<String>,
@@ -463,6 +492,7 @@ mod tests {
             payload: LifecyclePayload::OrderUpdated {
                 order_id: "o1".into(),
                 option_series_id: "s1".into(),
+                subaccount_id: 1,
                 status: "open".into(),
                 remaining_size_1e8: "100".into(),
                 size_1e8: "100".into(),
@@ -490,6 +520,8 @@ mod tests {
                 price_1e8: "1".into(),
                 size_1e8: "1".into(),
                 created_at_ms: now_ms(),
+                buyer_subaccount_id: 1,
+                seller_subaccount_id: 1,
             },
             emitted_at_ms: now_ms(),
         });
