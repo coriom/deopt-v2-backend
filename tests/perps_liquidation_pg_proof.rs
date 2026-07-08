@@ -149,6 +149,7 @@ fn base_input(
 ) -> SubmitPerpOrderInput {
     SubmitPerpOrderInput {
         account,
+        subaccount_id: 1,
         market_id: "ETH-PERP".to_string(),
         side,
         price_1e8: price,
@@ -183,6 +184,7 @@ async fn seed_pg_long(
 ) -> deopt_v2_backend::perps::PerpPosition {
     let position = deopt_v2_backend::perps::positions::new_position_skeleton(
         account.clone(),
+        1,
         market_id.to_string(),
         deopt_v2_backend::perps::PerpSide::Long,
         size_1e8,
@@ -203,6 +205,7 @@ async fn seed_pg_short(
 ) -> deopt_v2_backend::perps::PerpPosition {
     let position = deopt_v2_backend::perps::positions::new_position_skeleton(
         account.clone(),
+        1,
         market_id.to_string(),
         deopt_v2_backend::perps::PerpSide::Short,
         size_1e8,
@@ -441,6 +444,7 @@ async fn pg_liquidation_cancels_open_orders_for_account_market_only() {
     // Seed one resting ETH-PERP order for Alice.
     let alice_eth_order = deopt_v2_backend::perps::PerpOrder::new(
         alice.clone(),
+        1,
         "ETH-PERP".to_string(),
         PerpOrderSide::Buy,
         PRICE_ETH_3000 - ONE,
@@ -457,6 +461,7 @@ async fn pg_liquidation_cancels_open_orders_for_account_market_only() {
     // must NOT be cancelled by the ETH-PERP liquidation.
     let alice_btc_order = deopt_v2_backend::perps::PerpOrder::new(
         alice.clone(),
+        1,
         "BTC-PERP".to_string(),
         PerpOrderSide::Buy,
         50_000 * ONE,
@@ -473,6 +478,7 @@ async fn pg_liquidation_cancels_open_orders_for_account_market_only() {
     // must NOT be cancelled.
     let bob_eth_order = deopt_v2_backend::perps::PerpOrder::new(
         bob.clone(),
+        1,
         "ETH-PERP".to_string(),
         PerpOrderSide::Sell,
         PRICE_ETH_3000 + ONE,
@@ -607,6 +613,7 @@ async fn pg_liquidation_emits_lifecycle_after_commit_with_no_secrets() {
     // order-cancel frame too.
     let alice_order = deopt_v2_backend::perps::PerpOrder::new(
         alice.clone(),
+        1,
         "ETH-PERP".to_string(),
         PerpOrderSide::Buy,
         PRICE_ETH_3000 - ONE,
@@ -867,6 +874,7 @@ async fn in_memory_liquidation_still_works_when_repository_absent() {
     let alice = per_test_account("mem-liq", "aa00");
     let position = deopt_v2_backend::perps::positions::new_position_skeleton(
         alice.clone(),
+        1,
         "ETH-PERP".to_string(),
         deopt_v2_backend::perps::PerpSide::Long,
         ONE,
@@ -882,7 +890,7 @@ async fn in_memory_liquidation_still_works_when_repository_absent() {
     // Just verify the store contains the seeded row so the fallback
     // path stays wired.
     let positions = state.perp_positions_store.lock().unwrap();
-    assert!(positions.get_active(&alice, "ETH-PERP").is_some());
+    assert!(positions.get_active(&alice, 1, "ETH-PERP").is_some());
     // Silence unused warnings for imports only used in PG-gated tests.
     let _ = HashMap::<String, Option<u128>>::new();
     let _ = base_input(alice, PerpOrderSide::Buy, ONE, ONE, "mem-liq");

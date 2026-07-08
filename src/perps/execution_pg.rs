@@ -92,6 +92,7 @@ pub async fn submit_perp_order_via_repository<P: PerpOraclePriceReader + ?Sized>
 /// the exact same snapshot+emit pattern.
 pub(crate) struct RejectionSnapshot {
     account: AccountId,
+    subaccount_id: u32,
     market_id: String,
     side: PerpOrderSide,
     price_1e8: u128,
@@ -106,6 +107,7 @@ impl RejectionSnapshot {
     pub(crate) fn from_input(input: &SubmitPerpOrderInput) -> Self {
         Self {
             account: input.account.clone(),
+            subaccount_id: input.subaccount_id,
             market_id: input.market_id.clone(),
             side: input.side,
             price_1e8: input.price_1e8,
@@ -121,6 +123,7 @@ impl RejectionSnapshot {
         emit_perp_rejection_lifecycle(
             sender,
             &self.account,
+            self.subaccount_id,
             error,
             Some(self.market_id.clone()),
             Some(self.side),
@@ -164,6 +167,7 @@ async fn submit_perp_order_via_repository_inner<P: PerpOraclePriceReader + ?Size
     let now = now_ms();
     let taker_seed = PerpOrder::new(
         input.account.clone(),
+        input.subaccount_id,
         input.market_id.clone(),
         input.side,
         input.price_1e8,
@@ -271,6 +275,7 @@ async fn submit_perp_order_via_repository_inner<P: PerpOraclePriceReader + ?Size
             &market,
             PerpFillInput {
                 account: taker_seed.account.clone(),
+                subaccount_id: taker_seed.subaccount_id,
                 market_id: taker_seed.market_id.clone(),
                 side: taker_seed.side.position_side(),
                 size_1e8: plan.size_1e8,
@@ -291,6 +296,7 @@ async fn submit_perp_order_via_repository_inner<P: PerpOraclePriceReader + ?Size
             &market,
             PerpFillInput {
                 account: plan.maker_account.clone(),
+                subaccount_id: maker_updated.subaccount_id,
                 market_id: taker_seed.market_id.clone(),
                 side: taker_seed.side.opposite().position_side(),
                 size_1e8: plan.size_1e8,
@@ -313,6 +319,8 @@ async fn submit_perp_order_via_repository_inner<P: PerpOraclePriceReader + ?Size
             maker_order_id: plan.maker_order_id,
             taker_account: taker_seed.account.clone(),
             maker_account: plan.maker_account.clone(),
+            taker_subaccount_id: taker_seed.subaccount_id,
+            maker_subaccount_id: maker_updated.subaccount_id,
             taker_side: taker_seed.side,
             price_1e8: plan.price_1e8,
             size_1e8: plan.size_1e8,
@@ -597,6 +605,7 @@ async fn apply_perp_fill_pg(
             )?;
             let position = new_position_skeleton(
                 fill.account,
+                fill.subaccount_id,
                 fill.market_id,
                 fill.side,
                 fill.size_1e8,

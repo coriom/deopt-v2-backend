@@ -252,6 +252,7 @@ mod tests {
     fn long_position(size: u128, entry: u128, margin: u128) -> PerpPosition {
         new_position_skeleton(
             AccountId::new("0x0000000000000000000000000000000000000aaa"),
+            1,
             "ETH-PERP".to_string(),
             PerpSide::Long,
             size,
@@ -263,6 +264,7 @@ mod tests {
     fn short_position(size: u128, entry: u128, margin: u128) -> PerpPosition {
         new_position_skeleton(
             AccountId::new("0x0000000000000000000000000000000000000aaa"),
+            1,
             "ETH-PERP".to_string(),
             PerpSide::Short,
             size,

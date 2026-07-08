@@ -128,6 +128,7 @@ fn base_input(
 ) -> SubmitPerpOrderInput {
     SubmitPerpOrderInput {
         account,
+        subaccount_id: 1,
         market_id: "ETH-PERP".to_string(),
         side,
         price_1e8: price,

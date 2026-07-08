@@ -5769,9 +5769,19 @@ fn perp_position_from_row(row: PgRow) -> Result<crate::perps::PerpPosition> {
     let funding_index_str: String = row_get(&row, "last_funding_index_1e18")?;
     let funding_paid_str: String = row_get(&row, "cumulative_funding_payment_1e8")?;
     let version: i64 = row_get(&row, "version")?;
+    // PERPS-SUBACCOUNTS-ENGINE-ROUTING-V1 — column added in migration
+    // 0042 with DEFAULT 1. Any pre-migration row would return 1 via
+    // the default. Explicit fallback via try_get preserves compat if
+    // an in-flight test seeds rows before the migration applies.
+    let subaccount_id: u32 = row
+        .try_get::<i32, _>("subaccount_id")
+        .ok()
+        .and_then(|v| u32::try_from(v).ok())
+        .unwrap_or(1);
     Ok(crate::perps::PerpPosition {
         id: row_get(&row, "id")?,
         account: AccountId::new(row_get::<String>(&row, "account")?),
+        subaccount_id,
         market_id: row_get(&row, "market_id")?,
         side: crate::perps::PerpSide::parse(&side_str)?,
         size_1e8: size_str
@@ -5810,9 +5820,15 @@ fn perp_order_from_row(row: PgRow) -> Result<crate::perps::PerpOrder> {
     let remaining_str: String = row_get(&row, "remaining_size_1e8")?;
     let filled_str: String = row_get(&row, "filled_size_1e8")?;
     let margin_str: String = row_get(&row, "isolated_margin_1e8")?;
+    let subaccount_id: u32 = row
+        .try_get::<i32, _>("subaccount_id")
+        .ok()
+        .and_then(|v| u32::try_from(v).ok())
+        .unwrap_or(1);
     Ok(crate::perps::PerpOrder {
         id: row_get(&row, "id")?,
         account: AccountId::new(row_get::<String>(&row, "account")?),
+        subaccount_id,
         market_id: row_get(&row, "market_id")?,
         side: crate::perps::PerpOrderSide::parse(&side_str)?,
         order_type: crate::perps::PerpOrderType::parse(&order_type_str)?,
@@ -5848,6 +5864,16 @@ fn perp_fill_from_row(row: PgRow) -> Result<crate::perps::PerpFill> {
     let side_str: String = row_get(&row, "taker_side")?;
     let price_str: String = row_get(&row, "price_1e8")?;
     let size_str: String = row_get(&row, "size_1e8")?;
+    let taker_subaccount_id: u32 = row
+        .try_get::<i32, _>("taker_subaccount_id")
+        .ok()
+        .and_then(|v| u32::try_from(v).ok())
+        .unwrap_or(1);
+    let maker_subaccount_id: u32 = row
+        .try_get::<i32, _>("maker_subaccount_id")
+        .ok()
+        .and_then(|v| u32::try_from(v).ok())
+        .unwrap_or(1);
     Ok(crate::perps::PerpFill {
         id: row_get(&row, "id")?,
         market_id: row_get(&row, "market_id")?,
@@ -5855,6 +5881,8 @@ fn perp_fill_from_row(row: PgRow) -> Result<crate::perps::PerpFill> {
         maker_order_id: row_get(&row, "maker_order_id")?,
         taker_account: AccountId::new(row_get::<String>(&row, "taker_account")?),
         maker_account: AccountId::new(row_get::<String>(&row, "maker_account")?),
+        taker_subaccount_id,
+        maker_subaccount_id,
         taker_side: crate::perps::PerpOrderSide::parse(&side_str)?,
         price_1e8: price_str
             .parse()
@@ -6162,9 +6190,15 @@ fn perp_liquidation_event_from_row(row: PgRow) -> Result<crate::perps::PerpLiqui
             )))
         }
     };
+    let subaccount_id: u32 = row
+        .try_get::<i32, _>("subaccount_id")
+        .ok()
+        .and_then(|v| u32::try_from(v).ok())
+        .unwrap_or(1);
     Ok(crate::perps::PerpLiquidationEvent {
         id: row_get(&row, "id")?,
         account: AccountId::new(row_get::<String>(&row, "account")?),
+        subaccount_id,
         market_id: row_get(&row, "market_id")?,
         position_id: row_get(&row, "position_id")?,
         side: crate::perps::PerpSide::parse(&side_str)?,
@@ -6375,9 +6409,15 @@ fn perp_funding_event_from_row(row: PgRow) -> Result<crate::perps::PerpFundingEv
     let margin_before_str: String = row_get(&row, "margin_before_1e8")?;
     let margin_after_str: String = row_get(&row, "margin_after_1e8")?;
     let bad_debt_str: String = row_get(&row, "bad_debt_1e8")?;
+    let subaccount_id: u32 = row
+        .try_get::<i32, _>("subaccount_id")
+        .ok()
+        .and_then(|v| u32::try_from(v).ok())
+        .unwrap_or(1);
     Ok(crate::perps::PerpFundingEvent {
         id: row_get(&row, "id")?,
         account: AccountId::new(row_get::<String>(&row, "account")?),
+        subaccount_id,
         market_id: row_get(&row, "market_id")?,
         position_id: row_get(&row, "position_id")?,
         side: crate::perps::PerpSide::parse(&side_str)?,

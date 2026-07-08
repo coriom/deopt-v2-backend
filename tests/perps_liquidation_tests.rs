@@ -40,6 +40,7 @@ fn seed_long_position(
 ) -> uuid::Uuid {
     let pos = deopt_v2_backend::perps::positions::new_position_skeleton(
         account.clone(),
+        1,
         "ETH-PERP".to_string(),
         PerpSide::Long,
         size_1e8,
@@ -60,6 +61,7 @@ fn seed_short_position(
 ) -> uuid::Uuid {
     let pos = deopt_v2_backend::perps::positions::new_position_skeleton(
         account.clone(),
+        1,
         "ETH-PERP".to_string(),
         PerpSide::Short,
         size_1e8,
@@ -92,6 +94,7 @@ fn healthy_long_is_not_liquidated() {
     let market = cfg.market_by_symbol("ETH-PERP").unwrap();
     let position = deopt_v2_backend::perps::positions::new_position_skeleton(
         addr("0x0000000000000000000000000000000000000aaa"),
+        1,
         "ETH-PERP".to_string(),
         PerpSide::Long,
         ONE,
@@ -112,6 +115,7 @@ fn under_maintenance_long_is_liquidated() {
     let market = cfg.market_by_symbol("ETH-PERP").unwrap();
     let position = deopt_v2_backend::perps::positions::new_position_skeleton(
         addr("0x0000000000000000000000000000000000000aaa"),
+        1,
         "ETH-PERP".to_string(),
         PerpSide::Long,
         ONE,
@@ -132,6 +136,7 @@ fn under_maintenance_short_is_liquidated() {
     let market = cfg.market_by_symbol("ETH-PERP").unwrap();
     let position = deopt_v2_backend::perps::positions::new_position_skeleton(
         addr("0x0000000000000000000000000000000000000aaa"),
+        1,
         "ETH-PERP".to_string(),
         PerpSide::Short,
         ONE,
@@ -151,6 +156,7 @@ fn stale_price_returns_price_unavailable() {
     let market = cfg.market_by_symbol("ETH-PERP").unwrap();
     let position = deopt_v2_backend::perps::positions::new_position_skeleton(
         addr("0x0000000000000000000000000000000000000aaa"),
+        1,
         "ETH-PERP".to_string(),
         PerpSide::Long,
         ONE,
@@ -188,6 +194,7 @@ async fn liquidation_closes_position_realises_pnl_and_records_event() {
             &mut liquidations,
             &state.lifecycle_events,
             &alice,
+            1,
             "ETH-PERP",
             Some(2700 * ONE),
             now_ms(),
@@ -203,7 +210,7 @@ async fn liquidation_closes_position_realises_pnl_and_records_event() {
     assert_eq!(event.bad_debt_1e8, 0);
     // Position store should mark it as Liquidated.
     let positions = state.perp_positions_store.lock().unwrap();
-    assert!(positions.get_active(&alice, "ETH-PERP").is_none());
+    assert!(positions.get_active(&alice, 1, "ETH-PERP").is_none());
     let history = positions.list_for_account(&alice);
     assert_eq!(history.len(), 1);
     assert_eq!(history[0].status, PerpPositionStatus::Liquidated);
@@ -242,6 +249,7 @@ async fn liquidation_records_bad_debt_when_equity_is_negative() {
             &mut liquidations,
             &state.lifecycle_events,
             &alice,
+            1,
             "ETH-PERP",
             Some(2500 * ONE),
             now_ms(),
@@ -272,6 +280,7 @@ async fn stale_price_liquidation_records_price_unavailable_event_no_state_change
             &mut liquidations,
             &state.lifecycle_events,
             &alice,
+            1,
             "ETH-PERP",
             None, // mark unavailable
             now_ms(),
@@ -282,7 +291,7 @@ async fn stale_price_liquidation_records_price_unavailable_event_no_state_change
     assert_eq!(event.status, PerpLiquidationStatus::PriceUnavailable);
     // Position remains Open.
     let positions = state.perp_positions_store.lock().unwrap();
-    let pos = positions.get_active(&alice, "ETH-PERP").unwrap();
+    let pos = positions.get_active(&alice, 1, "ETH-PERP").unwrap();
     assert_eq!(pos.status, PerpPositionStatus::Open);
 }
 
@@ -306,6 +315,7 @@ async fn healthy_position_liquidation_returns_none_no_state_change() {
             &mut liquidations,
             &state.lifecycle_events,
             &alice,
+            1,
             "ETH-PERP",
             Some(PRICE_ETH_3000), // healthy mark
             now_ms(),
@@ -314,7 +324,7 @@ async fn healthy_position_liquidation_returns_none_no_state_change() {
     };
     assert!(result.is_none());
     let positions = state.perp_positions_store.lock().unwrap();
-    let pos = positions.get_active(&alice, "ETH-PERP").unwrap();
+    let pos = positions.get_active(&alice, 1, "ETH-PERP").unwrap();
     assert_eq!(pos.status, PerpPositionStatus::Open);
 }
 
@@ -375,6 +385,7 @@ async fn liquidation_cancels_open_orders_for_same_account_and_market() {
         let mut orders = state.perp_order_store.lock().unwrap();
         let alice_eth = deopt_v2_backend::perps::PerpOrder::new(
             alice.clone(),
+            1,
             "ETH-PERP".to_string(),
             deopt_v2_backend::perps::PerpOrderSide::Buy,
             2900 * ONE,
@@ -388,6 +399,7 @@ async fn liquidation_cancels_open_orders_for_same_account_and_market() {
         );
         let alice_btc = deopt_v2_backend::perps::PerpOrder::new(
             alice.clone(),
+            1,
             "BTC-PERP".to_string(),
             deopt_v2_backend::perps::PerpOrderSide::Buy,
             60_000 * ONE,
@@ -401,6 +413,7 @@ async fn liquidation_cancels_open_orders_for_same_account_and_market() {
         );
         let bob_eth = deopt_v2_backend::perps::PerpOrder::new(
             bob.clone(),
+            1,
             "ETH-PERP".to_string(),
             deopt_v2_backend::perps::PerpOrderSide::Buy,
             2800 * ONE,
@@ -431,6 +444,7 @@ async fn liquidation_cancels_open_orders_for_same_account_and_market() {
             &mut liquidations,
             &state.lifecycle_events,
             &alice,
+            1,
             "ETH-PERP",
             Some(2700 * ONE),
             now_ms(),
@@ -508,7 +522,7 @@ async fn tick_liquidates_only_the_unhealthy_positions() {
         .perp_positions_store
         .lock()
         .unwrap()
-        .get_active(&short_unhealthy, "ETH-PERP")
+        .get_active(&short_unhealthy, 1, "ETH-PERP")
         .unwrap();
     assert_eq!(short_pos.status, PerpPositionStatus::Open);
 }
@@ -560,6 +574,7 @@ async fn account_liquidations_endpoint_surfaces_persisted_events() {
             &mut liquidations,
             &state.lifecycle_events,
             &alice,
+            1,
             "ETH-PERP",
             Some(2500 * ONE),
             now_ms(),
@@ -677,6 +692,7 @@ async fn perp_position_liquidated_frame_has_no_secret_fields() {
             &mut liquidations,
             &state.lifecycle_events,
             &alice,
+            1,
             "ETH-PERP",
             Some(2500 * ONE),
             now_ms(),

@@ -116,6 +116,7 @@ async fn seed_pg_position(
 ) -> deopt_v2_backend::perps::PerpPosition {
     let position = deopt_v2_backend::perps::positions::new_position_skeleton(
         account.clone(),
+        1,
         market_id.to_string(),
         side,
         size_1e8,

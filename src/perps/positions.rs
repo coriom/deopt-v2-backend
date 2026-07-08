@@ -79,10 +79,23 @@ impl PerpPositionStatus {
     }
 }
 
+/// PERPS-SUBACCOUNTS-ENGINE-ROUTING-V1 — helper for `#[serde(default)]`
+/// on optional subaccount fields. Legacy wire payloads (pre-milestone)
+/// omit the field; default `1` maps to the wallet's Account 1.
+pub fn one_subaccount_id() -> u32 {
+    1
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PerpPosition {
     pub id: Uuid,
     pub account: AccountId,
+    /// PERPS-SUBACCOUNTS-ENGINE-ROUTING-V1 — the subaccount this
+    /// position belongs to. `1` is the default account. Positions are
+    /// isolated across subaccounts: two positions with the same
+    /// `(account, market_id)` but different `subaccount_id` do not net.
+    #[serde(default = "one_subaccount_id")]
+    pub subaccount_id: u32,
     pub market_id: String,
     pub side: PerpSide,
     /// Remaining position size, `1e8`.
@@ -133,9 +146,11 @@ impl PerpPosition {
 pub struct PerpPositionsStore {
     /// All positions by id (open + closed).
     by_id: HashMap<Uuid, PerpPosition>,
-    /// Fast lookup: (lower-cased account, market_id) → open position id.
-    /// Closed positions are removed from this index.
-    active_by_account_market: HashMap<(String, String), Uuid>,
+    /// PERPS-SUBACCOUNTS-ENGINE-ROUTING-V1 — subaccount-aware active
+    /// index: (lower-cased account, subaccount_id, market_id) →
+    /// open position id. Two positions on the same account+market but
+    /// different subaccounts coexist here without netting.
+    active_by_account_subaccount_market: HashMap<(String, u32, String), Uuid>,
 }
 
 impl PerpPositionsStore {
@@ -144,37 +159,52 @@ impl PerpPositionsStore {
     }
 
     /// Insert a fresh open position. Fails when an open position
-    /// already exists for the same `(account, market_id)` — the
-    /// caller is expected to reduce/close the existing one first.
+    /// already exists for the same `(account, subaccount_id, market_id)`
+    /// — the caller is expected to reduce/close the existing one first.
+    /// Cross-subaccount coexistence is allowed: Account 1 and Account
+    /// 2 can each hold one open ETH-PERP position on the same wallet.
     pub fn insert_open(&mut self, position: PerpPosition) -> Result<PerpPosition> {
         if position.status != PerpPositionStatus::Open {
             return Err(BackendError::Config(
                 "PerpPositionsStore::insert_open requires status='open'".to_string(),
             ));
         }
-        let key = index_key(&position.account, &position.market_id);
-        if self.active_by_account_market.contains_key(&key) {
+        let key = index_key(
+            &position.account,
+            position.subaccount_id,
+            &position.market_id,
+        );
+        if self.active_by_account_subaccount_market.contains_key(&key) {
             return Err(BackendError::PerpMarketPaused(format!(
-                "account already has an open position for market {}",
+                "account+subaccount already has an open position for market {}",
                 position.market_id
             )));
         }
-        self.active_by_account_market.insert(key, position.id);
+        self.active_by_account_subaccount_market
+            .insert(key, position.id);
         self.by_id.insert(position.id, position.clone());
         Ok(position)
     }
 
-    pub fn get_active(&self, account: &AccountId, market_id: &str) -> Option<PerpPosition> {
-        let key = index_key(account, market_id);
-        let id = self.active_by_account_market.get(&key)?;
+    pub fn get_active(
+        &self,
+        account: &AccountId,
+        subaccount_id: u32,
+        market_id: &str,
+    ) -> Option<PerpPosition> {
+        let key = index_key(account, subaccount_id, market_id);
+        let id = self.active_by_account_subaccount_market.get(&key)?;
         self.by_id.get(id).cloned()
     }
 
     /// Apply an in-place mutation. Returns the post-mutation row.
-    /// Bumps `version` + `updated_at_ms`.
+    /// Bumps `version` + `updated_at_ms`. Scoped to
+    /// `(account, subaccount_id, market_id)` — cross-subaccount reads
+    /// on the same wallet + market do NOT match.
     pub fn update_active<F>(
         &mut self,
         account: &AccountId,
+        subaccount_id: u32,
         market_id: &str,
         now: TimestampMs,
         mutator: F,
@@ -182,9 +212,9 @@ impl PerpPositionsStore {
     where
         F: FnOnce(&mut PerpPosition) -> Result<()>,
     {
-        let key = index_key(account, market_id);
+        let key = index_key(account, subaccount_id, market_id);
         let id = *self
-            .active_by_account_market
+            .active_by_account_subaccount_market
             .get(&key)
             .ok_or(BackendError::PerpPositionNotFound)?;
         let position = self.by_id.get_mut(&id).ok_or_else(|| {
@@ -199,17 +229,20 @@ impl PerpPositionsStore {
     /// PERPS-LIQUIDATION-AND-RISK-V1 — flip the active position to
     /// `Liquidated` status. Same shape as `close_active` but with a
     /// distinct terminal status so history / lifecycle can
-    /// distinguish trader-cancel vs risk-driven liquidation.
+    /// distinguish trader-cancel vs risk-driven liquidation. Scoped
+    /// to the exact `(account, subaccount_id, market_id)` key so a
+    /// liquidation tick on Account 2 does not touch Account 1.
     pub fn liquidate_active(
         &mut self,
         account: &AccountId,
+        subaccount_id: u32,
         market_id: &str,
         realized_pnl_delta_1e8: i128,
         now: TimestampMs,
     ) -> Result<PerpPosition> {
-        let key = index_key(account, market_id);
+        let key = index_key(account, subaccount_id, market_id);
         let id = self
-            .active_by_account_market
+            .active_by_account_subaccount_market
             .remove(&key)
             .ok_or(BackendError::PerpPositionNotFound)?;
         let position = self.by_id.get_mut(&id).ok_or_else(|| {
@@ -219,29 +252,25 @@ impl PerpPositionsStore {
         position.realized_pnl_1e8 = position
             .realized_pnl_1e8
             .saturating_add(realized_pnl_delta_1e8);
-        // A liquidation closes the whole position; the row's size
-        // stays at its pre-liquidation value for history readers
-        // (they see how big the position WAS at the moment of
-        // liquidation). The margin is released back to the trader
-        // conceptually — V1 does not touch on-chain vault.
         position.updated_at_ms = now;
         position.closed_at_ms = Some(now);
         position.version = position.version.saturating_add(1);
         Ok(position.clone())
     }
 
-    /// Close the active position for `(account, market_id)`. The row
-    /// stays in `by_id` (history) but is removed from the active
-    /// index.
+    /// Close the active position for
+    /// `(account, subaccount_id, market_id)`. Cross-subaccount rows on
+    /// the same wallet + market are not affected.
     pub fn close_active(
         &mut self,
         account: &AccountId,
+        subaccount_id: u32,
         market_id: &str,
         now: TimestampMs,
     ) -> Result<PerpPosition> {
-        let key = index_key(account, market_id);
+        let key = index_key(account, subaccount_id, market_id);
         let id = self
-            .active_by_account_market
+            .active_by_account_subaccount_market
             .remove(&key)
             .ok_or(BackendError::PerpPositionNotFound)?;
         let position = self.by_id.get_mut(&id).ok_or_else(|| {
@@ -272,7 +301,10 @@ impl PerpPositionsStore {
         self.by_id.values().cloned().collect()
     }
 
-    /// List positions for one account, newest-first.
+    /// List positions for one wallet across every subaccount, newest-
+    /// first. Callers who want subaccount-scoped views should use
+    /// `list_for_account_and_subaccount`. This method is preserved for
+    /// the `?all=true` read path.
     pub fn list_for_account(&self, account: &AccountId) -> Vec<PerpPosition> {
         let want = account.0.to_lowercase();
         let mut rows: Vec<PerpPosition> = self
@@ -284,16 +316,39 @@ impl PerpPositionsStore {
         rows.sort_by(|a, b| b.updated_at_ms.cmp(&a.updated_at_ms));
         rows
     }
+
+    /// PERPS-SUBACCOUNTS-ENGINE-ROUTING-V1 — subaccount-scoped list.
+    /// Default read path (no `?subaccount_id=`) uses `subaccount_id=1`.
+    pub fn list_for_account_and_subaccount(
+        &self,
+        account: &AccountId,
+        subaccount_id: u32,
+    ) -> Vec<PerpPosition> {
+        let want = account.0.to_lowercase();
+        let mut rows: Vec<PerpPosition> = self
+            .by_id
+            .values()
+            .filter(|p| p.account.0.to_lowercase() == want && p.subaccount_id == subaccount_id)
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| b.updated_at_ms.cmp(&a.updated_at_ms));
+        rows
+    }
 }
 
-fn index_key(account: &AccountId, market_id: &str) -> (String, String) {
-    (account.0.to_lowercase(), market_id.to_string())
+fn index_key(account: &AccountId, subaccount_id: u32, market_id: &str) -> (String, u32, String) {
+    (
+        account.0.to_lowercase(),
+        subaccount_id,
+        market_id.to_string(),
+    )
 }
 
 /// Build a fresh position skeleton — the actual `size`, `entry`, and
 /// `margin` come from the fill-application logic.
 pub fn new_position_skeleton(
     account: AccountId,
+    subaccount_id: u32,
     market_id: String,
     side: PerpSide,
     size_1e8: u128,
@@ -304,6 +359,7 @@ pub fn new_position_skeleton(
     PerpPosition {
         id: Uuid::new_v4(),
         account,
+        subaccount_id,
         market_id,
         side,
         size_1e8,
@@ -362,6 +418,7 @@ mod tests {
         let account = addr("0x0000000000000000000000000000000000000aaa");
         let position = new_position_skeleton(
             account.clone(),
+            1,
             "ETH-PERP".to_string(),
             PerpSide::Long,
             100_000_000,
@@ -370,7 +427,7 @@ mod tests {
         );
         let inserted = store.insert_open(position.clone()).unwrap();
         assert_eq!(inserted.id, position.id);
-        let hit = store.get_active(&account, "ETH-PERP").unwrap();
+        let hit = store.get_active(&account, 1, "ETH-PERP").unwrap();
         assert_eq!(hit.id, position.id);
     }
 
@@ -380,6 +437,7 @@ mod tests {
         let account = addr("0x0000000000000000000000000000000000000aaa");
         let p1 = new_position_skeleton(
             account.clone(),
+            1,
             "ETH-PERP".to_string(),
             PerpSide::Long,
             100_000_000,
@@ -389,6 +447,7 @@ mod tests {
         store.insert_open(p1).unwrap();
         let p2 = new_position_skeleton(
             account,
+            1,
             "ETH-PERP".to_string(),
             PerpSide::Long,
             100_000_000,
@@ -405,6 +464,7 @@ mod tests {
         let account = addr("0x0000000000000000000000000000000000000aaa");
         let p1 = new_position_skeleton(
             account.clone(),
+            1,
             "ETH-PERP".to_string(),
             PerpSide::Long,
             100_000_000,
@@ -413,13 +473,14 @@ mod tests {
         );
         store.insert_open(p1).unwrap();
         let closed = store
-            .close_active(&account, "ETH-PERP", 1_782_000_000_000)
+            .close_active(&account, 1, "ETH-PERP", 1_782_000_000_000)
             .unwrap();
         assert_eq!(closed.status, PerpPositionStatus::Closed);
-        assert!(store.get_active(&account, "ETH-PERP").is_none());
+        assert!(store.get_active(&account, 1, "ETH-PERP").is_none());
         // Now re-opening on the same account+market should succeed.
         let p2 = new_position_skeleton(
             account.clone(),
+            1,
             "ETH-PERP".to_string(),
             PerpSide::Short,
             50_000_000,
@@ -428,7 +489,7 @@ mod tests {
         );
         store.insert_open(p2).unwrap();
         assert_eq!(
-            store.get_active(&account, "ETH-PERP").unwrap().side,
+            store.get_active(&account, 1, "ETH-PERP").unwrap().side,
             PerpSide::Short
         );
     }
@@ -440,6 +501,7 @@ mod tests {
         let account_upper = addr("0x0000000000000000000000000000000000000AAA");
         let mut p1 = new_position_skeleton(
             account_lower.clone(),
+            1,
             "ETH-PERP".to_string(),
             PerpSide::Long,
             100_000_000,
@@ -449,6 +511,7 @@ mod tests {
         p1.updated_at_ms = 1_000;
         let mut p2 = new_position_skeleton(
             account_upper.clone(),
+            1,
             "BTC-PERP".to_string(),
             PerpSide::Short,
             50_000_000,
@@ -461,5 +524,70 @@ mod tests {
         let list = store.list_for_account(&account_lower);
         assert_eq!(list.len(), 2);
         assert_eq!(list[0].market_id, "BTC-PERP"); // newest first
+    }
+
+    // PERPS-SUBACCOUNTS-ENGINE-ROUTING-V1 — cross-subaccount isolation.
+    #[test]
+    fn same_wallet_same_market_can_coexist_across_subaccounts() {
+        let mut store = PerpPositionsStore::new();
+        let account = addr("0x0000000000000000000000000000000000000aaa");
+        let p1 = new_position_skeleton(
+            account.clone(),
+            1,
+            "ETH-PERP".to_string(),
+            PerpSide::Long,
+            100_000_000,
+            300_000_000_000,
+            30_000_000_000,
+        );
+        let p2 = new_position_skeleton(
+            account.clone(),
+            2,
+            "ETH-PERP".to_string(),
+            PerpSide::Short,
+            50_000_000,
+            300_000_000_000,
+            15_000_000_000,
+        );
+        store.insert_open(p1).unwrap();
+        // MUST succeed — Account 2 is isolated from Account 1.
+        store.insert_open(p2).unwrap();
+        let a1 = store.get_active(&account, 1, "ETH-PERP").unwrap();
+        let a2 = store.get_active(&account, 2, "ETH-PERP").unwrap();
+        assert_eq!(a1.side, PerpSide::Long);
+        assert_eq!(a1.subaccount_id, 1);
+        assert_eq!(a2.side, PerpSide::Short);
+        assert_eq!(a2.subaccount_id, 2);
+    }
+
+    #[test]
+    fn subaccount_scoped_list_isolates_rows() {
+        let mut store = PerpPositionsStore::new();
+        let account = addr("0x0000000000000000000000000000000000000aaa");
+        store
+            .insert_open(new_position_skeleton(
+                account.clone(),
+                1,
+                "ETH-PERP".to_string(),
+                PerpSide::Long,
+                100_000_000,
+                300_000_000_000,
+                30_000_000_000,
+            ))
+            .unwrap();
+        store
+            .insert_open(new_position_skeleton(
+                account.clone(),
+                2,
+                "ETH-PERP".to_string(),
+                PerpSide::Short,
+                50_000_000,
+                300_000_000_000,
+                15_000_000_000,
+            ))
+            .unwrap();
+        assert_eq!(store.list_for_account_and_subaccount(&account, 1).len(), 1);
+        assert_eq!(store.list_for_account_and_subaccount(&account, 2).len(), 1);
+        assert_eq!(store.list_for_account(&account).len(), 2);
     }
 }

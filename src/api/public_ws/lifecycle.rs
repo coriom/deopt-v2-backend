@@ -214,6 +214,11 @@ pub enum LifecyclePayload {
     PerpOrderUpdated {
         order_id: String,
         market_id: String,
+        /// PERPS-SUBACCOUNTS-ENGINE-ROUTING-V1 — subaccount of the
+        /// order. Wire-compat: legacy pre-milestone payloads omit
+        /// the field and deserialise to `1`.
+        #[serde(default = "crate::perps::positions::one_subaccount_id")]
+        subaccount_id: u32,
         side: String,
         status: String,
         price_1e8: String,
@@ -236,6 +241,12 @@ pub enum LifecyclePayload {
         market_id: String,
         order_id: String,
         counterparty_order_id: String,
+        /// PERPS-SUBACCOUNTS-ENGINE-ROUTING-V1 — side-specific
+        /// subaccount ids for the fill counterparties.
+        #[serde(default = "crate::perps::positions::one_subaccount_id")]
+        taker_subaccount_id: u32,
+        #[serde(default = "crate::perps::positions::one_subaccount_id")]
+        maker_subaccount_id: u32,
         liquidity_role: String,
         side: String,
         price_1e8: String,
@@ -246,6 +257,8 @@ pub enum LifecyclePayload {
     PerpPositionUpdated {
         position_id: String,
         market_id: String,
+        #[serde(default = "crate::perps::positions::one_subaccount_id")]
+        subaccount_id: u32,
         side: String,
         size_1e8: String,
         entry_price_1e8: String,
@@ -260,6 +273,8 @@ pub enum LifecyclePayload {
     /// `account.perp_orders`. Never carries auth material.
     PerpOrderRejected {
         market_id: Option<String>,
+        #[serde(default = "crate::perps::positions::one_subaccount_id")]
+        subaccount_id: u32,
         side: Option<String>,
         price_1e8: Option<String>,
         size_1e8: Option<String>,
@@ -282,6 +297,8 @@ pub enum LifecyclePayload {
     PerpPositionLiquidated {
         liquidation_id: String,
         market_id: String,
+        #[serde(default = "crate::perps::positions::one_subaccount_id")]
+        subaccount_id: u32,
         position_id: String,
         side: String,
         size_1e8: String,
@@ -306,6 +323,8 @@ pub enum LifecyclePayload {
     PerpFundingPaymentCreated {
         funding_event_id: String,
         market_id: String,
+        #[serde(default = "crate::perps::positions::one_subaccount_id")]
+        subaccount_id: u32,
         position_id: String,
         side: String,
         position_size_1e8: String,

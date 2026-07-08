@@ -119,6 +119,7 @@ async fn in_memory_execution_still_works_when_repository_is_absent() {
             &reader,
             SubmitPerpOrderInput {
                 account: addr("0x0000000000000000000000000000000000000aaa"),
+                subaccount_id: 1,
                 market_id: "ETH-PERP".to_string(),
                 side: PerpOrderSide::Buy,
                 price_1e8: 3000 * ONE,

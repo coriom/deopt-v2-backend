@@ -52,6 +52,7 @@ fn base_input(
 ) -> SubmitPerpOrderInput {
     SubmitPerpOrderInput {
         account,
+        subaccount_id: 1,
         market_id: "ETH-PERP".to_string(),
         side,
         price_1e8: price,
@@ -425,6 +426,7 @@ async fn rejection_lifecycle_emits_for_post_only_would_match() {
     emit_perp_rejection_lifecycle(
         &state.lifecycle_events,
         &bob,
+        1,
         &err,
         Some("ETH-PERP".to_string()),
         Some(PerpOrderSide::Buy),
@@ -506,6 +508,7 @@ async fn classify_perp_rejection_covers_all_recordable_variants() {
         &market,
         PerpFillInput {
             account: addr("0x000000000000000000000000000000000000aaaa"),
+            subaccount_id: 1,
             market_id: "ETH-PERP".to_string(),
             side: PerpSide::Long,
             size_1e8: ONE,

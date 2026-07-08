@@ -72,6 +72,7 @@ fn base_input(
 ) -> SubmitPerpOrderInput {
     SubmitPerpOrderInput {
         account,
+        subaccount_id: 1,
         market_id: "ETH-PERP".to_string(),
         side,
         price_1e8: price,
@@ -169,6 +170,7 @@ async fn crossing_taker_matches_at_maker_price() {
     let taker_pos = positions
         .get_active(
             &addr("0x0000000000000000000000000000000000000bbb"),
+            1,
             "ETH-PERP",
         )
         .expect("taker position");
@@ -176,6 +178,7 @@ async fn crossing_taker_matches_at_maker_price() {
     let maker_pos = positions
         .get_active(
             &addr("0x0000000000000000000000000000000000000aaa"),
+            1,
             "ETH-PERP",
         )
         .expect("maker position");

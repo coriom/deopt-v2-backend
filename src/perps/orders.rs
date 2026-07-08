@@ -186,6 +186,13 @@ pub mod reason {
 pub struct PerpOrder {
     pub id: Uuid,
     pub account: AccountId,
+    /// PERPS-SUBACCOUNTS-ENGINE-ROUTING-V1 — the subaccount this order
+    /// belongs to. `1` is the default account. Cross-subaccount cancel
+    /// / matching is rejected: `cancel(account=X, subaccount=1)`
+    /// cannot cancel an order with `subaccount_id=2` even when
+    /// authenticated as X.
+    #[serde(default = "crate::perps::positions::one_subaccount_id")]
+    pub subaccount_id: u32,
     pub market_id: String,
     pub side: PerpOrderSide,
     pub order_type: PerpOrderType,
@@ -211,6 +218,7 @@ pub struct PerpOrder {
 impl PerpOrder {
     pub fn new(
         account: AccountId,
+        subaccount_id: u32,
         market_id: String,
         side: PerpOrderSide,
         price_1e8: u128,
@@ -225,6 +233,7 @@ impl PerpOrder {
         Self {
             id: Uuid::new_v4(),
             account,
+            subaccount_id,
             market_id,
             side,
             order_type: PerpOrderType::Limit,
@@ -255,6 +264,14 @@ pub struct PerpFill {
     pub maker_order_id: Uuid,
     pub taker_account: AccountId,
     pub maker_account: AccountId,
+    /// PERPS-SUBACCOUNTS-ENGINE-ROUTING-V1 — side-specific subaccount
+    /// ids. `1` = default account. Legacy wire payloads (pre-milestone)
+    /// omit the fields; serde defaults to `1` for backward-compat with
+    /// old JSON emitted before this ripple landed.
+    #[serde(default = "crate::perps::positions::one_subaccount_id")]
+    pub taker_subaccount_id: u32,
+    #[serde(default = "crate::perps::positions::one_subaccount_id")]
+    pub maker_subaccount_id: u32,
     pub taker_side: PerpOrderSide,
     pub price_1e8: u128,
     pub size_1e8: u128,

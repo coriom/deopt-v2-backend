@@ -36,6 +36,10 @@ use crate::types::{now_ms, AccountId, TimestampMs};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PerpFillInput {
     pub account: AccountId,
+    /// PERPS-SUBACCOUNTS-ENGINE-ROUTING-V1 — the subaccount the fill
+    /// mutates. Default `1` (Account 1) via the migration + serde
+    /// defaults; explicit values isolate positions across subaccounts.
+    pub subaccount_id: u32,
     pub market_id: String,
     pub side: PerpSide,
     pub size_1e8: u128,
@@ -100,7 +104,7 @@ pub fn apply_perp_fill_for_account(
         )));
     }
     let now = now_ms();
-    let existing = store.get_active(&fill.account, &fill.market_id);
+    let existing = store.get_active(&fill.account, fill.subaccount_id, &fill.market_id);
     match existing {
         None => open_fresh_position(store, market, fill, now),
         Some(pos) if pos.side == fill.side => increase_position(store, market, pos, fill, now),
@@ -144,6 +148,7 @@ fn open_fresh_position(
     )?;
     let position = new_position_skeleton(
         fill.account,
+        fill.subaccount_id,
         fill.market_id,
         fill.side,
         fill.size_1e8,
@@ -186,12 +191,18 @@ fn increase_position(
         new_margin,
         market.max_leverage,
     )?;
-    let position = store.update_active(&fill.account, &fill.market_id, now, |p| {
-        p.size_1e8 = new_size;
-        p.entry_price_1e8 = new_entry;
-        p.margin_1e8 = new_margin;
-        Ok(())
-    })?;
+    let position = store.update_active(
+        &fill.account,
+        fill.subaccount_id,
+        &fill.market_id,
+        now,
+        |p| {
+            p.size_1e8 = new_size;
+            p.entry_price_1e8 = new_entry;
+            p.margin_1e8 = new_margin;
+            Ok(())
+        },
+    )?;
     Ok(PerpFillOutcome::Increased(position))
 }
 
@@ -219,7 +230,12 @@ fn reduce_or_reject(
     if full_close {
         // Close entire position. Realised PnL accumulates and margin
         // is conceptually released.
-        let mut closed = store.close_active(&existing.account, &existing.market_id, now)?;
+        let mut closed = store.close_active(
+            &existing.account,
+            existing.subaccount_id,
+            &existing.market_id,
+            now,
+        )?;
         closed.realized_pnl_1e8 = closed.realized_pnl_1e8.saturating_add(realized);
         closed.size_1e8 = 0;
         // Persist the mutated fields via a re-insert into `by_id` —
@@ -240,12 +256,18 @@ fn reduce_or_reject(
         // price is preserved for the residual.
         let released = mul_div_floor(existing.margin_1e8, fill.size_1e8, existing.size_1e8);
         let new_margin = existing.margin_1e8.saturating_sub(released);
-        let position = store.update_active(&fill.account, &fill.market_id, now, |p| {
-            p.size_1e8 = new_size;
-            p.margin_1e8 = new_margin;
-            p.realized_pnl_1e8 = p.realized_pnl_1e8.saturating_add(realized);
-            Ok(())
-        })?;
+        let position = store.update_active(
+            &fill.account,
+            fill.subaccount_id,
+            &fill.market_id,
+            now,
+            |p| {
+                p.size_1e8 = new_size;
+                p.margin_1e8 = new_margin;
+                p.realized_pnl_1e8 = p.realized_pnl_1e8.saturating_add(realized);
+                Ok(())
+            },
+        )?;
         Ok(PerpFillOutcome::Reduced {
             position,
             realized_pnl_1e8: realized,
@@ -348,6 +370,7 @@ mod tests {
             &market,
             PerpFillInput {
                 account: addr("0x0000000000000000000000000000000000000aaa"),
+                subaccount_id: 1,
                 market_id: "ETH-PERP".to_string(),
                 side: PerpSide::Long,
                 size_1e8: 100_000_000,      // 1 ETH
@@ -372,6 +395,7 @@ mod tests {
             &eth_market(),
             PerpFillInput {
                 account: addr("0x0000000000000000000000000000000000000aaa"),
+                subaccount_id: 1,
                 market_id: "ETH-PERP".to_string(),
                 side: PerpSide::Long,
                 size_1e8: 100_000_000,
@@ -394,6 +418,7 @@ mod tests {
             &btc_market(),
             PerpFillInput {
                 account: addr("0x0000000000000000000000000000000000000aaa"),
+                subaccount_id: 1,
                 market_id: "BTC-PERP".to_string(),
                 side: PerpSide::Long,
                 size_1e8: 100_000_000,         // 1 BTC
@@ -418,6 +443,7 @@ mod tests {
             &market,
             PerpFillInput {
                 account: acc.clone(),
+                subaccount_id: 1,
                 market_id: "ETH-PERP".to_string(),
                 side: PerpSide::Long,
                 size_1e8: 100_000_000,
@@ -432,6 +458,7 @@ mod tests {
             &market,
             PerpFillInput {
                 account: acc.clone(),
+                subaccount_id: 1,
                 market_id: "ETH-PERP".to_string(),
                 side: PerpSide::Long,
                 size_1e8: 100_000_000,
@@ -441,7 +468,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(outcome, PerpFillOutcome::Increased(_)));
-        let pos = store.get_active(&acc, "ETH-PERP").unwrap();
+        let pos = store.get_active(&acc, 1, "ETH-PERP").unwrap();
         assert_eq!(pos.size_1e8, 200_000_000);
         assert_eq!(pos.entry_price_1e8, 310_000_000_000);
         assert_eq!(pos.margin_1e8, 62_000_000_000);
@@ -457,6 +484,7 @@ mod tests {
             &market,
             PerpFillInput {
                 account: acc.clone(),
+                subaccount_id: 1,
                 market_id: "ETH-PERP".to_string(),
                 side: PerpSide::Long,
                 size_1e8: 200_000_000,
@@ -473,6 +501,7 @@ mod tests {
             &market,
             PerpFillInput {
                 account: acc.clone(),
+                subaccount_id: 1,
                 market_id: "ETH-PERP".to_string(),
                 side: PerpSide::Short,
                 size_1e8: 100_000_000,
@@ -483,7 +512,7 @@ mod tests {
         .unwrap();
         let realised = outcome.realized_pnl_1e8();
         assert_eq!(realised, 20_000_000_000); // ($3200 - $3000) * 1 = +$200
-        let pos = store.get_active(&acc, "ETH-PERP").unwrap();
+        let pos = store.get_active(&acc, 1, "ETH-PERP").unwrap();
         assert_eq!(pos.size_1e8, 100_000_000);
         assert_eq!(pos.entry_price_1e8, 300_000_000_000);
         // Margin released proportionally: 60 * 100/200 = 30 → residual 30.
@@ -500,6 +529,7 @@ mod tests {
             &market,
             PerpFillInput {
                 account: acc.clone(),
+                subaccount_id: 1,
                 market_id: "ETH-PERP".to_string(),
                 side: PerpSide::Long,
                 size_1e8: 100_000_000,
@@ -513,6 +543,7 @@ mod tests {
             &market,
             PerpFillInput {
                 account: acc.clone(),
+                subaccount_id: 1,
                 market_id: "ETH-PERP".to_string(),
                 side: PerpSide::Short,
                 size_1e8: 100_000_000,
@@ -523,7 +554,7 @@ mod tests {
         .unwrap();
         assert!(matches!(outcome, PerpFillOutcome::Closed { .. }));
         assert_eq!(outcome.realized_pnl_1e8(), 10_000_000_000);
-        assert!(store.get_active(&acc, "ETH-PERP").is_none());
+        assert!(store.get_active(&acc, 1, "ETH-PERP").is_none());
     }
 
     #[test]
@@ -536,6 +567,7 @@ mod tests {
             &market,
             PerpFillInput {
                 account: acc.clone(),
+                subaccount_id: 1,
                 market_id: "ETH-PERP".to_string(),
                 side: PerpSide::Long,
                 size_1e8: 100_000_000,
@@ -549,6 +581,7 @@ mod tests {
             &market,
             PerpFillInput {
                 account: acc,
+                subaccount_id: 1,
                 market_id: "ETH-PERP".to_string(),
                 side: PerpSide::Short,
                 size_1e8: 200_000_000, // exceeds existing
@@ -568,6 +601,7 @@ mod tests {
             &eth_market(),
             PerpFillInput {
                 account: addr("0x0000000000000000000000000000000000000aaa"),
+                subaccount_id: 1,
                 market_id: "ETH-PERP".to_string(),
                 side: PerpSide::Long,
                 size_1e8: 0,
@@ -587,6 +621,7 @@ mod tests {
             &eth_market(),
             PerpFillInput {
                 account: addr("0x0000000000000000000000000000000000000aaa"),
+                subaccount_id: 1,
                 market_id: "ETH-PERP".to_string(),
                 side: PerpSide::Long,
                 size_1e8: 100_000_000,
@@ -606,6 +641,7 @@ mod tests {
             &eth_market(),
             PerpFillInput {
                 account: addr("0x0000000000000000000000000000000000000aaa"),
+                subaccount_id: 1,
                 market_id: "SOL-PERP".to_string(), // doesn't match the market row
                 side: PerpSide::Long,
                 size_1e8: 100_000_000,

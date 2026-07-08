@@ -76,6 +76,7 @@ mod tests {
     fn order(side: PerpOrderSide, price: u128, offset_ms: i64) -> PerpOrder {
         PerpOrder::new(
             addr(),
+            1,
             "ETH-PERP".to_string(),
             side,
             price,

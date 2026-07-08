@@ -231,6 +231,7 @@ async fn apply_pg_liquidation(
     let event = PerpLiquidationEvent {
         id: Uuid::new_v4(),
         account: position.account.clone(),
+        subaccount_id: position.subaccount_id,
         market_id: position.market_id.clone(),
         position_id: position.id,
         side: position.side,
@@ -302,6 +303,7 @@ fn emit_perp_position_liquidated_lifecycle(
         payload: LifecyclePayload::PerpPositionLiquidated {
             liquidation_id: event.id.to_string(),
             market_id: event.market_id.clone(),
+            subaccount_id: event.subaccount_id,
             position_id: event.position_id.to_string(),
             side: event.side.as_str().to_string(),
             size_1e8: event.size_1e8.to_string(),

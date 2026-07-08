@@ -97,13 +97,15 @@ impl PerpOrderStore {
     }
 
     /// PERPS-LIQUIDATION-AND-RISK-V1 — cancel every open order
-    /// belonging to `(account, market_id)` in one pass. Returns the
-    /// cancelled rows so the caller can emit lifecycle frames for
-    /// each. Idempotent: if the account has no open orders on that
-    /// market, returns an empty vec.
+    /// belonging to `(account, subaccount_id, market_id)` in one pass.
+    /// Returns the cancelled rows so the caller can emit lifecycle
+    /// frames for each. Idempotent: if the account+subaccount has no
+    /// open orders on that market, returns an empty vec. Cross-
+    /// subaccount orders on the same wallet+market are not touched.
     pub fn cancel_open_orders_for_account_market(
         &mut self,
         account: &AccountId,
+        subaccount_id: u32,
         market_id: &str,
         reason_code: &str,
         reason_source: &str,
@@ -116,6 +118,7 @@ impl PerpOrderStore {
             .filter(|o| {
                 o.market_id == market_id
                     && o.account.0.to_lowercase() == want
+                    && o.subaccount_id == subaccount_id
                     && o.status.is_active()
             })
             .map(|o| o.id)
@@ -147,6 +150,7 @@ mod tests {
     fn sample_order(client_id: Option<&str>) -> PerpOrder {
         PerpOrder::new(
             addr("0x0000000000000000000000000000000000000aaa"),
+            1,
             "ETH-PERP".to_string(),
             PerpOrderSide::Buy,
             300_000_000_000,

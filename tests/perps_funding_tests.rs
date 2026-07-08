@@ -40,6 +40,7 @@ fn seed_long_position(
 ) -> uuid::Uuid {
     let pos = deopt_v2_backend::perps::positions::new_position_skeleton(
         account.clone(),
+        1,
         "ETH-PERP".to_string(),
         PerpSide::Long,
         size_1e8,
@@ -60,6 +61,7 @@ fn seed_short_position(
 ) -> uuid::Uuid {
     let pos = deopt_v2_backend::perps::positions::new_position_skeleton(
         account.clone(),
+        1,
         "ETH-PERP".to_string(),
         PerpSide::Short,
         size_1e8,
@@ -396,7 +398,7 @@ fn tick_skips_closed_positions() {
         let mut positions = state.perp_positions_store.lock().unwrap();
         seed_long_position(&mut positions, &alice, ONE, 300 * ONE, 300 * ONE);
         positions
-            .close_active(&alice, "ETH-PERP", now_ms())
+            .close_active(&alice, 1, "ETH-PERP", now_ms())
             .unwrap();
     }
     let indices = HashMap::from([
@@ -576,6 +578,7 @@ fn list_view_helper_surfaces_persisted_events_newest_first() {
     let ev = deopt_v2_backend::perps::PerpFundingEvent {
         id: uuid::Uuid::new_v4(),
         account: alice.clone(),
+        subaccount_id: 1,
         market_id: "ETH-PERP".to_string(),
         position_id: uuid::Uuid::new_v4(),
         side: PerpSide::Long,

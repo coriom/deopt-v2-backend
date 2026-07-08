@@ -2240,18 +2240,10 @@ async fn perps_account_positions(
     Query(query): Query<PerpsAccountReadQuery>,
 ) -> Result<Json<crate::perps::PerpPositionListResponse>, ApiError> {
     let account = crate::types::AccountId::new(address);
-    // PERPS-SUBACCOUNTS-CORE-ROUTING-V1 — honest short-circuit for
-    // non-default subaccount filters: no rows are persisted for
-    // subaccount_id > 1 until the engine routing milestone lands.
-    if let Some(sub) = query.effective_subaccount_id() {
-        if sub > 1 {
-            return Ok(Json(crate::perps::PerpPositionListResponse {
-                positions: Vec::new(),
-                chain_id: state.perps_read_config.chain_id,
-                trading_enabled: false,
-            }));
-        }
-    }
+    // PERPS-SUBACCOUNTS-ENGINE-ROUTING-V1 — real subaccount filter.
+    // `effective_subaccount_id()` returns `Some(n)` for a scoped read
+    // and `None` when `?all=true`.
+    let filter_subaccount = query.effective_subaccount_id();
     // PERPS-PG-WRITE-PATH-V1 — branch to PG when persistence is enabled.
     if let Some(repository) = state.repository.clone() {
         let rows = repository.list_perp_positions_for_account(&account).await?;
@@ -2277,8 +2269,16 @@ async fn perps_account_positions(
                 cfg, market, position, mark, stale,
             ));
         }
+        let positions = if let Some(sub) = filter_subaccount {
+            views
+                .into_iter()
+                .filter(|v| v.subaccount_id == sub)
+                .collect()
+        } else {
+            views
+        };
         return Ok(Json(crate::perps::PerpPositionListResponse {
-            positions: views,
+            positions,
             chain_id: cfg.chain_id,
             trading_enabled: false,
         }));
@@ -2289,7 +2289,7 @@ async fn perps_account_positions(
         .map_err(|_| ApiError::internal())?
         .clone();
     let price_reader = build_perp_oracle_price_reader(&state).ok();
-    let listing = match price_reader {
+    let mut listing = match price_reader {
         Some(reader) => {
             crate::perps::list_perp_positions_for_account(
                 &state.perps_read_config,
@@ -2325,6 +2325,9 @@ async fn perps_account_positions(
             }
         }
     };
+    if let Some(sub) = filter_subaccount {
+        listing.positions.retain(|v| v.subaccount_id == sub);
+    }
     Ok(Json(listing))
 }
 
@@ -2337,23 +2340,18 @@ async fn perps_account_orders(
     Query(query): Query<PerpsAccountReadQuery>,
 ) -> Result<Json<crate::perps::PerpOrderListResponse>, ApiError> {
     let account = crate::types::AccountId::new(address);
-    if let Some(sub) = query.effective_subaccount_id() {
-        if sub > 1 {
-            return Ok(Json(crate::perps::PerpOrderListResponse {
-                orders: Vec::new(),
-                chain_id: state.perps_read_config.chain_id,
-                trading_enabled: false,
-            }));
-        }
-    }
+    let filter_subaccount = query.effective_subaccount_id();
     // PERPS-PG-WRITE-PATH-V1 — branch to PG when persistence is
     // enabled, else read the in-memory ledger.
     if let Some(repository) = state.repository.clone() {
         let rows = repository.list_perp_orders_for_account(&account).await?;
-        let orders: Vec<crate::perps::PerpOrderView> = rows
+        let mut orders: Vec<crate::perps::PerpOrderView> = rows
             .iter()
             .map(crate::perps::service::build_perp_order_view)
             .collect();
+        if let Some(sub) = filter_subaccount {
+            orders.retain(|v| v.subaccount_id == sub);
+        }
         return Ok(Json(crate::perps::PerpOrderListResponse {
             orders,
             chain_id: state.perps_read_config.chain_id,
@@ -2365,11 +2363,14 @@ async fn perps_account_orders(
         .lock()
         .map_err(|_| ApiError::internal())?
         .clone();
-    let response = crate::perps::service::list_perp_orders_for_account_view(
+    let mut response = crate::perps::service::list_perp_orders_for_account_view(
         &state.perps_read_config,
         &store,
         &account,
     );
+    if let Some(sub) = filter_subaccount {
+        response.orders.retain(|v| v.subaccount_id == sub);
+    }
     Ok(Json(response))
 }
 
@@ -2379,21 +2380,19 @@ async fn perps_account_fills(
     Query(query): Query<PerpsAccountReadQuery>,
 ) -> Result<Json<crate::perps::PerpFillListResponse>, ApiError> {
     let account = crate::types::AccountId::new(address);
-    if let Some(sub) = query.effective_subaccount_id() {
-        if sub > 1 {
-            return Ok(Json(crate::perps::PerpFillListResponse {
-                fills: Vec::new(),
-                chain_id: state.perps_read_config.chain_id,
-                trading_enabled: false,
-            }));
-        }
-    }
+    let filter_subaccount = query.effective_subaccount_id();
     if let Some(repository) = state.repository.clone() {
         let rows = repository.list_perp_fills_for_account(&account).await?;
-        let fills: Vec<crate::perps::PerpFillView> = rows
+        let mut fills: Vec<crate::perps::PerpFillView> = rows
             .iter()
             .map(|f| crate::perps::service::build_perp_fill_view(f, &account))
             .collect();
+        if let Some(sub) = filter_subaccount {
+            // Fills are two-sided: keep rows where either the taker OR
+            // maker matches the requested subaccount, since the wallet
+            // may have participated as either side.
+            fills.retain(|v| v.taker_subaccount_id == sub || v.maker_subaccount_id == sub);
+        }
         return Ok(Json(crate::perps::PerpFillListResponse {
             fills,
             chain_id: state.perps_read_config.chain_id,
@@ -2405,11 +2404,16 @@ async fn perps_account_fills(
         .lock()
         .map_err(|_| ApiError::internal())?
         .clone();
-    let response = crate::perps::service::list_perp_fills_for_account_view(
+    let mut response = crate::perps::service::list_perp_fills_for_account_view(
         &state.perps_read_config,
         &store,
         &account,
     );
+    if let Some(sub) = filter_subaccount {
+        response
+            .fills
+            .retain(|v| v.taker_subaccount_id == sub || v.maker_subaccount_id == sub);
+    }
     Ok(Json(response))
 }
 
@@ -2425,23 +2429,18 @@ async fn perps_account_liquidations(
     Query(query): Query<PerpsAccountReadQuery>,
 ) -> Result<Json<crate::perps::PerpLiquidationListResponse>, ApiError> {
     let account = crate::types::AccountId::new(address);
-    if let Some(sub) = query.effective_subaccount_id() {
-        if sub > 1 {
-            return Ok(Json(crate::perps::PerpLiquidationListResponse {
-                liquidations: Vec::new(),
-                chain_id: state.perps_read_config.chain_id,
-                trading_enabled: false,
-            }));
-        }
-    }
+    let filter_subaccount = query.effective_subaccount_id();
     if let Some(repository) = state.repository.clone() {
         let events = repository
             .list_perp_liquidation_events_for_account(&account)
             .await?;
-        let liquidations: Vec<crate::perps::PerpLiquidationEventView> = events
+        let mut liquidations: Vec<crate::perps::PerpLiquidationEventView> = events
             .iter()
             .map(crate::perps::build_perp_liquidation_view)
             .collect();
+        if let Some(sub) = filter_subaccount {
+            liquidations.retain(|v| v.subaccount_id == sub);
+        }
         return Ok(Json(crate::perps::PerpLiquidationListResponse {
             liquidations,
             chain_id: state.perps_read_config.chain_id,
@@ -2453,11 +2452,14 @@ async fn perps_account_liquidations(
         .lock()
         .map_err(|_| ApiError::internal())?
         .clone();
-    let response = crate::perps::list_perp_liquidations_for_account_view(
+    let mut response = crate::perps::list_perp_liquidations_for_account_view(
         &state.perps_read_config,
         &store,
         &account,
     );
+    if let Some(sub) = filter_subaccount {
+        response.liquidations.retain(|v| v.subaccount_id == sub);
+    }
     Ok(Json(response))
 }
 
@@ -2478,23 +2480,18 @@ async fn perps_account_funding(
     Query(query): Query<PerpsAccountReadQuery>,
 ) -> Result<Json<crate::perps::PerpFundingListResponse>, ApiError> {
     let account = crate::types::AccountId::new(address);
-    if let Some(sub) = query.effective_subaccount_id() {
-        if sub > 1 {
-            return Ok(Json(crate::perps::PerpFundingListResponse {
-                funding_events: Vec::new(),
-                chain_id: state.perps_read_config.chain_id,
-                trading_enabled: false,
-            }));
-        }
-    }
+    let filter_subaccount = query.effective_subaccount_id();
     if let Some(repository) = state.repository.clone() {
         let events = repository
             .list_perp_funding_events_for_account(&account)
             .await?;
-        let funding_events: Vec<crate::perps::PerpFundingEventView> = events
+        let mut funding_events: Vec<crate::perps::PerpFundingEventView> = events
             .iter()
             .map(crate::perps::build_perp_funding_view)
             .collect();
+        if let Some(sub) = filter_subaccount {
+            funding_events.retain(|v| v.subaccount_id == sub);
+        }
         return Ok(Json(crate::perps::PerpFundingListResponse {
             funding_events,
             chain_id: state.perps_read_config.chain_id,
@@ -2506,11 +2503,14 @@ async fn perps_account_funding(
         .lock()
         .map_err(|_| ApiError::internal())?
         .clone();
-    let response = crate::perps::list_perp_funding_events_for_account_view(
+    let mut response = crate::perps::list_perp_funding_events_for_account_view(
         &state.perps_read_config,
         &store,
         &account,
     );
+    if let Some(sub) = filter_subaccount {
+        response.funding_events.retain(|v| v.subaccount_id == sub);
+    }
     Ok(Json(response))
 }
 
@@ -2735,6 +2735,18 @@ async fn perps_submit_order(
     if !state.perps_public_trading_enabled {
         return Err(BackendError::PerpsNotLive.into());
     }
+    // PERPS-SUBACCOUNTS-ENGINE-ROUTING-V1 — closed-test allowlist
+    // gate. Even when `PERPS_PUBLIC_TRADING_ENABLED=true` (a scenario
+    // only used in the enabled-flag PG proof test), non-allowlisted
+    // callers still get 503 while `PERPS_CLOSED_TEST_ENABLED=true`.
+    // When closed-test is off, this call is a no-op (returns false and
+    // the mutation is allowed to proceed if public trading is on).
+    if state.perps_closed_test_enabled {
+        let caller = crate::types::AccountId::new(req.account.clone());
+        if !state.perps_closed_test_allows(&caller) {
+            return Err(BackendError::PerpsNotLive.into());
+        }
+    }
     // V1: enabled-mode submit requires a durable PG repository. The
     // in-memory dispatcher holds `std::sync::MutexGuard`s across
     // `.await` and produces a non-`Send` future which axum cannot
@@ -2769,6 +2781,13 @@ async fn perps_submit_order(
         &state.lifecycle_events,
         crate::perps::SubmitPerpOrderInput {
             account: account.clone(),
+            // PERPS-SUBACCOUNTS-ENGINE-ROUTING-V1 — HTTP body carries an
+            // optional subaccount_id (default 1). Full v2 write-auth
+            // enforcement of `envelope.version==2` + this value lives in
+            // the follow-up milestone; the handler still returns 503 at
+            // entry when the closed-test guard is closed, so any misuse
+            // is currently unreachable.
+            subaccount_id: req.subaccount_id.unwrap_or(1),
             market_id: req.market_id,
             side,
             price_1e8,
@@ -2808,6 +2827,15 @@ async fn perps_cancel_order(
 ) -> Result<Json<PerpsCancelOrderHttpResponse>, ApiError> {
     if !state.perps_public_trading_enabled {
         return Err(BackendError::PerpsNotLive.into());
+    }
+    // PERPS-SUBACCOUNTS-ENGINE-ROUTING-V1 — closed-test allowlist gate.
+    // Non-allowlisted callers cannot cancel Perps orders while the
+    // closed-test flag is on.
+    if state.perps_closed_test_enabled {
+        let caller = crate::types::AccountId::new(query.account.clone());
+        if !state.perps_closed_test_allows(&caller) {
+            return Err(BackendError::PerpsNotLive.into());
+        }
     }
     // V1: enabled-mode cancel requires PG for the same posture as
     // submit — the enabled surface is durable-only.

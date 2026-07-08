@@ -77,6 +77,7 @@ async fn positions_endpoint_surfaces_internal_ledger_with_honest_unavailable_mar
             &market,
             PerpFillInput {
                 account: account.clone(),
+                subaccount_id: 1,
                 market_id: "ETH-PERP".to_string(),
                 side: PerpSide::Long,
                 size_1e8: 100_000_000,
@@ -137,6 +138,7 @@ async fn positions_endpoint_is_case_insensitive_on_account() {
             &market,
             PerpFillInput {
                 account,
+                subaccount_id: 1,
                 market_id: "ETH-PERP".to_string(),
                 side: PerpSide::Long,
                 size_1e8: 100_000_000,
@@ -234,6 +236,7 @@ async fn positions_endpoint_hides_rows_whose_market_is_unconfigured() {
         let mut store = state.perp_positions_store.lock().unwrap();
         let position = deopt_v2_backend::perps::positions::new_position_skeleton(
             account.clone(),
+            1,
             "SOL-PERP".to_string(), // absent from PerpsReadConfig::enabled_in_memory_for_tests()
             PerpSide::Long,
             100_000_000,

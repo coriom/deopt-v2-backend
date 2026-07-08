@@ -185,6 +185,10 @@ pub fn calculate_funding_payment_1e8(
 pub struct PerpFundingEvent {
     pub id: Uuid,
     pub account: AccountId,
+    /// PERPS-SUBACCOUNTS-ENGINE-ROUTING-V1 — subaccount of the funded
+    /// position. Legacy pre-milestone payloads default to `1`.
+    #[serde(default = "crate::perps::positions::one_subaccount_id")]
+    pub subaccount_id: u32,
     pub market_id: String,
     pub position_id: Uuid,
     pub side: PerpSide,
@@ -229,6 +233,23 @@ impl PerpFundingEventsStore {
         rows
     }
 
+    /// PERPS-SUBACCOUNTS-ENGINE-ROUTING-V1 — subaccount-scoped list.
+    pub fn list_for_account_and_subaccount(
+        &self,
+        account: &AccountId,
+        subaccount_id: u32,
+    ) -> Vec<PerpFundingEvent> {
+        let want = account.0.to_lowercase();
+        let mut rows: Vec<PerpFundingEvent> = self
+            .by_id
+            .values()
+            .filter(|e| e.account.0.to_lowercase() == want && e.subaccount_id == subaccount_id)
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| b.created_at_ms.cmp(&a.created_at_ms));
+        rows
+    }
+
     pub fn all(&self) -> Vec<PerpFundingEvent> {
         let mut rows: Vec<PerpFundingEvent> = self.by_id.values().cloned().collect();
         rows.sort_by(|a, b| b.created_at_ms.cmp(&a.created_at_ms));
@@ -244,6 +265,10 @@ impl PerpFundingEventsStore {
 pub struct PerpFundingEventView {
     pub funding_event_id: String,
     pub account: String,
+    /// PERPS-SUBACCOUNTS-ENGINE-ROUTING-V1 — subaccount metadata for
+    /// frontend filtering.
+    #[serde(default = "crate::perps::positions::one_subaccount_id")]
+    pub subaccount_id: u32,
     pub market_id: String,
     pub position_id: String,
     pub side: String,
@@ -283,6 +308,7 @@ pub fn build_perp_funding_view(event: &PerpFundingEvent) -> PerpFundingEventView
     PerpFundingEventView {
         funding_event_id: event.id.to_string(),
         account: event.account.0.clone(),
+        subaccount_id: event.subaccount_id,
         market_id: event.market_id.clone(),
         position_id: event.position_id.to_string(),
         side: event.side.as_str().to_string(),
@@ -410,18 +436,24 @@ pub fn run_perp_funding_tick(
         // Mutate the position in-place: new margin, bumped
         // last_funding_index_1e18, accumulated
         // cumulative_funding_payment_1e8, bumped version.
-        let position_after =
-            positions_store.update_active(&candidate.account, &candidate.market_id, now, |p| {
+        let position_after = positions_store.update_active(
+            &candidate.account,
+            candidate.subaccount_id,
+            &candidate.market_id,
+            now,
+            |p| {
                 p.margin_1e8 = margin_after;
                 p.last_funding_index_1e18 = index_after;
                 p.cumulative_funding_payment_1e8 =
                     p.cumulative_funding_payment_1e8.saturating_add(payment);
                 Ok(())
-            })?;
+            },
+        )?;
 
         let event = PerpFundingEvent {
             id: Uuid::new_v4(),
             account: candidate.account.clone(),
+            subaccount_id: candidate.subaccount_id,
             market_id: candidate.market_id.clone(),
             position_id: candidate.id,
             side: candidate.side,
@@ -471,6 +503,7 @@ pub fn emit_perp_funding_lifecycle(sender: &LifecycleEventSender, event: &PerpFu
         payload: LifecyclePayload::PerpFundingPaymentCreated {
             funding_event_id: event.id.to_string(),
             market_id: event.market_id.clone(),
+            subaccount_id: event.subaccount_id,
             position_id: event.position_id.to_string(),
             side: event.side.as_str().to_string(),
             position_size_1e8: event.position_size_1e8.to_string(),

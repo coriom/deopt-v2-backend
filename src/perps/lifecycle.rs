@@ -27,6 +27,7 @@ pub fn emit_perp_order_lifecycle(sender: &LifecycleEventSender, order: &PerpOrde
         payload: LifecyclePayload::PerpOrderUpdated {
             order_id: order.id.to_string(),
             market_id: order.market_id.clone(),
+            subaccount_id: order.subaccount_id,
             side: order.side.as_str().to_string(),
             status: order.status.as_str().to_string(),
             price_1e8: order.price_1e8.to_string(),
@@ -56,6 +57,8 @@ pub fn emit_perp_fill_lifecycle(sender: &LifecycleEventSender, fill: &PerpFill) 
         payload: LifecyclePayload::PerpFillCreated {
             fill_id: fill.id.to_string(),
             market_id: fill.market_id.clone(),
+            taker_subaccount_id: fill.taker_subaccount_id,
+            maker_subaccount_id: fill.maker_subaccount_id,
             order_id: fill.taker_order_id.to_string(),
             counterparty_order_id: fill.maker_order_id.to_string(),
             liquidity_role: "taker".to_string(),
@@ -74,6 +77,8 @@ pub fn emit_perp_fill_lifecycle(sender: &LifecycleEventSender, fill: &PerpFill) 
         payload: LifecyclePayload::PerpFillCreated {
             fill_id: fill.id.to_string(),
             market_id: fill.market_id.clone(),
+            taker_subaccount_id: fill.taker_subaccount_id,
+            maker_subaccount_id: fill.maker_subaccount_id,
             order_id: fill.maker_order_id.to_string(),
             counterparty_order_id: fill.taker_order_id.to_string(),
             liquidity_role: "maker".to_string(),
@@ -99,6 +104,7 @@ pub fn emit_perp_position_lifecycle(sender: &LifecycleEventSender, position: &Pe
         payload: LifecyclePayload::PerpPositionUpdated {
             position_id: position.id.to_string(),
             market_id: position.market_id.clone(),
+            subaccount_id: position.subaccount_id,
             side: position.side.as_str().to_string(),
             size_1e8: position.size_1e8.to_string(),
             entry_price_1e8: position.entry_price_1e8.to_string(),
@@ -124,19 +130,23 @@ pub fn emit_lifecycle_for_submit_outcome(
     emit_perp_order_lifecycle(sender, &outcome.order);
     for fill in &outcome.fills {
         emit_perp_fill_lifecycle(sender, fill);
-        for account in [&fill.taker_account, &fill.maker_account] {
-            if let Some(position) = positions_store.get_active(account, &fill.market_id) {
+        // PERPS-SUBACCOUNTS-ENGINE-ROUTING-V1 — each side of the fill
+        // carries its own subaccount id; look up positions with the
+        // exact (account, subaccount, market) key so cross-subaccount
+        // rows do not leak into another wallet's WS stream.
+        let sides: [(&AccountId, u32); 2] = [
+            (&fill.taker_account, fill.taker_subaccount_id),
+            (&fill.maker_account, fill.maker_subaccount_id),
+        ];
+        for (account, sub) in sides {
+            if let Some(position) = positions_store.get_active(account, sub, &fill.market_id) {
                 emit_perp_position_lifecycle(sender, &position);
-            } else {
-                // Position may have been closed by a reduce/close
-                // fill; look up the most recent row by account.
-                if let Some(closed) = positions_store
-                    .list_for_account(account)
-                    .into_iter()
-                    .find(|p| p.market_id == fill.market_id)
-                {
-                    emit_perp_position_lifecycle(sender, &closed);
-                }
+            } else if let Some(closed) = positions_store
+                .list_for_account_and_subaccount(account, sub)
+                .into_iter()
+                .find(|p| p.market_id == fill.market_id)
+            {
+                emit_perp_position_lifecycle(sender, &closed);
             }
         }
     }
@@ -149,6 +159,7 @@ pub fn emit_lifecycle_for_submit_outcome(
 pub fn emit_perp_rejection_lifecycle(
     sender: &LifecycleEventSender,
     account: &AccountId,
+    subaccount_id: u32,
     error: &BackendError,
     market_id: Option<String>,
     side: Option<PerpOrderSide>,
@@ -168,6 +179,7 @@ pub fn emit_perp_rejection_lifecycle(
         channel: LifecycleChannel::AccountPerpOrders,
         payload: LifecyclePayload::PerpOrderRejected {
             market_id,
+            subaccount_id,
             side: side.map(|s| s.as_str().to_string()),
             price_1e8: price_1e8.map(|p| p.to_string()),
             size_1e8: size_1e8.map(|s| s.to_string()),

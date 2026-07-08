@@ -196,6 +196,10 @@ fn build_price_snapshot(
 pub struct PerpPositionView {
     pub id: String,
     pub account: String,
+    /// PERPS-SUBACCOUNTS-ENGINE-ROUTING-V1 — subaccount metadata for
+    /// frontend filtering. Legacy pre-milestone payloads default to `1`.
+    #[serde(default = "crate::perps::positions::one_subaccount_id")]
+    pub subaccount_id: u32,
     pub market_id: String,
     pub side: String,
     pub size_1e8: String,
@@ -276,6 +280,7 @@ pub fn build_perp_position_view(
     PerpPositionView {
         id: position.id.to_string(),
         account: position.account.0.clone(),
+        subaccount_id: position.subaccount_id,
         market_id: position.market_id.clone(),
         side: position.side.as_str().to_string(),
         size_1e8: position.size_1e8.to_string(),
@@ -338,19 +343,20 @@ pub async fn list_perp_market_positions_for_account<P: PerpOraclePriceReader + ?
     Ok(all)
 }
 
-/// Fetch one position view by (account, market). Returns
+/// Fetch one position view by (account, subaccount, market). Returns
 /// `PerpPositionNotFound` when there is no active position for the
-/// requested pair.
+/// requested key.
 pub async fn get_perp_position_view<P: PerpOraclePriceReader + ?Sized>(
     cfg: &PerpsReadConfig,
     store: &PerpPositionsStore,
     price_reader: &P,
     account: &AccountId,
+    subaccount_id: u32,
     market_id: &str,
 ) -> Result<PerpPositionView> {
     ensure_read_enabled(cfg)?;
     let position = store
-        .get_active(account, market_id)
+        .get_active(account, subaccount_id, market_id)
         .ok_or(BackendError::PerpPositionNotFound)?;
     let (mark, stale) = fetch_mark_snapshot(cfg, price_reader, market_id).await;
     let market = cfg
@@ -371,6 +377,10 @@ pub async fn get_perp_position_view<P: PerpOraclePriceReader + ?Sized>(
 pub struct PerpOrderView {
     pub order_id: String,
     pub account: String,
+    /// PERPS-SUBACCOUNTS-ENGINE-ROUTING-V1 — subaccount metadata for
+    /// frontend filtering.
+    #[serde(default = "crate::perps::positions::one_subaccount_id")]
+    pub subaccount_id: u32,
     pub market_id: String,
     pub side: String,
     pub order_type: String,
@@ -412,6 +422,12 @@ pub struct PerpFillView {
     pub maker_order_id: String,
     pub taker_account: String,
     pub maker_account: String,
+    /// PERPS-SUBACCOUNTS-ENGINE-ROUTING-V1 — side-specific subaccount
+    /// ids for the fill.
+    #[serde(default = "crate::perps::positions::one_subaccount_id")]
+    pub taker_subaccount_id: u32,
+    #[serde(default = "crate::perps::positions::one_subaccount_id")]
+    pub maker_subaccount_id: u32,
     /// The requesting account's role in the fill.
     pub liquidity_role: String,
     /// The requesting account's effective side.
@@ -434,6 +450,7 @@ pub fn build_perp_order_view(order: &PerpOrder) -> PerpOrderView {
     PerpOrderView {
         order_id: order.id.to_string(),
         account: order.account.0.clone(),
+        subaccount_id: order.subaccount_id,
         market_id: order.market_id.clone(),
         side: order.side.as_str().to_string(),
         order_type: order.order_type.as_str().to_string(),
@@ -471,6 +488,8 @@ pub fn build_perp_fill_view(fill: &PerpFill, viewer: &AccountId) -> PerpFillView
         maker_order_id: fill.maker_order_id.to_string(),
         taker_account: fill.taker_account.0.clone(),
         maker_account: fill.maker_account.0.clone(),
+        taker_subaccount_id: fill.taker_subaccount_id,
+        maker_subaccount_id: fill.maker_subaccount_id,
         liquidity_role: liquidity_role.to_string(),
         side: viewer_side.as_str().to_string(),
         price_1e8: fill.price_1e8.to_string(),

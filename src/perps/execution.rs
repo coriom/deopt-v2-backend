@@ -42,6 +42,11 @@ use uuid::Uuid;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SubmitPerpOrderInput {
     pub account: AccountId,
+    /// PERPS-SUBACCOUNTS-ENGINE-ROUTING-V1 — the subaccount this order
+    /// belongs to. Callers of the internal engine that predate this
+    /// milestone default to `1`. Cross-subaccount reduce / cancel /
+    /// liquidation is refused at the store layer.
+    pub subaccount_id: u32,
     pub market_id: String,
     pub side: PerpOrderSide,
     pub price_1e8: u128,
@@ -99,7 +104,7 @@ pub async fn submit_perp_order_internal<P: PerpOraclePriceReader + ?Sized>(
     let position_side_after = input.side.position_side();
     let is_reduce = input.reduce_only
         || positions_store
-            .get_active(&input.account, &input.market_id)
+            .get_active(&input.account, input.subaccount_id, &input.market_id)
             .filter(|p| p.side != position_side_after)
             .is_some();
     if !is_reduce {
@@ -112,6 +117,7 @@ pub async fn submit_perp_order_internal<P: PerpOraclePriceReader + ?Sized>(
     let now = now_ms();
     let mut order = PerpOrder::new(
         input.account.clone(),
+        input.subaccount_id,
         input.market_id.clone(),
         input.side,
         input.price_1e8,
@@ -228,6 +234,7 @@ pub async fn submit_perp_order_internal<P: PerpOraclePriceReader + ?Sized>(
             market,
             PerpFillInput {
                 account: order.account.clone(),
+                subaccount_id: order.subaccount_id,
                 market_id: order.market_id.clone(),
                 side: taker_side.position_side(),
                 size_1e8: plan.size_1e8,
@@ -248,6 +255,7 @@ pub async fn submit_perp_order_internal<P: PerpOraclePriceReader + ?Sized>(
             market,
             PerpFillInput {
                 account: plan.maker_account.clone(),
+                subaccount_id: maker_after.subaccount_id,
                 market_id: order.market_id.clone(),
                 side: maker_side.position_side(),
                 size_1e8: plan.size_1e8,
@@ -267,6 +275,8 @@ pub async fn submit_perp_order_internal<P: PerpOraclePriceReader + ?Sized>(
             maker_order_id: plan.maker_order_id,
             taker_account: order.account.clone(),
             maker_account: plan.maker_account.clone(),
+            taker_subaccount_id: order.subaccount_id,
+            maker_subaccount_id: maker_after.subaccount_id,
             taker_side,
             price_1e8: plan.price_1e8,
             size_1e8: plan.size_1e8,
@@ -453,7 +463,7 @@ fn enforce_reduce_only(
 ) -> Result<()> {
     let opposite = order.side.position_side().opposite();
     let existing = positions_store
-        .get_active(&order.account, &order.market_id)
+        .get_active(&order.account, order.subaccount_id, &order.market_id)
         .ok_or(BackendError::PerpReduceOnlyViolation)?;
     if existing.side != opposite {
         return Err(BackendError::PerpReduceOnlyViolation);

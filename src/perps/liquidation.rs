@@ -79,6 +79,11 @@ pub mod liquidation_reason {
 pub struct PerpLiquidationEvent {
     pub id: Uuid,
     pub account: AccountId,
+    /// PERPS-SUBACCOUNTS-ENGINE-ROUTING-V1 — subaccount of the
+    /// liquidated position. Cross-subaccount liquidation cannot
+    /// happen: this field always matches `position.subaccount_id`.
+    #[serde(default = "crate::perps::positions::one_subaccount_id")]
+    pub subaccount_id: u32,
     pub market_id: String,
     pub position_id: Uuid,
     pub side: PerpSide,
@@ -127,6 +132,23 @@ impl PerpLiquidationsStore {
         rows
     }
 
+    /// PERPS-SUBACCOUNTS-ENGINE-ROUTING-V1 — subaccount-scoped list.
+    pub fn list_for_account_and_subaccount(
+        &self,
+        account: &AccountId,
+        subaccount_id: u32,
+    ) -> Vec<PerpLiquidationEvent> {
+        let want = account.0.to_lowercase();
+        let mut rows: Vec<PerpLiquidationEvent> = self
+            .by_id
+            .values()
+            .filter(|e| e.account.0.to_lowercase() == want && e.subaccount_id == subaccount_id)
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| b.created_at_ms.cmp(&a.created_at_ms));
+        rows
+    }
+
     pub fn all(&self) -> Vec<PerpLiquidationEvent> {
         let mut rows: Vec<PerpLiquidationEvent> = self.by_id.values().cloned().collect();
         rows.sort_by(|a, b| b.created_at_ms.cmp(&a.created_at_ms));
@@ -142,6 +164,10 @@ impl PerpLiquidationsStore {
 pub struct PerpLiquidationEventView {
     pub liquidation_id: String,
     pub account: String,
+    /// PERPS-SUBACCOUNTS-ENGINE-ROUTING-V1 — subaccount metadata for
+    /// frontend filtering.
+    #[serde(default = "crate::perps::positions::one_subaccount_id")]
+    pub subaccount_id: u32,
     pub market_id: String,
     pub position_id: String,
     pub side: String,
@@ -184,6 +210,7 @@ pub fn build_perp_liquidation_view(event: &PerpLiquidationEvent) -> PerpLiquidat
     PerpLiquidationEventView {
         liquidation_id: event.id.to_string(),
         account: event.account.0.clone(),
+        subaccount_id: event.subaccount_id,
         market_id: event.market_id.clone(),
         position_id: event.position_id.to_string(),
         side: event.side.as_str().to_string(),
@@ -265,6 +292,7 @@ pub fn liquidate_perp_position_internal(
     liquidations_store: &mut PerpLiquidationsStore,
     lifecycle_sender: &LifecycleEventSender,
     account: &AccountId,
+    subaccount_id: u32,
     market_id: &str,
     mark_price_1e8: Option<u128>,
     now: TimestampMs,
@@ -272,7 +300,7 @@ pub fn liquidate_perp_position_internal(
     let market = cfg
         .market_by_symbol(market_id)
         .ok_or_else(|| BackendError::PerpsMarketNotFound(market_id.to_string()))?;
-    let Some(position) = positions_store.get_active(account, market_id) else {
+    let Some(position) = positions_store.get_active(account, subaccount_id, market_id) else {
         return Ok(None);
     };
     let evaluation = evaluate_perp_liquidation(market, &position, mark_price_1e8);
@@ -332,10 +360,16 @@ fn apply_liquidation(
     // Bad debt: shortfall between equity and 0. Positive when the
     // trader owes more than their margin covers.
     let bad_debt: u128 = if equity < 0 { (-equity) as u128 } else { 0 };
-    let liquidated_position =
-        positions_store.liquidate_active(&position.account, &position.market_id, realized, now)?;
+    let liquidated_position = positions_store.liquidate_active(
+        &position.account,
+        position.subaccount_id,
+        &position.market_id,
+        realized,
+        now,
+    )?;
     let cancelled_orders = order_store.cancel_open_orders_for_account_market(
         &position.account,
+        position.subaccount_id,
         &position.market_id,
         order_reason::LIQUIDATED,
         order_reason::SOURCE_LIQUIDATION_TICK,
@@ -344,6 +378,7 @@ fn apply_liquidation(
     let event = PerpLiquidationEvent {
         id: Uuid::new_v4(),
         account: position.account.clone(),
+        subaccount_id: position.subaccount_id,
         market_id: position.market_id.clone(),
         position_id: position.id,
         side: position.side,
@@ -391,6 +426,7 @@ fn build_price_unavailable_event(
     PerpLiquidationEvent {
         id: Uuid::new_v4(),
         account: position.account.clone(),
+        subaccount_id: position.subaccount_id,
         market_id: position.market_id.clone(),
         position_id: position.id,
         side: position.side,
@@ -422,6 +458,7 @@ fn emit_perp_position_liquidated_lifecycle(
         payload: LifecyclePayload::PerpPositionLiquidated {
             liquidation_id: event.id.to_string(),
             market_id: event.market_id.clone(),
+            subaccount_id: event.subaccount_id,
             position_id: event.position_id.to_string(),
             side: event.side.as_str().to_string(),
             size_1e8: event.size_1e8.to_string(),
@@ -504,6 +541,7 @@ pub fn run_perp_liquidation_tick(
             liquidations_store,
             lifecycle_sender,
             &candidate.account,
+            candidate.subaccount_id,
             &candidate.market_id,
             mark,
             now,

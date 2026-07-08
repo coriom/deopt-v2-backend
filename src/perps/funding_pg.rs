@@ -141,6 +141,7 @@ async fn settle_perp_position_via_repository(
     let event = PerpFundingEvent {
         id: Uuid::new_v4(),
         account: current.account.clone(),
+        subaccount_id: current.subaccount_id,
         market_id: current.market_id.clone(),
         position_id: current.id,
         side: current.side,
