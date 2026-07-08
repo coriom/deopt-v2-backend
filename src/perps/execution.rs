@@ -108,7 +108,14 @@ pub async fn submit_perp_order_internal<P: PerpOraclePriceReader + ?Sized>(
             .filter(|p| p.side != position_side_after)
             .is_some();
     if !is_reduce {
+        // PERPS-MARGIN-ORACLE-RISK-V1 — layered pre-submit gate:
+        //   * fresh oracle mark (existing guard, unchanged);
+        //   * deviation guard between index + mark;
+        //   * per-market risk caps (order size / notional / subaccount
+        //     notional / open interest).
         ensure_mark_fresh(cfg, price_reader, market).await?;
+        ensure_mark_within_deviation(cfg, price_reader, market).await?;
+        enforce_pre_submit_risk_caps(market, positions_store, &input)?;
     }
 
     // Now insert the order (status=Open). The store dedupes by
@@ -426,6 +433,145 @@ async fn ensure_mark_fresh<P: PerpOraclePriceReader + ?Sized>(
             "mark price is stale for {}",
             market.symbol
         )));
+    }
+    Ok(())
+}
+
+/// PERPS-MARGIN-ORACLE-RISK-V1 — deviation guard between index and
+/// mark. V1 OracleRouter returns `mark == index` from `getPriceSafe`,
+/// so this call passes deterministically today. The guard is present
+/// so a future divergence (e.g. a per-market mark smoother) rejects
+/// anything above threshold rather than silently letting stale-shape
+/// prices settle risk-taking mutations.
+///
+/// Reads a single price and compares the mark against the index. In
+/// V1 they're the same field on `PerpPriceRead`, so the observed
+/// deviation is always 0 bps → pass. Kept as a first-class function
+/// so tests can freeze the shape.
+async fn ensure_mark_within_deviation<P: PerpOraclePriceReader + ?Sized>(
+    cfg: &PerpsReadConfig,
+    price_reader: &P,
+    market: &PerpsReadMarket,
+) -> Result<()> {
+    let read = price_reader
+        .read_price(market)
+        .await
+        .map_err(|err| BackendError::PerpMarkPriceUnavailable(err.to_string()))?;
+    let index = read.price_1e8;
+    let mark = read.price_1e8; // V1: mark == index at OracleRouter.
+    let observed_bps = deviation_bps(index, mark);
+    if observed_bps > cfg.oracle_max_deviation_bps {
+        return Err(BackendError::PerpOracleDeviationExceeded(format!(
+            "{}: observed {}bps > max {}bps",
+            market.symbol, observed_bps, cfg.oracle_max_deviation_bps
+        )));
+    }
+    Ok(())
+}
+
+/// Absolute deviation between two 1e8 prices, expressed in basis
+/// points relative to `index`. Returns 0 when index is 0 (no
+/// meaningful ratio; the freshness guard already caught that).
+pub fn deviation_bps(index_1e8: u128, mark_1e8: u128) -> u32 {
+    if index_1e8 == 0 {
+        return 0;
+    }
+    let diff = if mark_1e8 >= index_1e8 {
+        mark_1e8 - index_1e8
+    } else {
+        index_1e8 - mark_1e8
+    };
+    // (diff / index) in bps, saturating at u32::MAX so anything wild
+    // still reports as "way over".
+    let bps_u128 = diff
+        .saturating_mul(crate::perps::margin::BPS)
+        .checked_div(index_1e8)
+        .unwrap_or(0);
+    if bps_u128 > u32::MAX as u128 {
+        u32::MAX
+    } else {
+        bps_u128 as u32
+    }
+}
+
+/// PERPS-MARGIN-ORACLE-RISK-V1 — market-side risk caps applied to a
+/// candidate submit BEFORE the order is inserted into the book and
+/// BEFORE any margin math persists a position.
+///
+/// * Order size cap: `input.size_1e8 <= market.max_order_size_1e8`.
+/// * Order notional cap: `size * price / 1e8 <= market.max_order_notional_1e8`.
+/// * Per-subaccount notional cap: after the hypothetical fill, the
+///   sum of `size * entry` for every active position for this
+///   (wallet, subaccount) on this market must not exceed
+///   `market.max_subaccount_notional_1e8`.
+/// * Open-interest cap: after the hypothetical fill, market-wide
+///   summed open size on this market must not exceed
+///   `market.max_open_interest_1e8`.
+///
+/// Reduce-only paths skip these checks — `is_reduce` in the caller
+/// already routes reduces around this gate. Cross-subaccount netting
+/// is never assumed: caps are scoped strictly to `(account, subaccount)`.
+pub(crate) fn enforce_pre_submit_risk_caps(
+    market: &PerpsReadMarket,
+    positions_store: &crate::perps::positions::PerpPositionsStore,
+    input: &SubmitPerpOrderInput,
+) -> Result<()> {
+    // (1) order size.
+    if let Some(cap) = market.max_order_size_1e8 {
+        if input.size_1e8 > cap {
+            return Err(BackendError::PerpOrderSizeCap(format!(
+                "{}: order size {} > max {}",
+                market.symbol, input.size_1e8, cap
+            )));
+        }
+    }
+    // (2) order notional.
+    let order_notional = crate::perps::margin::notional_1e8(input.size_1e8, input.price_1e8);
+    if let Some(cap) = market.max_order_notional_1e8 {
+        if order_notional > cap {
+            return Err(BackendError::PerpOrderNotionalCap(format!(
+                "{}: order notional {} > max {}",
+                market.symbol, order_notional, cap
+            )));
+        }
+    }
+    // (3) per-subaccount notional across this market.
+    if let Some(cap) = market.max_subaccount_notional_1e8 {
+        let existing_subaccount_notional: u128 = positions_store
+            .list_for_account_and_subaccount(&input.account, input.subaccount_id)
+            .iter()
+            .filter(|p| {
+                p.status == crate::perps::positions::PerpPositionStatus::Open
+                    && p.market_id == market.symbol
+            })
+            .map(|p| crate::perps::margin::notional_1e8(p.size_1e8, p.entry_price_1e8))
+            .sum();
+        let after = existing_subaccount_notional.saturating_add(order_notional);
+        if after > cap {
+            return Err(BackendError::PerpSubaccountNotionalCap(format!(
+                "{}: post-fill subaccount notional {} > max {}",
+                market.symbol, after, cap
+            )));
+        }
+    }
+    // (4) market-wide open interest.
+    if let Some(cap) = market.max_open_interest_1e8 {
+        let current_oi: u128 = positions_store
+            .by_id_values_iter()
+            .iter()
+            .filter(|p| {
+                p.status == crate::perps::positions::PerpPositionStatus::Open
+                    && p.market_id == market.symbol
+            })
+            .map(|p| p.size_1e8)
+            .sum();
+        let after = current_oi.saturating_add(input.size_1e8);
+        if after > cap {
+            return Err(BackendError::PerpOpenInterestCap(format!(
+                "{}: post-fill open interest {} > max {}",
+                market.symbol, after, cap
+            )));
+        }
     }
     Ok(())
 }

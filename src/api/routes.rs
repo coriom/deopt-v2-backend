@@ -13682,9 +13682,19 @@ impl From<BackendError> for ApiError {
             | BackendError::PerpPositionFlip
             | BackendError::PerpReduceExceedsPosition
             | BackendError::PerpInsufficientMargin(_)
-            | BackendError::PerpLeverageExceeded { .. } => StatusCode::UNPROCESSABLE_ENTITY,
+            | BackendError::PerpLeverageExceeded { .. }
+            // PERPS-MARGIN-ORACLE-RISK-V1 — cap rejects and deviation
+            // rejects both map to 422 (unprocessable): the request was
+            // well-formed but the server refused to fill.
+            | BackendError::PerpOrderSizeCap(_)
+            | BackendError::PerpOrderNotionalCap(_)
+            | BackendError::PerpSubaccountNotionalCap(_)
+            | BackendError::PerpOpenInterestCap(_) => StatusCode::UNPROCESSABLE_ENTITY,
             BackendError::PerpPositionNotFound => StatusCode::NOT_FOUND,
             BackendError::PerpMarkPriceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+            // Deviation-exceeded fails the same way stale-oracle does:
+            // the market is temporarily unsafe → 503.
+            BackendError::PerpOracleDeviationExceeded(_) => StatusCode::SERVICE_UNAVAILABLE,
             // PERPS-ORDER-EXECUTION-INTERNAL-V1
             BackendError::PerpOrderNotFound(_) => StatusCode::NOT_FOUND,
             BackendError::PerpInvalidOrderState(_)

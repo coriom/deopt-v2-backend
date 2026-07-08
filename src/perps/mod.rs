@@ -75,7 +75,8 @@ pub use orders::{
     PerpOrderType, PerpTimeInForce,
 };
 
-pub use config::PerpsReadConfig;
+pub use config::{PerpsMarketRiskStatus, PerpsReadConfig, PerpsReadMarket};
+pub use execution::deviation_bps;
 pub use fills::{apply_perp_fill_for_account, PerpFillInput, PerpFillOutcome};
 pub use market_reader::{PerpMarketRegistryReader, PerpMarketRegistryRpcReader};
 pub use positions::{PerpPosition, PerpPositionStatus, PerpPositionsStore, PerpSide};

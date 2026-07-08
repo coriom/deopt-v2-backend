@@ -701,6 +701,28 @@ impl AppConfig {
                         "PERPS_ETH_MAINTENANCE_MARGIN_BPS",
                         "500",
                     )?,
+                    // PERPS-MARGIN-ORACLE-RISK-V1 — per-market risk
+                    // caps. Defaults match the closed-test scope doc.
+                    max_order_size_1e8: Some(parse_env::<u128>(
+                        &mut lookup,
+                        "PERPS_ETH_MAX_ORDER_SIZE_1E8",
+                        "1000000000",
+                    )?),
+                    max_order_notional_1e8: Some(parse_env::<u128>(
+                        &mut lookup,
+                        "PERPS_ETH_MAX_ORDER_NOTIONAL_1E8",
+                        "10000000000000",
+                    )?),
+                    max_subaccount_notional_1e8: Some(parse_env::<u128>(
+                        &mut lookup,
+                        "PERPS_ETH_MAX_SUBACCOUNT_NOTIONAL_1E8",
+                        "50000000000000",
+                    )?),
+                    max_open_interest_1e8: Some(parse_env::<u128>(
+                        &mut lookup,
+                        "PERPS_ETH_MAX_OPEN_INTEREST_1E8",
+                        "5000000000",
+                    )?),
                 });
             }
             if let (Some(base), Some(quote)) = (
@@ -720,8 +742,33 @@ impl AppConfig {
                         "PERPS_BTC_MAINTENANCE_MARGIN_BPS",
                         "750",
                     )?,
+                    max_order_size_1e8: Some(parse_env::<u128>(
+                        &mut lookup,
+                        "PERPS_BTC_MAX_ORDER_SIZE_1E8",
+                        "100000000",
+                    )?),
+                    max_order_notional_1e8: Some(parse_env::<u128>(
+                        &mut lookup,
+                        "PERPS_BTC_MAX_ORDER_NOTIONAL_1E8",
+                        "10000000000000",
+                    )?),
+                    max_subaccount_notional_1e8: Some(parse_env::<u128>(
+                        &mut lookup,
+                        "PERPS_BTC_MAX_SUBACCOUNT_NOTIONAL_1E8",
+                        "50000000000000",
+                    )?),
+                    max_open_interest_1e8: Some(parse_env::<u128>(
+                        &mut lookup,
+                        "PERPS_BTC_MAX_OPEN_INTEREST_1E8",
+                        "500000000",
+                    )?),
                 });
             }
+            // PERPS-MARGIN-ORACLE-RISK-V1 — deviation guard threshold.
+            // Default 500 bps (5%). Validated by
+            // `PerpsReadConfig::validate_startup`.
+            let oracle_max_deviation_bps: u32 =
+                parse_env(&mut lookup, "PERPS_ORACLE_MAX_DEVIATION_BPS", "500")?;
             let cfg = crate::perps::PerpsReadConfig {
                 enabled,
                 chain_id: perps_chain_id,
@@ -730,6 +777,7 @@ impl AppConfig {
                 oracle_router_address,
                 markets,
                 stale_after_sec,
+                oracle_max_deviation_bps,
             };
             cfg.validate_startup()?;
             cfg

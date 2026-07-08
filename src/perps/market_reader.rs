@@ -159,6 +159,10 @@ mod tests {
             quote_asset_address: AccountId::new("0x0000000000000000000000000000000000000002"),
             max_leverage: 10,
             maintenance_margin_bps: 500,
+            max_order_size_1e8: None,
+            max_order_notional_1e8: None,
+            max_subaccount_notional_1e8: None,
+            max_open_interest_1e8: None,
         }
     }
 

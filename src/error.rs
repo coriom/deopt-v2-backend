@@ -209,6 +209,21 @@ pub enum BackendError {
     PerpDuplicateClientOrderId(String),
     #[error("perp self-trade rejected")]
     PerpSelfTrade,
+    // PERPS-MARGIN-ORACLE-RISK-V1 — reject reasons for the pre-submit
+    // risk gate. Distinct from the existing insufficient-margin /
+    // leverage-exceeded errors so operators / clients can distinguish
+    // "trader would exceed a market-wide cap" from "trader's own
+    // margin math is off".
+    #[error("perp order size exceeds market cap: {0}")]
+    PerpOrderSizeCap(String),
+    #[error("perp order notional exceeds market cap: {0}")]
+    PerpOrderNotionalCap(String),
+    #[error("perp subaccount notional exceeds market cap: {0}")]
+    PerpSubaccountNotionalCap(String),
+    #[error("perp market open interest would exceed cap: {0}")]
+    PerpOpenInterestCap(String),
+    #[error("perp market oracle deviation exceeds threshold: {0}")]
+    PerpOracleDeviationExceeded(String),
     // SUBACCOUNTS-CORE-BACKEND-V1
     #[error("subaccount not found")]
     SubaccountNotFound,

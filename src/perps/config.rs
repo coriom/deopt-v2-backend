@@ -17,6 +17,22 @@ const DEFAULT_STALE_AFTER_SEC: u64 = 60;
 const DEFAULT_ETH_ONCHAIN_MARKET_ID: u64 = 1;
 const DEFAULT_BTC_ONCHAIN_MARKET_ID: u64 = 2;
 
+// PERPS-MARGIN-ORACLE-RISK-V1 defaults.
+//
+// Deviation: OracleRouter guarantees `mark == index` in V1, but we
+// thread the guard through the same pre-submit gate as the freshness
+// check so a future divergence flips from "pass deterministically" to
+// "reject at threshold". Threshold defaults to 500 bps (5 %).
+const DEFAULT_MAX_DEVIATION_BPS: u32 = 500;
+// Sane bounds for the deviation config — anything outside these is a
+// startup-refusal because it either lets clearly unsafe prices through
+// or is so tight it can never pass. `10_000` bps == 100 %.
+const MAX_ALLOWED_DEVIATION_BPS: u32 = 5_000;
+// Same reasoning for staleness — anything under 1s risks flapping,
+// anything over an hour has no legitimate trading use case in V1.
+const MIN_STALE_AFTER_SEC: u64 = 1;
+const MAX_STALE_AFTER_SEC: u64 = 3_600;
+
 /// One row of the read-only market catalogue. The (base, quote)
 /// addresses tell `OracleRouter.getPriceSafe(base, quote)` which feed
 /// to query; the human symbol is what the frontend renders.
@@ -51,6 +67,21 @@ pub struct PerpsReadMarket {
     /// / 10_000`, the position is eligible for liquidation in a
     /// later milestone.
     pub maintenance_margin_bps: u32,
+    /// PERPS-MARGIN-ORACLE-RISK-V1 — per-market risk caps. Every cap
+    /// is `None` for the disabled config and populated on the closed-
+    /// test config. Reads default to `u128::MAX` behaviour (no cap)
+    /// when `None`, matching the pre-milestone posture.
+    ///
+    /// Max order size (base units, `1e8` scaled). E.g. 10 ETH → `10 * 1e8 = 1_000_000_000`.
+    pub max_order_size_1e8: Option<u128>,
+    /// Max order notional (quote units, `1e8` scaled). E.g. $100k → `100_000 * 1e8 = 10_000_000_000_000`.
+    pub max_order_notional_1e8: Option<u128>,
+    /// Max aggregate open notional per (wallet, subaccount) on this
+    /// market. Cross-subaccount notional is not netted.
+    pub max_subaccount_notional_1e8: Option<u128>,
+    /// Max market-wide open interest, in base units (`1e8`). Sums the
+    /// size of every active position across every wallet + subaccount.
+    pub max_open_interest_1e8: Option<u128>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -76,6 +107,14 @@ pub struct PerpsReadConfig {
     /// on the wire but is still returned. Default 60s (matches the
     /// mock-feed `maxDelay` seen in the base-sepolia deployment).
     pub stale_after_sec: u64,
+    /// PERPS-MARGIN-ORACLE-RISK-V1 — max absolute deviation, in bps,
+    /// between the trusted `index` price and the mark used for
+    /// execution. V1 uses `mark == index` from OracleRouter, so the
+    /// guard passes deterministically today; the field is validated at
+    /// startup so a future divergence path (e.g. a per-market mark
+    /// smoother) rejects anything above threshold rather than silently
+    /// letting stale-shape prices settle risk-taking mutations.
+    pub oracle_max_deviation_bps: u32,
 }
 
 impl PerpsReadConfig {
@@ -90,6 +129,7 @@ impl PerpsReadConfig {
             oracle_router_address: None,
             markets: Vec::new(),
             stale_after_sec: DEFAULT_STALE_AFTER_SEC,
+            oracle_max_deviation_bps: DEFAULT_MAX_DEVIATION_BPS,
         }
     }
 
@@ -122,6 +162,12 @@ impl PerpsReadConfig {
                     ),
                     max_leverage: 10,
                     maintenance_margin_bps: 500,
+                    // PERPS-MARGIN-ORACLE-RISK-V1 — closed-test caps
+                    // for ETH-PERP per the scope doc.
+                    max_order_size_1e8: Some(10 * 100_000_000),
+                    max_order_notional_1e8: Some(100_000 * 100_000_000),
+                    max_subaccount_notional_1e8: Some(500_000 * 100_000_000),
+                    max_open_interest_1e8: Some(50 * 100_000_000),
                 },
                 PerpsReadMarket {
                     symbol: "BTC-PERP".to_string(),
@@ -136,9 +182,15 @@ impl PerpsReadConfig {
                     ),
                     max_leverage: 5,
                     maintenance_margin_bps: 750,
+                    // BTC-PERP stays deferred in V1; caps set defensively.
+                    max_order_size_1e8: Some(100_000_000),
+                    max_order_notional_1e8: Some(100_000 * 100_000_000),
+                    max_subaccount_notional_1e8: Some(500_000 * 100_000_000),
+                    max_open_interest_1e8: Some(5 * 100_000_000),
                 },
             ],
             stale_after_sec: DEFAULT_STALE_AFTER_SEC,
+            oracle_max_deviation_bps: DEFAULT_MAX_DEVIATION_BPS,
         }
     }
 
@@ -147,6 +199,26 @@ impl PerpsReadConfig {
     /// downstream (e.g. mainnet chain id, RPC missing while enabled,
     /// registry address missing while enabled).
     pub fn validate_startup(&self) -> crate::error::Result<()> {
+        // PERPS-MARGIN-ORACLE-RISK-V1 — bounds checks apply even in
+        // the disabled config so a dangerous knob (e.g. 0 stale) is
+        // rejected regardless of whether the reader is turned on.
+        if self.oracle_max_deviation_bps == 0
+            || self.oracle_max_deviation_bps > MAX_ALLOWED_DEVIATION_BPS
+        {
+            return Err(crate::error::BackendError::Config(format!(
+                "PERPS_ORACLE_MAX_DEVIATION_BPS must be in (0, {MAX_ALLOWED_DEVIATION_BPS}], \
+                 got {}",
+                self.oracle_max_deviation_bps
+            )));
+        }
+        if self.stale_after_sec < MIN_STALE_AFTER_SEC || self.stale_after_sec > MAX_STALE_AFTER_SEC
+        {
+            return Err(crate::error::BackendError::Config(format!(
+                "PERPS_ORACLE_STALE_AFTER_SEC must be in [{MIN_STALE_AFTER_SEC}, \
+                 {MAX_STALE_AFTER_SEC}], got {}",
+                self.stale_after_sec
+            )));
+        }
         if !self.enabled {
             return Ok(());
         }
@@ -181,12 +253,107 @@ impl PerpsReadConfig {
                     .to_string(),
             ));
         }
+        for market in &self.markets {
+            market.validate_startup()?;
+        }
         Ok(())
     }
 
     /// Look up one seeded market row by human symbol.
     pub fn market_by_symbol(&self, symbol: &str) -> Option<&PerpsReadMarket> {
         self.markets.iter().find(|m| m.symbol == symbol)
+    }
+}
+
+impl PerpsReadMarket {
+    /// PERPS-MARGIN-ORACLE-RISK-V1 — per-market cross-consistency
+    /// checks. Called during `PerpsReadConfig::validate_startup`.
+    pub fn validate_startup(&self) -> crate::error::Result<()> {
+        if self.max_leverage == 0 {
+            return Err(crate::error::BackendError::Config(format!(
+                "perps market {}: max_leverage must be > 0",
+                self.symbol
+            )));
+        }
+        if self.maintenance_margin_bps == 0
+            || self.maintenance_margin_bps >= crate::perps::margin::BPS as u32
+        {
+            return Err(crate::error::BackendError::Config(format!(
+                "perps market {}: maintenance_margin_bps must be in (0, {}), got {}",
+                self.symbol,
+                crate::perps::margin::BPS,
+                self.maintenance_margin_bps
+            )));
+        }
+        // Cross-consistency: maintenance margin must be strictly less
+        // than initial margin. Otherwise every fresh open is instantly
+        // liquidatable, which is a footgun. Initial margin bps at
+        // `max_leverage`x is `10_000 / max_leverage`.
+        let initial_bps = crate::perps::margin::BPS / (self.max_leverage as u128);
+        if (self.maintenance_margin_bps as u128) >= initial_bps {
+            return Err(crate::error::BackendError::Config(format!(
+                "perps market {}: maintenance_margin_bps {} must be < initial-margin-at-max-leverage bps {} (max_leverage {})",
+                self.symbol, self.maintenance_margin_bps, initial_bps, self.max_leverage
+            )));
+        }
+        for (name, cap) in [
+            ("max_order_size_1e8", self.max_order_size_1e8),
+            ("max_order_notional_1e8", self.max_order_notional_1e8),
+            (
+                "max_subaccount_notional_1e8",
+                self.max_subaccount_notional_1e8,
+            ),
+            ("max_open_interest_1e8", self.max_open_interest_1e8),
+        ] {
+            if let Some(0) = cap {
+                return Err(crate::error::BackendError::Config(format!(
+                    "perps market {}: {} must be > 0 (or None to disable)",
+                    self.symbol, name
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// PERPS-MARGIN-ORACLE-RISK-V1 — market safety status. Composed at
+/// read time from `(config, current price snapshot)`. Never persisted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PerpsMarketRiskStatus {
+    /// Fresh oracle within deviation threshold; new orders allowed.
+    Active,
+    /// Oracle mark is stale beyond `stale_after_sec` or unavailable;
+    /// new risk-increasing orders reject.
+    StaleOracle { reason: &'static str },
+    /// Absolute deviation between `index` and `mark` exceeded the
+    /// configured `oracle_max_deviation_bps`; new orders reject.
+    DeviationExceeded {
+        observed_bps: u32,
+        threshold_bps: u32,
+    },
+    /// Reserved — operator-driven pause. Currently only reachable via
+    /// tests / the internal admin surface (not yet an env-driven knob
+    /// in V1). New orders reject; reduce-only cancel remains allowed.
+    Paused,
+}
+
+impl PerpsMarketRiskStatus {
+    /// True when new risk-increasing orders may proceed. Reduce-only
+    /// callers ignore this flag; the fill applicator computes its own
+    /// reduce-vs-increase view at commit time.
+    pub fn allows_new_risk(&self) -> bool {
+        matches!(self, PerpsMarketRiskStatus::Active)
+    }
+
+    /// Structured reason string for API/WS surfaces. Stable — pinned
+    /// by `perps_margin_oracle_risk_v1_tests.rs`.
+    pub fn reason_code(&self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::StaleOracle { .. } => "stale_oracle",
+            Self::DeviationExceeded { .. } => "deviation_exceeded",
+            Self::Paused => "paused",
+        }
     }
 }
 
