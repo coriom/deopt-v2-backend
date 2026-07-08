@@ -5195,6 +5195,46 @@ impl crate::auth::WriteAuthChallengeStore for PgRepository {
     }
 }
 
+// ===================================================================
+// SUBACCOUNTS-V2-NONCE-TABLE-V1 — used_nonces_v2
+// ===================================================================
+
+#[async_trait::async_trait]
+impl crate::auth::UsedNonceV2Store for PgRepository {
+    async fn consume_v2_nonce(
+        &self,
+        account: &AccountId,
+        subaccount_id: u32,
+        action: crate::auth::WriteAuthAction,
+        nonce_bytes: [u8; 32],
+        request_digest: [u8; 32],
+        now_ms: TimestampMs,
+    ) -> std::result::Result<crate::auth::V2NonceClaimOutcome, crate::auth::WriteAuthError> {
+        use crate::auth::V2NonceClaimOutcome;
+        let subaccount_id_i32 =
+            i32::try_from(subaccount_id).map_err(|_| crate::auth::WriteAuthError::Persistence)?;
+        let result = sqlx::query(
+            "INSERT INTO used_nonces_v2 (
+                account, subaccount_id, action, nonce_bytes,
+                request_digest, used_at_ms
+             ) VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(account.0.to_lowercase())
+        .bind(subaccount_id_i32)
+        .bind(action.as_str())
+        .bind(nonce_bytes.as_slice())
+        .bind(request_digest.as_slice())
+        .bind(now_ms)
+        .execute(&self.pool)
+        .await;
+        match result {
+            Ok(_) => Ok(V2NonceClaimOutcome::Fresh),
+            Err(err) if is_unique_violation(&err) => Ok(V2NonceClaimOutcome::Duplicate),
+            Err(_) => Err(crate::auth::WriteAuthError::Persistence),
+        }
+    }
+}
+
 impl ExecutionIntentRepository for PgRepository {
     fn list_pending_execution_intents(
         &self,

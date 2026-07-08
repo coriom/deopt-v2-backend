@@ -500,6 +500,40 @@ pub trait WriteAuthChallengeStore: Send + Sync {
     ) -> std::result::Result<(), WriteAuthError>;
 }
 
+/// SUBACCOUNTS-V2-NONCE-TABLE-V1 — outcome of a v2 nonce claim.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum V2NonceClaimOutcome {
+    /// First time this `(account, subaccount_id, action, nonce)` was
+    /// seen — row was inserted.
+    Fresh,
+    /// Row already exists — the caller MUST reject with
+    /// `NonceAlreadyUsed`. `used_nonces_v2` is append-only; this
+    /// outcome is emitted whether or not the stored `request_digest`
+    /// matches, because a v2 replay always crosses the challenge store
+    /// first and only reaches `consume_v2_nonce` on a fresh claim.
+    Duplicate,
+}
+
+/// SUBACCOUNTS-V2-NONCE-TABLE-V1 — persistent v2-scoped nonce
+/// consumption ledger. Independent of `WriteAuthChallengeStore`
+/// (v1 nonce claim + idempotency). Only invoked when
+/// `AuthorizationEnvelope.version == Some(2)`.
+#[async_trait]
+pub trait UsedNonceV2Store: Send + Sync {
+    /// Atomically inserts one row into `used_nonces_v2`. Duplicate PK
+    /// (case-insensitive `account`, `subaccount_id`, `action`,
+    /// `nonce_bytes`) yields `Duplicate`.
+    async fn consume_v2_nonce(
+        &self,
+        account: &AccountId,
+        subaccount_id: u32,
+        action: WriteAuthAction,
+        nonce_bytes: [u8; 32],
+        request_digest: [u8; 32],
+        now_ms: TimestampMs,
+    ) -> std::result::Result<V2NonceClaimOutcome, WriteAuthError>;
+}
+
 /// Verify an `AuthorizationEnvelope` against the canonical payload and
 /// atomically claim its nonce.
 ///
@@ -782,6 +816,45 @@ pub mod memory_store {
                 record.resource_id = Some(resource_id.to_string());
             }
             Ok(())
+        }
+    }
+
+    /// SUBACCOUNTS-V2-NONCE-TABLE-V1 — test/in-memory backend for
+    /// `UsedNonceV2Store`. Uses a HashSet keyed by the same tuple as
+    /// the PG unique index so dev/test behaviour matches production.
+    #[derive(Default)]
+    pub struct InMemoryUsedNonceV2Store {
+        inner: Mutex<std::collections::HashSet<(String, u32, WriteAuthAction, [u8; 32])>>,
+    }
+
+    impl InMemoryUsedNonceV2Store {
+        pub fn new() -> Self {
+            Self::default()
+        }
+    }
+
+    #[async_trait]
+    impl UsedNonceV2Store for InMemoryUsedNonceV2Store {
+        async fn consume_v2_nonce(
+            &self,
+            account: &AccountId,
+            subaccount_id: u32,
+            action: WriteAuthAction,
+            nonce_bytes: [u8; 32],
+            _request_digest: [u8; 32],
+            _now_ms: TimestampMs,
+        ) -> std::result::Result<V2NonceClaimOutcome, WriteAuthError> {
+            let mut guard = self
+                .inner
+                .lock()
+                .expect("InMemoryUsedNonceV2Store poisoned");
+            let key = (account.0.to_lowercase(), subaccount_id, action, nonce_bytes);
+            if guard.contains(&key) {
+                Ok(V2NonceClaimOutcome::Duplicate)
+            } else {
+                guard.insert(key);
+                Ok(V2NonceClaimOutcome::Fresh)
+            }
         }
     }
 }

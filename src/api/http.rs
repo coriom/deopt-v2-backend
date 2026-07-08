@@ -1,7 +1,9 @@
 use crate::admin::{AdminConfig, MetricsConfig};
 use crate::api::public_ws::{LifecycleEventSender, PublicWsConfig};
-use crate::auth::write_authorization::memory_store::InMemoryChallengeStore;
-use crate::auth::WriteAuthChallengeStore;
+use crate::auth::write_authorization::memory_store::{
+    InMemoryChallengeStore, InMemoryUsedNonceV2Store,
+};
+use crate::auth::{UsedNonceV2Store, WriteAuthChallengeStore};
 use crate::confirmation::ConfirmationConfig;
 use crate::db::PgRepository;
 use crate::engine::EngineState;
@@ -91,6 +93,14 @@ pub struct AppState {
     /// in-memory store is used (suitable for unit tests only — NOT a
     /// production-safe replay-protection surface).
     pub write_auth_challenges: Arc<dyn WriteAuthChallengeStore + Send + Sync>,
+    /// SUBACCOUNTS-V2-NONCE-TABLE-V1 — persistent (or in-memory
+    /// fallback) v2 nonce consumption ledger. Keyed by
+    /// `(lower(account), subaccount_id, action, nonce_bytes)`. Only
+    /// consulted when a request supplies `AuthorizationEnvelope.version
+    /// = Some(2)`; v1 requests never touch this store. Backed by
+    /// `PgRepository` when persistence is on, `InMemoryUsedNonceV2Store`
+    /// otherwise (tests only).
+    pub used_nonces_v2: Arc<dyn UsedNonceV2Store + Send + Sync>,
     /// ORDER-LIFECYCLE-OBSERVABILITY-V1 — process-wide broadcast sink
     /// for `LifecycleEvent`s. Mutation services emit AFTER successful
     /// DB commit; per-session WS listeners filter and forward events
@@ -288,6 +298,10 @@ impl AppState {
                 Some(repo) => Arc::new(repo.clone()),
                 None => Arc::new(InMemoryChallengeStore::new()),
             };
+        let used_nonces_v2: Arc<dyn UsedNonceV2Store + Send + Sync> = match repository.as_ref() {
+            Some(repo) => Arc::new(repo.clone()),
+            None => Arc::new(InMemoryUsedNonceV2Store::new()),
+        };
         let subaccounts: Arc<dyn SubaccountStore + Send + Sync> = match repository.as_ref() {
             Some(repo) => Arc::new(repo.clone()),
             None => Arc::new(InMemorySubaccountStore::new()),
@@ -336,6 +350,7 @@ impl AppState {
             ),
             local_test_intents: crate::api::local_test_fixtures::shared_store(),
             write_auth_challenges,
+            used_nonces_v2,
             lifecycle_events: LifecycleEventSender::default(),
             perps_read_config: crate::perps::PerpsReadConfig::disabled(),
             perp_positions_store: std::sync::Arc::new(std::sync::Mutex::new(
@@ -421,6 +436,7 @@ impl AppState {
         state.persistence_enabled = true;
         state.database_configured = true;
         state.write_auth_challenges = Arc::new(repository.clone());
+        state.used_nonces_v2 = Arc::new(repository.clone());
         state.subaccounts = Arc::new(repository.clone());
         state.repository = Some(repository);
         state

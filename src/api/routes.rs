@@ -3623,10 +3623,11 @@ async fn submit_option_order(
         ),
         _ => canonical_option_order_submit(&request),
     };
-    let verified = require_write_auth(
+    let verified = require_write_auth_v2_aware(
         &state,
         WriteAuthAction::OptionOrderSubmit,
         &request.account,
+        resolved_subaccount_id,
         &canonical,
         &request.authorization,
     )
@@ -3840,10 +3841,11 @@ async fn create_conditional_order_route(
         Some(2) => canonical_conditional_order_create_v2(&account, resolved_subaccount_id, &body),
         _ => canonical_conditional_order_create(&account, &body),
     };
-    let _verified = require_write_auth(
+    let _verified = require_write_auth_v2_aware(
         &state,
         WriteAuthAction::ConditionalOrderCreate,
         &account,
+        resolved_subaccount_id,
         &canonical,
         &body.authorization,
     )
@@ -4074,10 +4076,11 @@ async fn cancel_conditional_order_route(
         Some(2) => canonical_conditional_order_cancel_v2(&account, resolved_subaccount_id, &id),
         _ => canonical_conditional_order_cancel(&account, &id),
     };
-    let _verified = require_write_auth(
+    let _verified = require_write_auth_v2_aware(
         &state,
         WriteAuthAction::ConditionalOrderCancel,
         &account,
+        resolved_subaccount_id,
         &canonical,
         &body.authorization,
     )
@@ -4207,10 +4210,11 @@ async fn cancel_option_order(
         }
         _ => canonical_option_order_cancel(&order.account, &order_id),
     };
-    let _verified = require_write_auth(
+    let _verified = require_write_auth_v2_aware(
         &state,
         WriteAuthAction::OptionOrderCancel,
         &order.account,
+        resolved_subaccount_id,
         &canonical,
         &body.authorization,
     )
@@ -4472,10 +4476,11 @@ async fn create_option_rfq(
         Some(2) => canonical_option_rfq_create_v2(&request, resolved_subaccount_id),
         _ => canonical_option_rfq_create(&request),
     };
-    let _verified = require_write_auth(
+    let _verified = require_write_auth_v2_aware(
         &state,
         WriteAuthAction::OptionRfqCreate,
         &request.taker,
+        resolved_subaccount_id,
         &canonical,
         &request.authorization,
     )
@@ -4593,10 +4598,11 @@ async fn submit_option_rfq_quote(
         }
         _ => canonical_option_rfq_quote_submit(&option_rfq_id, &request),
     };
-    let _verified = require_write_auth(
+    let _verified = require_write_auth_v2_aware(
         &state,
         WriteAuthAction::OptionRfqQuoteSubmit,
         &request.mm_account,
+        resolved_subaccount_id,
         &canonical,
         &request.authorization,
     )
@@ -4821,10 +4827,11 @@ async fn create_option_twap_order(
         Some(2) => canonical_option_twap_create_v2(&request, resolved_subaccount_id),
         _ => canonical_option_twap_create(&request),
     };
-    let _verified = require_write_auth(
+    let _verified = require_write_auth_v2_aware(
         &state,
         WriteAuthAction::OptionTwapCreate,
         &request.account,
+        resolved_subaccount_id,
         &canonical,
         &request.authorization,
     )
@@ -4907,10 +4914,11 @@ async fn cancel_option_twap_order(
         }
         _ => canonical_option_twap_cancel(&twap.account, &option_twap_id),
     };
-    let _verified = require_write_auth(
+    let _verified = require_write_auth_v2_aware(
         &state,
         WriteAuthAction::OptionTwapCancel,
         &twap.account,
+        resolved_subaccount_id,
         &canonical,
         &body.authorization,
     )
@@ -4974,10 +4982,11 @@ async fn accept_option_rfq_quote(
         ),
         _ => canonical_option_rfq_accept(&rfq.taker, &option_rfq_id, &quote_id),
     };
-    let _verified = require_write_auth(
+    let _verified = require_write_auth_v2_aware(
         &state,
         WriteAuthAction::OptionRfqAccept,
         &rfq.taker,
+        resolved_subaccount_id,
         &canonical,
         &body.authorization,
     )
@@ -5023,10 +5032,11 @@ async fn cancel_option_rfq(
         }
         _ => canonical_option_rfq_cancel(&rfq.taker, &option_rfq_id),
     };
-    let _verified = require_write_auth(
+    let _verified = require_write_auth_v2_aware(
         &state,
         WriteAuthAction::OptionRfqCancel,
         &rfq.taker,
+        resolved_subaccount_id,
         &canonical,
         &body.authorization,
     )
@@ -12211,6 +12221,82 @@ async fn require_write_auth(
     )
     .await;
     authorize_or_log(expected_action, expected_account, result)
+}
+
+/// SUBACCOUNTS-V2-NONCE-TABLE-V1 — subaccount-aware write-auth wrapper
+/// used by every Options and RFQ v2 handler that has flipped from
+/// foundation posture. Runs the v1 verification path via
+/// `require_write_auth` (which claims the row in
+/// `write_auth_challenges`) and then, only when the envelope declares
+/// `version == Some(2)` AND the claim was a fresh consumption (not an
+/// idempotent replay of an already-consumed nonce), atomically inserts
+/// into `used_nonces_v2` keyed by `(lower(account), subaccount_id,
+/// action, nonce_bytes)`. A duplicate PK from that insert maps to
+/// `WriteAuthError::NonceAlreadyUsed` — defence-in-depth against any
+/// caller that reaches this point with a nonce that was somehow
+/// consumed under the same v2 tuple before.
+///
+/// v1 envelopes (`version = None | Some(1)`) short-circuit past the
+/// v2 store entirely, preserving byte-for-byte compatibility with the
+/// pre-milestone behaviour and leaving the existing v1 nonce tests
+/// unaffected.
+async fn require_write_auth_v2_aware(
+    state: &AppState,
+    expected_action: WriteAuthAction,
+    expected_account: &AccountId,
+    subaccount_id: u32,
+    canonical_payload: &[u8],
+    envelope: &AuthorizationEnvelope,
+) -> Result<crate::auth::WriteAuthVerified, ApiError> {
+    let verified = require_write_auth(
+        state,
+        expected_action,
+        expected_account,
+        canonical_payload,
+        envelope,
+    )
+    .await?;
+    if envelope.version == Some(2) && verified.was_fresh {
+        // Recompute the same digest the challenge store bound the
+        // request to. Feeding the exact same inputs guarantees the
+        // `used_nonces_v2.request_digest` column matches the v1
+        // audit column for the same envelope. If digest computation
+        // fails here it means the envelope shape drifted between the
+        // two calls, which should be impossible on the success path.
+        let request_digest = match crate::auth::write_auth_eip712_digest(
+            expected_action,
+            expected_account,
+            canonical_payload,
+            &verified.nonce_bytes,
+            envelope.deadline_ms,
+            envelope.idempotency_key.as_deref(),
+        ) {
+            Ok(d) => crate::signing::eip712::keccak256(&d),
+            Err(_) => {
+                return Err(ApiError::from(BackendError::WriteAuth(
+                    crate::auth::WriteAuthError::InvalidSignature,
+                )));
+            }
+        };
+        let outcome = state
+            .used_nonces_v2
+            .consume_v2_nonce(
+                expected_account,
+                subaccount_id,
+                expected_action,
+                verified.nonce_bytes,
+                request_digest,
+                now_ms(),
+            )
+            .await
+            .map_err(|err| ApiError::from(BackendError::WriteAuth(err)))?;
+        if matches!(outcome, crate::auth::V2NonceClaimOutcome::Duplicate) {
+            return Err(ApiError::from(BackendError::WriteAuth(
+                crate::auth::WriteAuthError::NonceAlreadyUsed,
+            )));
+        }
+    }
+    Ok(verified)
 }
 
 /// SUBACCOUNTS-OPTIONS-ROUTING-V2 — shared runtime resolver for every

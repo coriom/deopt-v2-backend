@@ -16,7 +16,7 @@ pub mod write_authorization;
 
 pub use write_authorization::{
     canonical_payload_bytes, write_auth_domain, write_auth_eip712_digest, AuthorizationEnvelope,
-    CanonicalValue, ChallengeRecord, ChallengeStatus, WriteAuthAction, WriteAuthChallengeStore,
-    WriteAuthError, WriteAuthVerified, ENVIRONMENT, WRITE_AUTH_DOMAIN_SALT,
-    WRITE_AUTH_DOMAIN_VERSION, WRITE_AUTH_PRIMARY_TYPE,
+    CanonicalValue, ChallengeRecord, ChallengeStatus, UsedNonceV2Store, V2NonceClaimOutcome,
+    WriteAuthAction, WriteAuthChallengeStore, WriteAuthError, WriteAuthVerified, ENVIRONMENT,
+    WRITE_AUTH_DOMAIN_SALT, WRITE_AUTH_DOMAIN_VERSION, WRITE_AUTH_PRIMARY_TYPE,
 };
