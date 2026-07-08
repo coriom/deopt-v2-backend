@@ -2237,8 +2237,21 @@ async fn perps_market_price(
 async fn perps_account_positions(
     State(state): State<AppState>,
     Path(address): Path<String>,
+    Query(query): Query<PerpsAccountReadQuery>,
 ) -> Result<Json<crate::perps::PerpPositionListResponse>, ApiError> {
     let account = crate::types::AccountId::new(address);
+    // PERPS-SUBACCOUNTS-CORE-ROUTING-V1 — honest short-circuit for
+    // non-default subaccount filters: no rows are persisted for
+    // subaccount_id > 1 until the engine routing milestone lands.
+    if let Some(sub) = query.effective_subaccount_id() {
+        if sub > 1 {
+            return Ok(Json(crate::perps::PerpPositionListResponse {
+                positions: Vec::new(),
+                chain_id: state.perps_read_config.chain_id,
+                trading_enabled: false,
+            }));
+        }
+    }
     // PERPS-PG-WRITE-PATH-V1 — branch to PG when persistence is enabled.
     if let Some(repository) = state.repository.clone() {
         let rows = repository.list_perp_positions_for_account(&account).await?;
@@ -2321,8 +2334,18 @@ async fn perps_account_positions(
 async fn perps_account_orders(
     State(state): State<AppState>,
     Path(address): Path<String>,
+    Query(query): Query<PerpsAccountReadQuery>,
 ) -> Result<Json<crate::perps::PerpOrderListResponse>, ApiError> {
     let account = crate::types::AccountId::new(address);
+    if let Some(sub) = query.effective_subaccount_id() {
+        if sub > 1 {
+            return Ok(Json(crate::perps::PerpOrderListResponse {
+                orders: Vec::new(),
+                chain_id: state.perps_read_config.chain_id,
+                trading_enabled: false,
+            }));
+        }
+    }
     // PERPS-PG-WRITE-PATH-V1 — branch to PG when persistence is
     // enabled, else read the in-memory ledger.
     if let Some(repository) = state.repository.clone() {
@@ -2353,8 +2376,18 @@ async fn perps_account_orders(
 async fn perps_account_fills(
     State(state): State<AppState>,
     Path(address): Path<String>,
+    Query(query): Query<PerpsAccountReadQuery>,
 ) -> Result<Json<crate::perps::PerpFillListResponse>, ApiError> {
     let account = crate::types::AccountId::new(address);
+    if let Some(sub) = query.effective_subaccount_id() {
+        if sub > 1 {
+            return Ok(Json(crate::perps::PerpFillListResponse {
+                fills: Vec::new(),
+                chain_id: state.perps_read_config.chain_id,
+                trading_enabled: false,
+            }));
+        }
+    }
     if let Some(repository) = state.repository.clone() {
         let rows = repository.list_perp_fills_for_account(&account).await?;
         let fills: Vec<crate::perps::PerpFillView> = rows
@@ -2389,8 +2422,18 @@ async fn perps_account_fills(
 async fn perps_account_liquidations(
     State(state): State<AppState>,
     Path(address): Path<String>,
+    Query(query): Query<PerpsAccountReadQuery>,
 ) -> Result<Json<crate::perps::PerpLiquidationListResponse>, ApiError> {
     let account = crate::types::AccountId::new(address);
+    if let Some(sub) = query.effective_subaccount_id() {
+        if sub > 1 {
+            return Ok(Json(crate::perps::PerpLiquidationListResponse {
+                liquidations: Vec::new(),
+                chain_id: state.perps_read_config.chain_id,
+                trading_enabled: false,
+            }));
+        }
+    }
     if let Some(repository) = state.repository.clone() {
         let events = repository
             .list_perp_liquidation_events_for_account(&account)
@@ -2432,8 +2475,18 @@ async fn perps_account_liquidations(
 async fn perps_account_funding(
     State(state): State<AppState>,
     Path(address): Path<String>,
+    Query(query): Query<PerpsAccountReadQuery>,
 ) -> Result<Json<crate::perps::PerpFundingListResponse>, ApiError> {
     let account = crate::types::AccountId::new(address);
+    if let Some(sub) = query.effective_subaccount_id() {
+        if sub > 1 {
+            return Ok(Json(crate::perps::PerpFundingListResponse {
+                funding_events: Vec::new(),
+                chain_id: state.perps_read_config.chain_id,
+                trading_enabled: false,
+            }));
+        }
+    }
     if let Some(repository) = state.repository.clone() {
         let events = repository
             .list_perp_funding_events_for_account(&account)
@@ -2600,6 +2653,48 @@ struct PerpsSubmitOrderHttpRequest {
     isolated_margin_1e8: String,
     #[serde(default)]
     client_order_id: Option<String>,
+    // PERPS-SUBACCOUNTS-CORE-ROUTING-V1 — optional subaccount id.
+    // Defaults to 1 (Account 1) when omitted for v1 wire compat. v2
+    // callers MUST supply this and it must match the value embedded
+    // in the v2 canonical payload. Enforcement lands with the engine
+    // rippling in `PERPS-SUBACCOUNTS-ENGINE-ROUTING-V1`; today the
+    // handler still returns 503 `PerpsNotLive` at entry unless both
+    // `perps_public_trading_enabled` and the closed-test gate open.
+    #[serde(default)]
+    subaccount_id: Option<u32>,
+}
+
+// PERPS-SUBACCOUNTS-CORE-ROUTING-V1 — read-endpoint query params.
+// Both fields are optional. `subaccount_id` defaults to `1` when
+// omitted (Account 1). `all=true` overrides the filter and returns
+// every wallet-level row across every subaccount.
+//
+// V1 posture (this milestone): only `subaccount_id=1` (or `all=true`)
+// yields rows. Higher subaccount ids return an empty list because no
+// non-default-subaccount data is persisted until the engine routing
+// milestone extends the position/order/fill/funding/liquidation
+// stores. This is honest, not fake — `?subaccount_id=2` will populate
+// once `PERPS-SUBACCOUNTS-ENGINE-ROUTING-V1` lands.
+#[derive(Clone, Debug, Default, Deserialize)]
+struct PerpsAccountReadQuery {
+    #[serde(default)]
+    subaccount_id: Option<u32>,
+    #[serde(default)]
+    all: Option<bool>,
+}
+
+impl PerpsAccountReadQuery {
+    /// Returns `Some(effective_subaccount_id)` when the caller wants
+    /// filtered rows, or `None` when they explicitly asked for the
+    /// aggregate view (`all=true`). Default (both `None`) resolves to
+    /// `Some(1)`.
+    fn effective_subaccount_id(&self) -> Option<u32> {
+        if self.all.unwrap_or(false) {
+            None
+        } else {
+            Some(self.subaccount_id.unwrap_or(1))
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -12800,6 +12895,67 @@ pub(crate) fn canonical_option_order_cancel_v2(
 ) -> Vec<u8> {
     crate::auth::write_authorization::canonical_payload_bytes(
         WriteAuthAction::OptionOrderCancel,
+        &[
+            ("account", CanonicalValue::Address(account.clone())),
+            ("subaccount_id", CanonicalValue::U64(subaccount_id as u64)),
+            ("order_id", CanonicalValue::Str(order_id.to_string())),
+        ],
+    )
+}
+
+// PERPS-SUBACCOUNTS-CORE-ROUTING-V1 — v2 canonical payloads for Perps
+// submit and cancel actions. There is no v1 counterpart because Perps
+// public trading has never shipped; the closed-test flip introduces
+// the wire directly at v2. Byte-freeze coverage lives in
+// `tests/perps_subaccounts_core_routing_v1_tests.rs`.
+#[allow(dead_code)]
+pub(crate) fn canonical_perp_order_submit_v2(
+    account: &AccountId,
+    subaccount_id: u32,
+    market_id: &str,
+    side_str: &str,
+    price_1e8: &str,
+    size_1e8: &str,
+    tif_str: &str,
+    post_only: bool,
+    reduce_only: bool,
+    isolated_margin_1e8: &str,
+    client_order_id: Option<&str>,
+) -> Vec<u8> {
+    crate::auth::write_authorization::canonical_payload_bytes(
+        WriteAuthAction::PerpOrderSubmit,
+        &[
+            ("account", CanonicalValue::Address(account.clone())),
+            ("subaccount_id", CanonicalValue::U64(subaccount_id as u64)),
+            ("market_id", CanonicalValue::Str(market_id.to_string())),
+            ("side", CanonicalValue::Str(side_str.to_string())),
+            ("price_1e8", CanonicalValue::Str(price_1e8.to_string())),
+            ("size_1e8", CanonicalValue::Str(size_1e8.to_string())),
+            ("time_in_force", CanonicalValue::Str(tif_str.to_string())),
+            ("post_only", CanonicalValue::Bool(post_only)),
+            ("reduce_only", CanonicalValue::Bool(reduce_only)),
+            (
+                "isolated_margin_1e8",
+                CanonicalValue::Str(isolated_margin_1e8.to_string()),
+            ),
+            (
+                "client_order_id",
+                client_order_id
+                    .map(|v| CanonicalValue::Str(v.to_string()))
+                    .unwrap_or(CanonicalValue::Null),
+            ),
+        ],
+    )
+}
+
+#[allow(dead_code)]
+pub(crate) fn canonical_perp_order_cancel_v2(
+    account: &AccountId,
+    subaccount_id: u32,
+    order_id: &str,
+) -> Vec<u8> {
+    crate::auth::write_authorization::canonical_payload_bytes(
+        WriteAuthAction::PerpOrderCancel,
         &[
             ("account", CanonicalValue::Address(account.clone())),
             ("subaccount_id", CanonicalValue::U64(subaccount_id as u64)),

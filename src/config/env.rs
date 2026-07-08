@@ -66,6 +66,20 @@ pub struct AppConfig {
     /// chain id is refused at startup by `validate_startup`.
     /// Env: `PERPS_PUBLIC_TRADING_ENABLED=true` (default `false`).
     pub perps_public_trading_enabled: bool,
+    /// PERPS-SUBACCOUNTS-CORE-ROUTING-V1 — closed-test opt-in flag. When
+    /// `true`, allowlisted wallets can reach the Perps mutation surface
+    /// (still 503 for everyone else). When `false`, every mutation
+    /// returns 503 regardless of `perps_public_trading_enabled`.
+    /// Refused on mainnet chain ids at startup, mirroring the public
+    /// trading flag. Env: `PERPS_CLOSED_TEST_ENABLED` (default `false`).
+    pub perps_closed_test_enabled: bool,
+    /// PERPS-SUBACCOUNTS-CORE-ROUTING-V1 — comma-separated allowlist
+    /// of wallet addresses that may reach Perps mutations while
+    /// `perps_closed_test_enabled` is true. Addresses are lower-cased
+    /// on parse. Empty list means "no wallets allowed" — a closed test
+    /// with no allowlist is honest but useless. Env:
+    /// `PERPS_CLOSED_TEST_ALLOWLIST` (default empty).
+    pub perps_closed_test_allowlist: Vec<AccountId>,
 }
 
 impl AppConfig {
@@ -732,6 +746,28 @@ impl AppConfig {
             )));
         }
 
+        // PERPS-SUBACCOUNTS-CORE-ROUTING-V1 — closed-test opt-in flag +
+        // allowlist. Both default off / empty. Refused on mainnet chain
+        // ids at startup, same as the public trading flag.
+        let perps_closed_test_enabled: bool =
+            parse_env(&mut lookup, "PERPS_CLOSED_TEST_ENABLED", "false")?;
+        if perps_closed_test_enabled && (chain_id == 1 || chain_id == 8453) {
+            return Err(BackendError::Config(format!(
+                "PERPS_CLOSED_TEST_ENABLED=true is refused on mainnet chain id {chain_id}"
+            )));
+        }
+        let perps_closed_test_allowlist: Vec<AccountId> = lookup("PERPS_CLOSED_TEST_ALLOWLIST")
+            .filter(|value| !value.is_empty())
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(|entry| entry.trim().to_lowercase())
+                    .filter(|entry| !entry.is_empty())
+                    .map(AccountId::new)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
         Ok(Self {
             host,
             port,
@@ -762,6 +798,8 @@ impl AppConfig {
             trading_views,
             perps_read,
             perps_public_trading_enabled,
+            perps_closed_test_enabled,
+            perps_closed_test_allowlist,
         })
     }
 

@@ -70,6 +70,17 @@ pub enum WriteAuthAction {
     /// subaccount. Canonical payload embeds `account`, `subaccount_id`,
     /// and the new `name`.
     SubaccountRename,
+    /// PERPS-SUBACCOUNTS-CORE-ROUTING-V1 — Perps order submit. The
+    /// canonical v2 payload embeds `subaccount_id` immediately after
+    /// `account`. There is no v1 canonical builder because Perps
+    /// public trading has never shipped a v1 wire; every Perps write
+    /// is v2-only at introduction. The public trading gate remains
+    /// closed by default — this action is only reachable when
+    /// `PERPS_CLOSED_TEST_ENABLED=true` and the caller wallet is on
+    /// the closed-test allowlist.
+    PerpOrderSubmit,
+    /// PERPS-SUBACCOUNTS-CORE-ROUTING-V1 — Perps order cancel.
+    PerpOrderCancel,
 }
 
 impl WriteAuthAction {
@@ -90,6 +101,8 @@ impl WriteAuthAction {
             Self::OptionTwapCancel => "OPTION_TWAP_CANCEL",
             Self::SubaccountCreate => "SUBACCOUNT_CREATE",
             Self::SubaccountRename => "SUBACCOUNT_RENAME",
+            Self::PerpOrderSubmit => "PERP_ORDER_SUBMIT",
+            Self::PerpOrderCancel => "PERP_ORDER_CANCEL",
         }
     }
 
@@ -110,6 +123,8 @@ impl WriteAuthAction {
             "OPTION_TWAP_CANCEL" => Self::OptionTwapCancel,
             "SUBACCOUNT_CREATE" => Self::SubaccountCreate,
             "SUBACCOUNT_RENAME" => Self::SubaccountRename,
+            "PERP_ORDER_SUBMIT" => Self::PerpOrderSubmit,
+            "PERP_ORDER_CANCEL" => Self::PerpOrderCancel,
             _ => return None,
         })
     }

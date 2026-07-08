@@ -21,6 +21,7 @@ use crate::reconciliation::ReconciliationConfig;
 use crate::rfq::{RfqConfig, RfqStore};
 use crate::signing::{Eip712Domain, NonceStore, SignatureVerificationMode};
 use crate::subaccounts::{InMemorySubaccountStore, SubaccountStore};
+use crate::types::AccountId;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
@@ -152,6 +153,18 @@ pub struct AppState {
     /// Enabling this on a mainnet chain id is refused at startup by
     /// `validate_startup`. Env: `PERPS_PUBLIC_TRADING_ENABLED=true`.
     pub perps_public_trading_enabled: bool,
+    /// PERPS-SUBACCOUNTS-CORE-ROUTING-V1 — closed-test opt-in flag.
+    /// Independent of `perps_public_trading_enabled`. When true AND
+    /// the caller is on `perps_closed_test_allowlist`, Perps mutation
+    /// handlers may proceed; otherwise every handler still returns
+    /// 503 `PerpsNotLive`. Refused on mainnet at startup. Default
+    /// `false`. Env: `PERPS_CLOSED_TEST_ENABLED`.
+    pub perps_closed_test_enabled: bool,
+    /// PERPS-SUBACCOUNTS-CORE-ROUTING-V1 — allowlisted wallet
+    /// addresses (lower-cased). Empty by default. Consumed by the
+    /// closed-test guard on Perps mutations. Env:
+    /// `PERPS_CLOSED_TEST_ALLOWLIST` (comma-separated hex).
+    pub perps_closed_test_allowlist: Vec<AccountId>,
     /// SUBACCOUNTS-CORE-BACKEND-V1 — real Derive-like subaccount
     /// identity store. When `repository` is `Some`, the PgRepository
     /// is wired here so rows survive restarts. Otherwise an in-memory
@@ -366,6 +379,11 @@ impl AppState {
                 crate::perps::PerpFundingEventsStore::new(),
             )),
             perps_public_trading_enabled: false,
+            // PERPS-SUBACCOUNTS-CORE-ROUTING-V1 — default off; empty
+            // allowlist. Constructed AppStates start with Perps
+            // mutation surface fail-closed for every wallet.
+            perps_closed_test_enabled: false,
+            perps_closed_test_allowlist: Vec::new(),
             subaccounts,
         }
     }
@@ -463,5 +481,26 @@ impl AppState {
             fees_config,
             84532,
         )
+    }
+
+    /// PERPS-SUBACCOUNTS-CORE-ROUTING-V1 — the layered closed-test
+    /// gate. Returns `true` when the caller wallet may reach the Perps
+    /// mutation surface under the current config. Callers still must
+    /// invoke this AFTER the fail-closed public trading gate — this
+    /// helper does not open a bypass around `perps_public_trading_enabled`.
+    ///
+    /// Semantics:
+    /// * `perps_closed_test_enabled == false` → always `false`.
+    /// * Allowlist empty → always `false` (an honest closed test with
+    ///   no allowlisted wallets is a well-defined "nobody in").
+    /// * Address match is case-insensitive.
+    pub fn perps_closed_test_allows(&self, caller: &AccountId) -> bool {
+        if !self.perps_closed_test_enabled {
+            return false;
+        }
+        let want = caller.0.to_lowercase();
+        self.perps_closed_test_allowlist
+            .iter()
+            .any(|allowed| allowed.0.to_lowercase() == want)
     }
 }

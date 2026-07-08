@@ -99,6 +99,11 @@ async fn main() -> deopt_v2_backend::Result<()> {
     // PERPS-FRONTEND-TICKET-ENABLEMENT-V1 — propagate the strict
     // opt-in flag from env to `AppState`. Default remains false.
     state.perps_public_trading_enabled = config.perps_public_trading_enabled;
+    // PERPS-SUBACCOUNTS-CORE-ROUTING-V1 — propagate closed-test flag
+    // + allowlist. Independent of the public trading flag; both
+    // remain fail-closed by default.
+    state.perps_closed_test_enabled = config.perps_closed_test_enabled;
+    state.perps_closed_test_allowlist = config.perps_closed_test_allowlist.clone();
     // OPTIONS-CONDITIONAL-ORDERS-PERSISTENT-E2E-V1 — read worker env
     // vars. Defaults are safe (enabled=false) so this is a no-op for
     // any operator who has not opted in.
