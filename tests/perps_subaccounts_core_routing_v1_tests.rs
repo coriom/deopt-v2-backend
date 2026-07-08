@@ -259,12 +259,14 @@ fn perps_closed_test_denies_when_flag_off_even_if_wallet_on_list() {
 // ---------------------------------------------------------------------
 
 #[tokio::test]
-async fn perps_submit_returns_503_when_closed_test_on_but_public_trading_off() {
+async fn perps_submit_returns_503_when_closed_test_on_and_non_allowlisted() {
+    // PERPS-V2-WRITE-AUTH-ENFORCEMENT-V1 — under the new gate,
+    // closed-test mode opens the path for ALLOWLISTED callers
+    // (progressing to auth verification). Non-allowlisted callers
+    // still see 503. This assertion pins the non-allowlisted branch.
     let mut state = build_perps_state();
-    // Closed-test flag on with an allowlisted wallet — but the public
-    // trading flag stays false. The mutation handler MUST still return
-    // 503 because the fail-closed layer 1 is `perps_public_trading_enabled`.
     state.perps_closed_test_enabled = true;
+    // Allowlist contains only `0xaa`; the caller below is `0xbb`.
     state.perps_closed_test_allowlist = vec![AccountId::new(
         "0x00000000000000000000000000000000000000aa".to_string(),
     )];
@@ -272,7 +274,7 @@ async fn perps_submit_returns_503_when_closed_test_on_but_public_trading_off() {
 
     let body = serde_json::json!({
         "market_id": "ETH-PERP",
-        "account": "0x00000000000000000000000000000000000000aa",
+        "account": "0x00000000000000000000000000000000000000bb",
         "side": "buy",
         "price_1e8": "300000000000",
         "size_1e8": "100000000",

@@ -338,13 +338,15 @@ async fn public_perps_cancel_still_503_after_engine_ripple() {
 // =====================================================================
 
 #[tokio::test]
-async fn public_perps_submit_still_503_when_closed_test_on_but_public_trading_off() {
+async fn public_perps_submit_still_503_when_closed_test_on_and_non_allowlisted() {
+    // PERPS-V2-WRITE-AUTH-ENFORCEMENT-V1 — closed-test mode opens the
+    // path for allowlisted callers (progressing to auth verification);
+    // non-allowlisted callers still see 503. This asserts the
+    // non-allowlisted branch under the new gate.
     let mut state = state();
     state.perps_closed_test_enabled = true;
+    // Allowlist contains only `0xaa`; the caller below is `0xbb`.
     state.perps_closed_test_allowlist = vec![addr("0x00000000000000000000000000000000000000aa")];
-    // Public trading flag stays off — the fail-closed layer 1 fires
-    // BEFORE the closed-test guard even executes. This is the
-    // documented "belt + braces" posture.
     let app = router(state);
     let request = Request::builder()
         .method("POST")
@@ -353,7 +355,7 @@ async fn public_perps_submit_still_503_when_closed_test_on_but_public_trading_of
         .body(Body::from(
             serde_json::json!({
                 "market_id": "ETH-PERP",
-                "account": "0x00000000000000000000000000000000000000aa",
+                "account": "0x00000000000000000000000000000000000000bb",
                 "side": "buy",
                 "price_1e8": "300000000000",
                 "size_1e8": "100000000",

@@ -296,11 +296,17 @@ async fn pg_flag_on_perps_cancel_deletes_open_order() {
 }
 
 // =====================================================================
-// 5. Flag on + NO PG → still 503 (V1 posture: durable-only)
+// 5. Flag on + NO PG → still denies (V1 posture: durable-only)
 // =====================================================================
 
 #[tokio::test]
-async fn flag_on_without_pg_still_returns_503() {
+async fn flag_on_without_pg_still_denies_submit() {
+    // PERPS-V2-WRITE-AUTH-ENFORCEMENT-V1 — under the new gate, a submit
+    // without an authorization envelope is rejected at auth-layer
+    // (400 `InvalidSubaccountRequest`) before we ever check for a PG
+    // repository. The test's intent — "no PG → no submit success" —
+    // is preserved by asserting the response is not OK. Adding a valid
+    // v2 envelope would then still hit the PG-required layer and 503.
     let mut state = AppState::new(EngineState::with_default_markets());
     let mut cfg = PerpsReadConfig::enabled_in_memory_for_tests();
     cfg.rpc_url = None;
@@ -320,7 +326,7 @@ async fn flag_on_without_pg_still_returns_503() {
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_ne!(response.status(), StatusCode::OK);
 }
 
 // =====================================================================

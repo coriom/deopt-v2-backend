@@ -2638,7 +2638,7 @@ async fn admin_perps_liquidations_tick(
 // as `isolated_margin_1e8`.
 // =====================================================================
 
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct PerpsSubmitOrderHttpRequest {
     market_id: String,
     account: String,
@@ -2653,15 +2653,28 @@ struct PerpsSubmitOrderHttpRequest {
     isolated_margin_1e8: String,
     #[serde(default)]
     client_order_id: Option<String>,
-    // PERPS-SUBACCOUNTS-CORE-ROUTING-V1 — optional subaccount id.
-    // Defaults to 1 (Account 1) when omitted for v1 wire compat. v2
-    // callers MUST supply this and it must match the value embedded
-    // in the v2 canonical payload. Enforcement lands with the engine
-    // rippling in `PERPS-SUBACCOUNTS-ENGINE-ROUTING-V1`; today the
-    // handler still returns 503 `PerpsNotLive` at entry unless both
-    // `perps_public_trading_enabled` and the closed-test gate open.
+    // PERPS-SUBACCOUNTS-CORE-ROUTING-V1 — subaccount the order runs
+    // under. Optional at the wire so the default fail-closed path (both
+    // Perps flags off) can 503 without needing the field. Required and
+    // must match `authorization` canonical bytes under closed-test /
+    // public-trading paths (see `PERPS-V2-WRITE-AUTH-ENFORCEMENT-V1`).
     #[serde(default)]
     subaccount_id: Option<u32>,
+    /// PERPS-V2-WRITE-AUTH-ENFORCEMENT-V1 — v2 authorization envelope.
+    ///
+    /// * Default fail-closed path (both `PERPS_PUBLIC_TRADING_ENABLED`
+    ///   and `PERPS_CLOSED_TEST_ENABLED` off): field is ignored; the
+    ///   handler returns 503 `PerpsNotLive` at entry.
+    /// * Closed-test path (public off + closed-test on + allowlisted):
+    ///   REQUIRED. Envelope MUST be `version=2` and its EIP-712 digest
+    ///   MUST reconstruct byte-identically from the body fields.
+    ///   Missing/invalid envelope → 400.
+    /// * Public-trading path (public on): REQUIRED. Same v2 posture as
+    ///   closed-test — Perps never shipped a v1 wire, so all live paths
+    ///   are uniformly v2. This is a stricter policy than Options which
+    ///   supports both v1 and v2.
+    #[serde(default)]
+    authorization: Option<AuthorizationEnvelope>,
 }
 
 // PERPS-SUBACCOUNTS-CORE-ROUTING-V1 — read-endpoint query params.
@@ -2719,6 +2732,21 @@ struct PerpsCancelOrderQuery {
     account: String,
 }
 
+/// PERPS-V2-WRITE-AUTH-ENFORCEMENT-V1 — body for `DELETE /perps/orders/:id`.
+///
+/// * Default fail-closed path: body may be empty. Handler 503s at entry.
+/// * Closed-test / public-trading path: body MUST supply `authorization`
+///   (v2 envelope) + `subaccount_id`. Canonical bytes rebuilt from the
+///   order's own `account` + `subaccount_id` + `order_id` must digest-
+///   match the envelope's signed payload.
+#[derive(Clone, Debug, Default, Deserialize)]
+struct PerpsCancelOrderBody {
+    #[serde(default)]
+    authorization: Option<AuthorizationEnvelope>,
+    #[serde(default)]
+    subaccount_id: Option<u32>,
+}
+
 fn parse_u128_field(field: &str, raw: &str) -> Result<u128, ApiError> {
     raw.parse::<u128>().map_err(|_| {
         ApiError::from(BackendError::Config(format!(
@@ -2731,27 +2759,70 @@ async fn perps_submit_order(
     State(state): State<AppState>,
     Json(req): Json<PerpsSubmitOrderHttpRequest>,
 ) -> Result<Json<PerpsSubmitOrderHttpResponse>, ApiError> {
-    // Fail-closed default. NEVER auto-flipped.
-    if !state.perps_public_trading_enabled {
+    // PERPS-V2-WRITE-AUTH-ENFORCEMENT-V1 — layered gate.
+    //
+    // Layer 1 — default fail-closed. Both Perps flags off → 503
+    // immediately. This preserves the default posture even when the
+    // request body is malformed / missing / envelope-less; the handler
+    // never touches the envelope on the default path.
+    if !state.perps_public_trading_enabled && !state.perps_closed_test_enabled {
         return Err(BackendError::PerpsNotLive.into());
     }
-    // PERPS-SUBACCOUNTS-ENGINE-ROUTING-V1 — closed-test allowlist
-    // gate. Even when `PERPS_PUBLIC_TRADING_ENABLED=true` (a scenario
-    // only used in the enabled-flag PG proof test), non-allowlisted
-    // callers still get 503 while `PERPS_CLOSED_TEST_ENABLED=true`.
-    // When closed-test is off, this call is a no-op (returns false and
-    // the mutation is allowed to proceed if public trading is on).
-    if state.perps_closed_test_enabled {
-        let caller = crate::types::AccountId::new(req.account.clone());
-        if !state.perps_closed_test_allows(&caller) {
-            return Err(BackendError::PerpsNotLive.into());
-        }
+    // Layer 2 — closed-test allowlist. When closed-test is on, only
+    // allowlisted wallets pass; runs regardless of the public trading
+    // flag so an operator running a closed test still restricts to the
+    // allowlist even if public trading was flipped in the same env.
+    let caller = crate::types::AccountId::new(req.account.clone());
+    if state.perps_closed_test_enabled && !state.perps_closed_test_allows(&caller) {
+        return Err(BackendError::PerpsNotLive.into());
     }
-    // V1: enabled-mode submit requires a durable PG repository. The
+    // Layer 3 — v2 authorization envelope required. Perps never
+    // shipped a v1 wire; the closed-test flip introduces submit at v2
+    // directly. Missing envelope → 400. This runs BEFORE the PG-required
+    // check so an invalid-auth submit against an in-memory-only backend
+    // fails at auth (400) rather than silently 503'ing.
+    let authorization = req.authorization.as_ref().ok_or_else(|| {
+        ApiError::from(BackendError::InvalidSubaccountRequest(
+            "perps submit requires a v2 authorization envelope".to_string(),
+        ))
+    })?;
+    // Layer 4 — resolve + validate subaccount. Strict v2: envelope
+    // MUST declare `version=2`; body MUST carry `subaccount_id`;
+    // subaccount MUST exist on the caller wallet.
+    let resolved_subaccount_id =
+        resolve_perps_v2_subaccount(&state, authorization, req.subaccount_id, &caller).await?;
+    // Layer 5 — reconstruct canonical bytes exactly. Byte-frozen by
+    // `canonical_perp_order_submit_v2`.
+    let canonical = canonical_perp_order_submit_v2(
+        &caller,
+        resolved_subaccount_id,
+        &req.market_id,
+        &req.side,
+        &req.price_1e8,
+        &req.size_1e8,
+        &req.time_in_force,
+        req.post_only,
+        req.reduce_only,
+        &req.isolated_margin_1e8,
+        req.client_order_id.as_deref(),
+    );
+    // Layer 6 — verify signature + challenge + consume v2 nonce.
+    // Duplicate nonce → `NonceAlreadyUsed`. Payload mismatch → 401.
+    // Failed auth returns BEFORE any persistence.
+    let _verified = require_write_auth_v2_aware(
+        &state,
+        WriteAuthAction::PerpOrderSubmit,
+        &caller,
+        resolved_subaccount_id,
+        &canonical,
+        authorization,
+    )
+    .await?;
+    // Layer 7 — PG-required. Enabled-path submit is durable-only; the
     // in-memory dispatcher holds `std::sync::MutexGuard`s across
     // `.await` and produces a non-`Send` future which axum cannot
-    // accept as a handler. Callers with only in-memory state should
-    // continue to use the internal execution unit tests.
+    // accept as a handler. In-memory setups exercise the engine via
+    // internal unit tests.
     let Some(repository) = state.repository.clone() else {
         return Err(BackendError::PerpsNotLive.into());
     };
@@ -2771,7 +2842,7 @@ async fn perps_submit_order(
     let size_1e8 = parse_u128_field("size_1e8", &req.size_1e8)?;
     let isolated_margin_1e8 = parse_u128_field("isolated_margin_1e8", &req.isolated_margin_1e8)?;
 
-    let account = crate::types::AccountId::new(req.account);
+    let account = caller;
 
     let reader = build_perp_oracle_price_reader(&state)?;
     let outcome = crate::perps::submit_perp_order_via_repository(
@@ -2781,13 +2852,7 @@ async fn perps_submit_order(
         &state.lifecycle_events,
         crate::perps::SubmitPerpOrderInput {
             account: account.clone(),
-            // PERPS-SUBACCOUNTS-ENGINE-ROUTING-V1 — HTTP body carries an
-            // optional subaccount_id (default 1). Full v2 write-auth
-            // enforcement of `envelope.version==2` + this value lives in
-            // the follow-up milestone; the handler still returns 503 at
-            // entry when the closed-test guard is closed, so any misuse
-            // is currently unreachable.
-            subaccount_id: req.subaccount_id.unwrap_or(1),
+            subaccount_id: resolved_subaccount_id,
             market_id: req.market_id,
             side,
             price_1e8,
@@ -2824,27 +2889,80 @@ async fn perps_cancel_order(
     State(state): State<AppState>,
     Path(order_id): Path<String>,
     axum::extract::Query(query): axum::extract::Query<PerpsCancelOrderQuery>,
+    body: axum::body::Bytes,
 ) -> Result<Json<PerpsCancelOrderHttpResponse>, ApiError> {
-    if !state.perps_public_trading_enabled {
+    // PERPS-V2-WRITE-AUTH-ENFORCEMENT-V1 — same layered gate as submit.
+    //
+    // Layer 1 — default fail-closed. Both flags off → 503, body not read.
+    if !state.perps_public_trading_enabled && !state.perps_closed_test_enabled {
         return Err(BackendError::PerpsNotLive.into());
     }
-    // PERPS-SUBACCOUNTS-ENGINE-ROUTING-V1 — closed-test allowlist gate.
-    // Non-allowlisted callers cannot cancel Perps orders while the
-    // closed-test flag is on.
-    if state.perps_closed_test_enabled {
-        let caller = crate::types::AccountId::new(query.account.clone());
-        if !state.perps_closed_test_allows(&caller) {
-            return Err(BackendError::PerpsNotLive.into());
-        }
+    let caller = crate::types::AccountId::new(query.account.clone());
+    // Layer 2 — closed-test allowlist.
+    if state.perps_closed_test_enabled && !state.perps_closed_test_allows(&caller) {
+        return Err(BackendError::PerpsNotLive.into());
     }
-    // V1: enabled-mode cancel requires PG for the same posture as
-    // submit — the enabled surface is durable-only.
+    // Layer 3 — v2 envelope required. Empty body / missing envelope
+    // → 400 InvalidSubaccountRequest. Malformed JSON → 400 Config.
+    if body.is_empty() {
+        return Err(ApiError::from(BackendError::InvalidSubaccountRequest(
+            "perps cancel requires a v2 authorization envelope in the request body".to_string(),
+        )));
+    }
+    let cancel_body: PerpsCancelOrderBody = serde_json::from_slice(&body).map_err(|e| {
+        ApiError::from(BackendError::Config(format!(
+            "perps cancel: invalid request body: {e}"
+        )))
+    })?;
+    let authorization = cancel_body.authorization.as_ref().ok_or_else(|| {
+        ApiError::from(BackendError::InvalidSubaccountRequest(
+            "perps cancel requires a v2 authorization envelope".to_string(),
+        ))
+    })?;
+    // Layer 4 — resolve + validate subaccount.
+    let resolved_subaccount_id =
+        resolve_perps_v2_subaccount(&state, authorization, cancel_body.subaccount_id, &caller)
+            .await?;
+    let order_uuid = uuid::Uuid::parse_str(&order_id)
+        .map_err(|_| ApiError::from(BackendError::PerpOrderNotFound(order_id.clone())))?;
+    // Layer 5 — reconstruct canonical + verify + consume nonce.
+    // Verification runs BEFORE we look up the order so an invalid
+    // signature is rejected without touching the persistence layer.
+    // Cross-subaccount checks happen at Layer 7 against the auth-
+    // committed subaccount id.
+    let canonical = canonical_perp_order_cancel_v2(&caller, resolved_subaccount_id, &order_id);
+    let _verified = require_write_auth_v2_aware(
+        &state,
+        WriteAuthAction::PerpOrderCancel,
+        &caller,
+        resolved_subaccount_id,
+        &canonical,
+        authorization,
+    )
+    .await?;
+    // Layer 6 — PG required for the actual cancel + cross-subaccount
+    // ownership check.
     let Some(repository) = state.repository.clone() else {
         return Err(BackendError::PerpsNotLive.into());
     };
-    let order_uuid = uuid::Uuid::parse_str(&order_id)
-        .map_err(|_| ApiError::from(BackendError::PerpOrderNotFound(order_id.clone())))?;
-    let caller = crate::types::AccountId::new(query.account);
+    // Layer 7 — cross-subaccount rejection. Look up the order and
+    // ensure it belongs to the auth-committed subaccount.
+    let existing = repository
+        .list_perp_orders_for_account(&caller)
+        .await?
+        .into_iter()
+        .find(|o| o.id == order_uuid);
+    let existing = existing
+        .ok_or_else(|| ApiError::from(BackendError::PerpOrderNotFound(order_id.clone())))?;
+    if existing.subaccount_id != resolved_subaccount_id {
+        return Err(ApiError::from(BackendError::InvalidSubaccountRequest(
+            format!(
+                "perps cancel: order belongs to subaccount {}, envelope signs for {}",
+                existing.subaccount_id, resolved_subaccount_id
+            ),
+        )));
+    }
+    // Layer 8 — execute cancel.
     let order = crate::perps::cancel_perp_order_via_repository(
         &repository,
         &state.lifecycle_events,
@@ -12481,6 +12599,51 @@ async fn resolve_options_v2_subaccount(
     }
 }
 
+/// PERPS-V2-WRITE-AUTH-ENFORCEMENT-V1 — strict v2 subaccount resolver
+/// for Perps mutations.
+///
+/// Unlike Options, Perps never shipped a v1 wire, so this resolver is
+/// stricter: the envelope MUST declare `version = Some(2)`, and the
+/// body MUST supply `subaccount_id`. There is no "default to 1" leg.
+///
+/// * v1 auth (`envelope.version = None | Some(1)`) → 400
+///   `InvalidSubaccountRequest("perps mutations require a v2 authorization
+///   envelope")`.
+/// * v2 auth + missing body `subaccount_id` → 400
+///   `InvalidSubaccountRequest("v2 authorization requires subaccount_id in body")`.
+/// * v2 auth + `subaccount_id` present → validate the subaccount exists
+///   for this owner via the identity store. Missing rows return 404
+///   `SubaccountNotFound`. Returns the resolved id.
+async fn resolve_perps_v2_subaccount(
+    state: &AppState,
+    envelope: &AuthorizationEnvelope,
+    body_subaccount_id: Option<u32>,
+    owner: &AccountId,
+) -> Result<u32, ApiError> {
+    match envelope.version {
+        Some(2) => {
+            let subaccount_id = body_subaccount_id.ok_or_else(|| {
+                ApiError::from(BackendError::InvalidSubaccountRequest(
+                    "v2 authorization requires subaccount_id in body".to_string(),
+                ))
+            })?;
+            let _ = crate::subaccounts::get_subaccount(
+                state.subaccounts.as_ref(),
+                owner,
+                subaccount_id,
+            )
+            .await?;
+            Ok(subaccount_id)
+        }
+        None | Some(1) => Err(ApiError::from(BackendError::InvalidSubaccountRequest(
+            "perps mutations require a v2 authorization envelope".to_string(),
+        ))),
+        Some(v) => Err(ApiError::from(BackendError::InvalidSubaccountRequest(
+            format!("unsupported authorization version: {v}"),
+        ))),
+    }
+}
+
 /// SUBACCOUNTS-OPTIONS-ORDERS-HISTORY-V1 — foundation-posture gate.
 ///
 /// Every Options mutation handler that has been prepared for the
@@ -12936,7 +13099,6 @@ pub(crate) fn canonical_option_order_cancel_v2(
 // public trading has never shipped; the closed-test flip introduces
 // the wire directly at v2. Byte-freeze coverage lives in
 // `tests/perps_subaccounts_core_routing_v1_tests.rs`.
-#[allow(dead_code)]
 pub(crate) fn canonical_perp_order_submit_v2(
     account: &AccountId,
     subaccount_id: u32,
@@ -12976,7 +13138,6 @@ pub(crate) fn canonical_perp_order_submit_v2(
     )
 }
 
-#[allow(dead_code)]
 pub(crate) fn canonical_perp_order_cancel_v2(
     account: &AccountId,
     subaccount_id: u32,
