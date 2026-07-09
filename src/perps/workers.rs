@@ -396,6 +396,11 @@ pub async fn run_perps_funding_tick_once(state: &crate::api::AppState) {
     let started = now_ms();
     if !state.perps_funding_worker_config.tick_enabled {
         record_funding_tick(state, PerpsWorkerTickRecord::skipped(started));
+        // PERPS-MONITORING-ALERTING-V1 — count kill-switch skips so a
+        // long spell of skips is visible without inspecting logs.
+        state
+            .perps_observability
+            .record_funding_tick_kill_switch_skip();
         return;
     }
     let reader = crate::perps::InMemoryPerpFundingIndexReader::new();
@@ -412,12 +417,18 @@ pub async fn run_perps_funding_tick_once(state: &crate::api::AppState) {
         )
         .await
         {
-            Ok(response) => record_funding_tick(
-                state,
-                PerpsWorkerTickRecord::from_funding(started, now_ms(), &response),
-            ),
+            Ok(response) => {
+                state
+                    .perps_observability
+                    .record_funding_tick_ok(response.skipped_source_unavailable_count);
+                record_funding_tick(
+                    state,
+                    PerpsWorkerTickRecord::from_funding(started, now_ms(), &response),
+                );
+            }
             Err(error) => {
                 tracing::warn!(%error, "perps funding worker tick (pg) failed");
+                state.perps_observability.record_funding_tick_failure();
                 record_funding_tick(state, PerpsWorkerTickRecord::errored(started, now_ms()));
             }
         }
@@ -451,12 +462,18 @@ pub async fn run_perps_funding_tick_once(state: &crate::api::AppState) {
         )
     };
     match outcome {
-        Ok(response) => record_funding_tick(
-            state,
-            PerpsWorkerTickRecord::from_funding(started, now_ms(), &response),
-        ),
+        Ok(response) => {
+            state
+                .perps_observability
+                .record_funding_tick_ok(response.skipped_source_unavailable_count);
+            record_funding_tick(
+                state,
+                PerpsWorkerTickRecord::from_funding(started, now_ms(), &response),
+            );
+        }
         Err(error) => {
             tracing::warn!(%error, "perps funding worker tick (in-memory) failed");
+            state.perps_observability.record_funding_tick_failure();
             record_funding_tick(state, PerpsWorkerTickRecord::errored(started, now_ms()));
         }
     }
@@ -469,12 +486,16 @@ pub async fn run_perps_liquidation_tick_once(state: &crate::api::AppState) {
     let started = now_ms();
     if !state.perps_liquidation_worker_config.tick_enabled {
         record_liquidation_tick(state, PerpsWorkerTickRecord::skipped(started));
+        state
+            .perps_observability
+            .record_liquidation_tick_kill_switch_skip();
         return;
     }
     let reader = match build_worker_price_reader(state) {
         Ok(reader) => reader,
         Err(error) => {
             tracing::warn!(%error, "perps liquidation worker could not build price reader");
+            state.perps_observability.record_liquidation_tick_failure();
             record_liquidation_tick(state, PerpsWorkerTickRecord::errored(started, now_ms()));
             return;
         }
@@ -492,12 +513,19 @@ pub async fn run_perps_liquidation_tick_once(state: &crate::api::AppState) {
         )
         .await
         {
-            Ok(response) => record_liquidation_tick(
-                state,
-                PerpsWorkerTickRecord::from_liquidation(started, now_ms(), &response),
-            ),
+            Ok(response) => {
+                state.perps_observability.record_liquidation_tick_ok(
+                    response.skipped_price_unavailable_count,
+                    response.liquidated_count,
+                );
+                record_liquidation_tick(
+                    state,
+                    PerpsWorkerTickRecord::from_liquidation(started, now_ms(), &response),
+                );
+            }
             Err(error) => {
                 tracing::warn!(%error, "perps liquidation worker tick (pg) failed");
+                state.perps_observability.record_liquidation_tick_failure();
                 record_liquidation_tick(state, PerpsWorkerTickRecord::errored(started, now_ms()));
             }
         }
@@ -537,12 +565,19 @@ pub async fn run_perps_liquidation_tick_once(state: &crate::api::AppState) {
         )
     };
     match outcome {
-        Ok(response) => record_liquidation_tick(
-            state,
-            PerpsWorkerTickRecord::from_liquidation(started, now_ms(), &response),
-        ),
+        Ok(response) => {
+            state.perps_observability.record_liquidation_tick_ok(
+                response.skipped_price_unavailable_count,
+                response.liquidated_count,
+            );
+            record_liquidation_tick(
+                state,
+                PerpsWorkerTickRecord::from_liquidation(started, now_ms(), &response),
+            );
+        }
         Err(error) => {
             tracing::warn!(%error, "perps liquidation worker tick (in-memory) failed");
+            state.perps_observability.record_liquidation_tick_failure();
             record_liquidation_tick(state, PerpsWorkerTickRecord::errored(started, now_ms()));
         }
     }

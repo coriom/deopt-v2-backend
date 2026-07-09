@@ -184,6 +184,13 @@ pub struct AppState {
     /// PERPS-FUNDING-LIQUIDATION-WORKERS-V1 — last liquidation tick
     /// record. Same posture as `perp_funding_last_tick`.
     pub perp_liquidation_last_tick: Arc<Mutex<Option<crate::perps::PerpsWorkerTickRecord>>>,
+    /// PERPS-MONITORING-ALERTING-V1 — in-process Perps observability
+    /// counters (worker tick outcomes, kill-switch skips, fail-closed
+    /// rejects, submit/cancel reject reason buckets, deviation-guard
+    /// trips, liquidation events, bad-debt events). Rendered by
+    /// `/metrics`; never carries wallets, RPC URLs, DB URLs, admin
+    /// tokens, signatures, envelopes, or nonces (grep-guarded).
+    pub perps_observability: Arc<crate::perps::PerpsObservability>,
     /// SUBACCOUNTS-CORE-BACKEND-V1 — real Derive-like subaccount
     /// identity store. When `repository` is `Some`, the PgRepository
     /// is wired here so rows survive restarts. Otherwise an in-memory
@@ -411,6 +418,7 @@ impl AppState {
             perps_liquidation_worker_config: crate::perps::PerpsLiquidationWorkerConfig::disabled(),
             perp_funding_last_tick: Arc::new(Mutex::new(None)),
             perp_liquidation_last_tick: Arc::new(Mutex::new(None)),
+            perps_observability: Arc::new(crate::perps::PerpsObservability::new()),
             subaccounts,
         }
     }

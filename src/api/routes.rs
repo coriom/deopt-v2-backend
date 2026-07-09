@@ -2876,6 +2876,7 @@ async fn perps_submit_order(
     // request body is malformed / missing / envelope-less; the handler
     // never touches the envelope on the default path.
     if !state.perps_public_trading_enabled && !state.perps_closed_test_enabled {
+        state.perps_observability.record_perps_not_live_reject();
         return Err(BackendError::PerpsNotLive.into());
     }
     // Layer 2 — closed-test allowlist. When closed-test is on, only
@@ -2884,6 +2885,7 @@ async fn perps_submit_order(
     // allowlist even if public trading was flipped in the same env.
     let caller = crate::types::AccountId::new(req.account.clone());
     if state.perps_closed_test_enabled && !state.perps_closed_test_allows(&caller) {
+        state.perps_observability.record_closed_test_access_denied();
         return Err(BackendError::PerpsNotLive.into());
     }
     // Layer 3 — v2 authorization envelope required. Perps never
@@ -3005,11 +3007,13 @@ async fn perps_cancel_order(
     //
     // Layer 1 — default fail-closed. Both flags off → 503, body not read.
     if !state.perps_public_trading_enabled && !state.perps_closed_test_enabled {
+        state.perps_observability.record_perps_not_live_reject();
         return Err(BackendError::PerpsNotLive.into());
     }
     let caller = crate::types::AccountId::new(query.account.clone());
     // Layer 2 — closed-test allowlist.
     if state.perps_closed_test_enabled && !state.perps_closed_test_allows(&caller) {
+        state.perps_observability.record_closed_test_access_denied();
         return Err(BackendError::PerpsNotLive.into());
     }
     // Layer 3 — v2 envelope required. Empty body / missing envelope

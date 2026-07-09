@@ -33,6 +33,7 @@ pub mod liquidation;
 pub mod liquidation_pg;
 pub mod margin;
 pub mod market_reader;
+pub mod observability;
 pub mod order_store;
 pub mod orderbook;
 pub mod orders;
@@ -84,6 +85,10 @@ pub use config::{
 pub use execution::deviation_bps;
 pub use fills::{apply_perp_fill_for_account, PerpFillInput, PerpFillOutcome};
 pub use market_reader::{PerpMarketRegistryReader, PerpMarketRegistryRpcReader};
+pub use observability::{
+    cancel_reason_labels, submit_reason_labels, tick_age_seconds, PerpsObservability,
+    PerpsObservabilitySnapshot,
+};
 pub use positions::{PerpPosition, PerpPositionStatus, PerpPositionsStore, PerpSide};
 pub use price_reader::{PerpOraclePriceReader, PerpOracleRouterRpcReader};
 pub use service::{

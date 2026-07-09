@@ -270,6 +270,15 @@ pub async fn render_metrics(state: &AppState) -> Result<String> {
         bool_value(state.perps_liquidation_worker_config.tick_enabled),
     );
 
+    // PERPS-MONITORING-ALERTING-V1 — worker + trading observability
+    // metrics. All counters start at 0. Label cardinality is bounded
+    // to the closed sets defined in
+    // `crate::perps::observability::{submit_reason_labels,
+    // cancel_reason_labels}`. No label value carries a wallet, RPC
+    // URL, DB URL, admin token, signature, envelope, or nonce.
+    append_perps_observability_metrics(state, &mut metrics);
+    append_perps_worker_tick_age_metrics(state, &mut metrics);
+
     append_database_metrics(state, &mut metrics).await?;
     append_execution_metrics(state, &mut metrics).await?;
     append_rfq_metrics(state, &mut metrics).await?;
@@ -288,6 +297,177 @@ pub async fn render_metrics(state: &AppState) -> Result<String> {
 /// `u128_to_u64_gauge`. Labels are restricted to the
 /// `BroadcastObservability` whitelist (`source_type`, `code`,
 /// `signer_kind`); no intent_id / address / secret ever appears.
+/// PERPS-MONITORING-ALERTING-V1 — render the Perps observability
+/// counters into Prometheus text. Every counter is emitted as a gauge
+/// of the cumulative in-process count (Prometheus computes rates
+/// downstream). Reason-labelled counters pre-seed every value from the
+/// bounded label set so `increase(...) > 0` alerts have a stable time
+/// series from the first scrape. No label value can carry a secret.
+fn append_perps_observability_metrics(state: &AppState, metrics: &mut MetricsText) {
+    use crate::perps::observability::{cancel_reason_labels, submit_reason_labels};
+
+    let snap = state.perps_observability.snapshot();
+
+    metrics.gauge(
+        "deopt_perps_funding_tick_ok_total",
+        "Cumulative count of Perps funding ticks that completed without a BackendError.",
+        snap.funding_tick_ok_total,
+    );
+    metrics.gauge(
+        "deopt_perps_funding_tick_failure_total",
+        "Cumulative count of Perps funding ticks that returned a BackendError. Non-zero increments are P1.",
+        snap.funding_tick_failure_total,
+    );
+    metrics.gauge(
+        "deopt_perps_funding_tick_kill_switch_skip_total",
+        "Cumulative count of Perps funding ticks skipped because PERPS_FUNDING_TICK_ENABLED=false.",
+        snap.funding_tick_kill_switch_skip_total,
+    );
+    metrics.gauge(
+        "deopt_perps_funding_market_stale_skip_total",
+        "Cumulative count of per-market funding-index skips due to stale/unavailable oracle.",
+        snap.funding_market_stale_skip_total,
+    );
+
+    metrics.gauge(
+        "deopt_perps_liquidation_tick_ok_total",
+        "Cumulative count of Perps liquidation ticks that completed without a BackendError.",
+        snap.liquidation_tick_ok_total,
+    );
+    metrics.gauge(
+        "deopt_perps_liquidation_tick_failure_total",
+        "Cumulative count of Perps liquidation ticks that returned a BackendError. Non-zero increments are P0.",
+        snap.liquidation_tick_failure_total,
+    );
+    metrics.gauge(
+        "deopt_perps_liquidation_tick_kill_switch_skip_total",
+        "Cumulative count of Perps liquidation ticks skipped because PERPS_LIQUIDATION_TICK_ENABLED=false.",
+        snap.liquidation_tick_kill_switch_skip_total,
+    );
+    metrics.gauge(
+        "deopt_perps_liquidation_market_stale_skip_total",
+        "Cumulative count of per-market liquidation-mark-price skips due to stale/unavailable oracle.",
+        snap.liquidation_market_stale_skip_total,
+    );
+
+    metrics.gauge(
+        "deopt_perps_not_live_reject_total",
+        "Cumulative count of Perps mutation-route rejects with PerpsNotLive at handler entry (public fail-closed layer 1).",
+        snap.perps_not_live_reject_total,
+    );
+    metrics.gauge(
+        "deopt_perps_closed_test_access_denied_total",
+        "Cumulative count of Perps mutation-route rejects at the closed-test allowlist layer.",
+        snap.closed_test_access_denied_total,
+    );
+    metrics.gauge(
+        "deopt_perps_v2_auth_failure_total",
+        "Cumulative count of Perps v2 write-auth failures (signature/nonce/canonical mismatch).",
+        snap.v2_auth_failure_total,
+    );
+
+    metrics.gauge(
+        "deopt_perps_deviation_exceeded_total",
+        "Cumulative count of pre-submit deviation-guard trips. V1 mark == index → stays 0.",
+        snap.deviation_exceeded_total,
+    );
+
+    metrics.gauge(
+        "deopt_perps_liquidation_event_total",
+        "Cumulative count of applied Perps liquidations (from tick responses' liquidated_count).",
+        snap.liquidation_event_total,
+    );
+    metrics.gauge(
+        "deopt_perps_bad_debt_event_total",
+        "Cumulative count of Perps liquidations that produced non-zero bad debt. Non-zero increments are P0.",
+        snap.bad_debt_event_total,
+    );
+
+    // Pre-seed the bounded reason-label sets so alert rules of the
+    // shape `increase(<metric>{reason="X"}[5m]) > 0` have a stable
+    // time series from the very first scrape.
+    let mut submit_counts: BTreeMap<String, u64> = BTreeMap::new();
+    for label in submit_reason_labels() {
+        submit_counts.insert((*label).to_string(), 0);
+    }
+    for (reason, count) in &snap.submit_reject_by_reason {
+        submit_counts
+            .entry(reason.clone())
+            .and_modify(|v| *v = v.saturating_add(*count))
+            .or_insert(*count);
+    }
+    metrics.labeled_gauges(
+        "deopt_perps_submit_reject_total",
+        "Cumulative Perps submit rejects bucketed by classified reason. Label cardinality bounded to a closed set (see crate::perps::observability::submit_reason_labels).",
+        &[("reason", &submit_counts)],
+    );
+
+    let mut cancel_counts: BTreeMap<String, u64> = BTreeMap::new();
+    for label in cancel_reason_labels() {
+        cancel_counts.insert((*label).to_string(), 0);
+    }
+    for (reason, count) in &snap.cancel_reject_by_reason {
+        cancel_counts
+            .entry(reason.clone())
+            .and_modify(|v| *v = v.saturating_add(*count))
+            .or_insert(*count);
+    }
+    metrics.labeled_gauges(
+        "deopt_perps_cancel_reject_total",
+        "Cumulative Perps cancel rejects bucketed by classified reason. Label cardinality bounded to a closed set (see crate::perps::observability::cancel_reason_labels).",
+        &[("reason", &cancel_counts)],
+    );
+}
+
+/// PERPS-MONITORING-ALERTING-V1 — derive last-tick age gauges from
+/// the existing `perp_funding_last_tick` / `perp_liquidation_last_tick`
+/// records. When no tick has been observed, the gauge is omitted (no
+/// negative sentinel).
+fn append_perps_worker_tick_age_metrics(state: &AppState, metrics: &mut MetricsText) {
+    use crate::perps::observability::tick_age_seconds;
+    use crate::types::now_ms;
+
+    let now = now_ms();
+    if let Ok(guard) = state.perp_funding_last_tick.lock() {
+        if let Some(record) = *guard {
+            metrics.gauge(
+                "deopt_perps_last_funding_tick_age_seconds",
+                "Seconds since the most recent Perps funding tick finished. Compare against PERPS_FUNDING_WORKER_INTERVAL_SEC to detect a stalled worker.",
+                tick_age_seconds(record.finished_at_ms, now),
+            );
+            metrics.gauge(
+                "deopt_perps_last_funding_tick_ok",
+                "1 if the most recent Perps funding tick returned Ok; 0 if it returned a BackendError.",
+                bool_value(record.ok),
+            );
+            metrics.gauge(
+                "deopt_perps_last_funding_tick_executed",
+                "1 if the most recent Perps funding tick actually executed; 0 if it was killed by the kill-switch.",
+                bool_value(record.executed),
+            );
+        }
+    }
+    if let Ok(guard) = state.perp_liquidation_last_tick.lock() {
+        if let Some(record) = *guard {
+            metrics.gauge(
+                "deopt_perps_last_liquidation_tick_age_seconds",
+                "Seconds since the most recent Perps liquidation tick finished. Compare against PERPS_LIQUIDATION_WORKER_INTERVAL_SEC.",
+                tick_age_seconds(record.finished_at_ms, now),
+            );
+            metrics.gauge(
+                "deopt_perps_last_liquidation_tick_ok",
+                "1 if the most recent Perps liquidation tick returned Ok; 0 if it returned a BackendError.",
+                bool_value(record.ok),
+            );
+            metrics.gauge(
+                "deopt_perps_last_liquidation_tick_executed",
+                "1 if the most recent Perps liquidation tick actually executed; 0 if it was killed by the kill-switch.",
+                bool_value(record.executed),
+            );
+        }
+    }
+}
+
 fn append_broadcast_observability_metrics(state: &AppState, metrics: &mut MetricsText) {
     let snap = state.broadcast_observability.snapshot();
 
