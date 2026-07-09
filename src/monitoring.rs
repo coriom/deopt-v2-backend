@@ -11,6 +11,13 @@ pub struct ReadinessResponse {
     pub ready: bool,
     pub service: &'static str,
     pub checks: Vec<ReadinessCheck>,
+    /// PERPS-FUNDING-LIQUIDATION-WORKERS-V1 — operator visibility for
+    /// the two periodic Perps workers + their kill-switches +
+    /// last-tick summary. Absent when neither worker has been
+    /// configured (all defaults). Populated even when both workers are
+    /// disabled so an operator can see the safe-default posture.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub perps_workers: Option<PerpsWorkersReadiness>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -18,6 +25,31 @@ pub struct ReadinessCheck {
     pub name: &'static str,
     pub ok: bool,
     pub status: &'static str,
+}
+
+/// PERPS-FUNDING-LIQUIDATION-WORKERS-V1 — public-safe view of the
+/// funding + liquidation worker state. Never contains wallets,
+/// signatures, RPC URLs, DB URLs, envelope digests, or subaccount
+/// detail; only the flags an operator flipped and the last-tick
+/// summary shape.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct PerpsWorkersReadiness {
+    pub funding_worker_enabled: bool,
+    pub funding_tick_enabled: bool,
+    pub funding_interval_sec: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub funding_last_tick: Option<crate::perps::PerpsWorkerTickRecord>,
+    pub liquidation_worker_enabled: bool,
+    pub liquidation_tick_enabled: bool,
+    pub liquidation_interval_sec: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub liquidation_last_tick: Option<crate::perps::PerpsWorkerTickRecord>,
+    /// Mirror of the public trading gate so an operator can see both
+    /// the fail-closed posture and the worker state in one place. Not
+    /// a security field — the gate itself lives on `AppState`.
+    pub perps_public_trading_enabled: bool,
+    /// Mirror of the closed-test gate. Same posture as above.
+    pub perps_closed_test_enabled: bool,
 }
 
 pub async fn readiness(state: &AppState) -> ReadinessResponse {
@@ -77,10 +109,36 @@ pub async fn readiness(state: &AppState) -> ReadinessResponse {
         });
     }
 
+    // PERPS-FUNDING-LIQUIDATION-WORKERS-V1 — surface the periodic
+    // worker + kill-switch state. `ready` stays coupled only to the
+    // required checks; the workers are opt-in and their disabled
+    // posture is expected — reporting on them does not gate readiness.
+    let perps_workers = Some(PerpsWorkersReadiness {
+        funding_worker_enabled: state.perps_funding_worker_config.worker_enabled,
+        funding_tick_enabled: state.perps_funding_worker_config.tick_enabled,
+        funding_interval_sec: state.perps_funding_worker_config.interval_sec,
+        funding_last_tick: state
+            .perp_funding_last_tick
+            .lock()
+            .ok()
+            .and_then(|guard| *guard),
+        liquidation_worker_enabled: state.perps_liquidation_worker_config.worker_enabled,
+        liquidation_tick_enabled: state.perps_liquidation_worker_config.tick_enabled,
+        liquidation_interval_sec: state.perps_liquidation_worker_config.interval_sec,
+        liquidation_last_tick: state
+            .perp_liquidation_last_tick
+            .lock()
+            .ok()
+            .and_then(|guard| *guard),
+        perps_public_trading_enabled: state.perps_public_trading_enabled,
+        perps_closed_test_enabled: state.perps_closed_test_enabled,
+    });
+
     ReadinessResponse {
         ready: checks.iter().all(|check| check.ok),
         service: "deopt-v2-backend",
         checks,
+        perps_workers,
     }
 }
 
@@ -185,6 +243,31 @@ pub async fn render_metrics(state: &AppState) -> Result<String> {
         "deopt_rebates_enabled",
         "Fee rebate accrual enabled.",
         bool_value(state.fees_config.rebates_enabled),
+    );
+    // PERPS-FUNDING-LIQUIDATION-WORKERS-V1 — periodic worker gauges.
+    // All four are 0 by default (both workers disabled, both
+    // kill-switches off) so Prometheus alerts of the shape
+    // `deopt_perps_funding_worker_enabled == 1` fire only after the
+    // operator has explicitly opted in.
+    metrics.gauge(
+        "deopt_perps_funding_worker_enabled",
+        "Perps funding periodic worker enabled (0 = disabled / default).",
+        bool_value(state.perps_funding_worker_config.worker_enabled),
+    );
+    metrics.gauge(
+        "deopt_perps_funding_tick_enabled",
+        "Perps funding tick kill-switch (0 = disabled). Consulted by both the periodic worker and the admin POST /admin/perps/funding/tick handler.",
+        bool_value(state.perps_funding_worker_config.tick_enabled),
+    );
+    metrics.gauge(
+        "deopt_perps_liquidation_worker_enabled",
+        "Perps liquidation periodic worker enabled (0 = disabled / default).",
+        bool_value(state.perps_liquidation_worker_config.worker_enabled),
+    );
+    metrics.gauge(
+        "deopt_perps_liquidation_tick_enabled",
+        "Perps liquidation tick kill-switch (0 = disabled). Consulted by both the periodic worker and the admin POST /admin/perps/liquidations/tick handler.",
+        bool_value(state.perps_liquidation_worker_config.tick_enabled),
     );
 
     append_database_metrics(state, &mut metrics).await?;

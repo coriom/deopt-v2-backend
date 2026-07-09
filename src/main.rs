@@ -12,6 +12,7 @@ use deopt_v2_backend::options::{
     spawn_option_confirmation_worker, spawn_option_event_indexer,
     spawn_option_reconciliation_worker,
 };
+use deopt_v2_backend::perps::{spawn_perps_funding_worker, spawn_perps_liquidation_worker};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -104,6 +105,12 @@ async fn main() -> deopt_v2_backend::Result<()> {
     // remain fail-closed by default.
     state.perps_closed_test_enabled = config.perps_closed_test_enabled;
     state.perps_closed_test_allowlist = config.perps_closed_test_allowlist.clone();
+    // PERPS-FUNDING-LIQUIDATION-WORKERS-V1 — periodic worker config.
+    // Both configs default to `disabled()`; the spawn functions return
+    // immediately unless `worker_enabled=true`, and the admin HTTP
+    // ticks in `routes.rs` consult `tick_enabled` too.
+    state.perps_funding_worker_config = config.perps_funding_worker.clone();
+    state.perps_liquidation_worker_config = config.perps_liquidation_worker.clone();
     // OPTIONS-CONDITIONAL-ORDERS-PERSISTENT-E2E-V1 — read worker env
     // vars. Defaults are safe (enabled=false) so this is a no-op for
     // any operator who has not opted in.
@@ -130,6 +137,14 @@ async fn main() -> deopt_v2_backend::Result<()> {
     // Default-off. Refuses to spawn when oracle/RPC missing — see
     // implementation in `src/options/conditional_orders.rs`.
     spawn_conditional_orders_worker(state.clone());
+    // PERPS-FUNDING-LIQUIDATION-WORKERS-V1 — periodic funding +
+    // liquidation workers. Both no-op unless the respective
+    // `worker_enabled` flag is true; the `tick_enabled` kill-switch
+    // controls whether the ticks execute or record a "skipped"
+    // heartbeat, and the same kill-switch is honoured by the admin
+    // HTTP ticks so the two surfaces cannot diverge.
+    spawn_perps_funding_worker(state.clone());
+    spawn_perps_liquidation_worker(state.clone());
     spawn_webtransport_gateway(config.mm_gateway.clone(), state).await?;
 
     info!(

@@ -80,6 +80,25 @@ pub struct AppConfig {
     /// with no allowlist is honest but useless. Env:
     /// `PERPS_CLOSED_TEST_ALLOWLIST` (default empty).
     pub perps_closed_test_allowlist: Vec<AccountId>,
+    /// PERPS-FUNDING-LIQUIDATION-WORKERS-V1 — periodic funding worker
+    /// configuration. Defaults `disabled()`. Env:
+    ///
+    /// * `PERPS_FUNDING_WORKER_ENABLED=true` (starts the periodic loop)
+    /// * `PERPS_FUNDING_TICK_ENABLED=true`   (kill-switch — consulted by
+    ///   both the periodic worker AND the admin HTTP tick)
+    /// * `PERPS_FUNDING_WORKER_INTERVAL_SEC` (30..=86400, default 3600)
+    /// * `PERPS_FUNDING_MAX_MARKETS_PER_TICK` (default 32)
+    /// * `PERPS_FUNDING_STALE_ORACLE_POLICY=skip` (V1 only supports skip)
+    pub perps_funding_worker: crate::perps::PerpsFundingWorkerConfig,
+    /// PERPS-FUNDING-LIQUIDATION-WORKERS-V1 — periodic liquidation
+    /// worker configuration. Defaults `disabled()`. Env:
+    ///
+    /// * `PERPS_LIQUIDATION_WORKER_ENABLED=true`
+    /// * `PERPS_LIQUIDATION_TICK_ENABLED=true` (kill-switch)
+    /// * `PERPS_LIQUIDATION_WORKER_INTERVAL_SEC` (5..=3600, default 30)
+    /// * `PERPS_LIQUIDATION_MAX_POSITIONS_PER_TICK` (default 500)
+    /// * `PERPS_LIQUIDATION_STALE_ORACLE_POLICY=skip`
+    pub perps_liquidation_worker: crate::perps::PerpsLiquidationWorkerConfig,
 }
 
 impl AppConfig {
@@ -816,6 +835,46 @@ impl AppConfig {
             })
             .unwrap_or_default();
 
+        // PERPS-FUNDING-LIQUIDATION-WORKERS-V1 — periodic funding
+        // worker + kill-switch. All defaults safe (worker off, tick
+        // off, 1h interval). Mainnet refusal enforced by
+        // `PerpsFundingWorkerConfig::validate_startup(chain_id)`.
+        let perps_funding_worker = crate::perps::PerpsFundingWorkerConfig {
+            worker_enabled: parse_env(&mut lookup, "PERPS_FUNDING_WORKER_ENABLED", "false")?,
+            tick_enabled: parse_env(&mut lookup, "PERPS_FUNDING_TICK_ENABLED", "false")?,
+            interval_sec: parse_env(&mut lookup, "PERPS_FUNDING_WORKER_INTERVAL_SEC", "3600")?,
+            max_markets_per_tick: parse_env(
+                &mut lookup,
+                "PERPS_FUNDING_MAX_MARKETS_PER_TICK",
+                "32",
+            )?,
+            stale_oracle_policy: crate::perps::PerpsWorkerStaleOraclePolicy::parse(&get_env(
+                &mut lookup,
+                "PERPS_FUNDING_STALE_ORACLE_POLICY",
+                "skip",
+            )),
+        };
+        perps_funding_worker.validate_startup(chain_id)?;
+
+        // PERPS-FUNDING-LIQUIDATION-WORKERS-V1 — periodic liquidation
+        // worker + kill-switch. All defaults safe.
+        let perps_liquidation_worker = crate::perps::PerpsLiquidationWorkerConfig {
+            worker_enabled: parse_env(&mut lookup, "PERPS_LIQUIDATION_WORKER_ENABLED", "false")?,
+            tick_enabled: parse_env(&mut lookup, "PERPS_LIQUIDATION_TICK_ENABLED", "false")?,
+            interval_sec: parse_env(&mut lookup, "PERPS_LIQUIDATION_WORKER_INTERVAL_SEC", "30")?,
+            max_positions_per_tick: parse_env(
+                &mut lookup,
+                "PERPS_LIQUIDATION_MAX_POSITIONS_PER_TICK",
+                "500",
+            )?,
+            stale_oracle_policy: crate::perps::PerpsWorkerStaleOraclePolicy::parse(&get_env(
+                &mut lookup,
+                "PERPS_LIQUIDATION_STALE_ORACLE_POLICY",
+                "skip",
+            )),
+        };
+        perps_liquidation_worker.validate_startup(chain_id)?;
+
         Ok(Self {
             host,
             port,
@@ -848,6 +907,8 @@ impl AppConfig {
             perps_public_trading_enabled,
             perps_closed_test_enabled,
             perps_closed_test_allowlist,
+            perps_funding_worker,
+            perps_liquidation_worker,
         })
     }
 

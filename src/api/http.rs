@@ -165,6 +165,25 @@ pub struct AppState {
     /// closed-test guard on Perps mutations. Env:
     /// `PERPS_CLOSED_TEST_ALLOWLIST` (comma-separated hex).
     pub perps_closed_test_allowlist: Vec<AccountId>,
+    /// PERPS-FUNDING-LIQUIDATION-WORKERS-V1 — periodic funding worker
+    /// configuration. Default `disabled()`: both `worker_enabled` and
+    /// `tick_enabled` are `false`. Both the periodic worker AND the
+    /// admin `POST /admin/perps/funding/tick` handler consult
+    /// `tick_enabled` — the kill-switch flips both surfaces to safe
+    /// no-ops without restarting the process.
+    pub perps_funding_worker_config: crate::perps::PerpsFundingWorkerConfig,
+    /// PERPS-FUNDING-LIQUIDATION-WORKERS-V1 — periodic liquidation
+    /// worker configuration. Same defaults + kill-switch semantics as
+    /// `perps_funding_worker_config`.
+    pub perps_liquidation_worker_config: crate::perps::PerpsLiquidationWorkerConfig,
+    /// PERPS-FUNDING-LIQUIDATION-WORKERS-V1 — last funding tick record.
+    /// Written after every funding tick (periodic OR admin-triggered)
+    /// and read by the readiness endpoint. Never contains wallets,
+    /// signatures, or subaccount detail — operator-facing summary only.
+    pub perp_funding_last_tick: Arc<Mutex<Option<crate::perps::PerpsWorkerTickRecord>>>,
+    /// PERPS-FUNDING-LIQUIDATION-WORKERS-V1 — last liquidation tick
+    /// record. Same posture as `perp_funding_last_tick`.
+    pub perp_liquidation_last_tick: Arc<Mutex<Option<crate::perps::PerpsWorkerTickRecord>>>,
     /// SUBACCOUNTS-CORE-BACKEND-V1 — real Derive-like subaccount
     /// identity store. When `repository` is `Some`, the PgRepository
     /// is wired here so rows survive restarts. Otherwise an in-memory
@@ -384,6 +403,14 @@ impl AppState {
             // mutation surface fail-closed for every wallet.
             perps_closed_test_enabled: false,
             perps_closed_test_allowlist: Vec::new(),
+            // PERPS-FUNDING-LIQUIDATION-WORKERS-V1 — periodic workers
+            // start disabled; kill-switches start off. AppState-based
+            // fixture tests can flip flags per-test without ever
+            // touching mainnet-refusal validation.
+            perps_funding_worker_config: crate::perps::PerpsFundingWorkerConfig::disabled(),
+            perps_liquidation_worker_config: crate::perps::PerpsLiquidationWorkerConfig::disabled(),
+            perp_funding_last_tick: Arc::new(Mutex::new(None)),
+            perp_liquidation_last_tick: Arc::new(Mutex::new(None)),
             subaccounts,
         }
     }

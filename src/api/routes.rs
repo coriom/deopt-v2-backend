@@ -2529,14 +2529,36 @@ async fn admin_perps_funding_tick(
     State(state): State<AppState>,
 ) -> Result<Json<crate::perps::PerpFundingTickResponse>, ApiError> {
     ensure_admin_access(&state, &headers)?;
-    let now = now_ms();
+    let started = now_ms();
+
+    // PERPS-FUNDING-LIQUIDATION-WORKERS-V1 — kill-switch. When
+    // `tick_enabled=false` the admin path returns a zero-count tick
+    // envelope (same shape as a real tick) so the operator's tooling
+    // does not need a special-case branch. The last-tick record is
+    // updated so the readiness endpoint reflects a fresh heartbeat.
+    if !state.perps_funding_worker_config.tick_enabled {
+        if let Ok(mut slot) = state.perp_funding_last_tick.lock() {
+            *slot = Some(crate::perps::PerpsWorkerTickRecord::skipped(started));
+        }
+        return Ok(Json(crate::perps::PerpFundingTickResponse {
+            now_ms: started,
+            checked_count: 0,
+            settled_count: 0,
+            skipped_no_position_count: 0,
+            skipped_source_unavailable_count: 0,
+            funding_event_ids: Vec::new(),
+            chain_id: state.perps_read_config.chain_id,
+            trading_enabled: false,
+        }));
+    }
+
     // V1: the funding-index reader is a stub that reports every market
     // as source-unavailable. When a full on-chain reader lands, swap
     // this call for the RPC-backed reader; the tick logic is
     // unchanged.
     let reader = crate::perps::InMemoryPerpFundingIndexReader::new();
     let indices =
-        crate::perps::prefetch_funding_indices(&state.perps_read_config, &reader, now).await;
+        crate::perps::prefetch_funding_indices(&state.perps_read_config, &reader, started).await;
 
     if let Some(repository) = state.repository.clone() {
         let response = crate::perps::run_perp_funding_tick_via_repository(
@@ -2544,28 +2566,44 @@ async fn admin_perps_funding_tick(
             &repository,
             &indices,
             &state.lifecycle_events,
-            now,
+            started,
         )
         .await?;
+        if let Ok(mut slot) = state.perp_funding_last_tick.lock() {
+            *slot = Some(crate::perps::PerpsWorkerTickRecord::from_funding(
+                started,
+                now_ms(),
+                &response,
+            ));
+        }
         return Ok(Json(response));
     }
 
-    let mut positions = state
-        .perp_positions_store
-        .lock()
-        .map_err(|_| ApiError::internal())?;
-    let mut events = state
-        .perp_funding_events_store
-        .lock()
-        .map_err(|_| ApiError::internal())?;
-    let response = crate::perps::run_perp_funding_tick(
-        &state.perps_read_config,
-        &mut positions,
-        &mut events,
-        &indices,
-        &state.lifecycle_events,
-        now,
-    )?;
+    let response = {
+        let mut positions = state
+            .perp_positions_store
+            .lock()
+            .map_err(|_| ApiError::internal())?;
+        let mut events = state
+            .perp_funding_events_store
+            .lock()
+            .map_err(|_| ApiError::internal())?;
+        crate::perps::run_perp_funding_tick(
+            &state.perps_read_config,
+            &mut positions,
+            &mut events,
+            &indices,
+            &state.lifecycle_events,
+            started,
+        )?
+    };
+    if let Ok(mut slot) = state.perp_funding_last_tick.lock() {
+        *slot = Some(crate::perps::PerpsWorkerTickRecord::from_funding(
+            started,
+            now_ms(),
+            &response,
+        ));
+    }
     Ok(Json(response))
 }
 
@@ -2574,13 +2612,33 @@ async fn admin_perps_liquidations_tick(
     State(state): State<AppState>,
 ) -> Result<Json<crate::perps::PerpLiquidationTickResponse>, ApiError> {
     ensure_admin_access(&state, &headers)?;
-    let now = now_ms();
+    let started = now_ms();
+
+    // PERPS-FUNDING-LIQUIDATION-WORKERS-V1 — kill-switch. Same shape as
+    // the funding tick handler: returns a zero-count response envelope
+    // when disabled and records a heartbeat.
+    if !state.perps_liquidation_worker_config.tick_enabled {
+        if let Ok(mut slot) = state.perp_liquidation_last_tick.lock() {
+            *slot = Some(crate::perps::PerpsWorkerTickRecord::skipped(started));
+        }
+        return Ok(Json(crate::perps::PerpLiquidationTickResponse {
+            now_ms: started,
+            checked_count: 0,
+            liquidated_count: 0,
+            skipped_price_unavailable_count: 0,
+            liquidation_ids: Vec::new(),
+            chain_id: state.perps_read_config.chain_id,
+            trading_enabled: false,
+        }));
+    }
+
     // Two-phase to avoid holding MutexGuards or PG borrows across
     // unrelated async work:
     //   1) async: prefetch mark prices for every configured market.
     //   2) sync (in-memory) or per-candidate tx (PG): run the tick.
     let reader = build_perp_oracle_price_reader(&state)?;
-    let marks = crate::perps::prefetch_mark_prices(&state.perps_read_config, &reader, now).await;
+    let marks =
+        crate::perps::prefetch_mark_prices(&state.perps_read_config, &reader, started).await;
 
     // PERPS-LIQUIDATION-PG-EXECUTION-V1 — PG branch.
     if let Some(repository) = state.repository.clone() {
@@ -2589,34 +2647,50 @@ async fn admin_perps_liquidations_tick(
             &repository,
             &marks,
             &state.lifecycle_events,
-            now,
+            started,
         )
         .await?;
+        if let Ok(mut slot) = state.perp_liquidation_last_tick.lock() {
+            *slot = Some(crate::perps::PerpsWorkerTickRecord::from_liquidation(
+                started,
+                now_ms(),
+                &response,
+            ));
+        }
         return Ok(Json(response));
     }
 
     // In-memory branch.
-    let mut positions = state
-        .perp_positions_store
-        .lock()
-        .map_err(|_| ApiError::internal())?;
-    let mut orders = state
-        .perp_order_store
-        .lock()
-        .map_err(|_| ApiError::internal())?;
-    let mut liquidations = state
-        .perp_liquidations_store
-        .lock()
-        .map_err(|_| ApiError::internal())?;
-    let response = crate::perps::run_perp_liquidation_tick(
-        &state.perps_read_config,
-        &mut positions,
-        &mut orders,
-        &mut liquidations,
-        &marks,
-        &state.lifecycle_events,
-        now,
-    )?;
+    let response = {
+        let mut positions = state
+            .perp_positions_store
+            .lock()
+            .map_err(|_| ApiError::internal())?;
+        let mut orders = state
+            .perp_order_store
+            .lock()
+            .map_err(|_| ApiError::internal())?;
+        let mut liquidations = state
+            .perp_liquidations_store
+            .lock()
+            .map_err(|_| ApiError::internal())?;
+        crate::perps::run_perp_liquidation_tick(
+            &state.perps_read_config,
+            &mut positions,
+            &mut orders,
+            &mut liquidations,
+            &marks,
+            &state.lifecycle_events,
+            started,
+        )?
+    };
+    if let Ok(mut slot) = state.perp_liquidation_last_tick.lock() {
+        *slot = Some(crate::perps::PerpsWorkerTickRecord::from_liquidation(
+            started,
+            now_ms(),
+            &response,
+        ));
+    }
     Ok(Json(response))
 }
 

@@ -41,6 +41,7 @@ pub mod price_reader;
 pub mod rejection;
 pub mod service;
 pub mod types;
+pub mod workers;
 
 pub use funding::{
     build_perp_funding_view, calculate_funding_payment_1e8, emit_perp_funding_lifecycle,
@@ -89,3 +90,8 @@ pub use service::{
     PerpPositionView,
 };
 pub use types::{PerpMarket, PerpMarketStatus, PerpPriceSnapshot};
+pub use workers::{
+    run_perps_funding_tick_once, run_perps_liquidation_tick_once, spawn_perps_funding_worker,
+    spawn_perps_liquidation_worker, PerpsFundingWorkerConfig, PerpsLiquidationWorkerConfig,
+    PerpsWorkerStaleOraclePolicy, PerpsWorkerTickRecord,
+};
