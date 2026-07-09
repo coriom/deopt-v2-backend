@@ -7,7 +7,10 @@
 //! failure surfaces as `PerpsPriceUnavailable` with the reason.
 
 use crate::error::{BackendError, Result};
-use crate::perps::config::{PerpsReadConfig, PerpsReadMarket};
+use crate::perps::config::{
+    compute_perps_market_risk_status_view, PerpsMarketAdminOverride, PerpsMarketOracleSnapshot,
+    PerpsMarketRiskStatusView, PerpsReadConfig, PerpsReadMarket,
+};
 use crate::perps::margin;
 use crate::perps::market_reader::PerpMarketRegistryReader;
 use crate::perps::order_store::PerpOrderStore;
@@ -63,7 +66,9 @@ pub fn ensure_chain_id_matches(cfg: &PerpsReadConfig, requested_chain_id: u64) -
 }
 
 /// List all configured Perps markets with their on-chain liveness
-/// status.
+/// status. Legacy signature — the returned `PerpMarket.risk` is `None`.
+/// Callers that also have a `PerpOraclePriceReader` should use
+/// [`list_perp_markets_with_risk`] to populate the risk view.
 pub async fn list_perp_markets<R: PerpMarketRegistryReader + ?Sized>(
     cfg: &PerpsReadConfig,
     reader: &R,
@@ -80,7 +85,7 @@ pub async fn list_perp_markets<R: PerpMarketRegistryReader + ?Sized>(
             .read_status(row)
             .await
             .unwrap_or(PerpMarketStatus::Unknown);
-        markets.push(mint_perp_market(cfg, row, status));
+        markets.push(mint_perp_market(cfg, row, status, None));
     }
     Ok(PerpMarketListing {
         markets,
@@ -89,7 +94,44 @@ pub async fn list_perp_markets<R: PerpMarketRegistryReader + ?Sized>(
     })
 }
 
-/// Fetch one market by symbol (e.g. `"ETH-PERP"`).
+/// PERPS-MARKET-STATUS-DTO-WS-V1 — list markets with the operational
+/// risk status view populated per row. When the oracle read fails for
+/// a row the risk view is still populated with
+/// `status=="stale_oracle"` — this is honest, not fabricated: an
+/// unreadable oracle means the market cannot support new risk.
+pub async fn list_perp_markets_with_risk<
+    R: PerpMarketRegistryReader + ?Sized,
+    P: PerpOraclePriceReader + ?Sized,
+>(
+    cfg: &PerpsReadConfig,
+    reader: &R,
+    price_reader: &P,
+) -> Result<PerpMarketListing> {
+    ensure_read_enabled(cfg)?;
+    let now = now_ms();
+    let mut markets = Vec::with_capacity(cfg.markets.len());
+    for row in &cfg.markets {
+        let onchain_status = reader
+            .read_status(row)
+            .await
+            .unwrap_or(PerpMarketStatus::Unknown);
+        let oracle = fetch_oracle_snapshot(cfg, price_reader, row, now).await;
+        // V1 has no per-market admin override wired; a future admin
+        // pause/resume endpoint fills this in.
+        let admin = PerpsMarketAdminOverride::default();
+        let risk = compute_perps_market_risk_status_view(cfg, row, oracle, admin, now);
+        markets.push(mint_perp_market(cfg, row, onchain_status, Some(risk)));
+    }
+    Ok(PerpMarketListing {
+        markets,
+        chain_id: cfg.chain_id,
+        trading_enabled: false,
+    })
+}
+
+/// Fetch one market by symbol (e.g. `"ETH-PERP"`). Legacy signature —
+/// the returned `PerpMarket.risk` is `None`. Callers that also have a
+/// `PerpOraclePriceReader` should use [`get_perp_market_with_risk`].
 pub async fn get_perp_market<R: PerpMarketRegistryReader + ?Sized>(
     cfg: &PerpsReadConfig,
     reader: &R,
@@ -103,7 +145,66 @@ pub async fn get_perp_market<R: PerpMarketRegistryReader + ?Sized>(
         .read_status(row)
         .await
         .unwrap_or(PerpMarketStatus::Unknown);
-    Ok(mint_perp_market(cfg, row, status))
+    Ok(mint_perp_market(cfg, row, status, None))
+}
+
+/// PERPS-MARKET-STATUS-DTO-WS-V1 — fetch one market with the
+/// operational risk status view populated.
+pub async fn get_perp_market_with_risk<
+    R: PerpMarketRegistryReader + ?Sized,
+    P: PerpOraclePriceReader + ?Sized,
+>(
+    cfg: &PerpsReadConfig,
+    reader: &R,
+    price_reader: &P,
+    symbol: &str,
+) -> Result<PerpMarket> {
+    ensure_read_enabled(cfg)?;
+    let row = cfg
+        .market_by_symbol(symbol)
+        .ok_or_else(|| BackendError::PerpsMarketNotFound(symbol.to_string()))?;
+    let onchain_status = reader
+        .read_status(row)
+        .await
+        .unwrap_or(PerpMarketStatus::Unknown);
+    let now = now_ms();
+    let oracle = fetch_oracle_snapshot(cfg, price_reader, row, now).await;
+    let admin = PerpsMarketAdminOverride::default();
+    let risk = compute_perps_market_risk_status_view(cfg, row, oracle, admin, now);
+    Ok(mint_perp_market(cfg, row, onchain_status, Some(risk)))
+}
+
+/// PERPS-MARKET-STATUS-DTO-WS-V1 — shared oracle-snapshot builder for
+/// the market list + get + status-computation paths. Never fabricates:
+/// an RPC error, `ok=false`, or a zero price all become `None` (which
+/// `compute_perps_market_risk_status_view` maps to `stale_oracle`).
+async fn fetch_oracle_snapshot<P: PerpOraclePriceReader + ?Sized>(
+    cfg: &PerpsReadConfig,
+    price_reader: &P,
+    market: &PerpsReadMarket,
+    now: TimestampMs,
+) -> Option<PerpsMarketOracleSnapshot> {
+    let read = price_reader.read_price(market).await.ok()?;
+    if !read.ok || read.price_1e8 == 0 {
+        return None;
+    }
+    let updated_at_ms = read.updated_at_ms();
+    let stale_after_ms = (cfg.stale_after_sec as i64).saturating_mul(1000);
+    let is_stale = if updated_at_ms == 0 {
+        true
+    } else {
+        now.saturating_sub(updated_at_ms) > stale_after_ms
+    };
+    Some(PerpsMarketOracleSnapshot {
+        index_price_1e8: read.price_1e8,
+        // V1: mark == index. A future per-market mark smoother will
+        // diverge these two, at which point the deviation guard in
+        // `compute_perps_market_risk_status_view` starts producing
+        // `"deviation_exceeded"` above threshold.
+        mark_price_1e8: read.price_1e8,
+        updated_at_ms,
+        is_stale,
+    })
 }
 
 /// Fetch the latest price snapshot for one market by symbol.
@@ -128,6 +229,7 @@ fn mint_perp_market(
     cfg: &PerpsReadConfig,
     row: &PerpsReadMarket,
     status: PerpMarketStatus,
+    risk: Option<PerpsMarketRiskStatusView>,
 ) -> PerpMarket {
     PerpMarket {
         market_id: row.symbol.clone(),
@@ -138,6 +240,7 @@ fn mint_perp_market(
         chain_id: cfg.chain_id,
         source: PerpMarketSource::OnchainRegistry,
         trading_enabled: false,
+        risk,
     }
 }
 

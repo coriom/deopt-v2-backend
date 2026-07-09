@@ -10,7 +10,8 @@
 //! Perps mutation gate. The `PerpsNotLive` handler-entry guards remain
 //! in place regardless of what is configured here.
 
-use crate::types::AccountId;
+use crate::types::{AccountId, TimestampMs};
+use serde::{Deserialize, Serialize};
 
 const DEFAULT_BASE_SEPOLIA_CHAIN_ID: u64 = 84532;
 const DEFAULT_STALE_AFTER_SEC: u64 = 60;
@@ -346,7 +347,8 @@ impl PerpsMarketRiskStatus {
     }
 
     /// Structured reason string for API/WS surfaces. Stable — pinned
-    /// by `perps_margin_oracle_risk_v1_tests.rs`.
+    /// by `perps_margin_oracle_risk_v1_tests.rs` and
+    /// `perps_market_status_dto_ws_v1_tests.rs`.
     pub fn reason_code(&self) -> &'static str {
         match self {
             Self::Active => "active",
@@ -354,6 +356,275 @@ impl PerpsMarketRiskStatus {
             Self::DeviationExceeded { .. } => "deviation_exceeded",
             Self::Paused => "paused",
         }
+    }
+}
+
+// ---------------------------------------------------------------------
+// PERPS-MARKET-STATUS-DTO-WS-V1 — public/API-safe status view.
+// ---------------------------------------------------------------------
+
+/// Serialized public-safe view of a single Perps market's operational
+/// risk status. Returned on `GET /perps/markets` and
+/// `GET /perps/markets/:market_id`, and reusable as-is for a future
+/// public-market WS status frame (no such WS channel exists yet — the
+/// current WS surface is account-scoped only). Never carries RPC URLs,
+/// DB URLs, admin tokens, allowlist detail, signatures, nonces, or any
+/// internal-only config value.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PerpsMarketRiskStatusView {
+    /// Stable string form of the status. One of `"active"`,
+    /// `"stale_oracle"`, `"deviation_exceeded"`, `"paused"`,
+    /// `"cancel_only"`, or `"disabled"`. Pinned by the test binary
+    /// so future consumers can hard-match.
+    pub status: String,
+    /// Machine-readable reason code. Equals `status` for the simple
+    /// statuses; may carry structured context (e.g. deviation
+    /// observed vs threshold bps as a `":"`-separated tail — see
+    /// `deviation_reason_code_from`).
+    pub reason_code: String,
+    /// True only when `status == "active"`. New risk-increasing
+    /// orders (opens / increases) are gated on this.
+    pub allows_new_risk: bool,
+    /// True for every status except `"disabled"`. Reduce-only closes
+    /// are permitted in stale/deviation/paused/cancel-only because
+    /// they can only lower risk.
+    pub allows_reduce_only: bool,
+    /// True for every status except `"disabled"`. Cancels always
+    /// allowed while the market is registered so a trader can exit
+    /// a resting order regardless of oracle state.
+    pub allows_cancel: bool,
+    /// Configured `PERPS_STALE_AFTER_SEC`. Not a secret; exposed so
+    /// operator tooling can correlate stale-oracle status with the
+    /// configured threshold.
+    pub oracle_stale_after_sec: u64,
+    /// Configured `PERPS_ORACLE_MAX_DEVIATION_BPS`. Not a secret.
+    pub oracle_max_deviation_bps: u32,
+    /// Milliseconds since epoch when this snapshot was computed.
+    /// Consumers may treat older snapshots as stale for their own
+    /// caching purposes.
+    pub last_checked_at_ms: TimestampMs,
+}
+
+/// PERPS-MARKET-STATUS-DTO-WS-V1 — one oracle read for status
+/// computation. `None` means the read failed (RPC error, `ok=false`,
+/// or a zero price which we refuse to interpret). `Some(read)` carries
+/// the raw price, `updated_at_ms`, and derived staleness flag so the
+/// helper never needs to re-consult the config for the threshold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PerpsMarketOracleSnapshot {
+    /// Router-reported index price (`1e8`).
+    pub index_price_1e8: u128,
+    /// Router-reported mark price. In V1, `mark == index`; a future
+    /// per-market mark smoother will diverge this from the index and
+    /// the deviation guard will start rejecting above threshold.
+    pub mark_price_1e8: u128,
+    /// Milliseconds since epoch when the oracle last updated. `0`
+    /// when the oracle exposes a legitimate "never updated" state
+    /// (which the caller MUST treat as stale — this helper does).
+    pub updated_at_ms: TimestampMs,
+    /// True when the update timestamp exceeds
+    /// `PERPS_STALE_AFTER_SEC`. Callers that already computed
+    /// staleness (e.g. via `prefetch_mark_prices`) pass their derived
+    /// value here so the helper is fully deterministic given inputs.
+    pub is_stale: bool,
+}
+
+/// PERPS-MARKET-STATUS-DTO-WS-V1 — manual/admin-driven flags. Neither
+/// is env-reachable in V1; the enum variants exist so the compute
+/// helper's priority order is complete and a future admin
+/// pause/resume endpoint can flip these without a wire break.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PerpsMarketAdminOverride {
+    /// When `true` the market is treated as `PerpsMarketRiskStatus::Paused`
+    /// regardless of oracle state. Reduce-only closes and cancels are
+    /// still allowed on the DTO (`allows_reduce_only`, `allows_cancel`).
+    pub paused: bool,
+    /// When `true` the market is `cancel_only` — no new risk
+    /// (increase or open), reduce-only still allowed, cancels always
+    /// allowed. V1 does not surface this yet; reserved for a future
+    /// admin toggle.
+    pub cancel_only: bool,
+    /// When `true` the market is fully `disabled` — nothing allowed.
+    /// Distinct from `PerpsReadConfig.enabled == false` (which
+    /// disables the entire read layer). This flag is per-market and
+    /// currently unreachable from env.
+    pub disabled: bool,
+}
+
+/// PERPS-MARKET-STATUS-DTO-WS-V1 — compute a public-safe market risk
+/// status view for one market at a given moment.
+///
+/// **Priority order (highest first):**
+///
+/// 1. `disabled`   — market entirely off (`admin.disabled = true`).
+/// 2. `paused`     — operator-driven pause (`admin.paused = true`).
+/// 3. `cancel_only` — operator-driven cancel-only mode (`admin.cancel_only = true`).
+/// 4. `stale_oracle` — oracle read missing or older than
+///    `cfg.stale_after_sec`.
+/// 5. `deviation_exceeded` — |index − mark| / index in bps exceeds
+///    `cfg.oracle_max_deviation_bps`.
+/// 6. `active`     — every other case (fresh oracle, deviation within
+///    threshold, no admin override).
+///
+/// The priority puts `cancel_only` above oracle staleness so that an
+/// operator-driven cancel-only status is not masked by a stale
+/// oracle: the operator's decision is the ground truth.
+///
+/// **Reduce-only + cancel policy:**
+///
+/// * `allows_reduce_only = !disabled` — reduce-only can only lower
+///   risk, so it stays enabled in every non-disabled status.
+/// * `allows_cancel = !disabled` — cancel is a defensive action a
+///   trader must always be able to take.
+///
+/// **Never uses:** RPC URLs, DB URLs, admin tokens, allowlist, or any
+/// value not already surfaced through configured knobs.
+pub fn compute_perps_market_risk_status_view(
+    cfg: &PerpsReadConfig,
+    market: &PerpsReadMarket,
+    oracle: Option<PerpsMarketOracleSnapshot>,
+    admin: PerpsMarketAdminOverride,
+    now: TimestampMs,
+) -> PerpsMarketRiskStatusView {
+    let status = compute_status(cfg, oracle, admin);
+    // Admin overrides take priority for the wire string because the
+    // enum's `Paused` variant covers three distinct admin states
+    // (`disabled`, `paused`, `cancel_only`). Intercepting here keeps
+    // the enum minimal without ambiguity on the wire.
+    let (status_str, reason_code) = if admin.disabled {
+        ("disabled", "disabled".to_string())
+    } else if admin.paused {
+        ("paused", "paused".to_string())
+    } else if admin.cancel_only {
+        ("cancel_only", "cancel_only".to_string())
+    } else {
+        let (s, r) = status_wire(&status);
+        (s, r)
+    };
+    let allows_reduce_only = !admin.disabled;
+    let allows_cancel = !admin.disabled;
+    let _ = market; // reserved: per-market override slot
+    PerpsMarketRiskStatusView {
+        status: status_str.to_string(),
+        reason_code,
+        allows_new_risk: matches!(status, PerpsMarketRiskStatus::Active)
+            && !admin.disabled
+            && !admin.paused
+            && !admin.cancel_only,
+        allows_reduce_only,
+        allows_cancel,
+        oracle_stale_after_sec: cfg.stale_after_sec,
+        oracle_max_deviation_bps: cfg.oracle_max_deviation_bps,
+        last_checked_at_ms: now,
+    }
+}
+
+/// PERPS-MARKET-STATUS-DTO-WS-V1 — the internal compute step,
+/// returning the raw enum. Kept public so
+/// `compute_perps_market_risk_status_view` and any future admin
+/// endpoint can share it without duplicating the priority ladder.
+pub fn compute_perps_market_risk_status(
+    cfg: &PerpsReadConfig,
+    oracle: Option<PerpsMarketOracleSnapshot>,
+    admin: PerpsMarketAdminOverride,
+) -> PerpsMarketRiskStatus {
+    compute_status(cfg, oracle, admin)
+}
+
+fn compute_status(
+    cfg: &PerpsReadConfig,
+    oracle: Option<PerpsMarketOracleSnapshot>,
+    admin: PerpsMarketAdminOverride,
+) -> PerpsMarketRiskStatus {
+    // Priority 1: disabled (per-market admin flag). We surface this
+    // as `Paused` in the enum today because the enum has no
+    // `Disabled` variant; the wire string is still `"disabled"` via
+    // `status_wire`. Keeping the enum minimal is intentional — we do
+    // not want an enum variant that no computation path can produce
+    // to leak into the public API.
+    if admin.disabled {
+        return PerpsMarketRiskStatus::Paused;
+    }
+    // Priority 2: admin-driven pause.
+    if admin.paused {
+        return PerpsMarketRiskStatus::Paused;
+    }
+    // Priority 3: cancel-only. We surface as `Paused` at the enum
+    // level (same rationale as Disabled) and translate to
+    // `"cancel_only"` on the wire.
+    if admin.cancel_only {
+        return PerpsMarketRiskStatus::Paused;
+    }
+    // Priority 4: stale oracle. `None` (reader failed / ok=false /
+    // zero price) counts as stale.
+    let Some(snapshot) = oracle else {
+        return PerpsMarketRiskStatus::StaleOracle {
+            reason: "oracle_read_unavailable",
+        };
+    };
+    if snapshot.is_stale {
+        return PerpsMarketRiskStatus::StaleOracle {
+            reason: "oracle_stale",
+        };
+    }
+    // Priority 5: deviation guard. V1 has `mark == index` so this
+    // check passes deterministically; the guard is present so a
+    // future divergence rejects at threshold.
+    if snapshot.index_price_1e8 != 0 {
+        let observed = compute_deviation_bps(snapshot.index_price_1e8, snapshot.mark_price_1e8);
+        if observed > cfg.oracle_max_deviation_bps {
+            return PerpsMarketRiskStatus::DeviationExceeded {
+                observed_bps: observed,
+                threshold_bps: cfg.oracle_max_deviation_bps,
+            };
+        }
+    }
+    // Priority 6: active.
+    PerpsMarketRiskStatus::Active
+}
+
+/// Absolute deviation between two `1e8`-scaled prices in basis
+/// points, relative to `index`. Mirrors the internal
+/// `execution::deviation_bps` helper but is decoupled so the config
+/// module does not have to `use crate::perps::execution`.
+fn compute_deviation_bps(index_1e8: u128, mark_1e8: u128) -> u32 {
+    if index_1e8 == 0 {
+        return 0;
+    }
+    let diff = if mark_1e8 >= index_1e8 {
+        mark_1e8 - index_1e8
+    } else {
+        index_1e8 - mark_1e8
+    };
+    // `bps = diff / index * 10_000`. Saturate at `u32::MAX` for
+    // divergence so extreme cases still cross the threshold.
+    let bps = diff.saturating_mul(10_000) / index_1e8;
+    u32::try_from(bps).unwrap_or(u32::MAX)
+}
+
+/// Wire form for the status. Priority-driven translation so the
+/// runtime enum stays minimal but the wire string surface is
+/// complete. Includes structured context on `deviation_exceeded`.
+fn status_wire(status: &PerpsMarketRiskStatus) -> (&'static str, String) {
+    match status {
+        PerpsMarketRiskStatus::Active => ("active", "active".to_string()),
+        PerpsMarketRiskStatus::StaleOracle { reason } => {
+            ("stale_oracle", format!("stale_oracle:{reason}"))
+        }
+        PerpsMarketRiskStatus::DeviationExceeded {
+            observed_bps,
+            threshold_bps,
+        } => (
+            "deviation_exceeded",
+            format!("deviation_exceeded:observed={observed_bps},threshold={threshold_bps}"),
+        ),
+        // The enum's `Paused` variant is intentionally re-used for
+        // three admin-driven wire strings (`disabled`, `paused`,
+        // `cancel_only`) so the internal enum stays minimal. The
+        // wire caller MUST use `compute_perps_market_risk_status_view`
+        // which decides the wire string from the admin override.
+        // Direct enum conversion falls through to `"paused"`.
+        PerpsMarketRiskStatus::Paused => ("paused", "paused".to_string()),
     }
 }
 

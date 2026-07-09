@@ -32,6 +32,14 @@ pub struct PerpMarket {
     /// Always false in this milestone. Explicit for the frontend so
     /// there's no ambiguity about the mutation gate.
     pub trading_enabled: bool,
+    /// PERPS-MARKET-STATUS-DTO-WS-V1 — public-safe operational risk
+    /// status view. `None` when the caller could not compute a
+    /// snapshot (e.g. the older `list_perp_markets` code path that
+    /// doesn't receive a price reader — kept `Option` for wire
+    /// backwards-compat). `Some` carries the computed
+    /// `PerpsMarketRiskStatusView`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk: Option<crate::perps::config::PerpsMarketRiskStatusView>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

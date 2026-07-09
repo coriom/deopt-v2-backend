@@ -76,18 +76,22 @@ pub use orders::{
     PerpOrderType, PerpTimeInForce,
 };
 
-pub use config::{PerpsMarketRiskStatus, PerpsReadConfig, PerpsReadMarket};
+pub use config::{
+    compute_perps_market_risk_status, compute_perps_market_risk_status_view,
+    PerpsMarketAdminOverride, PerpsMarketOracleSnapshot, PerpsMarketRiskStatus,
+    PerpsMarketRiskStatusView, PerpsReadConfig, PerpsReadMarket,
+};
 pub use execution::deviation_bps;
 pub use fills::{apply_perp_fill_for_account, PerpFillInput, PerpFillOutcome};
 pub use market_reader::{PerpMarketRegistryReader, PerpMarketRegistryRpcReader};
 pub use positions::{PerpPosition, PerpPositionStatus, PerpPositionsStore, PerpSide};
 pub use price_reader::{PerpOraclePriceReader, PerpOracleRouterRpcReader};
 pub use service::{
-    cancel_perp_order_via_state, get_perp_market, get_perp_market_price, get_perp_position_view,
-    list_perp_market_positions_for_account, list_perp_markets, list_perp_positions_for_account,
-    submit_perp_order_via_state, PerpFillListResponse, PerpFillView, PerpMarketListing,
-    PerpMarketPriceResponse, PerpOrderListResponse, PerpOrderView, PerpPositionListResponse,
-    PerpPositionView,
+    cancel_perp_order_via_state, get_perp_market, get_perp_market_price, get_perp_market_with_risk,
+    get_perp_position_view, list_perp_market_positions_for_account, list_perp_markets,
+    list_perp_markets_with_risk, list_perp_positions_for_account, submit_perp_order_via_state,
+    PerpFillListResponse, PerpFillView, PerpMarketListing, PerpMarketPriceResponse,
+    PerpOrderListResponse, PerpOrderView, PerpPositionListResponse, PerpPositionView,
 };
 pub use types::{PerpMarket, PerpMarketStatus, PerpPriceSnapshot};
 pub use workers::{

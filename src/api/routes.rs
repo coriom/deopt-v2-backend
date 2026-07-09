@@ -2202,9 +2202,27 @@ async fn perps_markets(
     State(state): State<AppState>,
 ) -> Result<Json<crate::perps::PerpMarketListing>, ApiError> {
     crate::perps::service::ensure_read_enabled(&state.perps_read_config)?;
-    let reader = build_perp_market_registry_reader(&state)?;
-    let listing = crate::perps::list_perp_markets(&state.perps_read_config, &reader).await?;
-    Ok(Json(listing))
+    let registry_reader = build_perp_market_registry_reader(&state)?;
+    // PERPS-MARKET-STATUS-DTO-WS-V1 — populate the per-market risk
+    // status view. When the RPC layer is disabled the price reader
+    // build fails; in that case fall back to the legacy path so the
+    // registry-status surface still works, with `risk: None`.
+    match build_perp_oracle_price_reader(&state) {
+        Ok(price_reader) => {
+            let listing = crate::perps::list_perp_markets_with_risk(
+                &state.perps_read_config,
+                &registry_reader,
+                &price_reader,
+            )
+            .await?;
+            Ok(Json(listing))
+        }
+        Err(_) => {
+            let listing =
+                crate::perps::list_perp_markets(&state.perps_read_config, &registry_reader).await?;
+            Ok(Json(listing))
+        }
+    }
 }
 
 async fn perps_market(
@@ -2212,10 +2230,28 @@ async fn perps_market(
     Path(market_id): Path<String>,
 ) -> Result<Json<crate::perps::PerpMarket>, ApiError> {
     crate::perps::service::ensure_read_enabled(&state.perps_read_config)?;
-    let reader = build_perp_market_registry_reader(&state)?;
-    let market =
-        crate::perps::get_perp_market(&state.perps_read_config, &reader, &market_id).await?;
-    Ok(Json(market))
+    let registry_reader = build_perp_market_registry_reader(&state)?;
+    match build_perp_oracle_price_reader(&state) {
+        Ok(price_reader) => {
+            let market = crate::perps::get_perp_market_with_risk(
+                &state.perps_read_config,
+                &registry_reader,
+                &price_reader,
+                &market_id,
+            )
+            .await?;
+            Ok(Json(market))
+        }
+        Err(_) => {
+            let market = crate::perps::get_perp_market(
+                &state.perps_read_config,
+                &registry_reader,
+                &market_id,
+            )
+            .await?;
+            Ok(Json(market))
+        }
+    }
 }
 
 async fn perps_market_price(
