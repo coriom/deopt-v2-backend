@@ -63,6 +63,13 @@ pub enum WriteAuthAction {
     /// never satisfy a multi-leg create signature and vice versa.
     OptionMultiLegRfqCreate,
     OptionMultiLegRfqQuoteSubmit,
+    /// RFQ-MULTI-LEG-ATOMIC-ACCEPT-V1 — taker accept of a maker
+    /// package quote. Signs over rfq_id + quote_id + expected
+    /// package_price + expected legs_count + ordered per-leg prices
+    /// so the taker commits to the exact quote being accepted; the
+    /// server refuses if any of those fields diverge from the
+    /// server-loaded quote state.
+    OptionMultiLegRfqAccept,
     OptionExecutionIntentSignatureSubmit,
     /// OPTIONS-TWAP-ORDERS-V1 — taker create/cancel of a parent TWAP order.
     OptionTwapCreate,
@@ -102,6 +109,7 @@ impl WriteAuthAction {
             Self::OptionRfqCancel => "OPTION_RFQ_CANCEL",
             Self::OptionMultiLegRfqCreate => "OPTION_MULTI_LEG_RFQ_CREATE",
             Self::OptionMultiLegRfqQuoteSubmit => "OPTION_MULTI_LEG_RFQ_QUOTE_SUBMIT",
+            Self::OptionMultiLegRfqAccept => "OPTION_MULTI_LEG_RFQ_ACCEPT",
             Self::OptionExecutionIntentSignatureSubmit => {
                 "OPTION_EXECUTION_INTENT_SIGNATURE_SUBMIT"
             }
@@ -126,6 +134,7 @@ impl WriteAuthAction {
             "OPTION_RFQ_CANCEL" => Self::OptionRfqCancel,
             "OPTION_MULTI_LEG_RFQ_CREATE" => Self::OptionMultiLegRfqCreate,
             "OPTION_MULTI_LEG_RFQ_QUOTE_SUBMIT" => Self::OptionMultiLegRfqQuoteSubmit,
+            "OPTION_MULTI_LEG_RFQ_ACCEPT" => Self::OptionMultiLegRfqAccept,
             "OPTION_EXECUTION_INTENT_SIGNATURE_SUBMIT" => {
                 Self::OptionExecutionIntentSignatureSubmit
             }

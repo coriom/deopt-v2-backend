@@ -1,5 +1,5 @@
-//! RFQ-MULTI-LEG-CREATE-QUOTE-V1 — service layer for multi-leg
-//! atomic option RFQ create + quote paths.
+//! RFQ-MULTI-LEG-CREATE-QUOTE-V1 + RFQ-MULTI-LEG-ATOMIC-ACCEPT-V1 —
+//! service layer for multi-leg atomic option RFQ.
 //!
 //! Flag: `OPTION_RFQ_MULTI_LEG_ENABLED` (default `false`). Every
 //! public service function starts with
@@ -7,15 +7,17 @@
 //! with `BackendError::OptionMultiLegRfqNotLive` when the flag is
 //! `false`. The route layer maps that to `503 SERVICE_UNAVAILABLE`.
 //!
-//! Scope for this milestone:
+//! Scope now covers:
 //!
 //! * create parent + N legs (2..=8) atomically;
 //! * list / read;
 //! * submit quote parent + N per-leg prices atomically;
 //! * list / read quotes;
-//! * lifecycle events emitted after commit;
-//! * accept / cancel are NOT implemented here — deferred to
-//!   `RFQ-MULTI-LEG-ATOMIC-ACCEPT-V1` and `_CANCEL-V1`.
+//! * **atomic accept** — RFQ + winning quote flip to `accepted`, all
+//!   losing quotes flip to `rejected`, parent fill + N fill_leg rows
+//!   inserted, all inside a single transaction.
+//! * lifecycle events emitted post-commit;
+//! * cancel is NOT implemented here — deferred to `_CANCEL-V1`.
 
 use crate::api::AppState;
 use crate::error::{BackendError, Result};
@@ -24,11 +26,11 @@ use crate::options::service::{
 };
 use crate::options::types::OptionSeriesStatus;
 use crate::options::{
-    validate_multi_leg_composition, validate_multi_leg_quote_composition, OptionMultiLegRfqId,
-    OptionMultiLegRfqLeg, OptionMultiLegRfqQuote, OptionMultiLegRfqQuoteId,
-    OptionMultiLegRfqQuoteLeg, OptionMultiLegRfqQuoteSignatureStatus, OptionMultiLegRfqQuoteStatus,
-    OptionMultiLegRfqRequest, OptionMultiLegRfqStatus, MAX_LEGS_PER_MULTI_LEG_RFQ,
-    MIN_LEGS_PER_MULTI_LEG_RFQ,
+    validate_multi_leg_composition, validate_multi_leg_quote_composition, OptionMultiLegRfqFill,
+    OptionMultiLegRfqFillId, OptionMultiLegRfqFillLeg, OptionMultiLegRfqId, OptionMultiLegRfqLeg,
+    OptionMultiLegRfqQuote, OptionMultiLegRfqQuoteId, OptionMultiLegRfqQuoteLeg,
+    OptionMultiLegRfqQuoteSignatureStatus, OptionMultiLegRfqQuoteStatus, OptionMultiLegRfqRequest,
+    OptionMultiLegRfqStatus, MAX_LEGS_PER_MULTI_LEG_RFQ, MIN_LEGS_PER_MULTI_LEG_RFQ,
 };
 use crate::types::{now_ms, AccountId, Price1e8, Side, Size1e8};
 use uuid::Uuid;
@@ -514,4 +516,323 @@ fn validate_account(account: &AccountId) -> Result<()> {
 
 pub fn multi_leg_status_str(status: OptionMultiLegRfqStatus) -> &'static str {
     status.as_str()
+}
+
+// ---------------------------------------------------------------------
+// RFQ-MULTI-LEG-ATOMIC-ACCEPT-V1
+// ---------------------------------------------------------------------
+
+/// Compact accept input. Populated by the HTTP handler from
+/// `AcceptOptionMultiLegRfqQuoteRequest` AFTER the v2 authorization
+/// envelope has been verified. The `expected_*` fields feed into the
+/// canonical byte-freeze so a taker committing to a specific package
+/// price cannot be tricked into accepting a mutated quote.
+#[derive(Clone, Debug)]
+pub struct AcceptOptionMultiLegRfqQuoteInput {
+    pub taker: AccountId,
+    pub taker_subaccount_id: u32,
+    pub option_rfq_id: OptionMultiLegRfqId,
+    pub quote_id: OptionMultiLegRfqQuoteId,
+    pub expected_package_price_1e8: String,
+    pub expected_legs_count: u32,
+    pub expected_leg_prices_1e8: Vec<Price1e8>,
+}
+
+/// Outcome returned to the HTTP handler and echoed back to the
+/// client. Includes all rows the atomic transaction wrote, so the
+/// caller can render the accepted fill without a follow-up round
+/// trip.
+#[derive(Clone, Debug)]
+pub struct AcceptOptionMultiLegRfqQuoteOutcome {
+    pub rfq: OptionMultiLegRfqRequest,
+    pub quote: OptionMultiLegRfqQuote,
+    pub fill: OptionMultiLegRfqFill,
+    pub fill_legs: Vec<OptionMultiLegRfqFillLeg>,
+    pub legs: Vec<OptionMultiLegRfqLeg>,
+}
+
+pub async fn accept_option_multi_leg_rfq_quote(
+    state: &AppState,
+    input: AcceptOptionMultiLegRfqQuoteInput,
+) -> Result<AcceptOptionMultiLegRfqQuoteOutcome> {
+    ensure_option_multi_leg_rfq_enabled(state)?;
+    validate_account(&input.taker)?;
+    if input.taker_subaccount_id < 1 {
+        return Err(BackendError::InvalidOptionRfqState(
+            "multi-leg accept taker_subaccount_id must be >= 1".to_string(),
+        ));
+    }
+
+    let now = now_ms();
+
+    // Load RFQ + legs.
+    let (rfq, rfq_legs) = get_option_multi_leg_rfq(state, input.option_rfq_id).await?;
+
+    // Taker identity guard — the RFQ's taker MUST match the caller
+    // and the caller's subaccount must match the RFQ's persisted
+    // `taker_subaccount_id`. The v2 auth envelope binds `taker` to
+    // the signature; this check is the cross-subaccount refusal
+    // that mirrors the single-leg accept semantics.
+    if !accounts_equal(&rfq.taker, &input.taker) {
+        return Err(BackendError::InvalidOptionRfqState(
+            "multi-leg RFQ taker mismatch".to_string(),
+        ));
+    }
+    if rfq.taker_subaccount_id != input.taker_subaccount_id {
+        return Err(BackendError::InvalidOptionRfqState(
+            "multi-leg RFQ taker subaccount mismatch".to_string(),
+        ));
+    }
+    if rfq.effective_status(now) != OptionMultiLegRfqStatus::Open {
+        return Err(BackendError::InvalidOptionRfqState(
+            "multi-leg option RFQ is not open".to_string(),
+        ));
+    }
+
+    // Load quote + legs.
+    let (quote, quote_legs) = get_option_multi_leg_rfq_quote(state, input.quote_id).await?;
+    if quote.option_rfq_id != input.option_rfq_id {
+        return Err(BackendError::InvalidOptionRfqQuoteState(
+            "multi-leg option RFQ quote does not belong to RFQ".to_string(),
+        ));
+    }
+    if quote.effective_status(now) != OptionMultiLegRfqQuoteStatus::Active {
+        return Err(BackendError::InvalidOptionRfqQuoteState(
+            "multi-leg option RFQ quote is not active".to_string(),
+        ));
+    }
+
+    // Package-integrity guards — the taker's canonical committed to
+    // the package price, leg count, and every ordered per-leg price.
+    // Any divergence between the canonical inputs and the server-
+    // loaded quote is a hostile mutation attempt.
+    if quote.package_price_1e8 != input.expected_package_price_1e8 {
+        return Err(BackendError::InvalidOptionRfqQuoteState(
+            "multi-leg quote package_price_1e8 mismatch".to_string(),
+        ));
+    }
+    if quote_legs.len() as u32 != input.expected_legs_count {
+        return Err(BackendError::InvalidOptionRfqQuoteState(
+            "multi-leg quote legs_count mismatch".to_string(),
+        ));
+    }
+    if quote_legs.len() != rfq_legs.len() {
+        return Err(BackendError::InvalidOptionRfqQuoteState(
+            "multi-leg quote legs count does not match RFQ".to_string(),
+        ));
+    }
+    if input.expected_leg_prices_1e8.len() != quote_legs.len() {
+        return Err(BackendError::InvalidOptionRfqQuoteState(
+            "multi-leg accept expected_leg_prices length mismatch".to_string(),
+        ));
+    }
+    for (i, quote_leg) in quote_legs.iter().enumerate() {
+        if quote_leg.leg_index as usize != i {
+            return Err(BackendError::InvalidOptionRfqQuoteState(
+                "multi-leg quote legs are not contiguous".to_string(),
+            ));
+        }
+        if quote_leg.leg_index != rfq_legs[i].leg_index {
+            return Err(BackendError::InvalidOptionRfqQuoteState(
+                "multi-leg quote leg_index does not match RFQ leg_index".to_string(),
+            ));
+        }
+        if quote_leg.price_1e8 == 0 {
+            return Err(BackendError::InvalidOptionRfqQuoteState(
+                "multi-leg quote leg price is zero".to_string(),
+            ));
+        }
+        if input.expected_leg_prices_1e8[i] != quote_leg.price_1e8 {
+            return Err(BackendError::InvalidOptionRfqQuoteState(
+                "multi-leg accept expected_leg_price mismatch".to_string(),
+            ));
+        }
+    }
+    if quote.size_1e8 > rfq_legs.iter().map(|l| l.size_1e8).min().unwrap_or(0) {
+        return Err(BackendError::InvalidOptionRfqQuoteState(
+            "multi-leg quote size exceeds smallest RFQ leg size".to_string(),
+        ));
+    }
+
+    // Every referenced series must still be Active at accept time.
+    let now_sec_value = now_sec(now)?;
+    for leg in &rfq_legs {
+        let series = get_option_series(state, &leg.option_series_id).await?;
+        if series.effective_status(now_sec_value) != OptionSeriesStatus::Active {
+            return Err(BackendError::InvalidOptionRfqState(format!(
+                "multi-leg RFQ leg {} references an inactive option series",
+                leg.leg_index
+            )));
+        }
+    }
+
+    // Build the fill + fill legs. Prices come from the persisted
+    // quote legs (server-authoritative) — the taker cannot influence
+    // per-leg prices here beyond having signed off on the same list
+    // through the canonical.
+    let fill_id: OptionMultiLegRfqFillId = Uuid::new_v4();
+    let fill = OptionMultiLegRfqFill {
+        fill_id,
+        option_rfq_id: rfq.option_rfq_id,
+        quote_id: quote.quote_id,
+        taker: rfq.taker.clone(),
+        taker_subaccount_id: rfq.taker_subaccount_id,
+        mm_account: quote.mm_account.clone(),
+        maker_subaccount_id: quote.maker_subaccount_id,
+        package_price_1e8: quote.package_price_1e8.clone(),
+        size_1e8: quote.size_1e8,
+        created_at_ms: now,
+    };
+    let fill_legs: Vec<OptionMultiLegRfqFillLeg> = rfq_legs
+        .iter()
+        .zip(quote_legs.iter())
+        .map(|(rfq_leg, quote_leg)| OptionMultiLegRfqFillLeg {
+            fill_id,
+            leg_index: rfq_leg.leg_index,
+            option_series_id: rfq_leg.option_series_id.clone(),
+            side: rfq_leg.side,
+            size_1e8: quote.size_1e8,
+            price_1e8: quote_leg.price_1e8,
+        })
+        .collect();
+
+    // Persist atomically.
+    if let Some(repository) = state.repository.clone() {
+        repository
+            .accept_option_multi_leg_rfq_quote_and_insert_fill(
+                rfq.option_rfq_id,
+                quote.quote_id,
+                &fill,
+                &fill_legs,
+            )
+            .await?;
+        // Reload the rows so the response reflects the committed
+        // state (status flips, etc.).
+        let (persisted_rfq, persisted_legs) = repository
+            .get_option_multi_leg_rfq(rfq.option_rfq_id)
+            .await?
+            .ok_or(BackendError::InvalidOptionRfqId)?;
+        let (persisted_quote, _persisted_quote_legs) = repository
+            .get_option_multi_leg_rfq_quote(quote.quote_id)
+            .await?
+            .ok_or(BackendError::InvalidOptionRfqQuoteId)?;
+        let (persisted_fill, persisted_fill_legs) = repository
+            .get_option_multi_leg_rfq_fill(fill_id)
+            .await?
+            .ok_or_else(|| {
+                BackendError::Persistence(
+                    "multi-leg option RFQ fill vanished after insert".to_string(),
+                )
+            })?;
+        emit_multi_leg_rfq_accepted_lifecycle(
+            state,
+            &persisted_rfq,
+            &persisted_quote,
+            &persisted_fill,
+        );
+        return Ok(AcceptOptionMultiLegRfqQuoteOutcome {
+            rfq: persisted_rfq,
+            quote: persisted_quote,
+            fill: persisted_fill,
+            fill_legs: persisted_fill_legs,
+            legs: persisted_legs,
+        });
+    }
+
+    let (persisted_rfq, persisted_quote) = state
+        .options_store
+        .lock()
+        .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?
+        .accept_option_multi_leg_rfq_quote(
+            rfq.option_rfq_id,
+            quote.quote_id,
+            fill.clone(),
+            fill_legs.clone(),
+        )?;
+    emit_multi_leg_rfq_accepted_lifecycle(state, &persisted_rfq, &persisted_quote, &fill);
+    Ok(AcceptOptionMultiLegRfqQuoteOutcome {
+        rfq: persisted_rfq,
+        quote: persisted_quote,
+        fill,
+        fill_legs,
+        legs: rfq_legs,
+    })
+}
+
+pub async fn get_option_multi_leg_rfq_fill(
+    state: &AppState,
+    fill_id: OptionMultiLegRfqFillId,
+) -> Result<(OptionMultiLegRfqFill, Vec<OptionMultiLegRfqFillLeg>)> {
+    ensure_option_multi_leg_rfq_enabled(state)?;
+    if let Some(repository) = state.repository.clone() {
+        return repository
+            .get_option_multi_leg_rfq_fill(fill_id)
+            .await?
+            .ok_or_else(|| {
+                BackendError::InvalidOptionRfqState("multi-leg RFQ fill not found".to_string())
+            });
+    }
+    state
+        .options_store
+        .lock()
+        .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?
+        .get_option_multi_leg_rfq_fill(fill_id)
+        .ok_or_else(|| {
+            BackendError::InvalidOptionRfqState("multi-leg RFQ fill not found".to_string())
+        })
+}
+
+fn emit_multi_leg_rfq_accepted_lifecycle(
+    state: &AppState,
+    rfq: &OptionMultiLegRfqRequest,
+    quote: &OptionMultiLegRfqQuote,
+    fill: &OptionMultiLegRfqFill,
+) {
+    use crate::api::public_ws::{LifecycleChannel, LifecycleEvent, LifecyclePayload};
+    // For a multi-leg RFQ the fan-out targets are taker + maker.
+    // Unlike single-leg accept, we don't split by buy/sell because
+    // the package as a whole doesn't have a taker_side.
+    let now = now_ms();
+    let accepted_at_ms = fill.created_at_ms;
+    let payload = |legs_count: u32| LifecyclePayload::OptionMultiLegRfqAccepted {
+        option_rfq_id: rfq.option_rfq_id.to_string(),
+        quote_id: quote.quote_id.to_string(),
+        fill_id: fill.fill_id.to_string(),
+        taker: rfq.taker.0.clone(),
+        taker_subaccount_id: rfq.taker_subaccount_id,
+        mm_account: quote.mm_account.0.clone(),
+        maker_subaccount_id: quote.maker_subaccount_id,
+        legs_count,
+        package_price_1e8: fill.package_price_1e8.clone(),
+        size_1e8: fill.size_1e8.to_string(),
+        rfq_status: rfq.status.as_str().to_string(),
+        quote_status: quote.status.as_str().to_string(),
+        accepted_at_ms,
+    };
+
+    // Legs count is what the fill has; RFQ legs count is the same
+    // by construction (accept requires equality).
+    let legs_count = state
+        .options_store
+        .lock()
+        .ok()
+        .and_then(|guard| {
+            guard
+                .get_option_multi_leg_rfq(rfq.option_rfq_id)
+                .map(|(_r, legs)| legs.len())
+        })
+        .unwrap_or(0) as u32;
+
+    for account in [rfq.taker.clone(), quote.mm_account.clone()] {
+        state.lifecycle_events.emit(LifecycleEvent {
+            account,
+            channel: LifecycleChannel::AccountRfqs,
+            payload: payload(legs_count),
+            emitted_at_ms: now,
+        });
+    }
+}
+
+fn accounts_equal(left: &AccountId, right: &AccountId) -> bool {
+    left.0.eq_ignore_ascii_case(&right.0)
 }

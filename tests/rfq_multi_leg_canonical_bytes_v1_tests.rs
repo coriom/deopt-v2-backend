@@ -155,4 +155,58 @@ fn part3_action_names_are_isolated_from_single_leg() {
         WriteAuthAction::OptionRfqQuoteSubmit.as_str(),
         WriteAuthAction::OptionMultiLegRfqQuoteSubmit.as_str()
     );
+    assert_ne!(
+        WriteAuthAction::OptionRfqAccept.as_str(),
+        WriteAuthAction::OptionMultiLegRfqAccept.as_str()
+    );
+}
+
+// RFQ-MULTI-LEG-ATOMIC-ACCEPT-V1 — accept canonical byte freeze.
+#[test]
+fn part4_multi_leg_accept_canonical_bytes_are_frozen_for_two_legs() {
+    let fields: Vec<(&'static str, CanonicalValue)> = vec![
+        ("taker", CanonicalValue::Address(taker())),
+        ("subaccount_id", CanonicalValue::U64(2)),
+        (
+            "option_rfq_id",
+            CanonicalValue::Str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string()),
+        ),
+        (
+            "quote_id",
+            CanonicalValue::Str("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string()),
+        ),
+        (
+            "expected_package_price_1e8",
+            CanonicalValue::Str("50000000".to_string()),
+        ),
+        ("legs_count", CanonicalValue::U64(2)),
+        (
+            "leg_0_price_1e8",
+            CanonicalValue::Str("12000000000".to_string()),
+        ),
+        (
+            "leg_1_price_1e8",
+            CanonicalValue::Str("11500000000".to_string()),
+        ),
+    ];
+    let bytes = canonical_payload_bytes(WriteAuthAction::OptionMultiLegRfqAccept, &fields);
+    let expected = concat!(
+        "OPTION_MULTI_LEG_RFQ_ACCEPT",
+        "|taker=\"0x1111111111111111111111111111111111111111\"",
+        "|subaccount_id=2",
+        "|option_rfq_id=\"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\"",
+        "|quote_id=\"bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb\"",
+        "|expected_package_price_1e8=\"50000000\"",
+        "|legs_count=2",
+        "|leg_0_price_1e8=\"12000000000\"",
+        "|leg_1_price_1e8=\"11500000000\"",
+    );
+    assert_eq!(
+        std::str::from_utf8(&bytes).unwrap(),
+        expected,
+        "MULTI_LEG_RFQ_ACCEPT canonical bytes must not drift; existing signers commit to this shape"
+    );
+    // Guard: the mm variable is used only in part 2; touch it here to
+    // avoid a dead-code warning if part 2 ever changes.
+    let _ = mm();
 }

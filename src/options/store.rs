@@ -59,6 +59,15 @@ pub struct OptionSeriesStore {
     option_multi_leg_rfq_quotes: HashMap<OptionMultiLegRfqQuoteId, OptionMultiLegRfqQuote>,
     option_multi_leg_rfq_quote_legs:
         HashMap<(OptionMultiLegRfqQuoteId, u32), OptionMultiLegRfqQuoteLeg>,
+    // RFQ-MULTI-LEG-ATOMIC-ACCEPT-V1 — accepted-fill parent + per-leg
+    // rows. Written only through `accept_option_multi_leg_rfq_quote`
+    // which holds the store lock across the entire status flip +
+    // insert, guaranteeing all-or-nothing semantics that mirror the
+    // Postgres transaction path.
+    option_multi_leg_rfq_fills:
+        HashMap<super::OptionMultiLegRfqFillId, super::OptionMultiLegRfqFill>,
+    option_multi_leg_rfq_fill_legs:
+        HashMap<(super::OptionMultiLegRfqFillId, u32), super::OptionMultiLegRfqFillLeg>,
 }
 
 impl OptionSeriesStore {
@@ -1763,6 +1772,114 @@ impl OptionSeriesStore {
                 (quote, legs)
             })
             .collect()
+    }
+
+    // RFQ-MULTI-LEG-ATOMIC-ACCEPT-V1 — atomic accept for the in-memory
+    // store. Called with the store's `Mutex` held, so all mutations
+    // happen under a single guard: no reader can observe partial state.
+    // Mirrors the Postgres transaction semantics 1:1.
+    pub fn accept_option_multi_leg_rfq_quote(
+        &mut self,
+        option_rfq_id: super::OptionMultiLegRfqId,
+        quote_id: super::OptionMultiLegRfqQuoteId,
+        fill: super::OptionMultiLegRfqFill,
+        fill_legs: Vec<super::OptionMultiLegRfqFillLeg>,
+    ) -> Result<(OptionMultiLegRfqRequest, OptionMultiLegRfqQuote)> {
+        // RFQ guard
+        let rfq = self
+            .option_multi_leg_rfqs
+            .get(&option_rfq_id)
+            .cloned()
+            .ok_or(BackendError::InvalidOptionRfqId)?;
+        if rfq.status != super::OptionMultiLegRfqStatus::Open || rfq.accepted_quote_id.is_some() {
+            return Err(BackendError::InvalidOptionRfqState(
+                "multi-leg option RFQ is no longer open".to_string(),
+            ));
+        }
+
+        // Quote guard
+        let quote = self
+            .option_multi_leg_rfq_quotes
+            .get(&quote_id)
+            .cloned()
+            .ok_or(BackendError::InvalidOptionRfqQuoteId)?;
+        if quote.option_rfq_id != option_rfq_id
+            || quote.status != super::OptionMultiLegRfqQuoteStatus::Active
+        {
+            return Err(BackendError::InvalidOptionRfqQuoteState(
+                "multi-leg option RFQ quote is no longer active".to_string(),
+            ));
+        }
+
+        // From here on: mutations only. Any early return above left
+        // the maps untouched.
+        let fill_id = fill.fill_id;
+        {
+            let rfq_mut = self
+                .option_multi_leg_rfqs
+                .get_mut(&option_rfq_id)
+                .expect("rfq present");
+            rfq_mut.status = super::OptionMultiLegRfqStatus::Accepted;
+            rfq_mut.accepted_quote_id = Some(quote_id);
+            rfq_mut.accepted_fill_id = Some(fill_id);
+        }
+        {
+            let quote_mut = self
+                .option_multi_leg_rfq_quotes
+                .get_mut(&quote_id)
+                .expect("quote present");
+            quote_mut.status = super::OptionMultiLegRfqQuoteStatus::Accepted;
+        }
+        // Flip every losing active quote.
+        for competing in self.option_multi_leg_rfq_quotes.values_mut() {
+            if competing.option_rfq_id == option_rfq_id
+                && competing.quote_id != quote_id
+                && competing.status == super::OptionMultiLegRfqQuoteStatus::Active
+            {
+                competing.status = super::OptionMultiLegRfqQuoteStatus::Rejected;
+            }
+        }
+
+        self.option_multi_leg_rfq_fills.insert(fill_id, fill);
+        for leg in fill_legs {
+            self.option_multi_leg_rfq_fill_legs
+                .insert((fill_id, leg.leg_index), leg);
+        }
+
+        let updated_rfq = self
+            .option_multi_leg_rfqs
+            .get(&option_rfq_id)
+            .cloned()
+            .expect("rfq present after update");
+        let updated_quote = self
+            .option_multi_leg_rfq_quotes
+            .get(&quote_id)
+            .cloned()
+            .expect("quote present after update");
+        Ok((updated_rfq, updated_quote))
+    }
+
+    pub fn get_option_multi_leg_rfq_fill(
+        &self,
+        fill_id: super::OptionMultiLegRfqFillId,
+    ) -> Option<(
+        super::OptionMultiLegRfqFill,
+        Vec<super::OptionMultiLegRfqFillLeg>,
+    )> {
+        let fill = self.option_multi_leg_rfq_fills.get(&fill_id).cloned()?;
+        let mut legs: Vec<super::OptionMultiLegRfqFillLeg> = self
+            .option_multi_leg_rfq_fill_legs
+            .iter()
+            .filter_map(|((id, _), leg)| {
+                if *id == fill_id {
+                    Some(leg.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        legs.sort_by_key(|leg| leg.leg_index);
+        Some((fill, legs))
     }
 }
 

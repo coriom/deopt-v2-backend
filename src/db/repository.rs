@@ -8432,6 +8432,127 @@ impl PgRepository {
             .collect::<Result<Vec<_>>>()?;
         Ok(Some((fill, legs)))
     }
+
+    // RFQ-MULTI-LEG-ATOMIC-ACCEPT-V1 — single-transaction accept.
+    //
+    // Guards:
+    //   * The RFQ must still be `open` and have no `accepted_quote_id`
+    //     (single-winner UPDATE guard, matches single-leg).
+    //   * The winning quote must still be `active` and belong to the
+    //     RFQ.
+    //   * All other `active` quotes for this RFQ flip to `rejected`.
+    //   * Parent fill row + N fill_leg rows inserted before COMMIT.
+    //
+    // On UPDATE row count != 1 for either RFQ or quote, the whole
+    // transaction rolls back with a distinct error so the service
+    // layer can distinguish "quote lost the race" from "quote already
+    // expired". No partial state is ever visible to a reader.
+    pub async fn accept_option_multi_leg_rfq_quote_and_insert_fill(
+        &self,
+        option_rfq_id: OptionMultiLegRfqId,
+        quote_id: OptionMultiLegRfqQuoteId,
+        fill: &OptionMultiLegRfqFill,
+        fill_legs: &[OptionMultiLegRfqFillLeg],
+    ) -> Result<()> {
+        validate_multi_leg_fill_composition(fill.fill_id, fill_legs.len(), fill_legs)?;
+        let taker_subaccount_id = u32_to_i32("taker_subaccount_id", fill.taker_subaccount_id)?;
+        let maker_subaccount_id = u32_to_i32("maker_subaccount_id", fill.maker_subaccount_id)?;
+        let mut tx = self.begin().await?;
+
+        // Insert parent fill first so the FK from _rfqs.accepted_fill_id
+        // can point at it in the next UPDATE.
+        sqlx::query(
+            "INSERT INTO option_multi_leg_rfq_fills (
+                fill_id, option_rfq_id, quote_id, taker, taker_subaccount_id,
+                mm_account, maker_subaccount_id, package_price_1e8, size_1e8, created_at_ms
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+        )
+        .bind(fill.fill_id.to_string())
+        .bind(fill.option_rfq_id.to_string())
+        .bind(fill.quote_id.to_string())
+        .bind(&fill.taker.0)
+        .bind(taker_subaccount_id)
+        .bind(&fill.mm_account.0)
+        .bind(maker_subaccount_id)
+        .bind(&fill.package_price_1e8)
+        .bind(fill.size_1e8.to_string())
+        .bind(timestamp_to_i64(fill.created_at_ms))
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+
+        for leg in fill_legs {
+            let leg_index = u32_to_i32("leg_index", leg.leg_index)?;
+            sqlx::query(
+                "INSERT INTO option_multi_leg_rfq_fill_legs (
+                    fill_id, leg_index, option_series_id, side, size_1e8, price_1e8
+                ) VALUES ($1, $2, $3, $4, $5, $6)",
+            )
+            .bind(fill.fill_id.to_string())
+            .bind(leg_index)
+            .bind(&leg.option_series_id)
+            .bind(side_to_str(leg.side))
+            .bind(leg.size_1e8.to_string())
+            .bind(leg.price_1e8.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        }
+
+        // Flip the RFQ. Guards on `status = 'open'` and
+        // `accepted_quote_id IS NULL` — this is the single-winner
+        // barrier. A concurrent accept trying to grab this RFQ
+        // will hit rows_affected == 0.
+        let rfq_result = sqlx::query(
+            "UPDATE option_multi_leg_rfqs
+             SET status = 'accepted', accepted_quote_id = $2, accepted_fill_id = $3
+             WHERE option_rfq_id = $1 AND status = 'open' AND accepted_quote_id IS NULL",
+        )
+        .bind(option_rfq_id.to_string())
+        .bind(quote_id.to_string())
+        .bind(fill.fill_id.to_string())
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        if rfq_result.rows_affected() != 1 {
+            return Err(BackendError::InvalidOptionRfqState(
+                "multi-leg option RFQ is no longer open".to_string(),
+            ));
+        }
+
+        // Flip the winning quote.
+        let quote_result = sqlx::query(
+            "UPDATE option_multi_leg_rfq_quotes
+             SET status = 'accepted'
+             WHERE quote_id = $1 AND option_rfq_id = $2 AND status = 'active'",
+        )
+        .bind(quote_id.to_string())
+        .bind(option_rfq_id.to_string())
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        if quote_result.rows_affected() != 1 {
+            return Err(BackendError::InvalidOptionRfqQuoteState(
+                "multi-leg option RFQ quote is no longer active".to_string(),
+            ));
+        }
+
+        // Flip every losing quote.
+        sqlx::query(
+            "UPDATE option_multi_leg_rfq_quotes
+             SET status = 'rejected'
+             WHERE option_rfq_id = $1 AND quote_id <> $2 AND status = 'active'",
+        )
+        .bind(option_rfq_id.to_string())
+        .bind(quote_id.to_string())
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+
+        tx.commit()
+            .await
+            .map_err(|error| BackendError::Persistence(error.to_string()))
+    }
 }
 
 fn option_multi_leg_rfq_from_row(row: PgRow) -> Result<OptionMultiLegRfqRequest> {

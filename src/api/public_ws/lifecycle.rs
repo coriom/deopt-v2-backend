@@ -478,6 +478,33 @@ pub enum LifecyclePayload {
         created_at_ms: TimestampMs,
         expires_at_ms: TimestampMs,
     },
+    /// RFQ-MULTI-LEG-ATOMIC-ACCEPT-V1 — taker accepted a maker
+    /// package quote. Emitted AFTER the atomic transaction
+    /// commits (RFQ + winning quote flipped to Accepted, losing
+    /// quotes flipped to Rejected, parent fill + N fill-leg rows
+    /// inserted). Fan-out: one frame per interested account
+    /// (taker + maker). Consumers refetch the full fill (with
+    /// per-leg prices) via `GET /options/multi-leg-rfqs/:id`
+    /// once the fill-read route lands.
+    ///
+    /// Privacy: no signatures, no write-auth nonce, no envelope.
+    OptionMultiLegRfqAccepted {
+        option_rfq_id: String,
+        quote_id: String,
+        fill_id: String,
+        taker: String,
+        #[serde(default = "crate::options::types::one_subaccount_id")]
+        taker_subaccount_id: u32,
+        mm_account: String,
+        #[serde(default = "crate::options::types::one_subaccount_id")]
+        maker_subaccount_id: u32,
+        legs_count: u32,
+        package_price_1e8: String,
+        size_1e8: String,
+        rfq_status: String,
+        quote_status: String,
+        accepted_at_ms: TimestampMs,
+    },
 }
 
 /// Lightweight wrapper around `tokio::sync::broadcast::Sender` that

@@ -38,6 +38,7 @@ use crate::nonce_sync::{
     read_option_nonce, read_perp_nonce, OptionNonceResponse, PerpNonceResponse,
 };
 use crate::options::multi_leg_service::{
+    accept_option_multi_leg_rfq_quote as accept_option_multi_leg_rfq_quote_service,
     create_option_multi_leg_rfq as create_option_multi_leg_rfq_service,
     ensure_option_multi_leg_rfq_enabled,
     get_option_multi_leg_rfq as get_option_multi_leg_rfq_service,
@@ -45,8 +46,8 @@ use crate::options::multi_leg_service::{
     list_option_multi_leg_rfq_quotes as list_option_multi_leg_rfq_quotes_service,
     list_option_multi_leg_rfqs_by_taker as list_option_multi_leg_rfqs_by_taker_service,
     submit_option_multi_leg_rfq_quote as submit_option_multi_leg_rfq_quote_service,
-    CreateOptionMultiLegRfqInput, LegInput as MultiLegLegInput, QuoteLegInput,
-    SubmitOptionMultiLegRfqQuoteInput,
+    AcceptOptionMultiLegRfqQuoteInput, CreateOptionMultiLegRfqInput, LegInput as MultiLegLegInput,
+    QuoteLegInput, SubmitOptionMultiLegRfqQuoteInput,
 };
 use crate::options::service::{
     accept_option_rfq_quote as accept_option_rfq_quote_service,
@@ -421,6 +422,14 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/options/multi-leg-rfqs/:rfq_id/quotes/:quote_id",
             get(get_option_multi_leg_rfq_quote),
+        )
+        // RFQ-MULTI-LEG-ATOMIC-ACCEPT-V1 — flag-gated atomic accept.
+        // Single Postgres transaction: RFQ status flip + quote status
+        // flip + losing quotes → rejected + parent fill + N fill_leg
+        // rows. Lifecycle emit strictly after commit.
+        .route(
+            "/options/multi-leg-rfqs/:rfq_id/quotes/:quote_id/accept",
+            post(accept_option_multi_leg_rfq_quote),
         )
         .route(
             "/options/orders",
@@ -5405,6 +5414,163 @@ async fn get_option_multi_leg_rfq_quote(
 }
 
 // ---------------------------------------------------------------------
+// RFQ-MULTI-LEG-ATOMIC-ACCEPT-V1 — accept DTOs + handler.
+// ---------------------------------------------------------------------
+
+#[derive(Clone, Debug, Deserialize)]
+struct AcceptOptionMultiLegRfqQuoteRequest {
+    subaccount_id: Option<u32>,
+    expected_package_price_1e8: String,
+    expected_legs_count: u32,
+    expected_leg_prices_1e8: Vec<String>,
+    authorization: AuthorizationEnvelope,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct OptionMultiLegRfqFillLegResponse {
+    leg_index: u32,
+    option_series_id: String,
+    side: Side,
+    size_1e8: String,
+    price_1e8: String,
+}
+
+impl From<crate::options::OptionMultiLegRfqFillLeg> for OptionMultiLegRfqFillLegResponse {
+    fn from(leg: crate::options::OptionMultiLegRfqFillLeg) -> Self {
+        Self {
+            leg_index: leg.leg_index,
+            option_series_id: leg.option_series_id,
+            side: leg.side,
+            size_1e8: leg.size_1e8.to_string(),
+            price_1e8: leg.price_1e8.to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct AcceptOptionMultiLegRfqQuoteResponse {
+    option_rfq_id: String,
+    quote_id: String,
+    fill_id: String,
+    taker: AccountId,
+    taker_subaccount_id: u32,
+    mm_account: AccountId,
+    maker_subaccount_id: u32,
+    package_price_1e8: String,
+    size_1e8: String,
+    rfq_status: OptionMultiLegRfqStatus,
+    quote_status: OptionMultiLegRfqQuoteStatus,
+    legs_count: u32,
+    fill_legs: Vec<OptionMultiLegRfqFillLegResponse>,
+    created_at_ms: i64,
+}
+
+async fn accept_option_multi_leg_rfq_quote(
+    State(state): State<AppState>,
+    Path((rfq_id_path, quote_id_path)): Path<(String, String)>,
+    Json(request): Json<AcceptOptionMultiLegRfqQuoteRequest>,
+) -> Result<Json<AcceptOptionMultiLegRfqQuoteResponse>, ApiError> {
+    // Flag gate first — fails closed with 503 before touching auth.
+    ensure_option_multi_leg_rfq_enabled(&state)?;
+
+    // Multi-leg accept is v2-only.
+    if request.authorization.version != Some(2) {
+        return Err(ApiError::from(BackendError::InvalidSubaccountRequest(
+            "multi-leg accept requires an authorization envelope with version = 2".to_string(),
+        )));
+    }
+
+    let parsed_rfq_id = parse_option_rfq_id(&rfq_id_path)?;
+    let parsed_quote_id = parse_option_rfq_quote_id(&quote_id_path)?;
+
+    // Taker identity is the `account` on the auth envelope. Load the
+    // RFQ upfront to sanity-check it belongs to the caller before we
+    // burn a nonce — the atomic transaction still re-validates
+    // everything under the DB lock.
+    let taker = request.authorization.account.clone();
+    let resolved_subaccount_id = resolve_options_v2_subaccount(
+        &state,
+        &request.authorization,
+        request.subaccount_id,
+        &taker,
+    )
+    .await?;
+
+    // Parse expected per-leg prices from the request body. We need
+    // them BEFORE the canonical so the canonical bytes match what the
+    // taker actually signed. Any parse error rejects before touching
+    // auth.
+    let expected_leg_prices_1e8: Vec<u128> = request
+        .expected_leg_prices_1e8
+        .iter()
+        .map(|price| parse_fixed_u128("expected_leg_price_1e8", price).map_err(ApiError::from))
+        .collect::<Result<Vec<_>, ApiError>>()?;
+
+    let canonical = canonical_option_multi_leg_rfq_accept_v2(
+        &taker,
+        resolved_subaccount_id,
+        &rfq_id_path,
+        &quote_id_path,
+        &request.expected_package_price_1e8,
+        request.expected_legs_count,
+        &request.expected_leg_prices_1e8,
+    );
+
+    let _verified = require_write_auth_v2_aware(
+        &state,
+        WriteAuthAction::OptionMultiLegRfqAccept,
+        &taker,
+        resolved_subaccount_id,
+        &canonical,
+        &request.authorization,
+    )
+    .await?;
+
+    let outcome = accept_option_multi_leg_rfq_quote_service(
+        &state,
+        AcceptOptionMultiLegRfqQuoteInput {
+            taker: taker.clone(),
+            taker_subaccount_id: resolved_subaccount_id,
+            option_rfq_id: parsed_rfq_id,
+            quote_id: parsed_quote_id,
+            expected_package_price_1e8: request.expected_package_price_1e8,
+            expected_legs_count: request.expected_legs_count,
+            expected_leg_prices_1e8,
+        },
+    )
+    .await?;
+
+    attach_resource_best_effort(
+        &state,
+        &request.authorization.nonce,
+        &outcome.fill.fill_id.to_string(),
+    )
+    .await;
+
+    let legs_count = outcome.fill_legs.len() as u32;
+    Ok(Json(AcceptOptionMultiLegRfqQuoteResponse {
+        option_rfq_id: outcome.rfq.option_rfq_id.to_string(),
+        quote_id: outcome.quote.quote_id.to_string(),
+        fill_id: outcome.fill.fill_id.to_string(),
+        taker: outcome.fill.taker,
+        taker_subaccount_id: outcome.fill.taker_subaccount_id,
+        mm_account: outcome.fill.mm_account,
+        maker_subaccount_id: outcome.fill.maker_subaccount_id,
+        package_price_1e8: outcome.fill.package_price_1e8,
+        size_1e8: outcome.fill.size_1e8.to_string(),
+        rfq_status: outcome.rfq.status,
+        quote_status: outcome.quote.status,
+        legs_count,
+        fill_legs: outcome
+            .fill_legs
+            .into_iter()
+            .map(OptionMultiLegRfqFillLegResponse::from)
+            .collect(),
+        created_at_ms: outcome.fill.created_at_ms,
+    }))
+}
+
+// ---------------------------------------------------------------------
 // RFQ-MULTI-LEG-CREATE-QUOTE-V1 — canonical v2 payload builders. The
 // leg count is emitted as an explicit `legs_count` field before the
 // per-leg entries so a client cannot inject an extra leg without also
@@ -5510,6 +5676,55 @@ fn canonical_option_multi_leg_rfq_quote_submit_v2(
     ));
     crate::auth::write_authorization::canonical_payload_bytes(
         WriteAuthAction::OptionMultiLegRfqQuoteSubmit,
+        &fields,
+    )
+}
+
+// RFQ-MULTI-LEG-ATOMIC-ACCEPT-V1 — accept canonical. Taker commits to:
+//   * taker + subaccount_id  (who is accepting)
+//   * option_rfq_id + quote_id  (what is being accepted)
+//   * expected_package_price_1e8 + expected_legs_count + ordered per-leg
+//     prices  (the package as viewed by the taker at signing time)
+//
+// The server refuses if any of the expected fields diverge from the
+// server-loaded quote state, so a maker cannot slip a mutated quote
+// into an already-signed accept.
+fn canonical_option_multi_leg_rfq_accept_v2(
+    taker: &AccountId,
+    taker_subaccount_id: u32,
+    option_rfq_id: &str,
+    quote_id: &str,
+    expected_package_price_1e8: &str,
+    expected_legs_count: u32,
+    expected_leg_prices_1e8: &[String],
+) -> Vec<u8> {
+    let mut fields: Vec<(&'static str, CanonicalValue)> = Vec::new();
+    fields.push(("taker", CanonicalValue::Address(taker.clone())));
+    fields.push((
+        "subaccount_id",
+        CanonicalValue::U64(taker_subaccount_id as u64),
+    ));
+    fields.push((
+        "option_rfq_id",
+        CanonicalValue::Str(option_rfq_id.to_string()),
+    ));
+    fields.push(("quote_id", CanonicalValue::Str(quote_id.to_string())));
+    fields.push((
+        "expected_package_price_1e8",
+        CanonicalValue::Str(expected_package_price_1e8.to_string()),
+    ));
+    fields.push((
+        "legs_count",
+        CanonicalValue::U64(expected_legs_count as u64),
+    ));
+    for (i, price) in expected_leg_prices_1e8.iter().enumerate() {
+        fields.push((
+            leak_static_str(format!("leg_{i}_price_1e8")),
+            CanonicalValue::Str(price.clone()),
+        ));
+    }
+    crate::auth::write_authorization::canonical_payload_bytes(
+        WriteAuthAction::OptionMultiLegRfqAccept,
         &fields,
     )
 }
