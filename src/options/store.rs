@@ -3,12 +3,14 @@ use super::{
     OptionExecutionEvent, OptionExecutionEventLink, OptionExecutionIntent, OptionExecutionIntentId,
     OptionExecutionIntentStatus, OptionExecutionReceiptCost, OptionExecutionReconciliation,
     OptionExecutionSimulationResult, OptionExecutionSourceType, OptionExecutionTransaction,
-    OptionFill, OptionFillFilter, OptionFillId, OptionOrder, OptionOrderAttachmentPlan,
-    OptionOrderFilter, OptionOrderId, OptionOrderRejection, OptionOrderStatus, OptionRfqFill,
-    OptionRfqId, OptionRfqQuote, OptionRfqQuoteId, OptionRfqQuoteStatus, OptionRfqRequest,
-    OptionRfqStatus, OptionSeries, OptionSeriesFilter, OptionSeriesId, OptionSeriesStatus,
-    OptionTwapChildOrder, OptionTwapChildStatus, OptionTwapOrder, OptionTwapOrderFilter,
-    OptionTwapOrderId, OptionTwapStatus,
+    OptionFill, OptionFillFilter, OptionFillId, OptionMultiLegRfqId, OptionMultiLegRfqLeg,
+    OptionMultiLegRfqQuote, OptionMultiLegRfqQuoteId, OptionMultiLegRfqQuoteLeg,
+    OptionMultiLegRfqRequest, OptionOrder, OptionOrderAttachmentPlan, OptionOrderFilter,
+    OptionOrderId, OptionOrderRejection, OptionOrderStatus, OptionRfqFill, OptionRfqId,
+    OptionRfqQuote, OptionRfqQuoteId, OptionRfqQuoteStatus, OptionRfqRequest, OptionRfqStatus,
+    OptionSeries, OptionSeriesFilter, OptionSeriesId, OptionSeriesStatus, OptionTwapChildOrder,
+    OptionTwapChildStatus, OptionTwapOrder, OptionTwapOrderFilter, OptionTwapOrderId,
+    OptionTwapStatus,
 };
 use crate::error::{BackendError, Result};
 use crate::execution::ExecutionTransactionStatus;
@@ -46,6 +48,17 @@ pub struct OptionSeriesStore {
     // OPTIONS-TWAP-ORDERS-V1 — TWAP child rows keyed by child id;
     // one row is materialised per due tick, never fabricated ahead.
     option_twap_child_orders: HashMap<Uuid, OptionTwapChildOrder>,
+    // RFQ-MULTI-LEG-CREATE-QUOTE-V1 — parent multi-leg RFQ requests
+    // keyed by rfq id. Legs live in `option_multi_leg_rfq_legs`
+    // keyed by (rfq id, leg index).
+    option_multi_leg_rfqs: HashMap<OptionMultiLegRfqId, OptionMultiLegRfqRequest>,
+    option_multi_leg_rfq_legs: HashMap<(OptionMultiLegRfqId, u32), OptionMultiLegRfqLeg>,
+    // RFQ-MULTI-LEG-CREATE-QUOTE-V1 — maker quote parent + per-leg
+    // rows. `client_quote_id` uniqueness is checked at insert time
+    // against the composite (rfq_id, LOWER(mm_account), client_quote_id).
+    option_multi_leg_rfq_quotes: HashMap<OptionMultiLegRfqQuoteId, OptionMultiLegRfqQuote>,
+    option_multi_leg_rfq_quote_legs:
+        HashMap<(OptionMultiLegRfqQuoteId, u32), OptionMultiLegRfqQuoteLeg>,
 }
 
 impl OptionSeriesStore {
@@ -1527,6 +1540,229 @@ impl OptionSeriesStore {
         child.filled_size_1e8 = filled_size_1e8;
         child.error_message = error_message;
         Ok(child.clone())
+    }
+
+    // RFQ-MULTI-LEG-CREATE-QUOTE-V1 — in-memory persistence for the
+    // multi-leg atomic RFQ subsystem. Mirrors the PG repository CRUD
+    // semantics so unit + integration tests that don't spin up
+    // Postgres exercise the same shape.
+
+    pub fn insert_option_multi_leg_rfq(
+        &mut self,
+        rfq: OptionMultiLegRfqRequest,
+        legs: Vec<OptionMultiLegRfqLeg>,
+    ) -> Result<OptionMultiLegRfqRequest> {
+        if self.option_multi_leg_rfqs.contains_key(&rfq.option_rfq_id) {
+            return Err(BackendError::InvalidOptionRfqState(
+                "duplicate multi-leg RFQ id".to_string(),
+            ));
+        }
+        let rfq_id = rfq.option_rfq_id;
+        self.option_multi_leg_rfqs.insert(rfq_id, rfq.clone());
+        for leg in legs {
+            self.option_multi_leg_rfq_legs
+                .insert((rfq_id, leg.leg_index), leg);
+        }
+        Ok(rfq)
+    }
+
+    pub fn get_option_multi_leg_rfq(
+        &self,
+        rfq_id: OptionMultiLegRfqId,
+    ) -> Option<(OptionMultiLegRfqRequest, Vec<OptionMultiLegRfqLeg>)> {
+        let rfq = self.option_multi_leg_rfqs.get(&rfq_id).cloned()?;
+        let mut legs: Vec<OptionMultiLegRfqLeg> = self
+            .option_multi_leg_rfq_legs
+            .iter()
+            .filter_map(|((id, _), leg)| {
+                if *id == rfq_id {
+                    Some(leg.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        legs.sort_by_key(|leg| leg.leg_index);
+        Some((rfq, legs))
+    }
+
+    pub fn list_option_multi_leg_rfqs_by_taker(
+        &self,
+        taker: &AccountId,
+        taker_subaccount_id: u32,
+    ) -> Vec<(OptionMultiLegRfqRequest, Vec<OptionMultiLegRfqLeg>)> {
+        let mut rfqs: Vec<OptionMultiLegRfqRequest> = self
+            .option_multi_leg_rfqs
+            .values()
+            .filter(|rfq| {
+                rfq.taker.0.eq_ignore_ascii_case(&taker.0)
+                    && rfq.taker_subaccount_id == taker_subaccount_id
+            })
+            .cloned()
+            .collect();
+        rfqs.sort_by(|a, b| {
+            a.created_at_ms
+                .cmp(&b.created_at_ms)
+                .then_with(|| a.option_rfq_id.cmp(&b.option_rfq_id))
+        });
+        rfqs.into_iter()
+            .map(|rfq| {
+                let mut legs: Vec<OptionMultiLegRfqLeg> = self
+                    .option_multi_leg_rfq_legs
+                    .iter()
+                    .filter_map(|((id, _), leg)| {
+                        if *id == rfq.option_rfq_id {
+                            Some(leg.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                legs.sort_by_key(|leg| leg.leg_index);
+                (rfq, legs)
+            })
+            .collect()
+    }
+
+    pub fn count_option_multi_leg_rfq_quotes(&self, rfq_id: OptionMultiLegRfqId) -> usize {
+        self.option_multi_leg_rfq_quotes
+            .values()
+            .filter(|q| q.option_rfq_id == rfq_id)
+            .count()
+    }
+
+    pub fn insert_option_multi_leg_rfq_quote(
+        &mut self,
+        quote: OptionMultiLegRfqQuote,
+        quote_legs: Vec<OptionMultiLegRfqQuoteLeg>,
+    ) -> Result<OptionMultiLegRfqQuote> {
+        if self.has_duplicate_multi_leg_client_quote(
+            quote.option_rfq_id,
+            &quote.mm_account.0,
+            quote.client_quote_id.as_deref(),
+        ) {
+            return Err(BackendError::InvalidOptionRfqQuoteState(
+                "duplicate client_quote_id for multi-leg option RFQ and MM account".to_string(),
+            ));
+        }
+        let quote_id = quote.quote_id;
+        self.option_multi_leg_rfq_quotes
+            .insert(quote_id, quote.clone());
+        for leg in quote_legs {
+            self.option_multi_leg_rfq_quote_legs
+                .insert((quote_id, leg.leg_index), leg);
+        }
+        Ok(quote)
+    }
+
+    fn has_duplicate_multi_leg_client_quote(
+        &self,
+        rfq_id: OptionMultiLegRfqId,
+        mm_account: &str,
+        client_quote_id: Option<&str>,
+    ) -> bool {
+        let Some(client_quote_id) = client_quote_id else {
+            return false;
+        };
+        self.option_multi_leg_rfq_quotes.values().any(|q| {
+            q.option_rfq_id == rfq_id
+                && q.mm_account.0.eq_ignore_ascii_case(mm_account)
+                && q.client_quote_id.as_deref() == Some(client_quote_id)
+        })
+    }
+
+    pub fn get_option_multi_leg_rfq_quote(
+        &self,
+        quote_id: OptionMultiLegRfqQuoteId,
+    ) -> Option<(OptionMultiLegRfqQuote, Vec<OptionMultiLegRfqQuoteLeg>)> {
+        let quote = self.option_multi_leg_rfq_quotes.get(&quote_id).cloned()?;
+        let mut legs: Vec<OptionMultiLegRfqQuoteLeg> = self
+            .option_multi_leg_rfq_quote_legs
+            .iter()
+            .filter_map(|((id, _), leg)| {
+                if *id == quote_id {
+                    Some(leg.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        legs.sort_by_key(|leg| leg.leg_index);
+        Some((quote, legs))
+    }
+
+    pub fn list_option_multi_leg_rfq_quotes(
+        &self,
+        rfq_id: OptionMultiLegRfqId,
+    ) -> Vec<(OptionMultiLegRfqQuote, Vec<OptionMultiLegRfqQuoteLeg>)> {
+        let mut quotes: Vec<OptionMultiLegRfqQuote> = self
+            .option_multi_leg_rfq_quotes
+            .values()
+            .filter(|q| q.option_rfq_id == rfq_id)
+            .cloned()
+            .collect();
+        quotes.sort_by(|a, b| {
+            a.created_at_ms
+                .cmp(&b.created_at_ms)
+                .then_with(|| a.quote_id.cmp(&b.quote_id))
+        });
+        quotes
+            .into_iter()
+            .map(|quote| {
+                let mut legs: Vec<OptionMultiLegRfqQuoteLeg> = self
+                    .option_multi_leg_rfq_quote_legs
+                    .iter()
+                    .filter_map(|((id, _), leg)| {
+                        if *id == quote.quote_id {
+                            Some(leg.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                legs.sort_by_key(|leg| leg.leg_index);
+                (quote, legs)
+            })
+            .collect()
+    }
+
+    pub fn list_option_multi_leg_rfq_quotes_by_maker(
+        &self,
+        mm_account: &AccountId,
+        maker_subaccount_id: u32,
+    ) -> Vec<(OptionMultiLegRfqQuote, Vec<OptionMultiLegRfqQuoteLeg>)> {
+        let mut quotes: Vec<OptionMultiLegRfqQuote> = self
+            .option_multi_leg_rfq_quotes
+            .values()
+            .filter(|q| {
+                q.mm_account.0.eq_ignore_ascii_case(&mm_account.0)
+                    && q.maker_subaccount_id == maker_subaccount_id
+            })
+            .cloned()
+            .collect();
+        quotes.sort_by(|a, b| {
+            a.created_at_ms
+                .cmp(&b.created_at_ms)
+                .then_with(|| a.quote_id.cmp(&b.quote_id))
+        });
+        quotes
+            .into_iter()
+            .map(|quote| {
+                let mut legs: Vec<OptionMultiLegRfqQuoteLeg> = self
+                    .option_multi_leg_rfq_quote_legs
+                    .iter()
+                    .filter_map(|((id, _), leg)| {
+                        if *id == quote.quote_id {
+                            Some(leg.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                legs.sort_by_key(|leg| leg.leg_index);
+                (quote, legs)
+            })
+            .collect()
     }
 }
 

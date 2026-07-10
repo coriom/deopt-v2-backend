@@ -7,6 +7,7 @@ pub mod event_indexer;
 pub mod execution;
 pub mod lifecycle;
 pub mod multi_leg;
+pub mod multi_leg_service;
 pub mod reconciliation_worker;
 pub mod rfq_operator_packet;
 pub mod series_id;

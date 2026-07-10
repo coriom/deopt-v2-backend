@@ -37,6 +37,17 @@ use crate::monitoring::{readiness, render_metrics};
 use crate::nonce_sync::{
     read_option_nonce, read_perp_nonce, OptionNonceResponse, PerpNonceResponse,
 };
+use crate::options::multi_leg_service::{
+    create_option_multi_leg_rfq as create_option_multi_leg_rfq_service,
+    ensure_option_multi_leg_rfq_enabled,
+    get_option_multi_leg_rfq as get_option_multi_leg_rfq_service,
+    get_option_multi_leg_rfq_quote as get_option_multi_leg_rfq_quote_service,
+    list_option_multi_leg_rfq_quotes as list_option_multi_leg_rfq_quotes_service,
+    list_option_multi_leg_rfqs_by_taker as list_option_multi_leg_rfqs_by_taker_service,
+    submit_option_multi_leg_rfq_quote as submit_option_multi_leg_rfq_quote_service,
+    CreateOptionMultiLegRfqInput, LegInput as MultiLegLegInput, QuoteLegInput,
+    SubmitOptionMultiLegRfqQuoteInput,
+};
 use crate::options::service::{
     accept_option_rfq_quote as accept_option_rfq_quote_service,
     broadcast_option_execution_intent as broadcast_option_execution_intent_service,
@@ -84,8 +95,10 @@ use crate::options::{
     summarize_option_execution_events_by_contract_address as summarize_option_execution_events_by_contract_address_service,
     OptionExecutionIntent, OptionExecutionIntentId, OptionExecutionIntentStatus,
     OptionExecutionSimulationResult, OptionExecutionSimulationStatus, OptionFill, OptionFillFilter,
-    OptionFillId, OptionOrder, OptionOrderFilter, OptionOrderStatus, OptionOrderbookSnapshot,
-    OptionRfqFill, OptionRfqFillFilter, OptionRfqId, OptionRfqQuote, OptionRfqQuoteId,
+    OptionFillId, OptionMultiLegRfqLeg, OptionMultiLegRfqQuote, OptionMultiLegRfqQuoteLeg,
+    OptionMultiLegRfqQuoteStatus, OptionMultiLegRfqRequest, OptionMultiLegRfqStatus, OptionOrder,
+    OptionOrderFilter, OptionOrderStatus, OptionOrderbookSnapshot, OptionRfqFill,
+    OptionRfqFillFilter, OptionRfqId, OptionRfqQuote, OptionRfqQuoteId,
     OptionRfqQuoteSignatureStatus, OptionRfqQuoteStatus, OptionRfqRequest, OptionRfqStatus,
     OptionSeries, OptionSeriesFilter, OptionSeriesStatus, OptionTwapChildOrder, OptionTwapOrder,
     OptionTwapOrderFilter, OptionTwapOrderId, OPTION_EVENT_INDEXER_STATE_ID, OPTION_RFQ_QUOTE_TYPE,
@@ -386,6 +399,28 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/options/rfqs/:option_rfq_id/cancel",
             post(cancel_option_rfq),
+        )
+        // RFQ-MULTI-LEG-CREATE-QUOTE-V1 — flag-gated. Every handler
+        // starts with `ensure_option_multi_leg_rfq_enabled` which
+        // returns 503 `OptionMultiLegRfqNotLive` when
+        // OPTION_RFQ_MULTI_LEG_ENABLED=false. Accept + cancel are
+        // NOT wired here; they land in `_ATOMIC-ACCEPT-V1` and
+        // `_CANCEL-V1`.
+        .route(
+            "/options/multi-leg-rfqs",
+            post(create_option_multi_leg_rfq).get(list_option_multi_leg_rfqs_by_taker),
+        )
+        .route(
+            "/options/multi-leg-rfqs/:rfq_id",
+            get(get_option_multi_leg_rfq),
+        )
+        .route(
+            "/options/multi-leg-rfqs/:rfq_id/quotes",
+            post(submit_option_multi_leg_rfq_quote).get(list_option_multi_leg_rfq_quotes),
+        )
+        .route(
+            "/options/multi-leg-rfqs/:rfq_id/quotes/:quote_id",
+            get(get_option_multi_leg_rfq_quote),
         )
         .route(
             "/options/orders",
@@ -4999,6 +5034,494 @@ async fn list_option_rfq_quotes(
             .map(OptionRfqQuoteResponse::from)
             .collect(),
     ))
+}
+
+// ---------------------------------------------------------------------
+// RFQ-MULTI-LEG-CREATE-QUOTE-V1 — DTOs, canonicals, and handlers for the
+// multi-leg atomic RFQ create + quote paths. Accept + cancel are NOT
+// wired here — they land in `_ATOMIC-ACCEPT-V1` and `_CANCEL-V1`. Every
+// mutation handler is gated on `OPTION_RFQ_MULTI_LEG_ENABLED` via
+// `ensure_option_multi_leg_rfq_enabled`, which fails closed with
+// `503 OptionMultiLegRfqNotLive` when the flag is off.
+// ---------------------------------------------------------------------
+
+#[derive(Clone, Debug, Deserialize)]
+struct MultiLegLegRequest {
+    leg_index: u32,
+    option_series_id: String,
+    side: Side,
+    size_1e8: String,
+    #[serde(default = "default_ratio_component")]
+    ratio_num: u32,
+    #[serde(default = "default_ratio_component")]
+    ratio_den: u32,
+}
+
+fn default_ratio_component() -> u32 {
+    1
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct CreateOptionMultiLegRfqRequest {
+    taker: AccountId,
+    subaccount_id: Option<u32>,
+    legs: Vec<MultiLegLegRequest>,
+    ttl_ms: Option<u64>,
+    authorization: AuthorizationEnvelope,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct MultiLegQuoteLegRequest {
+    leg_index: u32,
+    price_1e8: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct SubmitOptionMultiLegRfqQuoteRequest {
+    mm_account: AccountId,
+    subaccount_id: Option<u32>,
+    session_id: Option<String>,
+    client_quote_id: Option<String>,
+    package_price_1e8: String,
+    size_1e8: String,
+    legs: Vec<MultiLegQuoteLegRequest>,
+    quote_nonce: Option<u64>,
+    quote_ttl_ms: Option<u64>,
+    signature: Option<String>,
+    authorization: AuthorizationEnvelope,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct OptionMultiLegRfqLegResponse {
+    leg_index: u32,
+    option_series_id: String,
+    side: Side,
+    size_1e8: String,
+    ratio_num: u32,
+    ratio_den: u32,
+}
+
+impl From<OptionMultiLegRfqLeg> for OptionMultiLegRfqLegResponse {
+    fn from(leg: OptionMultiLegRfqLeg) -> Self {
+        Self {
+            leg_index: leg.leg_index,
+            option_series_id: leg.option_series_id,
+            side: leg.side,
+            size_1e8: leg.size_1e8.to_string(),
+            ratio_num: leg.ratio_num,
+            ratio_den: leg.ratio_den,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct OptionMultiLegRfqResponse {
+    option_rfq_id: String,
+    taker: AccountId,
+    taker_subaccount_id: u32,
+    status: OptionMultiLegRfqStatus,
+    created_at_ms: i64,
+    expires_at_ms: i64,
+    accepted_quote_id: Option<String>,
+    accepted_fill_id: Option<String>,
+    legs_count: u32,
+    legs: Vec<OptionMultiLegRfqLegResponse>,
+}
+
+impl OptionMultiLegRfqResponse {
+    fn from_parts(rfq: OptionMultiLegRfqRequest, legs: Vec<OptionMultiLegRfqLeg>) -> Self {
+        let effective = rfq.effective_status(now_ms());
+        let legs_count = legs.len() as u32;
+        Self {
+            option_rfq_id: rfq.option_rfq_id.to_string(),
+            taker: rfq.taker,
+            taker_subaccount_id: rfq.taker_subaccount_id,
+            status: effective,
+            created_at_ms: rfq.created_at_ms,
+            expires_at_ms: rfq.expires_at_ms,
+            accepted_quote_id: rfq.accepted_quote_id.map(|id| id.to_string()),
+            accepted_fill_id: rfq.accepted_fill_id.map(|id| id.to_string()),
+            legs_count,
+            legs: legs
+                .into_iter()
+                .map(OptionMultiLegRfqLegResponse::from)
+                .collect(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct OptionMultiLegRfqQuoteLegResponse {
+    leg_index: u32,
+    price_1e8: String,
+}
+
+impl From<OptionMultiLegRfqQuoteLeg> for OptionMultiLegRfqQuoteLegResponse {
+    fn from(leg: OptionMultiLegRfqQuoteLeg) -> Self {
+        Self {
+            leg_index: leg.leg_index,
+            price_1e8: leg.price_1e8.to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct OptionMultiLegRfqQuoteResponse {
+    quote_id: String,
+    option_rfq_id: String,
+    mm_account: AccountId,
+    maker_subaccount_id: u32,
+    session_id: Option<String>,
+    client_quote_id: Option<String>,
+    package_price_1e8: String,
+    size_1e8: String,
+    status: OptionMultiLegRfqQuoteStatus,
+    created_at_ms: i64,
+    expires_at_ms: i64,
+    signature: Option<String>,
+    quote_nonce: Option<String>,
+    legs: Vec<OptionMultiLegRfqQuoteLegResponse>,
+}
+
+impl OptionMultiLegRfqQuoteResponse {
+    fn from_parts(quote: OptionMultiLegRfqQuote, legs: Vec<OptionMultiLegRfqQuoteLeg>) -> Self {
+        let effective = quote.effective_status(now_ms());
+        Self {
+            quote_id: quote.quote_id.to_string(),
+            option_rfq_id: quote.option_rfq_id.to_string(),
+            mm_account: quote.mm_account,
+            maker_subaccount_id: quote.maker_subaccount_id,
+            session_id: quote.session_id,
+            client_quote_id: quote.client_quote_id,
+            package_price_1e8: quote.package_price_1e8,
+            size_1e8: quote.size_1e8.to_string(),
+            status: effective,
+            created_at_ms: quote.created_at_ms,
+            expires_at_ms: quote.expires_at_ms,
+            signature: quote.signature,
+            quote_nonce: quote.quote_nonce,
+            legs: legs
+                .into_iter()
+                .map(OptionMultiLegRfqQuoteLegResponse::from)
+                .collect(),
+        }
+    }
+}
+
+async fn create_option_multi_leg_rfq(
+    State(state): State<AppState>,
+    Json(request): Json<CreateOptionMultiLegRfqRequest>,
+) -> Result<Json<OptionMultiLegRfqResponse>, ApiError> {
+    // Flag gate: fails closed with 503 when the multi-leg subsystem
+    // is not live. This happens BEFORE any signature/persistence work.
+    ensure_option_multi_leg_rfq_enabled(&state)?;
+
+    // Multi-leg is v2-only from birth. No v1 fallback exists.
+    if request.authorization.version != Some(2) {
+        return Err(ApiError::from(BackendError::InvalidSubaccountRequest(
+            "multi-leg RFQ requires an authorization envelope with version = 2".to_string(),
+        )));
+    }
+    let resolved_subaccount_id = resolve_options_v2_subaccount(
+        &state,
+        &request.authorization,
+        request.subaccount_id,
+        &request.taker,
+    )
+    .await?;
+    let canonical = canonical_option_multi_leg_rfq_create_v2(&request, resolved_subaccount_id);
+    let _verified = require_write_auth_v2_aware(
+        &state,
+        WriteAuthAction::OptionMultiLegRfqCreate,
+        &request.taker,
+        resolved_subaccount_id,
+        &canonical,
+        &request.authorization,
+    )
+    .await?;
+
+    let legs = request
+        .legs
+        .iter()
+        .map(|leg| {
+            Ok(MultiLegLegInput {
+                leg_index: leg.leg_index,
+                option_series_id: leg.option_series_id.clone(),
+                side: leg.side,
+                size_1e8: parse_fixed_u128("size_1e8", &leg.size_1e8)?,
+                ratio_num: leg.ratio_num,
+                ratio_den: leg.ratio_den,
+            })
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
+
+    let (rfq, persisted_legs) = create_option_multi_leg_rfq_service(
+        &state,
+        CreateOptionMultiLegRfqInput {
+            taker: request.taker,
+            taker_subaccount_id: resolved_subaccount_id,
+            legs,
+            ttl_ms: request.ttl_ms,
+        },
+    )
+    .await?;
+
+    attach_resource_best_effort(
+        &state,
+        &request.authorization.nonce,
+        &rfq.option_rfq_id.to_string(),
+    )
+    .await;
+    Ok(Json(OptionMultiLegRfqResponse::from_parts(
+        rfq,
+        persisted_legs,
+    )))
+}
+
+async fn list_option_multi_leg_rfqs_by_taker(
+    State(state): State<AppState>,
+    Query(query): Query<ListMultiLegRfqsQuery>,
+) -> Result<Json<Vec<OptionMultiLegRfqResponse>>, ApiError> {
+    let taker = AccountId::new(query.taker);
+    let subaccount_id = query.subaccount_id.unwrap_or(1);
+    let rows = list_option_multi_leg_rfqs_by_taker_service(&state, &taker, subaccount_id).await?;
+    Ok(Json(
+        rows.into_iter()
+            .map(|(rfq, legs)| OptionMultiLegRfqResponse::from_parts(rfq, legs))
+            .collect(),
+    ))
+}
+
+async fn get_option_multi_leg_rfq(
+    State(state): State<AppState>,
+    Path(rfq_id): Path<String>,
+) -> Result<Json<OptionMultiLegRfqResponse>, ApiError> {
+    let rfq_id = parse_option_rfq_id(&rfq_id)?;
+    let (rfq, legs) = get_option_multi_leg_rfq_service(&state, rfq_id).await?;
+    Ok(Json(OptionMultiLegRfqResponse::from_parts(rfq, legs)))
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ListMultiLegRfqsQuery {
+    taker: String,
+    #[serde(default)]
+    subaccount_id: Option<u32>,
+}
+
+async fn submit_option_multi_leg_rfq_quote(
+    State(state): State<AppState>,
+    Path(rfq_id): Path<String>,
+    Json(request): Json<SubmitOptionMultiLegRfqQuoteRequest>,
+) -> Result<Json<OptionMultiLegRfqQuoteResponse>, ApiError> {
+    ensure_option_multi_leg_rfq_enabled(&state)?;
+
+    if request.authorization.version != Some(2) {
+        return Err(ApiError::from(BackendError::InvalidSubaccountRequest(
+            "multi-leg quote requires an authorization envelope with version = 2".to_string(),
+        )));
+    }
+    let parsed_rfq_id = parse_option_rfq_id(&rfq_id)?;
+    let resolved_subaccount_id = resolve_options_v2_subaccount(
+        &state,
+        &request.authorization,
+        request.subaccount_id,
+        &request.mm_account,
+    )
+    .await?;
+    let canonical =
+        canonical_option_multi_leg_rfq_quote_submit_v2(&rfq_id, &request, resolved_subaccount_id);
+    let _verified = require_write_auth_v2_aware(
+        &state,
+        WriteAuthAction::OptionMultiLegRfqQuoteSubmit,
+        &request.mm_account,
+        resolved_subaccount_id,
+        &canonical,
+        &request.authorization,
+    )
+    .await?;
+
+    let legs = request
+        .legs
+        .iter()
+        .map(|leg| {
+            Ok(QuoteLegInput {
+                leg_index: leg.leg_index,
+                price_1e8: parse_fixed_u128("price_1e8", &leg.price_1e8)?,
+            })
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
+
+    let (quote, quote_legs) = submit_option_multi_leg_rfq_quote_service(
+        &state,
+        parsed_rfq_id,
+        SubmitOptionMultiLegRfqQuoteInput {
+            mm_account: request.mm_account,
+            maker_subaccount_id: resolved_subaccount_id,
+            session_id: request.session_id,
+            client_quote_id: request.client_quote_id,
+            package_price_1e8: request.package_price_1e8,
+            size_1e8: parse_fixed_u128("size_1e8", &request.size_1e8)?,
+            legs,
+            quote_nonce: request.quote_nonce,
+            quote_ttl_ms: request.quote_ttl_ms,
+            signature: request.signature,
+        },
+    )
+    .await?;
+
+    attach_resource_best_effort(
+        &state,
+        &request.authorization.nonce,
+        &quote.quote_id.to_string(),
+    )
+    .await;
+    Ok(Json(OptionMultiLegRfqQuoteResponse::from_parts(
+        quote, quote_legs,
+    )))
+}
+
+async fn list_option_multi_leg_rfq_quotes(
+    State(state): State<AppState>,
+    Path(rfq_id): Path<String>,
+) -> Result<Json<Vec<OptionMultiLegRfqQuoteResponse>>, ApiError> {
+    let rfq_id = parse_option_rfq_id(&rfq_id)?;
+    let rows = list_option_multi_leg_rfq_quotes_service(&state, rfq_id).await?;
+    Ok(Json(
+        rows.into_iter()
+            .map(|(quote, legs)| OptionMultiLegRfqQuoteResponse::from_parts(quote, legs))
+            .collect(),
+    ))
+}
+
+async fn get_option_multi_leg_rfq_quote(
+    State(state): State<AppState>,
+    Path((_rfq_id, quote_id)): Path<(String, String)>,
+) -> Result<Json<OptionMultiLegRfqQuoteResponse>, ApiError> {
+    let quote_id = parse_option_rfq_quote_id(&quote_id)?;
+    let (quote, legs) = get_option_multi_leg_rfq_quote_service(&state, quote_id).await?;
+    Ok(Json(OptionMultiLegRfqQuoteResponse::from_parts(
+        quote, legs,
+    )))
+}
+
+// ---------------------------------------------------------------------
+// RFQ-MULTI-LEG-CREATE-QUOTE-V1 — canonical v2 payload builders. The
+// leg count is emitted as an explicit `legs_count` field before the
+// per-leg entries so a client cannot inject an extra leg without also
+// bumping the count in the signature.
+// ---------------------------------------------------------------------
+
+fn canonical_option_multi_leg_rfq_create_v2(
+    req: &CreateOptionMultiLegRfqRequest,
+    taker_subaccount_id: u32,
+) -> Vec<u8> {
+    let mut fields: Vec<(&'static str, CanonicalValue)> = Vec::new();
+    fields.push(("taker", CanonicalValue::Address(req.taker.clone())));
+    fields.push((
+        "subaccount_id",
+        CanonicalValue::U64(taker_subaccount_id as u64),
+    ));
+    fields.push(("legs_count", CanonicalValue::U64(req.legs.len() as u64)));
+    for leg in req.legs.iter() {
+        fields.push((
+            leak_static_str(format!("leg_{}_option_series_id", leg.leg_index)),
+            CanonicalValue::Str(leg.option_series_id.clone()),
+        ));
+        fields.push((
+            leak_static_str(format!("leg_{}_side", leg.leg_index)),
+            CanonicalValue::Str(match leg.side {
+                Side::Buy => "buy".to_string(),
+                Side::Sell => "sell".to_string(),
+            }),
+        ));
+        fields.push((
+            leak_static_str(format!("leg_{}_size_1e8", leg.leg_index)),
+            CanonicalValue::Str(leg.size_1e8.clone()),
+        ));
+        fields.push((
+            leak_static_str(format!("leg_{}_ratio_num", leg.leg_index)),
+            CanonicalValue::U64(leg.ratio_num as u64),
+        ));
+        fields.push((
+            leak_static_str(format!("leg_{}_ratio_den", leg.leg_index)),
+            CanonicalValue::U64(leg.ratio_den as u64),
+        ));
+    }
+    fields.push((
+        "ttl_ms",
+        req.ttl_ms
+            .map(CanonicalValue::U64)
+            .unwrap_or(CanonicalValue::Null),
+    ));
+    crate::auth::write_authorization::canonical_payload_bytes(
+        WriteAuthAction::OptionMultiLegRfqCreate,
+        &fields,
+    )
+}
+
+fn canonical_option_multi_leg_rfq_quote_submit_v2(
+    option_rfq_id: &str,
+    req: &SubmitOptionMultiLegRfqQuoteRequest,
+    maker_subaccount_id: u32,
+) -> Vec<u8> {
+    let mut fields: Vec<(&'static str, CanonicalValue)> = Vec::new();
+    fields.push((
+        "option_rfq_id",
+        CanonicalValue::Str(option_rfq_id.to_string()),
+    ));
+    fields.push((
+        "mm_account",
+        CanonicalValue::Address(req.mm_account.clone()),
+    ));
+    fields.push((
+        "subaccount_id",
+        CanonicalValue::U64(maker_subaccount_id as u64),
+    ));
+    fields.push((
+        "package_price_1e8",
+        CanonicalValue::Str(req.package_price_1e8.clone()),
+    ));
+    fields.push(("size_1e8", CanonicalValue::Str(req.size_1e8.clone())));
+    fields.push(("legs_count", CanonicalValue::U64(req.legs.len() as u64)));
+    for leg in req.legs.iter() {
+        fields.push((
+            leak_static_str(format!("leg_{}_price_1e8", leg.leg_index)),
+            CanonicalValue::Str(leg.price_1e8.clone()),
+        ));
+    }
+    fields.push((
+        "client_quote_id",
+        req.client_quote_id
+            .as_ref()
+            .map(|v| CanonicalValue::Str(v.clone()))
+            .unwrap_or(CanonicalValue::Null),
+    ));
+    fields.push((
+        "quote_nonce",
+        req.quote_nonce
+            .map(CanonicalValue::U64)
+            .unwrap_or(CanonicalValue::Null),
+    ));
+    fields.push((
+        "quote_ttl_ms",
+        req.quote_ttl_ms
+            .map(CanonicalValue::U64)
+            .unwrap_or(CanonicalValue::Null),
+    ));
+    crate::auth::write_authorization::canonical_payload_bytes(
+        WriteAuthAction::OptionMultiLegRfqQuoteSubmit,
+        &fields,
+    )
+}
+
+/// Leak a dynamically-built key name into a `'static` slot so it can
+/// participate in the canonical payload builder's `&'static str` array.
+/// Called at most `(max_legs * 5)` times per request; the memory is
+/// small and never freed for the lifetime of the process. This is the
+/// simplest way to reuse the existing `canonical_payload_bytes` API
+/// for variable-cardinality inputs without changing its signature.
+fn leak_static_str(value: String) -> &'static str {
+    Box::leak(value.into_boxed_str())
 }
 
 /// OPTIONS-RFQ-TRADES-FEED-V1 — public read of accepted RFQ fills.
@@ -13782,6 +14305,10 @@ impl From<BackendError> for ApiError {
             BackendError::Persistence(_) => StatusCode::INTERNAL_SERVER_ERROR,
             // ACCOUNT-WRITE-AUTH-HARDENING-V1
             BackendError::PerpsNotLive => StatusCode::SERVICE_UNAVAILABLE,
+            // RFQ-MULTI-LEG-CREATE-QUOTE-V1 — flag-gated, fails closed
+            // at the route boundary when
+            // OPTION_RFQ_MULTI_LEG_ENABLED=false.
+            BackendError::OptionMultiLegRfqNotLive => StatusCode::SERVICE_UNAVAILABLE,
             // PERPS-MINIMAL-MARKET-AND-PRICE-V1
             BackendError::PerpsReadDisabled => StatusCode::SERVICE_UNAVAILABLE,
             BackendError::PerpsChainIdMismatch { .. } => StatusCode::BAD_REQUEST,

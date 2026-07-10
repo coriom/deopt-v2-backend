@@ -69,6 +69,8 @@ pub enum BackendError {
     OptionsDisabled,
     #[error("option RFQ is disabled")]
     OptionRfqDisabled,
+    #[error("multi-leg option RFQ is not live")]
+    OptionMultiLegRfqNotLive,
     #[error("MM permission denied: {0}")]
     MmPermissionDenied(String),
     #[error("invalid option series id: {0}")]

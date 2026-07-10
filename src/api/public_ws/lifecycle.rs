@@ -436,6 +436,48 @@ pub enum LifecyclePayload {
         status: String,
         cancelled_at_ms: TimestampMs,
     },
+    /// RFQ-MULTI-LEG-CREATE-QUOTE-V1 — a taker created a new
+    /// multi-leg atomic Options RFQ. Emitted AFTER the parent RFQ
+    /// row + N leg rows are committed. Carries `legs_count` and
+    /// the taker's subaccount but does NOT enumerate per-leg
+    /// series ids on the wire; consumers fetch the full leg list
+    /// via `GET /options/multi-leg-rfqs/:id`. This keeps the WS
+    /// frame small and avoids leaking every leg's series across
+    /// the pub-sub bus.
+    ///
+    /// Privacy: no signatures, no write-auth nonce, no envelope.
+    OptionMultiLegRfqCreated {
+        option_rfq_id: String,
+        taker: String,
+        #[serde(default = "crate::options::types::one_subaccount_id")]
+        taker_subaccount_id: u32,
+        legs_count: u32,
+        status: String,
+        created_at_ms: TimestampMs,
+        expires_at_ms: TimestampMs,
+    },
+    /// RFQ-MULTI-LEG-CREATE-QUOTE-V1 — a maker submitted a package
+    /// quote on an open multi-leg RFQ. Emitted AFTER the quote
+    /// row + N quote-leg rows are committed. Fan-out: one frame
+    /// per interested account (taker + maker). Consumers refetch
+    /// the full quote (with per-leg prices) via
+    /// `GET /options/multi-leg-rfqs/:id/quotes/:quote_id`.
+    OptionMultiLegRfqQuoteSubmitted {
+        option_rfq_id: String,
+        quote_id: String,
+        taker: String,
+        #[serde(default = "crate::options::types::one_subaccount_id")]
+        taker_subaccount_id: u32,
+        mm_account: String,
+        #[serde(default = "crate::options::types::one_subaccount_id")]
+        maker_subaccount_id: u32,
+        legs_count: u32,
+        package_price_1e8: String,
+        size_1e8: String,
+        status: String,
+        created_at_ms: TimestampMs,
+        expires_at_ms: TimestampMs,
+    },
 }
 
 /// Lightweight wrapper around `tokio::sync::broadcast::Sender` that

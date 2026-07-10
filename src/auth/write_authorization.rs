@@ -57,6 +57,12 @@ pub enum WriteAuthAction {
     OptionRfqQuoteSubmit,
     OptionRfqAccept,
     OptionRfqCancel,
+    /// RFQ-MULTI-LEG-CREATE-QUOTE-V1 — multi-leg atomic RFQ. Distinct
+    /// action names guarantee cross-flavor nonce isolation via the
+    /// `used_nonces_v2` action tuple: a single-leg accept nonce can
+    /// never satisfy a multi-leg create signature and vice versa.
+    OptionMultiLegRfqCreate,
+    OptionMultiLegRfqQuoteSubmit,
     OptionExecutionIntentSignatureSubmit,
     /// OPTIONS-TWAP-ORDERS-V1 — taker create/cancel of a parent TWAP order.
     OptionTwapCreate,
@@ -94,6 +100,8 @@ impl WriteAuthAction {
             Self::OptionRfqQuoteSubmit => "OPTION_RFQ_QUOTE_SUBMIT",
             Self::OptionRfqAccept => "OPTION_RFQ_ACCEPT",
             Self::OptionRfqCancel => "OPTION_RFQ_CANCEL",
+            Self::OptionMultiLegRfqCreate => "OPTION_MULTI_LEG_RFQ_CREATE",
+            Self::OptionMultiLegRfqQuoteSubmit => "OPTION_MULTI_LEG_RFQ_QUOTE_SUBMIT",
             Self::OptionExecutionIntentSignatureSubmit => {
                 "OPTION_EXECUTION_INTENT_SIGNATURE_SUBMIT"
             }
@@ -116,6 +124,8 @@ impl WriteAuthAction {
             "OPTION_RFQ_QUOTE_SUBMIT" => Self::OptionRfqQuoteSubmit,
             "OPTION_RFQ_ACCEPT" => Self::OptionRfqAccept,
             "OPTION_RFQ_CANCEL" => Self::OptionRfqCancel,
+            "OPTION_MULTI_LEG_RFQ_CREATE" => Self::OptionMultiLegRfqCreate,
+            "OPTION_MULTI_LEG_RFQ_QUOTE_SUBMIT" => Self::OptionMultiLegRfqQuoteSubmit,
             "OPTION_EXECUTION_INTENT_SIGNATURE_SUBMIT" => {
                 Self::OptionExecutionIntentSignatureSubmit
             }

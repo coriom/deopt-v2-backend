@@ -4322,16 +4322,24 @@ fn trim_asset(value: String) -> String {
     value.trim().to_string()
 }
 
-fn now_sec(now_ms: TimestampMs) -> Result<u64> {
+pub(crate) fn now_sec(now_ms: TimestampMs) -> Result<u64> {
     u64::try_from(now_ms / 1000)
         .map_err(|_| BackendError::Config("current timestamp cannot be encoded".to_string()))
 }
 
-fn checked_expiry(now: TimestampMs, ttl_ms: u64, context: &str) -> Result<TimestampMs> {
+pub(crate) fn checked_expiry(now: TimestampMs, ttl_ms: u64, context: &str) -> Result<TimestampMs> {
     let ttl_ms = i64::try_from(ttl_ms)
         .map_err(|_| BackendError::Config(format!("{context} ttl cannot be encoded")))?;
     now.checked_add(ttl_ms)
         .ok_or_else(|| BackendError::Config(format!("{context} overflow")))
+}
+
+/// RFQ-MULTI-LEG-CREATE-QUOTE-V1 — public wrapper for
+/// `ensure_option_rfq_enabled` so the multi-leg service can gate on
+/// both the master OPTION_RFQ_ENABLED and its own multi-leg flag
+/// without duplicating logic.
+pub(crate) fn ensure_option_rfq_enabled_public(state: &AppState) -> Result<()> {
+    ensure_option_rfq_enabled(state)
 }
 
 fn option_rfq_price_satisfies_limit(
