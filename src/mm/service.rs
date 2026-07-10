@@ -3,10 +3,12 @@ use super::protocol::{
     BulkCancelPayload, BulkCancelResultPayload, BulkSubmitItemResult, BulkSubmitPayload,
     BulkSubmitResultPayload, CancelAllPayload, CancelAllResultPayload, CancelOrderPayload,
     CancelOrderResultPayload, ClientMessage, ErrorCode, GetSessionResultPayload,
-    HeartbeatResultPayload, OptionRfqQuotePayload, OptionRfqQuoteResultPayload, ProtocolError,
-    QuoteLegPayload, QuoteReplaceLegResult, QuoteReplacePayload, QuoteReplaceResultPayload,
-    ResultEnvelope, RfqQuotePayload, RfqQuoteResultPayload, ServerMessage, SubmitOrderPayload,
-    SubmitOrderResultPayload,
+    HeartbeatResultPayload, OptionMultiLegRfqQuoteCancelPayload,
+    OptionMultiLegRfqQuoteCancelResultPayload, OptionMultiLegRfqQuotePayload,
+    OptionMultiLegRfqQuoteResultPayload, OptionRfqQuotePayload, OptionRfqQuoteResultPayload,
+    ProtocolError, QuoteLegPayload, QuoteReplaceLegResult, QuoteReplacePayload,
+    QuoteReplaceResultPayload, ResultEnvelope, RfqQuotePayload, RfqQuoteResultPayload,
+    ServerMessage, SubmitOrderPayload, SubmitOrderResultPayload,
 };
 use super::rate_limit::{
     check_cancels_per_bulk, check_in_flight, check_message_rate, check_open_orders,
@@ -16,6 +18,11 @@ use super::session::MmSession;
 use crate::api::dto::parse_fixed_u128;
 use crate::api::AppState;
 use crate::error::BackendError;
+use crate::options::multi_leg_service::{
+    cancel_option_multi_leg_rfq_quote_by_maker, submit_option_multi_leg_rfq_quote,
+    CancelOptionMultiLegRfqQuoteByMakerInput, QuoteLegInput as MultiLegQuoteLegInput,
+    SubmitOptionMultiLegRfqQuoteInput,
+};
 use crate::options::service::{submit_option_rfq_quote, SubmitOptionRfqQuoteInput};
 use crate::orders::service::{
     cancel_order, cancel_resting_orders, submit_signed_order, CancelOrderInput,
@@ -153,6 +160,22 @@ impl MmGatewayService {
             ClientMessage::OptionRfqQuote(envelope) => {
                 self.handle_option_rfq_quote(session, envelope.request_id, envelope.payload)
                     .await
+            }
+            ClientMessage::OptionMultiLegRfqQuote(envelope) => {
+                self.handle_option_multi_leg_rfq_quote(
+                    session,
+                    envelope.request_id,
+                    envelope.payload,
+                )
+                .await
+            }
+            ClientMessage::OptionMultiLegRfqQuoteCancel(envelope) => {
+                self.handle_option_multi_leg_rfq_quote_cancel(
+                    session,
+                    envelope.request_id,
+                    envelope.payload,
+                )
+                .await
             }
             ClientMessage::GetSession(envelope) => {
                 ServerMessage::GetSessionResult(ResultEnvelope::new(
@@ -840,6 +863,175 @@ impl MmGatewayService {
             Err(error) => {
                 backend_error_response(request_id, ErrorCode::OptionRfqQuoteRejected, error)
             }
+        }
+    }
+
+    // RFQ-MULTI-LEG-MM-GATEWAY-V1 — maker submits a package quote
+    // via the WT surface. Same auth model as the single-leg option
+    // RFQ quote handler: `session_account` pins the maker identity
+    // to the authenticated `MmSession`, then `resolve_mm_gateway_maker_subaccount`
+    // gates the subaccount lookup on that pinned identity.
+    //
+    // Leg composition is server-anchored — the maker only supplies
+    // per-leg prices. The shared multi-leg service performs the
+    // package-integrity checks + persistence + lifecycle emission
+    // that the HTTP path already exercises.
+    async fn handle_option_multi_leg_rfq_quote(
+        &self,
+        session: &mut MmSession,
+        request_id: String,
+        payload: OptionMultiLegRfqQuotePayload,
+    ) -> ServerMessage {
+        let Some(mm_account) = session_account(session, Some(payload.mm_account.clone())) else {
+            return ServerMessage::error(
+                request_id,
+                ErrorCode::OptionMultiLegRfqQuoteRejected,
+                "option_multi_leg_rfq_quote account does not match authenticated session",
+            );
+        };
+
+        let maker_subaccount_id = match resolve_mm_gateway_maker_subaccount(
+            &self.state,
+            &mm_account,
+            payload.maker_subaccount_id,
+        )
+        .await
+        {
+            Ok(id) => id,
+            Err(error) => {
+                return backend_error_response(
+                    request_id,
+                    ErrorCode::OptionMultiLegRfqQuoteRejected,
+                    error,
+                );
+            }
+        };
+
+        let size_1e8 = match parse_fixed_u128("size_1e8", &payload.size_1e8) {
+            Ok(v) => v,
+            Err(error) => {
+                return backend_error_response(
+                    request_id,
+                    ErrorCode::OptionMultiLegRfqQuoteRejected,
+                    error,
+                );
+            }
+        };
+
+        // Convert per-leg prices before touching the service so a
+        // malformed price rejects with a clean error code + bounded
+        // string instead of a persistence-layer panic.
+        let mut legs: Vec<MultiLegQuoteLegInput> = Vec::with_capacity(payload.legs.len());
+        for leg in &payload.legs {
+            match parse_fixed_u128("leg_price_1e8", &leg.price_1e8) {
+                Ok(price_1e8) => legs.push(MultiLegQuoteLegInput {
+                    leg_index: leg.leg_index,
+                    price_1e8,
+                }),
+                Err(error) => {
+                    return backend_error_response(
+                        request_id,
+                        ErrorCode::OptionMultiLegRfqQuoteRejected,
+                        error,
+                    );
+                }
+            }
+        }
+
+        match submit_option_multi_leg_rfq_quote(
+            &self.state,
+            payload.option_rfq_id,
+            SubmitOptionMultiLegRfqQuoteInput {
+                mm_account,
+                maker_subaccount_id,
+                session_id: Some(session.session_id.clone()),
+                client_quote_id: payload.client_quote_id,
+                package_price_1e8: payload.package_price_1e8,
+                size_1e8,
+                legs,
+                quote_nonce: payload.quote_nonce,
+                quote_ttl_ms: Some(payload.quote_ttl_ms),
+                signature: payload.signature,
+            },
+        )
+        .await
+        {
+            Ok((quote, legs)) => ServerMessage::OptionMultiLegRfqQuoteResult(ResultEnvelope::new(
+                "option_multi_leg_rfq_quote_result",
+                request_id,
+                OptionMultiLegRfqQuoteResultPayload {
+                    quote_id: quote.quote_id,
+                    option_rfq_id: quote.option_rfq_id,
+                    status: quote.status,
+                    expires_at_ms: quote.expires_at_ms,
+                    legs_count: legs.len() as u32,
+                },
+            )),
+            Err(error) => {
+                backend_error_response(request_id, ErrorCode::OptionMultiLegRfqQuoteRejected, error)
+            }
+        }
+    }
+
+    // RFQ-MULTI-LEG-MM-GATEWAY-V1 — maker cancel of their own quote.
+    // Refuses without touching persistence if the payload's
+    // `mm_account` disagrees with the authenticated session identity.
+    async fn handle_option_multi_leg_rfq_quote_cancel(
+        &self,
+        session: &mut MmSession,
+        request_id: String,
+        payload: OptionMultiLegRfqQuoteCancelPayload,
+    ) -> ServerMessage {
+        let Some(mm_account) = session_account(session, Some(payload.mm_account.clone())) else {
+            return ServerMessage::error(
+                request_id,
+                ErrorCode::OptionMultiLegRfqQuoteCancelRejected,
+                "option_multi_leg_rfq_quote_cancel account does not match authenticated session",
+            );
+        };
+
+        let maker_subaccount_id = match resolve_mm_gateway_maker_subaccount(
+            &self.state,
+            &mm_account,
+            payload.maker_subaccount_id,
+        )
+        .await
+        {
+            Ok(id) => id,
+            Err(error) => {
+                return backend_error_response(
+                    request_id,
+                    ErrorCode::OptionMultiLegRfqQuoteCancelRejected,
+                    error,
+                );
+            }
+        };
+
+        match cancel_option_multi_leg_rfq_quote_by_maker(
+            &self.state,
+            CancelOptionMultiLegRfqQuoteByMakerInput {
+                mm_account,
+                maker_subaccount_id,
+                option_rfq_id: payload.option_rfq_id,
+                quote_id: payload.quote_id,
+            },
+        )
+        .await
+        {
+            Ok(outcome) => ServerMessage::OptionMultiLegRfqQuoteCancelResult(ResultEnvelope::new(
+                "option_multi_leg_rfq_quote_cancel_result",
+                request_id,
+                OptionMultiLegRfqQuoteCancelResultPayload {
+                    quote_id: outcome.quote.quote_id,
+                    option_rfq_id: outcome.quote.option_rfq_id,
+                    status: outcome.quote.status,
+                },
+            )),
+            Err(error) => backend_error_response(
+                request_id,
+                ErrorCode::OptionMultiLegRfqQuoteCancelRejected,
+                error,
+            ),
         }
     }
 

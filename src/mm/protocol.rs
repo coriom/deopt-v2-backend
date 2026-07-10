@@ -1,5 +1,5 @@
 use super::session::PublicSessionSnapshot;
-use crate::options::OptionRfqQuoteStatus;
+use crate::options::{OptionMultiLegRfqQuoteStatus, OptionRfqQuoteStatus};
 use crate::rfq::{RfqQuoteStatus, RfqStatus};
 use crate::types::{AccountId, MarketId, OrderId, Side, TimeInForce, TimestampMs};
 use serde::de::{self, DeserializeOwned};
@@ -23,6 +23,8 @@ pub enum ErrorCode {
     QuoteReplaceFailed,
     RfqQuoteRejected,
     OptionRfqQuoteRejected,
+    OptionMultiLegRfqQuoteRejected,
+    OptionMultiLegRfqQuoteCancelRejected,
     InternalError,
     NotImplemented,
 }
@@ -62,6 +64,8 @@ pub enum ClientMessage {
     QuoteReplace(ClientEnvelope<QuoteReplacePayload>),
     RfqQuote(ClientEnvelope<RfqQuotePayload>),
     OptionRfqQuote(ClientEnvelope<OptionRfqQuotePayload>),
+    OptionMultiLegRfqQuote(ClientEnvelope<OptionMultiLegRfqQuotePayload>),
+    OptionMultiLegRfqQuoteCancel(ClientEnvelope<OptionMultiLegRfqQuoteCancelPayload>),
     GetSession(ClientEnvelope<GetSessionPayload>),
 }
 
@@ -80,6 +84,8 @@ impl ClientMessage {
             Self::QuoteReplace(envelope) => &envelope.request_id,
             Self::RfqQuote(envelope) => &envelope.request_id,
             Self::OptionRfqQuote(envelope) => &envelope.request_id,
+            Self::OptionMultiLegRfqQuote(envelope) => &envelope.request_id,
+            Self::OptionMultiLegRfqQuoteCancel(envelope) => &envelope.request_id,
             Self::GetSession(envelope) => &envelope.request_id,
         }
     }
@@ -98,6 +104,8 @@ impl ClientMessage {
             Self::QuoteReplace(_) => "quote_replace",
             Self::RfqQuote(_) => "rfq_quote",
             Self::OptionRfqQuote(_) => "option_rfq_quote",
+            Self::OptionMultiLegRfqQuote(_) => "option_multi_leg_rfq_quote",
+            Self::OptionMultiLegRfqQuoteCancel(_) => "option_multi_leg_rfq_quote_cancel",
             Self::GetSession(_) => "get_session",
         }
     }
@@ -154,6 +162,12 @@ fn parse_raw_client_envelope(raw: RawClientEnvelope) -> Result<ClientMessage, Pr
         "quote_replace" => Ok(ClientMessage::QuoteReplace(parse_payload(raw)?)),
         "rfq_quote" => Ok(ClientMessage::RfqQuote(parse_payload(raw)?)),
         "option_rfq_quote" => Ok(ClientMessage::OptionRfqQuote(parse_payload(raw)?)),
+        "option_multi_leg_rfq_quote" => {
+            Ok(ClientMessage::OptionMultiLegRfqQuote(parse_payload(raw)?))
+        }
+        "option_multi_leg_rfq_quote_cancel" => Ok(ClientMessage::OptionMultiLegRfqQuoteCancel(
+            parse_payload(raw)?,
+        )),
         "get_session" => Ok(ClientMessage::GetSession(parse_payload(raw)?)),
         _ => Err(ProtocolError::new(
             ErrorCode::UnknownMessageType,
@@ -284,6 +298,49 @@ pub struct OptionRfqQuotePayload {
     /// Omitted = Account 1 for backward compatibility. Explicit ids
     /// > 1 are validated against the authenticated MM identity in
     /// `MmGatewayService::handle_option_rfq_quote`.
+    #[serde(default)]
+    pub maker_subaccount_id: Option<u32>,
+}
+
+/// RFQ-MULTI-LEG-MM-GATEWAY-V1 — maker submits a package quote on
+/// an open multi-leg RFQ via the WT surface.
+///
+/// The maker identity is bound to the authenticated `MmSession`.
+/// `mm_account` on the payload MUST match; if it does not, the
+/// handler refuses before touching persistence. Leg composition is
+/// server-anchored by `option_rfq_id`; the maker only supplies
+/// per-leg prices.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+pub struct OptionMultiLegRfqQuotePayload {
+    pub option_rfq_id: uuid::Uuid,
+    pub mm_account: AccountId,
+    #[serde(default)]
+    pub maker_subaccount_id: Option<u32>,
+    pub client_quote_id: Option<String>,
+    pub package_price_1e8: String,
+    pub size_1e8: String,
+    pub legs: Vec<OptionMultiLegRfqQuoteLegPayload>,
+    pub quote_nonce: Option<u64>,
+    pub quote_ttl_ms: u64,
+    pub signature: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+pub struct OptionMultiLegRfqQuoteLegPayload {
+    pub leg_index: u32,
+    pub price_1e8: String,
+}
+
+/// RFQ-MULTI-LEG-MM-GATEWAY-V1 — maker cancel of their own active
+/// multi-leg quote. Does NOT cancel the RFQ; only flips the maker's
+/// specific quote from `active` to `cancelled`. Refuses if the quote
+/// is already accepted / rejected / cancelled or belongs to a
+/// different maker or subaccount.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+pub struct OptionMultiLegRfqQuoteCancelPayload {
+    pub option_rfq_id: uuid::Uuid,
+    pub quote_id: uuid::Uuid,
+    pub mm_account: AccountId,
     #[serde(default)]
     pub maker_subaccount_id: Option<u32>,
 }
@@ -468,6 +525,49 @@ pub struct OptionRfqQuoteRejectedPayload {
     pub reason: String,
 }
 
+/// RFQ-MULTI-LEG-MM-GATEWAY-V1 — WT result envelope returned to the
+/// maker after a successful multi-leg quote submission. Consumer
+/// refetches the full quote (with per-leg prices) via the HTTP
+/// `GET /options/multi-leg-rfqs/:id/quotes/:quote_id` route.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct OptionMultiLegRfqQuoteResultPayload {
+    pub quote_id: uuid::Uuid,
+    pub option_rfq_id: uuid::Uuid,
+    pub status: OptionMultiLegRfqQuoteStatus,
+    pub expires_at_ms: TimestampMs,
+    pub legs_count: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct OptionMultiLegRfqQuoteCancelResultPayload {
+    pub quote_id: uuid::Uuid,
+    pub option_rfq_id: uuid::Uuid,
+    pub status: OptionMultiLegRfqQuoteStatus,
+}
+
+/// RFQ-MULTI-LEG-MM-GATEWAY-V1 — push to the maker's WT session
+/// AFTER their multi-leg quote is atomically accepted. Bounded
+/// payload: no signatures, no nonces, no raw error strings.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct OptionMultiLegRfqQuoteAcceptedPayload {
+    pub option_rfq_id: uuid::Uuid,
+    pub quote_id: uuid::Uuid,
+    pub fill_id: uuid::Uuid,
+    pub legs_count: u32,
+}
+
+/// RFQ-MULTI-LEG-MM-GATEWAY-V1 — push to the makers whose competing
+/// quotes lost when a winning quote was accepted, OR to the maker
+/// whose quote was flipped to `Cancelled` by their own cancel
+/// request. `reason` is drawn from a bounded label set so the wire
+/// cannot leak raw error strings.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct OptionMultiLegRfqQuoteRejectedPayload {
+    pub option_rfq_id: uuid::Uuid,
+    pub quote_id: uuid::Uuid,
+    pub reason: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct GetSessionResultPayload {
     pub session: PublicSessionSnapshot,
@@ -494,6 +594,10 @@ pub enum ServerMessage {
     OptionRfqQuoteResult(ResultEnvelope<OptionRfqQuoteResultPayload>),
     OptionRfqQuoteAccepted(NotificationEnvelope<OptionRfqQuoteAcceptedPayload>),
     OptionRfqQuoteRejected(NotificationEnvelope<OptionRfqQuoteRejectedPayload>),
+    OptionMultiLegRfqQuoteResult(ResultEnvelope<OptionMultiLegRfqQuoteResultPayload>),
+    OptionMultiLegRfqQuoteCancelResult(ResultEnvelope<OptionMultiLegRfqQuoteCancelResultPayload>),
+    OptionMultiLegRfqQuoteAccepted(NotificationEnvelope<OptionMultiLegRfqQuoteAcceptedPayload>),
+    OptionMultiLegRfqQuoteRejected(NotificationEnvelope<OptionMultiLegRfqQuoteRejectedPayload>),
     GetSessionResult(ResultEnvelope<GetSessionResultPayload>),
     Error(ErrorEnvelope),
 }
@@ -538,6 +642,10 @@ impl Serialize for ServerMessage {
             Self::OptionRfqQuoteResult(envelope) => envelope.serialize(serializer),
             Self::OptionRfqQuoteAccepted(envelope) => envelope.serialize(serializer),
             Self::OptionRfqQuoteRejected(envelope) => envelope.serialize(serializer),
+            Self::OptionMultiLegRfqQuoteResult(envelope) => envelope.serialize(serializer),
+            Self::OptionMultiLegRfqQuoteCancelResult(envelope) => envelope.serialize(serializer),
+            Self::OptionMultiLegRfqQuoteAccepted(envelope) => envelope.serialize(serializer),
+            Self::OptionMultiLegRfqQuoteRejected(envelope) => envelope.serialize(serializer),
             Self::GetSessionResult(envelope) => envelope.serialize(serializer),
             Self::Error(envelope) => envelope.serialize(serializer),
         }

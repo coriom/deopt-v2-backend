@@ -525,6 +525,23 @@ pub enum LifecyclePayload {
         cancelled_quotes: u32,
         cancelled_at_ms: TimestampMs,
     },
+    /// RFQ-MULTI-LEG-MM-GATEWAY-V1 — a maker cancelled their own
+    /// active multi-leg RFQ quote. Fan-out: taker + maker. The RFQ
+    /// itself stays `Open` — the taker sees the quote drop out of
+    /// the active-quotes list and can still accept a different
+    /// competing quote if any.
+    OptionMultiLegRfqQuoteCancelled {
+        option_rfq_id: String,
+        quote_id: String,
+        taker: String,
+        #[serde(default = "crate::options::types::one_subaccount_id")]
+        taker_subaccount_id: u32,
+        mm_account: String,
+        #[serde(default = "crate::options::types::one_subaccount_id")]
+        maker_subaccount_id: u32,
+        status: String,
+        cancelled_at_ms: TimestampMs,
+    },
 }
 
 /// Lightweight wrapper around `tokio::sync::broadcast::Sender` that

@@ -1909,6 +1909,36 @@ impl OptionSeriesStore {
         Ok(cancelled_quotes)
     }
 
+    // RFQ-MULTI-LEG-MM-GATEWAY-V1 — maker cancel of their own active
+    // multi-leg quote. Held under the store `Mutex`, so the ownership
+    // check and status flip are one commit visible to readers.
+    pub fn cancel_option_multi_leg_rfq_quote_by_maker(
+        &mut self,
+        quote_id: super::OptionMultiLegRfqQuoteId,
+        mm_account: &AccountId,
+        maker_subaccount_id: u32,
+    ) -> Result<()> {
+        let quote = self
+            .option_multi_leg_rfq_quotes
+            .get(&quote_id)
+            .cloned()
+            .ok_or(BackendError::InvalidOptionRfqQuoteId)?;
+        if !quote.mm_account.0.eq_ignore_ascii_case(&mm_account.0)
+            || quote.maker_subaccount_id != maker_subaccount_id
+            || quote.status != super::OptionMultiLegRfqQuoteStatus::Active
+        {
+            return Err(BackendError::InvalidOptionRfqQuoteState(
+                "multi-leg quote cannot be cancelled by maker".to_string(),
+            ));
+        }
+        let quote_mut = self
+            .option_multi_leg_rfq_quotes
+            .get_mut(&quote_id)
+            .expect("quote present");
+        quote_mut.status = super::OptionMultiLegRfqQuoteStatus::Cancelled;
+        Ok(())
+    }
+
     pub fn get_option_multi_leg_rfq_fill(
         &self,
         fill_id: super::OptionMultiLegRfqFillId,

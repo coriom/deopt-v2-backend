@@ -730,6 +730,12 @@ pub async fn accept_option_multi_leg_rfq_quote(
             &persisted_quote,
             &persisted_fill,
         );
+        notify_multi_leg_mm_gateway_on_accept(
+            state,
+            &persisted_quote,
+            persisted_fill_legs.len() as u32,
+            persisted_fill.fill_id,
+        );
         return Ok(AcceptOptionMultiLegRfqQuoteOutcome {
             rfq: persisted_rfq,
             quote: persisted_quote,
@@ -750,6 +756,12 @@ pub async fn accept_option_multi_leg_rfq_quote(
             fill_legs.clone(),
         )?;
     emit_multi_leg_rfq_accepted_lifecycle(state, &persisted_rfq, &persisted_quote, &fill);
+    notify_multi_leg_mm_gateway_on_accept(
+        state,
+        &persisted_quote,
+        fill_legs.len() as u32,
+        fill.fill_id,
+    );
     Ok(AcceptOptionMultiLegRfqQuoteOutcome {
         rfq: persisted_rfq,
         quote: persisted_quote,
@@ -962,4 +974,173 @@ fn emit_multi_leg_rfq_cancelled_lifecycle(
         },
         emitted_at_ms: now,
     });
+}
+
+// ---------------------------------------------------------------------
+// RFQ-MULTI-LEG-MM-GATEWAY-V1 — maker-side quote cancel.
+// ---------------------------------------------------------------------
+
+#[derive(Clone, Debug)]
+pub struct CancelOptionMultiLegRfqQuoteByMakerInput {
+    pub mm_account: AccountId,
+    pub maker_subaccount_id: u32,
+    pub option_rfq_id: OptionMultiLegRfqId,
+    pub quote_id: OptionMultiLegRfqQuoteId,
+}
+
+#[derive(Clone, Debug)]
+pub struct CancelOptionMultiLegRfqQuoteByMakerOutcome {
+    pub quote: OptionMultiLegRfqQuote,
+    pub rfq: OptionMultiLegRfqRequest,
+    pub cancelled_at_ms: crate::types::TimestampMs,
+}
+
+/// Maker cancel of their own active multi-leg RFQ quote. Guards:
+///
+///   * flag must be live;
+///   * `maker_subaccount_id >= 1`;
+///   * the quote belongs to `(mm_account, maker_subaccount_id)`;
+///   * the quote must be `Active` — accepted / rejected / cancelled
+///     quotes refuse before any write;
+///   * the quote must belong to the RFQ named on the request (guards
+///     against a maker cancelling a quote on the wrong RFQ);
+///   * RFQ status is NOT mutated; only the specific quote flips.
+///
+/// Emits `OptionMultiLegRfqQuoteCancelled` to taker + maker.
+pub async fn cancel_option_multi_leg_rfq_quote_by_maker(
+    state: &AppState,
+    input: CancelOptionMultiLegRfqQuoteByMakerInput,
+) -> Result<CancelOptionMultiLegRfqQuoteByMakerOutcome> {
+    ensure_option_multi_leg_rfq_enabled(state)?;
+    validate_account(&input.mm_account)?;
+    if input.maker_subaccount_id < 1 {
+        return Err(BackendError::InvalidOptionRfqQuoteState(
+            "multi-leg quote cancel maker_subaccount_id must be >= 1".to_string(),
+        ));
+    }
+
+    // Preflight ownership + status guards. The atomic UPDATE re-checks
+    // the same invariants so we survive a concurrent accept.
+    let (quote, _legs) = get_option_multi_leg_rfq_quote(state, input.quote_id).await?;
+    if quote.option_rfq_id != input.option_rfq_id {
+        return Err(BackendError::InvalidOptionRfqQuoteState(
+            "multi-leg quote does not belong to the referenced RFQ".to_string(),
+        ));
+    }
+    if !accounts_equal(&quote.mm_account, &input.mm_account) {
+        return Err(BackendError::InvalidOptionRfqQuoteState(
+            "multi-leg quote does not belong to the caller".to_string(),
+        ));
+    }
+    if quote.maker_subaccount_id != input.maker_subaccount_id {
+        return Err(BackendError::InvalidOptionRfqQuoteState(
+            "multi-leg quote maker subaccount mismatch".to_string(),
+        ));
+    }
+    if quote.status != OptionMultiLegRfqQuoteStatus::Active {
+        return Err(BackendError::InvalidOptionRfqQuoteState(
+            "multi-leg quote is not active".to_string(),
+        ));
+    }
+
+    if let Some(repository) = state.repository.clone() {
+        repository
+            .cancel_option_multi_leg_rfq_quote_by_maker(
+                input.quote_id,
+                &input.mm_account,
+                input.maker_subaccount_id,
+            )
+            .await?;
+    } else {
+        state
+            .options_store
+            .lock()
+            .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?
+            .cancel_option_multi_leg_rfq_quote_by_maker(
+                input.quote_id,
+                &input.mm_account,
+                input.maker_subaccount_id,
+            )?;
+    }
+
+    let (persisted_quote, _legs) = get_option_multi_leg_rfq_quote(state, input.quote_id).await?;
+    let (persisted_rfq, _rfq_legs) = get_option_multi_leg_rfq(state, input.option_rfq_id).await?;
+    let cancelled_at_ms = now_ms();
+    emit_multi_leg_rfq_quote_cancelled_lifecycle(
+        state,
+        &persisted_rfq,
+        &persisted_quote,
+        cancelled_at_ms,
+    );
+
+    Ok(CancelOptionMultiLegRfqQuoteByMakerOutcome {
+        quote: persisted_quote,
+        rfq: persisted_rfq,
+        cancelled_at_ms,
+    })
+}
+
+fn emit_multi_leg_rfq_quote_cancelled_lifecycle(
+    state: &AppState,
+    rfq: &OptionMultiLegRfqRequest,
+    quote: &OptionMultiLegRfqQuote,
+    cancelled_at_ms: crate::types::TimestampMs,
+) {
+    use crate::api::public_ws::{LifecycleChannel, LifecycleEvent, LifecyclePayload};
+    let now = now_ms();
+    for account in [rfq.taker.clone(), quote.mm_account.clone()] {
+        state.lifecycle_events.emit(LifecycleEvent {
+            account,
+            channel: LifecycleChannel::AccountRfqs,
+            payload: LifecyclePayload::OptionMultiLegRfqQuoteCancelled {
+                option_rfq_id: rfq.option_rfq_id.to_string(),
+                quote_id: quote.quote_id.to_string(),
+                taker: rfq.taker.0.clone(),
+                taker_subaccount_id: rfq.taker_subaccount_id,
+                mm_account: quote.mm_account.0.clone(),
+                maker_subaccount_id: quote.maker_subaccount_id,
+                status: quote.status.as_str().to_string(),
+                cancelled_at_ms,
+            },
+            emitted_at_ms: now,
+        });
+    }
+}
+
+// RFQ-MULTI-LEG-MM-GATEWAY-V1 — best-effort push to the winning
+// maker's MM Gateway WT session AFTER accept commits. Mirrors the
+// single-leg `notify_option_rfq_quote_acceptance` shape but is
+// scoped to the multi-leg wire (own bounded payload type).
+//
+// Losing-maker rejection pushes for multi-leg are deferred: when
+// the accept path lands the losing-quote session enrichment in a
+// follow-up, a future revision can push a rejected event per
+// competing session. V1 relies on the taker/maker consumer polling
+// `.../quotes` for status-flip visibility, which matches the
+// single-leg behaviour before its own enrichment.
+fn notify_multi_leg_mm_gateway_on_accept(
+    state: &AppState,
+    accepted_quote: &OptionMultiLegRfqQuote,
+    legs_count: u32,
+    fill_id: OptionMultiLegRfqFillId,
+) {
+    use crate::mm::protocol::{
+        NotificationEnvelope, OptionMultiLegRfqQuoteAcceptedPayload, ServerMessage,
+    };
+    let Some(session_id) = accepted_quote.session_id.as_deref() else {
+        return;
+    };
+    let message = ServerMessage::OptionMultiLegRfqQuoteAccepted(NotificationEnvelope::new(
+        "option_multi_leg_rfq_quote_accepted",
+        format!("option-multi-leg-rfq-accepted-{}", accepted_quote.quote_id),
+        OptionMultiLegRfqQuoteAcceptedPayload {
+            option_rfq_id: accepted_quote.option_rfq_id,
+            quote_id: accepted_quote.quote_id,
+            fill_id,
+            legs_count,
+        },
+    ));
+    // Best-effort: a full or absent receiver does not fail the
+    // caller. Errors are already logged inside `send_to_session`.
+    let _ = state.mm_sessions.send_to_session(session_id, message);
 }

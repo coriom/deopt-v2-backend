@@ -8620,6 +8620,40 @@ impl PgRepository {
 
         Ok(u32::try_from(quote_result.rows_affected()).unwrap_or(u32::MAX))
     }
+
+    // RFQ-MULTI-LEG-MM-GATEWAY-V1 — maker cancel of a single multi-leg
+    // quote. Guarded on `(quote_id, LOWER(mm_account), maker_subaccount_id, status='active')`;
+    // a UPDATE row-count of 0 means either "wrong maker / subaccount",
+    // "already accepted / rejected / cancelled", or "does not exist".
+    // No fill is touched, no RFQ status is touched.
+    pub async fn cancel_option_multi_leg_rfq_quote_by_maker(
+        &self,
+        quote_id: OptionMultiLegRfqQuoteId,
+        mm_account: &AccountId,
+        maker_subaccount_id: u32,
+    ) -> Result<()> {
+        let maker_subaccount_id_i32 = u32_to_i32("maker_subaccount_id", maker_subaccount_id)?;
+        let result = sqlx::query(
+            "UPDATE option_multi_leg_rfq_quotes
+             SET status = 'cancelled'
+             WHERE quote_id = $1
+               AND LOWER(mm_account) = LOWER($2)
+               AND maker_subaccount_id = $3
+               AND status = 'active'",
+        )
+        .bind(quote_id.to_string())
+        .bind(&mm_account.0)
+        .bind(maker_subaccount_id_i32)
+        .execute(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        if result.rows_affected() != 1 {
+            return Err(BackendError::InvalidOptionRfqQuoteState(
+                "multi-leg quote cannot be cancelled by maker".to_string(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn option_multi_leg_rfq_from_row(row: PgRow) -> Result<OptionMultiLegRfqRequest> {
