@@ -763,6 +763,32 @@ impl MmGatewayService {
             );
         };
 
+        // SUBACCOUNTS-MM-GATEWAY-QUOTES-V1 — resolve the maker
+        // subaccount id. Omitted defaults to Account 1 for backward
+        // compatibility with pre-V1 clients. Explicit `0` is rejected
+        // (matches the DB `CHECK (>= 1)` constraint). Explicit ids
+        // > 1 must be an existing subaccount owned by the
+        // authenticated MM identity — the (owner, subaccount_id)
+        // composite key guarantees no cross-account routing because
+        // `session_account` has already pinned `mm_account` to this
+        // session.
+        let maker_subaccount_id = match resolve_mm_gateway_maker_subaccount(
+            &self.state,
+            &mm_account,
+            payload.maker_subaccount_id,
+        )
+        .await
+        {
+            Ok(id) => id,
+            Err(error) => {
+                return backend_error_response(
+                    request_id,
+                    ErrorCode::OptionRfqQuoteRejected,
+                    error,
+                );
+            }
+        };
+
         let price_1e8 = match parse_fixed_u128("price_1e8", &payload.price_1e8) {
             Ok(value) => value,
             Err(error) => {
@@ -789,13 +815,7 @@ impl MmGatewayService {
             payload.option_rfq_id,
             SubmitOptionRfqQuoteInput {
                 mm_account,
-                // SUBACCOUNTS-RFQ-INTEGRATION-V1 — MM Gateway sessions
-                // are wallet-level today; subaccount routing over the
-                // WebTransport surface is a follow-up (out of scope
-                // for the public HTTP path this milestone targets).
-                // Default to Account 1 so the existing MM smoke keeps
-                // working byte-identically.
-                maker_subaccount_id: 1,
+                maker_subaccount_id,
                 session_id: Some(session.session_id.clone()),
                 client_quote_id: payload.client_quote_id,
                 price_1e8,
@@ -1068,6 +1088,34 @@ fn format_client_error(message: String, client_order_id: Option<&str>) -> String
     match client_order_id {
         Some(client_order_id) => format!("{client_order_id}: {message}"),
         None => message,
+    }
+}
+
+/// SUBACCOUNTS-MM-GATEWAY-QUOTES-V1 — validate a maker subaccount id
+/// against the authenticated MM identity. The mm_account has already
+/// been pinned to the session by `session_account`, so the (owner,
+/// subaccount_id) composite lookup naturally rejects any subaccount
+/// that belongs to a different wallet. Explicit `0` is rejected to
+/// match the DB `CHECK (>= 1)` invariant; omitted defaults to 1 so
+/// legacy MM clients continue to work byte-identically.
+async fn resolve_mm_gateway_maker_subaccount(
+    state: &AppState,
+    mm_account: &AccountId,
+    body_maker_subaccount_id: Option<u32>,
+) -> Result<u32, BackendError> {
+    match body_maker_subaccount_id {
+        None | Some(1) => Ok(1),
+        Some(0) => Err(BackendError::InvalidSubaccountRequest(
+            "maker_subaccount_id must be >= 1".to_string(),
+        )),
+        Some(id) => {
+            // Confirms the row exists AND belongs to mm_account. A
+            // subaccount created for a different wallet has a
+            // different composite key and returns `SubaccountNotFound`.
+            let _ = crate::subaccounts::get_subaccount(state.subaccounts.as_ref(), mm_account, id)
+                .await?;
+            Ok(id)
+        }
     }
 }
 

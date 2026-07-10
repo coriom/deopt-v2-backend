@@ -280,6 +280,12 @@ pub struct OptionRfqQuotePayload {
     pub quote_nonce: Option<u64>,
     pub quote_ttl_ms: u64,
     pub signature: Option<String>,
+    /// SUBACCOUNTS-MM-GATEWAY-QUOTES-V1 — optional maker subaccount.
+    /// Omitted = Account 1 for backward compatibility. Explicit ids
+    /// > 1 are validated against the authenticated MM identity in
+    /// `MmGatewayService::handle_option_rfq_quote`.
+    #[serde(default)]
+    pub maker_subaccount_id: Option<u32>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Default, Deserialize)]
