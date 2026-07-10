@@ -159,6 +159,35 @@ fn part3_action_names_are_isolated_from_single_leg() {
         WriteAuthAction::OptionRfqAccept.as_str(),
         WriteAuthAction::OptionMultiLegRfqAccept.as_str()
     );
+    assert_ne!(
+        WriteAuthAction::OptionRfqCancel.as_str(),
+        WriteAuthAction::OptionMultiLegRfqCancel.as_str()
+    );
+}
+
+// RFQ-MULTI-LEG-CANCEL-V1 — cancel canonical byte freeze.
+#[test]
+fn part5_multi_leg_cancel_canonical_bytes_are_frozen() {
+    let fields: Vec<(&'static str, CanonicalValue)> = vec![
+        ("taker", CanonicalValue::Address(taker())),
+        ("subaccount_id", CanonicalValue::U64(2)),
+        (
+            "option_rfq_id",
+            CanonicalValue::Str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string()),
+        ),
+    ];
+    let bytes = canonical_payload_bytes(WriteAuthAction::OptionMultiLegRfqCancel, &fields);
+    let expected = concat!(
+        "OPTION_MULTI_LEG_RFQ_CANCEL",
+        "|taker=\"0x1111111111111111111111111111111111111111\"",
+        "|subaccount_id=2",
+        "|option_rfq_id=\"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\"",
+    );
+    assert_eq!(
+        std::str::from_utf8(&bytes).unwrap(),
+        expected,
+        "MULTI_LEG_RFQ_CANCEL canonical bytes must not drift; existing signers commit to this shape"
+    );
 }
 
 // RFQ-MULTI-LEG-ATOMIC-ACCEPT-V1 — accept canonical byte freeze.

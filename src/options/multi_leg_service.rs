@@ -836,3 +836,130 @@ fn emit_multi_leg_rfq_accepted_lifecycle(
 fn accounts_equal(left: &AccountId, right: &AccountId) -> bool {
     left.0.eq_ignore_ascii_case(&right.0)
 }
+
+// ---------------------------------------------------------------------
+// RFQ-MULTI-LEG-CANCEL-V1
+// ---------------------------------------------------------------------
+
+/// Compact cancel input. Populated by the HTTP handler AFTER the v2
+/// authorization envelope has been verified against the cancel
+/// canonical.
+#[derive(Clone, Debug)]
+pub struct CancelOptionMultiLegRfqInput {
+    pub taker: AccountId,
+    pub taker_subaccount_id: u32,
+    pub option_rfq_id: OptionMultiLegRfqId,
+}
+
+/// Outcome returned to the HTTP handler. Includes the final RFQ row
+/// so the client can render the cancelled RFQ without a second
+/// round trip.
+#[derive(Clone, Debug)]
+pub struct CancelOptionMultiLegRfqOutcome {
+    pub rfq: OptionMultiLegRfqRequest,
+    pub cancelled_quotes: u32,
+    pub cancelled_at_ms: crate::types::TimestampMs,
+}
+
+pub async fn cancel_option_multi_leg_rfq(
+    state: &AppState,
+    input: CancelOptionMultiLegRfqInput,
+) -> Result<CancelOptionMultiLegRfqOutcome> {
+    ensure_option_multi_leg_rfq_enabled(state)?;
+    validate_account(&input.taker)?;
+    if input.taker_subaccount_id < 1 {
+        return Err(BackendError::InvalidOptionRfqState(
+            "multi-leg cancel taker_subaccount_id must be >= 1".to_string(),
+        ));
+    }
+
+    // Pre-flight guards: reject before touching persistence when we
+    // can already tell the cancel is invalid. The atomic transaction
+    // re-checks everything under lock so the race is still safe if a
+    // concurrent accept slips in between.
+    let (rfq, _legs) = get_option_multi_leg_rfq(state, input.option_rfq_id).await?;
+    if !accounts_equal(&rfq.taker, &input.taker) {
+        return Err(BackendError::InvalidOptionRfqState(
+            "multi-leg RFQ does not belong to caller".to_string(),
+        ));
+    }
+    if rfq.taker_subaccount_id != input.taker_subaccount_id {
+        return Err(BackendError::InvalidOptionRfqState(
+            "multi-leg RFQ taker subaccount mismatch".to_string(),
+        ));
+    }
+    if rfq.accepted_quote_id.is_some() || rfq.accepted_fill_id.is_some() {
+        return Err(BackendError::InvalidOptionRfqState(
+            "multi-leg option RFQ already accepted; cannot cancel".to_string(),
+        ));
+    }
+    // `effective_status` folds expiry into the Open→Expired transition
+    // for reads. For cancel we deliberately want the raw persisted
+    // status: an expired-but-still-Open row is cancellable so an
+    // operator sweep never has to race with a taker cancel.
+    if rfq.status != OptionMultiLegRfqStatus::Open {
+        return Err(BackendError::InvalidOptionRfqState(
+            "multi-leg option RFQ is not open".to_string(),
+        ));
+    }
+
+    let cancelled_quotes = if let Some(repository) = state.repository.clone() {
+        repository
+            .cancel_option_multi_leg_rfq(
+                input.option_rfq_id,
+                &input.taker,
+                input.taker_subaccount_id,
+            )
+            .await?
+    } else {
+        state
+            .options_store
+            .lock()
+            .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?
+            .cancel_option_multi_leg_rfq(
+                input.option_rfq_id,
+                &input.taker,
+                input.taker_subaccount_id,
+            )?
+    };
+
+    // Reload for a consistent post-commit view.
+    let (persisted_rfq, _legs) = get_option_multi_leg_rfq(state, input.option_rfq_id).await?;
+    let cancelled_at_ms = now_ms();
+
+    emit_multi_leg_rfq_cancelled_lifecycle(
+        state,
+        &persisted_rfq,
+        cancelled_quotes,
+        cancelled_at_ms,
+    );
+
+    Ok(CancelOptionMultiLegRfqOutcome {
+        rfq: persisted_rfq,
+        cancelled_quotes,
+        cancelled_at_ms,
+    })
+}
+
+fn emit_multi_leg_rfq_cancelled_lifecycle(
+    state: &AppState,
+    rfq: &OptionMultiLegRfqRequest,
+    cancelled_quotes: u32,
+    cancelled_at_ms: crate::types::TimestampMs,
+) {
+    use crate::api::public_ws::{LifecycleChannel, LifecycleEvent, LifecyclePayload};
+    let now = now_ms();
+    state.lifecycle_events.emit(LifecycleEvent {
+        account: rfq.taker.clone(),
+        channel: LifecycleChannel::AccountRfqs,
+        payload: LifecyclePayload::OptionMultiLegRfqCancelled {
+            option_rfq_id: rfq.option_rfq_id.to_string(),
+            taker: rfq.taker.0.clone(),
+            taker_subaccount_id: rfq.taker_subaccount_id,
+            status: rfq.status.as_str().to_string(),
+            cancelled_quotes,
+            cancelled_at_ms,
+        },
+        emitted_at_ms: now,
+    });
+}

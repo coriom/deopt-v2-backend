@@ -8553,6 +8553,73 @@ impl PgRepository {
             .await
             .map_err(|error| BackendError::Persistence(error.to_string()))
     }
+
+    // RFQ-MULTI-LEG-CANCEL-V1 — single-transaction cancel.
+    //
+    // Guards:
+    //   * RFQ must still be `open` and have `accepted_quote_id IS NULL`
+    //     — a UPDATE row-count of 0 means either "already cancelled",
+    //     "already accepted", or "does not belong to this taker /
+    //     subaccount". The caller has already verified taker identity
+    //     against the loaded RFQ, so a zero-count here is a race that
+    //     the transaction wins by rolling back with a clear error.
+    //   * All open quotes for this RFQ flip to `cancelled` in the same
+    //     transaction.
+    //   * No fill is created, no accepted quote's status is touched.
+    //
+    // Returns the number of quotes that were flipped from `active` to
+    // `cancelled` so the caller can surface a count on the response +
+    // lifecycle payload.
+    pub async fn cancel_option_multi_leg_rfq(
+        &self,
+        option_rfq_id: OptionMultiLegRfqId,
+        taker: &AccountId,
+        taker_subaccount_id: u32,
+    ) -> Result<u32> {
+        let taker_subaccount_id_i32 = u32_to_i32("taker_subaccount_id", taker_subaccount_id)?;
+        let mut tx = self.begin().await?;
+
+        // Guarded RFQ status flip. WHERE also anchors on taker + subaccount
+        // so a stale race that already flipped taker attribution cannot
+        // succeed silently.
+        let rfq_result = sqlx::query(
+            "UPDATE option_multi_leg_rfqs
+             SET status = 'cancelled'
+             WHERE option_rfq_id = $1
+               AND LOWER(taker) = LOWER($2)
+               AND taker_subaccount_id = $3
+               AND status = 'open'
+               AND accepted_quote_id IS NULL
+               AND accepted_fill_id IS NULL",
+        )
+        .bind(option_rfq_id.to_string())
+        .bind(&taker.0)
+        .bind(taker_subaccount_id_i32)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        if rfq_result.rows_affected() != 1 {
+            return Err(BackendError::InvalidOptionRfqState(
+                "multi-leg option RFQ cannot be cancelled".to_string(),
+            ));
+        }
+
+        let quote_result = sqlx::query(
+            "UPDATE option_multi_leg_rfq_quotes
+             SET status = 'cancelled'
+             WHERE option_rfq_id = $1 AND status = 'active'",
+        )
+        .bind(option_rfq_id.to_string())
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+
+        tx.commit()
+            .await
+            .map_err(|error| BackendError::Persistence(error.to_string()))?;
+
+        Ok(u32::try_from(quote_result.rows_affected()).unwrap_or(u32::MAX))
+    }
 }
 
 fn option_multi_leg_rfq_from_row(row: PgRow) -> Result<OptionMultiLegRfqRequest> {

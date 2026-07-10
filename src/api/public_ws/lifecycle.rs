@@ -505,6 +505,26 @@ pub enum LifecyclePayload {
         quote_status: String,
         accepted_at_ms: TimestampMs,
     },
+    /// RFQ-MULTI-LEG-CANCEL-V1 — taker cancelled their open
+    /// multi-leg RFQ. Emitted AFTER the atomic transaction commits
+    /// (RFQ status flipped to Cancelled, every open quote flipped
+    /// to Cancelled). Fan-out: taker only in V1. Makers with open
+    /// quotes see their quotes flip status on the next quote
+    /// refresh via `GET /options/multi-leg-rfqs/:id/quotes`; a
+    /// per-maker fan-out variant is deferred to
+    /// `RFQ-MULTI-LEG-MM-GATEWAY-V1` when the maker-side channel
+    /// gains a routing hook.
+    ///
+    /// Privacy: no signatures, no write-auth nonce, no envelope.
+    OptionMultiLegRfqCancelled {
+        option_rfq_id: String,
+        taker: String,
+        #[serde(default = "crate::options::types::one_subaccount_id")]
+        taker_subaccount_id: u32,
+        status: String,
+        cancelled_quotes: u32,
+        cancelled_at_ms: TimestampMs,
+    },
 }
 
 /// Lightweight wrapper around `tokio::sync::broadcast::Sender` that

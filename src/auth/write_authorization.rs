@@ -70,6 +70,12 @@ pub enum WriteAuthAction {
     /// server refuses if any of those fields diverge from the
     /// server-loaded quote state.
     OptionMultiLegRfqAccept,
+    /// RFQ-MULTI-LEG-CANCEL-V1 — taker cancel of an open multi-leg
+    /// RFQ. Signs over `(taker, subaccount_id, option_rfq_id)` so a
+    /// cancel signature cannot be replayed against a different RFQ
+    /// or a different subaccount. Accepted / already-cancelled RFQs
+    /// refuse at the service layer before the write is attempted.
+    OptionMultiLegRfqCancel,
     OptionExecutionIntentSignatureSubmit,
     /// OPTIONS-TWAP-ORDERS-V1 — taker create/cancel of a parent TWAP order.
     OptionTwapCreate,
@@ -110,6 +116,7 @@ impl WriteAuthAction {
             Self::OptionMultiLegRfqCreate => "OPTION_MULTI_LEG_RFQ_CREATE",
             Self::OptionMultiLegRfqQuoteSubmit => "OPTION_MULTI_LEG_RFQ_QUOTE_SUBMIT",
             Self::OptionMultiLegRfqAccept => "OPTION_MULTI_LEG_RFQ_ACCEPT",
+            Self::OptionMultiLegRfqCancel => "OPTION_MULTI_LEG_RFQ_CANCEL",
             Self::OptionExecutionIntentSignatureSubmit => {
                 "OPTION_EXECUTION_INTENT_SIGNATURE_SUBMIT"
             }
@@ -135,6 +142,7 @@ impl WriteAuthAction {
             "OPTION_MULTI_LEG_RFQ_CREATE" => Self::OptionMultiLegRfqCreate,
             "OPTION_MULTI_LEG_RFQ_QUOTE_SUBMIT" => Self::OptionMultiLegRfqQuoteSubmit,
             "OPTION_MULTI_LEG_RFQ_ACCEPT" => Self::OptionMultiLegRfqAccept,
+            "OPTION_MULTI_LEG_RFQ_CANCEL" => Self::OptionMultiLegRfqCancel,
             "OPTION_EXECUTION_INTENT_SIGNATURE_SUBMIT" => {
                 Self::OptionExecutionIntentSignatureSubmit
             }

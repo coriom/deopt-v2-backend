@@ -1859,6 +1859,56 @@ impl OptionSeriesStore {
         Ok((updated_rfq, updated_quote))
     }
 
+    // RFQ-MULTI-LEG-CANCEL-V1 — atomic cancel for the in-memory store.
+    // Held under the store's `Mutex`, so readers see the RFQ + every
+    // affected quote flip in one commit. Returns the number of open
+    // quotes that were flipped to `cancelled`.
+    pub fn cancel_option_multi_leg_rfq(
+        &mut self,
+        option_rfq_id: super::OptionMultiLegRfqId,
+        taker: &AccountId,
+        taker_subaccount_id: u32,
+    ) -> Result<u32> {
+        let rfq = self
+            .option_multi_leg_rfqs
+            .get(&option_rfq_id)
+            .cloned()
+            .ok_or(BackendError::InvalidOptionRfqId)?;
+        if !rfq.taker.0.eq_ignore_ascii_case(&taker.0)
+            || rfq.taker_subaccount_id != taker_subaccount_id
+        {
+            return Err(BackendError::InvalidOptionRfqState(
+                "multi-leg option RFQ cannot be cancelled".to_string(),
+            ));
+        }
+        if rfq.status != super::OptionMultiLegRfqStatus::Open
+            || rfq.accepted_quote_id.is_some()
+            || rfq.accepted_fill_id.is_some()
+        {
+            return Err(BackendError::InvalidOptionRfqState(
+                "multi-leg option RFQ cannot be cancelled".to_string(),
+            ));
+        }
+
+        {
+            let rfq_mut = self
+                .option_multi_leg_rfqs
+                .get_mut(&option_rfq_id)
+                .expect("rfq present");
+            rfq_mut.status = super::OptionMultiLegRfqStatus::Cancelled;
+        }
+        let mut cancelled_quotes: u32 = 0;
+        for quote in self.option_multi_leg_rfq_quotes.values_mut() {
+            if quote.option_rfq_id == option_rfq_id
+                && quote.status == super::OptionMultiLegRfqQuoteStatus::Active
+            {
+                quote.status = super::OptionMultiLegRfqQuoteStatus::Cancelled;
+                cancelled_quotes = cancelled_quotes.saturating_add(1);
+            }
+        }
+        Ok(cancelled_quotes)
+    }
+
     pub fn get_option_multi_leg_rfq_fill(
         &self,
         fill_id: super::OptionMultiLegRfqFillId,

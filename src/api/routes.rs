@@ -39,6 +39,7 @@ use crate::nonce_sync::{
 };
 use crate::options::multi_leg_service::{
     accept_option_multi_leg_rfq_quote as accept_option_multi_leg_rfq_quote_service,
+    cancel_option_multi_leg_rfq as cancel_option_multi_leg_rfq_service,
     create_option_multi_leg_rfq as create_option_multi_leg_rfq_service,
     ensure_option_multi_leg_rfq_enabled,
     get_option_multi_leg_rfq as get_option_multi_leg_rfq_service,
@@ -46,8 +47,8 @@ use crate::options::multi_leg_service::{
     list_option_multi_leg_rfq_quotes as list_option_multi_leg_rfq_quotes_service,
     list_option_multi_leg_rfqs_by_taker as list_option_multi_leg_rfqs_by_taker_service,
     submit_option_multi_leg_rfq_quote as submit_option_multi_leg_rfq_quote_service,
-    AcceptOptionMultiLegRfqQuoteInput, CreateOptionMultiLegRfqInput, LegInput as MultiLegLegInput,
-    QuoteLegInput, SubmitOptionMultiLegRfqQuoteInput,
+    AcceptOptionMultiLegRfqQuoteInput, CancelOptionMultiLegRfqInput, CreateOptionMultiLegRfqInput,
+    LegInput as MultiLegLegInput, QuoteLegInput, SubmitOptionMultiLegRfqQuoteInput,
 };
 use crate::options::service::{
     accept_option_rfq_quote as accept_option_rfq_quote_service,
@@ -430,6 +431,14 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/options/multi-leg-rfqs/:rfq_id/quotes/:quote_id/accept",
             post(accept_option_multi_leg_rfq_quote),
+        )
+        // RFQ-MULTI-LEG-CANCEL-V1 — flag-gated taker cancel. Single
+        // transaction: RFQ → Cancelled + every open quote →
+        // Cancelled. Refuses cross-subaccount, accepted, or already-
+        // cancelled RFQs before touching persistence.
+        .route(
+            "/options/multi-leg-rfqs/:rfq_id/cancel",
+            post(cancel_option_multi_leg_rfq),
         )
         .route(
             "/options/orders",
@@ -5571,6 +5580,95 @@ async fn accept_option_multi_leg_rfq_quote(
 }
 
 // ---------------------------------------------------------------------
+// RFQ-MULTI-LEG-CANCEL-V1 — cancel DTOs + handler.
+// ---------------------------------------------------------------------
+
+#[derive(Clone, Debug, Deserialize)]
+struct CancelOptionMultiLegRfqRequest {
+    subaccount_id: Option<u32>,
+    authorization: AuthorizationEnvelope,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct CancelOptionMultiLegRfqResponse {
+    option_rfq_id: String,
+    taker: AccountId,
+    taker_subaccount_id: u32,
+    status: OptionMultiLegRfqStatus,
+    cancelled_quotes: u32,
+    cancelled_at_ms: i64,
+}
+
+async fn cancel_option_multi_leg_rfq(
+    State(state): State<AppState>,
+    Path(rfq_id_path): Path<String>,
+    Json(request): Json<CancelOptionMultiLegRfqRequest>,
+) -> Result<Json<CancelOptionMultiLegRfqResponse>, ApiError> {
+    // Flag gate first — fails closed with 503 before touching auth.
+    ensure_option_multi_leg_rfq_enabled(&state)?;
+
+    // Multi-leg cancel is v2-only.
+    if request.authorization.version != Some(2) {
+        return Err(ApiError::from(BackendError::InvalidSubaccountRequest(
+            "multi-leg cancel requires an authorization envelope with version = 2".to_string(),
+        )));
+    }
+
+    let parsed_rfq_id = parse_option_rfq_id(&rfq_id_path)?;
+
+    // Taker identity is the `account` on the auth envelope. Load the
+    // RFQ upfront to sanity-check taker ownership + subaccount before
+    // burning a nonce; the atomic transaction re-validates under lock.
+    let taker = request.authorization.account.clone();
+    let resolved_subaccount_id = resolve_options_v2_subaccount(
+        &state,
+        &request.authorization,
+        request.subaccount_id,
+        &taker,
+    )
+    .await?;
+
+    let canonical =
+        canonical_option_multi_leg_rfq_cancel_v2(&taker, resolved_subaccount_id, &rfq_id_path);
+
+    let _verified = require_write_auth_v2_aware(
+        &state,
+        WriteAuthAction::OptionMultiLegRfqCancel,
+        &taker,
+        resolved_subaccount_id,
+        &canonical,
+        &request.authorization,
+    )
+    .await?;
+
+    let outcome = cancel_option_multi_leg_rfq_service(
+        &state,
+        CancelOptionMultiLegRfqInput {
+            taker: taker.clone(),
+            taker_subaccount_id: resolved_subaccount_id,
+            option_rfq_id: parsed_rfq_id,
+        },
+    )
+    .await?;
+
+    attach_resource_best_effort(
+        &state,
+        &request.authorization.nonce,
+        &outcome.rfq.option_rfq_id.to_string(),
+    )
+    .await;
+
+    Ok(Json(CancelOptionMultiLegRfqResponse {
+        option_rfq_id: outcome.rfq.option_rfq_id.to_string(),
+        taker: outcome.rfq.taker,
+        taker_subaccount_id: outcome.rfq.taker_subaccount_id,
+        status: outcome.rfq.status,
+        cancelled_quotes: outcome.cancelled_quotes,
+        cancelled_at_ms: outcome.cancelled_at_ms,
+    }))
+}
+
+// ---------------------------------------------------------------------
 // RFQ-MULTI-LEG-CREATE-QUOTE-V1 — canonical v2 payload builders. The
 // leg count is emitted as an explicit `legs_count` field before the
 // per-leg entries so a client cannot inject an extra leg without also
@@ -5725,6 +5823,38 @@ fn canonical_option_multi_leg_rfq_accept_v2(
     }
     crate::auth::write_authorization::canonical_payload_bytes(
         WriteAuthAction::OptionMultiLegRfqAccept,
+        &fields,
+    )
+}
+
+// RFQ-MULTI-LEG-CANCEL-V1 — cancel canonical. Taker commits to:
+//   * taker + subaccount_id  (who is cancelling)
+//   * option_rfq_id  (what is being cancelled)
+//
+// No quote id — a cancel targets the whole RFQ. No expected package
+// price — cancel is intentionally independent of any quote state.
+// A cancel signature cannot be replayed against a different RFQ id
+// because `option_rfq_id` is part of the byte stream, and it cannot
+// be replayed against a different subaccount because
+// `subaccount_id` is too.
+fn canonical_option_multi_leg_rfq_cancel_v2(
+    taker: &AccountId,
+    taker_subaccount_id: u32,
+    option_rfq_id: &str,
+) -> Vec<u8> {
+    let fields: Vec<(&'static str, CanonicalValue)> = vec![
+        ("taker", CanonicalValue::Address(taker.clone())),
+        (
+            "subaccount_id",
+            CanonicalValue::U64(taker_subaccount_id as u64),
+        ),
+        (
+            "option_rfq_id",
+            CanonicalValue::Str(option_rfq_id.to_string()),
+        ),
+    ];
+    crate::auth::write_authorization::canonical_payload_bytes(
+        WriteAuthAction::OptionMultiLegRfqCancel,
         &fields,
     )
 }
