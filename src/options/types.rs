@@ -30,6 +30,14 @@ pub struct OptionsConfig {
     pub rfq_max_quotes_per_rfq: usize,
     pub rfq_quote_signature_mode: OptionRfqQuoteSignatureMode,
     pub rfq_eip712_domain: Eip712Domain,
+    /// RFQ-MULTI-LEG-SCHEMA-V1 — master gate for the multi-leg RFQ
+    /// subsystem. When `false`, the multi-leg tables continue to
+    /// exist (schema is always ready) but no service function or
+    /// route referencing them may run. Default `false`. The current
+    /// milestone lands only the schema + types + repository CRUD;
+    /// there is no route wired to this flag yet, so an operator
+    /// setting it `true` today has no observable effect.
+    pub rfq_multi_leg_enabled: bool,
     pub execution_enabled: bool,
     pub execution_require_persistence: bool,
     pub matching_engine_address: AccountId,
@@ -79,6 +87,7 @@ impl OptionsConfig {
             rfq_max_quote_ttl_ms: 10_000,
             rfq_max_quotes_per_rfq: 50,
             rfq_quote_signature_mode: OptionRfqQuoteSignatureMode::Disabled,
+            rfq_multi_leg_enabled: false,
             rfq_eip712_domain: Eip712Domain {
                 name: "DeOptV2OptionRFQ".to_string(),
                 version: "1".to_string(),

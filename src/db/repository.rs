@@ -20,16 +20,21 @@ use crate::options::store::{
 };
 use crate::options::terminal_reason;
 use crate::options::{
-    AttachmentLegSpec, AttachmentPlanStatus, OptionEventIndexerState,
-    OptionExecutionConfirmationStatus, OptionExecutionEvent, OptionExecutionEventLink,
-    OptionExecutionGasCheckStatus, OptionExecutionIntent, OptionExecutionIntentId,
-    OptionExecutionIntentStatus, OptionExecutionReceiptCost, OptionExecutionReconciliation,
-    OptionExecutionSimulationResult, OptionExecutionSimulationStatus, OptionExecutionSourceType,
-    OptionExecutionTransaction, OptionFill, OptionFillId, OptionOrder, OptionOrderAttachmentPlan,
-    OptionOrderId, OptionOrderRejection, OptionOrderStatus, OptionReconciliationStatus,
-    OptionRfqFill, OptionRfqFillId, OptionRfqId, OptionRfqQuote, OptionRfqQuoteId,
-    OptionRfqQuoteSignatureStatus, OptionRfqQuoteStatus, OptionRfqRequest, OptionRfqStatus,
-    OptionSeries, OptionSeriesSource, OptionSeriesStatus, OptionTwapChildOrder,
+    validate_multi_leg_composition, validate_multi_leg_fill_composition,
+    validate_multi_leg_quote_composition, AttachmentLegSpec, AttachmentPlanStatus,
+    OptionEventIndexerState, OptionExecutionConfirmationStatus, OptionExecutionEvent,
+    OptionExecutionEventLink, OptionExecutionGasCheckStatus, OptionExecutionIntent,
+    OptionExecutionIntentId, OptionExecutionIntentStatus, OptionExecutionReceiptCost,
+    OptionExecutionReconciliation, OptionExecutionSimulationResult,
+    OptionExecutionSimulationStatus, OptionExecutionSourceType, OptionExecutionTransaction,
+    OptionFill, OptionFillId, OptionMultiLegRfqFill, OptionMultiLegRfqFillId,
+    OptionMultiLegRfqFillLeg, OptionMultiLegRfqId, OptionMultiLegRfqLeg, OptionMultiLegRfqQuote,
+    OptionMultiLegRfqQuoteId, OptionMultiLegRfqQuoteLeg, OptionMultiLegRfqQuoteSignatureStatus,
+    OptionMultiLegRfqQuoteStatus, OptionMultiLegRfqRequest, OptionMultiLegRfqStatus, OptionOrder,
+    OptionOrderAttachmentPlan, OptionOrderId, OptionOrderRejection, OptionOrderStatus,
+    OptionReconciliationStatus, OptionRfqFill, OptionRfqFillId, OptionRfqId, OptionRfqQuote,
+    OptionRfqQuoteId, OptionRfqQuoteSignatureStatus, OptionRfqQuoteStatus, OptionRfqRequest,
+    OptionRfqStatus, OptionSeries, OptionSeriesSource, OptionSeriesStatus, OptionTwapChildOrder,
     OptionTwapChildStatus, OptionTwapOrder, OptionTwapOrderId, OptionTwapStatus,
 };
 use crate::reconciliation::{
@@ -8045,4 +8050,598 @@ impl crate::subaccounts::SubaccountStore for PgRepository {
         self.subaccounts_rename(owner, subaccount_id, new_name, updated_at_ms)
             .await
     }
+}
+
+// ===========================================================================
+// RFQ-MULTI-LEG-SCHEMA-V1 — multi-leg atomic RFQ repository CRUD.
+//
+// Schema-only foundation. Each transactional insert wraps the parent
+// row + all leg rows in a single Postgres transaction so callers get
+// atomicity by construction; there is no partial-parent state possible
+// via these methods.
+//
+// No service function calls these yet; they will be picked up by
+// `RFQ-MULTI-LEG-CREATE-QUOTE-V1` and `_ATOMIC-ACCEPT-V1`.
+// ===========================================================================
+
+impl PgRepository {
+    pub async fn insert_option_multi_leg_rfq(
+        &self,
+        rfq: &OptionMultiLegRfqRequest,
+        legs: &[OptionMultiLegRfqLeg],
+    ) -> Result<()> {
+        validate_multi_leg_composition(rfq.option_rfq_id, legs)?;
+        let taker_subaccount_id = u32_to_i32("taker_subaccount_id", rfq.taker_subaccount_id)?;
+        let mut tx = self.begin().await?;
+        sqlx::query(
+            "INSERT INTO option_multi_leg_rfqs (
+                option_rfq_id, taker, taker_subaccount_id, status,
+                created_at_ms, expires_at_ms, accepted_quote_id, accepted_fill_id
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+        )
+        .bind(rfq.option_rfq_id.to_string())
+        .bind(&rfq.taker.0)
+        .bind(taker_subaccount_id)
+        .bind(rfq.status.as_str())
+        .bind(timestamp_to_i64(rfq.created_at_ms))
+        .bind(timestamp_to_i64(rfq.expires_at_ms))
+        .bind(rfq.accepted_quote_id.map(|id| id.to_string()))
+        .bind(rfq.accepted_fill_id.map(|id| id.to_string()))
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+
+        for leg in legs {
+            let leg_index = u32_to_i32("leg_index", leg.leg_index)?;
+            let ratio_num = u32_to_i32("ratio_num", leg.ratio_num)?;
+            let ratio_den = u32_to_i32("ratio_den", leg.ratio_den)?;
+            sqlx::query(
+                "INSERT INTO option_multi_leg_rfq_legs (
+                    option_rfq_id, leg_index, option_series_id, side,
+                    size_1e8, ratio_num, ratio_den
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            )
+            .bind(rfq.option_rfq_id.to_string())
+            .bind(leg_index)
+            .bind(&leg.option_series_id)
+            .bind(side_to_str(leg.side))
+            .bind(leg.size_1e8.to_string())
+            .bind(ratio_num)
+            .bind(ratio_den)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        Ok(())
+    }
+
+    pub async fn get_option_multi_leg_rfq(
+        &self,
+        option_rfq_id: OptionMultiLegRfqId,
+    ) -> Result<Option<(OptionMultiLegRfqRequest, Vec<OptionMultiLegRfqLeg>)>> {
+        let rfq_row = sqlx::query(
+            "SELECT option_rfq_id, taker, taker_subaccount_id, status,
+                    created_at_ms, expires_at_ms, accepted_quote_id, accepted_fill_id
+             FROM option_multi_leg_rfqs
+             WHERE option_rfq_id = $1",
+        )
+        .bind(option_rfq_id.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        let Some(rfq_row) = rfq_row else {
+            return Ok(None);
+        };
+        let rfq = option_multi_leg_rfq_from_row(rfq_row)?;
+
+        let leg_rows = sqlx::query(
+            "SELECT option_rfq_id, leg_index, option_series_id, side,
+                    size_1e8, ratio_num, ratio_den
+             FROM option_multi_leg_rfq_legs
+             WHERE option_rfq_id = $1
+             ORDER BY leg_index ASC",
+        )
+        .bind(option_rfq_id.to_string())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        let legs = leg_rows
+            .into_iter()
+            .map(option_multi_leg_rfq_leg_from_row)
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Some((rfq, legs)))
+    }
+
+    pub async fn list_option_multi_leg_rfqs_by_taker(
+        &self,
+        taker: &AccountId,
+        taker_subaccount_id: u32,
+    ) -> Result<Vec<(OptionMultiLegRfqRequest, Vec<OptionMultiLegRfqLeg>)>> {
+        let taker_subaccount_id = u32_to_i32("taker_subaccount_id", taker_subaccount_id)?;
+        let rows = sqlx::query(
+            "SELECT option_rfq_id, taker, taker_subaccount_id, status,
+                    created_at_ms, expires_at_ms, accepted_quote_id, accepted_fill_id
+             FROM option_multi_leg_rfqs
+             WHERE LOWER(taker) = LOWER($1) AND taker_subaccount_id = $2
+             ORDER BY created_at_ms ASC, option_rfq_id ASC",
+        )
+        .bind(&taker.0)
+        .bind(taker_subaccount_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let rfq = option_multi_leg_rfq_from_row(row)?;
+            let leg_rows = sqlx::query(
+                "SELECT option_rfq_id, leg_index, option_series_id, side,
+                        size_1e8, ratio_num, ratio_den
+                 FROM option_multi_leg_rfq_legs
+                 WHERE option_rfq_id = $1
+                 ORDER BY leg_index ASC",
+            )
+            .bind(rfq.option_rfq_id.to_string())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|error| BackendError::Persistence(error.to_string()))?;
+            let legs = leg_rows
+                .into_iter()
+                .map(option_multi_leg_rfq_leg_from_row)
+                .collect::<Result<Vec<_>>>()?;
+            out.push((rfq, legs));
+        }
+        Ok(out)
+    }
+
+    pub async fn insert_option_multi_leg_rfq_quote(
+        &self,
+        quote: &OptionMultiLegRfqQuote,
+        expected_leg_count: usize,
+        legs: &[OptionMultiLegRfqQuoteLeg],
+    ) -> Result<()> {
+        validate_multi_leg_quote_composition(quote.quote_id, expected_leg_count, legs)?;
+        let maker_subaccount_id = u32_to_i32("maker_subaccount_id", quote.maker_subaccount_id)?;
+        let mut tx = self.begin().await?;
+        let result = sqlx::query(
+            "INSERT INTO option_multi_leg_rfq_quotes (
+                quote_id, option_rfq_id, mm_account, maker_subaccount_id, session_id,
+                client_quote_id, package_price_1e8, size_1e8, status,
+                created_at_ms, expires_at_ms,
+                signature, quote_digest, quote_nonce, signature_status, recovered_signer
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
+        )
+        .bind(quote.quote_id.to_string())
+        .bind(quote.option_rfq_id.to_string())
+        .bind(&quote.mm_account.0)
+        .bind(maker_subaccount_id)
+        .bind(&quote.session_id)
+        .bind(&quote.client_quote_id)
+        .bind(&quote.package_price_1e8)
+        .bind(quote.size_1e8.to_string())
+        .bind(quote.status.as_str())
+        .bind(timestamp_to_i64(quote.created_at_ms))
+        .bind(timestamp_to_i64(quote.expires_at_ms))
+        .bind(&quote.signature)
+        .bind(&quote.quote_digest)
+        .bind(&quote.quote_nonce)
+        .bind(quote.signature_status.as_str())
+        .bind(quote.recovered_signer.as_ref().map(|account| &account.0))
+        .execute(&mut *tx)
+        .await;
+        match result {
+            Ok(_) => {}
+            Err(error) if is_unique_violation(&error) => {
+                return Err(BackendError::InvalidOptionRfqQuoteState(
+                    "duplicate client_quote_id for multi-leg option RFQ and MM account".to_string(),
+                ));
+            }
+            Err(error) => return Err(BackendError::Persistence(error.to_string())),
+        }
+
+        for leg in legs {
+            let leg_index = u32_to_i32("leg_index", leg.leg_index)?;
+            sqlx::query(
+                "INSERT INTO option_multi_leg_rfq_quote_legs (
+                    quote_id, leg_index, price_1e8
+                ) VALUES ($1, $2, $3)",
+            )
+            .bind(quote.quote_id.to_string())
+            .bind(leg_index)
+            .bind(leg.price_1e8.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        Ok(())
+    }
+
+    pub async fn get_option_multi_leg_rfq_quote(
+        &self,
+        quote_id: OptionMultiLegRfqQuoteId,
+    ) -> Result<Option<(OptionMultiLegRfqQuote, Vec<OptionMultiLegRfqQuoteLeg>)>> {
+        let row = sqlx::query(
+            "SELECT quote_id, option_rfq_id, mm_account, maker_subaccount_id, session_id,
+                    client_quote_id, package_price_1e8, size_1e8, status,
+                    created_at_ms, expires_at_ms,
+                    signature, quote_digest, quote_nonce, signature_status, recovered_signer
+             FROM option_multi_leg_rfq_quotes
+             WHERE quote_id = $1",
+        )
+        .bind(quote_id.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let quote = option_multi_leg_rfq_quote_from_row(row)?;
+
+        let leg_rows = sqlx::query(
+            "SELECT quote_id, leg_index, price_1e8
+             FROM option_multi_leg_rfq_quote_legs
+             WHERE quote_id = $1
+             ORDER BY leg_index ASC",
+        )
+        .bind(quote_id.to_string())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        let legs = leg_rows
+            .into_iter()
+            .map(option_multi_leg_rfq_quote_leg_from_row)
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Some((quote, legs)))
+    }
+
+    pub async fn list_option_multi_leg_rfq_quotes_by_maker(
+        &self,
+        mm_account: &AccountId,
+        maker_subaccount_id: u32,
+    ) -> Result<Vec<(OptionMultiLegRfqQuote, Vec<OptionMultiLegRfqQuoteLeg>)>> {
+        let maker_subaccount_id = u32_to_i32("maker_subaccount_id", maker_subaccount_id)?;
+        let rows = sqlx::query(
+            "SELECT quote_id, option_rfq_id, mm_account, maker_subaccount_id, session_id,
+                    client_quote_id, package_price_1e8, size_1e8, status,
+                    created_at_ms, expires_at_ms,
+                    signature, quote_digest, quote_nonce, signature_status, recovered_signer
+             FROM option_multi_leg_rfq_quotes
+             WHERE LOWER(mm_account) = LOWER($1) AND maker_subaccount_id = $2
+             ORDER BY created_at_ms ASC, quote_id ASC",
+        )
+        .bind(&mm_account.0)
+        .bind(maker_subaccount_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let quote = option_multi_leg_rfq_quote_from_row(row)?;
+            let leg_rows = sqlx::query(
+                "SELECT quote_id, leg_index, price_1e8
+                 FROM option_multi_leg_rfq_quote_legs
+                 WHERE quote_id = $1
+                 ORDER BY leg_index ASC",
+            )
+            .bind(quote.quote_id.to_string())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|error| BackendError::Persistence(error.to_string()))?;
+            let legs = leg_rows
+                .into_iter()
+                .map(option_multi_leg_rfq_quote_leg_from_row)
+                .collect::<Result<Vec<_>>>()?;
+            out.push((quote, legs));
+        }
+        Ok(out)
+    }
+
+    pub async fn insert_option_multi_leg_rfq_fill(
+        &self,
+        fill: &OptionMultiLegRfqFill,
+        expected_leg_count: usize,
+        legs: &[OptionMultiLegRfqFillLeg],
+    ) -> Result<()> {
+        validate_multi_leg_fill_composition(fill.fill_id, expected_leg_count, legs)?;
+        let taker_subaccount_id = u32_to_i32("taker_subaccount_id", fill.taker_subaccount_id)?;
+        let maker_subaccount_id = u32_to_i32("maker_subaccount_id", fill.maker_subaccount_id)?;
+        let mut tx = self.begin().await?;
+        sqlx::query(
+            "INSERT INTO option_multi_leg_rfq_fills (
+                fill_id, option_rfq_id, quote_id, taker, taker_subaccount_id,
+                mm_account, maker_subaccount_id, package_price_1e8, size_1e8, created_at_ms
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+        )
+        .bind(fill.fill_id.to_string())
+        .bind(fill.option_rfq_id.to_string())
+        .bind(fill.quote_id.to_string())
+        .bind(&fill.taker.0)
+        .bind(taker_subaccount_id)
+        .bind(&fill.mm_account.0)
+        .bind(maker_subaccount_id)
+        .bind(&fill.package_price_1e8)
+        .bind(fill.size_1e8.to_string())
+        .bind(timestamp_to_i64(fill.created_at_ms))
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+
+        for leg in legs {
+            let leg_index = u32_to_i32("leg_index", leg.leg_index)?;
+            sqlx::query(
+                "INSERT INTO option_multi_leg_rfq_fill_legs (
+                    fill_id, leg_index, option_series_id, side, size_1e8, price_1e8
+                ) VALUES ($1, $2, $3, $4, $5, $6)",
+            )
+            .bind(fill.fill_id.to_string())
+            .bind(leg_index)
+            .bind(&leg.option_series_id)
+            .bind(side_to_str(leg.side))
+            .bind(leg.size_1e8.to_string())
+            .bind(leg.price_1e8.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        Ok(())
+    }
+
+    pub async fn get_option_multi_leg_rfq_fill(
+        &self,
+        fill_id: OptionMultiLegRfqFillId,
+    ) -> Result<Option<(OptionMultiLegRfqFill, Vec<OptionMultiLegRfqFillLeg>)>> {
+        let row = sqlx::query(
+            "SELECT fill_id, option_rfq_id, quote_id, taker, taker_subaccount_id,
+                    mm_account, maker_subaccount_id, package_price_1e8, size_1e8, created_at_ms
+             FROM option_multi_leg_rfq_fills
+             WHERE fill_id = $1",
+        )
+        .bind(fill_id.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let fill = option_multi_leg_rfq_fill_from_row(row)?;
+
+        let leg_rows = sqlx::query(
+            "SELECT fill_id, leg_index, option_series_id, side, size_1e8, price_1e8
+             FROM option_multi_leg_rfq_fill_legs
+             WHERE fill_id = $1
+             ORDER BY leg_index ASC",
+        )
+        .bind(fill_id.to_string())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        let legs = leg_rows
+            .into_iter()
+            .map(option_multi_leg_rfq_fill_leg_from_row)
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Some((fill, legs)))
+    }
+}
+
+fn option_multi_leg_rfq_from_row(row: PgRow) -> Result<OptionMultiLegRfqRequest> {
+    let option_rfq_id: String = row_get(&row, "option_rfq_id")?;
+    let status: String = row_get(&row, "status")?;
+    let accepted_quote_id: Option<String> = row_get(&row, "accepted_quote_id")?;
+    let accepted_fill_id: Option<String> = row_get(&row, "accepted_fill_id")?;
+    let taker_subaccount_id: i32 = row_get(&row, "taker_subaccount_id")?;
+    if taker_subaccount_id < 1 {
+        return Err(BackendError::Persistence(
+            "multi-leg option RFQ taker_subaccount_id must be >= 1".to_string(),
+        ));
+    }
+    Ok(OptionMultiLegRfqRequest {
+        option_rfq_id: option_rfq_id.parse().map_err(|error| {
+            BackendError::Persistence(format!("invalid multi-leg option RFQ id: {error}"))
+        })?,
+        taker: AccountId::new(row_get::<String>(&row, "taker")?),
+        taker_subaccount_id: taker_subaccount_id as u32,
+        status: OptionMultiLegRfqStatus::parse(&status)?,
+        created_at_ms: row_get(&row, "created_at_ms")?,
+        expires_at_ms: row_get(&row, "expires_at_ms")?,
+        accepted_quote_id: accepted_quote_id
+            .map(|value| {
+                value.parse().map_err(|error| {
+                    BackendError::Persistence(format!(
+                        "invalid multi-leg option RFQ accepted quote id: {error}"
+                    ))
+                })
+            })
+            .transpose()?,
+        accepted_fill_id: accepted_fill_id
+            .map(|value| {
+                value.parse().map_err(|error| {
+                    BackendError::Persistence(format!(
+                        "invalid multi-leg option RFQ accepted fill id: {error}"
+                    ))
+                })
+            })
+            .transpose()?,
+    })
+}
+
+fn option_multi_leg_rfq_leg_from_row(row: PgRow) -> Result<OptionMultiLegRfqLeg> {
+    let option_rfq_id: String = row_get(&row, "option_rfq_id")?;
+    let leg_index: i32 = row_get(&row, "leg_index")?;
+    let ratio_num: i32 = row_get(&row, "ratio_num")?;
+    let ratio_den: i32 = row_get(&row, "ratio_den")?;
+    let side: String = row_get(&row, "side")?;
+    if leg_index < 0 || ratio_num < 1 || ratio_den < 1 {
+        return Err(BackendError::Persistence(
+            "multi-leg option RFQ leg invariants violated on read".to_string(),
+        ));
+    }
+    Ok(OptionMultiLegRfqLeg {
+        option_rfq_id: option_rfq_id.parse().map_err(|error| {
+            BackendError::Persistence(format!("invalid multi-leg RFQ leg parent id: {error}"))
+        })?,
+        leg_index: leg_index as u32,
+        option_series_id: row_get(&row, "option_series_id")?,
+        side: parse_side(&side)?,
+        size_1e8: row_get::<String>(&row, "size_1e8")?
+            .parse()
+            .map_err(|error| {
+                BackendError::Persistence(format!("invalid multi-leg RFQ leg size: {error}"))
+            })?,
+        ratio_num: ratio_num as u32,
+        ratio_den: ratio_den as u32,
+    })
+}
+
+fn option_multi_leg_rfq_quote_from_row(row: PgRow) -> Result<OptionMultiLegRfqQuote> {
+    let quote_id: String = row_get(&row, "quote_id")?;
+    let option_rfq_id: String = row_get(&row, "option_rfq_id")?;
+    let status: String = row_get(&row, "status")?;
+    let signature_status: String = row_get(&row, "signature_status")?;
+    let recovered_signer: Option<String> = row_get(&row, "recovered_signer")?;
+    let maker_subaccount_id: i32 = row_get(&row, "maker_subaccount_id")?;
+    if maker_subaccount_id < 1 {
+        return Err(BackendError::Persistence(
+            "multi-leg option RFQ quote maker_subaccount_id must be >= 1".to_string(),
+        ));
+    }
+    Ok(OptionMultiLegRfqQuote {
+        quote_id: quote_id.parse().map_err(|error| {
+            BackendError::Persistence(format!("invalid multi-leg option RFQ quote id: {error}"))
+        })?,
+        option_rfq_id: option_rfq_id.parse().map_err(|error| {
+            BackendError::Persistence(format!(
+                "invalid multi-leg option RFQ quote RFQ id: {error}"
+            ))
+        })?,
+        mm_account: AccountId::new(row_get::<String>(&row, "mm_account")?),
+        maker_subaccount_id: maker_subaccount_id as u32,
+        session_id: row_get(&row, "session_id")?,
+        client_quote_id: row_get(&row, "client_quote_id")?,
+        package_price_1e8: row_get::<String>(&row, "package_price_1e8")?,
+        size_1e8: row_get::<String>(&row, "size_1e8")?
+            .parse()
+            .map_err(|error| {
+                BackendError::Persistence(format!(
+                    "invalid multi-leg option RFQ quote size: {error}"
+                ))
+            })?,
+        status: OptionMultiLegRfqQuoteStatus::parse(&status)?,
+        created_at_ms: row_get(&row, "created_at_ms")?,
+        expires_at_ms: row_get(&row, "expires_at_ms")?,
+        signature: row_get(&row, "signature")?,
+        quote_digest: row_get(&row, "quote_digest")?,
+        quote_nonce: row_get(&row, "quote_nonce")?,
+        signature_status: OptionMultiLegRfqQuoteSignatureStatus::parse(&signature_status)?,
+        recovered_signer: recovered_signer.map(AccountId::new),
+    })
+}
+
+fn option_multi_leg_rfq_quote_leg_from_row(row: PgRow) -> Result<OptionMultiLegRfqQuoteLeg> {
+    let quote_id: String = row_get(&row, "quote_id")?;
+    let leg_index: i32 = row_get(&row, "leg_index")?;
+    if leg_index < 0 {
+        return Err(BackendError::Persistence(
+            "multi-leg option RFQ quote leg_index must be >= 0".to_string(),
+        ));
+    }
+    Ok(OptionMultiLegRfqQuoteLeg {
+        quote_id: quote_id.parse().map_err(|error| {
+            BackendError::Persistence(format!(
+                "invalid multi-leg option RFQ quote leg parent id: {error}"
+            ))
+        })?,
+        leg_index: leg_index as u32,
+        price_1e8: row_get::<String>(&row, "price_1e8")?
+            .parse()
+            .map_err(|error| {
+                BackendError::Persistence(format!(
+                    "invalid multi-leg option RFQ quote leg price: {error}"
+                ))
+            })?,
+    })
+}
+
+fn option_multi_leg_rfq_fill_from_row(row: PgRow) -> Result<OptionMultiLegRfqFill> {
+    let fill_id: String = row_get(&row, "fill_id")?;
+    let option_rfq_id: String = row_get(&row, "option_rfq_id")?;
+    let quote_id: String = row_get(&row, "quote_id")?;
+    let taker_subaccount_id: i32 = row_get(&row, "taker_subaccount_id")?;
+    let maker_subaccount_id: i32 = row_get(&row, "maker_subaccount_id")?;
+    if taker_subaccount_id < 1 || maker_subaccount_id < 1 {
+        return Err(BackendError::Persistence(
+            "multi-leg option RFQ fill subaccount ids must be >= 1".to_string(),
+        ));
+    }
+    Ok(OptionMultiLegRfqFill {
+        fill_id: fill_id.parse().map_err(|error| {
+            BackendError::Persistence(format!("invalid multi-leg option RFQ fill id: {error}"))
+        })?,
+        option_rfq_id: option_rfq_id.parse().map_err(|error| {
+            BackendError::Persistence(format!("invalid multi-leg option RFQ fill RFQ id: {error}"))
+        })?,
+        quote_id: quote_id.parse().map_err(|error| {
+            BackendError::Persistence(format!(
+                "invalid multi-leg option RFQ fill quote id: {error}"
+            ))
+        })?,
+        taker: AccountId::new(row_get::<String>(&row, "taker")?),
+        taker_subaccount_id: taker_subaccount_id as u32,
+        mm_account: AccountId::new(row_get::<String>(&row, "mm_account")?),
+        maker_subaccount_id: maker_subaccount_id as u32,
+        package_price_1e8: row_get::<String>(&row, "package_price_1e8")?,
+        size_1e8: row_get::<String>(&row, "size_1e8")?
+            .parse()
+            .map_err(|error| {
+                BackendError::Persistence(format!(
+                    "invalid multi-leg option RFQ fill size: {error}"
+                ))
+            })?,
+        created_at_ms: row_get(&row, "created_at_ms")?,
+    })
+}
+
+fn option_multi_leg_rfq_fill_leg_from_row(row: PgRow) -> Result<OptionMultiLegRfqFillLeg> {
+    let fill_id: String = row_get(&row, "fill_id")?;
+    let leg_index: i32 = row_get(&row, "leg_index")?;
+    let side: String = row_get(&row, "side")?;
+    if leg_index < 0 {
+        return Err(BackendError::Persistence(
+            "multi-leg option RFQ fill leg_index must be >= 0".to_string(),
+        ));
+    }
+    Ok(OptionMultiLegRfqFillLeg {
+        fill_id: fill_id.parse().map_err(|error| {
+            BackendError::Persistence(format!(
+                "invalid multi-leg option RFQ fill leg parent id: {error}"
+            ))
+        })?,
+        leg_index: leg_index as u32,
+        option_series_id: row_get(&row, "option_series_id")?,
+        side: parse_side(&side)?,
+        size_1e8: row_get::<String>(&row, "size_1e8")?
+            .parse()
+            .map_err(|error| {
+                BackendError::Persistence(format!(
+                    "invalid multi-leg option RFQ fill leg size: {error}"
+                ))
+            })?,
+        price_1e8: row_get::<String>(&row, "price_1e8")?
+            .parse()
+            .map_err(|error| {
+                BackendError::Persistence(format!(
+                    "invalid multi-leg option RFQ fill leg price: {error}"
+                ))
+            })?,
+    })
 }

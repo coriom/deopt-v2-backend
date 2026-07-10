@@ -6,6 +6,7 @@ pub mod confirmation_worker;
 pub mod event_indexer;
 pub mod execution;
 pub mod lifecycle;
+pub mod multi_leg;
 pub mod reconciliation_worker;
 pub mod rfq_operator_packet;
 pub mod series_id;
@@ -103,4 +104,13 @@ pub use types::{
     OptionTwapChildOrder, OptionTwapChildStatus, OptionTwapOrder, OptionTwapOrderFilter,
     OptionTwapOrderId, OptionTwapStatus, OptionsConfig, OPTION_EXECUTION_GAS_SAFETY_BPS_DEFAULT,
     OPTION_EXECUTION_GAS_SAFETY_BPS_MAX, OPTION_EXECUTION_GAS_SAFETY_BPS_MIN,
+};
+
+pub use multi_leg::{
+    validate_multi_leg_composition, validate_multi_leg_fill_composition,
+    validate_multi_leg_quote_composition, OptionMultiLegRfqFill, OptionMultiLegRfqFillId,
+    OptionMultiLegRfqFillLeg, OptionMultiLegRfqId, OptionMultiLegRfqLeg, OptionMultiLegRfqQuote,
+    OptionMultiLegRfqQuoteId, OptionMultiLegRfqQuoteLeg, OptionMultiLegRfqQuoteSignatureStatus,
+    OptionMultiLegRfqQuoteStatus, OptionMultiLegRfqRequest, OptionMultiLegRfqStatus,
+    MAX_LEGS_PER_MULTI_LEG_RFQ, MIN_LEGS_PER_MULTI_LEG_RFQ,
 };

@@ -348,6 +348,7 @@ impl AppConfig {
                 "OPTION_RFQ_QUOTE_SIGNATURE_MODE",
                 "disabled",
             )?,
+            rfq_multi_leg_enabled: parse_env(&mut lookup, "OPTION_RFQ_MULTI_LEG_ENABLED", "false")?,
             rfq_eip712_domain: Eip712Domain {
                 name: get_env(&mut lookup, "OPTION_RFQ_EIP712_NAME", "DeOptV2OptionRFQ"),
                 version: get_env(&mut lookup, "OPTION_RFQ_EIP712_VERSION", "1"),
@@ -2203,6 +2204,7 @@ mod tests {
             config.options.rfq_quote_signature_mode,
             crate::options::OptionRfqQuoteSignatureMode::Disabled
         );
+        assert!(!config.options.rfq_multi_leg_enabled);
         assert_eq!(config.options.rfq_eip712_domain.name, "DeOptV2OptionRFQ");
         assert!(!config.options.execution_enabled);
         assert!(config.options.execution_require_persistence);
