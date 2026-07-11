@@ -94,6 +94,7 @@ impl FromStr for OptionFeeBasis {
 pub enum FeeSourceType {
     OptionOrderFill,
     OptionRfqFill,
+    OptionMultiLegRfqFill,
     PerpTrade,
     PerpExecution,
     PerpRfq,
@@ -104,6 +105,7 @@ impl FeeSourceType {
         match self {
             Self::OptionOrderFill => "option_order_fill",
             Self::OptionRfqFill => "option_rfq_fill",
+            Self::OptionMultiLegRfqFill => "option_multi_leg_rfq_fill",
             Self::PerpTrade => "perp_trade",
             Self::PerpExecution => "perp_execution",
             Self::PerpRfq => "perp_rfq",

@@ -8,7 +8,8 @@ use crate::error::{BackendError, Result};
 use crate::indexer::IndexedPerpTrade;
 use crate::mm::permissions::list_permission_accounts;
 use crate::options::{
-    OptionExecutionEvent, OptionFill, OptionRfqFill, OptionRfqQuote, OptionSeries,
+    OptionExecutionEvent, OptionFill, OptionMultiLegRfqFill, OptionMultiLegRfqFillLeg,
+    OptionMultiLegRfqQuote, OptionRfqFill, OptionRfqQuote, OptionSeries,
 };
 use crate::types::{AccountId, MarketId, Price1e8, Size1e8, TimestampMs};
 use chrono::{DateTime, Duration, Utc};
@@ -182,6 +183,122 @@ pub async fn record_option_rfq_fill(
         },
     )
     .await
+}
+
+/// RFQ-MULTI-LEG-FEES-V1 — package-fee accounting for accepted
+/// multi-leg RFQs.
+///
+/// Fee basis mirrors the single-leg RFQ path (`record_option_rfq_fill`)
+/// with per-leg gross notionals summed to a package total:
+///
+/// * `notional_1e8`         = Σ per-leg `option_underlying_notional_1e8`
+///                            (using each leg's own series strike +
+///                            contract_size)
+/// * `premium_notional_1e8` = Σ per-leg gross premium notional
+///                            (`|price_1e8| * size_1e8 / 1e8`)
+///
+/// Both sums are ABSOLUTE / gross exposures so a debit/credit spread
+/// cannot pay zero fees on a small net package price. The fee amount
+/// is then `option_capped_amount_1e8(underlying, premium, rate, cap)`
+/// applied once per role (maker payer + taker payer), matching the
+/// single-leg two-event pattern.
+///
+/// Source type is a NEW variant, `FeeSourceType::OptionMultiLegRfqFill`,
+/// so a multi-leg fill_id UUID cannot collide with a single-leg
+/// `option_rfq_fill` row under the `(source_type, source_id, payer,
+/// recipient)` uniqueness constraint on `fee_events`. The fee event's
+/// `option_series_id` is `None` because the package spans multiple
+/// series — leg-level detail is available on the fill legs table.
+///
+/// Subaccount attribution is NOT stored on `fee_events` (single-leg
+/// RFQ also does not); the source_id → fill row lookup preserves the
+/// `taker_subaccount_id` / `maker_subaccount_id` pair on the parent
+/// fill.
+///
+/// Rebate: the maker's `RebateEligibilityKind::OptionRfqFill` bit is
+/// reused. `can_quote_option_rfq` governs both single- and multi-leg
+/// RFQ paths.
+pub async fn record_option_multi_leg_rfq_fill(
+    state: &AppState,
+    fill: &OptionMultiLegRfqFill,
+    fill_legs: &[OptionMultiLegRfqFillLeg],
+    _quote: &OptionMultiLegRfqQuote,
+) -> Result<()> {
+    if !state.fees_config.enabled {
+        return Ok(());
+    }
+
+    let (notional_1e8, premium_notional_1e8) =
+        multi_leg_package_notionals_1e8(state, fill_legs).await?;
+
+    record_participant_fee(
+        state,
+        FeeEventInput {
+            source_type: FeeSourceType::OptionMultiLegRfqFill,
+            source_id: fill.fill_id.to_string(),
+            market_type: FeeMarketType::Option,
+            flow_type: FeeFlowType::Rfq,
+            product: FeeProduct::OptionRfq,
+            market_id: None,
+            option_series_id: None,
+            maker: &fill.mm_account,
+            taker: &fill.taker,
+            payer: &fill.mm_account,
+            role: FeeParticipantRole::Maker,
+            notional_1e8,
+            premium_notional_1e8,
+            rebate_kind: Some(RebateEligibilityKind::OptionRfqFill),
+            created_at_ms: fill.created_at_ms,
+        },
+    )
+    .await?;
+    record_participant_fee(
+        state,
+        FeeEventInput {
+            source_type: FeeSourceType::OptionMultiLegRfqFill,
+            source_id: fill.fill_id.to_string(),
+            market_type: FeeMarketType::Option,
+            flow_type: FeeFlowType::Rfq,
+            product: FeeProduct::OptionRfq,
+            market_id: None,
+            option_series_id: None,
+            maker: &fill.mm_account,
+            taker: &fill.taker,
+            payer: &fill.taker,
+            role: FeeParticipantRole::Taker,
+            notional_1e8,
+            premium_notional_1e8,
+            rebate_kind: None,
+            created_at_ms: fill.created_at_ms,
+        },
+    )
+    .await
+}
+
+/// Sum gross per-leg underlying notional and gross per-leg premium
+/// notional across every fill leg. Loads the series for each leg to
+/// pick up strike + contract_size. Fails on any series lookup failure
+/// or arithmetic overflow.
+async fn multi_leg_package_notionals_1e8(
+    state: &AppState,
+    fill_legs: &[OptionMultiLegRfqFillLeg],
+) -> Result<(u128, u128)> {
+    let mut total_underlying_1e8: u128 = 0;
+    let mut total_premium_1e8: u128 = 0;
+    for leg in fill_legs {
+        let series = load_option_series(state, &leg.option_series_id).await?;
+        let leg_underlying = option_underlying_notional_1e8(&series, leg.size_1e8)?;
+        let leg_premium = premium_notional_1e8(leg.price_1e8, leg.size_1e8)?;
+        total_underlying_1e8 = total_underlying_1e8
+            .checked_add(leg_underlying)
+            .ok_or_else(|| {
+                BackendError::Config("multi-leg package underlying notional overflow".to_string())
+            })?;
+        total_premium_1e8 = total_premium_1e8.checked_add(leg_premium).ok_or_else(|| {
+            BackendError::Config("multi-leg package premium notional overflow".to_string())
+        })?;
+    }
+    Ok((total_underlying_1e8, total_premium_1e8))
 }
 
 pub async fn record_indexed_perp_trade_fees(

@@ -724,6 +724,13 @@ pub async fn accept_option_multi_leg_rfq_quote(
                     "multi-leg option RFQ fill vanished after insert".to_string(),
                 )
             })?;
+        crate::fees::service::record_option_multi_leg_rfq_fill(
+            state,
+            &persisted_fill,
+            &persisted_fill_legs,
+            &persisted_quote,
+        )
+        .await?;
         emit_multi_leg_rfq_accepted_lifecycle(
             state,
             &persisted_rfq,
@@ -755,6 +762,13 @@ pub async fn accept_option_multi_leg_rfq_quote(
             fill.clone(),
             fill_legs.clone(),
         )?;
+    crate::fees::service::record_option_multi_leg_rfq_fill(
+        state,
+        &fill,
+        &fill_legs,
+        &persisted_quote,
+    )
+    .await?;
     emit_multi_leg_rfq_accepted_lifecycle(state, &persisted_rfq, &persisted_quote, &fill);
     notify_multi_leg_mm_gateway_on_accept(
         state,
