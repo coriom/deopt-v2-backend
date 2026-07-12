@@ -556,16 +556,33 @@ pub struct OptionMultiLegRfqQuoteAcceptedPayload {
     pub legs_count: u32,
 }
 
-/// RFQ-MULTI-LEG-MM-GATEWAY-V1 — push to the makers whose competing
-/// quotes lost when a winning quote was accepted, OR to the maker
-/// whose quote was flipped to `Cancelled` by their own cancel
-/// request. `reason` is drawn from a bounded label set so the wire
-/// cannot leak raw error strings.
+/// RFQ-MULTI-LEG-MM-GATEWAY-V1 (reserved) / LOSING-MAKER-REJECTION-PUSH-V1
+/// (activated) — push to the makers whose competing quotes lost when a
+/// winning quote was accepted.
+///
+/// Bounded payload: no signatures, no nonces, no authorization
+/// envelopes, no raw error strings. `reason` is drawn from a bounded
+/// label set (V1 always emits `"not_selected"` from the accept-time
+/// path); `accepted_quote_id` and `fill_id` reference the winning
+/// quote's atomic accept so the losing maker knows what the RFQ was
+/// filled against.
+///
+/// `Option` on `accepted_quote_id` / `fill_id` leaves room for a
+/// future push variant that carries the reason label without a
+/// winning fill (e.g. maker self-cancel driven by a different
+/// milestone); every V1 push emitted by
+/// `notify_multi_leg_mm_gateway_on_losing_makers` sets both to
+/// `Some(...)`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct OptionMultiLegRfqQuoteRejectedPayload {
     pub option_rfq_id: uuid::Uuid,
     pub quote_id: uuid::Uuid,
+    pub accepted_quote_id: Option<uuid::Uuid>,
+    pub fill_id: Option<uuid::Uuid>,
+    pub maker_subaccount_id: u32,
+    pub legs_count: u32,
     pub reason: String,
+    pub rejected_at_ms: i64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]

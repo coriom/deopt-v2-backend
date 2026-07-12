@@ -8389,6 +8389,33 @@ impl PgRepository {
         Ok(Some((quote, legs)))
     }
 
+    /// LOSING-MAKER-REJECTION-PUSH-V1 — read-only metadata list of
+    /// every quote submitted against a given multi-leg RFQ, returned
+    /// without the per-leg detail (the losing-maker push does not
+    /// need it). Ordering matches the in-memory helper: earliest
+    /// submission first, `quote_id` as tiebreaker.
+    pub async fn list_option_multi_leg_rfq_quotes_for_rfq(
+        &self,
+        rfq_id: OptionMultiLegRfqId,
+    ) -> Result<Vec<OptionMultiLegRfqQuote>> {
+        let rows = sqlx::query(
+            "SELECT quote_id, option_rfq_id, mm_account, maker_subaccount_id, session_id,
+                    client_quote_id, package_price_1e8, size_1e8, status,
+                    created_at_ms, expires_at_ms,
+                    signature, quote_digest, quote_nonce, signature_status, recovered_signer
+             FROM option_multi_leg_rfq_quotes
+             WHERE option_rfq_id = $1
+             ORDER BY created_at_ms ASC, quote_id ASC",
+        )
+        .bind(rfq_id.to_string())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        rows.into_iter()
+            .map(option_multi_leg_rfq_quote_from_row)
+            .collect()
+    }
+
     pub async fn list_option_multi_leg_rfq_quotes_by_maker(
         &self,
         mm_account: &AccountId,

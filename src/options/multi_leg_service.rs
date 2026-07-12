@@ -743,6 +743,15 @@ pub async fn accept_option_multi_leg_rfq_quote(
             persisted_fill_legs.len() as u32,
             persisted_fill.fill_id,
         );
+        notify_multi_leg_mm_gateway_on_losing_makers(
+            state,
+            persisted_rfq.option_rfq_id,
+            persisted_quote.quote_id,
+            persisted_fill.fill_id,
+            persisted_fill_legs.len() as u32,
+            persisted_fill.created_at_ms,
+        )
+        .await;
         return Ok(AcceptOptionMultiLegRfqQuoteOutcome {
             rfq: persisted_rfq,
             quote: persisted_quote,
@@ -776,6 +785,15 @@ pub async fn accept_option_multi_leg_rfq_quote(
         fill_legs.len() as u32,
         fill.fill_id,
     );
+    notify_multi_leg_mm_gateway_on_losing_makers(
+        state,
+        persisted_rfq.option_rfq_id,
+        persisted_quote.quote_id,
+        fill.fill_id,
+        fill_legs.len() as u32,
+        fill.created_at_ms,
+    )
+    .await;
     Ok(AcceptOptionMultiLegRfqQuoteOutcome {
         rfq: persisted_rfq,
         quote: persisted_quote,
@@ -1157,4 +1175,88 @@ fn notify_multi_leg_mm_gateway_on_accept(
     // Best-effort: a full or absent receiver does not fail the
     // caller. Errors are already logged inside `send_to_session`.
     let _ = state.mm_sessions.send_to_session(session_id, message);
+}
+
+// LOSING-MAKER-REJECTION-PUSH-V1 — best-effort push to the makers
+// whose competing quotes lost when a winning quote was accepted.
+//
+// Semantics:
+//
+//   * Runs strictly AFTER the accept transaction commits (both PG
+//     and in-memory paths). Never inside the accept transaction.
+//   * Best-effort: a full or missing session drops silently. The
+//     accept response is unaffected by any push failure.
+//   * Fetches every quote submitted against the RFQ, filters to
+//     `status == Rejected` (i.e. was `Active` at accept-open time
+//     and is not the winning quote) with a persisted `session_id`.
+//   * Winning maker does NOT receive a rejection push — filtered
+//     out by `quote_id != accepted_quote_id` AND `status != Accepted`.
+//   * Losing makers that never associated a WT session (`session_id`
+//     is `None`) are simply skipped — accept still succeeds; the
+//     next milestone can extend this with a lifecycle-broadcast
+//     fallback if desired.
+//   * Payload is bounded: only IDs, counts, subaccount id, timestamp,
+//     and a fixed reason label (`"not_selected"`).
+async fn notify_multi_leg_mm_gateway_on_losing_makers(
+    state: &AppState,
+    rfq_id: OptionMultiLegRfqId,
+    accepted_quote_id: OptionMultiLegRfqQuoteId,
+    fill_id: OptionMultiLegRfqFillId,
+    legs_count: u32,
+    rejected_at_ms: crate::types::TimestampMs,
+) {
+    use crate::mm::protocol::{
+        NotificationEnvelope, OptionMultiLegRfqQuoteRejectedPayload, ServerMessage,
+    };
+
+    // Fetch metadata for every quote on this RFQ. Best-effort — any
+    // repository / lock error results in no push, no accept failure.
+    let quotes: Vec<OptionMultiLegRfqQuote> = if let Some(repository) = state.repository.clone() {
+        match repository
+            .list_option_multi_leg_rfq_quotes_for_rfq(rfq_id)
+            .await
+        {
+            Ok(rows) => rows,
+            Err(_) => return,
+        }
+    } else {
+        match state.options_store.lock() {
+            Ok(store) => store
+                .list_option_multi_leg_rfq_quotes(rfq_id)
+                .into_iter()
+                .map(|(quote, _legs)| quote)
+                .collect(),
+            Err(_) => return,
+        }
+    };
+
+    for quote in quotes {
+        if quote.quote_id == accepted_quote_id {
+            continue;
+        }
+        // Only push to makers whose quote lost because a winning
+        // quote was accepted. Cancelled or Expired quotes are not
+        // this milestone's concern.
+        if quote.status != OptionMultiLegRfqQuoteStatus::Rejected {
+            continue;
+        }
+        let Some(session_id) = quote.session_id.as_deref() else {
+            continue;
+        };
+        let message = ServerMessage::OptionMultiLegRfqQuoteRejected(NotificationEnvelope::new(
+            "option_multi_leg_rfq_quote_rejected",
+            format!("option-multi-leg-rfq-rejected-{}", quote.quote_id),
+            OptionMultiLegRfqQuoteRejectedPayload {
+                option_rfq_id: rfq_id,
+                quote_id: quote.quote_id,
+                accepted_quote_id: Some(accepted_quote_id),
+                fill_id: Some(fill_id),
+                maker_subaccount_id: quote.maker_subaccount_id,
+                legs_count,
+                reason: "not_selected".to_string(),
+                rejected_at_ms,
+            },
+        ));
+        let _ = state.mm_sessions.send_to_session(session_id, message);
+    }
 }
