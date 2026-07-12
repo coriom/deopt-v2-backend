@@ -10,7 +10,9 @@ use crate::execution::{
     ExecutionIntent, ExecutionIntentRepository, ExecutionIntentStatus, ExecutionTransaction,
     ExecutionTransactionStatus, SimulationResult, StoredTradeSignatures,
 };
-use crate::fees::{FeeEvent, FeeFlowType, FeeMarketType, RebateAccrual, VolumeBucket};
+use crate::fees::{
+    FeeEvent, FeeFlowType, FeeMarketType, FeeSourceType, FeeStatus, RebateAccrual, VolumeBucket,
+};
 use crate::indexer::IndexedPerpTrade;
 use crate::mm::{MmAccountPermissions, MmProductPermission};
 use crate::monitoring::FeeEventLabels;
@@ -993,6 +995,36 @@ impl PgRepository {
         .map_err(|error| BackendError::Persistence(error.to_string()))?;
         let count: i64 = row_get(&row, "row_count")?;
         i64_to_u64_persistence("row_count", count)
+    }
+
+    /// RFQ-MULTI-LEG-FILL-READ-V1 — read-only typed lookup for every
+    /// fee event belonging to a `(source_type, source_id)` pair.
+    /// Complements `admin_recent_fee_events` (which is admin-only and
+    /// returns raw JSON) with a typed helper used by the per-fill read
+    /// route.
+    pub async fn list_fee_events_by_source(
+        &self,
+        source_type: &str,
+        source_id: &str,
+    ) -> Result<Vec<FeeEvent>> {
+        if !self.admin_table_exists("fee_events").await? {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            "SELECT fee_event_id, source_type, source_id, market_type, flow_type, market_id,
+                    option_series_id, maker, taker, payer, recipient, fee_asset, notional_1e8,
+                    fee_rate_micro_bps, fee_amount_1e8, rebate_rate_micro_bps,
+                    rebate_amount_1e8, protocol_amount_1e8, status, created_at_ms
+             FROM fee_events
+             WHERE source_type = $1 AND source_id = $2
+             ORDER BY created_at_ms ASC, fee_event_id ASC",
+        )
+        .bind(source_type)
+        .bind(source_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        rows.into_iter().map(fee_event_from_row).collect()
     }
 
     pub async fn admin_recent_fee_events(&self, limit: u32) -> Result<Vec<serde_json::Value>> {
@@ -7861,6 +7893,62 @@ where
 {
     row.try_get(column)
         .map_err(|error| BackendError::Persistence(error.to_string()))
+}
+
+/// RFQ-MULTI-LEG-FILL-READ-V1 — hand-mapped row → `FeeEvent`. Kept
+/// local to the repository so the fee ledger types don't grow a
+/// `sqlx::FromRow` impl the rest of the crate doesn't need.
+fn fee_event_from_row(row: PgRow) -> Result<FeeEvent> {
+    use std::str::FromStr;
+
+    let source_type_str: String = row_get(&row, "source_type")?;
+    let market_type_str: String = row_get(&row, "market_type")?;
+    let flow_type_str: String = row_get(&row, "flow_type")?;
+    let status_str: String = row_get(&row, "status")?;
+    let market_id: Option<i64> = row_get(&row, "market_id")?;
+    let fee_rate_micro_bps: i64 = row_get(&row, "fee_rate_micro_bps")?;
+    let rebate_rate_micro_bps: i64 = row_get(&row, "rebate_rate_micro_bps")?;
+    let created_at_ms: i64 = row_get(&row, "created_at_ms")?;
+
+    Ok(FeeEvent {
+        fee_event_id: row_get(&row, "fee_event_id")?,
+        source_type: FeeSourceType::from_str(&source_type_str)?,
+        source_id: row_get(&row, "source_id")?,
+        market_type: FeeMarketType::from_str(&market_type_str)?,
+        flow_type: FeeFlowType::from_str(&flow_type_str)?,
+        market_id: market_id
+            .map(|value| i64_to_u64_persistence("market_id", value))
+            .transpose()?,
+        option_series_id: row_get(&row, "option_series_id")?,
+        maker: row_get::<Option<String>>(&row, "maker")?.map(crate::types::AccountId::new),
+        taker: row_get::<Option<String>>(&row, "taker")?.map(crate::types::AccountId::new),
+        payer: crate::types::AccountId::new(row_get::<String>(&row, "payer")?),
+        recipient: row_get(&row, "recipient")?,
+        fee_asset: row_get(&row, "fee_asset")?,
+        notional_1e8: parse_persistence_u128("notional_1e8", row_get(&row, "notional_1e8")?)?,
+        fee_rate_micro_bps: i64_to_u64_persistence("fee_rate_micro_bps", fee_rate_micro_bps)?,
+        fee_amount_1e8: parse_persistence_u128("fee_amount_1e8", row_get(&row, "fee_amount_1e8")?)?,
+        rebate_rate_micro_bps: i64_to_u64_persistence(
+            "rebate_rate_micro_bps",
+            rebate_rate_micro_bps,
+        )?,
+        rebate_amount_1e8: parse_persistence_u128(
+            "rebate_amount_1e8",
+            row_get(&row, "rebate_amount_1e8")?,
+        )?,
+        protocol_amount_1e8: parse_persistence_u128(
+            "protocol_amount_1e8",
+            row_get(&row, "protocol_amount_1e8")?,
+        )?,
+        status: FeeStatus::from_str(&status_str)?,
+        created_at_ms,
+    })
+}
+
+fn parse_persistence_u128(field: &str, value: String) -> Result<u128> {
+    value
+        .parse()
+        .map_err(|error| BackendError::Persistence(format!("invalid {field}: {error}")))
 }
 
 fn is_unique_violation(error: &sqlx::Error) -> bool {

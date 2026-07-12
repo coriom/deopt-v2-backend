@@ -99,6 +99,31 @@ impl FeeLedgerStore {
             .fold(0u128, |acc, value| acc.saturating_add(value))
     }
 
+    /// RFQ-MULTI-LEG-FILL-READ-V1 — read-only lookup for fee events
+    /// belonging to a single `(source_type, source_id)` pair. Used by
+    /// the per-fill read route to attach a fee summary without touching
+    /// the write path or the admin-only list.
+    ///
+    /// Ordering: `created_at_ms ASC` then `fee_event_id ASC` so the
+    /// caller sees maker-then-taker in insertion order (matches the
+    /// record helper).
+    pub fn list_fee_events_by_source(&self, source_type: &str, source_id: &str) -> Vec<FeeEvent> {
+        let mut events = self
+            .fee_events
+            .values()
+            .filter(|event| {
+                event.source_type.as_str() == source_type && event.source_id.as_str() == source_id
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        events.sort_by(|left, right| {
+            left.created_at_ms
+                .cmp(&right.created_at_ms)
+                .then_with(|| left.fee_event_id.cmp(&right.fee_event_id))
+        });
+        events
+    }
+
     pub fn list_fee_events(&self, limit: usize) -> Vec<FeeEvent> {
         let mut events = self.fee_events.values().cloned().collect::<Vec<_>>();
         events.sort_by(|left, right| {

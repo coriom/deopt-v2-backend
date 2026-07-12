@@ -440,6 +440,15 @@ pub fn router(state: AppState) -> Router {
             "/options/multi-leg-rfqs/:rfq_id/cancel",
             post(cancel_option_multi_leg_rfq),
         )
+        // RFQ-MULTI-LEG-FILL-READ-V1 — read-only per-fill lookup with
+        // side-aware access control. Returns 404 for any account /
+        // subaccount that is not the taker or maker seat on this
+        // specific fill. No write path is touched; response carries
+        // no signatures / nonces / authorization.
+        .route(
+            "/options/multi-leg-rfqs/:rfq_id/fills/:fill_id",
+            get(get_option_multi_leg_rfq_fill_read),
+        )
         .route(
             "/options/orders",
             post(submit_option_order).get(list_option_orders),
@@ -5666,6 +5675,272 @@ async fn cancel_option_multi_leg_rfq(
         cancelled_quotes: outcome.cancelled_quotes,
         cancelled_at_ms: outcome.cancelled_at_ms,
     }))
+}
+
+// ---------------------------------------------------------------------
+// RFQ-MULTI-LEG-FILL-READ-V1 — read-only per-fill lookup with
+// side-aware access control. Behaviour:
+//
+//   * Flag gate first — 503 `OPTION_MULTI_LEG_RFQ_NOT_LIVE` when
+//     `OPTION_RFQ_MULTI_LEG_ENABLED=false`.
+//   * `account` query parameter is required. `subaccount_id`
+//     defaults to `1`, matching every other subaccount-scoped read.
+//   * If `fill_id` does not exist → 404. If the `rfq_id` in the path
+//     does not match the fill's `option_rfq_id` → 404. If the caller
+//     is not on the taker seat `(taker, taker_subaccount_id)` or the
+//     maker seat `(mm_account, maker_subaccount_id)` → 404. Callers
+//     never learn whether a fill they cannot see exists.
+//   * Response bundles the parent fill + N fill legs in ascending
+//     `leg_index` order + a fee summary keyed on
+//     `FeeSourceType::OptionMultiLegRfqFill`. Fees may be
+//     `available=false` when the fee ledger has no matching events
+//     (fees disabled or the operator has not backfilled) —
+//     `available=false` is honest; the handler never fabricates
+//     zeros to hide missing data.
+//   * No write path is touched. No lifecycle emission. No nonce
+//     consumption. No signatures / nonces / authorization in the
+//     response body.
+// ---------------------------------------------------------------------
+
+#[derive(Clone, Debug, Deserialize)]
+struct MultiLegFillReadQuery {
+    account: AccountId,
+    #[serde(default)]
+    subaccount_id: Option<u32>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct OptionMultiLegRfqFillReadFillLegEntry {
+    leg_index: u32,
+    option_series_id: String,
+    side: Side,
+    size_1e8: String,
+    price_1e8: String,
+}
+
+impl From<crate::options::OptionMultiLegRfqFillLeg> for OptionMultiLegRfqFillReadFillLegEntry {
+    fn from(leg: crate::options::OptionMultiLegRfqFillLeg) -> Self {
+        Self {
+            leg_index: leg.leg_index,
+            option_series_id: leg.option_series_id,
+            side: leg.side,
+            size_1e8: leg.size_1e8.to_string(),
+            price_1e8: leg.price_1e8.to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct OptionMultiLegRfqFillReadFillEntry {
+    fill_id: String,
+    option_rfq_id: String,
+    quote_id: String,
+    taker: AccountId,
+    taker_subaccount_id: u32,
+    mm_account: AccountId,
+    maker_subaccount_id: u32,
+    package_price_1e8: String,
+    size_1e8: String,
+    created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct OptionMultiLegRfqFillReadFeeSummary {
+    /// `option_multi_leg_rfq_fill` — the discriminator on
+    /// `fee_events` used to look up the two rows for this fill.
+    source_type: &'static str,
+    /// `true` iff at least one matching fee event exists.
+    available: bool,
+    /// Total fee events counted (expected 2 — one payer=maker + one
+    /// payer=taker — when populated).
+    events_count: u32,
+    /// Absolute per-side fee amounts, both non-negative. Represented
+    /// as 1e8 decimal-strings for wire safety.
+    taker_fee_1e8: String,
+    maker_fee_1e8: String,
+    /// Per-side rebate amounts (paid TO the payer). Zero when the
+    /// operator has rebates disabled.
+    taker_rebate_1e8: String,
+    maker_rebate_1e8: String,
+    /// Total protocol amount collected across both sides.
+    protocol_amount_1e8: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct OptionMultiLegRfqFillReadResponse {
+    fill: OptionMultiLegRfqFillReadFillEntry,
+    legs: Vec<OptionMultiLegRfqFillReadFillLegEntry>,
+    fees: OptionMultiLegRfqFillReadFeeSummary,
+}
+
+async fn get_option_multi_leg_rfq_fill_read(
+    State(state): State<AppState>,
+    Path((rfq_id_path, fill_id_path)): Path<(String, String)>,
+    Query(query): Query<MultiLegFillReadQuery>,
+) -> Result<Json<OptionMultiLegRfqFillReadResponse>, ApiError> {
+    // Flag gate FIRST — matches every other multi-leg route so the
+    // subsystem stays invisible when the operator has not enabled it.
+    ensure_option_multi_leg_rfq_enabled(&state)?;
+
+    // Path parsing. Any malformed UUID renders as 404 via the mapping
+    // on `InvalidOptionRfqId` / `InvalidOptionRfqQuoteId`.
+    let parsed_rfq_id = parse_option_rfq_id(&rfq_id_path)?;
+    let parsed_fill_id = parse_option_rfq_quote_id(&fill_id_path)?;
+
+    // Account 0 is rejected at the seat guard below, but callers may
+    // still submit it — reject early with a bounded 404.
+    let subaccount_id = query.subaccount_id.unwrap_or(1);
+    if subaccount_id < 1 {
+        return Err(ApiError::not_found("multi-leg RFQ fill not found"));
+    }
+
+    // Load the fill + legs via the read-only service. On missing row
+    // we return 404 with a bounded message. Cross-subaccount /
+    // cross-account refusals below use the SAME message so callers
+    // cannot distinguish "row does not exist" from "row exists but
+    // you cannot see it" — this is the privacy-preserving pattern
+    // spec'd by `RFQ-MULTI-LEG-FILL-READ-V1`.
+    let (fill, legs) = match crate::options::multi_leg_service::get_option_multi_leg_rfq_fill(
+        &state,
+        parsed_fill_id,
+    )
+    .await
+    {
+        Ok(pair) => pair,
+        Err(BackendError::InvalidOptionRfqState(_)) => {
+            return Err(ApiError::not_found("multi-leg RFQ fill not found"));
+        }
+        Err(other) => return Err(ApiError::from(other)),
+    };
+
+    // rfq_id in the path MUST match the fill's parent RFQ id.
+    // Otherwise a caller could probe by pairing arbitrary rfq_ids
+    // with a valid fill_id. Same 404 as any other refusal.
+    if fill.option_rfq_id != parsed_rfq_id {
+        return Err(ApiError::not_found("multi-leg RFQ fill not found"));
+    }
+
+    // Seat check. The caller must be either the taker on
+    // `taker_subaccount_id` OR the maker on `maker_subaccount_id`.
+    // Address comparison is case-insensitive (matches every other
+    // account-scoped read). Any other pairing → 404.
+    let requester_lc = query.account.0.to_ascii_lowercase();
+    let on_taker_seat = fill.taker.0.eq_ignore_ascii_case(&requester_lc)
+        && fill.taker_subaccount_id == subaccount_id;
+    let on_maker_seat = fill.mm_account.0.eq_ignore_ascii_case(&requester_lc)
+        && fill.maker_subaccount_id == subaccount_id;
+    if !on_taker_seat && !on_maker_seat {
+        return Err(ApiError::not_found("multi-leg RFQ fill not found"));
+    }
+
+    // Fee summary lookup. Read-only — no fee row is created and no
+    // recomputation happens. If the ledger has no matching rows
+    // (fees disabled, operator has not backfilled) we return
+    // `available=false` and leave every amount at "0" — the
+    // caller can distinguish "no events" from a legitimate
+    // zero-fee accept by checking `available`.
+    let fee_summary = load_multi_leg_rfq_fill_fee_summary(&state, &fill).await?;
+
+    let legs_sorted: Vec<OptionMultiLegRfqFillReadFillLegEntry> = {
+        let mut sorted = legs;
+        sorted.sort_by_key(|leg| leg.leg_index);
+        sorted
+            .into_iter()
+            .map(OptionMultiLegRfqFillReadFillLegEntry::from)
+            .collect()
+    };
+
+    Ok(Json(OptionMultiLegRfqFillReadResponse {
+        fill: OptionMultiLegRfqFillReadFillEntry {
+            fill_id: fill.fill_id.to_string(),
+            option_rfq_id: fill.option_rfq_id.to_string(),
+            quote_id: fill.quote_id.to_string(),
+            taker: fill.taker,
+            taker_subaccount_id: fill.taker_subaccount_id,
+            mm_account: fill.mm_account,
+            maker_subaccount_id: fill.maker_subaccount_id,
+            package_price_1e8: fill.package_price_1e8,
+            size_1e8: fill.size_1e8.to_string(),
+            created_at_ms: fill.created_at_ms,
+        },
+        legs: legs_sorted,
+        fees: fee_summary,
+    }))
+}
+
+/// Fee summary read helper. Reads `fee_events` for the fill's
+/// `(source_type=option_multi_leg_rfq_fill, source_id=fill_id)` and
+/// attributes per-side fees + rebates by comparing each event's
+/// `payer` to the fill row's `taker` and `mm_account`. If no matching
+/// events exist, returns `available=false` with all amounts at "0";
+/// the caller distinguishes "no ledger rows" from a legitimate
+/// zero-fee accept by the `available` flag rather than the amount
+/// fields.
+async fn load_multi_leg_rfq_fill_fee_summary(
+    state: &AppState,
+    fill: &crate::options::OptionMultiLegRfqFill,
+) -> Result<OptionMultiLegRfqFillReadFeeSummary, ApiError> {
+    let source_type = crate::fees::FeeSourceType::OptionMultiLegRfqFill.as_str();
+    let source_id = fill.fill_id.to_string();
+
+    let events = if let Some(repository) = state.repository.clone() {
+        repository
+            .list_fee_events_by_source(source_type, &source_id)
+            .await?
+    } else {
+        state
+            .fees_store
+            .lock()
+            .map_err(|_| ApiError::internal())?
+            .list_fee_events_by_source(source_type, &source_id)
+    };
+
+    if events.is_empty() {
+        return Ok(OptionMultiLegRfqFillReadFeeSummary {
+            source_type,
+            available: false,
+            events_count: 0,
+            taker_fee_1e8: "0".to_string(),
+            maker_fee_1e8: "0".to_string(),
+            taker_rebate_1e8: "0".to_string(),
+            maker_rebate_1e8: "0".to_string(),
+            protocol_amount_1e8: "0".to_string(),
+        });
+    }
+
+    let taker_lc = fill.taker.0.to_ascii_lowercase();
+    let maker_lc = fill.mm_account.0.to_ascii_lowercase();
+    let mut taker_fee: u128 = 0;
+    let mut maker_fee: u128 = 0;
+    let mut taker_rebate: u128 = 0;
+    let mut maker_rebate: u128 = 0;
+    let mut protocol: u128 = 0;
+
+    for event in &events {
+        let payer_lc = event.payer.0.to_ascii_lowercase();
+        if payer_lc == taker_lc {
+            taker_fee = taker_fee.saturating_add(event.fee_amount_1e8);
+            taker_rebate = taker_rebate.saturating_add(event.rebate_amount_1e8);
+        } else if payer_lc == maker_lc {
+            maker_fee = maker_fee.saturating_add(event.fee_amount_1e8);
+            maker_rebate = maker_rebate.saturating_add(event.rebate_amount_1e8);
+        }
+        // Events with payers matching neither seat (shouldn't
+        // happen for a well-formed multi-leg fill, but guard
+        // anyway) contribute only to the protocol total.
+        protocol = protocol.saturating_add(event.protocol_amount_1e8);
+    }
+
+    Ok(OptionMultiLegRfqFillReadFeeSummary {
+        source_type,
+        available: true,
+        events_count: events.len() as u32,
+        taker_fee_1e8: taker_fee.to_string(),
+        maker_fee_1e8: maker_fee.to_string(),
+        taker_rebate_1e8: taker_rebate.to_string(),
+        maker_rebate_1e8: maker_rebate.to_string(),
+        protocol_amount_1e8: protocol.to_string(),
+    })
 }
 
 // ---------------------------------------------------------------------
@@ -14569,6 +14844,16 @@ impl ApiError {
     fn forbidden(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::FORBIDDEN,
+            message: message.into(),
+        }
+    }
+
+    /// RFQ-MULTI-LEG-FILL-READ-V1 — 404 with a bounded, privacy-
+    /// preserving message. Used by the per-fill read route to hide
+    /// whether a fill exists from unrelated callers.
+    fn not_found(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
             message: message.into(),
         }
     }

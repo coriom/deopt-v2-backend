@@ -113,6 +113,24 @@ impl FeeSourceType {
     }
 }
 
+impl FromStr for FeeSourceType {
+    type Err = BackendError;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "option_order_fill" => Ok(Self::OptionOrderFill),
+            "option_rfq_fill" => Ok(Self::OptionRfqFill),
+            "option_multi_leg_rfq_fill" => Ok(Self::OptionMultiLegRfqFill),
+            "perp_trade" => Ok(Self::PerpTrade),
+            "perp_execution" => Ok(Self::PerpExecution),
+            "perp_rfq" => Ok(Self::PerpRfq),
+            other => Err(BackendError::Persistence(format!(
+                "invalid fee source_type: {other}"
+            ))),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FeeMarketType {
@@ -125,6 +143,20 @@ impl FeeMarketType {
         match self {
             Self::Perp => "perp",
             Self::Option => "option",
+        }
+    }
+}
+
+impl FromStr for FeeMarketType {
+    type Err = BackendError;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "perp" => Ok(Self::Perp),
+            "option" => Ok(Self::Option),
+            other => Err(BackendError::Persistence(format!(
+                "invalid fee market_type: {other}"
+            ))),
         }
     }
 }
@@ -145,6 +177,20 @@ impl FeeFlowType {
     }
 }
 
+impl FromStr for FeeFlowType {
+    type Err = BackendError;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "orderbook" => Ok(Self::Orderbook),
+            "rfq" => Ok(Self::Rfq),
+            other => Err(BackendError::Persistence(format!(
+                "invalid fee flow_type: {other}"
+            ))),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FeeStatus {
@@ -155,6 +201,19 @@ impl FeeStatus {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Accrued => "accrued",
+        }
+    }
+}
+
+impl FromStr for FeeStatus {
+    type Err = BackendError;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "accrued" => Ok(Self::Accrued),
+            other => Err(BackendError::Persistence(format!(
+                "invalid fee status: {other}"
+            ))),
         }
     }
 }
