@@ -566,6 +566,54 @@ fn subaccount_rename_canonical_bytes_are_frozen() {
     );
 }
 
+/// SUBACCOUNTS-RENAME-NETWORK-FETCH-V1 — regression guard.
+///
+/// The subaccount rename endpoint uses HTTP `PATCH`. If the API's
+/// CORS layer drops `PATCH` from `allow_methods`, browsers reject
+/// the preflight and the frontend surfaces `Failed to fetch`
+/// instead of a real error body. This test issues a CORS preflight
+/// against the rename path and asserts `PATCH` shows up in
+/// `Access-Control-Allow-Methods` so that a future refactor of the
+/// method list cannot silently break the rename flow again.
+#[tokio::test]
+async fn cors_preflight_allows_patch_for_rename_route() {
+    let state = build_state();
+    let app = router(state);
+
+    // The default `CORS_ALLOWED_ORIGINS` value (see `cors_layer_from_env`)
+    // is `http://localhost:3000,http://127.0.0.1:3000`. Use the first
+    // one as the request origin so the preflight passes.
+    let req = Request::builder()
+        .method("OPTIONS")
+        .uri("/accounts/0xabcdef0000000000000000000000000000000001/subaccounts/2")
+        .header(header::ORIGIN, "http://localhost:3000")
+        .header("Access-Control-Request-Method", "PATCH")
+        .header("Access-Control-Request-Headers", "content-type")
+        .body(Body::empty())
+        .expect("build preflight request");
+
+    let response = app.oneshot(req).await.expect("preflight response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let allow_methods = response
+        .headers()
+        .get("access-control-allow-methods")
+        .expect("access-control-allow-methods header set on preflight")
+        .to_str()
+        .expect("allow-methods header ascii")
+        .to_ascii_uppercase();
+    assert!(
+        allow_methods.contains("PATCH"),
+        "access-control-allow-methods missing PATCH: {allow_methods:?}",
+    );
+    let allow_origin = response
+        .headers()
+        .get("access-control-allow-origin")
+        .expect("access-control-allow-origin header set on preflight")
+        .to_str()
+        .expect("allow-origin header ascii");
+    assert_eq!(allow_origin, "http://localhost:3000");
+}
+
 #[test]
 fn write_auth_action_string_roundtrips_for_subaccounts() {
     assert_eq!(

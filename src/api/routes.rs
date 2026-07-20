@@ -161,7 +161,19 @@ fn cors_layer_from_env() -> CorsLayer {
 
     CorsLayer::new()
         .allow_origin(origins)
-        .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
+        // PATCH is included so browsers pass the CORS preflight for
+        // the single PATCH route (`/accounts/:address/subaccounts/:id`
+        // — subaccount rename). Without it Chrome/Firefox reject the
+        // preflight and `fetch()` surfaces as `Failed to fetch` on
+        // the frontend, even though the request would have been
+        // valid.
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PATCH,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
         .allow_headers([CONTENT_TYPE, ACCEPT, AUTHORIZATION])
 }
 
