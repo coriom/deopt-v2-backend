@@ -13,7 +13,7 @@ use deopt_v2_backend::options::{
     spawn_option_reconciliation_worker,
 };
 use deopt_v2_backend::perps::{spawn_perps_funding_worker, spawn_perps_liquidation_worker};
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -65,6 +65,18 @@ async fn main() -> deopt_v2_backend::Result<()> {
         repository.run_migrations().await?;
         Some(repository)
     } else {
+        // SUBACCOUNTS-PERSISTENCE-SESSION-RELOAD-V1 — surface the
+        // ephemeral-store posture at startup so an operator running
+        // `cargo run` without `PERSISTENCE_ENABLED=true` sees
+        // immediately (not after a mysterious data loss) that
+        // subaccounts, write-auth challenges, and used-nonces v2 are
+        // held in an in-memory store that resets on every restart.
+        warn!(
+            "PERSISTENCE_ENABLED=false: subaccounts, write-auth challenges, \
+             and used-nonces-v2 are stored in memory and will NOT survive a \
+             backend restart. Set PERSISTENCE_ENABLED=true + DATABASE_URL to \
+             a Postgres URL to persist across restarts (see README)."
+        );
         None
     };
     let mut state = AppState::with_all_config(

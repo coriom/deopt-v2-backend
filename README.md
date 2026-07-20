@@ -11,6 +11,30 @@ cp .env.example .env
 cargo run
 ```
 
+### Persistence for local dev
+
+The default `PERSISTENCE_ENABLED=false` wires an **in-memory** store
+for subaccounts, write-auth challenges, and the used-nonces v2 ledger.
+Rows written during a session are lost when the backend restarts —
+the startup log emits a loud `WARN` in this mode so it does not
+surprise operators later.
+
+To persist across restarts (recommended for any UX testing that
+spans a backend reboot), point the backend at a local Postgres and
+flip the flag:
+
+```sh
+docker run --name deopt-pg -e POSTGRES_USER=deopt -e POSTGRES_PASSWORD=deopt \
+  -e POSTGRES_DB=deopt_v2_backend -p 5432:5432 -d postgres:16
+export PERSISTENCE_ENABLED=true
+export DATABASE_URL=postgres://deopt:deopt@127.0.0.1:5432/deopt_v2_backend
+cargo run
+```
+
+Migrations run automatically at startup when `PERSISTENCE_ENABLED=true`.
+Subaccounts, challenges, and nonces then survive `cargo run` restarts.
+
+
 Defaults:
 
 ```text
