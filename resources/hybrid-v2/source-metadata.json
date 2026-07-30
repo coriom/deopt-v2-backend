@@ -1,0 +1,21 @@
+{
+  "note": "Pinned Solidity source of every JSON in this directory. Regenerated when the Solidity commit ships a new deployment-manifest surface.",
+  "solidity": {
+    "repository": "deopt-v2-sol",
+    "commit": "f080272",
+    "milestone": "ONCHAIN-SUBACCOUNT-GLOBAL-INVARIANT-SUITE-V1"
+  },
+  "hybridV2": {
+    "architectureVersion": 1,
+    "storageVersion": 1,
+    "eventVersion": 1,
+    "manifestSchemaVersion": 1
+  },
+  "snapshots": {
+    "manifest-schema-v1.json":       "e90e104c3e1d6814acdfb09ac41d53675be04f3e5c0d4fe8187d48536240a579",
+    "event-topics-v1.json":          "187a56cf0fbe2282de796dc0370943f20585212559c6a2eecc1ebd1e6e6367b2",
+    "error-selectors-v1.json":       "2b21cdd2e6aa183d0ffa481c5f9f1d56c4c83b124379fbd7ea729e0ea1844610",
+    "abi-surface-v1.json":           "58d796531f27e42ba4f6690326b99c413f89ef934595380d237c46e7e7de9527",
+    "base-sepolia-template-v1.json": "886fea47210a5aafb7e071f80e51c310c7512a477be15f1b8172b2b8f15e29b9"
+  }
+}

@@ -1,0 +1,49 @@
+{
+  "schemaVersion": 1,
+  "generatedFor": "hybrid-v2",
+  "note": "Index of the frozen Hybrid V2 ABI surface: canonical source files per module slot. Full function-level ABIs live in `out/*/*.json` under the forge build tree. This index binds each manifest module slot to its canonical Solidity source, its declared interface, and its version block.",
+  "safety": "EXPERIMENTAL — NOT SECURITY APPROVED",
+  "versions": {
+    "architectureVersion": 1,
+    "storageVersion": 1,
+    "eventVersion": 1,
+    "manifestSchemaVersion": 1
+  },
+  "modules": [
+    { "slot": 0,  "name": "SubaccountRegistry",         "source": "src/hybrid-v2/registry/SubaccountRegistry.sol",       "interface": "src/hybrid-v2/interfaces/ISubaccountRegistry.sol" },
+    { "slot": 1,  "name": "CollateralVaultV2",          "source": "src/hybrid-v2/vault/CollateralVaultV2.sol",           "interface": "src/hybrid-v2/interfaces/ICollateralVault.sol" },
+    { "slot": 2,  "name": "OptionsPositionsLedger",     "source": "src/hybrid-v2/positions/OptionsPositionsLedger.sol",  "interface": "src/hybrid-v2/interfaces/IOptionsPositionsLedger.sol" },
+    { "slot": 3,  "name": "OptionsRiskModuleV2",        "source": "src/hybrid-v2/risk/OptionsRiskModuleV2.sol",           "interface": "src/hybrid-v2/interfaces/IRiskModule.sol" },
+    { "slot": 4,  "name": "MarginEngineV2",             "source": "src/hybrid-v2/margin/MarginEngineV2.sol",             "interface": "src/hybrid-v2/interfaces/IMarginEngine.sol" },
+    { "slot": 5,  "name": "OptionMatchingEngineV2",     "source": "src/hybrid-v2/options/OptionMatchingEngineV2.sol",    "interface": "src/hybrid-v2/interfaces/IOptionMatchingEngine.sol" },
+    { "slot": 6,  "name": "EscapeControllerV1",         "source": "src/hybrid-v2/recovery/EscapeControllerV1.sol",       "interface": "src/hybrid-v2/interfaces/IEscapeController.sol" },
+    { "slot": 7,  "name": "RecoveryFinalizerV1",        "source": "src/hybrid-v2/recovery/RecoveryFinalizerV1.sol",      "interface": "src/hybrid-v2/interfaces/IRecoveryFinalizer.sol" },
+    { "slot": 8,  "name": "OracleAdapter",              "source": "EXTERNAL",                                             "interface": "src/hybrid-v2/interfaces/IOracleAdapter.sol" },
+    { "slot": 9,  "name": "OptionsRiskProvider",        "source": "EXTERNAL",                                             "interface": "src/hybrid-v2/interfaces/IOptionsRiskProvider.sol" },
+    { "slot": 10, "name": "QuoteToken",                 "source": "EXTERNAL",                                             "interface": "IERC20 (canonical)" },
+    { "slot": 11, "name": "FeesManagerV2",              "source": "OPTIONAL",                                             "interface": "src/hybrid-v2/interfaces/IOptionExecutionFeeHook.sol" },
+    { "slot": 12, "name": "OptionExecutionFeeAdapter",  "source": "src/hybrid-v2/fees/OptionExecutionFeeAdapterV2.sol",   "interface": "src/hybrid-v2/interfaces/IOptionExecutionFeeHook.sol" },
+    { "slot": 13, "name": "ProtocolTimelock",           "source": "OPTIONAL",                                             "interface": "OpenZeppelin TimelockController (canonical)" },
+    { "slot": 14, "name": "Governance",                 "source": "IDENTITY_ONLY",                                        "interface": "n/a (address)" },
+    { "slot": 15, "name": "Guardian",                   "source": "IDENTITY_ONLY",                                        "interface": "n/a (address)" }
+  ],
+  "supportingLibraries": [
+    { "name": "Versions",     "source": "src/hybrid-v2/libraries/Versions.sol" },
+    { "name": "Capabilities", "source": "src/hybrid-v2/libraries/Capabilities.sol" },
+    { "name": "SubKey",       "source": "src/hybrid-v2/libraries/SubKey.sol" },
+    { "name": "IntentHash",   "source": "src/hybrid-v2/libraries/IntentHash.sol" },
+    { "name": "PositionTypes","source": "src/hybrid-v2/libraries/PositionTypes.sol" },
+    { "name": "RecoveryTypes","source": "src/hybrid-v2/libraries/RecoveryTypes.sol" },
+    { "name": "EIP712Types",  "source": "src/hybrid-v2/libraries/EIP712Types.sol" }
+  ],
+  "manifestContract": {
+    "name": "DeploymentManifestV1",
+    "source": "src/hybrid-v2/deployment/DeploymentManifestV1.sol"
+  },
+  "sibling": {
+    "eventTopics": "deployment-manifest/event-topics-v1.json",
+    "errorSelectors": "deployment-manifest/error-selectors-v1.json",
+    "manifestSchema": "deployment-manifest/schema-v1.json",
+    "baseSepoliaTemplate": "deployment-manifest/base-sepolia-template-v1.json"
+  }
+}

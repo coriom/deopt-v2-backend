@@ -10,6 +10,7 @@ pub mod engine;
 pub mod error;
 pub mod execution;
 pub mod fees;
+pub mod hybrid_v2;
 pub mod indexer;
 pub mod mm;
 pub mod monitoring;

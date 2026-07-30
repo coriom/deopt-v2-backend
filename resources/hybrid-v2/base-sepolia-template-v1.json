@@ -1,0 +1,115 @@
+{
+  "manifestSchemaVersion": 1,
+  "environmentTag": "0x626173652d7365706f6c69610000000000000000000000000000000000000000",
+  "environment": "base-sepolia",
+  "chainId": 84532,
+  "deploymentVersion": 1,
+  "architectureVersion": 1,
+  "storageVersion": 1,
+  "eventVersion": 1,
+  "deploymentBlock": 0,
+  "deploymentTimestamp": 0,
+  "deployer": "0x0000000000000000000000000000000000000000",
+  "manifestAddress": "0x0000000000000000000000000000000000000000",
+  "activationStatus": "NOT_DEPLOYED",
+  "safety": {
+    "status": "EXPERIMENTAL_NOT_SECURITY_APPROVED",
+    "baseMainnetPermitted": false,
+    "notes": "Template file. Placeholder addresses. No live Base Sepolia deployment exists yet."
+  },
+  "modules": {
+    "subaccountRegistry": {
+      "address": "0x0000000000000000000000000000000000000000",
+      "role": "SubaccountRegistry",
+      "code": { "hasCode": true }
+    },
+    "collateralVault": {
+      "address": "0x0000000000000000000000000000000000000000",
+      "role": "CollateralVaultV2",
+      "code": { "hasCode": true }
+    },
+    "optionsPositionsLedger": {
+      "address": "0x0000000000000000000000000000000000000000",
+      "role": "OptionsPositionsLedger",
+      "code": { "hasCode": true }
+    },
+    "riskModule": {
+      "address": "0x0000000000000000000000000000000000000000",
+      "role": "OptionsRiskModuleV2",
+      "code": { "hasCode": true }
+    },
+    "marginEngine": {
+      "address": "0x0000000000000000000000000000000000000000",
+      "role": "MarginEngineV2",
+      "code": { "hasCode": true }
+    },
+    "optionMatchingEngine": {
+      "address": "0x0000000000000000000000000000000000000000",
+      "role": "OptionMatchingEngineV2",
+      "code": { "hasCode": true }
+    },
+    "escapeController": {
+      "address": "0x0000000000000000000000000000000000000000",
+      "role": "EscapeControllerV1",
+      "code": { "hasCode": true }
+    },
+    "recoveryFinalizer": {
+      "address": "0x0000000000000000000000000000000000000000",
+      "role": "RecoveryFinalizerV1",
+      "code": { "hasCode": true }
+    },
+    "oracleAdapter": {
+      "address": "0x0000000000000000000000000000000000000000",
+      "role": "IOracleAdapter",
+      "code": { "hasCode": true }
+    },
+    "optionsRiskProvider": {
+      "address": "0x0000000000000000000000000000000000000000",
+      "role": "IOptionsRiskProvider",
+      "code": { "hasCode": true }
+    },
+    "quoteToken": {
+      "address": "0x0000000000000000000000000000000000000000",
+      "role": "USDC (Base Sepolia)",
+      "code": { "hasCode": true }
+    },
+    "feesManagerV2": {
+      "address": "0x0000000000000000000000000000000000000000",
+      "note": "Optional. Populate if FeesManagerV2 is wired into this deployment."
+    },
+    "optionExecutionFeeAdapter": {
+      "address": "0x0000000000000000000000000000000000000000",
+      "note": "Optional. Populate if OptionExecutionFeeAdapterV2 is wired."
+    },
+    "protocolTimelock": {
+      "address": "0x0000000000000000000000000000000000000000",
+      "note": "Optional. Populate when timelock is deployed."
+    },
+    "governance": {
+      "address": "0x0000000000000000000000000000000000000000",
+      "note": "May be a multisig EOA or a timelock contract."
+    },
+    "guardian": {
+      "address": "0x0000000000000000000000000000000000000000",
+      "note": "May be a multisig EOA."
+    }
+  },
+  "protocolIdentities": {
+    "protocolFeeSubKey": "0x0000000000000000000000000000000000000000000000000000000000000000",
+    "rebateBudgetSubKey": "0x0000000000000000000000000000000000000000000000000000000000000000",
+    "insuranceFundSubKey": "0x0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "frozenBounds": {
+    "maxCollateralTokens": 8,
+    "maxActiveSeriesPerSubaccount": 32,
+    "allCapabilitiesMask": "0x000000000000000000000000000000000000000000000000000000000000ffff",
+    "highestAssignedCapabilityBit": 15,
+    "recoveryActivationDelaySeconds": 3600,
+    "recoveryPauseMaxDurationBlocks": 100800
+  },
+  "canonicalHashes": {
+    "manifestHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+    "moduleAddressesHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+    "criticalConfigHash": "0x0000000000000000000000000000000000000000000000000000000000000000"
+  }
+}

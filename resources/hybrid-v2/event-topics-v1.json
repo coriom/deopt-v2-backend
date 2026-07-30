@@ -1,0 +1,64 @@
+{
+  "schemaVersion": 1,
+  "generatedFor": "hybrid-v2",
+  "note": "Canonical event topic hashes for the Hybrid V2 architecture. Each entry maps a canonical event to its keccak256(signature) topic0. Ownership follows contract-spec/13. Every event carries `uint16 eventVersion = 1` in V1.",
+  "safety": "EXPERIMENTAL — NOT SECURITY APPROVED",
+  "regenerationCommand": "See scripts/topic-hashes.md (cast keccak per signature).",
+  "topics": [
+    { "contract": "SubaccountRegistry", "event": "SubaccountCreated", "signature": "SubaccountCreated(address,uint32,bytes32,uint256,uint16)", "topic0": "0x8a4452859e48c40ee605ebd412f3f41b7e31d06e79a555f6ecfb9b20c712e499" },
+    { "contract": "SubaccountRegistry", "event": "SubaccountLazyRegistered", "signature": "SubaccountLazyRegistered(address,uint32,bytes32,uint256,address,uint16)", "topic0": "0x73877816803f49c60a5d3cec46723b9b1071d38fabd08818c2cc9efd67956c65" },
+
+    { "contract": "CollateralVaultV2", "event": "Deposit", "signature": "Deposit(bytes32,address,uint32,address,uint256,address,uint16)", "topic0": "0x774b18d5c0a5d41384d85f57a6cb80146a2d07b438593f2a31d5984d31ca2588" },
+    { "contract": "CollateralVaultV2", "event": "Withdraw", "signature": "Withdraw(bytes32,address,uint32,address,uint256,address,uint16)", "topic0": "0x8a1b643fe55c1af823e441f3547c965154725bfa5f705c9563854c03f6905c62" },
+    { "contract": "CollateralVaultV2", "event": "InternalTransfer", "signature": "InternalTransfer(bytes32,bytes32,address,uint256,address,uint32,uint32,uint16)", "topic0": "0x32624e5751759c1a980b8f332fcaa0abdd6aabdbc1d0e95f75ff89f87bb31407" },
+    { "contract": "CollateralVaultV2", "event": "CollateralLocked", "signature": "CollateralLocked(bytes32,address,address,uint256,uint16)", "topic0": "0xb257f3ca707cbe1b79d4d385bbb6d7615658afed8a00fbd33d1516a88fc4b3c0" },
+    { "contract": "CollateralVaultV2", "event": "CollateralUnlocked", "signature": "CollateralUnlocked(bytes32,address,address,uint256,uint16)", "topic0": "0xd02c6a9b0ac6fd79e994a04c03b1cd268c1a5199733f8d8980b5b05dbc0d1b25" },
+    { "contract": "VaultCapabilityController", "event": "EngineCapabilityChanged", "signature": "EngineCapabilityChanged(address,uint256,uint256,uint16)", "topic0": "0x00b5fb0400bc62e078fe1a30911831bea11f2a129c8de6928c5dee777b11ed7b" },
+    { "contract": "VaultCapabilityController", "event": "EngineGuardianRevoked", "signature": "EngineGuardianRevoked(address,address,uint16)", "topic0": "0x231111d13e03d6b628cfc1b76167de74d2ee3795853f17c98990b1c12d0dee0d" },
+    { "contract": "VaultCapabilityController", "event": "GuardianChanged", "signature": "GuardianChanged(address,address,uint16)", "topic0": "0xe5981a96dcee521a9e755eaeab8c8d4844435c46489abe3a764730fd105ded60" },
+    { "contract": "CollateralVaultV2", "event": "OrphanedLockReleased", "signature": "OrphanedLockReleased(bytes32,address,address,uint256,string,uint16)", "topic0": "0x5363d70c437a3c4d6a3245067c3c6d5a9344122c7d39532e231b79ec61487827" },
+    { "contract": "CollateralVaultV2Core", "event": "SupportedTokenAdded", "signature": "SupportedTokenAdded(address,uint16)", "topic0": "0x542bbac8ffbfa75b7935c7b77e757a22d548cd26ed83e8659ce332c0267e2abe" },
+    { "contract": "CollateralVaultV2Core", "event": "SupportedTokenRemoved", "signature": "SupportedTokenRemoved(address,uint16)", "topic0": "0x4915d8bab7c4f6da1041eaf7792b1186794f8f387a88679117a1f59983e84e13" },
+    { "contract": "CollateralVaultV2Core", "event": "CollateralTokenEnteredUniverse", "signature": "CollateralTokenEnteredUniverse(address,uint256,uint16)", "topic0": "0x6bc46ba5fe2bba7da05311369d1a31316991feb74c5c32b9244d622e05414471" },
+    { "contract": "CollateralVaultV2", "event": "OptionPremiumTransferred", "signature": "OptionPremiumTransferred(bytes32,bytes32,address,uint256,address,uint16)", "topic0": "0x2af00d3662f61faae04420ad8fbd08dd2efd15c1f286c2f7af28f5c399893676" },
+    { "contract": "CollateralVaultV2", "event": "OptionFeeCharged", "signature": "OptionFeeCharged(bytes32,bytes32,address,uint256,address,uint16)", "topic0": "0x693ee9b6475a640e28b94f71fdc3d3588c523c6c6d464eab4181837d72252b18" },
+    { "contract": "CollateralVaultV2", "event": "OptionRebatePaid", "signature": "OptionRebatePaid(bytes32,bytes32,address,uint256,address,uint16)", "topic0": "0xf65e7293067ac7ca92cfee2632423d2a37c8d276bda04348563704df384b5f9b" },
+    { "contract": "CollateralVaultV2", "event": "RecoveryFinalizationWithdrawn", "signature": "RecoveryFinalizationWithdrawn(bytes32,address,address,uint256,address,uint16)", "topic0": "0xecd608119704e10d37afc48dd8597b2a98d20d6c749b48f412872fa7bf43daa4" },
+    { "contract": "CollateralVaultV2", "event": "PauseFlagChanged", "signature": "PauseFlagChanged(bytes32,bool,address,uint16)", "topic0": "0x104e853a70614248dd9d5db302653788320a9ff75241a0f7530c7112b285b4f7" },
+    { "contract": "CollateralVaultV2", "event": "BadDebtSocialized", "signature": "BadDebtSocialized(bytes32,address,uint256,uint16)", "topic0": "0xbf5a4b0b49b3c727af1ee9fbd3dcb46bba0e55ab3cf5b2fce9c03ce1e3cb3eac" },
+    { "contract": "CollateralVaultV2Core", "event": "ProtocolSubaccountsInitialized", "signature": "ProtocolSubaccountsInitialized(bytes32,bytes32,bytes32,uint16)", "topic0": "0x01884fa7db04aab7156225a786e04d6af4c29c76307fd0b2f851844d2edd338b" },
+    { "contract": "CollateralVaultV2Core", "event": "EscapeControllerInitialized", "signature": "EscapeControllerInitialized(address,uint16)", "topic0": "0xb7187495435bb60109ec5b301d3b6e44ebad5b3f615a76c6034413364de2beb2" },
+    { "contract": "CollateralVaultV2Core", "event": "RecoveryFinalizerInitialized", "signature": "RecoveryFinalizerInitialized(address,uint16)", "topic0": "0x3e79856244e45d113d0f94626aaf46100fc1bc74fd482cc4c609f2371cf11410" },
+
+    { "contract": "OptionsPositionsLedger", "event": "OptionPositionOpened", "signature": "OptionPositionOpened(bytes32,uint256,uint8,uint128,uint128,address,address,uint32,uint16)", "topic0": "0x883f3ba81bf89b4b8440b5662a218a076dea8f0475d7fbb5ac73ad687848f566" },
+    { "contract": "OptionsPositionsLedger", "event": "OptionPositionModified", "signature": "OptionPositionModified(bytes32,uint256,uint8,int128,uint128,address,address,uint32,uint16)", "topic0": "0xa29da332d2948ce8cd946d9496707d9341d0e99ea98ce59658c687145ab01a99" },
+    { "contract": "OptionsPositionsLedger", "event": "OptionPositionClosed", "signature": "OptionPositionClosed(bytes32,uint256,uint8,address,address,uint32,uint16)", "topic0": "0x9614fc5262919739afc0198492b6b4856aa14cfd9822655633fac090083e4915" },
+    { "contract": "OptionsPositionsLedger", "event": "OptionExercised", "signature": "OptionExercised(bytes32,uint256,uint128,uint128,int256,address,uint32,uint16)", "topic0": "0xa18d04ca4d11d009d4db2f95c286dab19e9bec8ff5bb5938fda4be17e5aea01b" },
+    { "contract": "OptionsPositionsLedger", "event": "OptionSettled", "signature": "OptionSettled(bytes32,uint256,uint128,int256,address,uint32,uint16)", "topic0": "0x8b81624db7bb8fa4d479d51909f23e3e846d91f1c5d11d59ba54230bd3e6aec2" },
+    { "contract": "OptionsPositionsLedger", "event": "OptionPositionLiquidated", "signature": "OptionPositionLiquidated(bytes32,uint256,uint128,uint128,bytes32,uint16)", "topic0": "0xa3ca0dc331ebaafd54be6e3de63f6bb42d6151273b8b84fe1e63cf00c64e61aa" },
+
+    { "contract": "OptionMatchingEngineV2", "event": "OptionOrderPairExecuted", "signature": "OptionOrderPairExecuted(bytes32,bytes32,bytes32,uint256,bytes32,bytes32,address,address,uint32,uint32,uint128,uint128,uint256,address,uint8,uint8,uint128,uint128,address,uint16)", "topic0": "0x5f1468e41f3dc2025f66566667670e60b71846f79df1f84a457bf6b3a8eefe75" },
+    { "contract": "OptionMatchingEngineV2", "event": "OptionOrderFilled", "signature": "OptionOrderFilled(bytes32,bytes32,uint256,uint8,uint8,uint128,uint128,uint128,uint128,bool,uint8,address,uint16)", "topic0": "0xfcb24be7e88ddbe667d00e7cab6f148072ed803e28e88fdde36cd66b032f307d" },
+    { "contract": "OptionMatchingEngineV2", "event": "OptionOrderCancelled", "signature": "OptionOrderCancelled(bytes32,bytes32,address,address,uint16)", "topic0": "0x5f1da788a264c52c59e6bb9ff247b6bee5a5ff1eb711bc1c8c818ddaab76006f" },
+    { "contract": "OptionMatchingEngineV2", "event": "OptionSubaccountMinValidOrderNonceAdvanced", "signature": "OptionSubaccountMinValidOrderNonceAdvanced(bytes32,address,uint256,uint256,address,uint16)", "topic0": "0x047ff718fb46155865411d4da6985a211e86524f977d21a35ef88ab27ba7ef8a" },
+
+    { "contract": "EscapeControllerV1", "event": "RecoveryRequested", "signature": "RecoveryRequested(bytes32,address,uint32,uint256,uint64,uint16)", "topic0": "0x99272b7b0936c1be21184e3b8303e95653f0b27fffeb821141f4709ee161764a" },
+    { "contract": "EscapeControllerV1", "event": "RecoveryActivated", "signature": "RecoveryActivated(bytes32,address,uint32,uint256,uint16)", "topic0": "0x3b0e643751f917ed7143bfa4a093c94ce3974b7323936d1e9157be88f61c04c9" },
+    { "contract": "EscapeControllerV1", "event": "RecoveryCancelled", "signature": "RecoveryCancelled(bytes32,address,uint32,uint16)", "topic0": "0x28cb5de9a9e210d529153dcda10f91684b09ff392ed3767218878ef472863ac4" },
+    { "contract": "EscapeControllerV1", "event": "RecoveryEpochIncremented", "signature": "RecoveryEpochIncremented(bytes32,address,uint8,uint256,uint16)", "topic0": "0x2c4274d2cd1ce327b679899225a385eede7d99e7077fea624e305ec5b120a0c2" },
+    { "contract": "EscapeControllerV1", "event": "RecoveryPauseSet", "signature": "RecoveryPauseSet(bool,uint64,address,uint16)", "topic0": "0x660fb13c236ffc96f03d35730c19036d2ba11bc7fa424824ab74209ed7dccbc7" },
+
+    { "contract": "RecoveryFinalizerV1", "event": "RecoveryFinalized", "signature": "RecoveryFinalized(bytes32,address,uint32,uint256,uint64,uint8,address,uint16)", "topic0": "0x5d8bf05ccd48556b2a1560dfb9a6b16238cd8b21e91ac6120f6a59de06a1e44a" },
+
+    { "contract": "ReplayAndEpochController", "event": "IntentConsumed", "signature": "IntentConsumed(bytes32,address,address,bytes32,uint16)", "topic0": "0x9c3a45f7859c37449925685b802d35970473d4c3a8382fadb445bec8ceddd121" },
+    { "contract": "ReplayAndEpochController", "event": "NonceCancelled", "signature": "NonceCancelled(address,uint256,uint256,address,uint16)", "topic0": "0x180904c26fd4aa4a2a17cfa7b96092d3a951c13c6367b175f6a2865179c0d08f" },
+    { "contract": "ReplayAndEpochController", "event": "OwnerRecoveryEpochAdvanced", "signature": "OwnerRecoveryEpochAdvanced(address,uint256,uint256,address,uint16)", "topic0": "0xa3cd3ecafc2b5057fcab67c408f2a97890fec7c6c0ae6b8db41de79980dd8b0f" },
+    { "contract": "ReplayAndEpochController", "event": "SubaccountRecoveryEpochAdvanced", "signature": "SubaccountRecoveryEpochAdvanced(bytes32,address,uint32,uint256,uint256,address,uint16)", "topic0": "0x6c7ce309e96fc02fca79f1d6ca2f961525a081588475bc1a226cfd2e13bafcc5" },
+
+    { "contract": "IRiskModule", "event": "RiskParamsSet", "signature": "RiskParamsSet(bytes32,bytes,uint16)", "topic0": "0x51e6ef537abfa0113555b58f416e2901616e96f3c2a2c34a74555b4e5d36bd03" },
+    { "contract": "IRiskModule", "event": "RiskModuleActivated", "signature": "RiskModuleActivated(uint16,uint16,uint16)", "topic0": "0x098813cdf332b96a958469f45ae58a0fa0207cb89d8486c359dda570abc81f80" },
+    { "contract": "IRiskModule", "event": "LiquidationTriggered", "signature": "LiquidationTriggered(bytes32,uint8,uint16)", "topic0": "0x8d20b6e898ef2ca1feee7aa63235c785a54cfe6197e8467c97f950080eb8d74e" },
+
+    { "contract": "DeploymentManifestV1", "event": "DeploymentManifestDeclared", "signature": "DeploymentManifestDeclared(bytes32,uint256,address,bytes32,uint16,uint16,uint16,bytes32,bytes32,uint64,uint64,uint16)", "topic0": "0x0c7768f8f3d5c0493e4b4a4f84996f6f7da7402f439d0fe28494c8a5bf0367aa" }
+  ]
+}

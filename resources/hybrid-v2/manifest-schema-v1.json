@@ -1,0 +1,263 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://deopt.dev/schemas/deployment-manifest/hybrid-v2/v1.json",
+  "title": "DeploymentManifestV1 (Hybrid V2, experimental)",
+  "description": "Machine-readable schema for a Hybrid V2 deployment manifest. Mirrors the on-chain DeploymentManifestV1 contract 1:1. Instantiated per (chainId, environment, deploymentVersion). Immutable per instance. Owner: deopt-v2-sol milestone ONCHAIN-SUBACCOUNT-EVENT-SURFACE-AND-DEPLOYMENT-MANIFEST-V1 (WP-11). Status: EXPERIMENTAL — NOT SECURITY APPROVED. Base mainnet (chainId 8453) is explicitly rejected by the on-chain constructor.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "manifestSchemaVersion",
+    "environmentTag",
+    "environment",
+    "chainId",
+    "deploymentVersion",
+    "architectureVersion",
+    "storageVersion",
+    "eventVersion",
+    "deploymentBlock",
+    "deploymentTimestamp",
+    "deployer",
+    "modules",
+    "protocolIdentities",
+    "frozenBounds",
+    "canonicalHashes",
+    "manifestAddress",
+    "activationStatus",
+    "safety"
+  ],
+  "properties": {
+    "manifestSchemaVersion": {
+      "const": 1,
+      "description": "Structural version of this JSON schema. Bumped only when the schema itself changes."
+    },
+    "environmentTag": {
+      "type": "string",
+      "pattern": "^0x[0-9a-fA-F]{64}$",
+      "description": "bytes32 UTF-8 tag captured on-chain (e.g. 'local', 'base-sepolia'). Right-padded with zeros."
+    },
+    "environment": {
+      "type": "string",
+      "enum": ["local", "closed-test", "base-sepolia", "public-testnet"],
+      "description": "Human-readable environment identifier. Base mainnet is intentionally not enumerable in V1."
+    },
+    "chainId": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "block.chainid at deployment. Must not equal 8453 (Base mainnet is forbidden for this experimental manifest)."
+    },
+    "deploymentVersion": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 65535,
+      "description": "Per-(chainId, environment) monotonic version. Bumped on every full redeployment."
+    },
+    "architectureVersion": {
+      "const": 1,
+      "description": "Frozen for Hybrid V2 (Versions.ARCHITECTURE_VERSION)."
+    },
+    "storageVersion": {
+      "const": 1,
+      "description": "Frozen for Hybrid V2 (Versions.STORAGE_VERSION)."
+    },
+    "eventVersion": {
+      "const": 1,
+      "description": "Frozen for Hybrid V2 (Versions.EVENT_VERSION)."
+    },
+    "deploymentBlock": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "block.number at manifest instantiation. Backends subscribe to logs from this block onward."
+    },
+    "deploymentTimestamp": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "block.timestamp (seconds) at manifest instantiation."
+    },
+    "deployer": {
+      "type": "string",
+      "pattern": "^0x[0-9a-fA-F]{40}$",
+      "description": "msg.sender at manifest construction — recorded for audit."
+    },
+    "manifestAddress": {
+      "type": "string",
+      "pattern": "^0x[0-9a-fA-F]{40}$",
+      "description": "Deployed DeploymentManifestV1 contract address on `chainId`."
+    },
+    "activationStatus": {
+      "type": "string",
+      "enum": ["NOT_DEPLOYED", "PROPOSED", "PENDING", "ACTIVE", "SUNSET"],
+      "description": "Off-chain lifecycle marker used by tooling. NOT authoritative — chain state is."
+    },
+    "safety": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "baseMainnetPermitted"],
+      "properties": {
+        "status": {
+          "const": "EXPERIMENTAL_NOT_SECURITY_APPROVED"
+        },
+        "baseMainnetPermitted": {
+          "const": false
+        },
+        "notes": {
+          "type": "string"
+        }
+      }
+    },
+    "modules": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Ordered dense table of every canonical module slot. Keys match the on-chain MODULE_* constant order.",
+      "required": [
+        "subaccountRegistry",
+        "collateralVault",
+        "optionsPositionsLedger",
+        "riskModule",
+        "marginEngine",
+        "optionMatchingEngine",
+        "escapeController",
+        "recoveryFinalizer",
+        "oracleAdapter",
+        "optionsRiskProvider",
+        "quoteToken",
+        "feesManagerV2",
+        "optionExecutionFeeAdapter",
+        "protocolTimelock",
+        "governance",
+        "guardian"
+      ],
+      "properties": {
+        "subaccountRegistry": { "$ref": "#/$defs/moduleEntry" },
+        "collateralVault": { "$ref": "#/$defs/moduleEntry" },
+        "optionsPositionsLedger": { "$ref": "#/$defs/moduleEntry" },
+        "riskModule": { "$ref": "#/$defs/moduleEntry" },
+        "marginEngine": { "$ref": "#/$defs/moduleEntry" },
+        "optionMatchingEngine": { "$ref": "#/$defs/moduleEntry" },
+        "escapeController": { "$ref": "#/$defs/moduleEntry" },
+        "recoveryFinalizer": { "$ref": "#/$defs/moduleEntry" },
+        "oracleAdapter": { "$ref": "#/$defs/moduleEntryExternal" },
+        "optionsRiskProvider": { "$ref": "#/$defs/moduleEntryExternal" },
+        "quoteToken": { "$ref": "#/$defs/moduleEntryExternal" },
+        "feesManagerV2": { "$ref": "#/$defs/moduleEntryOptional" },
+        "optionExecutionFeeAdapter": { "$ref": "#/$defs/moduleEntryOptional" },
+        "protocolTimelock": { "$ref": "#/$defs/moduleEntryOptional" },
+        "governance": { "$ref": "#/$defs/moduleAddressOptional" },
+        "guardian": { "$ref": "#/$defs/moduleAddressOptional" }
+      }
+    },
+    "protocolIdentities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocolFeeSubKey", "rebateBudgetSubKey", "insuranceFundSubKey"],
+      "properties": {
+        "protocolFeeSubKey": { "type": "string", "pattern": "^0x[0-9a-fA-F]{64}$" },
+        "rebateBudgetSubKey": { "type": "string", "pattern": "^0x[0-9a-fA-F]{64}$" },
+        "insuranceFundSubKey": { "type": "string", "pattern": "^0x[0-9a-fA-F]{64}$" }
+      }
+    },
+    "frozenBounds": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "maxCollateralTokens",
+        "maxActiveSeriesPerSubaccount",
+        "allCapabilitiesMask",
+        "recoveryActivationDelaySeconds",
+        "recoveryPauseMaxDurationBlocks",
+        "highestAssignedCapabilityBit"
+      ],
+      "properties": {
+        "maxCollateralTokens": { "const": 8 },
+        "maxActiveSeriesPerSubaccount": { "const": 32 },
+        "allCapabilitiesMask": {
+          "const": "0x000000000000000000000000000000000000000000000000000000000000ffff",
+          "description": "Capabilities.ALL_CAPABILITIES = (1<<16)-1. Bits 0..15 assigned; bit 16+ reserved."
+        },
+        "highestAssignedCapabilityBit": { "const": 15 },
+        "recoveryActivationDelaySeconds": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 259200,
+          "description": "Immutable per deployment. Upper bound 72h (259200s) per EscapeControllerV1.MAX_ACTIVATION_DELAY."
+        },
+        "recoveryPauseMaxDurationBlocks": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100800,
+          "description": "Immutable per deployment. Upper bound ~14 days at 12s/block (100800 blocks)."
+        }
+      }
+    },
+    "canonicalHashes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["manifestHash", "moduleAddressesHash", "criticalConfigHash"],
+      "properties": {
+        "manifestHash": { "type": "string", "pattern": "^0x[0-9a-fA-F]{64}$" },
+        "moduleAddressesHash": { "type": "string", "pattern": "^0x[0-9a-fA-F]{64}$" },
+        "criticalConfigHash": { "type": "string", "pattern": "^0x[0-9a-fA-F]{64}$" }
+      },
+      "description": "Recomputable via DeploymentManifestV1.recomputeManifestHash()."
+    }
+  },
+  "$defs": {
+    "moduleEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["address", "role", "code"],
+      "properties": {
+        "address": {
+          "type": "string",
+          "pattern": "^0x[0-9a-fA-F]{40}$",
+          "description": "Deployed non-zero contract address."
+        },
+        "role": {
+          "type": "string",
+          "description": "Canonical module role (spec-13)."
+        },
+        "code": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["hasCode"],
+          "properties": {
+            "hasCode": { "const": true },
+            "codeHash": { "type": "string", "pattern": "^0x[0-9a-fA-F]{64}$" },
+            "compiler": { "type": "string" },
+            "optimizerRuns": { "type": "integer" }
+          }
+        }
+      }
+    },
+    "moduleEntryExternal": {
+      "allOf": [{ "$ref": "#/$defs/moduleEntry" }],
+      "description": "External module (oracle / provider / quote token) referenced but not deployed as part of the hybrid-v2 tree."
+    },
+    "moduleEntryOptional": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["address"],
+          "properties": {
+            "address": { "const": "0x0000000000000000000000000000000000000000" },
+            "note": { "type": "string" }
+          }
+        },
+        { "$ref": "#/$defs/moduleEntry" }
+      ]
+    },
+    "moduleAddressOptional": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["address"],
+      "properties": {
+        "address": {
+          "type": "string",
+          "pattern": "^0x[0-9a-fA-F]{40}$",
+          "description": "May be an EOA (multisig signer, dev key) or a contract. Zero-address permitted."
+        },
+        "note": { "type": "string" }
+      }
+    }
+  }
+}
