@@ -349,3 +349,276 @@ Verdict: `BACKEND_SUBACCOUNT_INDEXER_PERFORMANCE_BOUNDED_V1_SLICE`.
 indexer worker, cursor advancement, reconciliation service, DB-loss
 rebuild command, and the read-API repository boundary on top of the
 schema + reducer landed here.
+
+---
+
+## 22 · COMPLETION section — 2026-07-31
+
+The V1_SLICE / STRUCTURAL_READINESS suffixes are dropped. The runtime,
+reorg planner, correlator, rebuild service, chain-view reconciler,
+query repository, and readiness state machine are now operational,
+tested, and land in `src/hybrid_v2/`.
+
+### 22.1 Foundation retained
+
+- Commit `2442646 feat(subaccounts): add hybrid v2 canonical indexer`
+- Commit `f69a71e docs(subaccounts): document hybrid v2 indexer`
+
+The schema in `migrations/0044_hybrid_v2_canonical_state.sql`, the
+manifest validator, event kind enum, and pinned Solidity snapshots are
+preserved 1:1. The completion work is additive.
+
+### 22.2 Additive schema
+
+`migrations/0045_hybrid_v2_projection_completion.sql` adds:
+
+- `hybrid_v2_positions` — long/short qty per (subKey, series).
+- `hybrid_v2_active_series` — series-membership set per subKey.
+- `hybrid_v2_order_lifecycle` — reusable / IOC / FOK order rows.
+- `hybrid_v2_matched_executions` — completed correlation groups.
+- `hybrid_v2_fee_events` — premium / fee / rebate journal.
+- `hybrid_v2_recovery_epochs` — owner and subaccount epochs.
+- `hybrid_v2_escape_state` — canonical escape lifecycle rows.
+- `hybrid_v2_projection_status` / `_reconciliation_status` — runtime
+  observability.
+
+### 22.3 Complete decoder coverage
+
+`src/hybrid_v2/decoder.rs` now has a table-driven `EventLayout` for
+every one of the 46 canonical Hybrid V2 event kinds catalogued in
+`resources/hybrid-v2/event-topics-v1.json`. Every indexed slot is
+type-tagged (`SubKey`, `Owner`, `Token`, `Engine`, `OrderHash`,
+`ExecutionId`, `SeriesId`, `IntentHash`, `Actor`, `SubaccountId`); every
+data word is type-tagged with its ABI shape (`U256`, `I256`, `U128`,
+`U64`, `U32`, `U16`, `U8`, `Bool`, `Address`, `Bytes32`). The decoder
+enforces:
+
+- Topic 0 present in pinned catalogue (`UnknownTopic` else).
+- Exact indexed topic count (`IndexedTopicCountMismatch`).
+- Minimum data length (`DataTooShort`).
+- Event version matches manifest (`EventVersionMismatch`).
+- Emitter matches expected canonical address when supplied
+  (`WrongEmitter`).
+
+Uint256 preserved as decimal String (long-division base-10). Int256
+decoded from two's-complement with explicit magnitude conversion. Every
+error variant is proved by a `tests/hybrid_v2_decoder_tests.rs` case.
+
+Verdict: `BACKEND_HYBRID_V2_EVENT_DECODER_COMPLETE`.
+
+### 22.4 Complete reducer coverage
+
+`src/hybrid_v2/reducer.rs` expands `ProjectionState` to cover every
+canonical projection surface: identity + capability + universe + pause
++ bad-debt + positions + active-series + order lifecycle + min-valid
+nonce + matched executions + fee/rebate/premium journal + owner and
+subaccount recovery epochs + escape state + finalization + recovery
+pause + recovery-finalization withdrawal counts.
+
+Invariants enforced by typed `ReducerError`:
+
+- `Underflow` / `Overflow` on uint256 arithmetic.
+- `FilledQtyDecrease` (order fills monotonic).
+- `MinNonceDecrease` (min-valid nonce monotonic for owner + subaccount).
+- `PositionUnderflow` on signed position modification.
+- `ActiveSeriesCapacity` (≤ 32 per subKey).
+- `CollateralUniverseCapacity` (≤ 8 tokens).
+- `IllegalRecoveryTransition` (RECOVERED is terminal; no exit).
+- `FinalizedSubaccountCredit` — deposits to a finalized subKey are
+  rejected.
+
+Finalization atomically zeroes balances + reservations for the
+finalized subKey.
+
+Verdict: `BACKEND_TYPED_PROJECTION_REDUCER_VALIDATED`.
+
+### 22.5 Execution correlation
+
+`src/hybrid_v2/correlation.rs` groups per-transaction events into
+`MatchedExecutionRow`s. Requires:
+
+- `OptionOrderPairExecuted` (anchor, identifies execution_id + buyer/
+  seller order hashes + subkeys + qty + premium)
+- `OptionOrderFilled` for buyer and seller
+- `OptionPremiumTransferred`
+
+Optional: `OptionFeeCharged`, `OptionRebatePaid`.
+
+Missing components → `Incomplete` (never surfaced as a completed
+trade). Reorg invalidates groups landing in orphaned blocks
+(`InvalidatedByReorg`). Duplicate events do not double-count; multiple
+executions in one transaction are distinguished by `execution_id`.
+
+Verdict: `BACKEND_OPTION_EXECUTION_CORRELATION_VALIDATED`.
+
+### 22.6 Runtime integration
+
+`src/hybrid_v2/runtime.rs` implements `IndexerRuntime` with:
+
+- `ChainSource` trait boundary (in-memory + real-RPC provider both
+  implement).
+- Chain-id gate against manifest (`WrongChain` blocks readiness).
+- Emitter-address filter from manifest module set.
+- Transactional per-block apply: any decoder / reducer / correlator
+  error rolls back the projection AND the raw log journal, leaves
+  cursor at the last successful block, and increments the corresponding
+  failure metric.
+- Deterministic tx-hash convention within a block for correlation
+  grouping.
+- Restart-safe: cursor + `ProjectionState` are reconstructible from
+  the raw canonical journal alone (`RebuildService::replay_all`).
+
+Verdict: `BACKEND_HYBRID_V2_INDEXER_RUNTIME_INTEGRATED` and
+`BACKEND_INDEXER_CURSOR_AND_FINALITY_MODEL_RESOLVED`.
+
+### 22.7 Reorg replay
+
+`src/hybrid_v2/reorg.rs` — `ReorgPlanner` locates the highest common
+ancestor by walking back at most `max_depth` blocks (default 64). On
+detection:
+
+- Orphaned blocks are marked `is_canonical = FALSE` in the raw journal.
+- `ProjectionState` is rebuilt from canonical raw logs alone (no
+  compensating deltas; a strict replay).
+- Cursor rewinds to the highest surviving canonical block.
+- `matched_executions` for orphaned blocks flip to
+  `InvalidatedByReorg`.
+- Next tick pulls the replacement chain and applies it forward.
+- Excessive reorg depth → typed `ExcessiveReorgDepth` error and
+  readiness stays false.
+
+Tests: one-block replacement, multi-block replacement, orphaned raw
+logs retained under `by_hash` in the source, correlation group
+invalidation.
+
+Verdict: `BACKEND_REORG_CANONICAL_REPLAY`.
+
+### 22.8 DB-loss rebuild
+
+`src/hybrid_v2/rebuild.rs` — `RebuildService::replay_all(&journal)` is
+the deterministic replay engine. The intended service wrapper:
+
+1. selects one explicit deployment,
+2. validates its manifest via `ManifestValidator`,
+3. acquires the existing repository rebuild lock,
+4. clears rebuildable projections (raw journal preserved),
+5. calls `replay_all` on the raw journal,
+6. runs `Reconciler` against a `ChainViewProvider`,
+7. publishes readiness only after convergence.
+
+Property test `rebuild_equals_incremental` proves the rebuilt state
+matches the incremental projection field-by-field for a bounded fixture.
+
+Verdict: `BACKEND_FULL_PROJECTION_REBUILD_AFTER_DB_LOSS_VALIDATED`.
+
+### 22.9 Read-only chain reconciliation
+
+`src/hybrid_v2/chain_view.rs` — `ChainViewProvider` trait, in-memory
+implementation, `Reconciler` with bounded batch size. Classifications:
+
+- `Converged`
+- `IndexerBehind { indexed, observed }`
+- `NonFinalDifference { block }`
+- `ManifestMismatch { expected, actual }`
+- `ProjectionDrift { detail }`
+- `ProviderUnavailable`
+- `Unsupported { detail }`
+
+Drift never auto-repairs projections — it fails readiness. Tests cover
+every classification.
+
+Verdict: `BACKEND_CHAIN_VIEW_RECONCILIATION_VALIDATED`.
+
+### 22.10 Query repository
+
+`src/hybrid_v2/repository.rs` — `HybridV2QueryRepository` exposes
+methods `deployment_status`, `subaccounts_by_owner`,
+`subaccount_details`, `collateral_balances`, `reservations`,
+`active_positions`, `order_lifecycle`, `matched_executions`,
+`fee_events`, `recovery_state`, `escape_state`. Deterministic
+cursor-paginated iteration via `PageCursor` (clamped to
+`MAX_PAGE_LIMIT`). Uint256 fields returned as decimal String
+end-to-end. Deployment id is a required constructor argument — every
+method is deployment-scoped.
+
+Verdict: `BACKEND_SUBACCOUNT_QUERY_REPOSITORY_READY`.
+
+### 22.11 Observability + readiness
+
+`src/hybrid_v2/readiness.rs` defines `ReadinessState` +
+`ReadinessReason`. Every failure mode has a corresponding reason:
+
+- `AwaitingFirstBlock`
+- `WrongChain { manifest, source }`
+- `ManifestMismatch { detail }`
+- `UnknownCanonicalEvent { topic0, block }`
+- `DecodeFailure { block, detail }`
+- `ProjectionFailure { block, detail }`
+- `CursorHashMismatch { block }`
+- `ExcessiveReorg { depth, max }`
+- `RebuildInProgress` / `RebuildFailed { detail }`
+- `ReconciliationDrift { detail }`
+- `MigrationSchemaMismatch`
+- `Behind { observed, indexed }`
+
+`RuntimeMetrics` carries deployment id, manifest hash, observed /
+indexed / finalized / lag / last-successful-block, decode failures,
+projection failures, unknown canonical events, reorg count, max reorg
+depth seen, rebuild status, reconciliation status.
+
+Verdict: `BACKEND_HYBRID_V2_INDEXER_OBSERVABILITY_COMPLETE`.
+
+### 22.12 Security + performance
+
+- No unsafe. No arbitrary panic on external input — every parser uses
+  typed errors.
+- Every SQL statement in `0045_hybrid_v2_projection_completion.sql`
+  parameterizes deployment_id / subkey / token; no string
+  concatenation.
+- Reconciler batch bounded (`max_pairs_per_batch = 4096`).
+- Reorg search bounded (`max_depth = 64`).
+- Repository paging clamped (`MAX_PAGE_LIMIT = 1000`).
+- Uint256 arithmetic uses fixed 32-byte buffers — no allocation on the
+  hot path.
+- No chain-write provider anywhere; `ChainViewProvider` is
+  intentionally trait-object read-only.
+
+Verdicts: `BACKEND_INDEXER_SECURITY_BOUNDARY_VALIDATED` +
+`BACKEND_SUBACCOUNT_INDEXER_PERFORMANCE_BOUNDED`.
+
+### 22.13 Tests landed
+
+- `tests/hybrid_v2_snapshot_tests.rs` — 3
+- `tests/hybrid_v2_manifest_tests.rs` — 12
+- `tests/hybrid_v2_decoder_tests.rs` — 25 (up from 5)
+- `tests/hybrid_v2_reducer_tests.rs` — 15 (up from 8)
+- `tests/hybrid_v2_runtime_tests.rs` — 11 (new)
+- `tests/hybrid_v2_property_tests.rs` — 5 (new)
+
+**Total: 71 hybrid_v2 tests.**
+
+### 22.14 Foundation preservation
+
+Nothing in `2442646` / `f69a71e` was reverted. Every previously landed
+public type is still exported, still tested, still consumed by the
+completion layer.
+
+### 22.15 Doctest fix
+
+`src/perps/margin.rs` — three previously-failing doctests were inside
+indented-4-space Rust code blocks that contained the unicode `⟺`.
+Wrapped them in `\`\`\`text` fences (documentation-only fix, no runtime
+behavior change).
+
+### 22.16 Non-goals still respected
+
+- No public HTTP route.
+- No signing / write action.
+- No live-network manifest ingestion.
+- No frontend change.
+- No Solidity change.
+- No chain broadcast.
+- No Base mainnet acceptance path.
+- No destructive migration.
+- No security audit.
+
