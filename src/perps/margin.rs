@@ -155,25 +155,31 @@ pub fn margin_ratio_bps(position: &PerpPosition, mark_price_1e8: u128) -> u128 {
 /// Derivation for a long position at entry E, size S (both `1e8`),
 /// margin M (`1e8`):
 ///
-///     equity_at_P   = M + (P - E) * S / 1e8
-///     mm_at_P       = P * S * mm_bps / (1e8 * 10_000)
-///     liquidation ⟺ equity_at_P == mm_at_P
+/// ```text
+/// equity_at_P   = M + (P - E) * S / 1e8
+/// mm_at_P       = P * S * mm_bps / (1e8 * 10_000)
+/// liquidation when equity_at_P == mm_at_P
 ///
-///  →  M + (P - E) * S / 1e8 = P * S * mm_bps / (1e8 * BPS)
-///  →  M * 1e8 * BPS + (P - E) * S * BPS = P * S * mm_bps
-///  →  M * 1e8 * BPS - E * S * BPS = P * S * mm_bps - P * S * BPS
-///  →  M * 1e8 * BPS - E * S * BPS = P * S * (mm_bps - BPS)
-///  →  P = [ M * 1e8 * BPS - E * S * BPS ] / [ S * (mm_bps - BPS) ]
+///   M + (P - E) * S / 1e8 = P * S * mm_bps / (1e8 * BPS)
+///   M * 1e8 * BPS + (P - E) * S * BPS = P * S * mm_bps
+///   M * 1e8 * BPS - E * S * BPS = P * S * mm_bps - P * S * BPS
+///   M * 1e8 * BPS - E * S * BPS = P * S * (mm_bps - BPS)
+///   P = [ M * 1e8 * BPS - E * S * BPS ] / [ S * (mm_bps - BPS) ]
+/// ```
 ///
 /// Because `mm_bps < BPS`, the denominator is negative for a long
 /// position, so we invert both signs to keep the arithmetic
 /// unsigned:
 ///
-///     P = [ E * S * BPS - M * 1e8 * BPS ] / [ S * (BPS - mm_bps) ]
+/// ```text
+/// P = [ E * S * BPS - M * 1e8 * BPS ] / [ S * (BPS - mm_bps) ]
+/// ```
 ///
 /// For a short, the same construction yields:
 ///
-///     P = [ E * S * BPS + M * 1e8 * BPS ] / [ S * (BPS + mm_bps) ]
+/// ```text
+/// P = [ E * S * BPS + M * 1e8 * BPS ] / [ S * (BPS + mm_bps) ]
+/// ```
 ///
 /// The formula assumes maintenance scales linearly with the observed
 /// mark — an approximation. A future `PERPS-LIQUIDATION-AND-RISK-V1`
