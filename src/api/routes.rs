@@ -299,6 +299,7 @@ fn admin_audit_deny(
 
 pub fn router(state: AppState) -> Router {
     let gate_state = state.clone();
+    let hybrid_v2_state = state.hybrid_v2_read.clone();
     Router::new()
         .route("/health", get(health))
         .route("/ready", get(ready))
@@ -756,6 +757,19 @@ pub fn router(state: AppState) -> Router {
         .layer(TraceLayer::new_for_http())
         .layer(cors_layer_from_env())
         .with_state(state)
+        // BACKEND-SUBACCOUNT-READ-API-RUNTIME-WIRING-CLOSURE-V1 — mount
+        // the Hybrid V2 read API into the main application router. The
+        // sub-router carries its own `HybridV2ApiState`; a merge keeps
+        // route paths at the top level so `/subaccounts/*`,
+        // `/accounts/:owner/hybrid-v2/*`, `/hybrid-v2/*` are reachable
+        // via the real backend HTTP server. When no deployment is
+        // configured, canonical routes return a structured 503 and
+        // status routes return an empty list — no fake deployment
+        // fabricated. See `docs/BACKEND_SUBACCOUNT_READ_API_AND_HISTORY_V1.md`
+        // §22 for the fail-closed contract.
+        .merge(crate::api::hybrid_v2_read::build_hybrid_v2_read_router(
+            hybrid_v2_state,
+        ))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]

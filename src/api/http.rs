@@ -198,6 +198,19 @@ pub struct AppState {
     /// on the first authenticated interaction with any listed owner
     /// (see `crate::subaccounts::ensure_default_subaccount`).
     pub subaccounts: Arc<dyn SubaccountStore + Send + Sync>,
+    /// `BACKEND-SUBACCOUNT-READ-API-RUNTIME-WIRING-CLOSURE-V1` — registry
+    /// of configured Hybrid V2 deployments consumed by the public read
+    /// API. Defaults to `HybridV2ApiState::empty()` — when empty, every
+    /// canonical Hybrid V2 route returns a structured 503; the
+    /// `/subaccounts/deployments*` status routes remain readable.
+    ///
+    /// Populated via `AppState::with_hybrid_v2` after builder assembly,
+    /// once the operator wires a validated `ManifestParams` +
+    /// `ChainSource` (this happens in the follow-up
+    /// `BACKEND-SUBACCOUNT-EXECUTION-AND-SIGNER-INTEGRATION-V1`
+    /// milestone which brings the RPC provider). Until then the field
+    /// is intentionally empty and the routes fail-closed.
+    pub hybrid_v2_read: crate::api::hybrid_v2_read::HybridV2ApiState,
 }
 
 impl AppState {
@@ -420,7 +433,17 @@ impl AppState {
             perp_liquidation_last_tick: Arc::new(Mutex::new(None)),
             perps_observability: Arc::new(crate::perps::PerpsObservability::new()),
             subaccounts,
+            hybrid_v2_read: crate::api::hybrid_v2_read::HybridV2ApiState::empty(),
         }
+    }
+
+    /// Attach a populated Hybrid V2 deployment registry. When no
+    /// deployment is configured (default), canonical routes return a
+    /// structured 503 and `/subaccounts/deployments` returns an empty
+    /// list.
+    pub fn with_hybrid_v2(mut self, state: crate::api::hybrid_v2_read::HybridV2ApiState) -> Self {
+        self.hybrid_v2_read = state;
+        self
     }
 
     pub fn with_rfq_config(engine: EngineState, rfq_config: RfqConfig) -> Self {
