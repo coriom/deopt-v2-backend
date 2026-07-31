@@ -108,6 +108,7 @@ pub struct MatchedExecutionRow {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ExecutionCompletion {
     #[default]
     Incomplete,
@@ -139,6 +140,7 @@ pub struct FeeEventRow {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum RecoveryStateProjection {
     Normal,
     RecoveryPending,
