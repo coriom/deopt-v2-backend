@@ -23,6 +23,7 @@ pub mod decoder;
 pub mod events;
 pub mod manifest;
 pub mod persistence;
+pub mod read_store;
 pub mod readiness;
 pub mod rebuild;
 pub mod reducer;
@@ -42,6 +43,14 @@ pub use manifest::{ManifestParams, ManifestValidationError, ManifestValidator, N
 pub use persistence::{
     CanonicalBlockRef, HybridV2ProjectionStore, InMemoryProjectionStore,
     PostgresHybridV2ProjectionStore, ReadinessSnapshot, RuntimeCursorSnapshot,
+};
+pub use read_store::{
+    filter_stable_hash, CollateralRecord, DeploymentListRecord, DeploymentStatusRecord,
+    FeeRebateRecord, HistoryConsistency, HistoryCursorKey, HistoryPage, HistoryPageAnchor,
+    HistoryRecord, HistoryScope, HybridV2ReadStore, InMemoryHybridV2ReadStore,
+    InMemoryJournalEntry, InMemoryStoreBuilder, MatchedExecutionRecord, OrderLifecycleRecord,
+    PageAnchor, PositionRecord, PostgresHybridV2ReadStore, ReadStoreError, RecoveryRecord,
+    ReservationRecord, StorePage, SubaccountRecord, SubaccountSummaryRecord,
 };
 pub use readiness::{ReadinessReason, ReadinessReport, ReadinessState};
 pub use rebuild::{RebuildOutcome, RebuildService};

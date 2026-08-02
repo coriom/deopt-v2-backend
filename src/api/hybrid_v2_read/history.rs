@@ -22,7 +22,7 @@ pub enum HistoryDirection {
     Metadata,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "family", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum HistoryEventPayload {
     SubaccountCreated {
