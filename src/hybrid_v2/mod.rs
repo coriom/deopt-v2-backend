@@ -22,6 +22,7 @@ pub mod correlation;
 pub mod decoder;
 pub mod events;
 pub mod manifest;
+pub mod persistence;
 pub mod readiness;
 pub mod rebuild;
 pub mod reducer;
@@ -38,6 +39,10 @@ pub use chain_view::{
 pub use correlation::{ExecutionCorrelator, ExecutionGroup};
 pub use events::{EventKind, HybridV2Event};
 pub use manifest::{ManifestParams, ManifestValidationError, ManifestValidator, NetworkPolicy};
+pub use persistence::{
+    CanonicalBlockRef, HybridV2ProjectionStore, InMemoryProjectionStore,
+    PostgresHybridV2ProjectionStore, ReadinessSnapshot, RuntimeCursorSnapshot,
+};
 pub use readiness::{ReadinessReason, ReadinessReport, ReadinessState};
 pub use rebuild::{RebuildOutcome, RebuildService};
 pub use reducer::{
