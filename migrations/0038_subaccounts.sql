@@ -26,7 +26,11 @@ CREATE TABLE IF NOT EXISTS subaccounts (
     -- no route that sets this column; the schema carries it so the
     -- follow-up milestone can land without another migration.
     archived_at_ms   BIGINT,
-    PRIMARY KEY (LOWER(owner_address), subaccount_id),
+    -- Table-level primary key must be a plain column list per PostgreSQL
+    -- SQL grammar (expressions are only permitted in CREATE INDEX). The
+    -- case-insensitive uniqueness invariant is enforced by
+    -- `subaccounts_lower_owner_subaccount_uniq` below.
+    PRIMARY KEY (owner_address, subaccount_id),
     -- `0` is reserved for a future system-owned sweep/vault subaccount;
     -- user subaccounts start at 1 and are dense integers per wallet.
     CONSTRAINT subaccounts_subaccount_id_positive CHECK (subaccount_id >= 1),
@@ -34,6 +38,15 @@ CREATE TABLE IF NOT EXISTS subaccounts (
         name IS NULL OR (char_length(name) >= 1 AND char_length(name) <= 64)
     )
 );
+
+-- Enforce case-insensitive uniqueness of (owner, subaccount_id). Every
+-- application query already normalises owner to lower-case (see
+-- `normalize_owner_address`) or uses `LOWER(owner_address) = LOWER($1)`
+-- predicates. This unique index promotes that convention into a database
+-- invariant so two rows differing only in owner-address casing can never
+-- coexist.
+CREATE UNIQUE INDEX IF NOT EXISTS subaccounts_lower_owner_subaccount_uniq
+    ON subaccounts (LOWER(owner_address), subaccount_id);
 
 CREATE INDEX IF NOT EXISTS subaccounts_by_owner
     ON subaccounts (LOWER(owner_address));

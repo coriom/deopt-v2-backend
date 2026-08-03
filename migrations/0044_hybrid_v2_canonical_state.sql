@@ -68,8 +68,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS hybrid_v2_deployments_version_uniq
 -- a migration replay of historical data; the ingestion module is the
 -- canonical enforcement point.
 COMMENT ON TABLE hybrid_v2_deployments IS
-    'One row per deployed HybridV2 manifest. Base mainnet (8453) is ' ||
-    'rejected by the ingestion module, not by a check constraint here.';
+    'One row per deployed HybridV2 manifest. Base mainnet (8453) is rejected by the ingestion module, not by a check constraint here.';
 
 -------------------------------------------------------------------------------
 -- Reorg-safe cursor
