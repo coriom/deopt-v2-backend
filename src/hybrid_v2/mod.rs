@@ -18,6 +18,7 @@
 
 pub mod chain_source;
 pub mod chain_view;
+pub mod config;
 pub mod correlation;
 pub mod decoder;
 pub mod events;
@@ -39,6 +40,7 @@ pub use chain_source::{ChainSource, InMemoryChainSource, RawBlock};
 pub use chain_view::{
     ChainViewProvider, InMemoryChainViewProvider, Reconciler, ReconciliationResult,
 };
+pub use config::HybridV2Config;
 pub use correlation::{ExecutionCorrelator, ExecutionGroup};
 pub use events::{EventKind, HybridV2Event};
 pub use manifest::{ManifestParams, ManifestValidationError, ManifestValidator, NetworkPolicy};

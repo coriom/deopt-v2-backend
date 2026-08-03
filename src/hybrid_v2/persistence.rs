@@ -127,6 +127,8 @@ fn reason_kind(reason: &ReadinessReason) -> String {
         ReadinessReason::ReconciliationDrift { .. } => "RECONCILIATION_DRIFT".to_string(),
         ReadinessReason::MigrationSchemaMismatch => "MIGRATION_SCHEMA_MISMATCH".to_string(),
         ReadinessReason::Behind { .. } => "BEHIND".to_string(),
+        ReadinessReason::Bootstrapping => "BOOTSTRAPPING".to_string(),
+        ReadinessReason::Stopping => "STOPPING".to_string(),
     }
 }
 
@@ -213,6 +215,18 @@ pub trait HybridV2ProjectionStore: Send + Sync {
 
     /// Look up the currently-persisted readiness snapshot (for restart).
     async fn read_readiness(&self, deployment_id: i64) -> Result<Option<ReadinessSnapshot>>;
+
+    /// Read every canonical raw log for a deployment, in canonical
+    /// order (`(block_number ASC, log_index ASC)`), used by
+    /// `IndexerRuntime::bootstrap_from_persistence` to rehydrate the
+    /// in-memory reducer state on restart via `RebuildService::replay_all`.
+    ///
+    /// SAFETY / RISK: currently unbounded. For deployments with
+    /// millions of raw logs this will materialise every row into a
+    /// `Vec<JournaledLog>`. A future stage (BOOTSTRAP-3) will add
+    /// pagination; until then callers should only invoke this on
+    /// restart and never inside a request handler.
+    async fn read_canonical_journal(&self, deployment_id: i64) -> Result<Vec<JournaledLog>>;
 }
 
 // -----------------------------------------------------------------
@@ -526,6 +540,106 @@ impl HybridV2ProjectionStore for PostgresHybridV2ProjectionStore {
             reason: row.try_get("reason").map_err(pg_err)?,
             reason_detail: row.try_get("reason_detail").map_err(pg_err)?,
         }))
+    }
+
+    async fn read_canonical_journal(&self, deployment_id: i64) -> Result<Vec<JournaledLog>> {
+        // NOTE(unbounded): this pulls every canonical raw log for the
+        // deployment into memory. Bootstrap-only; not a request-path
+        // primitive. See trait doc for the pagination follow-up plan.
+        let rows = sqlx::query(
+            "SELECT block_number, block_hash, parent_hash, block_timestamp,
+                    tx_hash, tx_index, log_index, emitter, topics_json, data_hex
+             FROM hybrid_v2_raw_logs
+             WHERE deployment_id = $1 AND is_canonical = TRUE
+             ORDER BY block_number ASC, log_index ASC",
+        )
+        .bind(deployment_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(pg_err)?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let block_number: i64 = row.try_get("block_number").map_err(pg_err)?;
+            let block_hash: String = row.try_get("block_hash").map_err(pg_err)?;
+            let parent_hash: String = row.try_get("parent_hash").map_err(pg_err)?;
+            let block_timestamp: i64 = row.try_get("block_timestamp").map_err(pg_err)?;
+            let tx_hash: String = row.try_get("tx_hash").map_err(pg_err)?;
+            let tx_index: i32 = row.try_get("tx_index").map_err(pg_err)?;
+            let log_index: i32 = row.try_get("log_index").map_err(pg_err)?;
+            let emitter: String = row.try_get("emitter").map_err(pg_err)?;
+            let topics_json: serde_json::Value = row.try_get("topics_json").map_err(pg_err)?;
+            let data_hex: String = row.try_get("data_hex").map_err(pg_err)?;
+            let topics = decode_topics_json(&topics_json)?;
+            let data = decode_hex_string(&data_hex)?;
+            out.push(JournaledLog {
+                block_number: i64_to_u64("block_number", block_number)?,
+                block_hash,
+                parent_hash,
+                block_timestamp: i64_to_u64("block_timestamp", block_timestamp)?,
+                tx_hash,
+                tx_index: tx_index.max(0) as u32,
+                log_index: log_index.max(0) as u32,
+                emitter,
+                topics,
+                data,
+                is_canonical: true,
+                orphaned_at_block: None,
+            });
+        }
+        Ok(out)
+    }
+}
+
+fn decode_topics_json(v: &serde_json::Value) -> Result<Vec<[u8; 32]>> {
+    let arr = v
+        .as_array()
+        .ok_or_else(|| BackendError::Persistence("topics_json is not an array".to_string()))?;
+    let mut out = Vec::with_capacity(arr.len());
+    for entry in arr {
+        let s = entry.as_str().ok_or_else(|| {
+            BackendError::Persistence("topics_json entry is not a string".to_string())
+        })?;
+        let bytes = decode_hex_string(s)?;
+        if bytes.len() != 32 {
+            return Err(BackendError::Persistence(format!(
+                "topics_json entry length {} != 32",
+                bytes.len()
+            )));
+        }
+        let mut arr32 = [0u8; 32];
+        arr32.copy_from_slice(&bytes);
+        out.push(arr32);
+    }
+    Ok(out)
+}
+
+fn decode_hex_string(s: &str) -> Result<Vec<u8>> {
+    let stripped = s.strip_prefix("0x").unwrap_or(s);
+    if stripped.len() % 2 != 0 {
+        return Err(BackendError::Persistence(format!(
+            "hex string has odd length: {}",
+            stripped.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(stripped.len() / 2);
+    let bytes = stripped.as_bytes();
+    for i in (0..bytes.len()).step_by(2) {
+        let hi = hex_nibble(bytes[i])?;
+        let lo = hex_nibble(bytes[i + 1])?;
+        out.push((hi << 4) | lo);
+    }
+    Ok(out)
+}
+
+fn hex_nibble(b: u8) -> Result<u8> {
+    match b {
+        b'0'..=b'9' => Ok(b - b'0'),
+        b'a'..=b'f' => Ok(b - b'a' + 10),
+        b'A'..=b'F' => Ok(b - b'A' + 10),
+        _ => Err(BackendError::Persistence(format!(
+            "invalid hex nibble: {}",
+            b as char
+        ))),
     }
 }
 
@@ -2089,6 +2203,23 @@ impl HybridV2ProjectionStore for InMemoryProjectionStore {
     async fn read_readiness(&self, deployment_id: i64) -> Result<Option<ReadinessSnapshot>> {
         let inner = self.inner.lock().unwrap();
         Ok(inner.readiness.get(&deployment_id).cloned())
+    }
+
+    async fn read_canonical_journal(&self, deployment_id: i64) -> Result<Vec<JournaledLog>> {
+        let inner = self.inner.lock().unwrap();
+        let mut out: Vec<JournaledLog> = inner
+            .raw_logs
+            .iter()
+            .filter_map(|((d, _bh, _tx, _idx), (_id, log))| {
+                if *d == deployment_id && log.is_canonical {
+                    Some(log.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        out.sort_by(|a, b| (a.block_number, a.log_index).cmp(&(b.block_number, b.log_index)));
+        Ok(out)
     }
 }
 

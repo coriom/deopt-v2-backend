@@ -118,8 +118,13 @@ pub enum RuntimeError {
 /// which model applied so the caller can decide whether reducer replay
 /// (RebuildService) is needed before serving live traffic.
 ///
-/// BOOTSTRAP-1 partial: cursor + readiness only; reducer state must
-/// be rehydrated by rebuild if needed for a live runtime.
+/// BOOTSTRAP-2: cursor + readiness are restored from projections, and
+/// (when the persisted cursor is non-empty) the raw canonical journal
+/// is replayed via `RebuildService::replay_all` to rehydrate the
+/// reducer's in-memory `ProjectionState` + `ExecutionCorrelator`. When
+/// the replayed head diverges from the persisted cursor the runtime
+/// enters `NOT_READY(ProjectionFailure)` and the caller is expected to
+/// trigger a full rebuild.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BootstrapResult {
     /// No persistence configured — the runtime starts fresh in memory.
@@ -128,7 +133,29 @@ pub enum BootstrapResult {
     FreshStart,
     /// Cursor + readiness restored from projections; reducer state must
     /// be rehydrated separately (rebuild) before serving live traffic.
+    /// Retained for callers that opt out of replay (e.g. tests that
+    /// only exercise cursor restoration).
     RestoredCursorOnly { indexed_head_block: u64 },
+    /// Cursor + readiness restored AND reducer state rehydrated via
+    /// `RebuildService::replay_all` over the canonical raw journal.
+    /// `blocks` is the final head block reached by the replay;
+    /// `events` is the total events replayed successfully.
+    HydratedFromJournal { blocks: u64, events: u64 },
+    /// Cursor loaded but replay's final head disagreed with the
+    /// persisted cursor. The runtime's in-memory state may be a partial
+    /// rebuild; readiness is set to `NOT_READY(ProjectionFailure)` with
+    /// a descriptive detail. Callers MUST NOT serve live traffic; a
+    /// full rebuild is required.
+    Diverged {
+        persisted_head: u64,
+        replayed_head: u64,
+        detail: String,
+    },
+    /// The persisted cursor's chain_id (implicitly, the manifest bound
+    /// to the runtime) is disallowed — e.g. Base mainnet (8453). The
+    /// runtime refuses to bootstrap and readiness is set to
+    /// `NOT_READY(WrongChain)`.
+    ChainForbidden { chain_id: u64 },
 }
 
 /// The full runtime state.
@@ -531,6 +558,26 @@ impl IndexerRuntime {
     /// - No auto-fallback: if persistence is configured and persist
     ///   fails, we do NOT silently continue with the in-memory
     ///   projection. The caller sees `RuntimeError::Persistence`.
+    ///
+    // SAFETY: `apply_block` mutates in-memory `state` + `cursor` BEFORE
+    // the Postgres commit, and the pre-persist snapshot below is what
+    // restores the previous state on failure. This ordering is safe
+    // because:
+    //   (1) The worker holds an exclusive `RwLock<IndexerRuntime>` write
+    //       guard across the entire `tick_and_persist` await, so no
+    //       other task can observe the transient (post-apply,
+    //       pre-commit) in-memory state.
+    //   (2) All external readers (HTTP handlers, per stage 2B) read
+    //       Postgres exclusively — the frozen posture
+    //       `PRODUCTION_HYBRID_V2_HTTP_READS_USE_POSTGRES_ONLY` is
+    //       audited and enforced at the API boundary; no route reaches
+    //       into the runtime's in-memory reducer.
+    //   (3) On persist failure the backup snapshot restores the exact
+    //       pre-apply state — no half-block projection ever leaks.
+    // A fully-isolated apply (separate ProjectionState scratch) would
+    // break the sync `tick()` compat path used by every existing
+    // runtime test; the write-lock serialisation + Postgres-only reads
+    // make the in-place approach the correct trade-off.
     pub async fn tick_and_persist(
         &mut self,
         source: &dyn ChainSource,
@@ -704,23 +751,64 @@ impl IndexerRuntime {
         }
     }
 
-    /// Hydrate the runtime cursor + readiness from the projection store.
+    /// Assert the runtime's manifest is bound to a permitted chain id.
     ///
-    /// BOOTSTRAP-1 partial: this restores cursor + readiness only. The
-    /// in-memory reducer working state (`ProjectionState`, raw logs,
-    /// decoded events, correlator) is NOT rehydrated by this call —
-    /// callers that need a warm reducer for a live runtime must invoke
-    /// `RebuildService::replay_all(...)` against a raw-log source
-    /// separately. The current design is safe because the cursor +
-    /// canonical block metadata alone are enough to skip already-persisted
-    /// blocks on restart, and the projection store's read paths do not
-    /// consult the in-memory reducer.
+    /// This is the fail-closed guard against operating a Hybrid V2
+    /// runtime on Base mainnet (`chain_id == 8453`) — the frozen
+    /// posture forbids it. Callers must invoke this BEFORE any
+    /// Postgres access so a mis-configured deployment cannot inadvertently
+    /// commit or read data on the wrong network.
+    pub fn validate_manifest_binding(&self) -> Result<(), RuntimeError> {
+        if self.manifest.chain_id == crate::hybrid_v2::manifest::BASE_MAINNET_CHAIN_ID {
+            return Err(RuntimeError::Bootstrap {
+                detail: format!(
+                    "Base mainnet forbidden: chain_id={} not authorised for Hybrid V2 runtime",
+                    self.manifest.chain_id
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// Hydrate the runtime cursor + readiness from the projection store,
+    /// then rehydrate the in-memory reducer state (`ProjectionState`,
+    /// raw logs, decoded events, correlator) by replaying the canonical
+    /// raw-log journal via `RebuildService::replay_all`.
+    ///
+    /// BOOTSTRAP-2: this replaces the cursor-only restoration from the
+    /// initial partial landing. The raw journal is authoritative — the
+    /// cursor is a fast pointer into it. On divergence between the
+    /// replayed head and the persisted cursor the runtime enters
+    /// `NOT_READY(ProjectionFailure)`.
+    ///
+    /// Failure modes:
+    /// - Chain-id refusal via `validate_manifest_binding` (returns
+    ///   `RuntimeError::Bootstrap`).
+    /// - Store read failure (returns `RuntimeError::Bootstrap`).
+    /// - Replay divergence (returns `Ok(BootstrapResult::Diverged{..})`
+    ///   with readiness set to `NOT_READY(ProjectionFailure)`).
     pub async fn bootstrap_from_persistence(&mut self) -> Result<BootstrapResult, RuntimeError> {
+        // Fail closed BEFORE touching Postgres.
+        if let Err(err) = self.validate_manifest_binding() {
+            self.readiness = ReadinessState::new_not_ready(ReadinessReason::WrongChain {
+                manifest: self.manifest.chain_id,
+                source: self.manifest.chain_id,
+            });
+            let chain_id = self.manifest.chain_id;
+            let _ = err;
+            return Ok(BootstrapResult::ChainForbidden { chain_id });
+        }
         let (Some(store), Some(deployment_id)) =
             (self.persistence.clone(), self.persistence_deployment_id)
         else {
             return Ok(BootstrapResult::NoPersistenceConfigured);
         };
+
+        // Announce we're bootstrapping. In-memory only (not persisted)
+        // so remote readers don't observe a transient BOOTSTRAPPING on
+        // every restart if bootstrap completes successfully.
+        self.readiness = ReadinessState::new_not_ready(ReadinessReason::Bootstrapping);
+
         let cursor_opt = store
             .read_cursor(deployment_id, &self.persistence_cursor_name)
             .await
@@ -735,14 +823,20 @@ impl IndexerRuntime {
                     detail: format!("read_readiness: {e}"),
                 })?;
         match (cursor_opt, readiness_opt) {
-            (None, None) => Ok(BootstrapResult::FreshStart),
+            (None, None) => {
+                // No cursor + no readiness — fresh start. Restore an
+                // awaiting-first-block readiness (matches a fresh
+                // `IndexerRuntime::new` invocation).
+                self.readiness = ReadinessState::new_not_ready(ReadinessReason::AwaitingFirstBlock);
+                Ok(BootstrapResult::FreshStart)
+            }
             (Some(cursor), readiness_opt) => {
                 self.cursor.indexed_head_block = cursor.indexed_head_block;
-                self.cursor.indexed_head_hash = cursor.indexed_head_hash;
-                self.cursor.indexed_head_parent = cursor.indexed_head_parent;
+                self.cursor.indexed_head_hash = cursor.indexed_head_hash.clone();
+                self.cursor.indexed_head_parent = cursor.indexed_head_parent.clone();
                 self.cursor.observed_head_block = cursor.observed_head_block;
                 self.cursor.finalized_head_block = cursor.finalized_head_block;
-                self.cursor.last_error = cursor.last_error;
+                self.cursor.last_error = cursor.last_error.clone();
                 self.metrics.indexed_block = cursor.indexed_head_block;
                 self.metrics.last_successful_block = cursor.last_success_block;
                 self.metrics.observed_block = cursor.observed_head_block;
@@ -752,26 +846,68 @@ impl IndexerRuntime {
                 self.metrics.decode_failures = cursor.decode_failures;
                 self.metrics.projection_failures = cursor.projection_failures;
                 self.metrics.unknown_canonical_events = cursor.unknown_canonical_events;
-                match readiness_opt {
-                    Some(r) if r.ready => {
-                        self.readiness = ReadinessState::ready();
-                    }
-                    _ => {
-                        // Cursor present but readiness absent OR not
-                        // ready — mark the resuming state via the
-                        // closest existing reason. The runtime will
-                        // recompute this on the next successful tick.
-                        self.readiness =
-                            ReadinessState::new_not_ready(ReadinessReason::AwaitingFirstBlock);
-                    }
+
+                if cursor.indexed_head_block == 0 {
+                    // Cursor persisted at head 0 — nothing to replay.
+                    self.raw_logs.clear();
+                    self.state = ProjectionState::default();
+                    self.correlator = ExecutionCorrelator::new();
+                    self.readiness = match readiness_opt {
+                        Some(r) if r.ready => ReadinessState::ready(),
+                        _ => ReadinessState::new_not_ready(ReadinessReason::AwaitingFirstBlock),
+                    };
+                    return Ok(BootstrapResult::RestoredCursorOnly {
+                        indexed_head_block: 0,
+                    });
                 }
-                Ok(BootstrapResult::RestoredCursorOnly {
-                    indexed_head_block: self.cursor.indexed_head_block,
+
+                // BOOTSTRAP-2: replay canonical journal to rehydrate reducer state.
+                let journal = store
+                    .read_canonical_journal(deployment_id)
+                    .await
+                    .map_err(|e| RuntimeError::Bootstrap {
+                        detail: format!("read_canonical_journal: {e}"),
+                    })?;
+                let rebuild =
+                    crate::hybrid_v2::rebuild::RebuildService::new(self.manifest.event_version);
+                let (state, correlator, outcome) = rebuild.replay_all(&journal);
+                self.state = state;
+                self.correlator = correlator;
+                self.raw_logs = journal.clone();
+
+                if outcome.final_head_block != cursor.indexed_head_block {
+                    let detail = format!(
+                        "bootstrap replay diverged: expected head {}, replayed to {}",
+                        cursor.indexed_head_block, outcome.final_head_block
+                    );
+                    self.readiness =
+                        ReadinessState::new_not_ready(ReadinessReason::ProjectionFailure {
+                            block: cursor.indexed_head_block,
+                            detail: detail.clone(),
+                        });
+                    return Ok(BootstrapResult::Diverged {
+                        persisted_head: cursor.indexed_head_block,
+                        replayed_head: outcome.final_head_block,
+                        detail,
+                    });
+                }
+
+                // Restore the persisted readiness (or default to
+                // awaiting-first-block on absent record; the next tick
+                // will recompute if the source has caught up).
+                self.readiness = match readiness_opt {
+                    Some(r) if r.ready => ReadinessState::ready(),
+                    _ => ReadinessState::new_not_ready(ReadinessReason::AwaitingFirstBlock),
+                };
+                Ok(BootstrapResult::HydratedFromJournal {
+                    blocks: outcome.final_head_block,
+                    events: outcome.events_replayed,
                 })
             }
             (None, Some(_)) => {
                 // Readiness without a cursor is unexpected but not
                 // fatal — treat as fresh start.
+                self.readiness = ReadinessState::new_not_ready(ReadinessReason::AwaitingFirstBlock);
                 Ok(BootstrapResult::FreshStart)
             }
         }

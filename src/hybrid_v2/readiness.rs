@@ -6,21 +6,55 @@
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum ReadinessReason {
+    #[default]
     AwaitingFirstBlock,
-    WrongChain { manifest: u64, source: u64 },
-    ManifestMismatch { detail: String },
-    UnknownCanonicalEvent { topic0: String, block: u64 },
-    DecodeFailure { block: u64, detail: String },
-    ProjectionFailure { block: u64, detail: String },
-    CursorHashMismatch { block: u64 },
-    ExcessiveReorg { depth: u64, max: u64 },
+    WrongChain {
+        manifest: u64,
+        source: u64,
+    },
+    ManifestMismatch {
+        detail: String,
+    },
+    UnknownCanonicalEvent {
+        topic0: String,
+        block: u64,
+    },
+    DecodeFailure {
+        block: u64,
+        detail: String,
+    },
+    ProjectionFailure {
+        block: u64,
+        detail: String,
+    },
+    CursorHashMismatch {
+        block: u64,
+    },
+    ExcessiveReorg {
+        depth: u64,
+        max: u64,
+    },
     RebuildInProgress,
-    RebuildFailed { detail: String },
-    ReconciliationDrift { detail: String },
+    RebuildFailed {
+        detail: String,
+    },
+    ReconciliationDrift {
+        detail: String,
+    },
     MigrationSchemaMismatch,
-    Behind { observed: u64, indexed: u64 },
+    Behind {
+        observed: u64,
+        indexed: u64,
+    },
+    /// Runtime is running `bootstrap_from_persistence` — transient
+    /// in-memory only; never persisted. Cleared on the next successful
+    /// tick / handler read that follows bootstrap completion.
+    Bootstrapping,
+    /// Runtime received a shutdown signal and is winding down; hard 503
+    /// until the process exits.
+    Stopping,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

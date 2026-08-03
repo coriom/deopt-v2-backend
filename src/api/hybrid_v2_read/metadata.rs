@@ -121,6 +121,8 @@ pub fn hard_readiness_failure(readiness: &ReadinessState) -> Option<&'static str
         Some(ReadinessReason::RebuildFailed { .. }) => Some("REBUILD_FAILED"),
         Some(ReadinessReason::ReconciliationDrift { .. }) => Some("RECONCILIATION_DRIFT"),
         Some(ReadinessReason::MigrationSchemaMismatch) => Some("MIGRATION_SCHEMA_MISMATCH"),
+        Some(ReadinessReason::Bootstrapping) => Some("BOOTSTRAPPING"),
+        Some(ReadinessReason::Stopping) => Some("STOPPING"),
         None => None,
     }
 }
@@ -251,6 +253,12 @@ pub fn hard_readiness_failure_from_status(
     }
     if starts_ci(bytes, b"MigrationSchemaMismatch") {
         return Some("MIGRATION_SCHEMA_MISMATCH");
+    }
+    if starts_ci(bytes, b"Bootstrapping") || starts_ci(bytes, b"BOOTSTRAPPING") {
+        return Some("BOOTSTRAPPING");
+    }
+    if starts_ci(bytes, b"Stopping") || starts_ci(bytes, b"STOPPING") {
+        return Some("STOPPING");
     }
     Some("INDEXER_NOT_READY")
 }
