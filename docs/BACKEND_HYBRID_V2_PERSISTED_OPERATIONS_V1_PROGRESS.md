@@ -11,6 +11,17 @@ tests) so the next session can layer reorg operational, rebuild lock,
 full rebuild, reconciliation, readiness state machine, and the
 30+ integration matrix on top.
 
+**Update 2026-08-04:** stage-3A landed as
+`BACKEND-HYBRID-V2-PERSISTED-RUNTIME-CORE-V1` — see
+`BACKEND_HYBRID_V2_PERSISTED_RUNTIME_CORE_V1.md`. The non-reorg
+lifecycle (bootstrap-2 journal replay, complete atomicity matrix,
+restart matrix, idempotency matrix, baseline readiness state machine
+with `Bootstrapping`/`Stopping` variants, `HybridV2Config` +
+fail-closed validation, `main.rs` lifecycle wire) is complete;
+Parts J/K also close on this pass. Reorg (Parts J/K/L of the parent
+brief) → next stage `BACKEND-HYBRID-V2-PERSISTED-REORG-RECOVERY-V1`.
+Rebuild + reconciliation → `BACKEND-HYBRID-V2-PROJECTION-PERSISTENCE-CLOSURE-V1`.
+
 ## Delivered in this landing
 
 - **Part A** — preflight (worktree artifact from prior milestone
