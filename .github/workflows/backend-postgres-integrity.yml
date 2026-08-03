@@ -1,0 +1,100 @@
+name: Backend PostgreSQL migration integrity
+
+# Fails loud when the full migration chain does not apply cleanly to a
+# fresh PostgreSQL 16 database. Also enforces the case-insensitive
+# subaccount uniqueness invariant added by the 0038 repair (see
+# BACKEND-PG-MIGRATION-CHAIN-INTEGRITY-V1).
+#
+# This is a dedicated PostgreSQL job so the standard Backend CI job
+# (which does not require a database) remains fast and self-contained.
+
+on:
+  pull_request:
+    paths:
+      - "migrations/**"
+      - "src/db/**"
+      - "src/subaccounts/**"
+      - "src/hybrid_v2/**"
+      - "tests/postgres_migration_chain_integration.rs"
+      - ".github/workflows/backend-postgres-integrity.yml"
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Never source real credentials. The disposable password below is
+  # only meaningful to the service container spawned by this job.
+  POSTGRES_PASSWORD: disposable_ci_pw
+  POSTGRES_USER: deopt_ci
+  POSTGRES_DB: deopt_hybrid_v2_disposable_ci
+
+jobs:
+  migration-integrity:
+    name: PostgreSQL migration chain
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: deopt_ci
+          POSTGRES_PASSWORD: disposable_ci_pw
+          POSTGRES_DB: deopt_hybrid_v2_disposable_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U deopt_ci -d deopt_hybrid_v2_disposable_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Wait for PostgreSQL
+        run: |
+          for i in $(seq 1 30); do
+            if pg_isready -h 127.0.0.1 -p 5432 -U "$POSTGRES_USER" >/dev/null 2>&1; then
+              echo "postgres ready after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "postgres not ready after 30s"
+          exit 1
+
+      - name: Run migration-chain integration test (fail-loud mode)
+        env:
+          PG_INTEGRATION_URL: postgres://deopt_ci:disposable_ci_pw@127.0.0.1:5432/deopt_hybrid_v2_disposable_ci
+          DEOPT_REQUIRE_PG_INTEGRATION: "1"
+        run: |
+          cd deopt-v2-backend || cd .
+          cargo test --test postgres_migration_chain_integration -- --nocapture
+
+      - name: Run every hybrid_v2 PostgreSQL proof suite against the disposable DB
+        env:
+          HYBRID_V2_PG_TEST_DATABASE_URL: postgres://deopt_ci:disposable_ci_pw@127.0.0.1:5432/deopt_hybrid_v2_disposable_ci
+        run: |
+          cd deopt-v2-backend || cd .
+          # Reset schema between each suite so tests do not observe
+          # residual rows from a prior suite.
+          for suite in hybrid_v2_persistence_core_pg_proof hybrid_v2_read_store_pg_proof; do
+            PGPASSWORD=disposable_ci_pw psql -h 127.0.0.1 -U deopt_ci -d deopt_hybrid_v2_disposable_ci <<'EOF' >/dev/null
+DROP SCHEMA public CASCADE;
+CREATE SCHEMA public;
+GRANT ALL ON SCHEMA public TO PUBLIC;
+EOF
+            cargo test --test "$suite" -- --test-threads=1
+          done
