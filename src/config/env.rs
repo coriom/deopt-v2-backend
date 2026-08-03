@@ -99,6 +99,17 @@ pub struct AppConfig {
     /// * `PERPS_LIQUIDATION_MAX_POSITIONS_PER_TICK` (default 500)
     /// * `PERPS_LIQUIDATION_STALE_ORACLE_POLICY=skip`
     pub perps_liquidation_worker: crate::perps::PerpsLiquidationWorkerConfig,
+    /// BACKEND-HYBRID-V2-PERSISTED-RUNTIME-CORE-V1 — Hybrid V2 indexer
+    /// worker configuration. Defaults `disabled()`. When
+    /// `HYBRID_V2_ENABLED=true`, `HybridV2Config::from_env` also reads
+    /// deployment_id, chain_id, poll_interval_ms, confirmation_depth,
+    /// max_block_batch, start_block, cursor_name. Base mainnet
+    /// (chain_id=8453) is refused unconditionally at parse time. The
+    /// worker requires `PERSISTENCE_ENABLED=true` and (in a future
+    /// stage) a live RPC ChainSource; stage 3A validates the config
+    /// and logs the wire state without spawning a real chain-driven
+    /// loop.
+    pub hybrid_v2: crate::hybrid_v2::config::HybridV2Config,
 }
 
 impl AppConfig {
@@ -876,6 +887,14 @@ impl AppConfig {
         };
         perps_liquidation_worker.validate_startup(chain_id)?;
 
+        // BACKEND-HYBRID-V2-PERSISTED-RUNTIME-CORE-V1 — load + validate
+        // the Hybrid V2 indexer worker config. `HybridV2Config::from_env`
+        // reads its own `HYBRID_V2_*` vars via `std::env::var` (dotenv
+        // has already loaded the file), refuses Base mainnet
+        // unconditionally, and returns `disabled()` when
+        // `HYBRID_V2_ENABLED` is unset or false.
+        let hybrid_v2 = crate::hybrid_v2::config::HybridV2Config::from_env()?;
+
         Ok(Self {
             host,
             port,
@@ -910,6 +929,7 @@ impl AppConfig {
             perps_closed_test_allowlist,
             perps_funding_worker,
             perps_liquidation_worker,
+            hybrid_v2,
         })
     }
 

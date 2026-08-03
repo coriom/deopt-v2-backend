@@ -50,6 +50,12 @@ async fn main() -> deopt_v2_backend::Result<()> {
         .mm_permissions
         .validate_startup(config.persistence_enabled)?;
     config.fees.validate_startup(config.persistence_enabled)?;
+    // BACKEND-HYBRID-V2-PERSISTED-RUNTIME-CORE-V1 — validate the
+    // Hybrid V2 config at startup so mis-configuration (Base mainnet,
+    // out-of-range bounds, missing deployment_id) fails fast rather
+    // than after network state has been mutated. `disabled()` returns
+    // Ok immediately.
+    config.hybrid_v2.validate()?;
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::new(config.rust_log.clone()))
         .init();
@@ -157,6 +163,36 @@ async fn main() -> deopt_v2_backend::Result<()> {
     // HTTP ticks so the two surfaces cannot diverge.
     spawn_perps_funding_worker(state.clone());
     spawn_perps_liquidation_worker(state.clone());
+    // BACKEND-HYBRID-V2-PERSISTED-RUNTIME-CORE-V1 — the persisted
+    // Hybrid V2 indexer worker is fully wired at the code layer
+    // (`hybrid_v2::worker::spawn_hybrid_v2_indexer_worker`) and
+    // integration-tested against a real Postgres + `InMemoryChainSource`.
+    // Production activation additionally requires a live-chain
+    // `ChainSource` (RPC or similar) which lands in the next stage of
+    // this milestone tree. When `HYBRID_V2_ENABLED=true` today we
+    // therefore log the configured state and defer the spawn; when
+    // `false` (default) we silently skip so unconfigured backends keep
+    // starting normally.
+    if config.hybrid_v2.enabled {
+        if !config.persistence_enabled {
+            warn!(
+                deployment_id = config.hybrid_v2.deployment_id,
+                chain_id = config.hybrid_v2.chain_id,
+                "HYBRID_V2_ENABLED=true but PERSISTENCE_ENABLED=false — refusing to spawn the \
+                 persisted Hybrid V2 indexer worker; canonical routes remain fail-closed."
+            );
+        } else {
+            info!(
+                deployment_id = config.hybrid_v2.deployment_id,
+                chain_id = config.hybrid_v2.chain_id,
+                poll_interval_ms = config.hybrid_v2.poll_interval_ms,
+                confirmation_depth = config.hybrid_v2.confirmation_depth,
+                cursor_name = %config.hybrid_v2.cursor_name,
+                "hybrid_v2 indexer worker configured; deferred until an RPC ChainSource lands \
+                 in the next stage (writer path is fully tested via InMemoryChainSource)"
+            );
+        }
+    }
     spawn_webtransport_gateway(config.mm_gateway.clone(), state).await?;
 
     info!(
@@ -183,6 +219,8 @@ async fn main() -> deopt_v2_backend::Result<()> {
         executor_dry_run = config.execution.dry_run,
         signature_verification_mode = ?config.signature_verification_mode,
         persistence_enabled = config.persistence_enabled,
+        hybrid_v2_enabled = config.hybrid_v2.enabled,
+        hybrid_v2_deployment_id = config.hybrid_v2.deployment_id,
         "starting http server"
     );
 
