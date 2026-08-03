@@ -131,3 +131,126 @@ pub fn now_ms() -> u64 {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
+
+// -----------------------------------------------------------------
+// `BACKEND-HYBRID-V2-POSTGRES-READ-STORE-2B-HANDLER-SWAP-V1`
+//
+// Store-boundary variants of `from_runtime` / `hard_readiness_failure`.
+// Handlers now source readiness + head/lag via
+// `HybridV2ReadStore::get_deployment_status` — no direct runtime access.
+// -----------------------------------------------------------------
+
+/// Build `CanonicalityMetadata` from a store-returned
+/// `DeploymentStatusRecord` and the immutable per-deployment manifest.
+pub fn build_metadata_from_status(
+    deployment_id: u64,
+    chain_id: u64,
+    manifest_hash: &str,
+    status: &crate::hybrid_v2::read_store::DeploymentStatusRecord,
+    consistency: ConsistencyMode,
+    generated_at_ms: u64,
+) -> CanonicalityMetadata {
+    let lag = status
+        .observed_head_block
+        .saturating_sub(status.indexed_head_block);
+    let canonicality_level = if !status.ready {
+        CanonicalityLevel::NotReady
+    } else if consistency == ConsistencyMode::Finalized
+        && status.indexed_head_block <= status.finalized_head_block
+    {
+        CanonicalityLevel::Finalized
+    } else if lag > 0 {
+        CanonicalityLevel::IndexerBehind
+    } else {
+        CanonicalityLevel::IndexedCanonical
+    };
+    CanonicalityMetadata {
+        deployment_id,
+        chain_id,
+        manifest_hash: manifest_hash.to_string(),
+        indexed_block: status.indexed_head_block,
+        indexed_block_hash: status.indexed_head_hash.clone(),
+        finalized_block: status.finalized_head_block,
+        observed_head_block: status.observed_head_block,
+        indexer_lag: lag,
+        reconciliation_status: status
+            .reconciliation_status
+            .clone()
+            .unwrap_or_else(|| "UNKNOWN".to_string()),
+        canonicality_level,
+        consistency_mode: consistency,
+        generated_at_ms,
+    }
+}
+
+/// Readiness gate parameterised on the persisted `ready` flag + a
+/// stringified `ready_reason` (as emitted by the store). Mirrors
+/// `hard_readiness_failure`'s runtime-enum policy: `Behind` and a
+/// missing reason are soft-fails; every explicit failure class is a
+/// hard 503.
+pub fn hard_readiness_failure_from_status(
+    ready: bool,
+    ready_reason: Option<&str>,
+) -> Option<&'static str> {
+    if ready {
+        return None;
+    }
+    let Some(r) = ready_reason else {
+        // Not ready but no reason recorded — refuse to serve canonical
+        // data rather than pretending everything is fine.
+        return Some("INDEXER_NOT_READY");
+    };
+    // Match by prefix of the debug form of `ReadinessReason` so this
+    // works for both the runtime (`{:?}` output) and the Postgres
+    // store (persisted string).
+    let bytes = r.as_bytes();
+    // Cheap prefix compares to avoid allocating a lower-case copy.
+    fn starts_ci(hay: &[u8], needle: &[u8]) -> bool {
+        if hay.len() < needle.len() {
+            return false;
+        }
+        hay.iter()
+            .zip(needle.iter())
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
+    }
+    if starts_ci(bytes, b"Behind") {
+        return None;
+    }
+    if starts_ci(bytes, b"AwaitingFirstBlock") {
+        return Some("AWAITING_FIRST_BLOCK");
+    }
+    if starts_ci(bytes, b"WrongChain") {
+        return Some("WRONG_CHAIN");
+    }
+    if starts_ci(bytes, b"ManifestMismatch") {
+        return Some("MANIFEST_MISMATCH");
+    }
+    if starts_ci(bytes, b"UnknownCanonicalEvent") {
+        return Some("UNKNOWN_CANONICAL_EVENT");
+    }
+    if starts_ci(bytes, b"DecodeFailure") {
+        return Some("DECODE_FAILURE");
+    }
+    if starts_ci(bytes, b"ProjectionFailure") {
+        return Some("PROJECTION_FAILURE");
+    }
+    if starts_ci(bytes, b"CursorHashMismatch") {
+        return Some("CURSOR_HASH_MISMATCH");
+    }
+    if starts_ci(bytes, b"ExcessiveReorg") {
+        return Some("EXCESSIVE_REORG");
+    }
+    if starts_ci(bytes, b"RebuildInProgress") {
+        return Some("REBUILD_IN_PROGRESS");
+    }
+    if starts_ci(bytes, b"RebuildFailed") {
+        return Some("REBUILD_FAILED");
+    }
+    if starts_ci(bytes, b"ReconciliationDrift") {
+        return Some("RECONCILIATION_DRIFT");
+    }
+    if starts_ci(bytes, b"MigrationSchemaMismatch") {
+        return Some("MIGRATION_SCHEMA_MISMATCH");
+    }
+    Some("INDEXER_NOT_READY")
+}

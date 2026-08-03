@@ -30,6 +30,7 @@ pub mod reducer;
 pub mod reorg;
 pub mod repository;
 pub mod runtime;
+pub mod runtime_backed_read_store;
 pub mod snapshot;
 pub mod topics;
 

@@ -193,7 +193,12 @@ async fn reorg_stale_cursor_returns_409_conflict() {
         vec![deposit_log(&manifest, "0xf1", "0xa1", 1, "0xef", "9")],
     ));
     {
-        let mut rt = entry.runtime.write().unwrap();
+        let rt_lock = entry
+            .runtime
+            .as_ref()
+            .expect("runtime-backed entry must carry a runtime handle")
+            .clone();
+        let mut rt = rt_lock.write().unwrap();
         while rt.tick(&source).unwrap() {}
     }
     // Now the old cursor is stale — bound to hash 0xb2 which is no longer canonical.

@@ -127,3 +127,45 @@ impl IntoResponse for ApiError {
         (status, Json(self.body())).into_response()
     }
 }
+
+// `BACKEND-HYBRID-V2-POSTGRES-READ-STORE-2B-HANDLER-SWAP-V1` — fail-closed
+// mapping of the store-boundary error taxonomy into the HTTP API error
+// model. Every branch preserves the existing structured-body contract and
+// never leaks raw SQL / credentials / URLs.
+impl From<crate::hybrid_v2::read_store::ReadStoreError> for ApiError {
+    fn from(err: crate::hybrid_v2::read_store::ReadStoreError) -> Self {
+        use crate::hybrid_v2::read_store::ReadStoreError;
+        match err {
+            ReadStoreError::Backend { detail } => ApiError::new(
+                ApiErrorCode::InternalInconsistency,
+                format!("read store backend unavailable: {}", detail),
+            ),
+            ReadStoreError::MalformedRow { detail } => ApiError::new(
+                ApiErrorCode::MalformedCanonicalData,
+                format!("persisted canonical row malformed: {}", detail),
+            ),
+            ReadStoreError::InvalidCursor { detail } => ApiError::new(
+                ApiErrorCode::InvalidCursor,
+                format!("cursor rejected by store: {}", detail),
+            ),
+            ReadStoreError::StaleCursor {
+                expected_hash,
+                actual_hash,
+            } => ApiError::new(
+                ApiErrorCode::StaleCursor,
+                format!(
+                    "cursor bound to orphaned indexed head (expected {}, got {}); restart pagination",
+                    expected_hash, actual_hash
+                ),
+            ),
+            ReadStoreError::LimitExceeded { max, requested } => ApiError::new(
+                ApiErrorCode::PageLimitExceeded,
+                format!("limit {} exceeds max {}", requested, max),
+            ),
+            ReadStoreError::InvalidFilter { detail } => ApiError::new(
+                ApiErrorCode::InvalidFilterCombination,
+                format!("filter rejected by store: {}", detail),
+            ),
+        }
+    }
+}

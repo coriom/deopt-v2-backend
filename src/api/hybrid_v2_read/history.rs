@@ -10,7 +10,7 @@ use crate::api::hybrid_v2_read::serialization::to_lower_hex;
 use crate::hybrid_v2::decoder::{decode_log_with, CanonicalRawLog};
 use crate::hybrid_v2::events::EventKind;
 use crate::hybrid_v2::reducer::ProjectionState;
-use crate::hybrid_v2::runtime::{IndexerRuntime, JournaledLog};
+use crate::hybrid_v2::runtime::IndexerRuntime;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
