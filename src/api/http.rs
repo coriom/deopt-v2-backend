@@ -446,6 +446,28 @@ impl AppState {
         self
     }
 
+    /// `BACKEND-HYBRID-V2-POSTGRES-READ-STORE-2B-HANDLER-SWAP-V1` —
+    /// production wiring. Constructs a `PostgresHybridV2ReadStore` over
+    /// the supplied SQLx pool and binds it to `hybrid_v2_read`. The
+    /// entries are metadata-only (`DeploymentEntry::from_metadata`);
+    /// there is NO production runtime-memory fallback and no automatic
+    /// downgrade to the runtime-backed adapter.
+    ///
+    /// Under a Postgres outage, canonical reads surface as structured
+    /// `INTERNAL_INCONSISTENCY` responses via `ApiError::from(ReadStoreError)`
+    /// rather than silently degrading to in-memory data — fail closed
+    /// per the `PRODUCTION_HYBRID_V2_HTTP_READS_USE_POSTGRES_ONLY`
+    /// posture.
+    pub fn with_hybrid_v2_postgres(
+        mut self,
+        pool: sqlx::PgPool,
+        entries: Vec<std::sync::Arc<crate::api::hybrid_v2_read::DeploymentEntry>>,
+    ) -> Self {
+        self.hybrid_v2_read =
+            crate::api::hybrid_v2_read::HybridV2ApiState::with_postgres(pool, entries);
+        self
+    }
+
     pub fn with_rfq_config(engine: EngineState, rfq_config: RfqConfig) -> Self {
         Self::with_all_config(
             engine,
