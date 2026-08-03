@@ -83,6 +83,22 @@ fn now_ms() -> i64 {
     1_700_000_000_000
 }
 
+// Derive a deterministic per-tag deployment_version so real PG's
+// UNIQUE(chain_id, deployment_version) constraint from migration 0044 is
+// not violated when multiple tests seed distinct deployments in the same
+// disposable database. Hash truncated to u16 so it fits the column.
+fn tag_deployment_version(tag: &str) -> u16 {
+    let mut h: u32 = 0x811c9dc5;
+    for b in tag.bytes() {
+        h ^= b as u32;
+        h = h.wrapping_mul(0x01000193);
+    }
+    // Reserve version==1 for the default seed elsewhere in the workspace,
+    // and stay strictly positive per manifest validator rules.
+    let v = ((h & 0xffff) as u16).max(2);
+    v
+}
+
 fn base_manifest(chain_id: u64, tag: &str) -> ManifestParams {
     ManifestParams {
         chain_id,
@@ -93,7 +109,7 @@ fn base_manifest(chain_id: u64, tag: &str) -> ManifestParams {
         architecture_version: 1,
         storage_version: 1,
         event_version: 1,
-        deployment_version: 1,
+        deployment_version: tag_deployment_version(tag),
         manifest_schema_version: 1,
         environment_tag: "TESTNET".into(),
         deployer: "0xdep".into(),
