@@ -33,6 +33,7 @@ pub mod runtime;
 pub mod runtime_backed_read_store;
 pub mod snapshot;
 pub mod topics;
+pub mod worker;
 
 pub use chain_source::{ChainSource, InMemoryChainSource, RawBlock};
 pub use chain_view::{
@@ -61,6 +62,9 @@ pub use reducer::{
 };
 pub use reorg::{ReorgOutcome, ReorgPlanner};
 pub use repository::{HybridV2QueryRepository, PageCursor};
-pub use runtime::{IndexerRuntime, RuntimeError, RuntimeMetrics};
+pub use runtime::{
+    BootstrapResult, IndexerRuntime, PendingReorgAudit, RuntimeError, RuntimeMetrics,
+};
 pub use snapshot::{PinnedSnapshots, SourceMetadata};
 pub use topics::TopicCatalogue;
+pub use worker::{spawn_hybrid_v2_indexer_worker, HybridV2IndexerWorkerConfig};
