@@ -2,7 +2,12 @@ use deopt_v2_backend::api::{router, AppState};
 use deopt_v2_backend::config::AppConfig;
 use deopt_v2_backend::db::PgRepository;
 use deopt_v2_backend::engine::EngineState;
+use deopt_v2_backend::error::BackendError;
 use deopt_v2_backend::execution::{spawn_executor, Executor};
+use deopt_v2_backend::hybrid_v2::{
+    spawn_hybrid_v2_indexer_worker, HybridV2IndexerWorkerConfig, IndexerRuntime, ManifestParams,
+    PostgresHybridV2ProjectionStore, RpcHybridV2ChainSource, RpcSourceConfig,
+};
 use deopt_v2_backend::indexer::{spawn_indexer, Indexer};
 use deopt_v2_backend::mm::transport::webtransport::spawn_webtransport_gateway;
 use deopt_v2_backend::options::conditional_orders::{
@@ -13,6 +18,9 @@ use deopt_v2_backend::options::{
     spawn_option_reconciliation_worker,
 };
 use deopt_v2_backend::perps::{spawn_perps_funding_worker, spawn_perps_liquidation_worker};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::{watch, RwLock};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -163,16 +171,24 @@ async fn main() -> deopt_v2_backend::Result<()> {
     // HTTP ticks so the two surfaces cannot diverge.
     spawn_perps_funding_worker(state.clone());
     spawn_perps_liquidation_worker(state.clone());
-    // BACKEND-HYBRID-V2-PERSISTED-RUNTIME-CORE-V1 — the persisted
-    // Hybrid V2 indexer worker is fully wired at the code layer
-    // (`hybrid_v2::worker::spawn_hybrid_v2_indexer_worker`) and
-    // integration-tested against a real Postgres + `InMemoryChainSource`.
-    // Production activation additionally requires a live-chain
-    // `ChainSource` (RPC or similar) which lands in the next stage of
-    // this milestone tree. When `HYBRID_V2_ENABLED=true` today we
-    // therefore log the configured state and defer the spawn; when
-    // `false` (default) we silently skip so unconfigured backends keep
-    // starting normally.
+    // BACKEND-HYBRID-V2-LIVE-CHAIN-SOURCE-AND-WORKER-ACTIVATION-V1 —
+    // Real live-chain worker spawn. When `HYBRID_V2_ENABLED=true`:
+    //   1. Persistence must be enabled (canonical route contract).
+    //   2. Manifest is loaded from disk (`HYBRID_V2_MANIFEST_PATH`).
+    //   3. A read-only `RpcHybridV2ChainSource` is constructed against
+    //      the configured JSON-RPC endpoint and its chain identity is
+    //      validated (mismatch or Base mainnet → fail-closed).
+    //   4. `bootstrap_from_persistence` runs before the tokio task is
+    //      spawned. `BootstrapResult::Diverged` fails startup so the
+    //      operator triggers a rebuild instead of serving inconsistent
+    //      state.
+    //   5. `spawn_hybrid_v2_indexer_worker` binds the runtime, source,
+    //      store and shutdown channel.
+    //
+    // Every failure path here returns before `axum::serve` binds — the
+    // process exits with a non-zero status rather than starting the
+    // HTTP surface with a mis-configured indexer behind it.
+    let mut _hybrid_v2_shutdown_tx: Option<watch::Sender<bool>> = None;
     if config.hybrid_v2.enabled {
         if !config.persistence_enabled {
             warn!(
@@ -181,15 +197,89 @@ async fn main() -> deopt_v2_backend::Result<()> {
                 "HYBRID_V2_ENABLED=true but PERSISTENCE_ENABLED=false — refusing to spawn the \
                  persisted Hybrid V2 indexer worker; canonical routes remain fail-closed."
             );
-        } else {
+        } else if let Some(repo) = repository.clone() {
+            let manifest = load_hybrid_v2_manifest(&config.hybrid_v2)?;
+            if manifest.chain_id != config.hybrid_v2.chain_id {
+                return Err(BackendError::Config(format!(
+                    "HYBRID_V2 manifest chain_id={} disagrees with HYBRID_V2_CHAIN_ID={}",
+                    manifest.chain_id, config.hybrid_v2.chain_id
+                )));
+            }
+            let emitters = collect_manifest_emitters(&manifest);
+            let rpc_endpoint = config.hybrid_v2.rpc_url.clone().ok_or_else(|| {
+                BackendError::Config(
+                    "HYBRID_V2_RPC_URL missing after validation — refusing to spawn".into(),
+                )
+            })?;
+            let source_config = RpcSourceConfig {
+                endpoint: rpc_endpoint,
+                chain_id: config.hybrid_v2.chain_id,
+                timeout: Duration::from_millis(config.hybrid_v2.rpc_timeout_ms),
+                max_retries: config.hybrid_v2.rpc_max_retries,
+                retry_backoff: Duration::from_millis(config.hybrid_v2.rpc_retry_backoff_ms),
+                max_logs_per_range: config.hybrid_v2.rpc_max_logs_per_range,
+                confirmation_depth: config.hybrid_v2.confirmation_depth,
+            };
+            let source = RpcHybridV2ChainSource::new(source_config, emitters).map_err(|e| {
+                BackendError::Config(format!("hybrid_v2 rpc source construction: {e}"))
+            })?;
+            let redacted_host = source.redacted_endpoint();
+            let observed = source.validate_chain_identity().await.map_err(|e| {
+                BackendError::Config(format!(
+                    "hybrid_v2 chain identity validation failed against endpoint {redacted_host}: {e}"
+                ))
+            })?;
+            let source_arc: Arc<dyn deopt_v2_backend::hybrid_v2::ChainSource> = Arc::new(source);
+            let store = Arc::new(PostgresHybridV2ProjectionStore::new(repo.pool().clone()));
+            let mut runtime = IndexerRuntime::new(config.hybrid_v2.deployment_id as u64, manifest)
+                .with_persistence(store.clone(), config.hybrid_v2.deployment_id)
+                .with_persistence_cursor_name(config.hybrid_v2.cursor_name.clone());
+            let bootstrap = runtime
+                .bootstrap_from_persistence()
+                .await
+                .map_err(|e| BackendError::Config(format!("hybrid_v2 bootstrap failed: {e}")))?;
+            if let deopt_v2_backend::hybrid_v2::BootstrapResult::Diverged {
+                persisted_head,
+                replayed_head,
+                detail,
+            } = &bootstrap
+            {
+                return Err(BackendError::Config(format!(
+                    "hybrid_v2 bootstrap DIVERGED (persisted_head={persisted_head}, \
+                     replayed_head={replayed_head}); refusing to spawn worker: {detail}"
+                )));
+            }
+            if let deopt_v2_backend::hybrid_v2::BootstrapResult::ChainForbidden { chain_id } =
+                &bootstrap
+            {
+                return Err(BackendError::Config(format!(
+                    "hybrid_v2 bootstrap refused: chain_id={chain_id} is not authorised",
+                )));
+            }
+            let runtime_arc = Arc::new(RwLock::new(runtime));
+            let worker_config = HybridV2IndexerWorkerConfig::new(
+                config.hybrid_v2.deployment_id,
+                config.hybrid_v2.poll_interval_ms,
+            );
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            let _worker_handle = spawn_hybrid_v2_indexer_worker(
+                runtime_arc,
+                source_arc,
+                store,
+                worker_config,
+                Some(shutdown_rx),
+            );
+            _hybrid_v2_shutdown_tx = Some(shutdown_tx);
             info!(
                 deployment_id = config.hybrid_v2.deployment_id,
                 chain_id = config.hybrid_v2.chain_id,
+                observed_chain_id = observed,
                 poll_interval_ms = config.hybrid_v2.poll_interval_ms,
                 confirmation_depth = config.hybrid_v2.confirmation_depth,
                 cursor_name = %config.hybrid_v2.cursor_name,
-                "hybrid_v2 indexer worker configured; deferred until an RPC ChainSource lands \
-                 in the next stage (writer path is fully tested via InMemoryChainSource)"
+                rpc_endpoint = %redacted_host,
+                bootstrap = ?bootstrap,
+                "hybrid_v2 live indexer worker spawned"
             );
         }
     }
@@ -231,4 +321,49 @@ async fn main() -> deopt_v2_backend::Result<()> {
         .await
         .map_err(|error| deopt_v2_backend::error::BackendError::Config(error.to_string()))?;
     Ok(())
+}
+
+/// Load a Hybrid V2 deployment manifest from `HYBRID_V2_MANIFEST_PATH`.
+/// Fails-closed when the path is unset or unreadable.
+fn load_hybrid_v2_manifest(
+    cfg: &deopt_v2_backend::hybrid_v2::HybridV2Config,
+) -> deopt_v2_backend::Result<ManifestParams> {
+    let path = cfg.manifest_path.as_deref().ok_or_else(|| {
+        BackendError::Config(
+            "HYBRID_V2_MANIFEST_PATH unset — cannot bind emitter addresses without a manifest".into(),
+        )
+    })?;
+    let bytes = std::fs::read(path)
+        .map_err(|e| BackendError::Config(format!("hybrid_v2 manifest read {path}: {e}")))?;
+    let manifest: ManifestParams = serde_json::from_slice(&bytes)
+        .map_err(|e| BackendError::Config(format!("hybrid_v2 manifest parse {path}: {e}")))?;
+    Ok(manifest)
+}
+
+/// Collect every canonical emitter address declared by the manifest,
+/// lowercased and 0x-prefixed. Includes optional modules and the
+/// manifest address itself.
+fn collect_manifest_emitters(manifest: &ManifestParams) -> Vec<String> {
+    let m = &manifest.module_addresses;
+    let mut set: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for addr in [
+        &m.subaccount_registry,
+        &m.collateral_vault,
+        &m.options_positions_ledger,
+        &m.risk_module,
+        &m.margin_engine,
+        &m.option_matching_engine,
+        &m.escape_controller,
+        &m.recovery_finalizer,
+    ] {
+        set.insert(addr.to_ascii_lowercase());
+    }
+    if let Some(a) = &m.fees_manager_v2 {
+        set.insert(a.to_ascii_lowercase());
+    }
+    if let Some(a) = &m.option_execution_fee_adapter {
+        set.insert(a.to_ascii_lowercase());
+    }
+    set.insert(manifest.manifest_address.to_ascii_lowercase());
+    set.into_iter().collect()
 }

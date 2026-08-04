@@ -112,6 +112,13 @@ impl PgRepository {
         Ok(Self { pool })
     }
 
+    /// Borrow the underlying pool — used by Hybrid V2 to construct its
+    /// own `PostgresHybridV2ProjectionStore` without duplicating the
+    /// connection budget.
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
     pub async fn run_migrations(&self) -> Result<()> {
         pool::run_migrations(&self.pool).await
     }
