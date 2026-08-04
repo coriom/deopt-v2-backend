@@ -38,7 +38,6 @@ pub mod topics;
 pub mod worker;
 
 pub use chain_source::{ChainSource, ChainSourceError, InMemoryChainSource, RawBlock};
-pub use rpc_chain_source::{RpcHybridV2ChainSource, RpcSourceConfig};
 pub use chain_view::{
     ChainViewProvider, InMemoryChainViewProvider, Reconciler, ReconciliationResult,
 };
@@ -66,6 +65,7 @@ pub use reducer::{
 };
 pub use reorg::{ReorgOutcome, ReorgPlanner};
 pub use repository::{HybridV2QueryRepository, PageCursor};
+pub use rpc_chain_source::{RpcHybridV2ChainSource, RpcSourceConfig};
 pub use runtime::{
     BootstrapResult, IndexerRuntime, PendingReorgAudit, RuntimeError, RuntimeMetrics,
 };

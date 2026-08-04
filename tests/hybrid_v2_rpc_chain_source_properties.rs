@@ -10,7 +10,11 @@ use deopt_v2_backend::hybrid_v2::{RpcHybridV2ChainSource, RpcSourceConfig};
 use hybrid_v2_mock_rpc_helpers::{addr20, make_block, make_log, topic_bytes32, MockRpcServer};
 use std::time::Duration;
 
-fn build_source(mock: &MockRpcServer, chain_id: u64, emitters: Vec<String>) -> RpcHybridV2ChainSource {
+fn build_source(
+    mock: &MockRpcServer,
+    chain_id: u64,
+    emitters: Vec<String>,
+) -> RpcHybridV2ChainSource {
     RpcHybridV2ChainSource::new(
         RpcSourceConfig {
             endpoint: mock.url(),
@@ -37,8 +41,13 @@ async fn prop_log_ordering_deterministic() {
         let emitter = addr20(0xa1);
         let mut b = make_block(1, 0xb1, &format!("0x{}{}", "b0", "0".repeat(62)), 1_010);
         for &i in &perm {
-            b.logs
-                .push(make_log(&b, &emitter, i, vec![topic_bytes32(0x10 + i as u8)], "0x"));
+            b.logs.push(make_log(
+                &b,
+                &emitter,
+                i,
+                vec![topic_bytes32(0x10 + i as u8)],
+                "0x",
+            ));
         }
         mock.push_block(b);
         let source = build_source(&mock, 84532, vec![emitter.clone()]);
@@ -138,7 +147,10 @@ async fn prop_retryable_failures_preserve_result() {
         mock.set_chain_id(84532);
         mock.simulate_rate_limit(k);
         let source = build_source(&mock, 84532, vec![]);
-        let got = source.chain_id().await.expect("must succeed within retry budget");
+        let got = source
+            .chain_id()
+            .await
+            .expect("must succeed within retry budget");
         assert_eq!(got, 84532, "k={k}");
     }
 }

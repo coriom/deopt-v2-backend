@@ -150,10 +150,9 @@ impl MockRpcServer {
         let addr = listener.local_addr().expect("local addr");
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let handle = tokio::spawn(async move {
-            let server = axum::serve(listener, router)
-                .with_graceful_shutdown(async move {
-                    let _ = shutdown_rx.await;
-                });
+            let server = axum::serve(listener, router).with_graceful_shutdown(async move {
+                let _ = shutdown_rx.await;
+            });
             let _ = server.await;
         });
         Self {
@@ -277,8 +276,8 @@ async fn handle_rpc(
         }
         if st.simulate_status_remaining > 0 {
             st.simulate_status_remaining -= 1;
-            let code =
-                StatusCode::from_u16(st.simulate_status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            let code = StatusCode::from_u16(st.simulate_status)
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             return (code, Json(json!({"error": "injected status"})));
         }
         if st.simulate_malformed_remaining > 0 {
@@ -432,10 +431,8 @@ fn dispatch(
                 .and_then(|v| v.as_str())
                 .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
                 .unwrap_or(from);
-            let addr_filter: Option<HashSet<String>> = filter
-                .get("address")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
+            let addr_filter: Option<HashSet<String>> =
+                filter.get("address").and_then(|v| v.as_array()).map(|arr| {
                     arr.iter()
                         .filter_map(|v| v.as_str().map(|s| s.to_ascii_lowercase()))
                         .collect()

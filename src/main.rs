@@ -330,7 +330,8 @@ fn load_hybrid_v2_manifest(
 ) -> deopt_v2_backend::Result<ManifestParams> {
     let path = cfg.manifest_path.as_deref().ok_or_else(|| {
         BackendError::Config(
-            "HYBRID_V2_MANIFEST_PATH unset — cannot bind emitter addresses without a manifest".into(),
+            "HYBRID_V2_MANIFEST_PATH unset — cannot bind emitter addresses without a manifest"
+                .into(),
         )
     })?;
     let bytes = std::fs::read(path)

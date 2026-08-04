@@ -108,7 +108,10 @@ impl std::fmt::Debug for HybridV2Config {
             .field("rpc_max_retries", &self.rpc_max_retries)
             .field("rpc_retry_backoff_ms", &self.rpc_retry_backoff_ms)
             .field("rpc_max_logs_per_range", &self.rpc_max_logs_per_range)
-            .field("manifest_path", &self.manifest_path.as_deref().map(|_| "<set>"))
+            .field(
+                "manifest_path",
+                &self.manifest_path.as_deref().map(|_| "<set>"),
+            )
             .finish()
     }
 }
@@ -188,8 +191,7 @@ impl HybridV2Config {
         let rpc_url = env::var("HYBRID_V2_RPC_URL").ok().filter(|s| !s.is_empty());
         let rpc_timeout_ms: u64 = parse_env("HYBRID_V2_RPC_TIMEOUT_MS")?.unwrap_or(10_000);
         let rpc_max_retries: u32 = parse_env("HYBRID_V2_RPC_MAX_RETRIES")?.unwrap_or(3);
-        let rpc_retry_backoff_ms: u64 =
-            parse_env("HYBRID_V2_RPC_RETRY_BACKOFF_MS")?.unwrap_or(250);
+        let rpc_retry_backoff_ms: u64 = parse_env("HYBRID_V2_RPC_RETRY_BACKOFF_MS")?.unwrap_or(250);
         let rpc_max_logs_per_range: u32 =
             parse_env("HYBRID_V2_RPC_MAX_LOGS_PER_RANGE")?.unwrap_or(2_000);
         let manifest_path = env::var("HYBRID_V2_MANIFEST_PATH")

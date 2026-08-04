@@ -26,7 +26,11 @@ fn source_config(url: String, chain_id: u64) -> RpcSourceConfig {
     }
 }
 
-fn build_source(mock: &MockRpcServer, chain_id: u64, emitters: Vec<String>) -> RpcHybridV2ChainSource {
+fn build_source(
+    mock: &MockRpcServer,
+    chain_id: u64,
+    emitters: Vec<String>,
+) -> RpcHybridV2ChainSource {
     RpcHybridV2ChainSource::new(source_config(mock.url(), chain_id), emitters)
         .expect("source construct")
 }
@@ -106,11 +110,22 @@ async fn block_at_returns_block_with_logs_when_present() {
     mock.set_chain_id(84532);
     let emitter = addr20(0xa1);
     let mut b = make_block(7, 0xb1, &format!("0x{}{}", "b0", "0".repeat(62)), 1_000);
-    b.logs.push(make_log(&b, &emitter, 0, vec![topic_bytes32(0x11)], "0x1234"));
-    b.logs.push(make_log(&b, &emitter, 1, vec![topic_bytes32(0x22)], "0x"));
+    b.logs.push(make_log(
+        &b,
+        &emitter,
+        0,
+        vec![topic_bytes32(0x11)],
+        "0x1234",
+    ));
+    b.logs
+        .push(make_log(&b, &emitter, 1, vec![topic_bytes32(0x22)], "0x"));
     mock.push_block(b);
     let source = build_source(&mock, 84532, vec![emitter.clone()]);
-    let got = source.block_at(7).await.expect("call ok").expect("block present");
+    let got = source
+        .block_at(7)
+        .await
+        .expect("call ok")
+        .expect("block present");
     assert_eq!(got.number, 7);
     assert_eq!(got.logs.len(), 2);
     assert_eq!(got.logs[0].emitter, emitter.to_ascii_lowercase());
@@ -124,9 +139,12 @@ async fn multi_emitter_block_filtered_by_configured_addresses() {
     let wanted = addr20(0xa1);
     let unwanted = addr20(0xff);
     let mut b = make_block(9, 0xb9, &format!("0x{}{}", "b8", "0".repeat(62)), 1_100);
-    b.logs.push(make_log(&b, &wanted, 0, vec![topic_bytes32(0x11)], "0x"));
-    b.logs.push(make_log(&b, &unwanted, 1, vec![topic_bytes32(0x22)], "0x"));
-    b.logs.push(make_log(&b, &wanted, 2, vec![topic_bytes32(0x33)], "0x"));
+    b.logs
+        .push(make_log(&b, &wanted, 0, vec![topic_bytes32(0x11)], "0x"));
+    b.logs
+        .push(make_log(&b, &unwanted, 1, vec![topic_bytes32(0x22)], "0x"));
+    b.logs
+        .push(make_log(&b, &wanted, 2, vec![topic_bytes32(0x33)], "0x"));
     mock.push_block(b);
     let source = build_source(&mock, 84532, vec![wanted.clone()]);
     let got = source.block_at(9).await.expect("call ok").expect("block");
@@ -276,7 +294,8 @@ async fn deterministic_json_rpc_error_not_retried() {
     let emitter = addr20(0xa1);
     // Inject an rpc error on the next eth_getLogs call.
     let mut b = make_block(1, 0xb1, &format!("0x{}{}", "b0", "0".repeat(62)), 1_010);
-    b.logs.push(make_log(&b, &emitter, 0, vec![topic_bytes32(0x11)], "0x"));
+    b.logs
+        .push(make_log(&b, &emitter, 0, vec![topic_bytes32(0x11)], "0x"));
     mock.push_block(b);
     mock.simulate_next_rpc_error(-32602, "invalid params");
     let source = build_source(&mock, 84532, vec![emitter]);
@@ -322,7 +341,11 @@ async fn prohibited_method_not_requested_ever() {
         let parent = if n == 1 {
             format!("0x{}{}", "00", "0".repeat(62))
         } else {
-            format!("0x{}{:0>62x}", format!("{:02x}", 0xb0 + (n as u8 - 1)), n - 1)
+            format!(
+                "0x{}{:0>62x}",
+                format!("{:02x}", 0xb0 + (n as u8 - 1)),
+                n - 1
+            )
         };
         let mut b = make_block(n, 0xb0 + n as u8, &parent, 1_000 + n * 12);
         b.logs

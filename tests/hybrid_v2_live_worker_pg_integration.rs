@@ -83,7 +83,11 @@ async fn build_store(pool: &PgPool) -> (Arc<PostgresHybridV2ProjectionStore>, i6
     (store, did)
 }
 
-fn source_from_mock(mock: &MockRpcServer, chain_id: u64, emitters: Vec<String>) -> RpcHybridV2ChainSource {
+fn source_from_mock(
+    mock: &MockRpcServer,
+    chain_id: u64,
+    emitters: Vec<String>,
+) -> RpcHybridV2ChainSource {
     RpcHybridV2ChainSource::new(
         RpcSourceConfig {
             endpoint: mock.url(),
@@ -98,7 +102,6 @@ fn source_from_mock(mock: &MockRpcServer, chain_id: u64, emitters: Vec<String>) 
     )
     .expect("source construct")
 }
-
 
 #[tokio::test(flavor = "multi_thread")]
 async fn disabled_configuration_starts_no_worker() {
@@ -162,7 +165,11 @@ async fn empty_block_commits_cursor_advance() {
     let applied = runtime.tick_and_persist(&source).await.expect("tick");
     assert!(applied);
     assert_eq!(runtime.cursor().indexed_head_block, 1);
-    let cursor = store.read_cursor(did, "indexer").await.expect("cursor").expect("row");
+    let cursor = store
+        .read_cursor(did, "indexer")
+        .await
+        .expect("cursor")
+        .expect("row");
     assert_eq!(cursor.indexed_head_block, 1);
 }
 

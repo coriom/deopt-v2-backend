@@ -103,10 +103,7 @@ impl std::fmt::Debug for RpcHybridV2ChainSource {
 impl RpcHybridV2ChainSource {
     /// Construct a live RPC chain source. Fails when the URL is
     /// malformed or the reqwest client cannot be built.
-    pub fn new(
-        config: RpcSourceConfig,
-        emitters: Vec<String>,
-    ) -> Result<Self, ChainSourceError> {
+    pub fn new(config: RpcSourceConfig, emitters: Vec<String>) -> Result<Self, ChainSourceError> {
         if !(config.endpoint.starts_with("http://") || config.endpoint.starts_with("https://")) {
             return Err(ChainSourceError::Unsupported(
                 "endpoint scheme not supported (only http/https)".to_string(),
@@ -221,10 +218,7 @@ impl RpcHybridV2ChainSource {
             .map_err(|e| ChainSourceError::Malformed(format!("json decode: {e}")))?;
         // JSON-RPC error object → deterministic error, do not retry.
         if let Some(err) = payload.get("error") {
-            let code = err
-                .get("code")
-                .and_then(|c| c.as_i64())
-                .unwrap_or(-32000);
+            let code = err.get("code").and_then(|c| c.as_i64()).unwrap_or(-32000);
             let message = err
                 .get("message")
                 .and_then(|m| m.as_str())
@@ -272,15 +266,14 @@ impl RpcHybridV2ChainSource {
         match tag {
             FinalityTag::Finalized => {
                 let v = self
-                    .call(
-                        "eth_getBlockByNumber",
-                        json!(["finalized", false]),
-                    )
+                    .call("eth_getBlockByNumber", json!(["finalized", false]))
                     .await?;
                 extract_block_number(&v)
             }
             FinalityTag::Safe => {
-                let v = self.call("eth_getBlockByNumber", json!(["safe", false])).await?;
+                let v = self
+                    .call("eth_getBlockByNumber", json!(["safe", false]))
+                    .await?;
                 extract_block_number(&v)
             }
             FinalityTag::ConfirmationDepth => {
@@ -295,10 +288,9 @@ impl RpcHybridV2ChainSource {
         selector: BlockSelector<'_>,
     ) -> Result<Option<BlockHeader>, ChainSourceError> {
         let (method, params) = match selector {
-            BlockSelector::Number(n) => (
-                "eth_getBlockByNumber",
-                json!([format!("0x{:x}", n), false]),
-            ),
+            BlockSelector::Number(n) => {
+                ("eth_getBlockByNumber", json!([format!("0x{:x}", n), false]))
+            }
             BlockSelector::Hash(h) => ("eth_getBlockByHash", json!([h, false])),
         };
         let v = self.call(method, params).await?;
@@ -389,10 +381,15 @@ impl ChainSource for RpcHybridV2ChainSource {
     }
 
     async fn block_at(&self, number: u64) -> Result<Option<RawBlock>, ChainSourceError> {
-        let Some(header) = self.fetch_block_header(BlockSelector::Number(number)).await? else {
+        let Some(header) = self
+            .fetch_block_header(BlockSelector::Number(number))
+            .await?
+        else {
             return Ok(None);
         };
-        let logs = self.fetch_logs_for_block(header.number, &header.hash).await?;
+        let logs = self
+            .fetch_logs_for_block(header.number, &header.hash)
+            .await?;
         Ok(Some(assemble_raw_block(header, logs)))
     }
 
@@ -400,7 +397,9 @@ impl ChainSource for RpcHybridV2ChainSource {
         let Some(header) = self.fetch_block_header(BlockSelector::Hash(hash)).await? else {
             return Ok(None);
         };
-        let logs = self.fetch_logs_for_block(header.number, &header.hash).await?;
+        let logs = self
+            .fetch_logs_for_block(header.number, &header.hash)
+            .await?;
         Ok(Some(assemble_raw_block(header, logs)))
     }
 }
@@ -549,16 +548,16 @@ fn parse_log(entry: &Value) -> Result<JsonRpcLog, ChainSourceError> {
         let s = t
             .as_str()
             .ok_or_else(|| ChainSourceError::Malformed("topic not string".into()))?;
-        let bytes = parse_bytes32_hex(s)
-            .map_err(|e| ChainSourceError::Malformed(format!("topic: {e}")))?;
+        let bytes =
+            parse_bytes32_hex(s).map_err(|e| ChainSourceError::Malformed(format!("topic: {e}")))?;
         topics.push(bytes);
     }
     let data_str = entry
         .get("data")
         .and_then(|v| v.as_str())
         .ok_or_else(|| ChainSourceError::Malformed("log missing `data`".into()))?;
-    let data = parse_hex_bytes(data_str)
-        .map_err(|e| ChainSourceError::Malformed(format!("data: {e}")))?;
+    let data =
+        parse_hex_bytes(data_str).map_err(|e| ChainSourceError::Malformed(format!("data: {e}")))?;
     Ok(JsonRpcLog {
         address,
         block_hash,
@@ -579,9 +578,9 @@ fn parse_u64_hex(v: &Value, ctx: &str) -> Result<u64, ChainSourceError> {
 
 fn parse_hex_u64(s: &str) -> Result<u64, String> {
     let s = s.trim();
-    let stripped = s.strip_prefix("0x").ok_or_else(|| {
-        format!("expected 0x-prefixed hex, got {} chars", s.len().min(64))
-    })?;
+    let stripped = s
+        .strip_prefix("0x")
+        .ok_or_else(|| format!("expected 0x-prefixed hex, got {} chars", s.len().min(64)))?;
     if stripped.is_empty() {
         return Ok(0);
     }
