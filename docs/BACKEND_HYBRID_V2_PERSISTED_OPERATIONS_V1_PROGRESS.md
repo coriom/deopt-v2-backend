@@ -22,6 +22,18 @@ Parts J/K also close on this pass. Reorg (Parts J/K/L of the parent
 brief) → next stage `BACKEND-HYBRID-V2-PERSISTED-REORG-RECOVERY-V1`.
 Rebuild + reconciliation → `BACKEND-HYBRID-V2-PROJECTION-PERSISTENCE-CLOSURE-V1`.
 
+**Update 2026-08-04 (2):** stage-3B landed as
+`BACKEND-HYBRID-V2-LIVE-CHAIN-SOURCE-AND-WORKER-ACTIVATION-V1` —
+see `BACKEND_HYBRID_V2_LIVE_CHAIN_SOURCE_AND_WORKER_ACTIVATION_V1.md`.
+The `ChainSource` trait is now async, `RpcHybridV2ChainSource` is a
+strictly read-only reqwest-based JSON-RPC source, `HybridV2Config`
+gained `rpc_url` + retry/timeout/log-bound fields with `Debug`
+redaction, and `main.rs` now actually spawns the supervised worker
+(previous log-only branch removed). Part R of the parent brief
+(worker wiring into `main.rs`) is therefore closed. Operational
+reorg (Parts J/K/L) still remains for
+`BACKEND-HYBRID-V2-PERSISTED-REORG-RECOVERY-V1`.
+
 ## Delivered in this landing
 
 - **Part A** — preflight (worktree artifact from prior milestone
