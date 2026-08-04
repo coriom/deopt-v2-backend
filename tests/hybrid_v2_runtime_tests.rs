@@ -20,12 +20,12 @@ use hybrid_v2_support::{
 
 // -------------------- RUNTIME BASICS --------------------
 
-#[test]
-fn runtime_rejects_wrong_chain_id() {
+#[tokio::test]
+async fn runtime_rejects_wrong_chain_id() {
     let manifest = baseline_manifest(84532);
     let mut runtime = IndexerRuntime::new(1, manifest);
     let source = InMemoryChainSource::new(31337);
-    let err = runtime.tick(&source).unwrap_err();
+    let err = runtime.tick(&source).await.unwrap_err();
     assert!(matches!(err, RuntimeError::WrongChain { .. }));
     assert!(!runtime.readiness().ready);
     assert!(matches!(
@@ -34,8 +34,8 @@ fn runtime_rejects_wrong_chain_id() {
     ));
 }
 
-#[test]
-fn runtime_advances_and_applies_block() {
+#[tokio::test]
+async fn runtime_advances_and_applies_block() {
     let manifest = baseline_manifest(84532);
     let mut source = InMemoryChainSource::new(84532);
     source
@@ -57,9 +57,9 @@ fn runtime_advances_and_applies_block() {
             vec![withdraw_log(&manifest, "0xabc1", "0xa1", 1, "0xe1", "400")],
         ));
     let mut runtime = IndexerRuntime::new(1, manifest);
-    assert!(runtime.tick(&source).unwrap());
-    assert!(runtime.tick(&source).unwrap());
-    assert!(!runtime.tick(&source).unwrap()); // no more blocks
+    assert!(runtime.tick(&source).await.unwrap());
+    assert!(runtime.tick(&source).await.unwrap());
+    assert!(!runtime.tick(&source).await.unwrap()); // no more blocks
     let bal = runtime
         .projection()
         .balances
@@ -70,8 +70,8 @@ fn runtime_advances_and_applies_block() {
     assert!(runtime.readiness().ready);
 }
 
-#[test]
-fn runtime_cursor_does_not_advance_after_failed_decode() {
+#[tokio::test]
+async fn runtime_cursor_does_not_advance_after_failed_decode() {
     let manifest = baseline_manifest(84532);
     let mut source = InMemoryChainSource::new(84532);
     // First block valid; second block contains an emitter-canonical log with
@@ -89,30 +89,30 @@ fn runtime_cursor_does_not_advance_after_failed_decode() {
         ))
         .push(block(2, "0xb2", "0xb1", 1012, vec![broken]));
     let mut runtime = IndexerRuntime::new(1, manifest);
-    runtime.tick(&source).unwrap();
-    let err = runtime.tick(&source).unwrap_err();
+    runtime.tick(&source).await.unwrap();
+    let err = runtime.tick(&source).await.unwrap_err();
     assert!(matches!(err, RuntimeError::Decoder { .. }));
     assert_eq!(runtime.cursor().indexed_head_block, 1);
     assert_eq!(runtime.metrics().decode_failures, 1);
 }
 
-#[test]
-fn runtime_duplicate_block_call_is_noop() {
+#[tokio::test]
+async fn runtime_duplicate_block_call_is_noop() {
     let manifest = baseline_manifest(84532);
     let mut source = InMemoryChainSource::new(84532);
     source.push(block(1, "0xb1", "0xb0", 1000, vec![]));
     let mut runtime = IndexerRuntime::new(1, manifest);
-    runtime.tick(&source).unwrap();
+    runtime.tick(&source).await.unwrap();
     let head_before = runtime.cursor().indexed_head_block;
     // No new blocks — tick returns false, cursor unchanged.
-    assert!(!runtime.tick(&source).unwrap());
+    assert!(!runtime.tick(&source).await.unwrap());
     assert_eq!(runtime.cursor().indexed_head_block, head_before);
 }
 
 // -------------------- REORG --------------------
 
-#[test]
-fn runtime_reorg_one_block_replacement() {
+#[tokio::test]
+async fn runtime_reorg_one_block_replacement() {
     let manifest = baseline_manifest(84532);
     let mut source = InMemoryChainSource::new(84532);
     source
@@ -134,8 +134,8 @@ fn runtime_reorg_one_block_replacement() {
             vec![deposit_log(&manifest, "0xf1", "0xa9", 1, "0xef", "500")],
         ));
     let mut runtime = IndexerRuntime::new(1, manifest.clone());
-    runtime.tick(&source).unwrap();
-    runtime.tick(&source).unwrap();
+    runtime.tick(&source).await.unwrap();
+    runtime.tick(&source).await.unwrap();
     let key = (pad_bytes32("0xf1"), pad_address("0xef"));
     assert_eq!(runtime.projection().balances.get(&key).unwrap(), "1500");
     // Chain reorgs from block 2 with a different block hash + different logs.
@@ -163,15 +163,15 @@ fn runtime_reorg_one_block_replacement() {
         1024,
         vec![deposit_log(&manifest, "0xf1", "0xa9", 1, "0xef", "77")],
     ));
-    while runtime.tick(&source).unwrap() {}
+    while runtime.tick(&source).await.unwrap() {}
     // After reorg replay: balance = 1000 (block1) + 200 (new block2) + 77 (block3) = 1277
     let key = (pad_bytes32("0xf1"), pad_address("0xef"));
     assert_eq!(runtime.projection().balances.get(&key).unwrap(), "1277");
     assert!(runtime.metrics().reorg_count >= 1);
 }
 
-#[test]
-fn runtime_multi_block_reorg() {
+#[tokio::test]
+async fn runtime_multi_block_reorg() {
     let manifest = baseline_manifest(84532);
     let mut source = InMemoryChainSource::new(84532);
     source
@@ -201,7 +201,7 @@ fn runtime_multi_block_reorg() {
         ));
     let mut runtime = IndexerRuntime::new(1, manifest.clone());
     for _ in 0..3 {
-        runtime.tick(&source).unwrap();
+        runtime.tick(&source).await.unwrap();
     }
     let key = (pad_bytes32("0xf1"), pad_address("0xef"));
     assert_eq!(runtime.projection().balances.get(&key).unwrap(), "180");
@@ -233,7 +233,7 @@ fn runtime_multi_block_reorg() {
         ],
     );
     // Advance again: runtime should detect divergence and replay.
-    while runtime.tick(&source).unwrap() {}
+    while runtime.tick(&source).await.unwrap() {}
     let key = (pad_bytes32("0xf1"), pad_address("0xef"));
     assert_eq!(runtime.projection().balances.get(&key).unwrap(), "130");
     assert!(runtime.metrics().reorg_count >= 1);
@@ -242,8 +242,8 @@ fn runtime_multi_block_reorg() {
 
 // -------------------- REBUILD --------------------
 
-#[test]
-fn rebuild_matches_incremental_projection() {
+#[tokio::test]
+async fn rebuild_matches_incremental_projection() {
     let manifest = baseline_manifest(84532);
     let mut source = InMemoryChainSource::new(84532);
     source
@@ -270,7 +270,7 @@ fn rebuild_matches_incremental_projection() {
             ],
         ));
     let mut runtime = IndexerRuntime::new(1, manifest.clone());
-    while runtime.tick(&source).unwrap() {}
+    while runtime.tick(&source).await.unwrap() {}
     let incremental_state = runtime.projection().clone();
     let rebuild = RebuildService::new(manifest.event_version);
     let (rebuilt_state, _, outcome) = rebuild.replay_all(&runtime.raw_logs);
@@ -282,8 +282,8 @@ fn rebuild_matches_incremental_projection() {
 
 // -------------------- CORRELATION --------------------
 
-#[test]
-fn execution_correlation_marks_complete_and_incomplete() {
+#[tokio::test]
+async fn execution_correlation_marks_complete_and_incomplete() {
     let manifest = baseline_manifest(84532);
     let mut source = InMemoryChainSource::new(84532);
     // Complete group.
@@ -318,7 +318,7 @@ fn execution_correlation_marks_complete_and_incomplete() {
         ],
     ));
     let mut runtime = IndexerRuntime::new(1, manifest);
-    while runtime.tick(&source).unwrap() {}
+    while runtime.tick(&source).await.unwrap() {}
     let m = &runtime.projection().matched_executions;
     assert_eq!(
         m.get(&pad_bytes32("0xcc01")).unwrap().completion_status,
@@ -332,8 +332,8 @@ fn execution_correlation_marks_complete_and_incomplete() {
 
 // -------------------- RECONCILIATION --------------------
 
-#[test]
-fn reconciliation_convergence_and_drift() {
+#[tokio::test]
+async fn reconciliation_convergence_and_drift() {
     let manifest = baseline_manifest(84532);
     let mut source = InMemoryChainSource::new(84532);
     source.push(block(
@@ -347,7 +347,7 @@ fn reconciliation_convergence_and_drift() {
         ],
     ));
     let mut runtime = IndexerRuntime::new(1, manifest.clone());
-    runtime.tick(&source).unwrap();
+    runtime.tick(&source).await.unwrap();
     let reconciler = Reconciler::new();
 
     // Converged provider.
@@ -425,8 +425,8 @@ fn reconciliation_convergence_and_drift() {
 
 // -------------------- REPOSITORY --------------------
 
-#[test]
-fn repository_query_methods_return_expected_shapes() {
+#[tokio::test]
+async fn repository_query_methods_return_expected_shapes() {
     let manifest = baseline_manifest(84532);
     let mut source = InMemoryChainSource::new(84532);
     source.push(block(
@@ -448,7 +448,7 @@ fn repository_query_methods_return_expected_shapes() {
         ],
     ));
     let mut runtime = IndexerRuntime::new(1, manifest.clone());
-    runtime.tick(&source).unwrap();
+    runtime.tick(&source).await.unwrap();
     let repo = HybridV2QueryRepository::new(
         1,
         runtime.projection(),
@@ -482,13 +482,13 @@ fn repository_query_methods_return_expected_shapes() {
 
 // -------------------- READINESS --------------------
 
-#[test]
-fn readiness_flips_to_ready_after_first_block() {
+#[tokio::test]
+async fn readiness_flips_to_ready_after_first_block() {
     let manifest = baseline_manifest(84532);
     let mut source = InMemoryChainSource::new(84532);
     source.push(block(1, "0xb1", "0xb0", 1000, vec![]));
     let mut runtime = IndexerRuntime::new(1, manifest);
     assert!(!runtime.readiness().ready);
-    runtime.tick(&source).unwrap();
+    runtime.tick(&source).await.unwrap();
     assert!(runtime.readiness().ready);
 }

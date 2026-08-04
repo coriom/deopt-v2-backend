@@ -35,7 +35,7 @@ impl ReorgPlanner {
         Self { max_depth }
     }
 
-    pub fn plan(
+    pub async fn plan(
         &self,
         journal: &[JournaledLog],
         source: &dyn ChainSource,
@@ -58,8 +58,14 @@ impl ReorgPlanner {
             let Some(local_hash) = canonical_hashes.get(&n) else {
                 continue;
             };
-            let Some(chain_block) = source.block_at(n) else {
-                continue;
+            let chain_block = match source.block_at(n).await {
+                Ok(Some(b)) => b,
+                Ok(None) => continue,
+                Err(err) => {
+                    return Err(RuntimeError::ChainSource {
+                        detail: format!("reorg planner block_at({n}): {err}"),
+                    });
+                }
             };
             if hashes_eq(local_hash, &chain_block.hash) {
                 common_ancestor = Some(n);

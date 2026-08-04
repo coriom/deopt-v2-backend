@@ -28,7 +28,7 @@ async fn get_body(app: axum::Router, uri: &str) -> (StatusCode, Value) {
     (status, json)
 }
 
-fn build_populated_state(chain_id: u64) -> (HybridV2ApiState, u64) {
+async fn build_populated_state(chain_id: u64) -> (HybridV2ApiState, u64) {
     let manifest = baseline_manifest(chain_id);
     let deployment_id = 1;
     let mut source = InMemoryChainSource::new(chain_id);
@@ -71,7 +71,7 @@ fn build_populated_state(chain_id: u64) -> (HybridV2ApiState, u64) {
             ],
         ));
     let mut runtime = IndexerRuntime::new(deployment_id, manifest);
-    while runtime.tick(&source).unwrap() {}
+    while runtime.tick(&source).await.unwrap() {}
     let entry = Arc::new(DeploymentEntry::new(runtime));
     let state = HybridV2ApiState::new(vec![entry]);
     (state, deployment_id)
@@ -79,7 +79,7 @@ fn build_populated_state(chain_id: u64) -> (HybridV2ApiState, u64) {
 
 #[tokio::test]
 async fn deployments_route_lists_configured_deployment() {
-    let (state, _) = build_populated_state(84532);
+    let (state, _) = build_populated_state(84532).await;
     let app = build_hybrid_v2_read_router(state);
     let (status, body) = get_body(app, "/subaccounts/deployments").await;
     assert_eq!(status, StatusCode::OK);
@@ -91,7 +91,7 @@ async fn deployments_route_lists_configured_deployment() {
 
 #[tokio::test]
 async fn deployment_status_readable_and_has_metadata() {
-    let (state, _) = build_populated_state(84532);
+    let (state, _) = build_populated_state(84532).await;
     let app = build_hybrid_v2_read_router(state);
     let (status, body) = get_body(app, "/subaccounts/deployments/1/status").await;
     assert_eq!(status, StatusCode::OK);
@@ -106,7 +106,7 @@ async fn deployment_status_readable_and_has_metadata() {
 
 #[tokio::test]
 async fn deployment_status_returns_404_for_unknown() {
-    let (state, _) = build_populated_state(84532);
+    let (state, _) = build_populated_state(84532).await;
     let app = build_hybrid_v2_read_router(state);
     let (status, body) = get_body(app, "/subaccounts/deployments/999/status").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
@@ -115,7 +115,7 @@ async fn deployment_status_returns_404_for_unknown() {
 
 #[tokio::test]
 async fn owner_subaccounts_returns_owned_subs_only() {
-    let (state, _) = build_populated_state(84532);
+    let (state, _) = build_populated_state(84532).await;
     let app = build_hybrid_v2_read_router(state);
     let owner_hex = pad_address("0xa1");
     let uri = format!("/accounts/{}/hybrid-v2/subaccounts", owner_hex);
@@ -134,7 +134,7 @@ async fn owner_subaccounts_returns_owned_subs_only() {
 
 #[tokio::test]
 async fn owner_subaccounts_rejects_account_0() {
-    let (state, _) = build_populated_state(84532);
+    let (state, _) = build_populated_state(84532).await;
     let app = build_hybrid_v2_read_router(state);
     let uri = format!("/accounts/{}/hybrid-v2/subaccounts", pad_address("0x0"));
     let (status, body) = get_body(app, &uri).await;
@@ -144,7 +144,7 @@ async fn owner_subaccounts_rejects_account_0() {
 
 #[tokio::test]
 async fn owner_subaccounts_rejects_bad_address() {
-    let (state, _) = build_populated_state(84532);
+    let (state, _) = build_populated_state(84532).await;
     let app = build_hybrid_v2_read_router(state);
     let (status, body) = get_body(app, "/accounts/0xnothex/hybrid-v2/subaccounts").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -153,7 +153,7 @@ async fn owner_subaccounts_rejects_bad_address() {
 
 #[tokio::test]
 async fn subaccount_summary_returns_details() {
-    let (state, _) = build_populated_state(84532);
+    let (state, _) = build_populated_state(84532).await;
     let app = build_hybrid_v2_read_router(state);
     let sk = pad_bytes32("0xff01");
     let uri = format!("/subaccounts/{}", sk);
@@ -168,7 +168,7 @@ async fn subaccount_summary_returns_details() {
 
 #[tokio::test]
 async fn subaccount_summary_404_for_unknown_subkey() {
-    let (state, _) = build_populated_state(84532);
+    let (state, _) = build_populated_state(84532).await;
     let app = build_hybrid_v2_read_router(state);
     let uri = format!("/subaccounts/{}", pad_bytes32("0xdead"));
     let (status, body) = get_body(app, &uri).await;
@@ -178,7 +178,7 @@ async fn subaccount_summary_404_for_unknown_subkey() {
 
 #[tokio::test]
 async fn subaccount_summary_rejects_bad_subkey() {
-    let (state, _) = build_populated_state(84532);
+    let (state, _) = build_populated_state(84532).await;
     let app = build_hybrid_v2_read_router(state);
     let (status, body) = get_body(app, "/subaccounts/0xshort").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -187,7 +187,7 @@ async fn subaccount_summary_rejects_bad_subkey() {
 
 #[tokio::test]
 async fn collateral_returns_exact_integer_strings() {
-    let (state, _) = build_populated_state(84532);
+    let (state, _) = build_populated_state(84532).await;
     let app = build_hybrid_v2_read_router(state);
     let sk = pad_bytes32("0xff01");
     let uri = format!("/subaccounts/{}/collateral", sk);
@@ -203,7 +203,7 @@ async fn collateral_returns_exact_integer_strings() {
 
 #[tokio::test]
 async fn reservations_route_returns_engine_grouped_rows() {
-    let (state, _) = build_populated_state(84532);
+    let (state, _) = build_populated_state(84532).await;
     let app = build_hybrid_v2_read_router(state);
     let sk = pad_bytes32("0xff01");
     let uri = format!("/subaccounts/{}/reservations", sk);
@@ -217,7 +217,7 @@ async fn reservations_route_returns_engine_grouped_rows() {
 
 #[tokio::test]
 async fn executions_returns_complete_group() {
-    let (state, _) = build_populated_state(84532);
+    let (state, _) = build_populated_state(84532).await;
     let app = build_hybrid_v2_read_router(state);
     let sk = pad_bytes32("0xff01");
     let uri = format!("/subaccounts/{}/executions", sk);
@@ -234,7 +234,7 @@ async fn executions_returns_complete_group() {
 
 #[tokio::test]
 async fn fees_route_returns_premium_row() {
-    let (state, _) = build_populated_state(84532);
+    let (state, _) = build_populated_state(84532).await;
     let app = build_hybrid_v2_read_router(state);
     let sk = pad_bytes32("0xff01");
     let uri = format!("/subaccounts/{}/fees", sk);
@@ -248,7 +248,7 @@ async fn fees_route_returns_premium_row() {
 
 #[tokio::test]
 async fn history_returns_typed_tagged_events() {
-    let (state, _) = build_populated_state(84532);
+    let (state, _) = build_populated_state(84532).await;
     let app = build_hybrid_v2_read_router(state);
     let owner_hex = pad_address("0xa1");
     let uri = format!("/accounts/{}/hybrid-v2/history?limit=100", owner_hex);
@@ -275,7 +275,7 @@ async fn history_returns_typed_tagged_events() {
 
 #[tokio::test]
 async fn history_pagination_yields_no_duplicates() {
-    let (state, _) = build_populated_state(84532);
+    let (state, _) = build_populated_state(84532).await;
     let app = build_hybrid_v2_read_router(state);
     let owner_hex = pad_address("0xa1");
     // First page limit=2
@@ -307,7 +307,7 @@ async fn history_pagination_yields_no_duplicates() {
 
 #[tokio::test]
 async fn history_rejects_invalid_cursor() {
-    let (state, _) = build_populated_state(84532);
+    let (state, _) = build_populated_state(84532).await;
     let app = build_hybrid_v2_read_router(state);
     let uri = "/hybrid-v2/history?cursor=not-a-valid-cursor";
     let (status, body) = get_body(app, uri).await;
@@ -317,7 +317,7 @@ async fn history_rejects_invalid_cursor() {
 
 #[tokio::test]
 async fn history_family_filter_narrows_result() {
-    let (state, _) = build_populated_state(84532);
+    let (state, _) = build_populated_state(84532).await;
     let app = build_hybrid_v2_read_router(state);
     let owner_hex = pad_address("0xa1");
     let uri = format!("/accounts/{}/hybrid-v2/history?families=DEPOSIT", owner_hex);
@@ -330,7 +330,7 @@ async fn history_family_filter_narrows_result() {
 
 #[tokio::test]
 async fn history_direction_filter() {
-    let (state, _) = build_populated_state(84532);
+    let (state, _) = build_populated_state(84532).await;
     let app = build_hybrid_v2_read_router(state);
     let owner_hex = pad_address("0xa1");
     let uri = format!(
@@ -346,7 +346,7 @@ async fn history_direction_filter() {
 
 #[tokio::test]
 async fn history_rejects_page_limit_exceeded() {
-    let (state, _) = build_populated_state(84532);
+    let (state, _) = build_populated_state(84532).await;
     let app = build_hybrid_v2_read_router(state);
     let (status, body) = get_body(app, "/hybrid-v2/history?limit=10000").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -355,7 +355,7 @@ async fn history_rejects_page_limit_exceeded() {
 
 #[tokio::test]
 async fn openapi_route_returns_json_spec() {
-    let (state, _) = build_populated_state(84532);
+    let (state, _) = build_populated_state(84532).await;
     let app = build_hybrid_v2_read_router(state);
     let response = app
         .oneshot(
@@ -399,7 +399,7 @@ async fn not_ready_state_returns_503_on_canonical_route() {
 
 #[tokio::test]
 async fn recovery_returns_state_summary() {
-    let (state, _) = build_populated_state(84532);
+    let (state, _) = build_populated_state(84532).await;
     let app = build_hybrid_v2_read_router(state);
     let sk = pad_bytes32("0xff01");
     let uri = format!("/subaccounts/{}/recovery", sk);
@@ -411,7 +411,7 @@ async fn recovery_returns_state_summary() {
 
 #[tokio::test]
 async fn positions_ordered_by_series() {
-    let (state, _) = build_populated_state(84532);
+    let (state, _) = build_populated_state(84532).await;
     let app = build_hybrid_v2_read_router(state);
     let sk = pad_bytes32("0xff01");
     let uri = format!("/subaccounts/{}/positions", sk);
@@ -453,8 +453,8 @@ async fn deployment_isolation_no_cross_leak() {
     ));
     let mut ra = IndexerRuntime::new(1, manifest_a);
     let mut rb = IndexerRuntime::new(2, manifest_b);
-    ra.tick(&source_a).unwrap();
-    rb.tick(&source_b).unwrap();
+    ra.tick(&source_a).await.unwrap();
+    rb.tick(&source_b).await.unwrap();
     let ea = Arc::new(DeploymentEntry::new(ra));
     let eb = Arc::new(DeploymentEntry::new(rb));
     let state = HybridV2ApiState::new(vec![ea, eb]);

@@ -19,7 +19,7 @@
 //! - Restart-safe: the cursor + projection are reconstructible from
 //!   the raw log journal alone.
 
-use crate::hybrid_v2::chain_source::{ChainSource, RawBlock};
+use crate::hybrid_v2::chain_source::{ChainSource, ChainSourceError, RawBlock};
 use crate::hybrid_v2::correlation::ExecutionCorrelator;
 use crate::hybrid_v2::decoder::{decode_log_with, DecoderError};
 use crate::hybrid_v2::events::HybridV2Event;
@@ -112,6 +112,20 @@ pub enum RuntimeError {
     Persistence { block: u64, detail: String },
     #[error("bootstrap error: {detail}")]
     Bootstrap { detail: String },
+    /// A `ChainSource` call failed (transport, timeout, provider error,
+    /// malformed response). Distinct from `Persistence` so operators can
+    /// distinguish "the RPC provider is unreachable" from "the projection
+    /// store rejected the write". Never advances the cursor.
+    #[error("chain source error: {detail}")]
+    ChainSource { detail: String },
+}
+
+impl From<ChainSourceError> for RuntimeError {
+    fn from(err: ChainSourceError) -> Self {
+        RuntimeError::ChainSource {
+            detail: err.to_string(),
+        }
+    }
 }
 
 /// Outcome of `IndexerRuntime::bootstrap_from_persistence`. Documents
@@ -261,21 +275,22 @@ impl IndexerRuntime {
     /// applying it transactionally. Returns:
     /// - `Ok(true)` when a block was applied.
     /// - `Ok(false)` when the source has no new block.
-    pub fn tick(&mut self, source: &dyn ChainSource) -> Result<bool, RuntimeError> {
-        if source.chain_id() != self.manifest.chain_id {
+    pub async fn tick(&mut self, source: &dyn ChainSource) -> Result<bool, RuntimeError> {
+        let src_chain_id = self.await_chain_id(source).await?;
+        if src_chain_id != self.manifest.chain_id {
             self.readiness = ReadinessState::new_not_ready(ReadinessReason::WrongChain {
                 manifest: self.manifest.chain_id,
-                source: source.chain_id(),
+                source: src_chain_id,
             });
             return Err(RuntimeError::WrongChain {
                 manifest: self.manifest.chain_id,
-                source_chain: source.chain_id(),
+                source_chain: src_chain_id,
             });
         }
-        self.metrics.observed_block = source.head_block_number();
-        self.metrics.finalized_block = source.finalized_block_number();
+        self.metrics.observed_block = self.await_head(source).await?;
+        self.metrics.finalized_block = self.await_finalized(source).await?;
         let next = self.cursor.indexed_head_block + 1;
-        let Some(block) = source.block_at(next) else {
+        let Some(block) = self.await_block_at(source, next).await? else {
             self.recompute_readiness();
             return Ok(false);
         };
@@ -283,11 +298,11 @@ impl IndexerRuntime {
         if self.cursor.indexed_head_block > 0
             && !parents_match(&self.cursor.indexed_head_hash, &block.parent_hash)
         {
-            self.handle_reorg(source, &block)?;
+            self.handle_reorg(source, &block).await?;
             // After rewind, cursor may have jumped back multiple blocks. The
             // next tick will re-pull the correct next block from the source
             // rather than skipping ahead to `block`.
-            self.metrics.observed_block = source.head_block_number();
+            self.metrics.observed_block = self.await_head(source).await?;
             self.metrics.lag = self
                 .metrics
                 .observed_block
@@ -296,13 +311,58 @@ impl IndexerRuntime {
             return Ok(true);
         }
         self.apply_block(&block)?;
-        self.metrics.observed_block = source.head_block_number();
+        self.metrics.observed_block = self.await_head(source).await?;
         self.metrics.lag = self
             .metrics
             .observed_block
             .saturating_sub(self.cursor.indexed_head_block);
         self.recompute_readiness();
         Ok(true)
+    }
+
+    /// Wrap `source.chain_id().await` in a fail-closed conversion that
+    /// sets readiness to `ProjectionFailure` for the current cursor
+    /// block and returns `RuntimeError::ChainSource`. Keeps the tick
+    /// bodies flat.
+    async fn await_chain_id(&mut self, source: &dyn ChainSource) -> Result<u64, RuntimeError> {
+        match source.chain_id().await {
+            Ok(v) => Ok(v),
+            Err(err) => Err(self.chain_source_failure(err)),
+        }
+    }
+
+    async fn await_head(&mut self, source: &dyn ChainSource) -> Result<u64, RuntimeError> {
+        match source.head_block_number().await {
+            Ok(v) => Ok(v),
+            Err(err) => Err(self.chain_source_failure(err)),
+        }
+    }
+
+    async fn await_finalized(&mut self, source: &dyn ChainSource) -> Result<u64, RuntimeError> {
+        match source.finalized_block_number().await {
+            Ok(v) => Ok(v),
+            Err(err) => Err(self.chain_source_failure(err)),
+        }
+    }
+
+    async fn await_block_at(
+        &mut self,
+        source: &dyn ChainSource,
+        n: u64,
+    ) -> Result<Option<RawBlock>, RuntimeError> {
+        match source.block_at(n).await {
+            Ok(v) => Ok(v),
+            Err(err) => Err(self.chain_source_failure(err)),
+        }
+    }
+
+    fn chain_source_failure(&mut self, err: ChainSourceError) -> RuntimeError {
+        let detail = format!("chain_source: {err}");
+        self.readiness = ReadinessState::new_not_ready(ReadinessReason::ProjectionFailure {
+            block: self.cursor.indexed_head_block,
+            detail: detail.clone(),
+        });
+        RuntimeError::ChainSource { detail }
     }
 
     /// Apply one canonical block atomically. On failure, projections and
@@ -394,13 +454,13 @@ impl IndexerRuntime {
         Ok(())
     }
 
-    fn handle_reorg(
+    async fn handle_reorg(
         &mut self,
         source: &dyn ChainSource,
         incoming: &RawBlock,
     ) -> Result<(), RuntimeError> {
         let planner = ReorgPlanner::new(self.max_reorg_depth);
-        let outcome = planner.plan(&self.raw_logs, source, incoming)?;
+        let outcome = planner.plan(&self.raw_logs, source, incoming).await?;
         match outcome {
             ReorgOutcome::NoReorgRequired => Ok(()),
             ReorgOutcome::Rewind {
@@ -583,23 +643,24 @@ impl IndexerRuntime {
         source: &dyn ChainSource,
     ) -> Result<bool, RuntimeError> {
         if self.persistence.is_none() {
-            return self.tick(source);
+            return self.tick(source).await;
         }
         // Chain-id mismatch — surface identically to `tick()`.
-        if source.chain_id() != self.manifest.chain_id {
+        let src_chain_id = self.await_chain_id(source).await?;
+        if src_chain_id != self.manifest.chain_id {
             self.readiness = ReadinessState::new_not_ready(ReadinessReason::WrongChain {
                 manifest: self.manifest.chain_id,
-                source: source.chain_id(),
+                source: src_chain_id,
             });
             return Err(RuntimeError::WrongChain {
                 manifest: self.manifest.chain_id,
-                source_chain: source.chain_id(),
+                source_chain: src_chain_id,
             });
         }
-        self.metrics.observed_block = source.head_block_number();
-        self.metrics.finalized_block = source.finalized_block_number();
+        self.metrics.observed_block = self.await_head(source).await?;
+        self.metrics.finalized_block = self.await_finalized(source).await?;
         let next = self.cursor.indexed_head_block + 1;
-        let Some(block) = source.block_at(next) else {
+        let Some(block) = self.await_block_at(source, next).await? else {
             self.recompute_readiness();
             return Ok(false);
         };
@@ -608,8 +669,8 @@ impl IndexerRuntime {
             && !parents_match(&self.cursor.indexed_head_hash, &block.parent_hash)
         {
             // Handle in-memory reorg; capture pending audit metadata.
-            self.handle_reorg(source, &block)?;
-            self.metrics.observed_block = source.head_block_number();
+            self.handle_reorg(source, &block).await?;
+            self.metrics.observed_block = self.await_head(source).await?;
             self.metrics.lag = self
                 .metrics
                 .observed_block
@@ -704,7 +765,7 @@ impl IndexerRuntime {
             });
         }
 
-        self.metrics.observed_block = source.head_block_number();
+        self.metrics.observed_block = self.await_head(source).await?;
         self.metrics.lag = self
             .metrics
             .observed_block

@@ -14,8 +14,8 @@ use hybrid_v2_support::{
 
 /// Duplicate application (via re-tick over the same block chain) is
 /// idempotent because the runtime cursor rejects already-indexed blocks.
-#[test]
-fn duplicate_tick_over_same_source_is_idempotent() {
+#[tokio::test]
+async fn duplicate_tick_over_same_source_is_idempotent() {
     let manifest = baseline_manifest(84532);
     let mut source = InMemoryChainSource::new(84532);
     source.push(block(
@@ -29,19 +29,19 @@ fn duplicate_tick_over_same_source_is_idempotent() {
         ],
     ));
     let mut runtime = IndexerRuntime::new(1, manifest);
-    while runtime.tick(&source).unwrap() {}
+    while runtime.tick(&source).await.unwrap() {}
     let first_state = runtime.projection().clone();
     // Ticking again with no new blocks changes nothing.
     for _ in 0..5 {
-        runtime.tick(&source).unwrap();
+        runtime.tick(&source).await.unwrap();
     }
     assert_eq!(&first_state, runtime.projection());
 }
 
 /// Full rebuild from the canonical raw log journal equals the incremental
 /// state exactly.
-#[test]
-fn rebuild_equals_incremental() {
+#[tokio::test]
+async fn rebuild_equals_incremental() {
     let manifest = baseline_manifest(84532);
     let mut source = InMemoryChainSource::new(84532);
     for i in 1u64..=10 {
@@ -64,7 +64,7 @@ fn rebuild_equals_incremental() {
         ));
     }
     let mut runtime = IndexerRuntime::new(1, manifest.clone());
-    while runtime.tick(&source).unwrap() {}
+    while runtime.tick(&source).await.unwrap() {}
     let incr = runtime.projection().clone();
     let rebuilt = RebuildService::new(manifest.event_version)
         .replay_all(&runtime.raw_logs)
@@ -75,8 +75,8 @@ fn rebuild_equals_incremental() {
 }
 
 /// Balances never go negative — every withdraw is bounded by prior deposits.
-#[test]
-fn balance_never_negative_under_bounded_ops() {
+#[tokio::test]
+async fn balance_never_negative_under_bounded_ops() {
     let manifest = baseline_manifest(84532);
     let mut source = InMemoryChainSource::new(84532);
     source.push(block(
@@ -91,15 +91,15 @@ fn balance_never_negative_under_bounded_ops() {
         ],
     ));
     let mut runtime = IndexerRuntime::new(1, manifest);
-    runtime.tick(&source).unwrap();
+    runtime.tick(&source).await.unwrap();
     for (_, bal) in runtime.projection().balances.iter() {
         assert!(!bal.starts_with('-'));
     }
 }
 
 /// Reservations never go negative under bounded lock/unlock sequences.
-#[test]
-fn reservation_never_negative() {
+#[tokio::test]
+async fn reservation_never_negative() {
     let manifest = baseline_manifest(84532);
     let mut source = InMemoryChainSource::new(84532);
     source.push(block(
@@ -114,15 +114,15 @@ fn reservation_never_negative() {
         ],
     ));
     let mut runtime = IndexerRuntime::new(1, manifest);
-    runtime.tick(&source).unwrap();
+    runtime.tick(&source).await.unwrap();
     for (_, r) in runtime.projection().reservations.iter() {
         assert!(!r.starts_with('-'));
     }
 }
 
 /// Two deployments never contaminate each other's projection state.
-#[test]
-fn deployments_are_isolated() {
+#[tokio::test]
+async fn deployments_are_isolated() {
     let manifest_a = baseline_manifest(84532);
     let mut manifest_b = baseline_manifest(84532);
     manifest_b.deployment_version = 2;
@@ -153,8 +153,8 @@ fn deployments_are_isolated() {
 
     let mut ra = IndexerRuntime::new(1, manifest_a);
     let mut rb = IndexerRuntime::new(2, manifest_b);
-    ra.tick(&source_a).unwrap();
-    rb.tick(&source_b).unwrap();
+    ra.tick(&source_a).await.unwrap();
+    rb.tick(&source_b).await.unwrap();
     let bal_a = ra.projection().balances.values().next().cloned().unwrap();
     let bal_b = rb.projection().balances.values().next().cloned().unwrap();
     assert_eq!(bal_a, "100");

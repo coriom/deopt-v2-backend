@@ -28,7 +28,7 @@ async fn get_body(app: axum::Router, uri: &str) -> (StatusCode, Value) {
     (status, json)
 }
 
-fn build_frozen_state(n_blocks: u64) -> Arc<DeploymentEntry> {
+async fn build_frozen_state(n_blocks: u64) -> Arc<DeploymentEntry> {
     let manifest = baseline_manifest(84532);
     let mut source = InMemoryChainSource::new(84532);
     for i in 1..=n_blocks {
@@ -55,13 +55,13 @@ fn build_frozen_state(n_blocks: u64) -> Arc<DeploymentEntry> {
         ));
     }
     let mut runtime = IndexerRuntime::new(1, manifest);
-    while runtime.tick(&source).unwrap() {}
+    while runtime.tick(&source).await.unwrap() {}
     Arc::new(DeploymentEntry::new(runtime))
 }
 
 #[tokio::test]
 async fn pagination_frozen_dataset_yields_every_item_once() {
-    let entry = build_frozen_state(20);
+    let entry = build_frozen_state(20).await;
     let state = HybridV2ApiState::new(vec![entry]);
     let app = build_hybrid_v2_read_router(state);
     let owner_hex = pad_address("0xa1");
@@ -103,7 +103,7 @@ async fn pagination_frozen_dataset_yields_every_item_once() {
 
 #[tokio::test]
 async fn filtered_pagination_equals_pagination_over_filtered_set() {
-    let entry = build_frozen_state(10);
+    let entry = build_frozen_state(10).await;
     let state = HybridV2ApiState::new(vec![entry]);
     let app = build_hybrid_v2_read_router(state);
     let owner_hex = pad_address("0xa1");
@@ -162,7 +162,7 @@ async fn reorg_stale_cursor_returns_409_conflict() {
             vec![deposit_log(&manifest, "0xf1", "0xa1", 1, "0xef", "50")],
         ));
     let mut runtime = IndexerRuntime::new(1, manifest.clone());
-    while runtime.tick(&source).unwrap() {}
+    while runtime.tick(&source).await.unwrap() {}
     let entry = Arc::new(DeploymentEntry::new(runtime));
     let state = HybridV2ApiState::new(vec![entry.clone()]);
     let app = build_hybrid_v2_read_router(state);
@@ -199,7 +199,7 @@ async fn reorg_stale_cursor_returns_409_conflict() {
             .expect("runtime-backed entry must carry a runtime handle")
             .clone();
         let mut rt = rt_lock.write().unwrap();
-        while rt.tick(&source).unwrap() {}
+        while rt.tick(&source).await.unwrap() {}
     }
     // Now the old cursor is stale — bound to hash 0xb2 which is no longer canonical.
     let uri = format!(
@@ -229,7 +229,7 @@ async fn owner_wide_history_never_leaks_sibling_events() {
         ],
     ));
     let mut runtime = IndexerRuntime::new(1, manifest);
-    runtime.tick(&source).unwrap();
+    runtime.tick(&source).await.unwrap();
     let entry = Arc::new(DeploymentEntry::new(runtime));
     let state = HybridV2ApiState::new(vec![entry]);
     let app = build_hybrid_v2_read_router(state);
@@ -262,7 +262,7 @@ async fn integer_serialization_roundtrips_large_uint() {
         ],
     ));
     let mut runtime = IndexerRuntime::new(1, manifest);
-    runtime.tick(&source).unwrap();
+    runtime.tick(&source).await.unwrap();
     let entry = Arc::new(DeploymentEntry::new(runtime));
     let state = HybridV2ApiState::new(vec![entry]);
     let app = build_hybrid_v2_read_router(state);

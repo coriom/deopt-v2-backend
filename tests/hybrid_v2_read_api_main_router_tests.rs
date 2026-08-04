@@ -63,11 +63,11 @@ async fn status_only(app: axum::Router, method: &str, uri: &str) -> StatusCode {
     response.status()
 }
 
-fn state_without_hybrid_v2() -> AppState {
+async fn state_without_hybrid_v2() -> AppState {
     AppState::new(EngineState::with_default_markets())
 }
 
-fn state_with_ready_hybrid_v2() -> AppState {
+async fn state_with_ready_hybrid_v2() -> AppState {
     let manifest = baseline_manifest(84532);
     let mut source = InMemoryChainSource::new(84532);
     source.push(block(
@@ -81,7 +81,7 @@ fn state_with_ready_hybrid_v2() -> AppState {
         ],
     ));
     let mut runtime = IndexerRuntime::new(1, manifest);
-    while runtime.tick(&source).unwrap() {}
+    while runtime.tick(&source).await.unwrap() {}
     let entry = Arc::new(DeploymentEntry::new(runtime));
     let hybrid_state = HybridV2ApiState::new(vec![entry]);
     AppState::new(EngineState::with_default_markets()).with_hybrid_v2(hybrid_state)
@@ -92,7 +92,7 @@ fn state_with_ready_hybrid_v2() -> AppState {
 #[tokio::test]
 async fn app_state_default_omits_hybrid_v2_configuration() {
     // AppState::new must succeed without any Hybrid V2 configuration.
-    let state = state_without_hybrid_v2();
+    let state = state_without_hybrid_v2().await;
     assert!(state.hybrid_v2_read.list().is_empty());
     // The full router must build without panicking.
     let _app = router(state);
@@ -100,7 +100,7 @@ async fn app_state_default_omits_hybrid_v2_configuration() {
 
 #[tokio::test]
 async fn deployments_route_returns_empty_when_unconfigured() {
-    let state = state_without_hybrid_v2();
+    let state = state_without_hybrid_v2().await;
     let app = router(state);
     let (status, body) = get_body(app, "/subaccounts/deployments").await;
     assert_eq!(status, StatusCode::OK);
@@ -114,7 +114,7 @@ async fn canonical_route_returns_400_when_unconfigured() {
     // `INVALID_DEPLOYMENT`. Once populated with a single deployment the
     // implicit resolution kicks in; when multiple are populated the
     // caller must pass `deployment_id`.
-    let state = state_without_hybrid_v2();
+    let state = state_without_hybrid_v2().await;
     let app = router(state);
     let owner_hex = pad_address("0xa1");
     let (status, body) = get_body(
@@ -130,7 +130,7 @@ async fn canonical_route_returns_400_when_unconfigured() {
 
 #[tokio::test]
 async fn health_route_still_reachable_through_merged_router() {
-    let state = state_without_hybrid_v2();
+    let state = state_without_hybrid_v2().await;
     let app = router(state);
     let response = app
         .oneshot(
@@ -146,7 +146,7 @@ async fn health_route_still_reachable_through_merged_router() {
 
 #[tokio::test]
 async fn markets_route_still_reachable_through_merged_router() {
-    let state = state_without_hybrid_v2();
+    let state = state_without_hybrid_v2().await;
     let app = router(state);
     let response = app
         .oneshot(
@@ -169,7 +169,7 @@ async fn account_history_v2_route_still_reachable_through_merged_router() {
     // reachable after the Hybrid V2 merge. We check for anything other
     // than 404 to prove non-collision — the exact status depends on the
     // V1 handler's behaviour with a synthetic address.
-    let state = state_without_hybrid_v2();
+    let state = state_without_hybrid_v2().await;
     let app = router(state);
     let addr = "0x000000000000000000000000000000000000abcd";
     let response = app
@@ -188,7 +188,7 @@ async fn account_history_v2_route_still_reachable_through_merged_router() {
 
 #[tokio::test]
 async fn ready_deployment_serves_status_through_real_router() {
-    let state = state_with_ready_hybrid_v2();
+    let state = state_with_ready_hybrid_v2().await;
     let app = router(state);
     let (status, body) = get_body(app, "/subaccounts/deployments/1/status").await;
     assert_eq!(status, StatusCode::OK);
@@ -200,7 +200,7 @@ async fn ready_deployment_serves_status_through_real_router() {
 
 #[tokio::test]
 async fn ready_deployment_serves_owner_subaccounts_through_real_router() {
-    let state = state_with_ready_hybrid_v2();
+    let state = state_with_ready_hybrid_v2().await;
     let app = router(state);
     let owner_hex = pad_address("0xa1");
     let (status, body) = get_body(
@@ -218,7 +218,7 @@ async fn ready_deployment_serves_owner_subaccounts_through_real_router() {
 
 #[tokio::test]
 async fn ready_deployment_serves_collateral_through_real_router() {
-    let state = state_with_ready_hybrid_v2();
+    let state = state_with_ready_hybrid_v2().await;
     let app = router(state);
     let sk = pad_bytes32("0xff01");
     let (status, body) = get_body(app, &format!("/subaccounts/{}/collateral", sk)).await;
@@ -230,7 +230,7 @@ async fn ready_deployment_serves_collateral_through_real_router() {
 
 #[tokio::test]
 async fn ready_deployment_serves_history_through_real_router() {
-    let state = state_with_ready_hybrid_v2();
+    let state = state_with_ready_hybrid_v2().await;
     let app = router(state);
     let owner_hex = pad_address("0xa1");
     let (status, body) = get_body(
@@ -254,7 +254,7 @@ async fn ready_deployment_serves_history_through_real_router() {
 
 #[tokio::test]
 async fn malformed_address_returns_400_through_real_router() {
-    let state = state_with_ready_hybrid_v2();
+    let state = state_with_ready_hybrid_v2().await;
     let app = router(state);
     let (status, body) = get_body(app, "/accounts/0xnothex/hybrid-v2/subaccounts").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -263,7 +263,7 @@ async fn malformed_address_returns_400_through_real_router() {
 
 #[tokio::test]
 async fn malformed_subkey_returns_400_through_real_router() {
-    let state = state_with_ready_hybrid_v2();
+    let state = state_with_ready_hybrid_v2().await;
     let app = router(state);
     let (status, body) = get_body(app, "/subaccounts/0xshort").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -272,7 +272,7 @@ async fn malformed_subkey_returns_400_through_real_router() {
 
 #[tokio::test]
 async fn account_0_rejected_through_real_router() {
-    let state = state_with_ready_hybrid_v2();
+    let state = state_with_ready_hybrid_v2().await;
     let app = router(state);
     let zero = format!("0x{}", "0".repeat(40));
     let (status, body) = get_body(app, &format!("/accounts/{}/hybrid-v2/subaccounts", zero)).await;
@@ -289,7 +289,7 @@ async fn hybrid_v2_write_method_rejected_405_or_404() {
     // Allowed when a path exists with different methods; 404 when the
     // path itself is unknown. Either is acceptable — the key contract is
     // that no write handler executes.
-    let state = state_with_ready_hybrid_v2();
+    let state = state_with_ready_hybrid_v2().await;
     let app = router(state);
     for method in ["POST", "PUT", "PATCH", "DELETE"] {
         let sk = pad_bytes32("0xff01");
@@ -312,7 +312,7 @@ async fn hybrid_v2_write_method_rejected_405_or_404() {
 
 #[tokio::test]
 async fn openapi_served_through_real_router() {
-    let state = state_without_hybrid_v2();
+    let state = state_without_hybrid_v2().await;
     let app = router(state);
     let response = app
         .oneshot(
