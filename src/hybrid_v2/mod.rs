@@ -30,13 +30,15 @@ pub mod rebuild;
 pub mod reducer;
 pub mod reorg;
 pub mod repository;
+pub mod rpc_chain_source;
 pub mod runtime;
 pub mod runtime_backed_read_store;
 pub mod snapshot;
 pub mod topics;
 pub mod worker;
 
-pub use chain_source::{ChainSource, InMemoryChainSource, RawBlock};
+pub use chain_source::{ChainSource, ChainSourceError, InMemoryChainSource, RawBlock};
+pub use rpc_chain_source::{RpcHybridV2ChainSource, RpcSourceConfig};
 pub use chain_view::{
     ChainViewProvider, InMemoryChainViewProvider, Reconciler, ReconciliationResult,
 };
