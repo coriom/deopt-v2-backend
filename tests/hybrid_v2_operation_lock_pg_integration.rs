@@ -74,6 +74,10 @@ async fn build_two_deployments(pool: &PgPool) -> (Arc<dyn HybridV2ProjectionStor
     let mut m2 = baseline_manifest(84532);
     m2.manifest_hash = format!("0x{}", "e".repeat(64));
     m2.manifest_address = format!("0x{}", "0e".repeat(20));
+    // `hybrid_v2_deployments_version_uniq` is keyed on
+    // `(chain_id, deployment_version)` — two manifests on the same
+    // chain must carry distinct versions to coexist in the store.
+    m2.deployment_version = m2.deployment_version.wrapping_add(1);
     let d2 = store
         .upsert_deployment(&m2, "PENDING", 1_700_000_000_000)
         .await

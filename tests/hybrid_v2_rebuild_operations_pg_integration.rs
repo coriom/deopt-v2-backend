@@ -97,6 +97,10 @@ fn baseline_manifest_alt(
         "0x{}",
         "d".repeat(64) // distinct manifest_hash → distinct deployment_id
     );
+    // `hybrid_v2_deployments_version_uniq` is keyed on
+    // `(chain_id, deployment_version)` — two manifests on the same
+    // chain must carry distinct versions.
+    m.deployment_version = m.deployment_version.wrapping_add(1);
     m
 }
 
