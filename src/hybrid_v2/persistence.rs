@@ -948,20 +948,23 @@ impl HybridV2ProjectionStore for PostgresHybridV2ProjectionStore {
         holder_epoch: i64,
         now_ms: i64,
     ) -> Result<Option<crate::hybrid_v2::reorg_recovery::ReorgLockGuard>> {
-        // Best-effort stale-lock cleanup: if the row exists but the
-        // paired recovery row is either absent, terminal-ok, or the
-        // stored epoch has advanced past the holder's, delete the lock
-        // before attempting to acquire.
+        // Best-effort stale-lock cleanup: only delete the lock when we
+        // can PROVE the previous holder is done — that is, a recovery
+        // row exists for this deployment whose epoch is >= the lock's
+        // holder_epoch AND the phase is terminal-ok (RECOVERED) OR the
+        // phase is MANUAL_INTERVENTION_REQUIRED (operator abandoned).
+        // Absence of a recovery row is NOT treated as stale — that
+        // condition holds during the natural gap between lock
+        // acquisition and the first `upsert_reorg_recovery` call in a
+        // freshly started recovery.
         sqlx::query(
             "DELETE FROM hybrid_v2_reorg_locks
              WHERE deployment_id = $1
-               AND (
-                   NOT EXISTS (
-                       SELECT 1 FROM hybrid_v2_reorg_recovery r
-                       WHERE r.deployment_id = $1
-                         AND r.recovery_epoch >= hybrid_v2_reorg_locks.holder_epoch
-                         AND r.phase NOT IN ('RECOVERED', 'NONE')
-                   )
+               AND EXISTS (
+                   SELECT 1 FROM hybrid_v2_reorg_recovery r
+                   WHERE r.deployment_id = $1
+                     AND r.recovery_epoch >= hybrid_v2_reorg_locks.holder_epoch
+                     AND r.phase IN ('RECOVERED', 'MANUAL_INTERVENTION_REQUIRED')
                )",
         )
         .bind(deployment_id)

@@ -204,6 +204,10 @@ async fn deployment_isolation_pg() {
     let manifest_a = baseline_manifest(84532);
     let mut manifest_b = baseline_manifest(84532);
     manifest_b.manifest_hash = "0xdifferent".to_string();
+    // `hybrid_v2_deployments_version_uniq` is keyed on
+    // `(chain_id, deployment_version)` — two manifests on the same
+    // chain must carry distinct versions to coexist in the store.
+    manifest_b.deployment_version = manifest_b.deployment_version.wrapping_add(1);
     let did_a = store
         .upsert_deployment(&manifest_a, "PENDING", 1_700_000_000_000)
         .await
@@ -495,4 +499,157 @@ async fn commit_reorg_recovery_marks_orphans_and_advances_cursor() {
     .await
     .unwrap();
     assert!(orphan_rows >= 2, "expected at least 2 orphaned blocks");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn excessive_depth_enters_manual_intervention() {
+    let Some(url) = get_pg_url_or_skip_or_panic("excessive_depth_enters_manual_intervention")
+    else {
+        return;
+    };
+    let pool = fresh_pool(&url).await;
+    let (store, did) = build_store(&pool).await;
+    let manifest = baseline_manifest(84532);
+    let mut runtime = IndexerRuntime::new(1, manifest.clone()).with_persistence(store.clone(), did);
+
+    // Build the canonical chain 0..=5 on branch AA.
+    let mut source = InMemoryChainSource::new(84532);
+    let b0 = make_block(0, 0xaa, "");
+    let mut parent = b0.hash.clone();
+    source.push(b0.clone());
+    let mut aa_blocks = Vec::new();
+    for n in 1..=5u64 {
+        let b = make_block(n, 0xaa, &parent);
+        parent = b.hash.clone();
+        aa_blocks.push(b.clone());
+        source.push(b);
+    }
+    let _ = drive_forward(&mut runtime, &source, 5).await;
+    assert_eq!(runtime.cursor().indexed_head_block, 5);
+
+    // Swap to a completely disjoint fork BB starting from block 1 —
+    // the recovery would need to walk back 4 blocks (depth=4) to find
+    // the common ancestor at height 0. Configure max_reorg_depth=2 so
+    // the ancestor search fails-closed to ManualInterventionRequired.
+    let mut parent_bb = b0.hash.clone();
+    let mut bb_blocks = Vec::new();
+    for n in 1..=6u64 {
+        let b = make_block(n, 0xbb, &parent_bb);
+        parent_bb = b.hash.clone();
+        bb_blocks.push(b);
+    }
+    source.reorg_from(1, bb_blocks.clone());
+
+    let cfg = ReorgRecoveryConfig {
+        max_reorg_depth: 2,
+        ..ReorgRecoveryConfig::default()
+    };
+    let service = ReorgRecoveryService::new(did, cfg);
+    let store_dyn: Arc<dyn HybridV2ProjectionStore> = store.clone();
+    let detection = ReorgDetection {
+        old_tip_block: 5,
+        old_tip_hash: aa_blocks.last().unwrap().hash.clone(),
+        conflicting_block: Some(6),
+        conflicting_hash: Some(bb_blocks.last().unwrap().hash.clone()),
+    };
+    let outcome = service
+        .recover(&source, &store_dyn, &manifest, Some(detection), "indexer")
+        .await
+        .expect("recovery reports outcome even on failure");
+    match outcome {
+        RecoveryOutcome::ManualInterventionRequired { reason, .. } => {
+            assert!(
+                reason.to_ascii_lowercase().contains("depth")
+                    || reason.to_ascii_lowercase().contains("ancestor"),
+                "unexpected reason: {reason}"
+            );
+        }
+        other => panic!("expected ManualInterventionRequired, got {other:?}"),
+    }
+    let recovery = store
+        .read_reorg_recovery(did)
+        .await
+        .unwrap()
+        .expect("recovery row persisted");
+    assert_eq!(
+        recovery.phase,
+        ReorgRecoveryPhase::ManualInterventionRequired
+    );
+    // Cursor must not advance.
+    let cursor = store.read_cursor(did, "indexer").await.unwrap().unwrap();
+    assert_eq!(cursor.indexed_head_block, 5);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn finalized_boundary_violation_manual_intervention() {
+    let Some(url) = get_pg_url_or_skip_or_panic("finalized_boundary_violation_manual_intervention")
+    else {
+        return;
+    };
+    let pool = fresh_pool(&url).await;
+    let (store, did) = build_store(&pool).await;
+    let manifest = baseline_manifest(84532);
+    let mut runtime = IndexerRuntime::new(1, manifest.clone()).with_persistence(store.clone(), did);
+
+    // Canonical AA chain 0..=5, with finalized=4 announced by the
+    // source. A reorg that requires rewriting block 3 would cross the
+    // finalized boundary.
+    let mut source = InMemoryChainSource::new(84532);
+    let b0 = make_block(0, 0xaa, "");
+    source.push(b0.clone());
+    let mut parent = b0.hash.clone();
+    let mut aa_blocks = Vec::new();
+    for n in 1..=5u64 {
+        let b = make_block(n, 0xaa, &parent);
+        parent = b.hash.clone();
+        aa_blocks.push(b.clone());
+        source.push(b);
+    }
+    source.set_finalized(4);
+    let _ = drive_forward(&mut runtime, &source, 5).await;
+    assert_eq!(runtime.cursor().indexed_head_block, 5);
+
+    // Reorg back to block 2 — ancestor=2 <= finalized=4 → refuse.
+    let b3b = make_block(3, 0xbb, &aa_blocks[1].hash);
+    let b4b = make_block(4, 0xbb, &b3b.hash);
+    let b5b = make_block(5, 0xbb, &b4b.hash);
+    let b6b = make_block(6, 0xbb, &b5b.hash);
+    source.reorg_from(3, vec![b3b.clone(), b4b.clone(), b5b.clone(), b6b.clone()]);
+    source.set_finalized(4);
+
+    let cfg = ReorgRecoveryConfig {
+        max_reorg_depth: 16,
+        allow_finalized_boundary_crossing: false,
+        ..ReorgRecoveryConfig::default()
+    };
+    let service = ReorgRecoveryService::new(did, cfg);
+    let store_dyn: Arc<dyn HybridV2ProjectionStore> = store.clone();
+    let detection = ReorgDetection {
+        old_tip_block: 5,
+        old_tip_hash: aa_blocks.last().unwrap().hash.clone(),
+        conflicting_block: Some(6),
+        conflicting_hash: Some(b6b.hash.clone()),
+    };
+    let result = service
+        .recover(&source, &store_dyn, &manifest, Some(detection), "indexer")
+        .await;
+    match result {
+        Err(err) => {
+            let s = err.to_string().to_ascii_lowercase();
+            assert!(s.contains("finalized"), "unexpected error string: {}", err);
+        }
+        Ok(other) => panic!("expected FinalizedBoundaryViolation error, got {other:?}"),
+    }
+    let recovery = store
+        .read_reorg_recovery(did)
+        .await
+        .unwrap()
+        .expect("recovery row persisted");
+    assert_eq!(
+        recovery.phase,
+        ReorgRecoveryPhase::ManualInterventionRequired
+    );
+    // Cursor must not advance.
+    let cursor = store.read_cursor(did, "indexer").await.unwrap().unwrap();
+    assert_eq!(cursor.indexed_head_block, 5);
 }
