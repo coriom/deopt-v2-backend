@@ -3299,17 +3299,20 @@ impl HybridV2ProjectionStore for InMemoryProjectionStore {
         now_ms: i64,
     ) -> Result<Option<crate::hybrid_v2::rebuild_operations::OperationLockGuard>> {
         let mut inner = self.inner.lock().unwrap();
+        // Stale-lock cleanup: only delete when we can prove the prior
+        // holder is terminal. Absence of any paired state row is NOT
+        // treated as terminal — that condition holds during the natural
+        // window between lock acquisition and the first upsert of the
+        // paired state row. Matching the PG semantics.
         let should_delete = match inner.operation_locks.get(&deployment_id) {
             Some((prev_op, _prev_epoch, _)) => match prev_op {
                 crate::hybrid_v2::rebuild_operations::OperationKind::Reorg => {
                     matches!(
-                        inner
-                            .reorg_recovery
-                            .get(&deployment_id)
-                            .map(|r| r.phase),
+                        inner.reorg_recovery.get(&deployment_id).map(|r| r.phase),
                         Some(crate::hybrid_v2::reorg_recovery::ReorgRecoveryPhase::Recovered)
-                            | Some(crate::hybrid_v2::reorg_recovery::ReorgRecoveryPhase::None)
-                            | None
+                            | Some(
+                                crate::hybrid_v2::reorg_recovery::ReorgRecoveryPhase::ManualInterventionRequired
+                            )
                     )
                 }
                 crate::hybrid_v2::rebuild_operations::OperationKind::Rebuild => inner
@@ -3317,9 +3320,9 @@ impl HybridV2ProjectionStore for InMemoryProjectionStore {
                     .iter()
                     .filter(|((d, _), _)| *d == deployment_id)
                     .map(|(_, v)| v.phase)
+                    .filter(|p| p.is_terminal())
                     .last()
-                    .map(|p| p.is_terminal())
-                    .unwrap_or(true),
+                    .is_some(),
                 crate::hybrid_v2::rebuild_operations::OperationKind::Reconciliation => true,
             },
             None => false,
