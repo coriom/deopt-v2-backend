@@ -91,7 +91,9 @@ fn empty_state() -> ProjectionState {
 #[tokio::test]
 async fn reconciliation_converged_persists_row() {
     let name = "reconciliation_converged_persists_row";
-    let Some(url) = get_pg_url_or_skip_or_panic(name) else { return };
+    let Some(url) = get_pg_url_or_skip_or_panic(name) else {
+        return;
+    };
     let pool = fresh_pool(&url).await;
     let (store, did) = build_store(&pool).await;
     let manifest = baseline_manifest(84532);
@@ -102,11 +104,21 @@ async fn reconciliation_converged_persists_row() {
     let sched = ReconciliationScheduler::new(did, ReconciliationSchedulerConfig::default());
     let state = empty_state();
     let record = sched
-        .run_once(&store, &provider, &manifest.manifest_hash, &state, 1, "0xabcd")
+        .run_once(
+            &store,
+            &provider,
+            &manifest.manifest_hash,
+            &state,
+            1,
+            "0xabcd",
+        )
         .await
         .expect("run");
     assert_eq!(record.classification, DriftClassification::Converged);
-    assert_eq!(record.provider_availability, ProviderAvailability::Available);
+    assert_eq!(
+        record.provider_availability,
+        ProviderAvailability::Available
+    );
     let latest = store
         .read_latest_reconciliation_result(did)
         .await
@@ -119,7 +131,9 @@ async fn reconciliation_converged_persists_row() {
 #[tokio::test]
 async fn reconciliation_detects_manifest_mismatch() {
     let name = "reconciliation_detects_manifest_mismatch";
-    let Some(url) = get_pg_url_or_skip_or_panic(name) else { return };
+    let Some(url) = get_pg_url_or_skip_or_panic(name) else {
+        return;
+    };
     let pool = fresh_pool(&url).await;
     let (store, did) = build_store(&pool).await;
     let manifest = baseline_manifest(84532);
@@ -131,7 +145,14 @@ async fn reconciliation_detects_manifest_mismatch() {
     let sched = ReconciliationScheduler::new(did, ReconciliationSchedulerConfig::default());
     let state = empty_state();
     let record = sched
-        .run_once(&store, &provider, &manifest.manifest_hash, &state, 1, "0xabcd")
+        .run_once(
+            &store,
+            &provider,
+            &manifest.manifest_hash,
+            &state,
+            1,
+            "0xabcd",
+        )
         .await
         .expect("run");
     assert_eq!(record.classification, DriftClassification::ManifestMismatch);
@@ -155,7 +176,9 @@ async fn reconciliation_detects_manifest_mismatch() {
 #[tokio::test]
 async fn reconciliation_provider_unavailable_never_publishes_drift() {
     let name = "reconciliation_provider_unavailable_never_publishes_drift";
-    let Some(url) = get_pg_url_or_skip_or_panic(name) else { return };
+    let Some(url) = get_pg_url_or_skip_or_panic(name) else {
+        return;
+    };
     let pool = fresh_pool(&url).await;
     let (store, did) = build_store(&pool).await;
     let manifest = baseline_manifest(84532);
@@ -164,7 +187,14 @@ async fn reconciliation_provider_unavailable_never_publishes_drift() {
     let sched = ReconciliationScheduler::new(did, ReconciliationSchedulerConfig::default());
     let state = empty_state();
     let record = sched
-        .run_once(&store, &provider, &manifest.manifest_hash, &state, 1, "0xabcd")
+        .run_once(
+            &store,
+            &provider,
+            &manifest.manifest_hash,
+            &state,
+            1,
+            "0xabcd",
+        )
         .await
         .expect("run");
     assert_eq!(
@@ -192,7 +222,9 @@ async fn reconciliation_provider_unavailable_never_publishes_drift() {
 #[tokio::test]
 async fn reconciliation_no_auto_repair_on_drift() {
     let name = "reconciliation_no_auto_repair_on_drift";
-    let Some(url) = get_pg_url_or_skip_or_panic(name) else { return };
+    let Some(url) = get_pg_url_or_skip_or_panic(name) else {
+        return;
+    };
     let pool = fresh_pool(&url).await;
     let (store, did) = build_store(&pool).await;
     let manifest = baseline_manifest(84532);
@@ -210,18 +242,21 @@ async fn reconciliation_no_auto_repair_on_drift() {
         .insert(("subX".to_string(), "TKN".to_string()), "500".to_string());
     let before = state.balances.clone();
     let record = sched
-        .run_once(&store, &provider, &manifest.manifest_hash, &state, 1, "0xabcd")
+        .run_once(
+            &store,
+            &provider,
+            &manifest.manifest_hash,
+            &state,
+            1,
+            "0xabcd",
+        )
         .await
         .expect("run");
     assert_eq!(record.classification, DriftClassification::ProjectionDrift);
     // Projection state passed in unchanged (borrow was &state); no auto-repair.
     assert_eq!(state.balances, before);
     // Readiness = drift.
-    let readiness = store
-        .read_readiness(did)
-        .await
-        .unwrap()
-        .expect("readiness");
+    let readiness = store.read_readiness(did).await.unwrap().expect("readiness");
     assert!(!readiness.ready);
     assert_eq!(readiness.reason.as_deref(), Some("RECONCILIATION_DRIFT"));
 }
@@ -229,7 +264,9 @@ async fn reconciliation_no_auto_repair_on_drift() {
 #[tokio::test]
 async fn reconciliation_history_append_only() {
     let name = "reconciliation_history_append_only";
-    let Some(url) = get_pg_url_or_skip_or_panic(name) else { return };
+    let Some(url) = get_pg_url_or_skip_or_panic(name) else {
+        return;
+    };
     let pool = fresh_pool(&url).await;
     let (store, did) = build_store(&pool).await;
     // Manually append three records with increasing ran_at_ms.
@@ -265,7 +302,10 @@ async fn reconciliation_history_append_only() {
             failure_detail: None,
             duration_ms: 5,
         };
-        store.insert_reconciliation_result(&r).await.expect("insert");
+        store
+            .insert_reconciliation_result(&r)
+            .await
+            .expect("insert");
     }
     let latest = store
         .read_latest_reconciliation_result(did)
@@ -279,7 +319,9 @@ async fn reconciliation_history_append_only() {
 #[tokio::test]
 async fn reconciliation_lock_exclusive_with_rebuild() {
     let name = "reconciliation_lock_exclusive_with_rebuild";
-    let Some(url) = get_pg_url_or_skip_or_panic(name) else { return };
+    let Some(url) = get_pg_url_or_skip_or_panic(name) else {
+        return;
+    };
     let pool = fresh_pool(&url).await;
     let (store, did) = build_store(&pool).await;
     // Take rebuild lock first.

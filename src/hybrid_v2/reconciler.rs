@@ -264,12 +264,9 @@ impl ReconciliationScheduler {
             }
         };
 
-        let result = self.reconciler.reconcile(
-            expected_manifest_hash,
-            indexed_block,
-            state,
-            provider,
-        );
+        let result =
+            self.reconciler
+                .reconcile(expected_manifest_hash, indexed_block, state, provider);
         let (classification, failure_detail, mismatch_sample) = classify(&result);
         let (categories, converged, divergent, items) = counts(&classification, state);
         let availability = if provider.is_available() {
@@ -332,7 +329,11 @@ impl ReconciliationScheduler {
 
 fn classify(
     r: &ReconciliationResult,
-) -> (DriftClassification, Option<String>, Option<serde_json::Value>) {
+) -> (
+    DriftClassification,
+    Option<String>,
+    Option<serde_json::Value>,
+) {
     match r {
         ReconciliationResult::Converged { .. } => (DriftClassification::Converged, None, None),
         ReconciliationResult::IndexerBehind { indexed, observed } => (

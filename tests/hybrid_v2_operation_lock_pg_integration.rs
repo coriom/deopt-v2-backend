@@ -84,7 +84,9 @@ async fn build_two_deployments(pool: &PgPool) -> (Arc<dyn HybridV2ProjectionStor
 #[tokio::test]
 async fn all_three_operations_mutually_exclusive_per_deployment() {
     let name = "all_three_operations_mutually_exclusive_per_deployment";
-    let Some(url) = get_pg_url_or_skip_or_panic(name) else { return };
+    let Some(url) = get_pg_url_or_skip_or_panic(name) else {
+        return;
+    };
     let pool = fresh_pool(&url).await;
     let (store, did, _did2) = build_two_deployments(&pool).await;
 
@@ -123,7 +125,9 @@ async fn all_three_operations_mutually_exclusive_per_deployment() {
 #[tokio::test]
 async fn distinct_deployments_are_independent() {
     let name = "distinct_deployments_are_independent";
-    let Some(url) = get_pg_url_or_skip_or_panic(name) else { return };
+    let Some(url) = get_pg_url_or_skip_or_panic(name) else {
+        return;
+    };
     let pool = fresh_pool(&url).await;
     let (store, d1, d2) = build_two_deployments(&pool).await;
     let g1 = store
@@ -150,7 +154,9 @@ async fn distinct_deployments_are_independent() {
 #[tokio::test]
 async fn release_is_fenced_by_holder_epoch() {
     let name = "release_is_fenced_by_holder_epoch";
-    let Some(url) = get_pg_url_or_skip_or_panic(name) else { return };
+    let Some(url) = get_pg_url_or_skip_or_panic(name) else {
+        return;
+    };
     let pool = fresh_pool(&url).await;
     let (store, did, _) = build_two_deployments(&pool).await;
     let g = store

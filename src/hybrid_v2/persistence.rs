@@ -343,11 +343,7 @@ pub trait HybridV2ProjectionStore: Send + Sync {
 
     /// Release the unified deployment-scoped operation lock. Fencing:
     /// delete only when the recorded holder_epoch still matches.
-    async fn release_operation_lock(
-        &self,
-        _deployment_id: i64,
-        _holder_epoch: i64,
-    ) -> Result<()> {
+    async fn release_operation_lock(&self, _deployment_id: i64, _holder_epoch: i64) -> Result<()> {
         Err(BackendError::Persistence(
             "release_operation_lock unimplemented for this store".to_string(),
         ))
@@ -1181,11 +1177,7 @@ impl HybridV2ProjectionStore for PostgresHybridV2ProjectionStore {
         ))
     }
 
-    async fn release_operation_lock(
-        &self,
-        deployment_id: i64,
-        holder_epoch: i64,
-    ) -> Result<()> {
+    async fn release_operation_lock(&self, deployment_id: i64, holder_epoch: i64) -> Result<()> {
         sqlx::query(
             "DELETE FROM hybrid_v2_operation_locks
              WHERE deployment_id = $1 AND holder_epoch = $2",
@@ -1326,7 +1318,10 @@ impl HybridV2ProjectionStore for PostgresHybridV2ProjectionStore {
         )
         .bind(record.deployment_id)
         .bind(record.ran_at_ms)
-        .bind(u64_to_i64("block_number_checked", record.block_number_checked)?)
+        .bind(u64_to_i64(
+            "block_number_checked",
+            record.block_number_checked,
+        )?)
         .bind(&record.block_hash_checked)
         .bind(record.categories_checked as i32)
         .bind(u64_to_i64("items_checked", record.items_checked)?)
@@ -1421,9 +1416,8 @@ fn row_to_rebuild_operation(
 ) -> Result<crate::hybrid_v2::rebuild_operations::RebuildOperationState> {
     let mode_str: String = row.try_get("mode").map_err(pg_err)?;
     let phase_str: String = row.try_get("phase").map_err(pg_err)?;
-    let mode = crate::hybrid_v2::rebuild_operations::RebuildMode::parse(&mode_str).ok_or_else(
-        || BackendError::Persistence(format!("unknown rebuild mode {mode_str}")),
-    )?;
+    let mode = crate::hybrid_v2::rebuild_operations::RebuildMode::parse(&mode_str)
+        .ok_or_else(|| BackendError::Persistence(format!("unknown rebuild mode {mode_str}")))?;
     let phase = crate::hybrid_v2::rebuild_operations::RebuildPhase::parse(&phase_str)
         .ok_or_else(|| BackendError::Persistence(format!("unknown rebuild phase {phase_str}")))?;
     let deployment_id: i64 = row.try_get("deployment_id").map_err(pg_err)?;
@@ -1442,32 +1436,34 @@ fn row_to_rebuild_operation(
     let last_failure_detail: Option<String> = row.try_get("last_failure_detail").map_err(pg_err)?;
     let updated_at_ms: i64 = row.try_get("updated_at_ms").map_err(pg_err)?;
     let completed_at_ms: Option<i64> = row.try_get("completed_at_ms").map_err(pg_err)?;
-    Ok(crate::hybrid_v2::rebuild_operations::RebuildOperationState {
-        deployment_id,
-        rebuild_epoch,
-        mode,
-        phase,
-        requested_at_ms,
-        source_start_block: source_start_block
-            .map(|v| i64_to_u64("source_start_block", v))
-            .transpose()?,
-        source_end_block: source_end_block
-            .map(|v| i64_to_u64("source_end_block", v))
-            .transpose()?,
-        events_replayed: events_replayed
-            .map(|v| i64_to_u64("events_replayed", v))
-            .transpose()?,
-        executions_correlated: executions_correlated
-            .map(|v| i64_to_u64("executions_correlated", v))
-            .transpose()?,
-        verification_result,
-        reconciliation_result,
-        generation_id,
-        retry_count: retry_count.max(0) as u32,
-        last_failure_detail,
-        updated_at_ms,
-        completed_at_ms,
-    })
+    Ok(
+        crate::hybrid_v2::rebuild_operations::RebuildOperationState {
+            deployment_id,
+            rebuild_epoch,
+            mode,
+            phase,
+            requested_at_ms,
+            source_start_block: source_start_block
+                .map(|v| i64_to_u64("source_start_block", v))
+                .transpose()?,
+            source_end_block: source_end_block
+                .map(|v| i64_to_u64("source_end_block", v))
+                .transpose()?,
+            events_replayed: events_replayed
+                .map(|v| i64_to_u64("events_replayed", v))
+                .transpose()?,
+            executions_correlated: executions_correlated
+                .map(|v| i64_to_u64("executions_correlated", v))
+                .transpose()?,
+            verification_result,
+            reconciliation_result,
+            generation_id,
+            retry_count: retry_count.max(0) as u32,
+            last_failure_detail,
+            updated_at_ms,
+            completed_at_ms,
+        },
+    )
 }
 
 fn decode_topics_json(v: &serde_json::Value) -> Result<Vec<[u8; 32]>> {
@@ -3346,11 +3342,7 @@ impl HybridV2ProjectionStore for InMemoryProjectionStore {
         ))
     }
 
-    async fn release_operation_lock(
-        &self,
-        deployment_id: i64,
-        holder_epoch: i64,
-    ) -> Result<()> {
+    async fn release_operation_lock(&self, deployment_id: i64, holder_epoch: i64) -> Result<()> {
         let mut inner = self.inner.lock().unwrap();
         if let Some((_, epoch, _)) = inner.operation_locks.get(&deployment_id).cloned() {
             if epoch == holder_epoch {

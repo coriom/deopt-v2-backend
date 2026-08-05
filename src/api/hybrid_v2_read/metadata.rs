@@ -118,7 +118,11 @@ pub fn hard_readiness_failure(readiness: &ReadinessState) -> Option<&'static str
         Some(ReadinessReason::CursorHashMismatch { .. }) => Some("CURSOR_HASH_MISMATCH"),
         Some(ReadinessReason::ExcessiveReorg { .. }) => Some("EXCESSIVE_REORG"),
         Some(ReadinessReason::RebuildInProgress) => Some("REBUILD_IN_PROGRESS"),
+        Some(ReadinessReason::RebuildRequested { .. }) => Some("REBUILD_REQUESTED"),
         Some(ReadinessReason::RebuildFailed { .. }) => Some("REBUILD_FAILED"),
+        Some(ReadinessReason::ReconciliationInProgress { .. }) => {
+            Some("RECONCILIATION_IN_PROGRESS")
+        }
         Some(ReadinessReason::ReconciliationDrift { .. }) => Some("RECONCILIATION_DRIFT"),
         Some(ReadinessReason::MigrationSchemaMismatch) => Some("MIGRATION_SCHEMA_MISMATCH"),
         Some(ReadinessReason::Bootstrapping) => Some("BOOTSTRAPPING"),
@@ -248,13 +252,21 @@ pub fn hard_readiness_failure_from_status(
     if starts_ci(bytes, b"ExcessiveReorg") {
         return Some("EXCESSIVE_REORG");
     }
-    if starts_ci(bytes, b"RebuildInProgress") {
+    if starts_ci(bytes, b"RebuildInProgress") || starts_ci(bytes, b"REBUILD_IN_PROGRESS") {
         return Some("REBUILD_IN_PROGRESS");
     }
-    if starts_ci(bytes, b"RebuildFailed") {
+    if starts_ci(bytes, b"RebuildRequested") || starts_ci(bytes, b"REBUILD_REQUESTED") {
+        return Some("REBUILD_REQUESTED");
+    }
+    if starts_ci(bytes, b"RebuildFailed") || starts_ci(bytes, b"REBUILD_FAILED") {
         return Some("REBUILD_FAILED");
     }
-    if starts_ci(bytes, b"ReconciliationDrift") {
+    if starts_ci(bytes, b"ReconciliationInProgress")
+        || starts_ci(bytes, b"RECONCILIATION_IN_PROGRESS")
+    {
+        return Some("RECONCILIATION_IN_PROGRESS");
+    }
+    if starts_ci(bytes, b"ReconciliationDrift") || starts_ci(bytes, b"RECONCILIATION_DRIFT") {
         return Some("RECONCILIATION_DRIFT");
     }
     if starts_ci(bytes, b"MigrationSchemaMismatch") {

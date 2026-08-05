@@ -48,7 +48,9 @@ async fn journal_replay_nothing_to_do_on_empty_journal_and_empty_projection() {
         .await
         .expect("rebuild ok");
     match outcome {
-        RebuildOutcome::NothingToDo { events_replayed, .. } => {
+        RebuildOutcome::NothingToDo {
+            events_replayed, ..
+        } => {
             assert_eq!(events_replayed, 0);
         }
         other => panic!("expected NothingToDo, got {other:?}"),
@@ -195,8 +197,7 @@ async fn rebuild_verification_detects_drift_and_escalates_manual() {
     match outcome {
         RebuildOutcome::ManualInterventionRequired { reason, .. } => {
             assert!(
-                reason.contains("balances differ")
-                    || reason.contains("drift"),
+                reason.contains("balances differ") || reason.contains("drift"),
                 "expected drift reason, got {reason}"
             );
         }
@@ -280,11 +281,21 @@ async fn reconciliation_converged_emits_ok_and_no_readiness_drift() {
     let sched = ReconciliationScheduler::new(did, ReconciliationSchedulerConfig::default());
     let state = ProjectionState::default();
     let record = sched
-        .run_once(&store, &provider, &manifest.manifest_hash, &state, 1, "0xabcd")
+        .run_once(
+            &store,
+            &provider,
+            &manifest.manifest_hash,
+            &state,
+            1,
+            "0xabcd",
+        )
         .await
         .expect("run");
     assert_eq!(record.classification, DriftClassification::Converged);
-    assert_eq!(record.provider_availability, ProviderAvailability::Available);
+    assert_eq!(
+        record.provider_availability,
+        ProviderAvailability::Available
+    );
     // No drift snapshot readiness written.
     let readiness = store.read_readiness(did).await.unwrap();
     assert!(readiness.is_none() || readiness.as_ref().map(|r| r.ready).unwrap_or(true));
@@ -306,7 +317,14 @@ async fn reconciliation_projection_drift_writes_readiness_and_persists_row() {
         .insert(("A".to_string(), "T".to_string()), "1".to_string());
     let sched = ReconciliationScheduler::new(did, ReconciliationSchedulerConfig::default());
     let record = sched
-        .run_once(&store, &provider, &manifest.manifest_hash, &state, 1, "0xabcd")
+        .run_once(
+            &store,
+            &provider,
+            &manifest.manifest_hash,
+            &state,
+            1,
+            "0xabcd",
+        )
         .await
         .expect("run");
     assert_eq!(record.classification, DriftClassification::ProjectionDrift);
@@ -316,11 +334,7 @@ async fn reconciliation_projection_drift_writes_readiness_and_persists_row() {
         .unwrap()
         .expect("latest");
     assert_eq!(latest.classification, DriftClassification::ProjectionDrift);
-    let readiness = store
-        .read_readiness(did)
-        .await
-        .unwrap()
-        .expect("readiness");
+    let readiness = store.read_readiness(did).await.unwrap().expect("readiness");
     assert!(!readiness.ready);
     assert_eq!(readiness.reason.as_deref(), Some("RECONCILIATION_DRIFT"));
 }
@@ -334,7 +348,14 @@ async fn reconciliation_provider_unavailable_never_touches_readiness() {
     let sched = ReconciliationScheduler::new(did, ReconciliationSchedulerConfig::default());
     let state = ProjectionState::default();
     let record = sched
-        .run_once(&store, &provider, &manifest.manifest_hash, &state, 1, "0xabcd")
+        .run_once(
+            &store,
+            &provider,
+            &manifest.manifest_hash,
+            &state,
+            1,
+            "0xabcd",
+        )
         .await
         .expect("run");
     assert_eq!(
@@ -367,7 +388,14 @@ async fn reconciliation_drift_never_repairs_projection() {
     let before = state.balances.clone();
     for _ in 0..3 {
         let record = sched
-            .run_once(&store, &provider, &manifest.manifest_hash, &state, 1, "0xabcd")
+            .run_once(
+                &store,
+                &provider,
+                &manifest.manifest_hash,
+                &state,
+                1,
+                "0xabcd",
+            )
             .await
             .expect("run");
         assert_eq!(record.classification, DriftClassification::ProjectionDrift);

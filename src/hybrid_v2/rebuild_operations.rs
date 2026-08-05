@@ -397,12 +397,12 @@ impl RebuildOperationsService {
         store: &Arc<dyn HybridV2ProjectionStore>,
         manifest: &ManifestParams,
     ) -> std::result::Result<RebuildOutcome, RebuildError> {
-        self.config.validate().map_err(|e| RebuildError::Config(e.to_string()))?;
+        self.config
+            .validate()
+            .map_err(|e| RebuildError::Config(e.to_string()))?;
 
         let started_ms = now_ms();
-        let epoch = self
-            .next_epoch(store)
-            .await?;
+        let epoch = self.next_epoch(store).await?;
         let mut state = RebuildOperationState::new_requested(
             self.deployment_id,
             epoch,
@@ -442,7 +442,10 @@ impl RebuildOperationsService {
         };
         state.phase = RebuildPhase::LockAcquired;
         state.updated_at_ms = now_ms();
-        store.upsert_rebuild_operation(&state).await.map_err(err_persist)?;
+        store
+            .upsert_rebuild_operation(&state)
+            .await
+            .map_err(err_persist)?;
 
         let outcome = self
             .rebuild_from_journal_inner(store, manifest, &mut state)
@@ -470,10 +473,11 @@ impl RebuildOperationsService {
         // ManifestValidator; here we only guard against Base mainnet.
         state.phase = RebuildPhase::ValidatingSource;
         state.updated_at_ms = now_ms();
-        store.upsert_rebuild_operation(state).await.map_err(err_persist)?;
-        if manifest.chain_id
-            == crate::hybrid_v2::manifest::BASE_MAINNET_CHAIN_ID
-        {
+        store
+            .upsert_rebuild_operation(state)
+            .await
+            .map_err(err_persist)?;
+        if manifest.chain_id == crate::hybrid_v2::manifest::BASE_MAINNET_CHAIN_ID {
             let reason = "Base mainnet forbidden".to_string();
             escalate_manual(store, state, reason.clone()).await?;
             return Err(RebuildError::ManifestMismatch(reason));
@@ -482,7 +486,10 @@ impl RebuildOperationsService {
         // Preparing — read the canonical journal.
         state.phase = RebuildPhase::Preparing;
         state.updated_at_ms = now_ms();
-        store.upsert_rebuild_operation(state).await.map_err(err_persist)?;
+        store
+            .upsert_rebuild_operation(state)
+            .await
+            .map_err(err_persist)?;
         let journal = store
             .read_canonical_journal(self.deployment_id)
             .await
@@ -491,7 +498,10 @@ impl RebuildOperationsService {
         // Replaying — feed the journal through the canonical replay primitive.
         state.phase = RebuildPhase::Replaying;
         state.updated_at_ms = now_ms();
-        store.upsert_rebuild_operation(state).await.map_err(err_persist)?;
+        store
+            .upsert_rebuild_operation(state)
+            .await
+            .map_err(err_persist)?;
         let (rebuilt_state, _correlator, outcome) =
             JournalReplayer::new(manifest.event_version).replay_all(&journal);
 
@@ -500,18 +510,27 @@ impl RebuildOperationsService {
         state.source_start_block = journal.first().map(|l| l.block_number);
         state.source_end_block = Some(outcome.final_head_block);
         state.updated_at_ms = now_ms();
-        store.upsert_rebuild_operation(state).await.map_err(err_persist)?;
+        store
+            .upsert_rebuild_operation(state)
+            .await
+            .map_err(err_persist)?;
 
         // Correlating phase (accounting only — the replay above already
         // ran the correlator; we persist the count for observability).
         state.phase = RebuildPhase::Correlating;
         state.updated_at_ms = now_ms();
-        store.upsert_rebuild_operation(state).await.map_err(err_persist)?;
+        store
+            .upsert_rebuild_operation(state)
+            .await
+            .map_err(err_persist)?;
 
         // Verifying — compare rebuilt state to live projection snapshot.
         state.phase = RebuildPhase::Verifying;
         state.updated_at_ms = now_ms();
-        store.upsert_rebuild_operation(state).await.map_err(err_persist)?;
+        store
+            .upsert_rebuild_operation(state)
+            .await
+            .map_err(err_persist)?;
 
         if !self.config.verification_enabled {
             // Verification disabled — Mark Complete NothingToDo.
@@ -550,14 +569,20 @@ impl RebuildOperationsService {
             Some("DISABLED".to_string())
         };
         state.updated_at_ms = now_ms();
-        store.upsert_rebuild_operation(state).await.map_err(err_persist)?;
+        store
+            .upsert_rebuild_operation(state)
+            .await
+            .map_err(err_persist)?;
 
         // Committing — no-op in the single-transaction model when
         // rebuilt == live; we record the phase for auditability then
         // transition to Complete.
         state.phase = RebuildPhase::Committing;
         state.updated_at_ms = now_ms();
-        store.upsert_rebuild_operation(state).await.map_err(err_persist)?;
+        store
+            .upsert_rebuild_operation(state)
+            .await
+            .map_err(err_persist)?;
 
         state.verification_result = Some("MATCH".to_string());
         self.mark_complete(store, state).await?;
@@ -590,7 +615,9 @@ impl RebuildOperationsService {
         F: FnOnce(u64, u64) -> Fut + Send,
         Fut: std::future::Future<Output = std::result::Result<(u64, u64), String>> + Send,
     {
-        self.config.validate().map_err(|e| RebuildError::Config(e.to_string()))?;
+        self.config
+            .validate()
+            .map_err(|e| RebuildError::Config(e.to_string()))?;
         if manifest.chain_id == crate::hybrid_v2::manifest::BASE_MAINNET_CHAIN_ID {
             return Err(RebuildError::ManifestMismatch(
                 "Base mainnet forbidden".to_string(),
@@ -606,7 +633,10 @@ impl RebuildOperationsService {
         );
         state.source_start_block = Some(start_block);
         state.source_end_block = Some(target_head);
-        store.upsert_rebuild_operation(&state).await.map_err(err_persist)?;
+        store
+            .upsert_rebuild_operation(&state)
+            .await
+            .map_err(err_persist)?;
 
         let guard = match store
             .try_acquire_operation_lock(
@@ -623,7 +653,10 @@ impl RebuildOperationsService {
                 state.phase = RebuildPhase::Failed;
                 state.last_failure_detail = Some("operation lock contention".to_string());
                 state.updated_at_ms = started_ms;
-                store.upsert_rebuild_operation(&state).await.map_err(err_persist)?;
+                store
+                    .upsert_rebuild_operation(&state)
+                    .await
+                    .map_err(err_persist)?;
                 return Err(RebuildError::LockContention {
                     deployment_id: self.deployment_id,
                     kind: "REBUILD",
@@ -633,16 +666,28 @@ impl RebuildOperationsService {
 
         state.phase = RebuildPhase::LockAcquired;
         state.updated_at_ms = now_ms();
-        store.upsert_rebuild_operation(&state).await.map_err(err_persist)?;
+        store
+            .upsert_rebuild_operation(&state)
+            .await
+            .map_err(err_persist)?;
         state.phase = RebuildPhase::ValidatingSource;
         state.updated_at_ms = now_ms();
-        store.upsert_rebuild_operation(&state).await.map_err(err_persist)?;
+        store
+            .upsert_rebuild_operation(&state)
+            .await
+            .map_err(err_persist)?;
         state.phase = RebuildPhase::Preparing;
         state.updated_at_ms = now_ms();
-        store.upsert_rebuild_operation(&state).await.map_err(err_persist)?;
+        store
+            .upsert_rebuild_operation(&state)
+            .await
+            .map_err(err_persist)?;
         state.phase = RebuildPhase::Replaying;
         state.updated_at_ms = now_ms();
-        store.upsert_rebuild_operation(&state).await.map_err(err_persist)?;
+        store
+            .upsert_rebuild_operation(&state)
+            .await
+            .map_err(err_persist)?;
 
         let ingest_res = ingest(start_block, target_head).await;
         let outcome = match ingest_res {
@@ -651,11 +696,17 @@ impl RebuildOperationsService {
                 state.executions_correlated = Some(corr);
                 state.phase = RebuildPhase::Verifying;
                 state.updated_at_ms = now_ms();
-                store.upsert_rebuild_operation(&state).await.map_err(err_persist)?;
+                store
+                    .upsert_rebuild_operation(&state)
+                    .await
+                    .map_err(err_persist)?;
                 state.verification_result = Some("SKIPPED".to_string());
                 state.phase = RebuildPhase::Committing;
                 state.updated_at_ms = now_ms();
-                store.upsert_rebuild_operation(&state).await.map_err(err_persist)?;
+                store
+                    .upsert_rebuild_operation(&state)
+                    .await
+                    .map_err(err_persist)?;
                 self.mark_complete(store, &mut state).await?;
                 Ok(RebuildOutcome::Rebuilt {
                     epoch,
@@ -672,12 +723,12 @@ impl RebuildOperationsService {
                     RebuildPhase::Failed
                 };
                 state.updated_at_ms = now_ms();
-                store.upsert_rebuild_operation(&state).await.map_err(err_persist)?;
+                store
+                    .upsert_rebuild_operation(&state)
+                    .await
+                    .map_err(err_persist)?;
                 if matches!(state.phase, RebuildPhase::ManualInterventionRequired) {
-                    Ok(RebuildOutcome::ManualInterventionRequired {
-                        epoch,
-                        reason,
-                    })
+                    Ok(RebuildOutcome::ManualInterventionRequired { epoch, reason })
                 } else {
                     Ok(RebuildOutcome::RetryableFailure { epoch, reason })
                 }
@@ -718,7 +769,10 @@ impl RebuildOperationsService {
         state.phase = RebuildPhase::Complete;
         state.completed_at_ms = Some(now_ms());
         state.updated_at_ms = now_ms();
-        store.upsert_rebuild_operation(state).await.map_err(err_persist)?;
+        store
+            .upsert_rebuild_operation(state)
+            .await
+            .map_err(err_persist)?;
         Ok(())
     }
 }
@@ -739,7 +793,10 @@ async fn escalate_manual(
     state.phase = RebuildPhase::ManualInterventionRequired;
     state.last_failure_detail = Some(reason);
     state.updated_at_ms = now_ms();
-    store.upsert_rebuild_operation(state).await.map_err(err_persist)?;
+    store
+        .upsert_rebuild_operation(state)
+        .await
+        .map_err(err_persist)?;
     Ok(())
 }
 

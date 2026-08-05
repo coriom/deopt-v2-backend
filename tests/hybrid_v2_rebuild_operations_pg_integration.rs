@@ -107,7 +107,9 @@ fn baseline_manifest_alt(
 #[tokio::test]
 async fn journal_replay_rebuild_nothing_to_do_when_projection_matches_journal() {
     let name = "journal_replay_rebuild_nothing_to_do_when_projection_matches_journal";
-    let Some(url) = get_pg_url_or_skip_or_panic(name) else { return };
+    let Some(url) = get_pg_url_or_skip_or_panic(name) else {
+        return;
+    };
     let pool = fresh_pool(&url).await;
     let (store, did, _did2) = build_store(&pool).await;
 
@@ -118,7 +120,10 @@ async fn journal_replay_rebuild_nothing_to_do_when_projection_matches_journal() 
         .await
         .expect("rebuild ok");
     match outcome {
-        RebuildOutcome::NothingToDo { epoch, events_replayed } => {
+        RebuildOutcome::NothingToDo {
+            epoch,
+            events_replayed,
+        } => {
             assert!(epoch >= 1);
             assert_eq!(events_replayed, 0);
         }
@@ -137,7 +142,9 @@ async fn journal_replay_rebuild_nothing_to_do_when_projection_matches_journal() 
 #[tokio::test]
 async fn rebuild_operation_lock_blocks_reconciliation() {
     let name = "rebuild_operation_lock_blocks_reconciliation";
-    let Some(url) = get_pg_url_or_skip_or_panic(name) else { return };
+    let Some(url) = get_pg_url_or_skip_or_panic(name) else {
+        return;
+    };
     let pool = fresh_pool(&url).await;
     let (store, did, _did2) = build_store(&pool).await;
 
@@ -172,7 +179,9 @@ async fn rebuild_operation_lock_blocks_reconciliation() {
 #[tokio::test]
 async fn operation_lock_is_deployment_scoped() {
     let name = "operation_lock_is_deployment_scoped";
-    let Some(url) = get_pg_url_or_skip_or_panic(name) else { return };
+    let Some(url) = get_pg_url_or_skip_or_panic(name) else {
+        return;
+    };
     let pool = fresh_pool(&url).await;
     let (store, did, did2) = build_store(&pool).await;
     let g1 = store
@@ -199,7 +208,9 @@ async fn operation_lock_is_deployment_scoped() {
 #[tokio::test]
 async fn rebuild_phase_persisted_across_restart() {
     let name = "rebuild_phase_persisted_across_restart";
-    let Some(url) = get_pg_url_or_skip_or_panic(name) else { return };
+    let Some(url) = get_pg_url_or_skip_or_panic(name) else {
+        return;
+    };
     let pool = fresh_pool(&url).await;
     let (store, did, _did2) = build_store(&pool).await;
 
@@ -222,7 +233,10 @@ async fn rebuild_phase_persisted_across_restart() {
         updated_at_ms: 1_700_000_000_500,
         completed_at_ms: None,
     };
-    store.upsert_rebuild_operation(&state).await.expect("upsert");
+    store
+        .upsert_rebuild_operation(&state)
+        .await
+        .expect("upsert");
     // "Restart": drop the store, reconnect.
     drop(store);
     let store2: Arc<dyn HybridV2ProjectionStore> =
@@ -239,14 +253,22 @@ async fn rebuild_phase_persisted_across_restart() {
 #[tokio::test]
 async fn duplicate_rebuild_request_is_idempotent_per_epoch() {
     let name = "duplicate_rebuild_request_is_idempotent_per_epoch";
-    let Some(url) = get_pg_url_or_skip_or_panic(name) else { return };
+    let Some(url) = get_pg_url_or_skip_or_panic(name) else {
+        return;
+    };
     let pool = fresh_pool(&url).await;
     let (store, did, _did2) = build_store(&pool).await;
     let manifest = baseline_manifest(84532);
     let svc = RebuildOperationsService::new(did, RebuildConfig::default());
 
-    let a = svc.rebuild_from_journal(&store, &manifest).await.expect("a");
-    let b = svc.rebuild_from_journal(&store, &manifest).await.expect("b");
+    let a = svc
+        .rebuild_from_journal(&store, &manifest)
+        .await
+        .expect("a");
+    let b = svc
+        .rebuild_from_journal(&store, &manifest)
+        .await
+        .expect("b");
     let (ea, eb) = match (a, b) {
         (
             RebuildOutcome::NothingToDo { epoch: ea, .. },
@@ -269,7 +291,9 @@ async fn duplicate_rebuild_request_is_idempotent_per_epoch() {
 #[tokio::test]
 async fn latest_rebuild_operation_returns_highest_epoch() {
     let name = "latest_rebuild_operation_returns_highest_epoch";
-    let Some(url) = get_pg_url_or_skip_or_panic(name) else { return };
+    let Some(url) = get_pg_url_or_skip_or_panic(name) else {
+        return;
+    };
     let pool = fresh_pool(&url).await;
     let (store, did, _did2) = build_store(&pool).await;
     for epoch in [3, 7, 1] {
