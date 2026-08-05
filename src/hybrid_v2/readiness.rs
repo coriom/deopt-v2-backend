@@ -55,6 +55,33 @@ pub enum ReadinessReason {
     /// Runtime received a shutdown signal and is winding down; hard 503
     /// until the process exits.
     Stopping,
+    /// Reorg recovery is in-flight: parent hash mismatch has been
+    /// detected and persisted, but the ancestor search + replay have
+    /// not yet completed. Hard-503 until the persisted recovery
+    /// transitions to RECOVERED.
+    ReorgDetected {
+        at_block: u64,
+        epoch: i64,
+    },
+    /// The recovery service is walking back the local canonical journal
+    /// looking for a common ancestor with the live chain.
+    ReorgSearching {
+        epoch: i64,
+    },
+    /// Ancestor found; the recovery service is invalidating the orphan
+    /// branch and replaying the replacement branch inside a single
+    /// Postgres transaction.
+    ReorgReplaying {
+        epoch: i64,
+        ancestor: u64,
+    },
+    /// Recovery escalated past the retry budget or crossed a finalized
+    /// boundary. The worker for this deployment stops advancing until
+    /// an operator restart clears the state.
+    ReorgManualInterventionRequired {
+        epoch: i64,
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -123,6 +123,12 @@ pub fn hard_readiness_failure(readiness: &ReadinessState) -> Option<&'static str
         Some(ReadinessReason::MigrationSchemaMismatch) => Some("MIGRATION_SCHEMA_MISMATCH"),
         Some(ReadinessReason::Bootstrapping) => Some("BOOTSTRAPPING"),
         Some(ReadinessReason::Stopping) => Some("STOPPING"),
+        Some(ReadinessReason::ReorgDetected { .. }) => Some("REORG_DETECTED"),
+        Some(ReadinessReason::ReorgSearching { .. }) => Some("REORG_SEARCHING"),
+        Some(ReadinessReason::ReorgReplaying { .. }) => Some("REORG_REPLAYING"),
+        Some(ReadinessReason::ReorgManualInterventionRequired { .. }) => {
+            Some("REORG_MANUAL_INTERVENTION_REQUIRED")
+        }
         None => None,
     }
 }
@@ -259,6 +265,20 @@ pub fn hard_readiness_failure_from_status(
     }
     if starts_ci(bytes, b"Stopping") || starts_ci(bytes, b"STOPPING") {
         return Some("STOPPING");
+    }
+    if starts_ci(bytes, b"ReorgDetected") || starts_ci(bytes, b"REORG_DETECTED") {
+        return Some("REORG_DETECTED");
+    }
+    if starts_ci(bytes, b"ReorgSearching") || starts_ci(bytes, b"REORG_SEARCHING") {
+        return Some("REORG_SEARCHING");
+    }
+    if starts_ci(bytes, b"ReorgReplaying") || starts_ci(bytes, b"REORG_REPLAYING") {
+        return Some("REORG_REPLAYING");
+    }
+    if starts_ci(bytes, b"ReorgManualInterventionRequired")
+        || starts_ci(bytes, b"REORG_MANUAL_INTERVENTION_REQUIRED")
+    {
+        return Some("REORG_MANUAL_INTERVENTION_REQUIRED");
     }
     Some("INDEXER_NOT_READY")
 }

@@ -82,6 +82,29 @@ pub struct HybridV2Config {
     /// version; guessing it would let the indexer decode against the
     /// wrong contracts.
     pub manifest_path: Option<String>,
+    /// Maximum depth (in blocks) the reorg recovery service will
+    /// search backwards for a common ancestor. Bounded to [1, 512].
+    /// Env: `HYBRID_V2_REORG_MAX_DEPTH`. Default 64.
+    pub reorg_max_depth: u64,
+    /// Maximum number of replacement branch blocks the recovery
+    /// service is willing to fetch + replay atomically. Bounded to
+    /// [1, 4096]. Env: `HYBRID_V2_REORG_MAX_REPLACEMENT_BLOCKS`.
+    /// Default 256.
+    pub reorg_max_replacement_blocks: u32,
+    /// Retry budget for transient recovery failures (RPC timeouts,
+    /// Postgres pool blips). Bounded to [0, 20].
+    /// Env: `HYBRID_V2_REORG_RETRY_MAX`. Default 5.
+    pub reorg_retry_max: u32,
+    /// Base backoff (ms) between recovery retries. Bounded to
+    /// [50, 60_000]. Env: `HYBRID_V2_REORG_RETRY_BACKOFF_MS`.
+    /// Default 500.
+    pub reorg_retry_backoff_ms: u64,
+    /// If false (default) any reorg that attempts to change a block at
+    /// or below the source's finalized head escalates immediately to
+    /// MANUAL_INTERVENTION_REQUIRED. If true, the recovery service
+    /// will still attempt to recover (development / test only).
+    /// Env: `HYBRID_V2_REORG_ALLOW_FINALIZED_CROSS`. Default false.
+    pub reorg_allow_finalized_boundary_crossing: bool,
 }
 
 impl std::fmt::Debug for HybridV2Config {
@@ -111,6 +134,17 @@ impl std::fmt::Debug for HybridV2Config {
             .field(
                 "manifest_path",
                 &self.manifest_path.as_deref().map(|_| "<set>"),
+            )
+            .field("reorg_max_depth", &self.reorg_max_depth)
+            .field(
+                "reorg_max_replacement_blocks",
+                &self.reorg_max_replacement_blocks,
+            )
+            .field("reorg_retry_max", &self.reorg_retry_max)
+            .field("reorg_retry_backoff_ms", &self.reorg_retry_backoff_ms)
+            .field(
+                "reorg_allow_finalized_boundary_crossing",
+                &self.reorg_allow_finalized_boundary_crossing,
             )
             .finish()
     }
@@ -154,6 +188,11 @@ impl HybridV2Config {
             rpc_retry_backoff_ms: 250,
             rpc_max_logs_per_range: 2_000,
             manifest_path: None,
+            reorg_max_depth: 64,
+            reorg_max_replacement_blocks: 256,
+            reorg_retry_max: 5,
+            reorg_retry_backoff_ms: 500,
+            reorg_allow_finalized_boundary_crossing: false,
         }
     }
 
@@ -197,6 +236,14 @@ impl HybridV2Config {
         let manifest_path = env::var("HYBRID_V2_MANIFEST_PATH")
             .ok()
             .filter(|s| !s.is_empty());
+        let reorg_max_depth: u64 = parse_env("HYBRID_V2_REORG_MAX_DEPTH")?.unwrap_or(64);
+        let reorg_max_replacement_blocks: u32 =
+            parse_env("HYBRID_V2_REORG_MAX_REPLACEMENT_BLOCKS")?.unwrap_or(256);
+        let reorg_retry_max: u32 = parse_env("HYBRID_V2_REORG_RETRY_MAX")?.unwrap_or(5);
+        let reorg_retry_backoff_ms: u64 =
+            parse_env("HYBRID_V2_REORG_RETRY_BACKOFF_MS")?.unwrap_or(500);
+        let reorg_allow_finalized_boundary_crossing: bool =
+            parse_bool_env("HYBRID_V2_REORG_ALLOW_FINALIZED_CROSS")?.unwrap_or(false);
         let cfg = Self {
             enabled: true,
             deployment_id,
@@ -212,6 +259,11 @@ impl HybridV2Config {
             rpc_retry_backoff_ms,
             rpc_max_logs_per_range,
             manifest_path,
+            reorg_max_depth,
+            reorg_max_replacement_blocks,
+            reorg_retry_max,
+            reorg_retry_backoff_ms,
+            reorg_allow_finalized_boundary_crossing,
         };
         cfg.validate()?;
         Ok(cfg)
@@ -319,6 +371,33 @@ impl HybridV2Config {
                 "HYBRID_V2_ENABLED=1 but HYBRID_V2_MANIFEST_PATH unset — the \
                  canonical manifest is required to bind emitter addresses",
             ));
+        }
+        // Reorg recovery bounds — fail-closed at parse time so a
+        // misconfigured recovery budget never lets an operator ship a
+        // silently-broken worker.
+        if !(1..=512).contains(&self.reorg_max_depth) {
+            return Err(cfg_err(format!(
+                "HYBRID_V2_REORG_MAX_DEPTH must be within [1, 512], got {}",
+                self.reorg_max_depth
+            )));
+        }
+        if !(1..=4096).contains(&self.reorg_max_replacement_blocks) {
+            return Err(cfg_err(format!(
+                "HYBRID_V2_REORG_MAX_REPLACEMENT_BLOCKS must be within [1, 4096], got {}",
+                self.reorg_max_replacement_blocks
+            )));
+        }
+        if self.reorg_retry_max > 20 {
+            return Err(cfg_err(format!(
+                "HYBRID_V2_REORG_RETRY_MAX must be <= 20, got {}",
+                self.reorg_retry_max
+            )));
+        }
+        if !(50..=60_000).contains(&self.reorg_retry_backoff_ms) {
+            return Err(cfg_err(format!(
+                "HYBRID_V2_REORG_RETRY_BACKOFF_MS must be within [50, 60000], got {}",
+                self.reorg_retry_backoff_ms
+            )));
         }
         Ok(())
     }

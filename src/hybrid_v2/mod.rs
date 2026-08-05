@@ -29,6 +29,7 @@ pub mod readiness;
 pub mod rebuild;
 pub mod reducer;
 pub mod reorg;
+pub mod reorg_recovery;
 pub mod repository;
 pub mod rpc_chain_source;
 pub mod runtime;
@@ -64,6 +65,10 @@ pub use reducer::{
     ProjectionState, RecoveryStateProjection, ReducerError,
 };
 pub use reorg::{ReorgOutcome, ReorgPlanner};
+pub use reorg_recovery::{
+    RecoveryOutcome, ReorgDetection, ReorgLockGuard, ReorgRecoveryConfig, ReorgRecoveryError,
+    ReorgRecoveryPhase, ReorgRecoveryService, ReorgRecoveryState,
+};
 pub use repository::{HybridV2QueryRepository, PageCursor};
 pub use rpc_chain_source::{RpcHybridV2ChainSource, RpcSourceConfig};
 pub use runtime::{

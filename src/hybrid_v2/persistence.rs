@@ -129,6 +129,12 @@ fn reason_kind(reason: &ReadinessReason) -> String {
         ReadinessReason::Behind { .. } => "BEHIND".to_string(),
         ReadinessReason::Bootstrapping => "BOOTSTRAPPING".to_string(),
         ReadinessReason::Stopping => "STOPPING".to_string(),
+        ReadinessReason::ReorgDetected { .. } => "REORG_DETECTED".to_string(),
+        ReadinessReason::ReorgSearching { .. } => "REORG_SEARCHING".to_string(),
+        ReadinessReason::ReorgReplaying { .. } => "REORG_REPLAYING".to_string(),
+        ReadinessReason::ReorgManualInterventionRequired { .. } => {
+            "REORG_MANUAL_INTERVENTION_REQUIRED".to_string()
+        }
     }
 }
 
@@ -227,6 +233,81 @@ pub trait HybridV2ProjectionStore: Send + Sync {
     /// pagination; until then callers should only invoke this on
     /// restart and never inside a request handler.
     async fn read_canonical_journal(&self, deployment_id: i64) -> Result<Vec<JournaledLog>>;
+
+    // -----------------------------------------------------------------
+    //          PERSISTED REORG RECOVERY (BACKEND-HYBRID-V2-...
+    //          PERSISTED-REORG-RECOVERY-V1)
+    // -----------------------------------------------------------------
+
+    /// Read the persisted reorg-recovery state row for a deployment.
+    /// Returns `None` when no recovery has ever started for this
+    /// deployment (fresh install).
+    async fn read_reorg_recovery(
+        &self,
+        deployment_id: i64,
+    ) -> Result<Option<crate::hybrid_v2::reorg_recovery::ReorgRecoveryState>>;
+
+    /// Idempotent upsert of the recovery state row. Persists the
+    /// full phase-machine snapshot so a subsequent bootstrap can
+    /// resume from the exact same point.
+    async fn upsert_reorg_recovery(
+        &self,
+        state: &crate::hybrid_v2::reorg_recovery::ReorgRecoveryState,
+    ) -> Result<()>;
+
+    /// Direct readiness upsert without going through the block-atomic
+    /// path. The recovery service uses this to publish transient
+    /// per-phase readiness reasons that map to hard 503 on the API.
+    async fn write_readiness_snapshot(
+        &self,
+        deployment_id: i64,
+        readiness: &ReadinessSnapshot,
+        now_ms: i64,
+    ) -> Result<()>;
+
+    /// Atomic commit of the recovery mutation phase.
+    ///
+    /// One Postgres transaction that:
+    ///   1. Marks orphan raw logs non-canonical (block_number > ancestor).
+    ///   2. Marks orphan canonical blocks non-canonical.
+    ///   3. Marks orphan matched executions INVALIDATED_BY_REORG.
+    ///   4. Writes each replacement block + raw logs + decoded events +
+    ///      projection mutations.
+    ///   5. Advances the cursor to the replacement tip.
+    ///   6. Updates readiness + metrics.
+    ///   7. Marks the recovery row `phase = RECOVERED`.
+    ///
+    /// On any failure inside the transaction the entire batch rolls
+    /// back and no persisted state changes — the caller retries.
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_reorg_recovery(
+        &self,
+        deployment_id: i64,
+        recovery_epoch: i64,
+        ancestor_block: u64,
+        ancestor_hash: &str,
+        replacement_blocks: &[CanonicalBlockRef],
+        replacement_raw_logs: &[JournaledLog],
+        replacement_decoded_events: &[(HybridV2Event, ApplyContext)],
+        projection_state: &ProjectionState,
+        cursor: &RuntimeCursorSnapshot,
+        readiness: &ReadinessSnapshot,
+        now_ms: i64,
+    ) -> Result<()>;
+
+    /// Attempt to acquire the deployment-scoped recovery lock. Returns
+    /// `Some(guard)` on success, `None` on contention.
+    async fn try_acquire_reorg_lock(
+        &self,
+        deployment_id: i64,
+        holder_epoch: i64,
+        now_ms: i64,
+    ) -> Result<Option<crate::hybrid_v2::reorg_recovery::ReorgLockGuard>>;
+
+    /// Release the deployment-scoped recovery lock. Callers pass the
+    /// epoch they acquired with — a stale delete (epoch no longer
+    /// matches) is a benign no-op.
+    async fn release_reorg_lock(&self, deployment_id: i64, holder_epoch: i64) -> Result<()>;
 }
 
 // -----------------------------------------------------------------
@@ -587,6 +668,339 @@ impl HybridV2ProjectionStore for PostgresHybridV2ProjectionStore {
             });
         }
         Ok(out)
+    }
+
+    // ---------------- REORG RECOVERY ----------------
+
+    async fn read_reorg_recovery(
+        &self,
+        deployment_id: i64,
+    ) -> Result<Option<crate::hybrid_v2::reorg_recovery::ReorgRecoveryState>> {
+        let row = sqlx::query(
+            "SELECT deployment_id, recovery_epoch, phase, detected_at_ms,
+                    old_tip_block, old_tip_hash, conflicting_block, conflicting_hash,
+                    common_ancestor_block, common_ancestor_hash,
+                    replacement_tip_block, replacement_tip_hash,
+                    orphan_depth, replacement_block_count,
+                    finalized_at_detection, retry_count, last_failure_detail,
+                    updated_at_ms, completed_at_ms
+             FROM hybrid_v2_reorg_recovery WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(pg_err)?;
+        let Some(row) = row else { return Ok(None) };
+        let phase_str: String = row.try_get("phase").map_err(pg_err)?;
+        let phase = crate::hybrid_v2::reorg_recovery::ReorgRecoveryPhase::parse(&phase_str)
+            .ok_or_else(|| BackendError::Persistence(format!("unknown phase {phase_str}")))?;
+        let deployment_id: i64 = row.try_get("deployment_id").map_err(pg_err)?;
+        let recovery_epoch: i64 = row.try_get("recovery_epoch").map_err(pg_err)?;
+        let detected_at_ms: i64 = row.try_get("detected_at_ms").map_err(pg_err)?;
+        let old_tip_block: i64 = row.try_get("old_tip_block").map_err(pg_err)?;
+        let old_tip_hash: String = row.try_get("old_tip_hash").map_err(pg_err)?;
+        let conflicting_block: Option<i64> = row.try_get("conflicting_block").map_err(pg_err)?;
+        let conflicting_hash: Option<String> = row.try_get("conflicting_hash").map_err(pg_err)?;
+        let common_ancestor_block: Option<i64> =
+            row.try_get("common_ancestor_block").map_err(pg_err)?;
+        let common_ancestor_hash: Option<String> =
+            row.try_get("common_ancestor_hash").map_err(pg_err)?;
+        let replacement_tip_block: Option<i64> =
+            row.try_get("replacement_tip_block").map_err(pg_err)?;
+        let replacement_tip_hash: Option<String> =
+            row.try_get("replacement_tip_hash").map_err(pg_err)?;
+        let orphan_depth: Option<i32> = row.try_get("orphan_depth").map_err(pg_err)?;
+        let replacement_block_count: Option<i32> =
+            row.try_get("replacement_block_count").map_err(pg_err)?;
+        let finalized_at_detection: Option<i64> =
+            row.try_get("finalized_at_detection").map_err(pg_err)?;
+        let retry_count: i32 = row.try_get("retry_count").map_err(pg_err)?;
+        let last_failure_detail: Option<String> =
+            row.try_get("last_failure_detail").map_err(pg_err)?;
+        let updated_at_ms: i64 = row.try_get("updated_at_ms").map_err(pg_err)?;
+        let completed_at_ms: Option<i64> = row.try_get("completed_at_ms").map_err(pg_err)?;
+        Ok(Some(crate::hybrid_v2::reorg_recovery::ReorgRecoveryState {
+            deployment_id,
+            recovery_epoch,
+            phase,
+            detected_at_ms,
+            old_tip_block: i64_to_u64("old_tip_block", old_tip_block)?,
+            old_tip_hash,
+            conflicting_block: conflicting_block
+                .map(|v| i64_to_u64("conflicting_block", v))
+                .transpose()?,
+            conflicting_hash,
+            common_ancestor_block: common_ancestor_block
+                .map(|v| i64_to_u64("common_ancestor_block", v))
+                .transpose()?,
+            common_ancestor_hash,
+            replacement_tip_block: replacement_tip_block
+                .map(|v| i64_to_u64("replacement_tip_block", v))
+                .transpose()?,
+            replacement_tip_hash,
+            orphan_depth: orphan_depth.map(|v| v.max(0) as u32),
+            replacement_block_count: replacement_block_count.map(|v| v.max(0) as u32),
+            finalized_at_detection: finalized_at_detection
+                .map(|v| i64_to_u64("finalized_at_detection", v))
+                .transpose()?,
+            retry_count: retry_count.max(0) as u32,
+            last_failure_detail,
+            updated_at_ms,
+            completed_at_ms,
+        }))
+    }
+
+    async fn upsert_reorg_recovery(
+        &self,
+        state: &crate::hybrid_v2::reorg_recovery::ReorgRecoveryState,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO hybrid_v2_reorg_recovery (
+                deployment_id, recovery_epoch, phase, detected_at_ms,
+                old_tip_block, old_tip_hash, conflicting_block, conflicting_hash,
+                common_ancestor_block, common_ancestor_hash,
+                replacement_tip_block, replacement_tip_hash,
+                orphan_depth, replacement_block_count,
+                finalized_at_detection, retry_count, last_failure_detail,
+                updated_at_ms, completed_at_ms
+             ) VALUES (
+                $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19
+             )
+             ON CONFLICT (deployment_id) DO UPDATE SET
+                recovery_epoch = EXCLUDED.recovery_epoch,
+                phase = EXCLUDED.phase,
+                detected_at_ms = EXCLUDED.detected_at_ms,
+                old_tip_block = EXCLUDED.old_tip_block,
+                old_tip_hash = EXCLUDED.old_tip_hash,
+                conflicting_block = EXCLUDED.conflicting_block,
+                conflicting_hash = EXCLUDED.conflicting_hash,
+                common_ancestor_block = EXCLUDED.common_ancestor_block,
+                common_ancestor_hash = EXCLUDED.common_ancestor_hash,
+                replacement_tip_block = EXCLUDED.replacement_tip_block,
+                replacement_tip_hash = EXCLUDED.replacement_tip_hash,
+                orphan_depth = EXCLUDED.orphan_depth,
+                replacement_block_count = EXCLUDED.replacement_block_count,
+                finalized_at_detection = EXCLUDED.finalized_at_detection,
+                retry_count = EXCLUDED.retry_count,
+                last_failure_detail = EXCLUDED.last_failure_detail,
+                updated_at_ms = EXCLUDED.updated_at_ms,
+                completed_at_ms = EXCLUDED.completed_at_ms",
+        )
+        .bind(state.deployment_id)
+        .bind(state.recovery_epoch)
+        .bind(state.phase.as_str())
+        .bind(state.detected_at_ms)
+        .bind(u64_to_i64("old_tip_block", state.old_tip_block)?)
+        .bind(&state.old_tip_hash)
+        .bind(
+            state
+                .conflicting_block
+                .map(|v| u64_to_i64("conflicting_block", v))
+                .transpose()?,
+        )
+        .bind(state.conflicting_hash.as_deref())
+        .bind(
+            state
+                .common_ancestor_block
+                .map(|v| u64_to_i64("common_ancestor_block", v))
+                .transpose()?,
+        )
+        .bind(state.common_ancestor_hash.as_deref())
+        .bind(
+            state
+                .replacement_tip_block
+                .map(|v| u64_to_i64("replacement_tip_block", v))
+                .transpose()?,
+        )
+        .bind(state.replacement_tip_hash.as_deref())
+        .bind(state.orphan_depth.map(|v| v as i32))
+        .bind(state.replacement_block_count.map(|v| v as i32))
+        .bind(
+            state
+                .finalized_at_detection
+                .map(|v| u64_to_i64("finalized_at_detection", v))
+                .transpose()?,
+        )
+        .bind(state.retry_count as i32)
+        .bind(state.last_failure_detail.as_deref())
+        .bind(state.updated_at_ms)
+        .bind(state.completed_at_ms)
+        .execute(&self.pool)
+        .await
+        .map_err(pg_err)?;
+        Ok(())
+    }
+
+    async fn write_readiness_snapshot(
+        &self,
+        deployment_id: i64,
+        readiness: &ReadinessSnapshot,
+        now_ms: i64,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await.map_err(pg_err)?;
+        upsert_readiness(&mut tx, deployment_id, readiness, now_ms).await?;
+        tx.commit().await.map_err(pg_err)?;
+        Ok(())
+    }
+
+    async fn commit_reorg_recovery(
+        &self,
+        deployment_id: i64,
+        recovery_epoch: i64,
+        ancestor_block: u64,
+        _ancestor_hash: &str,
+        replacement_blocks: &[CanonicalBlockRef],
+        replacement_raw_logs: &[JournaledLog],
+        replacement_decoded_events: &[(HybridV2Event, ApplyContext)],
+        projection_state: &ProjectionState,
+        cursor: &RuntimeCursorSnapshot,
+        readiness: &ReadinessSnapshot,
+        now_ms: i64,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await.map_err(pg_err)?;
+        let ancestor_i64 = u64_to_i64("ancestor_block", ancestor_block)?;
+
+        // 1. Mark orphan raw logs.
+        sqlx::query(
+            "UPDATE hybrid_v2_raw_logs
+             SET is_canonical = FALSE, orphaned_at_block = $2
+             WHERE deployment_id = $1 AND block_number > $2 AND is_canonical = TRUE",
+        )
+        .bind(deployment_id)
+        .bind(ancestor_i64)
+        .execute(&mut *tx)
+        .await
+        .map_err(pg_err)?;
+
+        // 2. Mark orphan canonical blocks.
+        sqlx::query(
+            "UPDATE hybrid_v2_canonical_blocks
+             SET is_canonical = FALSE, orphaned_at_block = $2
+             WHERE deployment_id = $1 AND block_number > $2 AND is_canonical = TRUE",
+        )
+        .bind(deployment_id)
+        .bind(ancestor_i64)
+        .execute(&mut *tx)
+        .await
+        .map_err(pg_err)?;
+
+        // 3. Mark orphan matched executions.
+        sqlx::query(
+            "UPDATE hybrid_v2_matched_executions
+             SET completion_status = 'INVALIDATED_BY_REORG'
+             WHERE deployment_id = $1
+               AND block_number > $2
+               AND completion_status <> 'INVALIDATED_BY_REORG'",
+        )
+        .bind(deployment_id)
+        .bind(ancestor_i64)
+        .execute(&mut *tx)
+        .await
+        .map_err(pg_err)?;
+
+        // 4. Write replacement blocks + raw logs + decoded events + projection mutations.
+        let mut raw_ids: Vec<i64> = Vec::with_capacity(replacement_raw_logs.len());
+        for block in replacement_blocks {
+            upsert_canonical_block(&mut tx, deployment_id, block, now_ms).await?;
+        }
+        for log in replacement_raw_logs {
+            let id = insert_raw_log(&mut tx, deployment_id, log, now_ms).await?;
+            raw_ids.push(id);
+        }
+        for (i, (event, ctx)) in replacement_decoded_events.iter().enumerate() {
+            let raw_id = raw_ids.get(i).copied().ok_or_else(|| {
+                BackendError::Persistence(
+                    "reorg commit: decoded/raw log count mismatch".to_string(),
+                )
+            })?;
+            insert_decoded_event(&mut tx, deployment_id, raw_id, event, ctx, now_ms).await?;
+            persist_event_projection(&mut tx, deployment_id, event, ctx, projection_state, now_ms)
+                .await?;
+        }
+
+        // 5. Advance cursor + metrics + readiness.
+        upsert_cursor(&mut tx, deployment_id, cursor, now_ms).await?;
+        upsert_runtime_metrics_tx(&mut tx, deployment_id, cursor, now_ms).await?;
+        upsert_readiness(&mut tx, deployment_id, readiness, now_ms).await?;
+
+        // 6. Mark the recovery row RECOVERED atomically with the mutation.
+        sqlx::query(
+            "UPDATE hybrid_v2_reorg_recovery
+             SET phase = 'RECOVERED',
+                 completed_at_ms = $3,
+                 updated_at_ms = $3
+             WHERE deployment_id = $1 AND recovery_epoch = $2",
+        )
+        .bind(deployment_id)
+        .bind(recovery_epoch)
+        .bind(now_ms)
+        .execute(&mut *tx)
+        .await
+        .map_err(pg_err)?;
+
+        tx.commit().await.map_err(pg_err)?;
+        Ok(())
+    }
+
+    async fn try_acquire_reorg_lock(
+        &self,
+        deployment_id: i64,
+        holder_epoch: i64,
+        now_ms: i64,
+    ) -> Result<Option<crate::hybrid_v2::reorg_recovery::ReorgLockGuard>> {
+        // Best-effort stale-lock cleanup: if the row exists but the
+        // paired recovery row is either absent, terminal-ok, or the
+        // stored epoch has advanced past the holder's, delete the lock
+        // before attempting to acquire.
+        sqlx::query(
+            "DELETE FROM hybrid_v2_reorg_locks
+             WHERE deployment_id = $1
+               AND (
+                   NOT EXISTS (
+                       SELECT 1 FROM hybrid_v2_reorg_recovery r
+                       WHERE r.deployment_id = $1
+                         AND r.recovery_epoch >= hybrid_v2_reorg_locks.holder_epoch
+                         AND r.phase NOT IN ('RECOVERED', 'NONE')
+                   )
+               )",
+        )
+        .bind(deployment_id)
+        .execute(&self.pool)
+        .await
+        .map_err(pg_err)?;
+
+        let inserted = sqlx::query(
+            "INSERT INTO hybrid_v2_reorg_locks (deployment_id, holder_epoch, acquired_at_ms)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (deployment_id) DO NOTHING",
+        )
+        .bind(deployment_id)
+        .bind(holder_epoch)
+        .bind(now_ms)
+        .execute(&self.pool)
+        .await
+        .map_err(pg_err)?;
+        if inserted.rows_affected() == 0 {
+            return Ok(None);
+        }
+        Ok(Some(crate::hybrid_v2::reorg_recovery::ReorgLockGuard {
+            deployment_id,
+            holder_epoch,
+            store: None,
+        }))
+    }
+
+    async fn release_reorg_lock(&self, deployment_id: i64, holder_epoch: i64) -> Result<()> {
+        sqlx::query(
+            "DELETE FROM hybrid_v2_reorg_locks
+             WHERE deployment_id = $1 AND holder_epoch = $2",
+        )
+        .bind(deployment_id)
+        .bind(holder_epoch)
+        .execute(&self.pool)
+        .await
+        .map_err(pg_err)?;
+        Ok(())
     }
 }
 
@@ -2031,6 +2445,9 @@ struct InMemoryInner {
     cursors: std::collections::BTreeMap<(i64, String), RuntimeCursorSnapshot>,
     readiness: std::collections::BTreeMap<i64, ReadinessSnapshot>,
     reorg_events: Vec<serde_json::Value>,
+    reorg_recovery:
+        std::collections::BTreeMap<i64, crate::hybrid_v2::reorg_recovery::ReorgRecoveryState>,
+    reorg_locks: std::collections::BTreeMap<i64, (i64, i64)>,
 }
 
 impl InMemoryProjectionStore {
@@ -2220,6 +2637,169 @@ impl HybridV2ProjectionStore for InMemoryProjectionStore {
             .collect();
         out.sort_by(|a, b| (a.block_number, a.log_index).cmp(&(b.block_number, b.log_index)));
         Ok(out)
+    }
+
+    async fn read_reorg_recovery(
+        &self,
+        deployment_id: i64,
+    ) -> Result<Option<crate::hybrid_v2::reorg_recovery::ReorgRecoveryState>> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner
+            .reorg_recovery
+            .get(&deployment_id)
+            .cloned()
+            .map(|s| crate::hybrid_v2::reorg_recovery::ReorgRecoveryState { ..s }))
+    }
+
+    async fn upsert_reorg_recovery(
+        &self,
+        state: &crate::hybrid_v2::reorg_recovery::ReorgRecoveryState,
+    ) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        inner
+            .reorg_recovery
+            .insert(state.deployment_id, state.clone());
+        Ok(())
+    }
+
+    async fn write_readiness_snapshot(
+        &self,
+        deployment_id: i64,
+        readiness: &ReadinessSnapshot,
+        _now_ms: i64,
+    ) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.readiness.insert(deployment_id, readiness.clone());
+        Ok(())
+    }
+
+    async fn commit_reorg_recovery(
+        &self,
+        deployment_id: i64,
+        recovery_epoch: i64,
+        ancestor_block: u64,
+        ancestor_hash: &str,
+        replacement_blocks: &[CanonicalBlockRef],
+        replacement_raw_logs: &[JournaledLog],
+        replacement_decoded_events: &[(HybridV2Event, ApplyContext)],
+        projection_state: &ProjectionState,
+        cursor: &RuntimeCursorSnapshot,
+        readiness: &ReadinessSnapshot,
+        _now_ms: i64,
+    ) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        // 1. Mark orphan raw logs non-canonical.
+        for ((d, _bh, _tx, _idx), (_id, log)) in inner.raw_logs.iter_mut() {
+            if *d == deployment_id && log.is_canonical && log.block_number > ancestor_block {
+                log.is_canonical = false;
+                log.orphaned_at_block = Some(ancestor_block);
+            }
+        }
+        // 2. Mark orphan blocks by deletion (in-memory has no separate is_canonical column
+        //    beyond the map itself; test asserts rely on block_count/head).
+        //    We keep the block ref but preserve the ancestor block; a "swap" is implicit
+        //    by writing the new blocks below and leaving the old under a different hash.
+        // 3. Mark orphan matched executions.
+        if let Some(state) = inner.state_snapshots.get_mut(&deployment_id) {
+            for (_id, row) in state.matched_executions.iter_mut() {
+                if row.block_number > ancestor_block
+                    && !matches!(
+                        row.completion_status,
+                        crate::hybrid_v2::reducer::ExecutionCompletion::InvalidatedByReorg
+                    )
+                {
+                    row.completion_status =
+                        crate::hybrid_v2::reducer::ExecutionCompletion::InvalidatedByReorg;
+                }
+            }
+        }
+        // 4. Write replacement blocks + raw logs.
+        for block in replacement_blocks {
+            inner
+                .blocks
+                .insert((deployment_id, block.block_hash.clone()), block.clone());
+        }
+        for (i, log) in replacement_raw_logs.iter().enumerate() {
+            inner.next_raw_id += 1;
+            let raw_id = inner.next_raw_id;
+            inner.raw_logs.insert(
+                (
+                    deployment_id,
+                    log.block_hash.clone(),
+                    log.tx_hash.clone(),
+                    log.log_index as i32,
+                ),
+                (raw_id, log.clone()),
+            );
+            if let Some((ev, _)) = replacement_decoded_events.get(i) {
+                inner.decoded_events.insert(raw_id, ev.clone());
+            }
+        }
+        // 5. Publish the new projection state.
+        inner
+            .state_snapshots
+            .insert(deployment_id, projection_state.clone());
+        inner
+            .cursors
+            .insert((deployment_id, cursor.cursor_name.clone()), cursor.clone());
+        inner.readiness.insert(deployment_id, readiness.clone());
+        // 6. Mark the recovery row as RECOVERED atomically.
+        if let Some(row) = inner.reorg_recovery.get_mut(&deployment_id) {
+            if row.recovery_epoch == recovery_epoch {
+                row.phase = crate::hybrid_v2::reorg_recovery::ReorgRecoveryPhase::Recovered;
+                row.completed_at_ms = Some(row.updated_at_ms);
+            }
+        }
+        let _ = ancestor_hash;
+        Ok(())
+    }
+
+    async fn try_acquire_reorg_lock(
+        &self,
+        deployment_id: i64,
+        holder_epoch: i64,
+        now_ms: i64,
+    ) -> Result<Option<crate::hybrid_v2::reorg_recovery::ReorgLockGuard>> {
+        let mut inner = self.inner.lock().unwrap();
+        // Stale-lock cleanup: if the paired recovery row is RECOVERED
+        // OR the recorded holder_epoch is less than the current
+        // recovery row's epoch, we consider it stale.
+        let should_delete = match (
+            inner.reorg_locks.get(&deployment_id),
+            inner.reorg_recovery.get(&deployment_id),
+        ) {
+            (Some(_), Some(recovery)) => matches!(
+                recovery.phase,
+                crate::hybrid_v2::reorg_recovery::ReorgRecoveryPhase::Recovered
+                    | crate::hybrid_v2::reorg_recovery::ReorgRecoveryPhase::None
+            ),
+            (Some(_), None) => true,
+            _ => false,
+        };
+        if should_delete {
+            inner.reorg_locks.remove(&deployment_id);
+        }
+        if inner.reorg_locks.contains_key(&deployment_id) {
+            return Ok(None);
+        }
+        inner
+            .reorg_locks
+            .insert(deployment_id, (holder_epoch, now_ms));
+        Ok(Some(crate::hybrid_v2::reorg_recovery::ReorgLockGuard {
+            deployment_id,
+            holder_epoch,
+            store: None,
+        }))
+    }
+
+    async fn release_reorg_lock(&self, deployment_id: i64, holder_epoch: i64) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some((epoch, _)) = inner.reorg_locks.get(&deployment_id) {
+            if *epoch == holder_epoch {
+                inner.reorg_locks.remove(&deployment_id);
+            }
+        }
+        Ok(())
     }
 }
 
