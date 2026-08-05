@@ -34,6 +34,24 @@ redaction, and `main.rs` now actually spawns the supervised worker
 reorg (Parts J/K/L) still remains for
 `BACKEND-HYBRID-V2-PERSISTED-REORG-RECOVERY-V1`.
 
+**Update 2026-08-05 (stage-3C):** landed as
+`BACKEND-HYBRID-V2-PERSISTED-REORG-RECOVERY-V1` — see
+`BACKEND_HYBRID_V2_PERSISTED_REORG_RECOVERY_V1.md`. Adds a
+persisted, restart-safe reorg-recovery state machine
+(`hybrid_v2_reorg_recovery` + `hybrid_v2_reorg_locks` in
+migration 0047) driven by a new `ReorgRecoveryService`. The runtime
+persists a DETECTED row on parent-hash mismatch and raises
+`RuntimeError::ReorgRequired`; the worker catches the error, invokes
+recovery (bounded ancestor search + bounded replacement fetch +
+one-transaction invalidate/replay/commit via
+`RebuildService::replay_all`), then rehydrates via
+`bootstrap_from_persistence`. Four new `ReadinessReason` variants
+map to hard-503. Frozen safety rules
+`REORG_RECOVERY_USES_PERSISTED_CANONICAL_REPLAY`,
+`NO_ORPHANED_ECONOMIC_STATE_IS_PUBLICLY_VISIBLE`, and
+`NO_READY_STATE_DURING_INCOMPLETE_REORG_RECOVERY` are enforced
+throughout. Parts J/K/L of the parent brief close on this landing.
+
 ## Delivered in this landing
 
 - **Part A** — preflight (worktree artifact from prior milestone
