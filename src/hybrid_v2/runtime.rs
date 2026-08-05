@@ -118,6 +118,29 @@ pub enum RuntimeError {
     /// store rejected the write". Never advances the cursor.
     #[error("chain source error: {detail}")]
     ChainSource { detail: String },
+    /// A reorg was detected during `tick_and_persist` and the persisted
+    /// recovery state machine must run before the runtime can resume.
+    /// The tick body persists the DETECTED phase (via the recovery
+    /// service's own entry point on the next tick) and hard-fails the
+    /// current tick so the worker can drive recovery. The runtime's
+    /// in-memory state is NOT mutated — recovery works entirely
+    /// against Postgres and the runtime is rehydrated via
+    /// bootstrap_from_persistence once RECOVERED.
+    #[error(
+        "reorg required at block {conflicting_block:?}: parent {cursor_hash} vs incoming {incoming_parent}"
+    )]
+    ReorgRequired {
+        cursor_block: u64,
+        cursor_hash: String,
+        conflicting_block: Option<u64>,
+        conflicting_hash: Option<String>,
+        incoming_parent: String,
+    },
+    /// A prior recovery is already active (or the deployment sits in
+    /// `MANUAL_INTERVENTION_REQUIRED`). The worker MUST let the
+    /// recovery service handle this before ticking again.
+    #[error("reorg recovery pending (phase {phase})")]
+    ReorgRecoveryPending { phase: String },
 }
 
 impl From<ChainSourceError> for RuntimeError {
@@ -657,6 +680,35 @@ impl IndexerRuntime {
                 source_chain: src_chain_id,
             });
         }
+
+        // Guard: refuse to advance while a persisted recovery is active.
+        if let (Some(store), Some(deployment_id)) =
+            (self.persistence.clone(), self.persistence_deployment_id)
+        {
+            if let Ok(Some(recovery)) = store.read_reorg_recovery(deployment_id).await {
+                if recovery.phase.is_terminal_failed() {
+                    self.readiness = ReadinessState::new_not_ready(
+                        ReadinessReason::ReorgManualInterventionRequired {
+                            epoch: recovery.recovery_epoch,
+                            reason: recovery
+                                .last_failure_detail
+                                .clone()
+                                .unwrap_or_else(|| "manual intervention required".to_string()),
+                        },
+                    );
+                    return Err(RuntimeError::ReorgRecoveryPending {
+                        phase: recovery.phase.as_str().to_string(),
+                    });
+                }
+                if recovery.phase.is_active() {
+                    self.readiness = ReadinessState::new_not_ready(recovery.readiness_reason());
+                    return Err(RuntimeError::ReorgRecoveryPending {
+                        phase: recovery.phase.as_str().to_string(),
+                    });
+                }
+            }
+        }
+
         self.metrics.observed_block = self.await_head(source).await?;
         self.metrics.finalized_block = self.await_finalized(source).await?;
         let next = self.cursor.indexed_head_block + 1;
@@ -668,19 +720,34 @@ impl IndexerRuntime {
         if self.cursor.indexed_head_block > 0
             && !parents_match(&self.cursor.indexed_head_hash, &block.parent_hash)
         {
-            // Handle in-memory reorg; capture pending audit metadata.
-            self.handle_reorg(source, &block).await?;
-            self.metrics.observed_block = self.await_head(source).await?;
-            self.metrics.lag = self
-                .metrics
-                .observed_block
-                .saturating_sub(self.cursor.indexed_head_block);
-            self.recompute_readiness();
-            // Flush the reorg audit event; failure logs + counts, never
-            // fails the reorg. This matches the frozen rule that reorg
-            // handling must not be blocked by observability writes.
-            self.record_pending_reorg_audit().await;
-            return Ok(true);
+            // Persist a Detected row + fail-closed readiness, then hand
+            // recovery off to the worker's persisted recovery service.
+            // In-memory state is NOT mutated — a subsequent
+            // bootstrap_from_persistence after RECOVERED rehydrates
+            // exactly from Postgres.
+            let cursor_block = self.cursor.indexed_head_block;
+            let cursor_hash = self.cursor.indexed_head_hash.clone();
+            let incoming_parent = block.parent_hash.clone();
+            let conflicting_block = block.number;
+            let conflicting_hash = block.hash.clone();
+            self.persist_reorg_detected(
+                cursor_block,
+                &cursor_hash,
+                conflicting_block,
+                &conflicting_hash,
+            )
+            .await;
+            self.readiness = ReadinessState::new_not_ready(ReadinessReason::ReorgDetected {
+                at_block: cursor_block,
+                epoch: 0,
+            });
+            return Err(RuntimeError::ReorgRequired {
+                cursor_block,
+                cursor_hash,
+                conflicting_block: Some(conflicting_block),
+                conflicting_hash: Some(conflicting_hash),
+                incoming_parent,
+            });
         }
 
         // Snapshot for rollback if persist fails.
@@ -774,9 +841,82 @@ impl IndexerRuntime {
         Ok(true)
     }
 
+    /// Persist a fresh DETECTED row for the persisted-recovery state
+    /// machine. Failures are logged but never blocking — the worker
+    /// will still see the parent-hash mismatch on the next tick and
+    /// retry via the recovery service (which reads the same persisted
+    /// row + can construct one lazily from its `detection` parameter).
+    async fn persist_reorg_detected(
+        &mut self,
+        old_tip_block: u64,
+        old_tip_hash: &str,
+        conflicting_block: u64,
+        conflicting_hash: &str,
+    ) {
+        let (Some(store), Some(deployment_id)) =
+            (self.persistence.clone(), self.persistence_deployment_id)
+        else {
+            return;
+        };
+        // Read any existing row so we can advance the epoch if the
+        // prior recovery already completed (fresh reorg after a clean
+        // recovery gets a new epoch).
+        let existing = store
+            .read_reorg_recovery(deployment_id)
+            .await
+            .ok()
+            .flatten();
+        let epoch = match existing.as_ref() {
+            Some(row) if row.phase.is_active() => row.recovery_epoch,
+            Some(row) => row.recovery_epoch + 1,
+            None => 1,
+        };
+        let now = now_ms();
+        let state = crate::hybrid_v2::reorg_recovery::ReorgRecoveryState::new_detected(
+            deployment_id,
+            epoch,
+            old_tip_block,
+            old_tip_hash.to_string(),
+            Some(conflicting_block),
+            Some(conflicting_hash.to_string()),
+            None,
+            now,
+        );
+        if let Err(err) = store.upsert_reorg_recovery(&state).await {
+            tracing::warn!(
+                target: "hybrid_v2::runtime",
+                deployment_id,
+                error = %err,
+                "failed to persist DETECTED reorg state (recovery service will re-persist on next tick)"
+            );
+        }
+        // Also publish a matching not-ready readiness snapshot.
+        let readiness_snapshot = crate::hybrid_v2::persistence::ReadinessSnapshot {
+            ready: false,
+            reason: Some("REORG_DETECTED".to_string()),
+            reason_detail: Some(format!("epoch={epoch} block={old_tip_block}")),
+        };
+        if let Err(err) = store
+            .write_readiness_snapshot(deployment_id, &readiness_snapshot, now)
+            .await
+        {
+            tracing::warn!(
+                target: "hybrid_v2::runtime",
+                deployment_id,
+                error = %err,
+                "failed to publish REORG_DETECTED readiness (API may briefly serve stale readiness)"
+            );
+        }
+    }
+
     /// Try to flush the last captured reorg audit event to persistence.
     /// This never returns an error: failures are logged + counted so
     /// reorg replay is not blocked by observability writes.
+    ///
+    /// Retained for the in-memory `handle_reorg` path used by the
+    /// sync `tick()` — the persisted-recovery path (`tick_and_persist`)
+    /// records the audit inside `commit_reorg_recovery` instead.
+    #[allow(dead_code)]
     async fn record_pending_reorg_audit(&mut self) {
         let Some(audit) = self.pending_reorg_audit.take() else {
             return;

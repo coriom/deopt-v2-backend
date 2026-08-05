@@ -193,6 +193,35 @@ impl MockRpcServer {
         st.blocks_by_hash.insert(block.hash.clone(), block);
     }
 
+    /// Atomically swap the best-chain suffix starting at `from_block`
+    /// with a replacement branch. Old blocks are dropped from
+    /// `blocks_by_number` (so a subsequent `eth_getBlockByNumber`
+    /// returns the replacement) but retained in `blocks_by_hash`
+    /// (so an ancestor search via block hash still resolves the
+    /// orphan header if needed).
+    ///
+    /// Also updates the head to the highest replacement block number.
+    pub fn switch_to_fork(&self, from_block: u64, new_blocks: Vec<MockBlock>) {
+        let mut st = self.state.lock().unwrap();
+        // Retain old headers by hash but evict from the number index.
+        let keys: Vec<u64> = st
+            .blocks_by_number
+            .keys()
+            .copied()
+            .filter(|n| *n >= from_block)
+            .collect();
+        for k in keys {
+            st.blocks_by_number.remove(&k);
+        }
+        let mut new_head = st.head;
+        for block in new_blocks {
+            new_head = new_head.max(block.number);
+            st.blocks_by_number.insert(block.number, block.clone());
+            st.blocks_by_hash.insert(block.hash.clone(), block);
+        }
+        st.head = new_head;
+    }
+
     pub fn simulate_status(&self, next_n: u32, status: u16) {
         let mut st = self.state.lock().unwrap();
         st.simulate_status_remaining = next_n;

@@ -18,10 +18,25 @@
 //! - No auto-fallback: a persistence failure leaves the runtime cursor
 //!   where it was in-memory (the sync runtime rolls back on persist
 //!   failure). The worker just keeps looping.
+//!
+//! Reorg recovery integration (BACKEND-HYBRID-V2-PERSISTED-REORG-
+//! RECOVERY-V1):
+//! - On bootstrap: if the persisted `hybrid_v2_reorg_recovery` row is
+//!   active (any phase other than NONE / RECOVERED /
+//!   MANUAL_INTERVENTION_REQUIRED), run recovery before ticking.
+//! - On tick: catch `RuntimeError::ReorgRequired` +
+//!   `RuntimeError::ReorgRecoveryPending`, invoke
+//!   `ReorgRecoveryService::recover`, then rebootstrap the runtime.
+//! - MANUAL_INTERVENTION_REQUIRED sleeps indefinitely with a hard-503
+//!   readiness — operator restart is the only unblock.
 
 use crate::hybrid_v2::chain_source::ChainSource;
+use crate::hybrid_v2::manifest::ManifestParams;
 use crate::hybrid_v2::persistence::HybridV2ProjectionStore;
-use crate::hybrid_v2::runtime::IndexerRuntime;
+use crate::hybrid_v2::reorg_recovery::{
+    RecoveryOutcome, ReorgDetection, ReorgRecoveryConfig, ReorgRecoveryService,
+};
+use crate::hybrid_v2::runtime::{IndexerRuntime, RuntimeError};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
@@ -40,6 +55,10 @@ pub struct HybridV2IndexerWorkerConfig {
     /// projection store. Must match the deployment attached to the
     /// runtime via `with_persistence`.
     pub deployment_id: i64,
+    /// Persisted reorg-recovery configuration bounds. Defaulted from
+    /// `ReorgRecoveryConfig::default()` when constructed via
+    /// `HybridV2IndexerWorkerConfig::new`.
+    pub reorg_recovery_config: ReorgRecoveryConfig,
 }
 
 impl HybridV2IndexerWorkerConfig {
@@ -47,7 +66,13 @@ impl HybridV2IndexerWorkerConfig {
         Self {
             poll_interval_ms: poll_interval_ms.max(1),
             deployment_id,
+            reorg_recovery_config: ReorgRecoveryConfig::default(),
         }
+    }
+
+    pub fn with_reorg_recovery_config(mut self, config: ReorgRecoveryConfig) -> Self {
+        self.reorg_recovery_config = config;
+        self
     }
 }
 
@@ -87,12 +112,63 @@ pub fn spawn_hybrid_v2_indexer_worker(
                 );
             }
         }
+
+        // If a persisted recovery is active from a prior run, drive
+        // it to completion before ticking. Manifest is captured off
+        // the runtime; we clone it because the recovery service takes
+        // it by shared reference and we do not want to hold the
+        // runtime write lock across the whole recovery flow.
+        let manifest_snapshot: ManifestParams = {
+            let guard = runtime.read().await;
+            guard.manifest.clone()
+        };
+        let cursor_name: String = {
+            let guard = runtime.read().await;
+            guard.persistence_cursor_name.clone()
+        };
+        // Ensure config bounds are valid — a bogus config should not
+        // silently degrade recovery. Log + escalate on failure.
+        if let Err(err) = config.reorg_recovery_config.validate() {
+            tracing::error!(
+                target: "hybrid_v2::worker",
+                deployment_id = config.deployment_id,
+                error = %err,
+                "hybrid_v2 indexer worker: reorg recovery config invalid — recovery disabled for this run"
+            );
+        }
+        let recovery_service =
+            ReorgRecoveryService::new(config.deployment_id, config.reorg_recovery_config.clone());
+        if let Ok(Some(persisted)) = store.read_reorg_recovery(config.deployment_id).await {
+            if persisted.phase.is_active() {
+                tracing::info!(
+                    target: "hybrid_v2::worker",
+                    deployment_id = config.deployment_id,
+                    phase = %persisted.phase.as_str(),
+                    epoch = persisted.recovery_epoch,
+                    "resuming persisted reorg recovery"
+                );
+                let outcome = recovery_service
+                    .recover(
+                        source.as_ref(),
+                        &store,
+                        &manifest_snapshot,
+                        None,
+                        &cursor_name,
+                    )
+                    .await;
+                if let Ok(RecoveryOutcome::Recovered { .. }) = outcome {
+                    let mut guard = runtime.write().await;
+                    let _ = guard.bootstrap_from_persistence().await;
+                }
+            }
+        }
+
         // Also record we've referenced the store here; store used below
         // via runtime's own persistence handle (which was set via
         // `with_persistence`). We keep our own handle live so the
         // caller can drop the outer Arc without disconnecting the
         // per-tick writes.
-        let _store_keepalive = store;
+        let store_keepalive = store.clone();
 
         let sleep_dur = Duration::from_millis(config.poll_interval_ms);
 
@@ -125,6 +201,130 @@ pub fn spawn_hybrid_v2_indexer_worker(
                 Ok(false) => {
                     // Source has no new block yet — sleep.
                 }
+                Err(RuntimeError::ReorgRequired {
+                    cursor_block,
+                    cursor_hash,
+                    conflicting_block,
+                    conflicting_hash,
+                    incoming_parent,
+                }) => {
+                    tracing::info!(
+                        target: "hybrid_v2::worker",
+                        deployment_id = config.deployment_id,
+                        cursor_block,
+                        conflicting_block = ?conflicting_block,
+                        incoming_parent,
+                        "reorg detected — driving persisted recovery"
+                    );
+                    let detection = ReorgDetection {
+                        old_tip_block: cursor_block,
+                        old_tip_hash: cursor_hash,
+                        conflicting_block,
+                        conflicting_hash,
+                    };
+                    let outcome = recovery_service
+                        .recover(
+                            source.as_ref(),
+                            &store_keepalive,
+                            &manifest_snapshot,
+                            Some(detection),
+                            &cursor_name,
+                        )
+                        .await;
+                    match outcome {
+                        Ok(RecoveryOutcome::Recovered {
+                            epoch,
+                            replacement_tip,
+                            orphan_depth,
+                            ..
+                        }) => {
+                            tracing::info!(
+                                target: "hybrid_v2::worker",
+                                deployment_id = config.deployment_id,
+                                epoch,
+                                replacement_tip,
+                                orphan_depth,
+                                "reorg recovered — rehydrating runtime"
+                            );
+                            let mut guard = runtime.write().await;
+                            let _ = guard.bootstrap_from_persistence().await;
+                        }
+                        Ok(RecoveryOutcome::ManualInterventionRequired { epoch, reason }) => {
+                            tracing::error!(
+                                target: "hybrid_v2::worker",
+                                deployment_id = config.deployment_id,
+                                epoch,
+                                reason = %reason,
+                                "reorg recovery escalated to MANUAL_INTERVENTION_REQUIRED — worker halted for this deployment"
+                            );
+                            // Sleep indefinitely — a restart is required
+                            // to clear the persisted state.
+                            wait_indefinitely_or_shutdown(shutdown_rx.clone()).await;
+                            return;
+                        }
+                        Ok(RecoveryOutcome::RetryableFailure { reason }) => {
+                            tracing::warn!(
+                                target: "hybrid_v2::worker",
+                                deployment_id = config.deployment_id,
+                                reason = %reason,
+                                "reorg recovery hit a retryable failure — will retry on next tick"
+                            );
+                        }
+                        Ok(RecoveryOutcome::NothingToDo) => {
+                            tracing::warn!(
+                                target: "hybrid_v2::worker",
+                                deployment_id = config.deployment_id,
+                                "recovery returned NothingToDo despite detected reorg — bootstrapping to reconcile"
+                            );
+                            let mut guard = runtime.write().await;
+                            let _ = guard.bootstrap_from_persistence().await;
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                target: "hybrid_v2::worker",
+                                deployment_id = config.deployment_id,
+                                error = %err,
+                                "reorg recovery failed — will retry on next tick"
+                            );
+                        }
+                    }
+                }
+                Err(RuntimeError::ReorgRecoveryPending { phase }) => {
+                    tracing::debug!(
+                        target: "hybrid_v2::worker",
+                        deployment_id = config.deployment_id,
+                        phase,
+                        "tick refused — recovery in progress"
+                    );
+                    // Drive the persisted recovery forward.
+                    let outcome = recovery_service
+                        .recover(
+                            source.as_ref(),
+                            &store_keepalive,
+                            &manifest_snapshot,
+                            None,
+                            &cursor_name,
+                        )
+                        .await;
+                    if let Ok(RecoveryOutcome::Recovered { .. }) = outcome {
+                        let mut guard = runtime.write().await;
+                        let _ = guard.bootstrap_from_persistence().await;
+                    } else if let Ok(RecoveryOutcome::ManualInterventionRequired {
+                        epoch,
+                        reason,
+                    }) = outcome
+                    {
+                        tracing::error!(
+                            target: "hybrid_v2::worker",
+                            deployment_id = config.deployment_id,
+                            epoch,
+                            reason = %reason,
+                            "reorg recovery escalated to MANUAL_INTERVENTION_REQUIRED — worker halted for this deployment"
+                        );
+                        wait_indefinitely_or_shutdown(shutdown_rx.clone()).await;
+                        return;
+                    }
+                }
                 Err(err) => {
                     tracing::warn!(
                         target: "hybrid_v2::worker",
@@ -155,4 +355,25 @@ pub fn spawn_hybrid_v2_indexer_worker(
             }
         }
     })
+}
+
+/// Block until the shutdown channel signals true (or drops). Used when
+/// the recovery service has escalated to MANUAL_INTERVENTION_REQUIRED
+/// and the worker must stop advancing for this deployment.
+async fn wait_indefinitely_or_shutdown(shutdown_rx: Option<watch::Receiver<bool>>) {
+    if let Some(mut rx) = shutdown_rx {
+        loop {
+            if *rx.borrow() {
+                return;
+            }
+            if rx.changed().await.is_err() {
+                return;
+            }
+        }
+    } else {
+        // Without a shutdown channel, sleep in long chunks.
+        loop {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        }
+    }
 }
