@@ -151,3 +151,29 @@ throughout. Parts J/K/L of the parent brief close on this landing.
 - Disposable Postgres container + private mode-600 credential files
   torn down after commits.
 - No credentials or URLs committed or logged.
+
+**Update 2026-08-05 (closure):** parent milestone
+`BACKEND-HYBRID-V2-PERSISTED-OPERATIONS-V1` is CLOSED by
+`BACKEND-HYBRID-V2-PROJECTION-PERSISTENCE-CLOSURE-V1` — see
+`BACKEND_HYBRID_V2_PROJECTION_PERSISTENCE_CLOSURE_V1.md` and the
+operator runbook at `HYBRID_V2_OPERATOR_RUNBOOK.md`. The closure
+adds the unified deployment-scoped operation lock
+(`hybrid_v2_operation_locks` in migration 0048), a 13-phase
+persisted rebuild state machine (`hybrid_v2_rebuild_operations`)
+with both `JournalReplay` and `FreshChain` modes reusing
+`RebuildService::replay_all` and the existing worker path
+respectively, a reconciler + 8-value drift classification with
+append-only history (`hybrid_v2_reconciliation_results`), two new
+readiness variants (`RebuildRequested`, `ReconciliationInProgress`)
+mapped to hard-503, and a comprehensive test matrix (11 in-memory
++ 15 PG-gated). Frozen safety rules
+`NO_PARTIAL_REBUILD_STATE_IS_PUBLICLY_READY`,
+`RECONCILIATION_DRIFT_NEVER_AUTO_REPAIRS_PROJECTIONS`,
+`READY_REQUIRES_PERSISTENCE_REORG_REBUILD_AND_RECONCILIATION_CONVERGENCE`,
+and
+`OPERATOR_RECOVERY_ACTIONS_ARE_DEPLOYMENT_SCOPED_AND_NON_PUBLIC`
+are enforced. Publication model:
+`BACKEND_HYBRID_V2_REBUILD_SINGLE_TRANSACTION_MODEL`. Deferred to
+follow-ups: HTTP operator endpoints (service layer + tests are in
+place), `RpcChainViewProvider` wiring, CI closure workflow
+(no existing PG workflow in this repo to extend).
