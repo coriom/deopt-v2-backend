@@ -27,6 +27,8 @@ pub mod persistence;
 pub mod read_store;
 pub mod readiness;
 pub mod rebuild;
+pub mod rebuild_operations;
+pub mod reconciler;
 pub mod reducer;
 pub mod reorg;
 pub mod reorg_recovery;
@@ -60,6 +62,14 @@ pub use read_store::{
 };
 pub use readiness::{ReadinessReason, ReadinessReport, ReadinessState};
 pub use rebuild::{RebuildOutcome, RebuildService};
+pub use rebuild_operations::{
+    OperationKind, OperationLockGuard, RebuildConfig, RebuildError, RebuildMode,
+    RebuildOperationState, RebuildOperationsService, RebuildOutcome as RebuildOperationOutcome,
+    RebuildPhase,
+};
+pub use reconciler::{
+    DriftClassification, ReconciliationRecord, ReconciliationScheduler, ReconciliationSchedulerConfig,
+};
 pub use reducer::{
     ApplyContext, EscapeStateRow, FeeEventRow, MatchedExecutionRow, OrderLifecycleRow, PositionRow,
     ProjectionState, RecoveryStateProjection, ReducerError,

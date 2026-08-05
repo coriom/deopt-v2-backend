@@ -37,8 +37,19 @@ pub enum ReadinessReason {
         max: u64,
     },
     RebuildInProgress,
+    /// A rebuild has been requested/enqueued for this deployment but
+    /// has not yet acquired the operation lock. Hard-503 until the
+    /// state machine advances.
+    RebuildRequested {
+        epoch: i64,
+    },
     RebuildFailed {
         detail: String,
+    },
+    /// The reconciliation scheduler is actively running (holds the
+    /// deployment-scoped operation lock). Hard-503 while active.
+    ReconciliationInProgress {
+        epoch: i64,
     },
     ReconciliationDrift {
         detail: String,

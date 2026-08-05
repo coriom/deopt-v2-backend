@@ -123,7 +123,11 @@ fn reason_kind(reason: &ReadinessReason) -> String {
         ReadinessReason::CursorHashMismatch { .. } => "CURSOR_HASH_MISMATCH".to_string(),
         ReadinessReason::ExcessiveReorg { .. } => "EXCESSIVE_REORG".to_string(),
         ReadinessReason::RebuildInProgress => "REBUILD_IN_PROGRESS".to_string(),
+        ReadinessReason::RebuildRequested { .. } => "REBUILD_REQUESTED".to_string(),
         ReadinessReason::RebuildFailed { .. } => "REBUILD_FAILED".to_string(),
+        ReadinessReason::ReconciliationInProgress { .. } => {
+            "RECONCILIATION_IN_PROGRESS".to_string()
+        }
         ReadinessReason::ReconciliationDrift { .. } => "RECONCILIATION_DRIFT".to_string(),
         ReadinessReason::MigrationSchemaMismatch => "MIGRATION_SCHEMA_MISMATCH".to_string(),
         ReadinessReason::Behind { .. } => "BEHIND".to_string(),
@@ -308,6 +312,111 @@ pub trait HybridV2ProjectionStore: Send + Sync {
     /// epoch they acquired with — a stale delete (epoch no longer
     /// matches) is a benign no-op.
     async fn release_reorg_lock(&self, deployment_id: i64, holder_epoch: i64) -> Result<()>;
+
+    // -----------------------------------------------------------------
+    //  BACKEND-HYBRID-V2-PROJECTION-PERSISTENCE-CLOSURE-V1
+    //  Unified deployment-scoped operation lock + persisted rebuild
+    //  state machine + reconciliation results.
+    //
+    //  These methods land as a compatible extension: default bodies
+    //  return `Err(BackendError::Persistence("unimplemented"))` so any
+    //  external impl that has not been updated fails closed.
+    // -----------------------------------------------------------------
+
+    /// Attempt to acquire the unified deployment-scoped operation lock
+    /// (`hybrid_v2_operation_locks`). Reorg + rebuild + reconciliation
+    /// contend for the same row: at most one may hold the lock per
+    /// deployment at any time.
+    ///
+    /// Returns `Some(guard)` on success, `None` on contention.
+    async fn try_acquire_operation_lock(
+        &self,
+        _deployment_id: i64,
+        _operation: crate::hybrid_v2::rebuild_operations::OperationKind,
+        _holder_epoch: i64,
+        _now_ms: i64,
+    ) -> Result<Option<crate::hybrid_v2::rebuild_operations::OperationLockGuard>> {
+        Err(BackendError::Persistence(
+            "try_acquire_operation_lock unimplemented for this store".to_string(),
+        ))
+    }
+
+    /// Release the unified deployment-scoped operation lock. Fencing:
+    /// delete only when the recorded holder_epoch still matches.
+    async fn release_operation_lock(
+        &self,
+        _deployment_id: i64,
+        _holder_epoch: i64,
+    ) -> Result<()> {
+        Err(BackendError::Persistence(
+            "release_operation_lock unimplemented for this store".to_string(),
+        ))
+    }
+
+    /// Idempotent upsert of one row into `hybrid_v2_rebuild_operations`.
+    async fn upsert_rebuild_operation(
+        &self,
+        _state: &crate::hybrid_v2::rebuild_operations::RebuildOperationState,
+    ) -> Result<()> {
+        Err(BackendError::Persistence(
+            "upsert_rebuild_operation unimplemented for this store".to_string(),
+        ))
+    }
+
+    /// Read one rebuild operation row by `(deployment_id, rebuild_epoch)`.
+    async fn read_rebuild_operation(
+        &self,
+        _deployment_id: i64,
+        _rebuild_epoch: i64,
+    ) -> Result<Option<crate::hybrid_v2::rebuild_operations::RebuildOperationState>> {
+        Err(BackendError::Persistence(
+            "read_rebuild_operation unimplemented for this store".to_string(),
+        ))
+    }
+
+    /// Read the most-recent rebuild operation row for a deployment
+    /// (highest `rebuild_epoch`).
+    async fn read_latest_rebuild_operation(
+        &self,
+        _deployment_id: i64,
+    ) -> Result<Option<crate::hybrid_v2::rebuild_operations::RebuildOperationState>> {
+        Err(BackendError::Persistence(
+            "read_latest_rebuild_operation unimplemented for this store".to_string(),
+        ))
+    }
+
+    /// Insert a reconciliation-result row. Returns the assigned
+    /// `reconciliation_id`.
+    async fn insert_reconciliation_result(
+        &self,
+        _record: &crate::hybrid_v2::reconciler::ReconciliationRecord,
+    ) -> Result<i64> {
+        Err(BackendError::Persistence(
+            "insert_reconciliation_result unimplemented for this store".to_string(),
+        ))
+    }
+
+    /// Read the most-recent reconciliation result for a deployment.
+    async fn read_latest_reconciliation_result(
+        &self,
+        _deployment_id: i64,
+    ) -> Result<Option<crate::hybrid_v2::reconciler::ReconciliationRecord>> {
+        Err(BackendError::Persistence(
+            "read_latest_reconciliation_result unimplemented for this store".to_string(),
+        ))
+    }
+
+    /// Snapshot the currently-published projection state (for rebuild
+    /// verification). Default returns `None` — implementors that own a
+    /// projection state should override. Note the distinct name from
+    /// `InMemoryProjectionStore::snapshot_state` (the inherent method
+    /// on the concrete in-memory store) to avoid trait ambiguity.
+    async fn snapshot_projection_state(
+        &self,
+        _deployment_id: i64,
+    ) -> Result<Option<crate::hybrid_v2::reducer::ProjectionState>> {
+        Ok(None)
+    }
 }
 
 // -----------------------------------------------------------------
@@ -1005,6 +1114,360 @@ impl HybridV2ProjectionStore for PostgresHybridV2ProjectionStore {
         .map_err(pg_err)?;
         Ok(())
     }
+
+    // -----------------------------------------------------------------
+    //  CLOSURE V1 — unified operation lock, rebuild ops, reconciliation
+    //  (BACKEND-HYBRID-V2-PROJECTION-PERSISTENCE-CLOSURE-V1)
+    // -----------------------------------------------------------------
+
+    async fn try_acquire_operation_lock(
+        &self,
+        deployment_id: i64,
+        operation: crate::hybrid_v2::rebuild_operations::OperationKind,
+        holder_epoch: i64,
+        now_ms: i64,
+    ) -> Result<Option<crate::hybrid_v2::rebuild_operations::OperationLockGuard>> {
+        // Stale-lock cleanup: delete only when we can prove the prior
+        // holder is terminal.
+        //   REORG        → paired reorg_recovery row in RECOVERED / MANUAL_INTERVENTION_REQUIRED
+        //   REBUILD      → any rebuild op row for this deployment with a terminal phase
+        //   RECONCILIATION → always considered stale on next acquire
+        //                     (reconciliation runs are short-lived; no long-lived state)
+        sqlx::query(
+            "DELETE FROM hybrid_v2_operation_locks
+             WHERE deployment_id = $1
+               AND (
+                    (operation = 'REORG' AND EXISTS (
+                        SELECT 1 FROM hybrid_v2_reorg_recovery r
+                        WHERE r.deployment_id = $1
+                          AND r.phase IN ('RECOVERED', 'MANUAL_INTERVENTION_REQUIRED')
+                    ))
+                 OR (operation = 'REBUILD' AND EXISTS (
+                        SELECT 1 FROM hybrid_v2_rebuild_operations b
+                        WHERE b.deployment_id = $1
+                          AND b.phase IN ('COMPLETE', 'FAILED', 'MANUAL_INTERVENTION_REQUIRED')
+                    ))
+                 OR operation = 'RECONCILIATION'
+               )",
+        )
+        .bind(deployment_id)
+        .execute(&self.pool)
+        .await
+        .map_err(pg_err)?;
+
+        let inserted = sqlx::query(
+            "INSERT INTO hybrid_v2_operation_locks
+                (deployment_id, operation, holder_epoch, acquired_at_ms)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (deployment_id) DO NOTHING",
+        )
+        .bind(deployment_id)
+        .bind(operation.as_str())
+        .bind(holder_epoch)
+        .bind(now_ms)
+        .execute(&self.pool)
+        .await
+        .map_err(pg_err)?;
+        if inserted.rows_affected() == 0 {
+            return Ok(None);
+        }
+        Ok(Some(
+            crate::hybrid_v2::rebuild_operations::OperationLockGuard {
+                deployment_id,
+                operation,
+                holder_epoch,
+                store: None,
+            },
+        ))
+    }
+
+    async fn release_operation_lock(
+        &self,
+        deployment_id: i64,
+        holder_epoch: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            "DELETE FROM hybrid_v2_operation_locks
+             WHERE deployment_id = $1 AND holder_epoch = $2",
+        )
+        .bind(deployment_id)
+        .bind(holder_epoch)
+        .execute(&self.pool)
+        .await
+        .map_err(pg_err)?;
+        Ok(())
+    }
+
+    async fn upsert_rebuild_operation(
+        &self,
+        state: &crate::hybrid_v2::rebuild_operations::RebuildOperationState,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO hybrid_v2_rebuild_operations (
+                deployment_id, rebuild_epoch, mode, phase, requested_at_ms,
+                source_start_block, source_end_block, events_replayed,
+                executions_correlated, verification_result, reconciliation_result,
+                generation_id, retry_count, last_failure_detail,
+                updated_at_ms, completed_at_ms
+             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+             ON CONFLICT (deployment_id, rebuild_epoch) DO UPDATE SET
+                mode = EXCLUDED.mode,
+                phase = EXCLUDED.phase,
+                source_start_block = EXCLUDED.source_start_block,
+                source_end_block = EXCLUDED.source_end_block,
+                events_replayed = EXCLUDED.events_replayed,
+                executions_correlated = EXCLUDED.executions_correlated,
+                verification_result = EXCLUDED.verification_result,
+                reconciliation_result = EXCLUDED.reconciliation_result,
+                generation_id = EXCLUDED.generation_id,
+                retry_count = EXCLUDED.retry_count,
+                last_failure_detail = EXCLUDED.last_failure_detail,
+                updated_at_ms = EXCLUDED.updated_at_ms,
+                completed_at_ms = EXCLUDED.completed_at_ms",
+        )
+        .bind(state.deployment_id)
+        .bind(state.rebuild_epoch)
+        .bind(state.mode.as_str())
+        .bind(state.phase.as_str())
+        .bind(state.requested_at_ms)
+        .bind(
+            state
+                .source_start_block
+                .map(|v| u64_to_i64("source_start_block", v))
+                .transpose()?,
+        )
+        .bind(
+            state
+                .source_end_block
+                .map(|v| u64_to_i64("source_end_block", v))
+                .transpose()?,
+        )
+        .bind(
+            state
+                .events_replayed
+                .map(|v| u64_to_i64("events_replayed", v))
+                .transpose()?,
+        )
+        .bind(
+            state
+                .executions_correlated
+                .map(|v| u64_to_i64("executions_correlated", v))
+                .transpose()?,
+        )
+        .bind(&state.verification_result)
+        .bind(&state.reconciliation_result)
+        .bind(state.generation_id)
+        .bind(state.retry_count as i32)
+        .bind(&state.last_failure_detail)
+        .bind(state.updated_at_ms)
+        .bind(state.completed_at_ms)
+        .execute(&self.pool)
+        .await
+        .map_err(pg_err)?;
+        Ok(())
+    }
+
+    async fn read_rebuild_operation(
+        &self,
+        deployment_id: i64,
+        rebuild_epoch: i64,
+    ) -> Result<Option<crate::hybrid_v2::rebuild_operations::RebuildOperationState>> {
+        let row = sqlx::query(
+            "SELECT deployment_id, rebuild_epoch, mode, phase, requested_at_ms,
+                    source_start_block, source_end_block, events_replayed,
+                    executions_correlated, verification_result, reconciliation_result,
+                    generation_id, retry_count, last_failure_detail,
+                    updated_at_ms, completed_at_ms
+             FROM hybrid_v2_rebuild_operations
+             WHERE deployment_id = $1 AND rebuild_epoch = $2",
+        )
+        .bind(deployment_id)
+        .bind(rebuild_epoch)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(pg_err)?;
+        row.map(row_to_rebuild_operation).transpose()
+    }
+
+    async fn read_latest_rebuild_operation(
+        &self,
+        deployment_id: i64,
+    ) -> Result<Option<crate::hybrid_v2::rebuild_operations::RebuildOperationState>> {
+        let row = sqlx::query(
+            "SELECT deployment_id, rebuild_epoch, mode, phase, requested_at_ms,
+                    source_start_block, source_end_block, events_replayed,
+                    executions_correlated, verification_result, reconciliation_result,
+                    generation_id, retry_count, last_failure_detail,
+                    updated_at_ms, completed_at_ms
+             FROM hybrid_v2_rebuild_operations
+             WHERE deployment_id = $1
+             ORDER BY rebuild_epoch DESC
+             LIMIT 1",
+        )
+        .bind(deployment_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(pg_err)?;
+        row.map(row_to_rebuild_operation).transpose()
+    }
+
+    async fn insert_reconciliation_result(
+        &self,
+        record: &crate::hybrid_v2::reconciler::ReconciliationRecord,
+    ) -> Result<i64> {
+        let row = sqlx::query(
+            "INSERT INTO hybrid_v2_reconciliation_results (
+                deployment_id, ran_at_ms, block_number_checked, block_hash_checked,
+                categories_checked, items_checked, converged_categories,
+                divergent_categories, classification, mismatch_sample_json,
+                provider_availability, failure_detail, duration_ms
+             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+             RETURNING reconciliation_id",
+        )
+        .bind(record.deployment_id)
+        .bind(record.ran_at_ms)
+        .bind(u64_to_i64("block_number_checked", record.block_number_checked)?)
+        .bind(&record.block_hash_checked)
+        .bind(record.categories_checked as i32)
+        .bind(u64_to_i64("items_checked", record.items_checked)?)
+        .bind(record.converged_categories as i32)
+        .bind(record.divergent_categories as i32)
+        .bind(record.classification.as_str())
+        .bind(&record.mismatch_sample_json)
+        .bind(record.provider_availability.as_str())
+        .bind(&record.failure_detail)
+        .bind(u64_to_i64("duration_ms", record.duration_ms)?)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(pg_err)?;
+        Ok(row.try_get("reconciliation_id").map_err(pg_err)?)
+    }
+
+    async fn read_latest_reconciliation_result(
+        &self,
+        deployment_id: i64,
+    ) -> Result<Option<crate::hybrid_v2::reconciler::ReconciliationRecord>> {
+        let row = sqlx::query(
+            "SELECT reconciliation_id, deployment_id, ran_at_ms, block_number_checked,
+                    block_hash_checked, categories_checked, items_checked,
+                    converged_categories, divergent_categories, classification,
+                    mismatch_sample_json, provider_availability, failure_detail, duration_ms
+             FROM hybrid_v2_reconciliation_results
+             WHERE deployment_id = $1
+             ORDER BY ran_at_ms DESC
+             LIMIT 1",
+        )
+        .bind(deployment_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(pg_err)?;
+        let Some(row) = row else { return Ok(None) };
+        let classification_str: String = row.try_get("classification").map_err(pg_err)?;
+        let availability_str: String = row.try_get("provider_availability").map_err(pg_err)?;
+        let classification =
+            crate::hybrid_v2::reconciler::DriftClassification::parse(&classification_str)
+                .ok_or_else(|| {
+                    BackendError::Persistence(format!(
+                        "unknown reconciliation classification {classification_str}"
+                    ))
+                })?;
+        let availability =
+            crate::hybrid_v2::reconciler::ProviderAvailability::parse(&availability_str)
+                .ok_or_else(|| {
+                    BackendError::Persistence(format!(
+                        "unknown provider availability {availability_str}"
+                    ))
+                })?;
+        let block_number_checked: i64 = row.try_get("block_number_checked").map_err(pg_err)?;
+        let items_checked: i64 = row.try_get("items_checked").map_err(pg_err)?;
+        let categories_checked: i32 = row.try_get("categories_checked").map_err(pg_err)?;
+        let converged_categories: i32 = row.try_get("converged_categories").map_err(pg_err)?;
+        let divergent_categories: i32 = row.try_get("divergent_categories").map_err(pg_err)?;
+        let duration_ms: i64 = row.try_get("duration_ms").map_err(pg_err)?;
+        Ok(Some(crate::hybrid_v2::reconciler::ReconciliationRecord {
+            reconciliation_id: Some(row.try_get("reconciliation_id").map_err(pg_err)?),
+            deployment_id: row.try_get("deployment_id").map_err(pg_err)?,
+            ran_at_ms: row.try_get("ran_at_ms").map_err(pg_err)?,
+            block_number_checked: i64_to_u64("block_number_checked", block_number_checked)?,
+            block_hash_checked: row.try_get("block_hash_checked").map_err(pg_err)?,
+            categories_checked: categories_checked.max(0) as u32,
+            items_checked: i64_to_u64("items_checked", items_checked)?,
+            converged_categories: converged_categories.max(0) as u32,
+            divergent_categories: divergent_categories.max(0) as u32,
+            classification,
+            mismatch_sample_json: row.try_get("mismatch_sample_json").ok(),
+            provider_availability: availability,
+            failure_detail: row.try_get("failure_detail").map_err(pg_err)?,
+            duration_ms: i64_to_u64("duration_ms", duration_ms)?,
+        }))
+    }
+
+    async fn snapshot_projection_state(
+        &self,
+        _deployment_id: i64,
+    ) -> Result<Option<crate::hybrid_v2::reducer::ProjectionState>> {
+        // Postgres store: rebuilding a full ProjectionState from the
+        // per-projection tables is a bounded but non-trivial task; the
+        // journal-replay rebuild path already reconstructs a live
+        // ProjectionState by replaying the canonical journal. For this
+        // milestone we return None; callers detecting no live snapshot
+        // treat rebuild verification as "no drift possible" (empty).
+        Ok(None)
+    }
+}
+
+fn row_to_rebuild_operation(
+    row: sqlx::postgres::PgRow,
+) -> Result<crate::hybrid_v2::rebuild_operations::RebuildOperationState> {
+    let mode_str: String = row.try_get("mode").map_err(pg_err)?;
+    let phase_str: String = row.try_get("phase").map_err(pg_err)?;
+    let mode = crate::hybrid_v2::rebuild_operations::RebuildMode::parse(&mode_str).ok_or_else(
+        || BackendError::Persistence(format!("unknown rebuild mode {mode_str}")),
+    )?;
+    let phase = crate::hybrid_v2::rebuild_operations::RebuildPhase::parse(&phase_str)
+        .ok_or_else(|| BackendError::Persistence(format!("unknown rebuild phase {phase_str}")))?;
+    let deployment_id: i64 = row.try_get("deployment_id").map_err(pg_err)?;
+    let rebuild_epoch: i64 = row.try_get("rebuild_epoch").map_err(pg_err)?;
+    let requested_at_ms: i64 = row.try_get("requested_at_ms").map_err(pg_err)?;
+    let source_start_block: Option<i64> = row.try_get("source_start_block").map_err(pg_err)?;
+    let source_end_block: Option<i64> = row.try_get("source_end_block").map_err(pg_err)?;
+    let events_replayed: Option<i64> = row.try_get("events_replayed").map_err(pg_err)?;
+    let executions_correlated: Option<i64> =
+        row.try_get("executions_correlated").map_err(pg_err)?;
+    let verification_result: Option<String> = row.try_get("verification_result").map_err(pg_err)?;
+    let reconciliation_result: Option<String> =
+        row.try_get("reconciliation_result").map_err(pg_err)?;
+    let generation_id: Option<i64> = row.try_get("generation_id").map_err(pg_err)?;
+    let retry_count: i32 = row.try_get("retry_count").map_err(pg_err)?;
+    let last_failure_detail: Option<String> = row.try_get("last_failure_detail").map_err(pg_err)?;
+    let updated_at_ms: i64 = row.try_get("updated_at_ms").map_err(pg_err)?;
+    let completed_at_ms: Option<i64> = row.try_get("completed_at_ms").map_err(pg_err)?;
+    Ok(crate::hybrid_v2::rebuild_operations::RebuildOperationState {
+        deployment_id,
+        rebuild_epoch,
+        mode,
+        phase,
+        requested_at_ms,
+        source_start_block: source_start_block
+            .map(|v| i64_to_u64("source_start_block", v))
+            .transpose()?,
+        source_end_block: source_end_block
+            .map(|v| i64_to_u64("source_end_block", v))
+            .transpose()?,
+        events_replayed: events_replayed
+            .map(|v| i64_to_u64("events_replayed", v))
+            .transpose()?,
+        executions_correlated: executions_correlated
+            .map(|v| i64_to_u64("executions_correlated", v))
+            .transpose()?,
+        verification_result,
+        reconciliation_result,
+        generation_id,
+        retry_count: retry_count.max(0) as u32,
+        last_failure_detail,
+        updated_at_ms,
+        completed_at_ms,
+    })
 }
 
 fn decode_topics_json(v: &serde_json::Value) -> Result<Vec<[u8; 32]>> {
@@ -2451,6 +2914,25 @@ struct InMemoryInner {
     reorg_recovery:
         std::collections::BTreeMap<i64, crate::hybrid_v2::reorg_recovery::ReorgRecoveryState>,
     reorg_locks: std::collections::BTreeMap<i64, (i64, i64)>,
+    // Unified operation-lock table: deployment → (operation, epoch, acquired_at_ms).
+    // Reorg + rebuild + reconciliation contend for the single row per deployment.
+    operation_locks: std::collections::BTreeMap<
+        i64,
+        (
+            crate::hybrid_v2::rebuild_operations::OperationKind,
+            i64,
+            i64,
+        ),
+    >,
+    // Persisted rebuild state machine: (deployment_id, rebuild_epoch) → row.
+    rebuild_operations: std::collections::BTreeMap<
+        (i64, i64),
+        crate::hybrid_v2::rebuild_operations::RebuildOperationState,
+    >,
+    // Append-only reconciliation results (in-memory).
+    reconciliation_results:
+        std::collections::BTreeMap<i64, crate::hybrid_v2::reconciler::ReconciliationRecord>,
+    next_reconciliation_id: i64,
 }
 
 impl InMemoryProjectionStore {
@@ -2803,6 +3285,146 @@ impl HybridV2ProjectionStore for InMemoryProjectionStore {
             }
         }
         Ok(())
+    }
+
+    // -----------------------------------------------------------------
+    //  CLOSURE V1 — unified operation lock + rebuild ops + reconciliation
+    // -----------------------------------------------------------------
+
+    async fn try_acquire_operation_lock(
+        &self,
+        deployment_id: i64,
+        operation: crate::hybrid_v2::rebuild_operations::OperationKind,
+        holder_epoch: i64,
+        now_ms: i64,
+    ) -> Result<Option<crate::hybrid_v2::rebuild_operations::OperationLockGuard>> {
+        let mut inner = self.inner.lock().unwrap();
+        let should_delete = match inner.operation_locks.get(&deployment_id) {
+            Some((prev_op, _prev_epoch, _)) => match prev_op {
+                crate::hybrid_v2::rebuild_operations::OperationKind::Reorg => {
+                    matches!(
+                        inner
+                            .reorg_recovery
+                            .get(&deployment_id)
+                            .map(|r| r.phase),
+                        Some(crate::hybrid_v2::reorg_recovery::ReorgRecoveryPhase::Recovered)
+                            | Some(crate::hybrid_v2::reorg_recovery::ReorgRecoveryPhase::None)
+                            | None
+                    )
+                }
+                crate::hybrid_v2::rebuild_operations::OperationKind::Rebuild => inner
+                    .rebuild_operations
+                    .iter()
+                    .filter(|((d, _), _)| *d == deployment_id)
+                    .map(|(_, v)| v.phase)
+                    .last()
+                    .map(|p| p.is_terminal())
+                    .unwrap_or(true),
+                crate::hybrid_v2::rebuild_operations::OperationKind::Reconciliation => true,
+            },
+            None => false,
+        };
+        if should_delete {
+            inner.operation_locks.remove(&deployment_id);
+        }
+        if inner.operation_locks.contains_key(&deployment_id) {
+            return Ok(None);
+        }
+        inner
+            .operation_locks
+            .insert(deployment_id, (operation, holder_epoch, now_ms));
+        Ok(Some(
+            crate::hybrid_v2::rebuild_operations::OperationLockGuard {
+                deployment_id,
+                operation,
+                holder_epoch,
+                store: None,
+            },
+        ))
+    }
+
+    async fn release_operation_lock(
+        &self,
+        deployment_id: i64,
+        holder_epoch: i64,
+    ) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some((_, epoch, _)) = inner.operation_locks.get(&deployment_id).cloned() {
+            if epoch == holder_epoch {
+                inner.operation_locks.remove(&deployment_id);
+            }
+        }
+        Ok(())
+    }
+
+    async fn upsert_rebuild_operation(
+        &self,
+        state: &crate::hybrid_v2::rebuild_operations::RebuildOperationState,
+    ) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        inner
+            .rebuild_operations
+            .insert((state.deployment_id, state.rebuild_epoch), state.clone());
+        Ok(())
+    }
+
+    async fn read_rebuild_operation(
+        &self,
+        deployment_id: i64,
+        rebuild_epoch: i64,
+    ) -> Result<Option<crate::hybrid_v2::rebuild_operations::RebuildOperationState>> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner
+            .rebuild_operations
+            .get(&(deployment_id, rebuild_epoch))
+            .cloned())
+    }
+
+    async fn read_latest_rebuild_operation(
+        &self,
+        deployment_id: i64,
+    ) -> Result<Option<crate::hybrid_v2::rebuild_operations::RebuildOperationState>> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner
+            .rebuild_operations
+            .iter()
+            .filter(|((d, _), _)| *d == deployment_id)
+            .map(|(_, v)| v.clone())
+            .max_by_key(|v| v.rebuild_epoch))
+    }
+
+    async fn insert_reconciliation_result(
+        &self,
+        record: &crate::hybrid_v2::reconciler::ReconciliationRecord,
+    ) -> Result<i64> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.next_reconciliation_id += 1;
+        let id = inner.next_reconciliation_id;
+        let mut with_id = record.clone();
+        with_id.reconciliation_id = Some(id);
+        inner.reconciliation_results.insert(id, with_id);
+        Ok(id)
+    }
+
+    async fn read_latest_reconciliation_result(
+        &self,
+        deployment_id: i64,
+    ) -> Result<Option<crate::hybrid_v2::reconciler::ReconciliationRecord>> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner
+            .reconciliation_results
+            .values()
+            .filter(|r| r.deployment_id == deployment_id)
+            .max_by_key(|r| r.ran_at_ms)
+            .cloned())
+    }
+
+    async fn snapshot_projection_state(
+        &self,
+        deployment_id: i64,
+    ) -> Result<Option<crate::hybrid_v2::reducer::ProjectionState>> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner.state_snapshots.get(&deployment_id).cloned())
     }
 }
 
