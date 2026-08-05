@@ -608,7 +608,14 @@ impl ReorgRecoveryService {
             .read_canonical_journal(self.deployment_id)
             .await
             .map_err(|e| ReorgRecoveryError::Persistence(e.to_string()))?;
-        let (canonical_head, ancestor_opt) = match self.find_common_ancestor(&journal, source).await
+        let (canonical_head, ancestor_opt) = match self
+            .find_common_ancestor_with_tip(
+                &journal,
+                source,
+                state.old_tip_block,
+                &state.old_tip_hash,
+            )
+            .await
         {
             Ok(pair) => pair,
             Err(err) => {
@@ -904,52 +911,105 @@ impl ReorgRecoveryService {
         })
     }
 
-    /// Find the highest block number for which our canonical journal's
-    /// hash matches the current live chain's hash at that number.
-    /// Returns `(canonical_head, Some(ancestor))` on success, or
-    /// `(canonical_head, None)` if no ancestor found within
-    /// `max_reorg_depth` — the caller escalates.
-    async fn find_common_ancestor(
+    /// Find the highest block number for which our canonical journal
+    /// (or persisted cursor identity) matches the current live chain's
+    /// hash at that number. Returns `(canonical_head, Some(ancestor))`
+    /// on success, or `(canonical_head, None)` if no ancestor found
+    /// within `max_reorg_depth` — the caller escalates.
+    ///
+    /// Uses the journal (if non-empty) plus the caller-provided
+    /// `old_tip_hash` to seed a backward traversal that resolves each
+    /// local block hash via `source.block_by_hash` (the source retains
+    /// orphan headers by hash).
+    async fn find_common_ancestor_with_tip(
         &self,
         journal: &[JournaledLog],
         source: &dyn ChainSource,
+        old_tip_block: u64,
+        old_tip_hash: &str,
     ) -> std::result::Result<(u64, Option<CanonicalBlockRef>), ReorgRecoveryError> {
-        // Extract distinct canonical (block_number, block_hash, parent_hash, block_timestamp) tuples in descending order.
-        let mut seen: Vec<CanonicalBlockRef> = Vec::new();
-        let mut seen_numbers: HashSet<u64> = HashSet::new();
-        for log in journal.iter().rev() {
-            if !log.is_canonical {
-                continue;
-            }
-            if seen_numbers.insert(log.block_number) {
-                seen.push(CanonicalBlockRef {
+        // Collect distinct canonical (block_number → block_hash) map from
+        // the journal so blocks with events can short-circuit the
+        // source-by-hash traversal.
+        let mut journal_by_number: std::collections::BTreeMap<u64, CanonicalBlockRef> =
+            std::collections::BTreeMap::new();
+        for log in journal.iter().filter(|l| l.is_canonical) {
+            journal_by_number
+                .entry(log.block_number)
+                .or_insert(CanonicalBlockRef {
                     block_number: log.block_number,
                     block_hash: log.block_hash.clone(),
                     parent_hash: log.parent_hash.clone(),
                     block_timestamp: log.block_timestamp,
                 });
-            }
         }
-        seen.sort_by_key(|b| std::cmp::Reverse(b.block_number));
-        let canonical_head = seen.first().map(|b| b.block_number).unwrap_or(0);
+        let canonical_head = journal_by_number
+            .keys()
+            .next_back()
+            .copied()
+            .unwrap_or(old_tip_block);
+
+        // Seed the traversal at the tip. If the tip hash has a block
+        // record in the source (retained across reorgs by hash), use
+        // it — otherwise start walking down from the tip block number.
+        let seed = source
+            .block_by_hash(old_tip_hash)
+            .await
+            .ok()
+            .flatten()
+            .map(|b| CanonicalBlockRef {
+                block_number: b.number,
+                block_hash: b.hash,
+                parent_hash: b.parent_hash,
+                block_timestamp: b.timestamp,
+            });
+
+        // Backward walk using parent_hash pointers. Each iteration
+        // compares the local hash against the current best chain at
+        // that block number.
         let mut steps: u64 = 0;
-        for entry in seen.iter() {
+        let mut current: Option<CanonicalBlockRef> = seed.or_else(|| {
+            journal_by_number
+                .values()
+                .next_back()
+                .cloned()
+                .map(|r| r.clone())
+        });
+        while let Some(entry) = current.clone() {
             if steps >= self.config.max_reorg_depth {
                 return Ok((canonical_head, None));
             }
             steps += 1;
             let chain_block = source.block_at(entry.block_number).await?;
-            let Some(remote) = chain_block else {
-                continue;
-            };
-            if remote.hash.eq_ignore_ascii_case(&entry.block_hash) {
-                return Ok((canonical_head, Some(entry.clone())));
+            if let Some(remote) = chain_block {
+                if remote.hash.eq_ignore_ascii_case(&entry.block_hash) {
+                    return Ok((canonical_head, Some(entry)));
+                }
             }
+            if entry.block_number == 0 {
+                break;
+            }
+            // Traverse via parent_hash (source retains orphan headers
+            // by hash).
+            current = source
+                .block_by_hash(&entry.parent_hash)
+                .await
+                .ok()
+                .flatten()
+                .map(|b| CanonicalBlockRef {
+                    block_number: b.number,
+                    block_hash: b.hash,
+                    parent_hash: b.parent_hash,
+                    block_timestamp: b.timestamp,
+                })
+                .or_else(|| {
+                    // Fall back to the journal (chain by number).
+                    journal_by_number
+                        .range(..entry.block_number)
+                        .next_back()
+                        .map(|(_, r)| r.clone())
+                });
         }
-        // If we walked the entire journal without finding a match,
-        // block 0 is treated as an implicit ancestor for a fresh
-        // deployment. That guards against a corner case where the
-        // whole persisted history is orphaned.
         Ok((canonical_head, None))
     }
 
