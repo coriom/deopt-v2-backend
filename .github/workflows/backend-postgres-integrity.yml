@@ -106,7 +106,9 @@ jobs:
               hybrid_v2_rpc_chain_view_provider_tests \
               hybrid_v2_reconciliation_task_properties \
               hybrid_v2_operation_lock_pg_integration \
-              hybrid_v2_persistence_convergence_tests; do
+              hybrid_v2_persistence_convergence_tests \
+              hybrid_v2_reorg_high_risk_matrix_pg_integration \
+              hybrid_v2_final_closure_properties; do
             PGPASSWORD=disposable_ci_pw psql -h 127.0.0.1 -U deopt_ci -d deopt_hybrid_v2_disposable_ci <<'EOF' >/dev/null
 DROP SCHEMA public CASCADE;
 CREATE SCHEMA public;
