@@ -102,6 +102,9 @@ jobs:
               hybrid_v2_reorg_recovery_pg_integration \
               hybrid_v2_rebuild_operations_pg_integration \
               hybrid_v2_reconciliation_pg_integration \
+              hybrid_v2_reconciliation_task_pg_integration \
+              hybrid_v2_rpc_chain_view_provider_tests \
+              hybrid_v2_reconciliation_task_properties \
               hybrid_v2_operation_lock_pg_integration \
               hybrid_v2_persistence_convergence_tests; do
             PGPASSWORD=disposable_ci_pw psql -h 127.0.0.1 -U deopt_ci -d deopt_hybrid_v2_disposable_ci <<'EOF' >/dev/null
