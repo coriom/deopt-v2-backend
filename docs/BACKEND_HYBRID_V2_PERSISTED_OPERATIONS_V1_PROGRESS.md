@@ -177,3 +177,32 @@ are enforced. Publication model:
 follow-ups: HTTP operator endpoints (service layer + tests are in
 place), `RpcChainViewProvider` wiring, CI closure workflow
 (no existing PG workflow in this repo to extend).
+
+
+---
+
+## 2026-08-06 — operational-closure correction note
+
+The final "closure complete" note above referenced
+`BACKEND-HYBRID-V2-PROJECTION-PERSISTENCE-CLOSURE-V1`. That milestone
+was subsequently superseded by
+`BACKEND-HYBRID-V2-PROJECTION-PERSISTENCE-OPERATIONAL-CLOSURE-V1`
+(see `docs/BACKEND_HYBRID_V2_PROJECTION_PERSISTENCE_OPERATIONAL_CLOSURE_V1.md`),
+which lands:
+
+- Real Mode-1 re-materialization (previously stubbed).
+- Runtime bootstrap + worker pre-tick check for active rebuild ops
+  (previously deferred).
+- Unified operation lock actually covering reorg (previously the
+  reorg path still used a separate table).
+- Mounted admin recovery routes at `/admin/hybrid_v2/deployments/...`
+  (previously "operator control surface deferred").
+- Extended CI workflow gating every PG-backed hybrid_v2 test suite.
+
+Still deferred (honestly documented, no verdict claimed):
+
+- Production `RpcChainViewProvider` — reconciliation admin route
+  returns 501 `RECONCILIATION_PROVIDER_UNAVAILABLE`.
+- Production periodic reconciliation worker.
+- Drop of the legacy `hybrid_v2_reorg_locks` table (kept as empty
+  historical row source).

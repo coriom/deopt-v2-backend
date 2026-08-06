@@ -116,3 +116,75 @@ shadow-generation is genuinely required.
   (6 PG-gated), `tests/hybrid_v2_operation_lock_pg_integration.rs`
   (3 PG-gated)
 - Docs: this file, `docs/HYBRID_V2_OPERATOR_RUNBOOK.md`.
+
+
+---
+
+## Correction note — 2026-08-06
+
+Milestone `BACKEND-HYBRID-V2-PROJECTION-PERSISTENCE-OPERATIONAL-CLOSURE-V1`
+supersedes several of the verdicts claimed above. Nothing in this
+document is deleted; the corrections are additive so historical claims
+remain traceable.
+
+**Superseded verdicts** (see the new milestone doc for the current
+state):
+
+- `BACKEND_HYBRID_V2_UNIFIED_OPERATION_LOCK_ACROSS_REORG_REBUILD_AND_RECONCILIATION_ACHIEVED`
+  — the previous closure landed the `hybrid_v2_operation_locks` table
+  and the `OperationKind::Reorg` variant, but the reorg recovery service
+  itself still called the legacy `try_acquire_reorg_lock` / `release_reorg_lock`
+  trait methods. Reorg + rebuild + reconciliation therefore contended
+  on two separate tables and were NOT actually mutually exclusive.
+  The operational closure removes the legacy trait methods, migrates
+  `ReorgRecoveryService::recover` to `try_acquire_operation_lock(
+  OperationKind::Reorg, ...)`, and preserves the legacy
+  `hybrid_v2_reorg_locks` table as an empty historical row source.
+
+- `BACKEND_HYBRID_V2_JOURNAL_REPLAY_REBUILD_VALIDATED` (Mode 1) —
+  the previous closure implemented the rebuild state machine but the
+  Postgres impl of `snapshot_projection_state` returned `Ok(None)`,
+  so drift verification always fell through and the workflow reported
+  `NothingToDo` even when the projections were corrupted. The
+  operational closure lands a real `snapshot_projection_state` PG
+  reader and a `commit_rematerialization` PG writer (TRUNCATE +
+  REINSERT + cursor/readiness/rebuild-op update in a single tx),
+  behind an opt-in `HYBRID_V2_REBUILD_AUTO_REMATERIALIZE` config flag.
+
+- `BACKEND_HYBRID_V2_OPERATOR_CONTROL_SURFACE_DEFERRED` — the
+  operational closure lands mounted HTTP admin routes at
+  `POST /admin/hybrid_v2/deployments/:id/rebuild`,
+  `POST /admin/hybrid_v2/deployments/:id/reconcile`, and
+  `GET /admin/hybrid_v2/deployments/:id/operations/latest`, guarded
+  by the same admin-token gate as `admin/options/events/tick` and
+  refusing Base mainnet at handler entry. The reconcile route
+  returns `501 RECONCILIATION_PROVIDER_UNAVAILABLE` until a
+  production `ChainViewProvider` is wired — that surface is still
+  deferred and honestly documented as such.
+
+- `NO_PARTIAL_REBUILD_STATE_IS_PUBLICLY_READY` — previously enforced
+  only inside the rebuild service. The operational closure also
+  checks `hybrid_v2_rebuild_operations` inside
+  `IndexerRuntime::bootstrap_from_persistence` and in the worker
+  pre-tick loop, so a mid-flight rebuild survives process restarts.
+
+**Preserved verdicts** (still valid):
+
+- Every unified operation-lock row still fences terminal contention
+  the same way; the migration only changes which caller acquires the
+  Reorg lock.
+- The `NO_ORPHANED_ECONOMIC_STATE_IS_PUBLICLY_VISIBLE` and
+  `REORG_RECOVERY_USES_PERSISTED_CANONICAL_REPLAY` invariants are
+  unchanged.
+
+**Newly enforced invariants** (introduced by the operational closure):
+
+- `REBUILD_VALIDATED_MEANS_PROJECTIONS_ARE_ACTUALLY_REMATERIALIZED`
+- `UNIFIED_OPERATION_LOCK_MEANS_REORG_REBUILD_AND_RECONCILIATION_USE_THE_SAME_EXCLUSION_DOMAIN`
+- `CI_GATE_VALIDATED_MEANS_A_REAL_WORKFLOW_FILE_EXECUTES_THE_GATE`
+
+The `BACKEND_HYBRID_V2_PRODUCTION_RECONCILIATION_OPERATIONAL` and
+`BACKEND_HYBRID_V2_PRODUCTION_RPC_CHAIN_VIEW_PROVIDER_VALIDATED`
+verdicts remain deferred — no production `ChainViewProvider` has
+been wired yet, and the operational-closure milestone does not
+claim otherwise.

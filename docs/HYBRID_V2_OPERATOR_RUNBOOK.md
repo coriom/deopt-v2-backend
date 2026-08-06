@@ -217,3 +217,99 @@ only. Never log `HYBRID_V2_RPC_URL` verbatim.
 Hybrid V2 has no signing capability, no keys, no transaction
 broadcast. If a procedure asks to "sign" or "send", it does not
 apply here.
+
+
+---
+
+## Operator recovery controls — 2026-08-06
+
+`BACKEND-HYBRID-V2-PROJECTION-PERSISTENCE-OPERATIONAL-CLOSURE-V1`
+mounts three admin-gated HTTP routes for operator recovery of the
+Hybrid V2 projection layer. Every route uses the same admin-token
+gate as `admin/options/events/tick` — configure via `ADMIN_ENABLED=true`
+and `ADMIN_TOKEN=<opaque>`.
+
+### POST /admin/hybrid_v2/deployments/:deployment_id/rebuild
+
+Triggers a persisted Mode-1 (JournalReplay) rebuild for the deployment.
+The request body accepts:
+
+```json
+{
+  "mode": "JOURNAL_REPLAY",
+  "auto_rematerialize": false
+}
+```
+
+- `mode` defaults to `"JOURNAL_REPLAY"`. `"FRESH_CHAIN"` is refused
+  with 501 `FRESH_CHAIN_NOT_ROUTED` — it requires an operator-supplied
+  ingestion closure and is only exposed via direct service calls.
+- `auto_rematerialize` (default `false`) — when `true`, drift detected
+  by the journal replay triggers a single-tx TRUNCATE + REINSERT of
+  the re-materializable projection tables. When `false`, drift escalates
+  to `MANUAL_INTERVENTION_REQUIRED` and the operator must decide how
+  to proceed. **This flag is strongly recommended off during production
+  first launch.**
+
+Response codes:
+
+- `200 OK` with `{ "outcome": "NOTHING_TO_DO" | "REBUILT", ... }`
+  on success.
+- `409 CONFLICT` with outcome `"MANUAL_INTERVENTION_REQUIRED"` on
+  drift when `auto_rematerialize=false`, or with
+  `"OPERATION_LOCK_CONTENTION"` when another operation
+  (rebuild / reorg / reconciliation) is running.
+- `403 FORBIDDEN` on chain-id violation (Base mainnet) or auth failure.
+- `404 NOT_FOUND` on unknown `deployment_id`.
+- `503 HYBRID_V2_NOT_CONFIGURED` when no projection store is attached.
+
+### POST /admin/hybrid_v2/deployments/:deployment_id/reconcile
+
+Reserved for a future `ChainViewProvider`-backed operator reconciliation.
+Currently returns `501 RECONCILIATION_PROVIDER_UNAVAILABLE`. The
+scheduler + persistence surface is fully implemented — only the
+production `RpcChainViewProvider` is missing.
+
+### GET /admin/hybrid_v2/deployments/:deployment_id/operations/latest
+
+Returns the most recent rebuild-op row, reconciliation-result row,
+and reorg-recovery row for the deployment. Use this to poll status
+after triggering a rebuild.
+
+### Operational sequence — journal-replay rebuild
+
+1. Verify readiness: `GET /admin/hybrid_v2/deployments/:id/operations/latest`
+   — confirm no active rebuild.
+2. Trigger: `POST /admin/hybrid_v2/deployments/:id/rebuild`
+   with `{"mode":"JOURNAL_REPLAY"}`. Response body carries the
+   `rebuild_epoch` and outcome.
+3. If the response is `NOTHING_TO_DO`, the projections are already
+   consistent with the canonical journal — no further action.
+4. If the response is `409 MANUAL_INTERVENTION_REQUIRED`, inspect the
+   `detail` field, review the affected projection tables, and — after
+   operator sign-off — re-trigger with `{"auto_rematerialize": true}`.
+5. During any active rebuild, the runtime reports readiness
+   `RebuildInProgress` (hard 503) and the worker pauses ticks.
+
+### Unified operation lock
+
+Reorg + rebuild + reconciliation now contend for the same row in
+`hybrid_v2_operation_locks`. Inspect via:
+
+```sql
+SELECT deployment_id, operation, holder_epoch, acquired_at_ms
+FROM hybrid_v2_operation_locks;
+```
+
+The legacy `hybrid_v2_reorg_locks` table remains for historical
+purposes but is never written to. It can be dropped in a follow-up
+migration when convenient.
+
+### Bootstrap-time rebuild block
+
+If a rebuild-op row exists with a non-terminal / Failed / manual-
+intervention-required phase when the runtime starts,
+`IndexerRuntime::bootstrap_from_persistence` returns
+`BootstrapResult::RebuildBlocked` and the worker refuses to tick
+until an operator clears the row. Log lines include `rebuild_epoch`
+and `phase` for tracing.
