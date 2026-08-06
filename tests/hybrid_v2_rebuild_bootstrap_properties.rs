@@ -233,7 +233,6 @@ async fn commit_rematerialization_publishes_snapshot_and_marks_complete() {
     );
 }
 
-
 // -----------------------------------------------------------------
 //   AUTO-REMATERIALIZE FLOW (drift -> commit_rematerialization)
 // -----------------------------------------------------------------
@@ -278,7 +277,14 @@ async fn rebuild_from_journal_auto_rematerialize_rewrites_projection() {
     let seed_row = baseline_rebuild_row(did, RebuildPhase::Preparing);
     store_dyn.upsert_rebuild_operation(&seed_row).await.unwrap();
     store_dyn
-        .commit_rematerialization(did, 42, &drift_state, &cursor, &readiness, 1_700_000_000_100)
+        .commit_rematerialization(
+            did,
+            42,
+            &drift_state,
+            &cursor,
+            &readiness,
+            1_700_000_000_100,
+        )
         .await
         .unwrap();
 
@@ -298,9 +304,16 @@ async fn rebuild_from_journal_auto_rematerialize_rewrites_projection() {
     config.auto_rematerialize = true;
     let service = RebuildOperationsService::new(did, config);
     let manifest = manifest_84532();
-    let outcome = service.rebuild_from_journal(&store_dyn, &manifest).await.unwrap();
+    let outcome = service
+        .rebuild_from_journal(&store_dyn, &manifest)
+        .await
+        .unwrap();
     match outcome {
-        RebuildOutcome::Rebuilt { events_replayed, executions_correlated, .. } => {
+        RebuildOutcome::Rebuilt {
+            events_replayed,
+            executions_correlated,
+            ..
+        } => {
             assert_eq!(events_replayed, 0);
             assert_eq!(executions_correlated, 0);
         }
@@ -318,5 +331,9 @@ async fn rebuild_from_journal_auto_rematerialize_rewrites_projection() {
         .await
         .unwrap()
         .expect("snapshot");
-    assert!(after.balances.is_empty(), "expected balances wiped, got {:?}", after.balances);
+    assert!(
+        after.balances.is_empty(),
+        "expected balances wiped, got {:?}",
+        after.balances
+    );
 }
