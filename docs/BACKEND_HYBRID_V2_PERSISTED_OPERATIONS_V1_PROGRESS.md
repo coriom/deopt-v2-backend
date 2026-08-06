@@ -206,3 +206,34 @@ Still deferred (honestly documented, no verdict claimed):
 - Production periodic reconciliation worker.
 - Drop of the legacy `hybrid_v2_reorg_locks` table (kept as empty
   historical row source).
+
+---
+
+## 2026-08-06 — chain-view provider + reconciliation task correction
+
+`BACKEND-HYBRID-V2-CHAIN-VIEW-PROVIDER-AND-RECONCILIATION-TASK-V1`
+(see `docs/BACKEND_HYBRID_V2_CHAIN_VIEW_PROVIDER_AND_RECONCILIATION_TASK_V1.md`)
+lands the two remaining items above:
+
+- New `RpcChainViewProvider` (`src/hybrid_v2/rpc_chain_view.rs`) issues
+  block-bound `eth_call` reads via a new narrow public method on
+  `RpcHybridV2ChainSource::eth_call` that enforces a compile-time
+  per-module selector allowlist inside the source (defence in depth).
+- New periodic reconciliation worker
+  (`src/hybrid_v2/reconciliation_worker.rs`) spawned from `main.rs`
+  when `HYBRID_V2_RECONCILIATION_ENABLED=true` and
+  `HYBRID_V2_RECONCILIATION_PERIODIC_MS > 0`; shares its
+  `tick_once` entry point with the admin route.
+- `POST /admin/hybrid_v2/deployments/:id/reconcile` no longer returns
+  501 — it acquires the unified operation lock, invokes `tick_once`,
+  and persists the classification. 409 on lock contention.
+- Mock RPC harness extended with `eth_call` support + fixture map.
+- New test suites: `hybrid_v2_rpc_chain_view_provider_tests` (14
+  tests, mock RPC), `hybrid_v2_reconciliation_task_properties` (5
+  bounded properties), `hybrid_v2_reconciliation_task_pg_integration`
+  (8 PG-gated tests).
+- CI workflow extended to gate all three new suites.
+- Legacy `hybrid_v2_reorg_locks` table drop remains deferred.
+- Reservations / positions / order lifecycle / executions views
+  remain `UNSUPPORTED_VIEW` — the provider does not fetch those
+  because the Solidity view signatures are not yet pinned.

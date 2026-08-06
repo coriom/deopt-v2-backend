@@ -149,6 +149,51 @@ Classifications: `CONVERGED`, `INDEXER_BEHIND`, `NON_FINAL_DIFFERENCE`,
 `PROVIDER_UNAVAILABLE` is transient — it does NOT count as drift
 against the projection.
 
+### 7.1 Production `RpcChainViewProvider` + admin trigger + periodic worker
+
+Introduced by
+`BACKEND-HYBRID-V2-CHAIN-VIEW-PROVIDER-AND-RECONCILIATION-TASK-V1`.
+
+- Enable with `HYBRID_V2_RECONCILIATION_ENABLED=1`. The provider is
+  wired on `AppState`; the admin `/reconcile` route stops returning
+  `RECONCILIATION_PROVIDER_UNAVAILABLE`.
+- Set `HYBRID_V2_RECONCILIATION_PERIODIC_MS` to a non-zero value to
+  spawn a background worker that ticks at that cadence. `0` disables
+  the worker (admin-triggered runs still work).
+- `HYBRID_V2_RECONCILIATION_MAX_ITEMS_PER_RUN` (default `4096`) caps
+  the number of subaccounts sampled per run.
+- The provider uses block-bound `eth_call` against
+  `SubaccountRegistry.ownerOf`, `CollateralVault.balanceWithYield`,
+  and `RecoveryFinalizer.getRecoveryState`. Each call is validated
+  against a compile-time per-module selector allowlist inside
+  `RpcHybridV2ChainSource::eth_call`.
+- Reservations / positions / order lifecycle / executions are
+  `UNSUPPORTED_VIEW` in this milestone — the reconciler does not
+  compare those categories against chain state.
+
+Admin trigger:
+
+```
+curl -X POST -H "x-admin-token: $ADMIN_TOKEN" \
+  https://backend.example/admin/hybrid_v2/deployments/42/reconcile
+```
+
+Response body:
+
+```json
+{"deployment_id": 42, "operation_id": 17, "classification": "CONVERGED",
+ "status": "COMPLETED"}
+```
+
+Non-success outcomes:
+
+- 409 `RECONCILIATION_SKIPPED` — operation lock contention (a rebuild
+  or reorg is in flight).
+- 503 `RECONCILIATION_PROVIDER_UNAVAILABLE` — the provider is not
+  wired (missing env var, missing manifest, or invalid module address).
+- 500 `RECONCILIATION_FAILED` — persistence error; the row was NOT
+  written.
+
 ## 8. Lock inspection
 
 ```sql
