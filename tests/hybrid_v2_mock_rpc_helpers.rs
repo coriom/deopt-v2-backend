@@ -110,6 +110,13 @@ pub struct MockState {
     /// code (not retryable) on the next call.
     pub simulate_next_rpc_error: Option<(i64, String)>,
     pub prohibited_calls_seen: HashSet<String>,
+    /// eth_call fixture map keyed by (lowercased_to, 4-byte selector).
+    /// Values are raw response bytes; the handler encodes as
+    /// "0x{hex}".
+    pub eth_call_responses: BTreeMap<(String, [u8; 4]), Vec<u8>>,
+    /// If Some, respond to the next eth_call with a JSON-RPC error
+    /// (never retried). Consumed after use.
+    pub eth_call_next_rpc_error: Option<(i64, String)>,
 }
 
 impl Default for MockState {
@@ -129,6 +136,8 @@ impl Default for MockState {
             simulate_malformed_remaining: 0,
             simulate_next_rpc_error: None,
             prohibited_calls_seen: HashSet::new(),
+            eth_call_responses: BTreeMap::new(),
+            eth_call_next_rpc_error: None,
         }
     }
 }
@@ -238,6 +247,21 @@ impl MockRpcServer {
 
     pub fn simulate_next_rpc_error(&self, code: i64, message: impl Into<String>) {
         self.state.lock().unwrap().simulate_next_rpc_error = Some((code, message.into()));
+    }
+
+    /// Register a canned `eth_call` response keyed by (to, selector).
+    /// The 4-byte selector is the first four bytes of the ABI calldata.
+    pub fn set_eth_call_response(&self, to: &str, selector: [u8; 4], response: Vec<u8>) {
+        let key = (to.to_ascii_lowercase(), selector);
+        self.state
+            .lock()
+            .unwrap()
+            .eth_call_responses
+            .insert(key, response);
+    }
+
+    pub fn set_eth_call_next_rpc_error(&self, code: i64, message: impl Into<String>) {
+        self.state.lock().unwrap().eth_call_next_rpc_error = Some((code, message.into()));
     }
 
     pub fn calls(&self) -> Vec<Call> {
@@ -480,6 +504,48 @@ fn dispatch(
                 }
             }
             json!({"jsonrpc": "2.0", "id": id, "result": out})
+        }
+        "eth_call" => {
+            let mut st = state.lock().unwrap();
+            if let Some((code, msg)) = st.eth_call_next_rpc_error.take() {
+                return json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "error": {"code": code, "message": msg}
+                });
+            }
+            let arr = params.as_array();
+            let call_obj = arr.and_then(|a| a.get(0)).cloned().unwrap_or(json!({}));
+            let to = call_obj
+                .get("to")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let data_hex = call_obj.get("data").and_then(|v| v.as_str()).unwrap_or("");
+            let data_stripped = data_hex.strip_prefix("0x").unwrap_or(data_hex);
+            if data_stripped.len() < 8 {
+                return json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "error": {"code": -32602, "message": "call data too short"}
+                });
+            }
+            let mut selector = [0u8; 4];
+            for i in 0..4 {
+                let byte = u8::from_str_radix(&data_stripped[i * 2..i * 2 + 2], 16).unwrap_or(0);
+                selector[i] = byte;
+            }
+            match st.eth_call_responses.get(&(to.clone(), selector)) {
+                Some(resp) => {
+                    let mut hex = String::from("0x");
+                    for b in resp {
+                        hex.push_str(&format!("{:02x}", b));
+                    }
+                    json!({"jsonrpc": "2.0", "id": id, "result": hex})
+                }
+                None => json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "error": {"code": -32000, "message": format!("mock: no eth_call fixture for {} sel=0x{:02x}{:02x}{:02x}{:02x}", to, selector[0], selector[1], selector[2], selector[3])}
+                }),
+            }
         }
         other => json!({
             "jsonrpc": "2.0", "id": id,

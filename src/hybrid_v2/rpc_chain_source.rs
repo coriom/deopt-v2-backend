@@ -14,6 +14,7 @@
 //! - `eth_getBlockByNumber`
 //! - `eth_getBlockByHash`
 //! - `eth_getLogs`
+//! - `eth_call` (block-bound, allowlisted target address + selector)
 //!
 //! Retry policy: bounded exponential backoff on transport failures,
 //! HTTP 429, and HTTP 5xx. Deterministic JSON-RPC error responses
@@ -283,6 +284,73 @@ impl RpcHybridV2ChainSource {
         }
     }
 
+    /// Read-only `eth_call` against a Hybrid V2 module contract.
+    ///
+    /// Strict boundary enforced INSIDE this method:
+    /// - `to` must be a well-formed 20-byte 0x-prefixed hex address.
+    /// - `data` must be at least 4 bytes (a function selector).
+    /// - The 4-byte selector must appear in `allowed_selectors` for the
+    ///   normalised target address; if the map is empty for a target the
+    ///   call is REJECTED (the caller wires the allowlist).
+    /// - `block` may be `Number(n)` (encoded as `"0x{n:x}"`) or
+    ///   `Latest`. `Hash(_)` is unsupported by all providers we target
+    ///   so it is REJECTED here (returns `Unsupported`).
+    ///
+    /// Retry policy identical to every other allowed method.
+    ///
+    /// Returns the raw hex-decoded response bytes.
+    pub async fn eth_call(
+        &self,
+        to: &str,
+        data: &[u8],
+        block: BlockRef,
+        allowed_selectors: &std::collections::HashMap<[u8; 20], std::collections::HashSet<[u8; 4]>>,
+    ) -> Result<Vec<u8>, ChainSourceError> {
+        if !is_address_hex(to) {
+            return Err(ChainSourceError::Malformed(format!(
+                "eth_call `to` is not a 20-byte hex address"
+            )));
+        }
+        if data.len() < 4 {
+            return Err(ChainSourceError::Malformed(
+                "eth_call `data` shorter than 4-byte selector".to_string(),
+            ));
+        }
+        let mut selector = [0u8; 4];
+        selector.copy_from_slice(&data[0..4]);
+        let normalised_to = normalise_address(to);
+        let to_bytes = address_hex_to_bytes(&normalised_to)
+            .map_err(|e| ChainSourceError::Malformed(format!("eth_call `to` decode: {e}")))?;
+        let Some(allowed) = allowed_selectors.get(&to_bytes) else {
+            return Err(ChainSourceError::Unsupported(format!(
+                "eth_call target {normalised_to} is not in the module allowlist"
+            )));
+        };
+        if !allowed.contains(&selector) {
+            return Err(ChainSourceError::Unsupported(format!(
+                "eth_call selector 0x{:02x}{:02x}{:02x}{:02x} is not allowed for target {}",
+                selector[0], selector[1], selector[2], selector[3], normalised_to,
+            )));
+        }
+        let block_param = match block {
+            BlockRef::Number(n) => Value::String(format!("0x{:x}", n)),
+            BlockRef::Latest => Value::String("latest".to_string()),
+        };
+        let params = json!([
+            {
+                "to": normalised_to,
+                "data": format!("0x{}", hex_encode(data)),
+            },
+            block_param,
+        ]);
+        let v = self.call("eth_call", params).await?;
+        let s = v.as_str().ok_or_else(|| {
+            ChainSourceError::Malformed("eth_call response not a string".to_string())
+        })?;
+        parse_hex_bytes(s)
+            .map_err(|e| ChainSourceError::Malformed(format!("eth_call hex decode: {e}")))
+    }
+
     async fn fetch_block_header(
         &self,
         selector: BlockSelector<'_>,
@@ -364,6 +432,15 @@ impl RpcHybridV2ChainSource {
 enum BlockSelector<'a> {
     Number(u64),
     Hash(&'a str),
+}
+
+/// Which block a read-only view is bound to. `Number(n)` produces a
+/// deterministic snapshot at height `n`; `Latest` is only appropriate
+/// for probe calls where the caller does not need block-coherent state.
+#[derive(Debug, Clone, Copy)]
+pub enum BlockRef {
+    Number(u64),
+    Latest,
 }
 
 #[async_trait]
@@ -637,6 +714,33 @@ fn hash_eq(a: &str, b: &str) -> bool {
     a.eq_ignore_ascii_case(b)
 }
 
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push_str(&format!("{:02x}", b));
+    }
+    out
+}
+
+fn normalise_address(addr: &str) -> String {
+    let lower = addr.trim().to_ascii_lowercase();
+    if lower.starts_with("0x") {
+        lower
+    } else {
+        format!("0x{lower}")
+    }
+}
+
+fn address_hex_to_bytes(addr: &str) -> Result<[u8; 20], String> {
+    let bytes = parse_hex_bytes(addr)?;
+    if bytes.len() != 20 {
+        return Err(format!("expected 20 bytes, got {}", bytes.len()));
+    }
+    let mut out = [0u8; 20];
+    out.copy_from_slice(&bytes);
+    Ok(out)
+}
+
 fn map_reqwest_send_err(err: reqwest::Error) -> ChainSourceError {
     if err.is_timeout() {
         ChainSourceError::Timeout
@@ -758,9 +862,100 @@ mod tests {
             "eth_getBlockByNumber",
             "eth_getBlockByHash",
             "eth_getLogs",
+            "eth_call",
         ] {
             assert!(!is_prohibited_method(m), "must be allowed: {m}");
         }
+    }
+
+    #[tokio::test]
+    async fn eth_call_rejects_bad_target() {
+        // Use a dummy endpoint — the source will construct fine but never
+        // send a request because validation trips first.
+        let cfg = RpcSourceConfig {
+            endpoint: "http://127.0.0.1:1/".to_string(),
+            chain_id: 84532,
+            timeout: Duration::from_millis(50),
+            max_retries: 0,
+            retry_backoff: Duration::from_millis(1),
+            max_logs_per_range: 1000,
+            confirmation_depth: 12,
+        };
+        let src = RpcHybridV2ChainSource::new(cfg, vec![]).expect("construct");
+        let allowlist = std::collections::HashMap::new();
+        // Non-hex `to` is rejected before any allowlist lookup.
+        let err = src
+            .eth_call("garbage", &[0x1u8, 2, 3, 4], BlockRef::Latest, &allowlist)
+            .await
+            .expect_err("must reject non-address");
+        assert!(matches!(err, ChainSourceError::Malformed(_)));
+    }
+
+    #[tokio::test]
+    async fn eth_call_rejects_short_data() {
+        let cfg = RpcSourceConfig {
+            endpoint: "http://127.0.0.1:1/".to_string(),
+            chain_id: 84532,
+            timeout: Duration::from_millis(50),
+            max_retries: 0,
+            retry_backoff: Duration::from_millis(1),
+            max_logs_per_range: 1000,
+            confirmation_depth: 12,
+        };
+        let src = RpcHybridV2ChainSource::new(cfg, vec![]).expect("construct");
+        let allowlist = std::collections::HashMap::new();
+        let addr = format!("0x{}", "aa".repeat(20));
+        let err = src
+            .eth_call(&addr, &[0x1u8, 2, 3], BlockRef::Latest, &allowlist)
+            .await
+            .expect_err("must reject short data");
+        assert!(matches!(err, ChainSourceError::Malformed(_)));
+    }
+
+    #[tokio::test]
+    async fn eth_call_rejects_unlisted_target() {
+        let cfg = RpcSourceConfig {
+            endpoint: "http://127.0.0.1:1/".to_string(),
+            chain_id: 84532,
+            timeout: Duration::from_millis(50),
+            max_retries: 0,
+            retry_backoff: Duration::from_millis(1),
+            max_logs_per_range: 1000,
+            confirmation_depth: 12,
+        };
+        let src = RpcHybridV2ChainSource::new(cfg, vec![]).expect("construct");
+        let allowlist = std::collections::HashMap::new();
+        let addr = format!("0x{}", "aa".repeat(20));
+        let err = src
+            .eth_call(&addr, &[0x1u8, 2, 3, 4], BlockRef::Latest, &allowlist)
+            .await
+            .expect_err("must reject unlisted target");
+        assert!(matches!(err, ChainSourceError::Unsupported(_)));
+    }
+
+    #[tokio::test]
+    async fn eth_call_rejects_unlisted_selector() {
+        let cfg = RpcSourceConfig {
+            endpoint: "http://127.0.0.1:1/".to_string(),
+            chain_id: 84532,
+            timeout: Duration::from_millis(50),
+            max_retries: 0,
+            retry_backoff: Duration::from_millis(1),
+            max_logs_per_range: 1000,
+            confirmation_depth: 12,
+        };
+        let src = RpcHybridV2ChainSource::new(cfg, vec![]).expect("construct");
+        let addr = format!("0x{}", "aa".repeat(20));
+        let target_bytes = address_hex_to_bytes(&addr).unwrap();
+        let mut allowed_sel = std::collections::HashSet::new();
+        allowed_sel.insert([0xde, 0xad, 0xbe, 0xef]);
+        let mut allowlist = std::collections::HashMap::new();
+        allowlist.insert(target_bytes, allowed_sel);
+        let err = src
+            .eth_call(&addr, &[0x1u8, 2, 3, 4], BlockRef::Latest, &allowlist)
+            .await
+            .expect_err("must reject unlisted selector");
+        assert!(matches!(err, ChainSourceError::Unsupported(_)));
     }
 
     #[test]
