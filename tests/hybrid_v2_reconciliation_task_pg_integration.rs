@@ -329,7 +329,7 @@ async fn task_operation_lock_conflicts_between_reconciliation_and_rebuild() {
         .await
         .expect("upsert");
     // Rebuild acquires lock first.
-    let rebuild_guard = store
+    let _rebuild_guard = store
         .try_acquire_operation_lock(did, OperationKind::Rebuild, 1, 1_700_000_000_000)
         .await
         .expect("acq")
@@ -343,14 +343,19 @@ async fn task_operation_lock_conflicts_between_reconciliation_and_rebuild() {
         recon.is_none(),
         "reconciliation must not acquire while rebuild holds"
     );
-    rebuild_guard.release().await.expect("release");
+    // The PG-store `OperationLockGuard` does not carry a store
+    // reference (see `rebuild_operations::OperationLockGuard`), so
+    // `release()` on it is a no-op. Release explicitly via the
+    // store — this is the release contract every production caller
+    // (rebuild service, reconciliation task, admin route) uses.
+    store.release_operation_lock(did, 1).await.expect("release");
     // After release, reconciliation acquires cleanly.
-    let recon2 = store
+    let _recon2 = store
         .try_acquire_operation_lock(did, OperationKind::Reconciliation, 3, 1_700_000_000_002)
         .await
         .expect("acq")
         .expect("acquired");
-    recon2.release().await.expect("release");
+    store.release_operation_lock(did, 3).await.expect("release");
 }
 
 #[tokio::test]
