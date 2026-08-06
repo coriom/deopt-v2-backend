@@ -105,6 +105,25 @@ pub struct HybridV2Config {
     /// will still attempt to recover (development / test only).
     /// Env: `HYBRID_V2_REORG_ALLOW_FINALIZED_CROSS`. Default false.
     pub reorg_allow_finalized_boundary_crossing: bool,
+    // -----------------------------------------------------------------
+    // BACKEND-HYBRID-V2-CHAIN-VIEW-PROVIDER-AND-RECONCILIATION-TASK-V1
+    // -----------------------------------------------------------------
+    /// Master switch for the production reconciliation surface. When
+    /// `false` (the default) the admin `/reconcile` route continues to
+    /// return `RECONCILIATION_DISABLED` and no periodic worker is
+    /// spawned. When `true` the operator opts into on-chain view reads
+    /// via `RpcChainViewProvider`.
+    /// Env: `HYBRID_V2_RECONCILIATION_ENABLED`.
+    pub reconciliation_enabled: bool,
+    /// Periodic reconciliation cadence in milliseconds. `0` disables
+    /// the worker even when `reconciliation_enabled=true`.
+    /// Bounded to [0, 86_400_000].
+    /// Env: `HYBRID_V2_RECONCILIATION_PERIODIC_MS`.
+    pub reconciliation_periodic_ms: u64,
+    /// Cap on the number of subaccounts sampled per reconciliation
+    /// run. Bounded to [1, 1_000_000]. Env:
+    /// `HYBRID_V2_RECONCILIATION_MAX_ITEMS_PER_RUN`.
+    pub reconciliation_max_items_per_run: u64,
 }
 
 impl std::fmt::Debug for HybridV2Config {
@@ -145,6 +164,15 @@ impl std::fmt::Debug for HybridV2Config {
             .field(
                 "reorg_allow_finalized_boundary_crossing",
                 &self.reorg_allow_finalized_boundary_crossing,
+            )
+            .field("reconciliation_enabled", &self.reconciliation_enabled)
+            .field(
+                "reconciliation_periodic_ms",
+                &self.reconciliation_periodic_ms,
+            )
+            .field(
+                "reconciliation_max_items_per_run",
+                &self.reconciliation_max_items_per_run,
             )
             .finish()
     }
@@ -193,6 +221,9 @@ impl HybridV2Config {
             reorg_retry_max: 5,
             reorg_retry_backoff_ms: 500,
             reorg_allow_finalized_boundary_crossing: false,
+            reconciliation_enabled: false,
+            reconciliation_periodic_ms: 0,
+            reconciliation_max_items_per_run: 4_096,
         }
     }
 
@@ -244,6 +275,12 @@ impl HybridV2Config {
             parse_env("HYBRID_V2_REORG_RETRY_BACKOFF_MS")?.unwrap_or(500);
         let reorg_allow_finalized_boundary_crossing: bool =
             parse_bool_env("HYBRID_V2_REORG_ALLOW_FINALIZED_CROSS")?.unwrap_or(false);
+        let reconciliation_enabled: bool =
+            parse_bool_env("HYBRID_V2_RECONCILIATION_ENABLED")?.unwrap_or(false);
+        let reconciliation_periodic_ms: u64 =
+            parse_env("HYBRID_V2_RECONCILIATION_PERIODIC_MS")?.unwrap_or(0);
+        let reconciliation_max_items_per_run: u64 =
+            parse_env("HYBRID_V2_RECONCILIATION_MAX_ITEMS_PER_RUN")?.unwrap_or(4_096);
         let cfg = Self {
             enabled: true,
             deployment_id,
@@ -264,6 +301,9 @@ impl HybridV2Config {
             reorg_retry_max,
             reorg_retry_backoff_ms,
             reorg_allow_finalized_boundary_crossing,
+            reconciliation_enabled,
+            reconciliation_periodic_ms,
+            reconciliation_max_items_per_run,
         };
         cfg.validate()?;
         Ok(cfg)
@@ -397,6 +437,21 @@ impl HybridV2Config {
             return Err(cfg_err(format!(
                 "HYBRID_V2_REORG_RETRY_BACKOFF_MS must be within [50, 60000], got {}",
                 self.reorg_retry_backoff_ms
+            )));
+        }
+        // Reconciliation bounds — validated regardless of the enable
+        // switch so an operator does not silently ship a broken cadence
+        // when they later flip `HYBRID_V2_RECONCILIATION_ENABLED=1`.
+        if self.reconciliation_periodic_ms > 86_400_000 {
+            return Err(cfg_err(format!(
+                "HYBRID_V2_RECONCILIATION_PERIODIC_MS must be within [0, 86400000], got {}",
+                self.reconciliation_periodic_ms
+            )));
+        }
+        if !(1..=1_000_000).contains(&self.reconciliation_max_items_per_run) {
+            return Err(cfg_err(format!(
+                "HYBRID_V2_RECONCILIATION_MAX_ITEMS_PER_RUN must be within [1, 1000000], got {}",
+                self.reconciliation_max_items_per_run
             )));
         }
         Ok(())

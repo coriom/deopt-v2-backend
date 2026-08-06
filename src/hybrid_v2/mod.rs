@@ -29,11 +29,13 @@ pub mod readiness;
 pub mod rebuild;
 pub mod rebuild_operations;
 pub mod reconciler;
+pub mod reconciliation_worker;
 pub mod reducer;
 pub mod reorg;
 pub mod reorg_recovery;
 pub mod repository;
 pub mod rpc_chain_source;
+pub mod rpc_chain_view;
 pub mod runtime;
 pub mod runtime_backed_read_store;
 pub mod snapshot;
@@ -71,6 +73,9 @@ pub use reconciler::{
     DriftClassification, ReconciliationRecord, ReconciliationScheduler,
     ReconciliationSchedulerConfig,
 };
+pub use reconciliation_worker::{
+    spawn_hybrid_v2_reconciliation_worker, HybridV2ReconciliationWorkerConfig,
+};
 pub use reducer::{
     ApplyContext, EscapeStateRow, FeeEventRow, MatchedExecutionRow, OrderLifecycleRow, PositionRow,
     ProjectionState, RecoveryStateProjection, ReducerError,
@@ -81,7 +86,8 @@ pub use reorg_recovery::{
     ReorgRecoveryService, ReorgRecoveryState,
 };
 pub use repository::{HybridV2QueryRepository, PageCursor};
-pub use rpc_chain_source::{RpcHybridV2ChainSource, RpcSourceConfig};
+pub use rpc_chain_source::{BlockRef, RpcHybridV2ChainSource, RpcSourceConfig};
+pub use rpc_chain_view::{RpcChainViewProvider, RpcChainViewProviderError};
 pub use runtime::{
     BootstrapResult, IndexerRuntime, PendingReorgAudit, RuntimeError, RuntimeMetrics,
 };
