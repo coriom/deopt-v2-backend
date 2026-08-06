@@ -327,6 +327,19 @@ impl ReconciliationScheduler {
     }
 }
 
+/// Public wrapper around the private [`classify`] mapping — used by the
+/// admin route + periodic worker to produce persistable classification +
+/// mismatch details without duplicating the match arms.
+pub fn classify_public(
+    r: &ReconciliationResult,
+) -> (
+    DriftClassification,
+    Option<String>,
+    Option<serde_json::Value>,
+) {
+    classify(r)
+}
+
 fn classify(
     r: &ReconciliationResult,
 ) -> (
