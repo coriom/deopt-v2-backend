@@ -278,6 +278,16 @@ pub struct RebuildConfig {
     /// Retryable-failure budget before the machine escalates to
     /// `ManualInterventionRequired`. Bounded [0, 10].
     pub retry_max: u32,
+    /// If true, drift detected during `JournalReplay` triggers an
+    /// automatic re-materialization of the projection tables via
+    /// `HybridV2ProjectionStore::commit_rematerialization`. If false
+    /// (the safe default), drift escalates to
+    /// `ManualInterventionRequired` without touching any live table.
+    ///
+    /// Configured via the environment variable
+    /// `HYBRID_V2_REBUILD_AUTO_REMATERIALIZE` (accepts `1`, `true`,
+    /// `yes` — case insensitive; anything else stays false).
+    pub auto_rematerialize: bool,
 }
 
 impl Default for RebuildConfig {
@@ -287,6 +297,7 @@ impl Default for RebuildConfig {
             verification_enabled: true,
             reconciliation_enabled: true,
             retry_max: 3,
+            auto_rematerialize: false,
         }
     }
 }
@@ -553,6 +564,77 @@ impl RebuildOperationsService {
             let detail = format!("rebuild drift: {}", reason);
             state.verification_result = Some("DRIFT".to_string());
             state.last_failure_detail = Some(detail.clone());
+            if self.config.auto_rematerialize {
+                // BACKEND-HYBRID-V2-PROJECTION-PERSISTENCE-OPERATIONAL-CLOSURE-V1
+                // Real Mode-1 re-materialization: TRUNCATE + REINSERT the
+                // rebuilt state in a single transaction.
+                state.phase = RebuildPhase::Committing;
+                state.updated_at_ms = now_ms();
+                store
+                    .upsert_rebuild_operation(state)
+                    .await
+                    .map_err(err_persist)?;
+                let cursor_snapshot = crate::hybrid_v2::persistence::RuntimeCursorSnapshot {
+                    cursor_name: "hybrid_v2_indexer".to_string(),
+                    indexed_head_block: rebuilt_state
+                        .matched_executions
+                        .values()
+                        .map(|e| e.block_number)
+                        .max()
+                        .unwrap_or(outcome.final_head_block),
+                    indexed_head_hash: String::new(),
+                    indexed_head_parent: String::new(),
+                    observed_head_block: outcome.final_head_block,
+                    finalized_head_block: 0,
+                    last_error: None,
+                    reorg_count: 0,
+                    max_reorg_depth_seen: 0,
+                    decode_failures: 0,
+                    projection_failures: 0,
+                    unknown_canonical_events: 0,
+                    last_success_block: outcome.final_head_block,
+                };
+                let readiness_snapshot = crate::hybrid_v2::persistence::ReadinessSnapshot {
+                    ready: false,
+                    reason: Some("AwaitingFirstBlock".to_string()),
+                    reason_detail: None,
+                };
+                match store
+                    .commit_rematerialization(
+                        self.deployment_id,
+                        state.rebuild_epoch,
+                        &rebuilt_state,
+                        &cursor_snapshot,
+                        &readiness_snapshot,
+                        now_ms(),
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        state.phase = RebuildPhase::Complete;
+                        state.verification_result = Some("REMATERIALIZED".to_string());
+                        state.completed_at_ms = Some(now_ms());
+                        state.updated_at_ms = now_ms();
+                        store
+                            .upsert_rebuild_operation(state)
+                            .await
+                            .map_err(err_persist)?;
+                        return Ok(RebuildOutcome::Rebuilt {
+                            epoch: state.rebuild_epoch,
+                            events_replayed: outcome.events_replayed,
+                            executions_correlated: rebuilt_state.matched_executions.len() as u64,
+                        });
+                    }
+                    Err(e) => {
+                        let commit_detail = format!("{}: commit_rematerialization: {}", detail, e);
+                        escalate_manual(store, state, commit_detail.clone()).await?;
+                        return Ok(RebuildOutcome::ManualInterventionRequired {
+                            epoch: state.rebuild_epoch,
+                            reason: commit_detail,
+                        });
+                    }
+                }
+            }
             escalate_manual(store, state, detail.clone()).await?;
             return Ok(RebuildOutcome::ManualInterventionRequired {
                 epoch: state.rebuild_epoch,

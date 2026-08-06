@@ -334,26 +334,27 @@ async fn duplicate_recovery_trigger_serialised_via_lock() {
     let (store, did) = build_store(&pool).await;
     // Acquire the lock manually with epoch 1; second acquire must
     // fail while the first is held.
+    use deopt_v2_backend::hybrid_v2::OperationKind;
     let guard = store
-        .try_acquire_reorg_lock(did, 1, 1_700_000_000_000)
+        .try_acquire_operation_lock(did, OperationKind::Reorg, 1, 1_700_000_000_000)
         .await
         .unwrap();
     assert!(guard.is_some(), "first acquire must succeed");
     let second = store
-        .try_acquire_reorg_lock(did, 2, 1_700_000_000_000)
+        .try_acquire_operation_lock(did, OperationKind::Reorg, 2, 1_700_000_000_000)
         .await
         .unwrap();
     assert!(
         second.is_none(),
         "second acquire must fail (lock held by another holder)"
     );
-    store.release_reorg_lock(did, 1).await.unwrap();
+    store.release_operation_lock(did, 1).await.unwrap();
     let third = store
-        .try_acquire_reorg_lock(did, 3, 1_700_000_000_000)
+        .try_acquire_operation_lock(did, OperationKind::Reorg, 3, 1_700_000_000_000)
         .await
         .unwrap();
     assert!(third.is_some(), "third acquire must succeed after release");
-    store.release_reorg_lock(did, 3).await.unwrap();
+    store.release_operation_lock(did, 3).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -378,10 +379,10 @@ async fn stale_reorg_lock_reclaimed_after_completion() {
     recovered.phase = ReorgRecoveryPhase::Recovered;
     recovered.completed_at_ms = Some(1_700_000_000_000);
     store.upsert_reorg_recovery(&recovered).await.unwrap();
-    // Insert a stale lock row.
+    // Insert a stale unified operation-lock row for a prior REORG holder.
     sqlx::query(
-        "INSERT INTO hybrid_v2_reorg_locks (deployment_id, holder_epoch, acquired_at_ms)
-         VALUES ($1, $2, $3)",
+        "INSERT INTO hybrid_v2_operation_locks (deployment_id, operation, holder_epoch, acquired_at_ms)
+         VALUES ($1, 'REORG', $2, $3)",
     )
     .bind(did)
     .bind(1_i64)
@@ -391,15 +392,16 @@ async fn stale_reorg_lock_reclaimed_after_completion() {
     .unwrap();
     // Attempt to acquire — should succeed because the stale lock is
     // auto-reclaimed for a completed recovery.
+    use deopt_v2_backend::hybrid_v2::OperationKind;
     let guard = store
-        .try_acquire_reorg_lock(did, 2, 1_700_000_000_000)
+        .try_acquire_operation_lock(did, OperationKind::Reorg, 2, 1_700_000_000_000)
         .await
         .unwrap();
     assert!(
         guard.is_some(),
         "stale lock must be reclaimed after recovery completes"
     );
-    store.release_reorg_lock(did, 2).await.unwrap();
+    store.release_operation_lock(did, 2).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]

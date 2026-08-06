@@ -263,50 +263,16 @@ impl ReorgRecoveryState {
 // -----------------------------------------------------------------
 //                       LOCK GUARD
 // -----------------------------------------------------------------
-
-/// Guard for the deployment-scoped recovery mutex.
-///
-/// The Postgres implementation holds the guard purely as a "logical"
-/// handle: acquisition inserts a row into `hybrid_v2_reorg_locks`, and
-/// release deletes it. The guard does NOT auto-release on drop for
-/// the Postgres implementation because a delete requires an async
-/// query — callers MUST explicitly `.release(...).await` inside a
-/// completion path. For the in-memory implementation the guard
-/// auto-releases via the `Mutex` semantics behind an `Arc`.
-///
-/// Callers hold at most one guard per deployment at a time.
-pub struct ReorgLockGuard {
-    pub deployment_id: i64,
-    pub holder_epoch: i64,
-    /// Store reference kept so the guard can call the appropriate
-    /// release primitive. Optional to keep the type Send + testable
-    /// without an owned store (in-memory tests set this to None).
-    pub store: Option<Arc<dyn HybridV2ProjectionStore>>,
-}
-
-impl std::fmt::Debug for ReorgLockGuard {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ReorgLockGuard")
-            .field("deployment_id", &self.deployment_id)
-            .field("holder_epoch", &self.holder_epoch)
-            .field("store", &self.store.as_ref().map(|_| "<attached>"))
-            .finish()
-    }
-}
-
-impl ReorgLockGuard {
-    /// Explicit async release. Only the holder whose epoch matches the
-    /// stored row may release it. Returns `Ok(())` even if the row is
-    /// absent (double-release is benign).
-    pub async fn release(self) -> Result<()> {
-        if let Some(store) = self.store.as_ref() {
-            store
-                .release_reorg_lock(self.deployment_id, self.holder_epoch)
-                .await?;
-        }
-        Ok(())
-    }
-}
+//
+// The reorg-scoped lock has been unified into
+// `crate::hybrid_v2::rebuild_operations::OperationLockGuard` under
+// `BACKEND-HYBRID-V2-PROJECTION-PERSISTENCE-OPERATIONAL-CLOSURE-V1`.
+// Callers acquire via `store.try_acquire_operation_lock(deployment_id,
+// OperationKind::Reorg, epoch, now_ms)` and release via the guard's
+// `.release().await`.
+//
+// The legacy `hybrid_v2_reorg_locks` table is retained (unpopulated,
+// harmless) — it is not dropped so historical backups remain readable.
 
 // -----------------------------------------------------------------
 //                       CONFIG
@@ -483,7 +449,12 @@ impl ReorgRecoveryService {
             .validate()
             .map_err(|e| ReorgRecoveryError::Persistence(e.to_string()))?;
 
-        // Step 1. Acquire deployment-scoped lock.
+        // Step 1. Acquire the unified deployment-scoped operation lock.
+        //
+        // BACKEND-HYBRID-V2-PROJECTION-PERSISTENCE-OPERATIONAL-CLOSURE-V1
+        // migration: reorg now contends with rebuild + reconciliation
+        // on `hybrid_v2_operation_locks`. The legacy `hybrid_v2_reorg_locks`
+        // table is retained (empty; harmless) — no writer targets it.
         let now_ms = now_ms();
         let existing = store
             .read_reorg_recovery(self.deployment_id)
@@ -495,11 +466,21 @@ impl ReorgRecoveryService {
             None => 1,
         };
         let guard = match store
-            .try_acquire_reorg_lock(self.deployment_id, target_epoch, now_ms)
+            .try_acquire_operation_lock(
+                self.deployment_id,
+                crate::hybrid_v2::rebuild_operations::OperationKind::Reorg,
+                target_epoch,
+                now_ms,
+            )
             .await
             .map_err(|e| ReorgRecoveryError::Persistence(e.to_string()))?
         {
-            Some(g) => g,
+            Some(mut g) => {
+                // Attach the store handle so `.release().await` reaches
+                // the persistence layer.
+                g.store = Some(store.clone());
+                g
+            }
             None => {
                 return Err(ReorgRecoveryError::LockContention {
                     deployment_id: self.deployment_id,

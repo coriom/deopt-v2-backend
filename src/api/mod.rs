@@ -1,6 +1,7 @@
 pub mod dto;
 pub mod executor_health_v2;
 pub mod http;
+pub mod hybrid_v2_admin;
 pub mod hybrid_v2_read;
 pub mod local_test_fixtures;
 pub mod public_ws;

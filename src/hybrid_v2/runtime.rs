@@ -193,6 +193,13 @@ pub enum BootstrapResult {
     /// runtime refuses to bootstrap and readiness is set to
     /// `NOT_READY(WrongChain)`.
     ChainForbidden { chain_id: u64 },
+    /// `hybrid_v2_rebuild_operations` reports an active or terminal-failed
+    /// rebuild for this deployment. Bootstrap does NOT touch the reducer
+    /// state; readiness is set to `RebuildInProgress` / `RebuildRequested` /
+    /// `RebuildFailed` / manual-intervention depending on the recorded
+    /// phase. Callers MUST NOT serve live traffic while this holds.
+    /// BACKEND-HYBRID-V2-PROJECTION-PERSISTENCE-OPERATIONAL-CLOSURE-V1.
+    RebuildBlocked { rebuild_epoch: i64, phase: String },
 }
 
 /// The full runtime state.
@@ -1009,6 +1016,63 @@ impl IndexerRuntime {
         // so remote readers don't observe a transient BOOTSTRAPPING on
         // every restart if bootstrap completes successfully.
         self.readiness = ReadinessState::new_not_ready(ReadinessReason::Bootstrapping);
+
+        // BACKEND-HYBRID-V2-PROJECTION-PERSISTENCE-OPERATIONAL-CLOSURE-V1
+        // Check for an outstanding rebuild operation BEFORE touching the
+        // reducer state. If a rebuild is Requested / active / Failed /
+        // ManualInterventionRequired we set readiness accordingly and
+        // return `RebuildBlocked` — the worker should not proceed.
+        if let Ok(Some(op)) = store.read_latest_rebuild_operation(deployment_id).await {
+            use crate::hybrid_v2::rebuild_operations::RebuildPhase;
+            match op.phase {
+                RebuildPhase::Complete => {}
+                RebuildPhase::Requested => {
+                    self.readiness =
+                        ReadinessState::new_not_ready(ReadinessReason::RebuildRequested {
+                            epoch: op.rebuild_epoch,
+                        });
+                    return Ok(BootstrapResult::RebuildBlocked {
+                        rebuild_epoch: op.rebuild_epoch,
+                        phase: op.phase.as_str().to_string(),
+                    });
+                }
+                RebuildPhase::Failed => {
+                    let detail = op
+                        .last_failure_detail
+                        .clone()
+                        .unwrap_or_else(|| "rebuild failed".to_string());
+                    self.readiness =
+                        ReadinessState::new_not_ready(ReadinessReason::RebuildFailed { detail });
+                    return Ok(BootstrapResult::RebuildBlocked {
+                        rebuild_epoch: op.rebuild_epoch,
+                        phase: op.phase.as_str().to_string(),
+                    });
+                }
+                RebuildPhase::ManualInterventionRequired => {
+                    let detail = op
+                        .last_failure_detail
+                        .clone()
+                        .unwrap_or_else(|| "rebuild requires manual intervention".to_string());
+                    self.readiness =
+                        ReadinessState::new_not_ready(ReadinessReason::RebuildFailed { detail });
+                    return Ok(BootstrapResult::RebuildBlocked {
+                        rebuild_epoch: op.rebuild_epoch,
+                        phase: op.phase.as_str().to_string(),
+                    });
+                }
+                RebuildPhase::None => {}
+                _active => {
+                    // Any non-terminal, non-Requested phase is an
+                    // in-flight rebuild. Hard-503 with RebuildInProgress.
+                    self.readiness =
+                        ReadinessState::new_not_ready(ReadinessReason::RebuildInProgress);
+                    return Ok(BootstrapResult::RebuildBlocked {
+                        rebuild_epoch: op.rebuild_epoch,
+                        phase: op.phase.as_str().to_string(),
+                    });
+                }
+            }
+        }
 
         let cursor_opt = store
             .read_cursor(deployment_id, &self.persistence_cursor_name)

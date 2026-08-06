@@ -599,6 +599,24 @@ pub fn router(state: AppState) -> Router {
             get(reconciliations_for_intent),
         )
         .route("/reconciliations", get(reconciliations))
+        // BACKEND-HYBRID-V2-PROJECTION-PERSISTENCE-OPERATIONAL-CLOSURE-V1
+        // — mounted operator recovery controls. Every route is guarded
+        // by `ensure_admin_access` (same admin-token gate as
+        // `admin/options/events/tick`), refuses Base mainnet at handler
+        // entry, and returns 503 `HYBRID_V2_NOT_CONFIGURED` when no
+        // projection store is attached to `AppState`.
+        .route(
+            "/admin/hybrid_v2/deployments/:deployment_id/rebuild",
+            post(crate::api::hybrid_v2_admin::request_rebuild),
+        )
+        .route(
+            "/admin/hybrid_v2/deployments/:deployment_id/reconcile",
+            post(crate::api::hybrid_v2_admin::request_reconciliation),
+        )
+        .route(
+            "/admin/hybrid_v2/deployments/:deployment_id/operations/latest",
+            get(crate::api::hybrid_v2_admin::latest_operation),
+        )
         .route("/admin/status", get(admin_status))
         .route("/admin/config", get(admin_config))
         .route("/admin/db", get(admin_db))

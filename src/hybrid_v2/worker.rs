@@ -185,6 +185,54 @@ pub fn spawn_hybrid_v2_indexer_worker(
                 }
             }
 
+            // BACKEND-HYBRID-V2-PROJECTION-PERSISTENCE-OPERATIONAL-CLOSURE-V1
+            // Pre-tick check: if a rebuild is active for this deployment
+            // (any non-terminal, non-Complete phase), skip the tick and
+            // sleep. This prevents the worker from racing against a
+            // rebuild that may be re-materializing projection rows.
+            if let Ok(Some(op)) = store_keepalive
+                .read_latest_rebuild_operation(config.deployment_id)
+                .await
+            {
+                use crate::hybrid_v2::rebuild_operations::RebuildPhase;
+                let is_blocking = matches!(
+                    op.phase,
+                    RebuildPhase::Requested
+                        | RebuildPhase::LockAcquired
+                        | RebuildPhase::ValidatingSource
+                        | RebuildPhase::Preparing
+                        | RebuildPhase::Replaying
+                        | RebuildPhase::Correlating
+                        | RebuildPhase::Verifying
+                        | RebuildPhase::Reconciling
+                        | RebuildPhase::Committing
+                        | RebuildPhase::ManualInterventionRequired
+                );
+                if is_blocking {
+                    tracing::debug!(
+                        target: "hybrid_v2::worker",
+                        deployment_id = config.deployment_id,
+                        rebuild_epoch = op.rebuild_epoch,
+                        phase = %op.phase.as_str(),
+                        "tick skipped — rebuild operation is active"
+                    );
+                    // Sleep and continue.
+                    if let Some(mut rx) = shutdown_rx.clone() {
+                        tokio::select! {
+                            _ = tokio::time::sleep(sleep_dur) => {}
+                            changed = rx.changed() => {
+                                if changed.is_ok() && *rx.borrow() {
+                                    return;
+                                }
+                            }
+                        }
+                    } else {
+                        tokio::time::sleep(sleep_dur).await;
+                    }
+                    continue;
+                }
+            }
+
             let tick_outcome = {
                 let mut guard = runtime.write().await;
                 guard.tick_and_persist(source.as_ref()).await

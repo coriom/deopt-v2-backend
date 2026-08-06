@@ -299,19 +299,13 @@ pub trait HybridV2ProjectionStore: Send + Sync {
         now_ms: i64,
     ) -> Result<()>;
 
-    /// Attempt to acquire the deployment-scoped recovery lock. Returns
-    /// `Some(guard)` on success, `None` on contention.
-    async fn try_acquire_reorg_lock(
-        &self,
-        deployment_id: i64,
-        holder_epoch: i64,
-        now_ms: i64,
-    ) -> Result<Option<crate::hybrid_v2::reorg_recovery::ReorgLockGuard>>;
-
-    /// Release the deployment-scoped recovery lock. Callers pass the
-    /// epoch they acquired with — a stale delete (epoch no longer
-    /// matches) is a benign no-op.
-    async fn release_reorg_lock(&self, deployment_id: i64, holder_epoch: i64) -> Result<()>;
+    // NOTE: `try_acquire_reorg_lock` + `release_reorg_lock` were
+    // removed under
+    // `BACKEND-HYBRID-V2-PROJECTION-PERSISTENCE-OPERATIONAL-CLOSURE-V1`.
+    // Reorg now uses the unified `try_acquire_operation_lock(
+    // OperationKind::Reorg, ...)` below. The legacy
+    // `hybrid_v2_reorg_locks` table is retained (empty) — no code path
+    // writes to it.
 
     // -----------------------------------------------------------------
     //  BACKEND-HYBRID-V2-PROJECTION-PERSISTENCE-CLOSURE-V1
@@ -412,6 +406,35 @@ pub trait HybridV2ProjectionStore: Send + Sync {
         _deployment_id: i64,
     ) -> Result<Option<crate::hybrid_v2::reducer::ProjectionState>> {
         Ok(None)
+    }
+
+    /// Re-materialize the live projection tables from a rebuilt
+    /// `ProjectionState`. Semantics (implemented by real stores):
+    ///
+    /// 1. Wipe the re-materializable projection slices for
+    ///    `deployment_id` (balances, reservations, pause flags,
+    ///    bad debt, recovery state, matched executions).
+    /// 2. Reinsert every row from the rebuilt state.
+    /// 3. Update cursor + readiness rows.
+    /// 4. Mark the paired `hybrid_v2_rebuild_operations` row as
+    ///    `Complete` (phase, verification_result, completed_at_ms).
+    /// 5. All in a single transaction.
+    ///
+    /// The default stub returns
+    /// `Err(BackendError::Persistence("unimplemented..."))` so any
+    /// store that has not opted in fails closed.
+    async fn commit_rematerialization(
+        &self,
+        _deployment_id: i64,
+        _rebuild_epoch: i64,
+        _state: &crate::hybrid_v2::reducer::ProjectionState,
+        _cursor: &RuntimeCursorSnapshot,
+        _readiness: &ReadinessSnapshot,
+        _now_ms: i64,
+    ) -> Result<()> {
+        Err(BackendError::Persistence(
+            "commit_rematerialization unimplemented for this store".to_string(),
+        ))
     }
 }
 
@@ -1047,69 +1070,13 @@ impl HybridV2ProjectionStore for PostgresHybridV2ProjectionStore {
         Ok(())
     }
 
-    async fn try_acquire_reorg_lock(
-        &self,
-        deployment_id: i64,
-        holder_epoch: i64,
-        now_ms: i64,
-    ) -> Result<Option<crate::hybrid_v2::reorg_recovery::ReorgLockGuard>> {
-        // Best-effort stale-lock cleanup: only delete the lock when we
-        // can PROVE the previous holder is done — that is, a recovery
-        // row exists for this deployment whose epoch is >= the lock's
-        // holder_epoch AND the phase is terminal-ok (RECOVERED) OR the
-        // phase is MANUAL_INTERVENTION_REQUIRED (operator abandoned).
-        // Absence of a recovery row is NOT treated as stale — that
-        // condition holds during the natural gap between lock
-        // acquisition and the first `upsert_reorg_recovery` call in a
-        // freshly started recovery.
-        sqlx::query(
-            "DELETE FROM hybrid_v2_reorg_locks
-             WHERE deployment_id = $1
-               AND EXISTS (
-                   SELECT 1 FROM hybrid_v2_reorg_recovery r
-                   WHERE r.deployment_id = $1
-                     AND r.recovery_epoch >= hybrid_v2_reorg_locks.holder_epoch
-                     AND r.phase IN ('RECOVERED', 'MANUAL_INTERVENTION_REQUIRED')
-               )",
-        )
-        .bind(deployment_id)
-        .execute(&self.pool)
-        .await
-        .map_err(pg_err)?;
-
-        let inserted = sqlx::query(
-            "INSERT INTO hybrid_v2_reorg_locks (deployment_id, holder_epoch, acquired_at_ms)
-             VALUES ($1, $2, $3)
-             ON CONFLICT (deployment_id) DO NOTHING",
-        )
-        .bind(deployment_id)
-        .bind(holder_epoch)
-        .bind(now_ms)
-        .execute(&self.pool)
-        .await
-        .map_err(pg_err)?;
-        if inserted.rows_affected() == 0 {
-            return Ok(None);
-        }
-        Ok(Some(crate::hybrid_v2::reorg_recovery::ReorgLockGuard {
-            deployment_id,
-            holder_epoch,
-            store: None,
-        }))
-    }
-
-    async fn release_reorg_lock(&self, deployment_id: i64, holder_epoch: i64) -> Result<()> {
-        sqlx::query(
-            "DELETE FROM hybrid_v2_reorg_locks
-             WHERE deployment_id = $1 AND holder_epoch = $2",
-        )
-        .bind(deployment_id)
-        .bind(holder_epoch)
-        .execute(&self.pool)
-        .await
-        .map_err(pg_err)?;
-        Ok(())
-    }
+    // NOTE: The Postgres impls of `try_acquire_reorg_lock` /
+    // `release_reorg_lock` were removed under
+    // `BACKEND-HYBRID-V2-PROJECTION-PERSISTENCE-OPERATIONAL-CLOSURE-V1`.
+    // Reorg now uses the unified `try_acquire_operation_lock(
+    // OperationKind::Reorg, ...)` below. The legacy
+    // `hybrid_v2_reorg_locks` table is retained (empty) so backups
+    // remain readable.
 
     // -----------------------------------------------------------------
     //  CLOSURE V1 — unified operation lock, rebuild ops, reconciliation
@@ -1399,15 +1366,429 @@ impl HybridV2ProjectionStore for PostgresHybridV2ProjectionStore {
 
     async fn snapshot_projection_state(
         &self,
-        _deployment_id: i64,
+        deployment_id: i64,
     ) -> Result<Option<crate::hybrid_v2::reducer::ProjectionState>> {
-        // Postgres store: rebuilding a full ProjectionState from the
-        // per-projection tables is a bounded but non-trivial task; the
-        // journal-replay rebuild path already reconstructs a live
-        // ProjectionState by replaying the canonical journal. For this
-        // milestone we return None; callers detecting no live snapshot
-        // treat rebuild verification as "no drift possible" (empty).
-        Ok(None)
+        // BACKEND-HYBRID-V2-PROJECTION-PERSISTENCE-OPERATIONAL-CLOSURE-V1:
+        // Reconstruct a ProjectionState by reading the persisted
+        // re-materializable projection tables. We only rebuild the
+        // seven slices that own their storage in Postgres today:
+        //   * hybrid_v2_vault_balances
+        //   * hybrid_v2_reservations
+        //   * hybrid_v2_pause_flags
+        //   * hybrid_v2_bad_debt
+        //   * hybrid_v2_recovery_state
+        //   * hybrid_v2_matched_executions
+        // Slices without per-projection tables (positions, orders,
+        // capability grants, collateral universe, fee events, escape
+        // state, recovery-epochs, recovery pause/withdrawal counts) are
+        // read-only rederived from the journal at query time; drift on
+        // them is caught by the rebuild's journal replay itself.
+        use crate::hybrid_v2::reducer::{
+            ExecutionCompletion, MatchedExecutionRow, ProjectionState, RecoveryStateProjection,
+        };
+        let mut state = ProjectionState::default();
+
+        // Balances
+        let bal_rows = sqlx::query(
+            "SELECT subkey, token, balance FROM hybrid_v2_vault_balances
+             WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(pg_err)?;
+        for row in bal_rows {
+            let sk: String = row.try_get("subkey").map_err(pg_err)?;
+            let tk: String = row.try_get("token").map_err(pg_err)?;
+            let amt: String = row.try_get("balance").map_err(pg_err)?;
+            state.balances.insert((sk, tk), amt);
+        }
+
+        // Reservations
+        let res_rows = sqlx::query(
+            "SELECT subkey, token, engine, reserved FROM hybrid_v2_reservations
+             WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(pg_err)?;
+        for row in res_rows {
+            let sk: String = row.try_get("subkey").map_err(pg_err)?;
+            let tk: String = row.try_get("token").map_err(pg_err)?;
+            let en: String = row.try_get("engine").map_err(pg_err)?;
+            let amt: String = row.try_get("reserved").map_err(pg_err)?;
+            state.reservations.insert((sk, tk, en), amt);
+        }
+
+        // Pause flags
+        let pause_rows = sqlx::query(
+            "SELECT subkey, paused FROM hybrid_v2_pause_flags
+             WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(pg_err)?;
+        for row in pause_rows {
+            let sk: String = row.try_get("subkey").map_err(pg_err)?;
+            let p: bool = row.try_get("paused").map_err(pg_err)?;
+            state.pause_flags.insert(sk, p);
+        }
+
+        // Bad debt
+        let bd_rows = sqlx::query(
+            "SELECT subkey, token, amount FROM hybrid_v2_bad_debt
+             WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(pg_err)?;
+        for row in bd_rows {
+            let sk: String = row.try_get("subkey").map_err(pg_err)?;
+            let tk: String = row.try_get("token").map_err(pg_err)?;
+            let amt: String = row.try_get("amount").map_err(pg_err)?;
+            state.bad_debt.insert((sk, tk), amt);
+        }
+
+        // Recovery state
+        let rs_rows = sqlx::query(
+            "SELECT subkey, state FROM hybrid_v2_recovery_state
+             WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(pg_err)?;
+        for row in rs_rows {
+            let sk: String = row.try_get("subkey").map_err(pg_err)?;
+            let st: String = row.try_get("state").map_err(pg_err)?;
+            let proj = match st.as_str() {
+                "NORMAL" => RecoveryStateProjection::Normal,
+                "RECOVERY_PENDING" => RecoveryStateProjection::RecoveryPending,
+                "RECOVERY_ACTIVE" => RecoveryStateProjection::RecoveryActive,
+                "CANCELLED" => RecoveryStateProjection::Cancelled,
+                "RECOVERED" => RecoveryStateProjection::Recovered,
+                other => {
+                    return Err(BackendError::Persistence(format!(
+                        "unknown recovery_state value {other}"
+                    )));
+                }
+            };
+            state.recovery_state.insert(sk, proj);
+        }
+
+        // Matched executions
+        let me_rows = sqlx::query(
+            "SELECT execution_id, buyer_order_hash, seller_order_hash, buyer_subkey,
+                    seller_subkey, series_id, matched_qty_1e8, premium_amount,
+                    fee_amount, rebate_amount, block_number, tx_hash, completion_status
+             FROM hybrid_v2_matched_executions
+             WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(pg_err)?;
+        for row in me_rows {
+            let exec_id: String = row.try_get("execution_id").map_err(pg_err)?;
+            let block_number: i64 = row.try_get("block_number").map_err(pg_err)?;
+            let cs: String = row.try_get("completion_status").map_err(pg_err)?;
+            let completion = match cs.as_str() {
+                "COMPLETE" => ExecutionCompletion::Complete,
+                "INCOMPLETE" => ExecutionCompletion::Incomplete,
+                "INVALIDATED_BY_REORG" => ExecutionCompletion::InvalidatedByReorg,
+                other => {
+                    return Err(BackendError::Persistence(format!(
+                        "unknown completion_status value {other}"
+                    )));
+                }
+            };
+            state.matched_executions.insert(
+                exec_id,
+                MatchedExecutionRow {
+                    buyer_order_hash: row.try_get("buyer_order_hash").map_err(pg_err)?,
+                    seller_order_hash: row.try_get("seller_order_hash").map_err(pg_err)?,
+                    buyer_subkey: row.try_get("buyer_subkey").map_err(pg_err)?,
+                    seller_subkey: row.try_get("seller_subkey").map_err(pg_err)?,
+                    series_id: row.try_get("series_id").map_err(pg_err)?,
+                    matched_qty_1e8: row.try_get("matched_qty_1e8").map_err(pg_err)?,
+                    premium_amount: row.try_get("premium_amount").map_err(pg_err)?,
+                    fee_amount: row.try_get("fee_amount").map_err(pg_err)?,
+                    rebate_amount: row.try_get("rebate_amount").map_err(pg_err)?,
+                    block_number: i64_to_u64("block_number", block_number)?,
+                    tx_hash: row.try_get("tx_hash").map_err(pg_err)?,
+                    completion_status: completion,
+                },
+            );
+        }
+
+        Ok(Some(state))
+    }
+
+    async fn commit_rematerialization(
+        &self,
+        deployment_id: i64,
+        rebuild_epoch: i64,
+        state: &crate::hybrid_v2::reducer::ProjectionState,
+        cursor: &RuntimeCursorSnapshot,
+        readiness: &ReadinessSnapshot,
+        now_ms: i64,
+    ) -> Result<()> {
+        // BACKEND-HYBRID-V2-PROJECTION-PERSISTENCE-OPERATIONAL-CLOSURE-V1:
+        // Single-tx TRUNCATE-per-deployment + REINSERT + cursor/readiness/
+        // rebuild-op update. Only the six re-materializable projection
+        // slices are wiped. Rows in canonical tables (raw logs, decoded
+        // events, canonical blocks) are untouched: they are the source
+        // of truth used by the replayer.
+        let mut tx = self.pool.begin().await.map_err(pg_err)?;
+
+        // Wipe re-materializable projection rows for this deployment.
+        for table in [
+            "hybrid_v2_vault_balances",
+            "hybrid_v2_reservations",
+            "hybrid_v2_pause_flags",
+            "hybrid_v2_bad_debt",
+            "hybrid_v2_matched_executions",
+        ] {
+            let sql = format!("DELETE FROM {table} WHERE deployment_id = $1");
+            sqlx::query(&sql)
+                .bind(deployment_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(pg_err)?;
+        }
+        // Recovery state: wipe + reinsert.
+        sqlx::query("DELETE FROM hybrid_v2_recovery_state WHERE deployment_id = $1")
+            .bind(deployment_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(pg_err)?;
+
+        // Reinsert balances.
+        for ((subkey, token), amt) in state.balances.iter() {
+            sqlx::query(
+                "INSERT INTO hybrid_v2_vault_balances
+                    (deployment_id, subkey, token, balance, last_event_block,
+                     last_event_log_id, updated_at_ms)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7)",
+            )
+            .bind(deployment_id)
+            .bind(subkey)
+            .bind(token)
+            .bind(amt)
+            .bind(u64_to_i64("last_event_block", cursor.indexed_head_block)?)
+            .bind(0_i64)
+            .bind(now_ms)
+            .execute(&mut *tx)
+            .await
+            .map_err(pg_err)?;
+        }
+        // Reservations.
+        for ((subkey, token, engine), amt) in state.reservations.iter() {
+            sqlx::query(
+                "INSERT INTO hybrid_v2_reservations
+                    (deployment_id, subkey, token, engine, reserved,
+                     last_event_block, updated_at_ms)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7)",
+            )
+            .bind(deployment_id)
+            .bind(subkey)
+            .bind(token)
+            .bind(engine)
+            .bind(amt)
+            .bind(u64_to_i64("last_event_block", cursor.indexed_head_block)?)
+            .bind(now_ms)
+            .execute(&mut *tx)
+            .await
+            .map_err(pg_err)?;
+        }
+        // Pause flags.
+        for (subkey, paused) in state.pause_flags.iter() {
+            sqlx::query(
+                "INSERT INTO hybrid_v2_pause_flags
+                    (deployment_id, subkey, paused, last_event_block, updated_at_ms)
+                 VALUES ($1,$2,$3,$4,$5)",
+            )
+            .bind(deployment_id)
+            .bind(subkey)
+            .bind(*paused)
+            .bind(u64_to_i64("last_event_block", cursor.indexed_head_block)?)
+            .bind(now_ms)
+            .execute(&mut *tx)
+            .await
+            .map_err(pg_err)?;
+        }
+        // Bad debt.
+        for ((subkey, token), amt) in state.bad_debt.iter() {
+            sqlx::query(
+                "INSERT INTO hybrid_v2_bad_debt
+                    (deployment_id, subkey, token, amount, last_event_block, updated_at_ms)
+                 VALUES ($1,$2,$3,$4,$5,$6)",
+            )
+            .bind(deployment_id)
+            .bind(subkey)
+            .bind(token)
+            .bind(amt)
+            .bind(u64_to_i64("last_event_block", cursor.indexed_head_block)?)
+            .bind(now_ms)
+            .execute(&mut *tx)
+            .await
+            .map_err(pg_err)?;
+        }
+        // Recovery state.
+        for (subkey, proj) in state.recovery_state.iter() {
+            sqlx::query(
+                "INSERT INTO hybrid_v2_recovery_state
+                    (deployment_id, subkey, state, pending_since_ts, activation_eligible_at,
+                     finalized_at_ts, tokens_withdrawn, state_updated_block, updated_at_ms)
+                 VALUES ($1,$2,$3,NULL,NULL,NULL,0,$4,$5)",
+            )
+            .bind(deployment_id)
+            .bind(subkey)
+            .bind(proj.as_str())
+            .bind(u64_to_i64(
+                "state_updated_block",
+                cursor.indexed_head_block,
+            )?)
+            .bind(now_ms)
+            .execute(&mut *tx)
+            .await
+            .map_err(pg_err)?;
+        }
+        // Matched executions.
+        for (exec_id, row) in state.matched_executions.iter() {
+            let completion = match row.completion_status {
+                crate::hybrid_v2::reducer::ExecutionCompletion::Complete => "COMPLETE",
+                crate::hybrid_v2::reducer::ExecutionCompletion::Incomplete => "INCOMPLETE",
+                crate::hybrid_v2::reducer::ExecutionCompletion::InvalidatedByReorg => {
+                    "INVALIDATED_BY_REORG"
+                }
+            };
+            sqlx::query(
+                "INSERT INTO hybrid_v2_matched_executions (
+                    deployment_id, execution_id, buyer_order_hash, seller_order_hash,
+                    buyer_subkey, seller_subkey, series_id, matched_qty_1e8, premium_amount,
+                    fee_amount, rebate_amount, block_number, tx_hash, completion_status,
+                    completed_at_ms
+                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)",
+            )
+            .bind(deployment_id)
+            .bind(exec_id)
+            .bind(&row.buyer_order_hash)
+            .bind(&row.seller_order_hash)
+            .bind(&row.buyer_subkey)
+            .bind(&row.seller_subkey)
+            .bind(&row.series_id)
+            .bind(&row.matched_qty_1e8)
+            .bind(&row.premium_amount)
+            .bind(&row.fee_amount)
+            .bind(&row.rebate_amount)
+            .bind(u64_to_i64("block_number", row.block_number)?)
+            .bind(&row.tx_hash)
+            .bind(completion)
+            .bind(now_ms)
+            .execute(&mut *tx)
+            .await
+            .map_err(pg_err)?;
+        }
+
+        // Update the cursor + readiness inside the same transaction.
+        sqlx::query(
+            "INSERT INTO hybrid_v2_cursors
+                (deployment_id, cursor_name, indexed_head_block, indexed_head_hash,
+                 indexed_head_parent, observed_head_block, finalized_head_block,
+                 last_error, updated_at_ms, reorg_count, max_reorg_depth_seen,
+                 decode_failures, projection_failures, unknown_canonical_events,
+                 last_success_block)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+             ON CONFLICT (deployment_id, cursor_name) DO UPDATE SET
+                indexed_head_block = EXCLUDED.indexed_head_block,
+                indexed_head_hash = EXCLUDED.indexed_head_hash,
+                indexed_head_parent = EXCLUDED.indexed_head_parent,
+                observed_head_block = EXCLUDED.observed_head_block,
+                finalized_head_block = EXCLUDED.finalized_head_block,
+                last_error = EXCLUDED.last_error,
+                updated_at_ms = EXCLUDED.updated_at_ms,
+                reorg_count = EXCLUDED.reorg_count,
+                max_reorg_depth_seen = EXCLUDED.max_reorg_depth_seen,
+                decode_failures = EXCLUDED.decode_failures,
+                projection_failures = EXCLUDED.projection_failures,
+                unknown_canonical_events = EXCLUDED.unknown_canonical_events,
+                last_success_block = EXCLUDED.last_success_block",
+        )
+        .bind(deployment_id)
+        .bind(&cursor.cursor_name)
+        .bind(u64_to_i64("indexed_head_block", cursor.indexed_head_block)?)
+        .bind(&cursor.indexed_head_hash)
+        .bind(&cursor.indexed_head_parent)
+        .bind(u64_to_i64(
+            "observed_head_block",
+            cursor.observed_head_block,
+        )?)
+        .bind(u64_to_i64(
+            "finalized_head_block",
+            cursor.finalized_head_block,
+        )?)
+        .bind(&cursor.last_error)
+        .bind(now_ms)
+        .bind(u64_to_i64("reorg_count", cursor.reorg_count)?)
+        .bind(u64_to_i64(
+            "max_reorg_depth_seen",
+            cursor.max_reorg_depth_seen,
+        )?)
+        .bind(u64_to_i64("decode_failures", cursor.decode_failures)?)
+        .bind(u64_to_i64(
+            "projection_failures",
+            cursor.projection_failures,
+        )?)
+        .bind(u64_to_i64(
+            "unknown_canonical_events",
+            cursor.unknown_canonical_events,
+        )?)
+        .bind(u64_to_i64("last_success_block", cursor.last_success_block)?)
+        .execute(&mut *tx)
+        .await
+        .map_err(pg_err)?;
+
+        sqlx::query(
+            "INSERT INTO hybrid_v2_readiness
+                (deployment_id, ready, reason, reason_detail, updated_at_ms)
+             VALUES ($1,$2,$3,$4,$5)
+             ON CONFLICT (deployment_id) DO UPDATE SET
+                ready = EXCLUDED.ready,
+                reason = EXCLUDED.reason,
+                reason_detail = EXCLUDED.reason_detail,
+                updated_at_ms = EXCLUDED.updated_at_ms",
+        )
+        .bind(deployment_id)
+        .bind(readiness.ready)
+        .bind(&readiness.reason)
+        .bind(&readiness.reason_detail)
+        .bind(now_ms)
+        .execute(&mut *tx)
+        .await
+        .map_err(pg_err)?;
+
+        // Mark the rebuild op row Complete atomically.
+        sqlx::query(
+            "UPDATE hybrid_v2_rebuild_operations
+             SET phase = 'COMPLETE',
+                 verification_result = COALESCE(verification_result, 'REMATERIALIZED'),
+                 completed_at_ms = $3,
+                 updated_at_ms = $3
+             WHERE deployment_id = $1 AND rebuild_epoch = $2",
+        )
+        .bind(deployment_id)
+        .bind(rebuild_epoch)
+        .bind(now_ms)
+        .execute(&mut *tx)
+        .await
+        .map_err(pg_err)?;
+
+        tx.commit().await.map_err(pg_err)?;
+        Ok(())
     }
 }
 
@@ -3235,53 +3616,11 @@ impl HybridV2ProjectionStore for InMemoryProjectionStore {
         Ok(())
     }
 
-    async fn try_acquire_reorg_lock(
-        &self,
-        deployment_id: i64,
-        holder_epoch: i64,
-        now_ms: i64,
-    ) -> Result<Option<crate::hybrid_v2::reorg_recovery::ReorgLockGuard>> {
-        let mut inner = self.inner.lock().unwrap();
-        // Stale-lock cleanup: if the paired recovery row is RECOVERED
-        // OR the recorded holder_epoch is less than the current
-        // recovery row's epoch, we consider it stale.
-        let should_delete = match (
-            inner.reorg_locks.get(&deployment_id),
-            inner.reorg_recovery.get(&deployment_id),
-        ) {
-            (Some(_), Some(recovery)) => matches!(
-                recovery.phase,
-                crate::hybrid_v2::reorg_recovery::ReorgRecoveryPhase::Recovered
-                    | crate::hybrid_v2::reorg_recovery::ReorgRecoveryPhase::None
-            ),
-            (Some(_), None) => true,
-            _ => false,
-        };
-        if should_delete {
-            inner.reorg_locks.remove(&deployment_id);
-        }
-        if inner.reorg_locks.contains_key(&deployment_id) {
-            return Ok(None);
-        }
-        inner
-            .reorg_locks
-            .insert(deployment_id, (holder_epoch, now_ms));
-        Ok(Some(crate::hybrid_v2::reorg_recovery::ReorgLockGuard {
-            deployment_id,
-            holder_epoch,
-            store: None,
-        }))
-    }
-
-    async fn release_reorg_lock(&self, deployment_id: i64, holder_epoch: i64) -> Result<()> {
-        let mut inner = self.inner.lock().unwrap();
-        if let Some((epoch, _)) = inner.reorg_locks.get(&deployment_id) {
-            if *epoch == holder_epoch {
-                inner.reorg_locks.remove(&deployment_id);
-            }
-        }
-        Ok(())
-    }
+    // NOTE: The InMemory impls of `try_acquire_reorg_lock` /
+    // `release_reorg_lock` were removed under
+    // `BACKEND-HYBRID-V2-PROJECTION-PERSISTENCE-OPERATIONAL-CLOSURE-V1`.
+    // Reorg now goes through `try_acquire_operation_lock(OperationKind::Reorg)`
+    // below.
 
     // -----------------------------------------------------------------
     //  CLOSURE V1 — unified operation lock + rebuild ops + reconciliation
@@ -3420,6 +3759,39 @@ impl HybridV2ProjectionStore for InMemoryProjectionStore {
     ) -> Result<Option<crate::hybrid_v2::reducer::ProjectionState>> {
         let inner = self.inner.lock().unwrap();
         Ok(inner.state_snapshots.get(&deployment_id).cloned())
+    }
+
+    async fn commit_rematerialization(
+        &self,
+        deployment_id: i64,
+        rebuild_epoch: i64,
+        state: &crate::hybrid_v2::reducer::ProjectionState,
+        cursor: &RuntimeCursorSnapshot,
+        readiness: &ReadinessSnapshot,
+        now_ms: i64,
+    ) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        // Mirror the PG semantics: wipe + republish the projection
+        // snapshot, then update cursor + readiness + rebuild-op row.
+        inner.state_snapshots.insert(deployment_id, state.clone());
+        inner
+            .cursors
+            .insert((deployment_id, cursor.cursor_name.clone()), cursor.clone());
+        inner.readiness.insert(deployment_id, readiness.clone());
+        if let Some(row) = inner
+            .rebuild_operations
+            .get_mut(&(deployment_id, rebuild_epoch))
+        {
+            row.phase = crate::hybrid_v2::rebuild_operations::RebuildPhase::Complete;
+            row.verification_result = Some(
+                row.verification_result
+                    .clone()
+                    .unwrap_or_else(|| "REMATERIALIZED".to_string()),
+            );
+            row.completed_at_ms = Some(now_ms);
+            row.updated_at_ms = now_ms;
+        }
+        Ok(())
     }
 }
 

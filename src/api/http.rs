@@ -211,6 +211,15 @@ pub struct AppState {
     /// milestone which brings the RPC provider). Until then the field
     /// is intentionally empty and the routes fail-closed.
     pub hybrid_v2_read: crate::api::hybrid_v2_read::HybridV2ApiState,
+    /// BACKEND-HYBRID-V2-PROJECTION-PERSISTENCE-OPERATIONAL-CLOSURE-V1
+    /// — Postgres projection store handle used by operator-facing
+    /// admin recovery routes (`/admin/hybrid_v2/deployments/:id/rebuild`,
+    /// `.../reconcile`). Default `None`; populated by
+    /// `AppState::with_hybrid_v2_projection_store` in production.
+    /// When `None` every admin route returns
+    /// `HybridV2NotConfigured` at handler entry.
+    pub hybrid_v2_projection_store:
+        Option<std::sync::Arc<dyn crate::hybrid_v2::HybridV2ProjectionStore>>,
 }
 
 impl AppState {
@@ -434,6 +443,7 @@ impl AppState {
             perps_observability: Arc::new(crate::perps::PerpsObservability::new()),
             subaccounts,
             hybrid_v2_read: crate::api::hybrid_v2_read::HybridV2ApiState::empty(),
+            hybrid_v2_projection_store: None,
         }
     }
 
@@ -465,6 +475,19 @@ impl AppState {
     ) -> Self {
         self.hybrid_v2_read =
             crate::api::hybrid_v2_read::HybridV2ApiState::with_postgres(pool, entries);
+        self
+    }
+
+    /// BACKEND-HYBRID-V2-PROJECTION-PERSISTENCE-OPERATIONAL-CLOSURE-V1
+    /// — attach a `HybridV2ProjectionStore` handle so the admin
+    /// recovery routes (`/admin/hybrid_v2/...`) can drive rebuilds
+    /// and reconciliation. Callers pass the same store handle used
+    /// by the indexer worker.
+    pub fn with_hybrid_v2_projection_store(
+        mut self,
+        store: std::sync::Arc<dyn crate::hybrid_v2::HybridV2ProjectionStore>,
+    ) -> Self {
+        self.hybrid_v2_projection_store = Some(store);
         self
     }
 

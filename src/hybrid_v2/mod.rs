@@ -77,8 +77,8 @@ pub use reducer::{
 };
 pub use reorg::{ReorgOutcome, ReorgPlanner};
 pub use reorg_recovery::{
-    RecoveryOutcome, ReorgDetection, ReorgLockGuard, ReorgRecoveryConfig, ReorgRecoveryError,
-    ReorgRecoveryPhase, ReorgRecoveryService, ReorgRecoveryState,
+    RecoveryOutcome, ReorgDetection, ReorgRecoveryConfig, ReorgRecoveryError, ReorgRecoveryPhase,
+    ReorgRecoveryService, ReorgRecoveryState,
 };
 pub use repository::{HybridV2QueryRepository, PageCursor};
 pub use rpc_chain_source::{RpcHybridV2ChainSource, RpcSourceConfig};

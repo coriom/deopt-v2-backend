@@ -141,7 +141,6 @@ async fn main() -> deopt_v2_backend::Result<()> {
     // vars. Defaults are safe (enabled=false) so this is a no-op for
     // any operator who has not opted in.
     state.conditional_orders_config = ConditionalOrdersConfig::from_env();
-    let app = router(state.clone());
 
     if config.execution.execution_enabled && config.execution.dry_run {
         if let Some(repository) = repository.clone() {
@@ -231,6 +230,14 @@ async fn main() -> deopt_v2_backend::Result<()> {
             })?;
             let source_arc: Arc<dyn deopt_v2_backend::hybrid_v2::ChainSource> = Arc::new(source);
             let store = Arc::new(PostgresHybridV2ProjectionStore::new(repo.pool().clone()));
+            // BACKEND-HYBRID-V2-PROJECTION-PERSISTENCE-OPERATIONAL-CLOSURE-V1
+            // Attach the projection store to AppState so mounted admin
+            // routes (`/admin/hybrid_v2/...`) can drive rebuild +
+            // reconciliation without another handle.
+            state =
+                state
+                    .with_hybrid_v2_projection_store(store.clone()
+                        as Arc<dyn deopt_v2_backend::hybrid_v2::HybridV2ProjectionStore>);
             let mut runtime = IndexerRuntime::new(config.hybrid_v2.deployment_id as u64, manifest)
                 .with_persistence(store.clone(), config.hybrid_v2.deployment_id)
                 .with_persistence_cursor_name(config.hybrid_v2.cursor_name.clone());
@@ -283,6 +290,9 @@ async fn main() -> deopt_v2_backend::Result<()> {
             );
         }
     }
+    // Build the router AFTER hybrid_v2 wiring so mounted operator
+    // admin routes see the projection-store handle attached above.
+    let app = router(state.clone());
     spawn_webtransport_gateway(config.mm_gateway.clone(), state).await?;
 
     info!(
