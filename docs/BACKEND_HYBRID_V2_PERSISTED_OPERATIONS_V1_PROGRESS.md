@@ -237,3 +237,53 @@ lands the two remaining items above:
 - Reservations / positions / order lifecycle / executions views
   remain `UNSUPPORTED_VIEW` — the provider does not fetch those
   because the Solidity view signatures are not yet pinned.
+
+
+---
+
+## 2026-08-06 — final persistence matrix + parent closure
+
+`BACKEND-HYBRID-V2-FINAL-PERSISTENCE-MATRIX-AND-PARENT-CLOSURE-V1`
+(see `docs/BACKEND_HYBRID_V2_FINAL_PERSISTENCE_MATRIX_AND_PARENT_CLOSURE_V1.md`)
+lands the final closure for both parent milestones:
+
+- `BACKEND-HYBRID-V2-PERSISTED-OPERATIONS-V1` — **CLOSED**.
+- `BACKEND-HYBRID-V2-PROJECTION-PERSISTENCE-CLOSURE-V1` — **CLOSED**.
+
+Deliverables:
+
+- **High-risk reorg matrix** (`tests/hybrid_v2_reorg_high_risk_matrix_pg_integration.rs`,
+  10 tests) covering every orphan-economic-family invalidation
+  path (deposit, withdrawal, reservation, order + partial fill,
+  matched execution, premium transfer, multi-family batch,
+  replacement with changed components, concurrent recovery on two
+  deployments, restart-after-commit-before-memory-publication).
+- **Consolidated closure properties** (`tests/hybrid_v2_final_closure_properties.rs`,
+  7 tests): read-api-orphan-freedom, unsupported-never-converged,
+  ready-implies-no-active-op, deployment-isolation-across-operations,
+  read-api-reflects-replacement, operation-lock-serializes-all-three,
+  Policy A meta-property.
+- **Global closure matrix**
+  (`docs/BACKEND_HYBRID_V2_GLOBAL_CLOSURE_MATRIX.md`) mapping 138
+  scenarios across 14 in-scope categories to concrete test-file +
+  test-name entries.
+- **CI gate** — `.github/workflows/backend-postgres-integrity.yml`
+  extended with the two new binaries; total 15 PG-backed hybrid_v2
+  test binaries gated per PR.
+- **Runbook update** — Policy A supported-vs-unsupported
+  reconciliation categories documented at
+  `docs/HYBRID_V2_OPERATOR_RUNBOOK.md` §15.
+
+Reconciliation-scope Policy A (frozen):
+- Reconciler directly compares manifest / ownership / balance /
+  recovery_state only.
+- Reservations / positions / orders / executions / active-series /
+  escape-withdrawal remain `UNSUPPORTED_VIEW`.
+- `UNSUPPORTED_VIEW` is never `CONVERGED`. READY never implies the
+  unsupported categories were directly reconciled — their
+  correctness derives from the canonical journal + reducer.
+
+Frozen invariants:
+- `UNSUPPORTED_RECONCILIATION_VIEW_IS_NEVER_REPORTED_AS_CONVERGED`
+- `READY_NEVER_IMPLIES_UNSUPPORTED_CATEGORIES_WERE_RECONCILED`
+- `PARENT_CLOSURE_REQUIRES_ALL_MANDATORY_HYBRID_V2_PG_TESTS_TO_EXECUTE`

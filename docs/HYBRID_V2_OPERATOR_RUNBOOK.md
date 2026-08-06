@@ -358,3 +358,74 @@ intervention-required phase when the runtime starts,
 `BootstrapResult::RebuildBlocked` and the worker refuses to tick
 until an operator clears the row. Log lines include `rebuild_epoch`
 and `phase` for tracing.
+
+
+---
+
+## 15. Reconciliation-scope Policy A — 2026-08-06
+
+Introduced by
+`BACKEND-HYBRID-V2-FINAL-PERSISTENCE-MATRIX-AND-PARENT-CLOSURE-V1`.
+
+### Supported reconciliation categories
+
+The `Reconciler` directly compares projection against on-chain view
+for these four categories only:
+
+1. **Manifest identity** — expected hash vs
+   `ChainSnapshot.manifest_hash`.
+2. **Subaccount ownership** — `SubaccountRegistry.ownerOf(subKey)`.
+3. **Collateral vault balance** — `CollateralVault.balanceWithYield(
+   subKey, token)`.
+4. **Recovery state** — `RecoveryFinalizer.getRecoveryState(subKey)`.
+
+Every other category is `UNSUPPORTED_VIEW` at this milestone:
+
+- Reservations per (subKey, token, engine)
+- Positions per (subKey, series)
+- Order lifecycle
+- Matched executions
+- Active-series enumeration
+- Escape / withdrawal counts
+
+### Frozen invariants
+
+- **`UNSUPPORTED_RECONCILIATION_VIEW_IS_NEVER_REPORTED_AS_CONVERGED`.**
+  The reconciler returns `ReconciliationResult::Unsupported { detail }`
+  for unsupported categories; the scheduler never coerces that into
+  `Converged` when persisting a row.
+- **`READY_NEVER_IMPLIES_UNSUPPORTED_CATEGORIES_WERE_RECONCILED`.**
+  A READY response does NOT claim the unsupported categories were
+  reconciled against chain state. It claims:
+  - the supported categories are convergent under the reconciler +
+    provider allowlist, AND
+  - the canonical event journal has been played through the
+    deterministic reducer for every other category.
+
+### What READY means
+
+READY implies: the four supported categories were compared against
+chain state at the block referenced in the latest reconciliation
+row, and the classification was `CONVERGED`, `INDEXER_BEHIND`, or
+`PROVIDER_UNAVAILABLE` (transient) — never `PROJECTION_DRIFT`.
+
+READY does **NOT** imply: the unsupported categories were directly
+compared against chain state. Their correctness is derived from
+the canonical journal + reducer, verified separately by the
+runtime persistence property suite.
+
+### Serving policy A
+
+Operators MUST NOT infer that a hybrid v2 read for a position /
+order / execution is "chain-verified" — it is journal-derived. If
+an on-chain view for one of the deferred categories becomes
+required for a downstream product (e.g. a settlement UI), extend
+the RPC allowlist + provider first, add a reconciler comparison,
+and only then remove the category from the unsupported list. The
+provider allowlist in `RpcHybridV2ChainSource::eth_call` is the
+authoritative source; every entry must be a per-module compile-time
+selector.
+
+Cross-reference:
+- Closure milestone: `BACKEND_HYBRID_V2_FINAL_PERSISTENCE_MATRIX_AND_PARENT_CLOSURE_V1.md`
+- Global matrix: `BACKEND_HYBRID_V2_GLOBAL_CLOSURE_MATRIX.md`
