@@ -220,6 +220,30 @@ pub struct AppState {
     /// `HybridV2NotConfigured` at handler entry.
     pub hybrid_v2_projection_store:
         Option<std::sync::Arc<dyn crate::hybrid_v2::HybridV2ProjectionStore>>,
+    /// BACKEND-HYBRID-V2-CHAIN-VIEW-PROVIDER-AND-RECONCILIATION-TASK-V1
+    /// — production chain view provider bound to the manifest's module
+    /// addresses. Populated by main.rs when
+    /// `HYBRID_V2_RECONCILIATION_ENABLED=true`; None otherwise. The
+    /// admin `/reconcile` route returns 503
+    /// `RECONCILIATION_PROVIDER_UNAVAILABLE` when None.
+    pub hybrid_v2_chain_view_provider:
+        Option<std::sync::Arc<crate::hybrid_v2::RpcChainViewProvider>>,
+    /// The indexer runtime handle. Populated alongside
+    /// `hybrid_v2_chain_view_provider`; the admin `/reconcile` route
+    /// reads the current cursor + projection from this handle. Kept
+    /// separate from `hybrid_v2_read` because the read API state does
+    /// not expose the mutable runtime.
+    pub hybrid_v2_runtime:
+        Option<std::sync::Arc<tokio::sync::RwLock<crate::hybrid_v2::IndexerRuntime>>>,
+    /// Static manifest bound to the running deployment. Available when
+    /// the reconciliation provider is attached; used by the admin
+    /// route to construct the `HybridV2ReconciliationWorkerConfig`
+    /// without threading through main.rs.
+    pub hybrid_v2_manifest: Option<crate::hybrid_v2::ManifestParams>,
+    /// Reconciliation worker configuration (deployment_id + cadence
+    /// bounds). Populated alongside the provider handle.
+    pub hybrid_v2_reconciliation_worker_config:
+        Option<crate::hybrid_v2::HybridV2ReconciliationWorkerConfig>,
 }
 
 impl AppState {
@@ -444,7 +468,28 @@ impl AppState {
             subaccounts,
             hybrid_v2_read: crate::api::hybrid_v2_read::HybridV2ApiState::empty(),
             hybrid_v2_projection_store: None,
+            hybrid_v2_chain_view_provider: None,
+            hybrid_v2_runtime: None,
+            hybrid_v2_manifest: None,
+            hybrid_v2_reconciliation_worker_config: None,
         }
+    }
+
+    /// Attach the production reconciliation surface — provider,
+    /// runtime handle, manifest, and worker config. Used by main.rs
+    /// when `HYBRID_V2_RECONCILIATION_ENABLED=true`.
+    pub fn with_hybrid_v2_reconciliation(
+        mut self,
+        provider: std::sync::Arc<crate::hybrid_v2::RpcChainViewProvider>,
+        runtime: std::sync::Arc<tokio::sync::RwLock<crate::hybrid_v2::IndexerRuntime>>,
+        manifest: crate::hybrid_v2::ManifestParams,
+        worker_config: crate::hybrid_v2::HybridV2ReconciliationWorkerConfig,
+    ) -> Self {
+        self.hybrid_v2_chain_view_provider = Some(provider);
+        self.hybrid_v2_runtime = Some(runtime);
+        self.hybrid_v2_manifest = Some(manifest);
+        self.hybrid_v2_reconciliation_worker_config = Some(worker_config);
+        self
     }
 
     /// Attach a populated Hybrid V2 deployment registry. When no

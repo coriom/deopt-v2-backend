@@ -5,8 +5,10 @@ use deopt_v2_backend::engine::EngineState;
 use deopt_v2_backend::error::BackendError;
 use deopt_v2_backend::execution::{spawn_executor, Executor};
 use deopt_v2_backend::hybrid_v2::{
-    spawn_hybrid_v2_indexer_worker, HybridV2IndexerWorkerConfig, IndexerRuntime, ManifestParams,
-    PostgresHybridV2ProjectionStore, RpcHybridV2ChainSource, RpcSourceConfig,
+    spawn_hybrid_v2_indexer_worker, spawn_hybrid_v2_reconciliation_worker,
+    HybridV2IndexerWorkerConfig, HybridV2ReconciliationWorkerConfig, IndexerRuntime,
+    ManifestParams, PostgresHybridV2ProjectionStore, RpcChainViewProvider, RpcHybridV2ChainSource,
+    RpcSourceConfig,
 };
 use deopt_v2_backend::indexer::{spawn_indexer, Indexer};
 use deopt_v2_backend::mm::transport::webtransport::spawn_webtransport_gateway;
@@ -228,7 +230,13 @@ async fn main() -> deopt_v2_backend::Result<()> {
                     "hybrid_v2 chain identity validation failed against endpoint {redacted_host}: {e}"
                 ))
             })?;
-            let source_arc: Arc<dyn deopt_v2_backend::hybrid_v2::ChainSource> = Arc::new(source);
+            // Hold a concrete-typed handle so the reconciliation
+            // provider can invoke `eth_call` (not part of the
+            // read-only `ChainSource` trait). The chain-source Arc for
+            // the indexer worker is cast to the trait object below.
+            let rpc_source_concrete: Arc<RpcHybridV2ChainSource> = Arc::new(source);
+            let source_arc: Arc<dyn deopt_v2_backend::hybrid_v2::ChainSource> =
+                rpc_source_concrete.clone();
             let store = Arc::new(PostgresHybridV2ProjectionStore::new(repo.pool().clone()));
             // BACKEND-HYBRID-V2-PROJECTION-PERSISTENCE-OPERATIONAL-CLOSURE-V1
             // Attach the projection store to AppState so mounted admin
@@ -270,13 +278,62 @@ async fn main() -> deopt_v2_backend::Result<()> {
             );
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
             let _worker_handle = spawn_hybrid_v2_indexer_worker(
-                runtime_arc,
+                runtime_arc.clone(),
                 source_arc,
-                store,
+                store.clone(),
                 worker_config,
-                Some(shutdown_rx),
+                Some(shutdown_rx.clone()),
             );
             _hybrid_v2_shutdown_tx = Some(shutdown_tx);
+            // BACKEND-HYBRID-V2-CHAIN-VIEW-PROVIDER-AND-RECONCILIATION-TASK-V1
+            // Optional production reconciliation surface. Fail-closed:
+            // an invalid manifest address here aborts startup, matching
+            // the posture of the manifest ingestion layer.
+            if config.hybrid_v2.reconciliation_enabled {
+                let provider = RpcChainViewProvider::new(
+                    rpc_source_concrete.clone(),
+                    load_hybrid_v2_manifest(&config.hybrid_v2)?,
+                )
+                .map_err(|e| {
+                    BackendError::Config(format!(
+                        "hybrid_v2 reconciliation provider construction: {e}"
+                    ))
+                })?;
+                let provider_arc = Arc::new(provider);
+                let manifest_for_state = load_hybrid_v2_manifest(&config.hybrid_v2)?;
+                let recon_worker_config = HybridV2ReconciliationWorkerConfig::new(
+                    config.hybrid_v2.deployment_id,
+                    config.hybrid_v2.reconciliation_periodic_ms,
+                    config.hybrid_v2.reconciliation_max_items_per_run,
+                    manifest_for_state.clone(),
+                );
+                state = state.with_hybrid_v2_reconciliation(
+                    provider_arc.clone(),
+                    runtime_arc.clone(),
+                    manifest_for_state,
+                    recon_worker_config.clone(),
+                );
+                if config.hybrid_v2.reconciliation_periodic_ms > 0 {
+                    let _reconciliation_handle = spawn_hybrid_v2_reconciliation_worker(
+                        runtime_arc.clone(),
+                        provider_arc,
+                        store.clone(),
+                        recon_worker_config,
+                        Some(shutdown_rx),
+                    );
+                    info!(
+                        deployment_id = config.hybrid_v2.deployment_id,
+                        periodic_ms = config.hybrid_v2.reconciliation_periodic_ms,
+                        max_items_per_run = config.hybrid_v2.reconciliation_max_items_per_run,
+                        "hybrid_v2 reconciliation worker spawned"
+                    );
+                } else {
+                    info!(
+                        deployment_id = config.hybrid_v2.deployment_id,
+                        "hybrid_v2 reconciliation provider wired for admin-triggered runs only"
+                    );
+                }
+            }
             info!(
                 deployment_id = config.hybrid_v2.deployment_id,
                 chain_id = config.hybrid_v2.chain_id,

@@ -295,15 +295,92 @@ pub async fn request_reconciliation(
     if let Err(resp) = refuse_mainnet(entry.manifest.chain_id) {
         return resp;
     }
-    // We do not have a production ChainViewProvider yet. Return 501 —
-    // this is honest: the closure notes explain the deferred state.
-    let _ = store;
-    err_response(
-        StatusCode::NOT_IMPLEMENTED,
-        "RECONCILIATION_PROVIDER_UNAVAILABLE",
-        "no production ChainViewProvider is wired; reconciliation 
-         cannot be triggered without one",
+    // BACKEND-HYBRID-V2-CHAIN-VIEW-PROVIDER-AND-RECONCILIATION-TASK-V1
+    // Every dependency (provider, runtime, worker config, manifest)
+    // must be attached to AppState. Missing pieces surface as
+    // deterministic 503 responses so an operator misconfiguration is
+    // obvious rather than silently degrading behaviour.
+    let Some(provider) = state.hybrid_v2_chain_view_provider.clone() else {
+        return err_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "RECONCILIATION_PROVIDER_UNAVAILABLE",
+            "no production ChainViewProvider is wired for this deployment",
+        );
+    };
+    let Some(runtime) = state.hybrid_v2_runtime.clone() else {
+        return err_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "RECONCILIATION_RUNTIME_UNAVAILABLE",
+            "no indexer runtime handle is wired for this deployment",
+        );
+    };
+    let Some(worker_config) = state.hybrid_v2_reconciliation_worker_config.clone() else {
+        return err_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "RECONCILIATION_CONFIG_UNAVAILABLE",
+            "no reconciliation worker config is attached to AppState",
+        );
+    };
+    // Guardrail: the wired provider must match the requested deployment.
+    if worker_config.deployment_id != deployment_id {
+        return err_response(
+            StatusCode::CONFLICT,
+            "RECONCILIATION_DEPLOYMENT_MISMATCH",
+            &format!(
+                "requested deployment_id={deployment_id} does not match wired provider ({})",
+                worker_config.deployment_id,
+            ),
+        );
+    }
+    let reconciler = crate::hybrid_v2::chain_view::Reconciler {
+        max_pairs_per_batch: worker_config.max_items_per_run as usize,
+    };
+    let outcome = crate::hybrid_v2::reconciliation_worker::tick_once(
+        &runtime,
+        provider.as_ref(),
+        store.as_ref(),
+        &reconciler,
+        &worker_config,
     )
+    .await;
+    match outcome {
+        Ok(crate::hybrid_v2::reconciliation_worker::TickOutcome::Ran {
+            classification,
+            reconciliation_id,
+        }) => {
+            let status = if classification.is_converged_or_transient() {
+                StatusCode::OK
+            } else {
+                // Drift is not a client error — the request succeeded,
+                // and the operator's job is to inspect the persisted
+                // classification. Report 200 with the classification
+                // string so integrations can decide how to react.
+                StatusCode::OK
+            };
+            (
+                status,
+                Json(serde_json::json!({
+                    "deployment_id": deployment_id,
+                    "operation_id": reconciliation_id,
+                    "classification": classification.as_str(),
+                    "status": "COMPLETED",
+                })),
+            )
+                .into_response()
+        }
+        Ok(crate::hybrid_v2::reconciliation_worker::TickOutcome::Skipped { reason }) => {
+            err_response(
+                StatusCode::CONFLICT,
+                "RECONCILIATION_SKIPPED",
+                &format!("reconciliation skipped: {reason}"),
+            )
+        }
+        Err(detail) => err_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "RECONCILIATION_FAILED",
+            &detail,
+        ),
+    }
 }
 
 pub async fn latest_operation(
