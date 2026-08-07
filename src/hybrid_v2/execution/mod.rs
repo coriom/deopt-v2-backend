@@ -33,6 +33,7 @@ pub mod plan;
 pub mod preflight;
 pub mod rpc;
 pub mod signer;
+pub mod signer_firewall;
 pub mod signer_production;
 pub mod simulator;
 pub mod state;
@@ -55,6 +56,7 @@ pub use signer::{
     ExecutionSigner, SignedTx, SignerBackend, SignerError, SignerIdentity, SignerKind,
     SigningRequest,
 };
+pub use signer_firewall::{FirewallRejection, SignerPolicyFirewall};
 pub use signer_production::ProductionSignerUnavailable;
 pub use simulator::{ExecutionSimulator, SimulationError, SimulationOutcome};
 pub use state::{ExecutionPhase, PhaseParseError, PhaseTransitionError};
