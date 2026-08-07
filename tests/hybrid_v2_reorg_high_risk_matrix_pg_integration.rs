@@ -364,8 +364,12 @@ async fn orphaned_withdrawal_balance_reverted() {
     let owner = "0x000000000000000000000000000000000000baaa".to_string();
     let subkey = "0xaa11111111111111111111111111111111111111111111111111111111111111".to_string();
     let token = "0x000000000000000000000000000000000000c0de".to_string();
+    // Seed a deposit inside the same reorged block so the reducer has
+    // a balance to withdraw from; both logs are on block 2 and both
+    // become orphaned by the reorg.
+    let dep = deposit_log(&manifest, &subkey, &owner, 1, &token, "1000");
     let wd = withdraw_log(&manifest, &subkey, &owner, 1, &token, "500");
-    let fix = HighRiskFixture::build(vec![wd]);
+    let fix = HighRiskFixture::build(vec![dep, wd]);
 
     let outcome = drive_and_reorg(&store, did, &fix).await;
     let (rep_tip, rep_hash) = match outcome {

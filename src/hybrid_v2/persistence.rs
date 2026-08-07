@@ -1091,11 +1091,21 @@ impl HybridV2ProjectionStore for PostgresHybridV2ProjectionStore {
         now_ms: i64,
     ) -> Result<Option<crate::hybrid_v2::rebuild_operations::OperationLockGuard>> {
         // Stale-lock cleanup: delete only when we can prove the prior
-        // holder is terminal.
-        //   REORG        → paired reorg_recovery row in RECOVERED / MANUAL_INTERVENTION_REQUIRED
-        //   REBUILD      → any rebuild op row for this deployment with a terminal phase
-        //   RECONCILIATION → always considered stale on next acquire
-        //                     (reconciliation runs are short-lived; no long-lived state)
+        // holder is terminal. NEVER treat any held lock as
+        // unconditionally stale — that would let a competing operation
+        // silently steal the lock mid-run.
+        //   REORG          → paired reorg_recovery row in RECOVERED /
+        //                    MANUAL_INTERVENTION_REQUIRED.
+        //   REBUILD        → paired rebuild-op row in COMPLETE / FAILED /
+        //                    MANUAL_INTERVENTION_REQUIRED.
+        //   RECONCILIATION → no persisted state machine to consult, so
+        //                    stale-lock cleanup does NOT run for this
+        //                    operation. Explicit release
+        //                    (`release_operation_lock`) is the only
+        //                    path that clears a RECONCILIATION row. A
+        //                    process crash mid-reconciliation therefore
+        //                    holds the lock until operator restart —
+        //                    accepted trade-off vs. silent stealing.
         sqlx::query(
             "DELETE FROM hybrid_v2_operation_locks
              WHERE deployment_id = $1
@@ -1110,7 +1120,6 @@ impl HybridV2ProjectionStore for PostgresHybridV2ProjectionStore {
                         WHERE b.deployment_id = $1
                           AND b.phase IN ('COMPLETE', 'FAILED', 'MANUAL_INTERVENTION_REQUIRED')
                     ))
-                 OR operation = 'RECONCILIATION'
                )",
         )
         .bind(deployment_id)
