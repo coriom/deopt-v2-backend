@@ -27,8 +27,10 @@
 
 pub mod identity;
 pub mod persistence;
+pub mod plan;
 pub mod state;
 
 pub use identity::{derive_canonical_execution_id, CanonicalExecutionId};
 pub use persistence::{ExecutionRequestPatch, ExecutionRequestRow};
+pub use plan::{ExecutionPlan, ExecutionPlanBuilder, OptionOrder, PlanError, SignedActionEnvelope};
 pub use state::{ExecutionPhase, PhaseParseError, PhaseTransitionError};

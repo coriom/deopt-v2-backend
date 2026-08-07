@@ -51,8 +51,9 @@ pub use config::HybridV2Config;
 pub use correlation::{ExecutionCorrelator, ExecutionGroup};
 pub use events::{EventKind, HybridV2Event};
 pub use execution::{
-    derive_canonical_execution_id, CanonicalExecutionId, ExecutionPhase, ExecutionRequestPatch,
-    ExecutionRequestRow, PhaseParseError, PhaseTransitionError,
+    derive_canonical_execution_id, CanonicalExecutionId, ExecutionPhase, ExecutionPlan,
+    ExecutionPlanBuilder, ExecutionRequestPatch, ExecutionRequestRow, PhaseParseError,
+    PhaseTransitionError, PlanError,
 };
 pub use manifest::{ManifestParams, ManifestValidationError, ManifestValidator, NetworkPolicy};
 pub use persistence::{
