@@ -30,6 +30,7 @@ pub mod persistence;
 pub mod plan;
 pub mod preflight;
 pub mod rpc;
+pub mod simulator;
 pub mod state;
 pub mod target_policy;
 
@@ -41,5 +42,6 @@ pub use rpc::{
     BlockTag, DecodedRevert, EthCallOutcome, EthCallRequest, ExecutionRpcClient, ExecutionRpcError,
     FeeHistory, HttpExecutionRpcClient, ALLOWED_METHODS, KNOWN_CUSTOM_ERROR_SELECTORS,
 };
+pub use simulator::{ExecutionSimulator, SimulationError, SimulationOutcome};
 pub use state::{ExecutionPhase, PhaseParseError, PhaseTransitionError};
 pub use target_policy::{AllowedTarget, PolicyError, TargetPolicy};
