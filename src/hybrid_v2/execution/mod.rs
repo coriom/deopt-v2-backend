@@ -28,11 +28,13 @@
 pub mod identity;
 pub mod persistence;
 pub mod plan;
+pub mod preflight;
 pub mod state;
 pub mod target_policy;
 
 pub use identity::{derive_canonical_execution_id, CanonicalExecutionId};
 pub use persistence::{ExecutionRequestPatch, ExecutionRequestRow};
 pub use plan::{ExecutionPlan, ExecutionPlanBuilder, OptionOrder, PlanError, SignedActionEnvelope};
+pub use preflight::{PreflightChecker, PreflightRejection, TrustLevel};
 pub use state::{ExecutionPhase, PhaseParseError, PhaseTransitionError};
 pub use target_policy::{AllowedTarget, PolicyError, TargetPolicy};
