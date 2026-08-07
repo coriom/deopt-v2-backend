@@ -25,6 +25,7 @@
 //!   * orchestrator / admin routes (later package)
 //!   * broadcast (permanently disabled at trait level for HV2)
 
+pub mod gas_policy;
 pub mod identity;
 pub mod persistence;
 pub mod plan;
@@ -34,6 +35,7 @@ pub mod simulator;
 pub mod state;
 pub mod target_policy;
 
+pub use gas_policy::{GasComputationOutcome, GasFeePolicy, GasPolicyError};
 pub use identity::{derive_canonical_execution_id, CanonicalExecutionId};
 pub use persistence::{ExecutionRequestPatch, ExecutionRequestRow};
 pub use plan::{ExecutionPlan, ExecutionPlanBuilder, OptionOrder, PlanError, SignedActionEnvelope};
