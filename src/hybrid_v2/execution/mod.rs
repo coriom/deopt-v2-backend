@@ -32,6 +32,7 @@ pub mod persistence;
 pub mod plan;
 pub mod preflight;
 pub mod rpc;
+pub mod signature_verify;
 pub mod signer;
 pub mod signer_firewall;
 pub mod signer_production;
@@ -52,6 +53,7 @@ pub use rpc::{
     BlockTag, DecodedRevert, EthCallOutcome, EthCallRequest, ExecutionRpcClient, ExecutionRpcError,
     FeeHistory, HttpExecutionRpcClient, ALLOWED_METHODS, KNOWN_CUSTOM_ERROR_SELECTORS,
 };
+pub use signature_verify::{verify_signed_tx, SigVerifyError, VerifiedSignature};
 pub use signer::{
     ExecutionSigner, SignedTx, SignerBackend, SignerError, SignerIdentity, SignerKind,
     SigningRequest,
