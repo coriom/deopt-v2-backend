@@ -32,9 +32,14 @@ pub mod persistence;
 pub mod plan;
 pub mod preflight;
 pub mod rpc;
+pub mod signer;
+pub mod signer_production;
 pub mod simulator;
 pub mod state;
 pub mod target_policy;
+
+#[cfg(any(test, feature = "test-signer"))]
+pub mod signer_ephemeral;
 
 pub use gas_policy::{GasComputationOutcome, GasFeePolicy, GasPolicyError};
 pub use identity::{derive_canonical_execution_id, CanonicalExecutionId};
@@ -46,6 +51,11 @@ pub use rpc::{
     BlockTag, DecodedRevert, EthCallOutcome, EthCallRequest, ExecutionRpcClient, ExecutionRpcError,
     FeeHistory, HttpExecutionRpcClient, ALLOWED_METHODS, KNOWN_CUSTOM_ERROR_SELECTORS,
 };
+pub use signer::{
+    ExecutionSigner, SignedTx, SignerBackend, SignerError, SignerIdentity, SignerKind,
+    SigningRequest,
+};
+pub use signer_production::ProductionSignerUnavailable;
 pub use simulator::{ExecutionSimulator, SimulationError, SimulationOutcome};
 pub use state::{ExecutionPhase, PhaseParseError, PhaseTransitionError};
 pub use target_policy::{AllowedTarget, PolicyError, TargetPolicy};

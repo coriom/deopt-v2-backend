@@ -667,3 +667,74 @@ mod tests {
         assert_eq!(redact_rpc_url("not-a-url"), "<opaque>");
     }
 }
+
+// -----------------------------------------------------------------
+// BACKEND-HYBRID-V2-SIGNER-AND-EXECUTION-V1 — execution config
+// -----------------------------------------------------------------
+
+use crate::hybrid_v2::execution::gas_policy::GasFeePolicy;
+use crate::hybrid_v2::execution::signer::SignerBackend;
+
+/// Configuration surface for the Hybrid V2 pre-broadcast execution
+/// pipeline. Held by the orchestrator (Package 3); provided here so
+/// this milestone's callers can wire construction now.
+///
+/// Default `signer_kind = SignerBackend::Production` yields
+/// [`crate::hybrid_v2::execution::signer_production::ProductionSignerUnavailable`]
+/// — the honest verdict
+/// `BACKEND_HYBRID_V2_SIGNER_INTERFACE_READY_EXTERNAL_SIGNER_REQUIRED`.
+#[derive(Debug, Clone)]
+pub struct HybridV2ExecutionConfig {
+    /// Master switch. When `false` the execution orchestrator does not
+    /// start (Package 3). This flag has no effect on the read-only
+    /// simulation/gas/nonce/signer scaffolding introduced here.
+    pub execution_enabled: bool,
+    /// Executor 20-byte address. Used as `eth_call.from` in the
+    /// simulator and as the identity in nonce reservations.
+    pub executor_address: [u8; 20],
+    /// Selects the signer backend. Default `Production`.
+    pub signer_kind: SignerBackend,
+    /// Optional URI for the signer (KMS ARN, HTTP endpoint, ...).
+    /// Redacted in logs.
+    pub signer_endpoint: Option<String>,
+    /// Bounded gas + fee policy.
+    pub gas_policy: GasFeePolicy,
+    /// RPC endpoint dedicated to the execution pipeline. May be the
+    /// same as the indexer's RPC but is kept separate so operators
+    /// can rate-limit / route independently.
+    pub rpc_url: Option<String>,
+    /// Per-request timeout applied by the `ExecutionRpcClient`.
+    pub rpc_timeout_ms: u64,
+    /// Max age (ms) the signer firewall accepts for a persisted
+    /// simulation before demanding a re-simulation.
+    pub simulation_max_age_ms: u64,
+}
+
+impl HybridV2ExecutionConfig {
+    /// Disabled defaults — safe to construct even when the operator
+    /// has not opted into Hybrid V2 execution.
+    pub fn disabled() -> Self {
+        Self {
+            execution_enabled: false,
+            executor_address: [0u8; 20],
+            signer_kind: SignerBackend::Production,
+            signer_endpoint: None,
+            gas_policy: default_disabled_gas_policy(),
+            rpc_url: None,
+            rpc_timeout_ms: 10_000,
+            simulation_max_age_ms: 60_000,
+        }
+    }
+}
+
+fn default_disabled_gas_policy() -> GasFeePolicy {
+    use alloy_primitives::U256;
+    GasFeePolicy {
+        max_gas_limit: 5_000_000,
+        gas_limit_multiplier_bps: 12_000,
+        max_fee_per_gas_wei: U256::from(50_000_000_000u64),
+        max_priority_fee_per_gas_wei: U256::from(2_000_000_000u64),
+        max_total_native_cost_wei: U256::from(10u64).pow(U256::from(18u64)),
+        abnormal_estimate_reject_threshold: 10,
+    }
+}
