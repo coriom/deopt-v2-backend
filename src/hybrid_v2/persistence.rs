@@ -436,6 +436,123 @@ pub trait HybridV2ProjectionStore: Send + Sync {
             "commit_rematerialization unimplemented for this store".to_string(),
         ))
     }
+
+    // -----------------------------------------------------------------
+    //  BACKEND-HYBRID-V2-SIGNER-AND-EXECUTION-V1 (Foundation package)
+    //  Pre-broadcast execution persistence surface.
+    // -----------------------------------------------------------------
+
+    /// Idempotent insert of a new execution request row keyed by
+    /// `canonical_execution_id`. Returns `Ok(true)` if a new row was
+    /// inserted, `Ok(false)` if a row already existed. Never mutates
+    /// existing rows (idempotency by construction — the canonical id
+    /// is a hash of the intent).
+    async fn insert_execution_request(
+        &self,
+        _row: &crate::hybrid_v2::execution::ExecutionRequestRow,
+    ) -> Result<bool> {
+        Err(BackendError::Persistence(
+            "insert_execution_request unimplemented for this store".to_string(),
+        ))
+    }
+
+    /// Point read.
+    async fn get_execution_request(
+        &self,
+        _canonical_execution_id: &str,
+    ) -> Result<Option<crate::hybrid_v2::execution::ExecutionRequestRow>> {
+        Err(BackendError::Persistence(
+            "get_execution_request unimplemented for this store".to_string(),
+        ))
+    }
+
+    /// Conditional forward-only phase update. Semantics:
+    ///
+    /// 1. Refuses at the trait/SQL layer if the caller-provided `from`
+    ///    is not the current persisted phase, or if `from -> to` is
+    ///    not in the state-machine legal-edge matrix.
+    /// 2. Refuses if `patch.plan_hash` or `patch.calldata_hash` would
+    ///    mutate a previously-set value (immutability rule).
+    /// 3. Writes only the `Some(_)` fields from `patch`.
+    ///
+    /// Returns `Ok(true)` on successful update, `Ok(false)` on lost
+    /// update (phase moved elsewhere concurrently).
+    async fn update_execution_phase(
+        &self,
+        _canonical_execution_id: &str,
+        _from: crate::hybrid_v2::execution::ExecutionPhase,
+        _to: crate::hybrid_v2::execution::ExecutionPhase,
+        _now_ms: i64,
+        _patch: crate::hybrid_v2::execution::ExecutionRequestPatch,
+    ) -> Result<bool> {
+        Err(BackendError::Persistence(
+            "update_execution_phase unimplemented for this store".to_string(),
+        ))
+    }
+
+    /// Append a phase-transition attempt row. Returns the newly
+    /// assigned `attempt_id`.
+    async fn append_execution_attempt(
+        &self,
+        _canonical_execution_id: &str,
+        _phase: crate::hybrid_v2::execution::ExecutionPhase,
+        _detail: Option<serde_json::Value>,
+        _now_ms: i64,
+    ) -> Result<i64> {
+        Err(BackendError::Persistence(
+            "append_execution_attempt unimplemented for this store".to_string(),
+        ))
+    }
+
+    /// Deployment-scoped listing, bounded by `limit`. Ordered by
+    /// `updated_at_ms DESC`.
+    async fn list_execution_requests_by_deployment(
+        &self,
+        _deployment_id: i64,
+        _limit: i64,
+    ) -> Result<Vec<crate::hybrid_v2::execution::ExecutionRequestRow>> {
+        Err(BackendError::Persistence(
+            "list_execution_requests_by_deployment unimplemented for this store".to_string(),
+        ))
+    }
+
+    /// Atomic per-signer nonce reservation. Returns `Ok(true)` iff
+    /// the row was newly inserted (caller now holds the reservation),
+    /// `Ok(false)` on conflict (a competitor already holds it).
+    async fn reserve_executor_nonce(
+        &self,
+        _chain_id: i64,
+        _signer: &str,
+        _nonce: i64,
+        _canonical_execution_id: &str,
+        _now_ms: i64,
+    ) -> Result<bool> {
+        Err(BackendError::Persistence(
+            "reserve_executor_nonce unimplemented for this store".to_string(),
+        ))
+    }
+
+    /// Mark a reserved nonce as historically abandoned. No-op if the
+    /// row does not exist (idempotent).
+    async fn mark_executor_nonce_abandoned(
+        &self,
+        _chain_id: i64,
+        _signer: &str,
+        _nonce: i64,
+    ) -> Result<()> {
+        Err(BackendError::Persistence(
+            "mark_executor_nonce_abandoned unimplemented for this store".to_string(),
+        ))
+    }
+
+    /// Enumerate every reserved nonce (any status) for a
+    /// `(chain_id, signer_identity)` pair. Used at orchestrator
+    /// restart to reconcile in-memory state with persisted intent.
+    async fn get_reserved_nonces_for(&self, _chain_id: i64, _signer: &str) -> Result<Vec<i64>> {
+        Err(BackendError::Persistence(
+            "get_reserved_nonces_for unimplemented for this store".to_string(),
+        ))
+    }
 }
 
 // -----------------------------------------------------------------
@@ -1106,6 +1223,13 @@ impl HybridV2ProjectionStore for PostgresHybridV2ProjectionStore {
         //                    process crash mid-reconciliation therefore
         //                    holds the lock until operator restart —
         //                    accepted trade-off vs. silent stealing.
+        //   EXECUTION      → paired execution row (correlated by
+        //                    holder_epoch) in a terminal phase
+        //                    (BROADCAST_DISABLED / CANCELLED / STALE /
+        //                    FAILED). Absence of any correlated row is
+        //                    NOT treated as terminal — leaves the lock
+        //                    alone (safe default, same policy as
+        //                    RECONCILIATION).
         sqlx::query(
             "DELETE FROM hybrid_v2_operation_locks
              WHERE deployment_id = $1
@@ -1119,6 +1243,12 @@ impl HybridV2ProjectionStore for PostgresHybridV2ProjectionStore {
                         SELECT 1 FROM hybrid_v2_rebuild_operations b
                         WHERE b.deployment_id = $1
                           AND b.phase IN ('COMPLETE', 'FAILED', 'MANUAL_INTERVENTION_REQUIRED')
+                    ))
+                 OR (operation = 'EXECUTION' AND EXISTS (
+                        SELECT 1 FROM hybrid_v2_execution_requests x
+                        WHERE x.deployment_id = $1
+                          AND x.holder_epoch = hybrid_v2_operation_locks.holder_epoch
+                          AND x.phase IN ('BROADCAST_DISABLED', 'CANCELLED', 'STALE', 'FAILED')
                     ))
                )",
         )
@@ -1799,6 +1929,393 @@ impl HybridV2ProjectionStore for PostgresHybridV2ProjectionStore {
         tx.commit().await.map_err(pg_err)?;
         Ok(())
     }
+
+    // -----------------------------------------------------------------
+    //  Hybrid V2 execution surface (PG impl of migration 0049)
+    // -----------------------------------------------------------------
+
+    async fn insert_execution_request(
+        &self,
+        row: &crate::hybrid_v2::execution::ExecutionRequestRow,
+    ) -> Result<bool> {
+        let res = sqlx::query(
+            "INSERT INTO hybrid_v2_execution_requests (
+                canonical_execution_id, deployment_id, chain_id, execution_kind,
+                buyer_order_hash, seller_order_hash, buyer_subkey, seller_subkey,
+                series_id, fill_quantity_1e8, premium_amount, fee_schedule_epoch,
+                source_matched_execution_id, target_contract, selector,
+                calldata_hash, plan_hash, tx_value_wei,
+                simulation_block_number, simulation_block_hash,
+                simulation_gas_estimate, simulation_result_json,
+                signer_identity, signing_payload_hash,
+                signature_r, signature_s, signature_v, recovered_signer,
+                gas_limit, max_fee_per_gas_wei, max_priority_fee_per_gas_wei,
+                reserved_nonce, phase, failure_class, failure_detail,
+                retry_count, holder_epoch, created_at_ms, updated_at_ms
+             ) VALUES (
+                $1,$2,$3,$4,$5,$6,$7,$8,$9,
+                CAST($10 AS NUMERIC),CAST($11 AS NUMERIC),$12,
+                $13,$14,$15,$16,$17,CAST($18 AS NUMERIC),
+                $19,$20,$21,$22,
+                $23,$24,$25,$26,$27,$28,
+                $29,CAST($30 AS NUMERIC),CAST($31 AS NUMERIC),
+                $32,$33,$34,$35,
+                $36,$37,$38,$39
+             )
+             ON CONFLICT (canonical_execution_id) DO NOTHING",
+        )
+        .bind(&row.canonical_execution_id)
+        .bind(row.deployment_id)
+        .bind(row.chain_id)
+        .bind(&row.execution_kind)
+        .bind(&row.buyer_order_hash)
+        .bind(&row.seller_order_hash)
+        .bind(&row.buyer_subkey)
+        .bind(&row.seller_subkey)
+        .bind(&row.series_id)
+        .bind(&row.fill_quantity_1e8)
+        .bind(&row.premium_amount)
+        .bind(row.fee_schedule_epoch)
+        .bind(&row.source_matched_execution_id)
+        .bind(&row.target_contract)
+        .bind(&row.selector)
+        .bind(&row.calldata_hash)
+        .bind(&row.plan_hash)
+        .bind(&row.tx_value_wei)
+        .bind(row.simulation_block_number)
+        .bind(&row.simulation_block_hash)
+        .bind(row.simulation_gas_estimate)
+        .bind(&row.simulation_result_json)
+        .bind(&row.signer_identity)
+        .bind(&row.signing_payload_hash)
+        .bind(&row.signature_r)
+        .bind(&row.signature_s)
+        .bind(row.signature_v)
+        .bind(&row.recovered_signer)
+        .bind(row.gas_limit)
+        .bind(&row.max_fee_per_gas_wei)
+        .bind(&row.max_priority_fee_per_gas_wei)
+        .bind(row.reserved_nonce)
+        .bind(row.phase.as_str())
+        .bind(&row.failure_class)
+        .bind(&row.failure_detail)
+        .bind(row.retry_count)
+        .bind(row.holder_epoch)
+        .bind(row.created_at_ms)
+        .bind(row.updated_at_ms)
+        .execute(&self.pool)
+        .await
+        .map_err(pg_err)?;
+        Ok(res.rows_affected() == 1)
+    }
+
+    async fn get_execution_request(
+        &self,
+        canonical_execution_id: &str,
+    ) -> Result<Option<crate::hybrid_v2::execution::ExecutionRequestRow>> {
+        let row = sqlx::query(
+            "SELECT canonical_execution_id, deployment_id, chain_id, execution_kind,
+                    buyer_order_hash, seller_order_hash, buyer_subkey, seller_subkey,
+                    series_id,
+                    fill_quantity_1e8::text AS fill_quantity_1e8_txt,
+                    premium_amount::text AS premium_amount_txt,
+                    fee_schedule_epoch, source_matched_execution_id,
+                    target_contract, selector, calldata_hash, plan_hash,
+                    tx_value_wei::text AS tx_value_wei_txt,
+                    simulation_block_number, simulation_block_hash,
+                    simulation_gas_estimate, simulation_result_json,
+                    signer_identity, signing_payload_hash,
+                    signature_r, signature_s, signature_v, recovered_signer,
+                    gas_limit,
+                    max_fee_per_gas_wei::text AS max_fee_per_gas_wei_txt,
+                    max_priority_fee_per_gas_wei::text AS max_priority_fee_per_gas_wei_txt,
+                    reserved_nonce, phase, failure_class, failure_detail,
+                    retry_count, holder_epoch, created_at_ms, updated_at_ms
+             FROM hybrid_v2_execution_requests
+             WHERE canonical_execution_id = $1",
+        )
+        .bind(canonical_execution_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(pg_err)?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        Ok(Some(row_to_execution_request(row)?))
+    }
+
+    async fn update_execution_phase(
+        &self,
+        canonical_execution_id: &str,
+        from: crate::hybrid_v2::execution::ExecutionPhase,
+        to: crate::hybrid_v2::execution::ExecutionPhase,
+        now_ms: i64,
+        patch: crate::hybrid_v2::execution::ExecutionRequestPatch,
+    ) -> Result<bool> {
+        if !from.can_transition_to(to) {
+            return Err(BackendError::Persistence(format!(
+                "illegal execution phase transition {} -> {}",
+                from.as_str(),
+                to.as_str()
+            )));
+        }
+        // Use COALESCE for every Option field so `None` = don't touch.
+        // The WHERE clause enforces state-machine safety at the SQL
+        // layer (from-phase must match); the plan_hash immutability
+        // trigger blocks divergent hash updates.
+        let res = sqlx::query(
+            "UPDATE hybrid_v2_execution_requests SET
+                target_contract              = COALESCE($3, target_contract),
+                selector                     = COALESCE($4, selector),
+                calldata_hash                = COALESCE($5, calldata_hash),
+                plan_hash                    = COALESCE($6, plan_hash),
+                tx_value_wei                 = COALESCE(CAST($7 AS NUMERIC), tx_value_wei),
+                simulation_block_number      = COALESCE($8, simulation_block_number),
+                simulation_block_hash        = COALESCE($9, simulation_block_hash),
+                simulation_gas_estimate      = COALESCE($10, simulation_gas_estimate),
+                simulation_result_json       = COALESCE($11, simulation_result_json),
+                signer_identity              = COALESCE($12, signer_identity),
+                signing_payload_hash         = COALESCE($13, signing_payload_hash),
+                signature_r                  = COALESCE($14, signature_r),
+                signature_s                  = COALESCE($15, signature_s),
+                signature_v                  = COALESCE($16, signature_v),
+                recovered_signer             = COALESCE($17, recovered_signer),
+                gas_limit                    = COALESCE($18, gas_limit),
+                max_fee_per_gas_wei          = COALESCE(CAST($19 AS NUMERIC), max_fee_per_gas_wei),
+                max_priority_fee_per_gas_wei = COALESCE(CAST($20 AS NUMERIC), max_priority_fee_per_gas_wei),
+                reserved_nonce               = COALESCE($21, reserved_nonce),
+                failure_class                = COALESCE($22, failure_class),
+                failure_detail               = COALESCE($23, failure_detail),
+                holder_epoch                 = COALESCE($24, holder_epoch),
+                retry_count                  = COALESCE($25, retry_count),
+                phase                        = $26,
+                updated_at_ms                = $27
+             WHERE canonical_execution_id = $1 AND phase = $2",
+        )
+        .bind(canonical_execution_id)
+        .bind(from.as_str())
+        .bind(patch.target_contract.as_deref())
+        .bind(patch.selector.as_deref())
+        .bind(patch.calldata_hash.as_deref())
+        .bind(patch.plan_hash.as_deref())
+        .bind(patch.tx_value_wei.as_deref())
+        .bind(patch.simulation_block_number)
+        .bind(patch.simulation_block_hash.as_deref())
+        .bind(patch.simulation_gas_estimate)
+        .bind(patch.simulation_result_json.as_ref())
+        .bind(patch.signer_identity.as_deref())
+        .bind(patch.signing_payload_hash.as_deref())
+        .bind(patch.signature_r.as_deref())
+        .bind(patch.signature_s.as_deref())
+        .bind(patch.signature_v)
+        .bind(patch.recovered_signer.as_deref())
+        .bind(patch.gas_limit)
+        .bind(patch.max_fee_per_gas_wei.as_deref())
+        .bind(patch.max_priority_fee_per_gas_wei.as_deref())
+        .bind(patch.reserved_nonce)
+        .bind(patch.failure_class.as_deref())
+        .bind(patch.failure_detail.as_deref())
+        .bind(patch.holder_epoch)
+        .bind(patch.retry_count)
+        .bind(to.as_str())
+        .bind(now_ms)
+        .execute(&self.pool)
+        .await
+        .map_err(pg_err)?;
+        Ok(res.rows_affected() == 1)
+    }
+
+    async fn append_execution_attempt(
+        &self,
+        canonical_execution_id: &str,
+        phase: crate::hybrid_v2::execution::ExecutionPhase,
+        detail: Option<serde_json::Value>,
+        now_ms: i64,
+    ) -> Result<i64> {
+        // Compute attempt_number via one round-trip. We rely on the
+        // (canonical_execution_id, attempt_number) UNIQUE constraint
+        // to catch races — the caller wraps in its own tx if it needs
+        // stronger monotonicity. The `::bigint` cast normalizes
+        // `INT4 + INT4` to `INT8` for sqlx binding compatibility.
+        let next: i64 = sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT (COALESCE(MAX(attempt_number), 0) + 1)::bigint
+             FROM hybrid_v2_execution_attempts
+             WHERE canonical_execution_id = $1",
+        )
+        .bind(canonical_execution_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(pg_err)?
+        .unwrap_or(1);
+        let row = sqlx::query(
+            "INSERT INTO hybrid_v2_execution_attempts
+                (canonical_execution_id, attempt_number, phase, entered_at_ms, detail_json)
+             VALUES ($1, $2, $3, $4, $5)
+             RETURNING attempt_id",
+        )
+        .bind(canonical_execution_id)
+        .bind(next as i32)
+        .bind(phase.as_str())
+        .bind(now_ms)
+        .bind(detail.as_ref())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(pg_err)?;
+        let attempt_id: i64 = row.try_get("attempt_id").map_err(pg_err)?;
+        Ok(attempt_id)
+    }
+
+    async fn list_execution_requests_by_deployment(
+        &self,
+        deployment_id: i64,
+        limit: i64,
+    ) -> Result<Vec<crate::hybrid_v2::execution::ExecutionRequestRow>> {
+        let effective_limit = if limit <= 0 { 100 } else { limit.min(10_000) };
+        let rows = sqlx::query(
+            "SELECT canonical_execution_id, deployment_id, chain_id, execution_kind,
+                    buyer_order_hash, seller_order_hash, buyer_subkey, seller_subkey,
+                    series_id,
+                    fill_quantity_1e8::text AS fill_quantity_1e8_txt,
+                    premium_amount::text AS premium_amount_txt,
+                    fee_schedule_epoch, source_matched_execution_id,
+                    target_contract, selector, calldata_hash, plan_hash,
+                    tx_value_wei::text AS tx_value_wei_txt,
+                    simulation_block_number, simulation_block_hash,
+                    simulation_gas_estimate, simulation_result_json,
+                    signer_identity, signing_payload_hash,
+                    signature_r, signature_s, signature_v, recovered_signer,
+                    gas_limit,
+                    max_fee_per_gas_wei::text AS max_fee_per_gas_wei_txt,
+                    max_priority_fee_per_gas_wei::text AS max_priority_fee_per_gas_wei_txt,
+                    reserved_nonce, phase, failure_class, failure_detail,
+                    retry_count, holder_epoch, created_at_ms, updated_at_ms
+             FROM hybrid_v2_execution_requests
+             WHERE deployment_id = $1
+             ORDER BY updated_at_ms DESC
+             LIMIT $2",
+        )
+        .bind(deployment_id)
+        .bind(effective_limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(pg_err)?;
+        rows.into_iter().map(row_to_execution_request).collect()
+    }
+
+    async fn reserve_executor_nonce(
+        &self,
+        chain_id: i64,
+        signer: &str,
+        nonce: i64,
+        canonical_execution_id: &str,
+        now_ms: i64,
+    ) -> Result<bool> {
+        let res = sqlx::query(
+            "INSERT INTO hybrid_v2_executor_nonces
+                (chain_id, signer_identity, reserved_nonce,
+                 canonical_execution_id, reserved_at_ms, status)
+             VALUES ($1, $2, $3, $4, $5, 'RESERVED')
+             ON CONFLICT (chain_id, signer_identity, reserved_nonce) DO NOTHING",
+        )
+        .bind(chain_id)
+        .bind(signer)
+        .bind(nonce)
+        .bind(canonical_execution_id)
+        .bind(now_ms)
+        .execute(&self.pool)
+        .await
+        .map_err(pg_err)?;
+        Ok(res.rows_affected() == 1)
+    }
+
+    async fn mark_executor_nonce_abandoned(
+        &self,
+        chain_id: i64,
+        signer: &str,
+        nonce: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE hybrid_v2_executor_nonces
+             SET status = 'ABANDONED'
+             WHERE chain_id = $1 AND signer_identity = $2 AND reserved_nonce = $3",
+        )
+        .bind(chain_id)
+        .bind(signer)
+        .bind(nonce)
+        .execute(&self.pool)
+        .await
+        .map_err(pg_err)?;
+        Ok(())
+    }
+
+    async fn get_reserved_nonces_for(&self, chain_id: i64, signer: &str) -> Result<Vec<i64>> {
+        let rows = sqlx::query_scalar::<_, i64>(
+            "SELECT reserved_nonce
+             FROM hybrid_v2_executor_nonces
+             WHERE chain_id = $1 AND signer_identity = $2
+             ORDER BY reserved_nonce ASC",
+        )
+        .bind(chain_id)
+        .bind(signer)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(pg_err)?;
+        Ok(rows)
+    }
+}
+
+/// Row extractor for `hybrid_v2_execution_requests`. Numeric columns
+/// are read as text via `::text` to avoid pulling in `BigDecimal`.
+fn row_to_execution_request(
+    row: sqlx::postgres::PgRow,
+) -> Result<crate::hybrid_v2::execution::ExecutionRequestRow> {
+    use crate::hybrid_v2::execution::ExecutionPhase;
+    let phase_str: String = row.try_get("phase").map_err(pg_err)?;
+    let phase = ExecutionPhase::parse(&phase_str)
+        .map_err(|e| BackendError::Persistence(format!("unknown phase in execution row: {e}")))?;
+    Ok(crate::hybrid_v2::execution::ExecutionRequestRow {
+        canonical_execution_id: row.try_get("canonical_execution_id").map_err(pg_err)?,
+        deployment_id: row.try_get("deployment_id").map_err(pg_err)?,
+        chain_id: row.try_get("chain_id").map_err(pg_err)?,
+        execution_kind: row.try_get("execution_kind").map_err(pg_err)?,
+        buyer_order_hash: row.try_get("buyer_order_hash").map_err(pg_err)?,
+        seller_order_hash: row.try_get("seller_order_hash").map_err(pg_err)?,
+        buyer_subkey: row.try_get("buyer_subkey").map_err(pg_err)?,
+        seller_subkey: row.try_get("seller_subkey").map_err(pg_err)?,
+        series_id: row.try_get("series_id").map_err(pg_err)?,
+        fill_quantity_1e8: row.try_get("fill_quantity_1e8_txt").map_err(pg_err)?,
+        premium_amount: row.try_get("premium_amount_txt").map_err(pg_err)?,
+        fee_schedule_epoch: row.try_get("fee_schedule_epoch").map_err(pg_err)?,
+        source_matched_execution_id: row.try_get("source_matched_execution_id").map_err(pg_err)?,
+        target_contract: row.try_get("target_contract").map_err(pg_err)?,
+        selector: row.try_get("selector").map_err(pg_err)?,
+        calldata_hash: row.try_get("calldata_hash").map_err(pg_err)?,
+        plan_hash: row.try_get("plan_hash").map_err(pg_err)?,
+        tx_value_wei: row.try_get("tx_value_wei_txt").map_err(pg_err)?,
+        simulation_block_number: row.try_get("simulation_block_number").map_err(pg_err)?,
+        simulation_block_hash: row.try_get("simulation_block_hash").map_err(pg_err)?,
+        simulation_gas_estimate: row.try_get("simulation_gas_estimate").map_err(pg_err)?,
+        simulation_result_json: row.try_get("simulation_result_json").map_err(pg_err)?,
+        signer_identity: row.try_get("signer_identity").map_err(pg_err)?,
+        signing_payload_hash: row.try_get("signing_payload_hash").map_err(pg_err)?,
+        signature_r: row.try_get("signature_r").map_err(pg_err)?,
+        signature_s: row.try_get("signature_s").map_err(pg_err)?,
+        signature_v: row.try_get("signature_v").map_err(pg_err)?,
+        recovered_signer: row.try_get("recovered_signer").map_err(pg_err)?,
+        gas_limit: row.try_get("gas_limit").map_err(pg_err)?,
+        max_fee_per_gas_wei: row.try_get("max_fee_per_gas_wei_txt").map_err(pg_err)?,
+        max_priority_fee_per_gas_wei: row
+            .try_get("max_priority_fee_per_gas_wei_txt")
+            .map_err(pg_err)?,
+        reserved_nonce: row.try_get("reserved_nonce").map_err(pg_err)?,
+        phase,
+        failure_class: row.try_get("failure_class").map_err(pg_err)?,
+        failure_detail: row.try_get("failure_detail").map_err(pg_err)?,
+        retry_count: row.try_get("retry_count").map_err(pg_err)?,
+        holder_epoch: row.try_get("holder_epoch").map_err(pg_err)?,
+        created_at_ms: row.try_get("created_at_ms").map_err(pg_err)?,
+        updated_at_ms: row.try_get("updated_at_ms").map_err(pg_err)?,
+    })
 }
 
 fn row_to_rebuild_operation(
@@ -3319,6 +3836,25 @@ struct InMemoryInner {
     reconciliation_results:
         std::collections::BTreeMap<i64, crate::hybrid_v2::reconciler::ReconciliationRecord>,
     next_reconciliation_id: i64,
+    // BACKEND-HYBRID-V2-SIGNER-AND-EXECUTION-V1 (foundation package):
+    // pre-broadcast execution intent + phase history + per-signer
+    // nonce reservations. Every table below is keyed to align 1:1 with
+    // its Postgres counterpart in migration 0049.
+    execution_requests:
+        std::collections::BTreeMap<String, crate::hybrid_v2::execution::ExecutionRequestRow>,
+    execution_attempts: std::collections::BTreeMap<
+        i64,
+        (
+            String,
+            i32,
+            crate::hybrid_v2::execution::ExecutionPhase,
+            i64,
+            Option<serde_json::Value>,
+        ),
+    >,
+    next_execution_attempt_id: i64,
+    // (chain_id, signer, nonce) -> (canonical_execution_id, reserved_at_ms, status)
+    executor_nonces: std::collections::BTreeMap<(i64, String, i64), (Option<String>, i64, String)>,
 }
 
 impl InMemoryProjectionStore {
@@ -3649,7 +4185,7 @@ impl HybridV2ProjectionStore for InMemoryProjectionStore {
         // window between lock acquisition and the first upsert of the
         // paired state row. Matching the PG semantics.
         let should_delete = match inner.operation_locks.get(&deployment_id) {
-            Some((prev_op, _prev_epoch, _)) => match prev_op {
+            Some((prev_op, prev_epoch, _)) => match prev_op {
                 crate::hybrid_v2::rebuild_operations::OperationKind::Reorg => {
                     matches!(
                         inner.reorg_recovery.get(&deployment_id).map(|r| r.phase),
@@ -3667,7 +4203,27 @@ impl HybridV2ProjectionStore for InMemoryProjectionStore {
                     .filter(|p| p.is_terminal())
                     .last()
                     .is_some(),
-                crate::hybrid_v2::rebuild_operations::OperationKind::Reconciliation => true,
+                // Preserve existing safety guarantee: reconciliation
+                // holds the lock across the entire run and, per the
+                // audit-fixed regression in 4a8a382, MUST NOT be
+                // auto-cleaned by a competing operation. Explicit
+                // `release_operation_lock` remains the only path.
+                crate::hybrid_v2::rebuild_operations::OperationKind::Reconciliation => false,
+                // Execution locks are cleaned only when we can
+                // observe the paired execution row (keyed by
+                // holder_epoch as canonical_execution_id proxy) in a
+                // terminal ExecutionPhase. If the row cannot be
+                // correlated, leave the lock alone — safe default
+                // matching the RECONCILIATION policy.
+                crate::hybrid_v2::rebuild_operations::OperationKind::Execution => {
+                    let epoch = *prev_epoch;
+                    inner
+                        .execution_requests
+                        .values()
+                        .filter(|r| r.deployment_id == deployment_id)
+                        .filter(|r| r.holder_epoch == Some(epoch))
+                        .any(|r| r.phase.is_terminal())
+                }
             },
             None => false,
         };
@@ -3801,6 +4357,271 @@ impl HybridV2ProjectionStore for InMemoryProjectionStore {
             row.updated_at_ms = now_ms;
         }
         Ok(())
+    }
+
+    // -----------------------------------------------------------------
+    //  Hybrid V2 execution surface (in-memory mirror of migration 0049)
+    // -----------------------------------------------------------------
+
+    async fn insert_execution_request(
+        &self,
+        row: &crate::hybrid_v2::execution::ExecutionRequestRow,
+    ) -> Result<bool> {
+        use std::collections::btree_map::Entry;
+        let mut inner = self.inner.lock().unwrap();
+        match inner
+            .execution_requests
+            .entry(row.canonical_execution_id.clone())
+        {
+            Entry::Occupied(_) => Ok(false),
+            Entry::Vacant(v) => {
+                v.insert(row.clone());
+                Ok(true)
+            }
+        }
+    }
+
+    async fn get_execution_request(
+        &self,
+        canonical_execution_id: &str,
+    ) -> Result<Option<crate::hybrid_v2::execution::ExecutionRequestRow>> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner
+            .execution_requests
+            .get(canonical_execution_id)
+            .cloned())
+    }
+
+    async fn update_execution_phase(
+        &self,
+        canonical_execution_id: &str,
+        from: crate::hybrid_v2::execution::ExecutionPhase,
+        to: crate::hybrid_v2::execution::ExecutionPhase,
+        now_ms: i64,
+        patch: crate::hybrid_v2::execution::ExecutionRequestPatch,
+    ) -> Result<bool> {
+        if !from.can_transition_to(to) {
+            return Err(BackendError::Persistence(format!(
+                "illegal execution phase transition {} -> {}",
+                from.as_str(),
+                to.as_str()
+            )));
+        }
+        let mut inner = self.inner.lock().unwrap();
+        let row = match inner.execution_requests.get_mut(canonical_execution_id) {
+            Some(r) => r,
+            None => return Ok(false),
+        };
+        if row.phase != from {
+            // Lost update — competing writer already advanced this
+            // row. Return false so the caller can re-read and decide.
+            return Ok(false);
+        }
+        // Immutability rule: plan_hash / calldata_hash may only move
+        // from None -> Some(x); once set, subsequent patches must
+        // either omit the field or match the persisted value.
+        if let Some(new_ph) = &patch.plan_hash {
+            match &row.plan_hash {
+                Some(existing) if existing != new_ph => {
+                    return Err(BackendError::Persistence(
+                        "plan_hash is immutable once set".to_string(),
+                    ));
+                }
+                _ => {}
+            }
+        }
+        if let Some(new_cd) = &patch.calldata_hash {
+            match &row.calldata_hash {
+                Some(existing) if existing != new_cd => {
+                    return Err(BackendError::Persistence(
+                        "calldata_hash is immutable once set".to_string(),
+                    ));
+                }
+                _ => {}
+            }
+        }
+        // Apply patch (only Some fields).
+        if let Some(v) = patch.target_contract {
+            row.target_contract = v;
+        }
+        if let Some(v) = patch.selector {
+            row.selector = v;
+        }
+        if let Some(v) = patch.calldata_hash {
+            row.calldata_hash = Some(v);
+        }
+        if let Some(v) = patch.plan_hash {
+            row.plan_hash = Some(v);
+        }
+        if let Some(v) = patch.tx_value_wei {
+            row.tx_value_wei = v;
+        }
+        if let Some(v) = patch.simulation_block_number {
+            row.simulation_block_number = Some(v);
+        }
+        if let Some(v) = patch.simulation_block_hash {
+            row.simulation_block_hash = Some(v);
+        }
+        if let Some(v) = patch.simulation_gas_estimate {
+            row.simulation_gas_estimate = Some(v);
+        }
+        if let Some(v) = patch.simulation_result_json {
+            row.simulation_result_json = Some(v);
+        }
+        if let Some(v) = patch.signer_identity {
+            row.signer_identity = Some(v);
+        }
+        if let Some(v) = patch.signing_payload_hash {
+            row.signing_payload_hash = Some(v);
+        }
+        if let Some(v) = patch.signature_r {
+            row.signature_r = Some(v);
+        }
+        if let Some(v) = patch.signature_s {
+            row.signature_s = Some(v);
+        }
+        if let Some(v) = patch.signature_v {
+            row.signature_v = Some(v);
+        }
+        if let Some(v) = patch.recovered_signer {
+            row.recovered_signer = Some(v);
+        }
+        if let Some(v) = patch.gas_limit {
+            row.gas_limit = Some(v);
+        }
+        if let Some(v) = patch.max_fee_per_gas_wei {
+            row.max_fee_per_gas_wei = Some(v);
+        }
+        if let Some(v) = patch.max_priority_fee_per_gas_wei {
+            row.max_priority_fee_per_gas_wei = Some(v);
+        }
+        if let Some(v) = patch.reserved_nonce {
+            row.reserved_nonce = Some(v);
+        }
+        if let Some(v) = patch.failure_class {
+            row.failure_class = Some(v);
+        }
+        if let Some(v) = patch.failure_detail {
+            row.failure_detail = Some(v);
+        }
+        if let Some(v) = patch.holder_epoch {
+            row.holder_epoch = Some(v);
+        }
+        if let Some(v) = patch.retry_count {
+            row.retry_count = v;
+        }
+        row.phase = to;
+        row.updated_at_ms = now_ms;
+        Ok(true)
+    }
+
+    async fn append_execution_attempt(
+        &self,
+        canonical_execution_id: &str,
+        phase: crate::hybrid_v2::execution::ExecutionPhase,
+        detail: Option<serde_json::Value>,
+        now_ms: i64,
+    ) -> Result<i64> {
+        let mut inner = self.inner.lock().unwrap();
+        // FK check parity with PG: reject if the parent row is absent.
+        if !inner
+            .execution_requests
+            .contains_key(canonical_execution_id)
+        {
+            return Err(BackendError::Persistence(format!(
+                "append_execution_attempt: no execution row for {canonical_execution_id}"
+            )));
+        }
+        let attempt_number = inner
+            .execution_attempts
+            .values()
+            .filter(|(id, _, _, _, _)| id == canonical_execution_id)
+            .count() as i32
+            + 1;
+        inner.next_execution_attempt_id += 1;
+        let id = inner.next_execution_attempt_id;
+        inner.execution_attempts.insert(
+            id,
+            (
+                canonical_execution_id.to_string(),
+                attempt_number,
+                phase,
+                now_ms,
+                detail,
+            ),
+        );
+        Ok(id)
+    }
+
+    async fn list_execution_requests_by_deployment(
+        &self,
+        deployment_id: i64,
+        limit: i64,
+    ) -> Result<Vec<crate::hybrid_v2::execution::ExecutionRequestRow>> {
+        let inner = self.inner.lock().unwrap();
+        let mut rows: Vec<_> = inner
+            .execution_requests
+            .values()
+            .filter(|r| r.deployment_id == deployment_id)
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| b.updated_at_ms.cmp(&a.updated_at_ms));
+        if limit > 0 {
+            rows.truncate(limit as usize);
+        }
+        Ok(rows)
+    }
+
+    async fn reserve_executor_nonce(
+        &self,
+        chain_id: i64,
+        signer: &str,
+        nonce: i64,
+        canonical_execution_id: &str,
+        now_ms: i64,
+    ) -> Result<bool> {
+        use std::collections::btree_map::Entry;
+        let mut inner = self.inner.lock().unwrap();
+        let key = (chain_id, signer.to_string(), nonce);
+        match inner.executor_nonces.entry(key) {
+            Entry::Occupied(_) => Ok(false),
+            Entry::Vacant(v) => {
+                v.insert((
+                    Some(canonical_execution_id.to_string()),
+                    now_ms,
+                    "RESERVED".to_string(),
+                ));
+                Ok(true)
+            }
+        }
+    }
+
+    async fn mark_executor_nonce_abandoned(
+        &self,
+        chain_id: i64,
+        signer: &str,
+        nonce: i64,
+    ) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(entry) = inner
+            .executor_nonces
+            .get_mut(&(chain_id, signer.to_string(), nonce))
+        {
+            entry.2 = "ABANDONED".to_string();
+        }
+        Ok(())
+    }
+
+    async fn get_reserved_nonces_for(&self, chain_id: i64, signer: &str) -> Result<Vec<i64>> {
+        let inner = self.inner.lock().unwrap();
+        let mut out: Vec<i64> = inner
+            .executor_nonces
+            .keys()
+            .filter(|(cid, s, _)| *cid == chain_id && s == signer)
+            .map(|(_, _, n)| *n)
+            .collect();
+        out.sort_unstable();
+        Ok(out)
     }
 }
 

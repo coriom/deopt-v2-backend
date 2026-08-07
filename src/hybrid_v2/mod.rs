@@ -22,6 +22,7 @@ pub mod config;
 pub mod correlation;
 pub mod decoder;
 pub mod events;
+pub mod execution;
 pub mod manifest;
 pub mod persistence;
 pub mod read_store;
@@ -49,6 +50,10 @@ pub use chain_view::{
 pub use config::HybridV2Config;
 pub use correlation::{ExecutionCorrelator, ExecutionGroup};
 pub use events::{EventKind, HybridV2Event};
+pub use execution::{
+    derive_canonical_execution_id, CanonicalExecutionId, ExecutionPhase, ExecutionRequestPatch,
+    ExecutionRequestRow, PhaseParseError, PhaseTransitionError,
+};
 pub use manifest::{ManifestParams, ManifestValidationError, ManifestValidator, NetworkPolicy};
 pub use persistence::{
     CanonicalBlockRef, HybridV2ProjectionStore, InMemoryProjectionStore,
