@@ -13,6 +13,11 @@ default = []
 # `cargo build --features aws-kms-transport`. See
 # `docs/BACKEND_AWS_KMS_PRODUCTION_TRANSPORT_RESULT.md`.
 aws-kms-transport = ["dep:aws-config", "dep:aws-sdk-kms", "dep:aws-smithy-runtime-api", "dep:aws-smithy-types"]
+# Opt-in in-process test signer for the Hybrid V2 pre-broadcast
+# pipeline. Held behind a feature flag so non-test builds never
+# instantiate a signer that holds raw key bytes in memory. See
+# `src/hybrid_v2/execution/signer_ephemeral.rs`.
+test-signer = []
 
 [dependencies]
 aws-config = { version = "1.5", optional = true, default-features = false, features = ["rustls", "rt-tokio", "behavior-version-latest"] }

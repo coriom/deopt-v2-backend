@@ -29,6 +29,7 @@ pub mod identity;
 pub mod persistence;
 pub mod plan;
 pub mod preflight;
+pub mod rpc;
 pub mod state;
 pub mod target_policy;
 
@@ -36,5 +37,9 @@ pub use identity::{derive_canonical_execution_id, CanonicalExecutionId};
 pub use persistence::{ExecutionRequestPatch, ExecutionRequestRow};
 pub use plan::{ExecutionPlan, ExecutionPlanBuilder, OptionOrder, PlanError, SignedActionEnvelope};
 pub use preflight::{PreflightChecker, PreflightRejection, TrustLevel};
+pub use rpc::{
+    BlockTag, DecodedRevert, EthCallOutcome, EthCallRequest, ExecutionRpcClient, ExecutionRpcError,
+    FeeHistory, HttpExecutionRpcClient, ALLOWED_METHODS, KNOWN_CUSTOM_ERROR_SELECTORS,
+};
 pub use state::{ExecutionPhase, PhaseParseError, PhaseTransitionError};
 pub use target_policy::{AllowedTarget, PolicyError, TargetPolicy};
