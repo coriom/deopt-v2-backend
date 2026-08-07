@@ -203,11 +203,20 @@ impl RebuildOperationState {
 // -----------------------------------------------------------------
 
 /// Which subsystem holds the deployment-scoped operation lock.
+///
+/// Reorg, rebuild, reconciliation, and execution all contend for the
+/// same `hybrid_v2_operation_locks` row per deployment; at most one
+/// may hold the lock at a time. The `Execution` variant is added by
+/// `BACKEND-HYBRID-V2-SIGNER-AND-EXECUTION-V1` (foundation package):
+/// the execution orchestrator acquires the lock before advancing an
+/// execution row into any phase that could observe or mutate
+/// projection state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OperationKind {
     Reorg,
     Rebuild,
     Reconciliation,
+    Execution,
 }
 
 impl OperationKind {
@@ -216,6 +225,7 @@ impl OperationKind {
             OperationKind::Reorg => "REORG",
             OperationKind::Rebuild => "REBUILD",
             OperationKind::Reconciliation => "RECONCILIATION",
+            OperationKind::Execution => "EXECUTION",
         }
     }
     pub fn parse(s: &str) -> Option<Self> {
@@ -223,6 +233,7 @@ impl OperationKind {
             "REORG" => OperationKind::Reorg,
             "REBUILD" => OperationKind::Rebuild,
             "RECONCILIATION" => OperationKind::Reconciliation,
+            "EXECUTION" => OperationKind::Execution,
             _ => return None,
         })
     }
@@ -998,9 +1009,14 @@ mod tests {
             OperationKind::Reorg,
             OperationKind::Rebuild,
             OperationKind::Reconciliation,
+            OperationKind::Execution,
         ] {
             assert_eq!(OperationKind::parse(k.as_str()), Some(k));
         }
+        // Regression guard: the Execution token MUST round-trip
+        // through the exact string used in the SQL CHECK constraint
+        // on `hybrid_v2_operation_locks` (see migration 0049).
+        assert_eq!(OperationKind::Execution.as_str(), "EXECUTION");
     }
 
     #[test]
