@@ -52,3 +52,12 @@ wtransport = { version = "=0.5.0", default-features = false }
 
 [dev-dependencies]
 tower = { version = "0.4", features = ["util"] }
+
+# Integration tests that exercise the test-only ephemeral signer must
+# be built with the `test-signer` feature enabled so that
+# `signer_ephemeral` is visible from the integration crate. Non-test
+# builds never see the module.
+[[test]]
+name = "hybrid_v2_execution_simulator_and_signer_integration"
+path = "tests/hybrid_v2_execution_simulator_and_signer_integration.rs"
+required-features = ["test-signer"]
