@@ -53,7 +53,7 @@ pub use events::{EventKind, HybridV2Event};
 pub use execution::{
     derive_canonical_execution_id, CanonicalExecutionId, ExecutionPhase, ExecutionPlan,
     ExecutionPlanBuilder, ExecutionRequestPatch, ExecutionRequestRow, PhaseParseError,
-    PhaseTransitionError, PlanError,
+    PhaseTransitionError, PlanError, PolicyError, TargetPolicy,
 };
 pub use manifest::{ManifestParams, ManifestValidationError, ManifestValidator, NetworkPolicy};
 pub use persistence::{
