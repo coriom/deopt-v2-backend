@@ -126,3 +126,46 @@ EOF
               cargo test --test "$suite" -- --test-threads=1
             fi
           done
+
+      - name: Run BACKEND-HYBRID-V2-SIGNER-AND-EXECUTION-V1 default-feature suites
+        env:
+          HYBRID_V2_PG_TEST_DATABASE_URL: postgres://deopt_ci:disposable_ci_pw@127.0.0.1:5432/deopt_hybrid_v2_disposable_ci
+          DEOPT_REQUIRE_PG_INTEGRATION: "1"
+        run: |
+          cd deopt-v2-backend || cd .
+          # Default-features gate: foundation PG proof + zero-broadcast
+          # source scan. Reset schema between suites.
+          for suite in \
+              hybrid_v2_execution_foundation_pg_integration \
+              hybrid_v2_execution_zero_broadcast_scan; do
+            PGPASSWORD=disposable_ci_pw psql -h 127.0.0.1 -U deopt_ci -d deopt_hybrid_v2_disposable_ci <<'EOF' >/dev/null
+DROP SCHEMA public CASCADE;
+CREATE SCHEMA public;
+GRANT ALL ON SCHEMA public TO PUBLIC;
+EOF
+            cargo test --test "$suite" -- --test-threads=1
+          done
+
+      - name: Run BACKEND-HYBRID-V2-SIGNER-AND-EXECUTION-V1 test-signer suites
+        env:
+          HYBRID_V2_PG_TEST_DATABASE_URL: postgres://deopt_ci:disposable_ci_pw@127.0.0.1:5432/deopt_hybrid_v2_disposable_ci
+          DEOPT_REQUIRE_PG_INTEGRATION: "1"
+        run: |
+          cd deopt-v2-backend || cd .
+          # These suites require the `test-signer` cargo feature so
+          # `TestEphemeralSigner` is visible from the integration
+          # crate. Non-test builds have no visibility of the module.
+          for suite in \
+              hybrid_v2_execution_simulator_and_signer_integration \
+              hybrid_v2_execution_orchestrator_pg_integration \
+              hybrid_v2_execution_full_pg_matrix \
+              hybrid_v2_execution_properties \
+              hybrid_v2_execution_performance_bounds; do
+            PGPASSWORD=disposable_ci_pw psql -h 127.0.0.1 -U deopt_ci -d deopt_hybrid_v2_disposable_ci <<'EOF' >/dev/null
+DROP SCHEMA public CASCADE;
+CREATE SCHEMA public;
+GRANT ALL ON SCHEMA public TO PUBLIC;
+EOF
+            cargo test --features test-signer --test "$suite" -- --test-threads=1
+          done
+          echo "BACKEND_HYBRID_V2_SIGNER_EXECUTION_CI_GATE_VALIDATED"
