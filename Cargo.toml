@@ -61,3 +61,8 @@ tower = { version = "0.4", features = ["util"] }
 name = "hybrid_v2_execution_simulator_and_signer_integration"
 path = "tests/hybrid_v2_execution_simulator_and_signer_integration.rs"
 required-features = ["test-signer"]
+
+[[test]]
+name = "hybrid_v2_execution_orchestrator_pg_integration"
+path = "tests/hybrid_v2_execution_orchestrator_pg_integration.rs"
+required-features = ["test-signer"]
