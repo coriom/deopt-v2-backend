@@ -617,6 +617,31 @@ pub fn router(state: AppState) -> Router {
             "/admin/hybrid_v2/deployments/:deployment_id/operations/latest",
             get(crate::api::hybrid_v2_admin::latest_operation),
         )
+        // BACKEND-HYBRID-V2-SIGNER-AND-EXECUTION-V1 (Part S) —
+        // pre-broadcast execution orchestrator admin surface. Every
+        // route is behind the same admin-token gate, refuses Base
+        // mainnet at handler entry, and returns 503 when the
+        // orchestrator is not wired.
+        .route(
+            "/admin/hybrid_v2/deployments/:deployment_id/executions/:canonical_execution_id/prepare",
+            post(crate::api::hybrid_v2_execution_admin::prepare_execution),
+        )
+        .route(
+            "/admin/hybrid_v2/deployments/:deployment_id/executions/:canonical_execution_id",
+            get(crate::api::hybrid_v2_execution_admin::get_execution),
+        )
+        .route(
+            "/admin/hybrid_v2/deployments/:deployment_id/executions",
+            get(crate::api::hybrid_v2_execution_admin::list_executions),
+        )
+        .route(
+            "/admin/hybrid_v2/deployments/:deployment_id/executions/:canonical_execution_id/cancel",
+            post(crate::api::hybrid_v2_execution_admin::cancel_execution),
+        )
+        .route(
+            "/admin/hybrid_v2/deployments/:deployment_id/executions/:canonical_execution_id/retry",
+            post(crate::api::hybrid_v2_execution_admin::retry_execution),
+        )
         .route("/admin/status", get(admin_status))
         .route("/admin/config", get(admin_config))
         .route("/admin/db", get(admin_db))
