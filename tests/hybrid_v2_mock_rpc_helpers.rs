@@ -117,6 +117,26 @@ pub struct MockState {
     /// If Some, respond to the next eth_call with a JSON-RPC error
     /// (never retried). Consumed after use.
     pub eth_call_next_rpc_error: Option<(i64, String)>,
+    /// `eth_getTransactionCount` fixture map keyed by
+    /// (lowercased_address, block_tag_str).
+    pub transaction_count_responses: BTreeMap<(String, String), u64>,
+    /// `eth_feeHistory` fixture: base_fee_per_gas + reward samples.
+    /// When set, all `eth_feeHistory` calls return this value.
+    pub fee_history_response: Option<FeeHistoryFixture>,
+    /// `eth_estimateGas` fixture returned unconditionally when set.
+    pub estimate_gas_response: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FeeHistoryFixture {
+    /// Hex-encoded U256 base fees, in order oldest → newest.
+    pub base_fees_per_gas: Vec<String>,
+    /// Hex-encoded U256 reward samples per block, per percentile.
+    pub rewards: Vec<Vec<String>>,
+    /// Optional gas_used_ratio; defaults to 0.5 per block.
+    pub gas_used_ratio: Option<Vec<f64>>,
+    /// Oldest block number in hex; defaults to `0x1`.
+    pub oldest_block_hex: Option<String>,
 }
 
 impl Default for MockState {
@@ -138,6 +158,9 @@ impl Default for MockState {
             prohibited_calls_seen: HashSet::new(),
             eth_call_responses: BTreeMap::new(),
             eth_call_next_rpc_error: None,
+            transaction_count_responses: BTreeMap::new(),
+            fee_history_response: None,
+            estimate_gas_response: None,
         }
     }
 }
@@ -262,6 +285,50 @@ impl MockRpcServer {
 
     pub fn set_eth_call_next_rpc_error(&self, code: i64, message: impl Into<String>) {
         self.state.lock().unwrap().eth_call_next_rpc_error = Some((code, message.into()));
+    }
+
+    /// Register a canned `eth_getTransactionCount` response keyed by
+    /// (address, block_tag_str). `block_tag_str` is the literal RPC
+    /// block tag string as it appears on the wire (e.g. `"pending"`,
+    /// `"latest"`, or a `"0x{hex}"` block number).
+    pub fn set_transaction_count(&self, address: &str, block_tag_str: &str, count: u64) {
+        let key = (
+            address.to_ascii_lowercase(),
+            block_tag_str.to_ascii_lowercase(),
+        );
+        self.state
+            .lock()
+            .unwrap()
+            .transaction_count_responses
+            .insert(key, count);
+    }
+
+    /// Register a canned `eth_feeHistory` response. Values are
+    /// hex-encoded U256 strings (matching the JSON-RPC wire format).
+    pub fn set_fee_history(&self, base_fees_per_gas: Vec<String>, rewards: Vec<Vec<String>>) {
+        self.state.lock().unwrap().fee_history_response = Some(FeeHistoryFixture {
+            base_fees_per_gas,
+            rewards,
+            gas_used_ratio: None,
+            oldest_block_hex: None,
+        });
+    }
+
+    /// Register a full `eth_feeHistory` fixture with explicit ratios +
+    /// oldest block.
+    pub fn set_fee_history_full(&self, fixture: FeeHistoryFixture) {
+        self.state.lock().unwrap().fee_history_response = Some(fixture);
+    }
+
+    /// Register a canned `eth_estimateGas` response.
+    pub fn set_estimate_gas_response(&self, gas: u64) {
+        self.state.lock().unwrap().estimate_gas_response = Some(gas);
+    }
+
+    /// Assertion helper — the reject list must remain empty across
+    /// every test that exercises the execution pipeline.
+    pub fn prohibited_calls_seen(&self) -> HashSet<String> {
+        self.state.lock().unwrap().prohibited_calls_seen.clone()
     }
 
     pub fn calls(&self) -> Vec<Call> {
@@ -544,6 +611,84 @@ fn dispatch(
                 None => json!({
                     "jsonrpc": "2.0", "id": id,
                     "error": {"code": -32000, "message": format!("mock: no eth_call fixture for {} sel=0x{:02x}{:02x}{:02x}{:02x}", to, selector[0], selector[1], selector[2], selector[3])}
+                }),
+            }
+        }
+        "eth_getTransactionCount" => {
+            let arr = params.as_array();
+            let addr = arr
+                .and_then(|a| a.get(0))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let tag = arr
+                .and_then(|a| a.get(1))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let st = state.lock().unwrap();
+            match st
+                .transaction_count_responses
+                .get(&(addr.clone(), tag.clone()))
+            {
+                Some(n) => json!({"jsonrpc": "2.0", "id": id, "result": format!("0x{:x}", n)}),
+                None => {
+                    // Default to 0 when no fixture — a fresh
+                    // signer_identity legitimately has zero pending
+                    // txs, so this is the safe default rather than an
+                    // error.
+                    json!({"jsonrpc": "2.0", "id": id, "result": "0x0"})
+                }
+            }
+        }
+        "eth_estimateGas" => {
+            let st = state.lock().unwrap();
+            match st.estimate_gas_response {
+                Some(g) => json!({"jsonrpc": "2.0", "id": id, "result": format!("0x{:x}", g)}),
+                None => json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "error": {"code": -32000, "message": "mock: no eth_estimateGas fixture"}
+                }),
+            }
+        }
+        "eth_feeHistory" => {
+            let st = state.lock().unwrap();
+            match &st.fee_history_response {
+                Some(f) => {
+                    let base_fees: Vec<Value> =
+                        f.base_fees_per_gas.iter().map(|s| json!(s)).collect();
+                    let rewards: Vec<Value> = f
+                        .rewards
+                        .iter()
+                        .map(|row| Value::Array(row.iter().map(|s| json!(s)).collect()))
+                        .collect();
+                    let default_ratios: Vec<f64> = (0..base_fees.len().saturating_sub(1))
+                        .map(|_| 0.5)
+                        .collect();
+                    let ratios: Vec<Value> = f
+                        .gas_used_ratio
+                        .clone()
+                        .unwrap_or(default_ratios)
+                        .iter()
+                        .map(|r| json!(r))
+                        .collect();
+                    let oldest = f
+                        .oldest_block_hex
+                        .clone()
+                        .unwrap_or_else(|| "0x1".to_string());
+                    json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "result": {
+                            "oldestBlock": oldest,
+                            "baseFeePerGas": base_fees,
+                            "reward": rewards,
+                            "gasUsedRatio": ratios,
+                        },
+                    })
+                }
+                None => json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "error": {"code": -32000, "message": "mock: no eth_feeHistory fixture"}
                 }),
             }
         }
