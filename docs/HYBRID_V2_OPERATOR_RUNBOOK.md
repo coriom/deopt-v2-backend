@@ -429,3 +429,122 @@ selector.
 Cross-reference:
 - Closure milestone: `BACKEND_HYBRID_V2_FINAL_PERSISTENCE_MATRIX_AND_PARENT_CLOSURE_V1.md`
 - Global matrix: `BACKEND_HYBRID_V2_GLOBAL_CLOSURE_MATRIX.md`
+
+## 16. Signer & Execution (Pre-Broadcast) — 2026-08-08
+
+Milestone: `BACKEND-HYBRID-V2-SIGNER-AND-EXECUTION-V1` — see
+`BACKEND_HYBRID_V2_SIGNER_AND_EXECUTION_V1.md` and
+`BACKEND_HYBRID_V2_SIGNER_AND_EXECUTION_V1_SECURITY_REVIEW.md`.
+
+### 16.1 What the pre-broadcast layer does
+
+The pre-broadcast pipeline is invoked when an operator (or, in a future
+milestone, a live matching worker) has a pair of signed order envelopes
+that a `OptionMatchingEngineV2::executeMatch` transaction should be
+built for. It:
+
+1. Derives a `canonical_execution_id` from `(deployment_id, chain_id,
+   buyer_order_hash, seller_order_hash, fill_quantity_1e8)`. Deterministic;
+   duplicate triggers converge on the same row.
+2. Runs `PreflightChecker` (readiness, reorg/rebuild/reconciliation
+   drift, order cancelled/expired, on-chain settled correlation).
+3. Builds the deterministic ABI plan (target/selector from the
+   manifest allowlist; calldata from the plan builder). Persists
+   `plan_hash` and `calldata_hash` (immutable thereafter — SQL trigger).
+4. Reserves a nonce for the signer (atomic UNIQUE INSERT).
+5. Runs `eth_call` simulation bound to head block number + hash.
+6. Computes gas + fees via the bounded gas policy.
+7. Runs the firewall's independent revalidation of every field.
+8. Invokes the signer, verifies the returned signature locally, and
+   persists `(r, s, v, recovered_signer)`.
+9. Lands the row at the terminal `BROADCAST_DISABLED` phase.
+
+Broadcast is **disabled by construction** — no `send_*` method exists
+anywhere in the execution module. The next milestone
+(`BACKEND-HYBRID-V2-BROADCAST-AND-CONFIRMATION-V1`) will introduce it.
+
+### 16.2 Admin routes and expected inputs
+
+All routes are behind `x-admin-token` and are refused on Base mainnet
+(8453) at handler entry.
+
+Route: `POST /admin/hybrid_v2/deployments/:deployment_id/executions/:canonical_execution_id/prepare`
+
+Body (JSON):
+
+```json
+{
+  "buyer_envelope": { "owner": "0x...", "subaccount_id": 1, "subkey": "0x...", ... },
+  "buyer_order":    { "series_id": "42", "side": 0, "quantity_1e8": "100000000", ... },
+  "seller_envelope": { ... },
+  "seller_order":   { ... },
+  "fill_quantity_1e8": "100000000",
+  "buyer_active_series": ["42"],
+  "seller_active_series": ["42"],
+  "buyer_order_hash": "0x...",
+  "seller_order_hash": "0x...",
+  "series_id": "42",
+  "premium_amount": "50000000",
+  "fee_schedule_epoch": null
+}
+```
+
+Fields NOT in the body (and therefore NEVER caller-controllable):
+`target`, `selector`, `calldata`, `value_wei`, `nonce`, `gas_limit`,
+`max_fee_per_gas`, `max_priority_fee_per_gas`, `chain_id`.
+
+This milestone returns `503 EXECUTION_ORCHESTRATOR_NOT_WIRED` — live
+wiring lands with the production signer milestone.
+
+Read routes:
+
+- `GET /admin/hybrid_v2/deployments/:deployment_id/executions/:canonical_execution_id`
+  — sanitized row (no `(r, s, v)`, no signer secret; `recovered_signer`
+  is safe because it is a public address).
+- `GET /admin/hybrid_v2/deployments/:deployment_id/executions?limit=N&offset=M`
+  — bounded listing (`limit ≤ 1000`, page size is capped).
+
+Control routes:
+
+- `POST /admin/…/cancel` — refused past `AWAITING_SIGNATURE`.
+- `POST /admin/…/retry` — returns 409 `RETRY_MUST_ISSUE_NEW_CANONICAL_ID`;
+  terminal FAILED rows do not resurrect — the operator re-issues
+  `prepare` with the original intent, which derives the same canonical
+  id and converges on the same row.
+
+### 16.3 Failure classes and remediation
+
+| failure_class | Meaning | Operator action |
+|---|---|---|
+| `PREFLIGHT_REJECTED` | readiness / drift / cancelled / expired / etc. | Read `failure_detail`; wait for readiness or fix the order state |
+| `PLAN_BUILD_FAILED` | manifest mismatch, bad address, wrong chain | Inspect manifest + intent — usually a config regression |
+| `NONCE_RESERVATION_FAILED` | RPC + persistence disagreement | Inspect RPC health; usually retryable |
+| `SIMULATION_FAILED_DETERMINISTIC` | on-chain revert | Read the decoded selector — fix state or accept as invalid |
+| `SIMULATION_TRANSPORT_FAILED` | RPC transport blip | Retryable via a fresh `prepare` call |
+| `GAS_POLICY_REJECTED` | estimate/fee/total-cost out of bounds | Wait for gas to normalize or widen the policy |
+| `FIREWALL_REJECTED` | row tampered / plan mutated | Escalate — indicates DB tamper or bug |
+| `SIGNER_UNAVAILABLE` | signer not wired | Wait for production signer milestone |
+| `SIGNATURE_VERIFICATION_FAILED` | signer returned bad `(r,s,v)` | Escalate — signer compromise or bug |
+| `LOCK_CONTENTION` | another op holds the deployment lock | Retry after the concurrent op completes |
+| `STORE_FAILURE` | Postgres error | Check DB health |
+
+### 16.4 Broadcast is disabled — no runbook entry for "trigger broadcast"
+
+There is intentionally NO operator control for broadcasting a signed
+row. The `BROADCAST_DISABLED` phase is a first-class terminal. The
+next milestone will add the broadcast surface with its own runbook
+section; until then, a signed row is an **audit artifact**, not a
+transaction ready to submit.
+
+### 16.5 Reconciliation vs execution
+
+Reconciliation drift (`ProjectionDrift`, `ManifestMismatch`,
+`MalformedChainResponse`) **blocks preflight** — no execution row can
+advance until drift is resolved by an operator (rebuild, manifest fix,
+RPC provider swap). `UnsupportedView` alone does NOT block if every
+other axis reports Ready.
+
+Cross-reference:
+
+- Closure doc: `BACKEND_HYBRID_V2_SIGNER_AND_EXECUTION_V1.md`
+- Security review: `BACKEND_HYBRID_V2_SIGNER_AND_EXECUTION_V1_SECURITY_REVIEW.md`
