@@ -513,6 +513,23 @@ fn dispatch(
                         }
                     }
                 }
+                "latest" | "pending" => {
+                    let head = st.head;
+                    match st.blocks_by_number.get(&head) {
+                        Some(b) => {
+                            json!({"jsonrpc": "2.0", "id": id, "result": b.header_json()})
+                        }
+                        None => json!({
+                            "jsonrpc": "2.0", "id": id,
+                            "result": {
+                                "number": format!("0x{:x}", head),
+                                "hash": format!("0xL{:0>63x}", head),
+                                "parentHash": format!("0xL{:0>63x}", head.saturating_sub(1)),
+                                "timestamp": format!("0x{:x}", 1_700_000_000u64),
+                            }
+                        }),
+                    }
+                }
                 _ => json!({
                     "jsonrpc": "2.0", "id": id,
                     "error": {"code": -32602, "message": "unsupported block tag in mock"}
@@ -575,6 +592,20 @@ fn dispatch(
         "eth_call" => {
             let mut st = state.lock().unwrap();
             if let Some((code, msg)) = st.eth_call_next_rpc_error.take() {
+                // If the msg contains a trailing "\ndata:0x..." marker
+                // hoist the hex into a top-level `data` field. This
+                // matches provider convention: JSON-RPC error objects
+                // carry revert bytes under `data`, not inline in the
+                // message string. The HttpExecutionRpcClient reader
+                // uses the `data` field to detect the revert path.
+                if let Some(idx) = msg.find("\ndata:") {
+                    let (msg_only, marker) = msg.split_at(idx);
+                    let data = marker.trim_start_matches("\ndata:").to_string();
+                    return json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "error": {"code": code, "message": msg_only, "data": data}
+                    });
+                }
                 return json!({
                     "jsonrpc": "2.0", "id": id,
                     "error": {"code": code, "message": msg}

@@ -1101,41 +1101,114 @@ impl ExecutionOrchestrator {
         failure_detail: &str,
         attempts: u32,
     ) -> Result<PreparationOutcome, OrchestrationError> {
-        // Determine the current phase to build a legal edge to Failed.
-        // Simulating → Failed is legal via the matrix; other phases go
-        // Simulating → Failed indirectly. We just use the row's phase.
+        // Route the row from its current phase to Failed using ONLY
+        // edges that exist in the state-machine matrix. See
+        // `execution/state.rs` for the closed legal-edge set. Phases
+        // whose successor list does not include `Failed` are bridged
+        // via a stepping-stone forward edge.
         let current = row.phase;
         let patch = ExecutionRequestPatch {
             failure_class: Some(failure_class.to_string()),
             failure_detail: Some(failure_detail.to_string()),
             ..Default::default()
         };
-        // Bridge illegal edges via a stepping-stone: only phase that
-        // makes it hard is ReadyToSimulate (no direct → Failed). We
-        // route through Simulating.
-        if current == ExecutionPhase::ReadyToSimulate {
-            self.transition(
-                canonical_execution_id,
-                ExecutionPhase::ReadyToSimulate,
-                ExecutionPhase::Simulating,
-                &Default::default(),
-            )
-            .await?;
-            self.transition(
-                canonical_execution_id,
-                ExecutionPhase::Simulating,
-                ExecutionPhase::Failed,
-                &patch,
-            )
-            .await?;
-        } else {
-            self.transition(
-                canonical_execution_id,
-                current,
-                ExecutionPhase::Failed,
-                &patch,
-            )
-            .await?;
+        match current {
+            ExecutionPhase::Discovered
+            | ExecutionPhase::Validating
+            | ExecutionPhase::Simulating
+            | ExecutionPhase::Signing
+            | ExecutionPhase::SignatureVerified => {
+                self.transition(
+                    canonical_execution_id,
+                    current,
+                    ExecutionPhase::Failed,
+                    &patch,
+                )
+                .await?;
+            }
+            ExecutionPhase::ReadyToSimulate => {
+                self.transition(
+                    canonical_execution_id,
+                    ExecutionPhase::ReadyToSimulate,
+                    ExecutionPhase::Simulating,
+                    &Default::default(),
+                )
+                .await?;
+                self.transition(
+                    canonical_execution_id,
+                    ExecutionPhase::Simulating,
+                    ExecutionPhase::Failed,
+                    &patch,
+                )
+                .await?;
+            }
+            ExecutionPhase::SimulationSucceeded => {
+                // Bridge SimulationSucceeded → AwaitingSignature →
+                // Signing → Failed. Every intermediate hop is a legal
+                // edge; the failure_class + detail land at the final
+                // transition.
+                self.transition(
+                    canonical_execution_id,
+                    ExecutionPhase::SimulationSucceeded,
+                    ExecutionPhase::AwaitingSignature,
+                    &Default::default(),
+                )
+                .await?;
+                self.transition(
+                    canonical_execution_id,
+                    ExecutionPhase::AwaitingSignature,
+                    ExecutionPhase::Signing,
+                    &Default::default(),
+                )
+                .await?;
+                self.transition(
+                    canonical_execution_id,
+                    ExecutionPhase::Signing,
+                    ExecutionPhase::Failed,
+                    &patch,
+                )
+                .await?;
+            }
+            ExecutionPhase::AwaitingSignature => {
+                self.transition(
+                    canonical_execution_id,
+                    ExecutionPhase::AwaitingSignature,
+                    ExecutionPhase::Signing,
+                    &Default::default(),
+                )
+                .await?;
+                self.transition(
+                    canonical_execution_id,
+                    ExecutionPhase::Signing,
+                    ExecutionPhase::Failed,
+                    &patch,
+                )
+                .await?;
+            }
+            // Terminal or ReadyForBroadcast — no legal edge to Failed.
+            // Terminal states are already frozen; ReadyForBroadcast is
+            // one step from `BroadcastDisabled` (success terminal). If
+            // we ever reach here the caller made a routing bug; surface
+            // it deterministically.
+            ExecutionPhase::SimulationFailed => {
+                self.transition(
+                    canonical_execution_id,
+                    ExecutionPhase::SimulationFailed,
+                    ExecutionPhase::Failed,
+                    &patch,
+                )
+                .await?;
+            }
+            ExecutionPhase::ReadyForBroadcast
+            | ExecutionPhase::BroadcastDisabled
+            | ExecutionPhase::Cancelled
+            | ExecutionPhase::Stale
+            | ExecutionPhase::Failed => {
+                return Err(OrchestrationError::Unrecoverable(format!(
+                    "fail_from unreachable for phase {}: no legal Failed edge",
+                    current.as_str()
+                )));
+            }
         }
         let final_row = self.load_row(canonical_execution_id).await?;
         Ok(with_attempts(build_outcome(&final_row), attempts))
