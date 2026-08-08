@@ -28,6 +28,7 @@
 pub mod gas_policy;
 pub mod identity;
 pub mod nonce;
+pub mod orchestrator;
 pub mod persistence;
 pub mod plan;
 pub mod preflight;
@@ -46,6 +47,10 @@ pub mod signer_ephemeral;
 pub use gas_policy::{GasComputationOutcome, GasFeePolicy, GasPolicyError};
 pub use identity::{derive_canonical_execution_id, CanonicalExecutionId};
 pub use nonce::{NonceReservation, NonceReserveError, NonceReserver};
+pub use orchestrator::{
+    failure_class, Clock, ExecutionOrchestrator, MockClock, OrchestrationError, PreparationIntent,
+    PreparationOutcome, SystemClock, MAX_TRANSPORT_RETRIES,
+};
 pub use persistence::{ExecutionRequestPatch, ExecutionRequestRow};
 pub use plan::{ExecutionPlan, ExecutionPlanBuilder, OptionOrder, PlanError, SignedActionEnvelope};
 pub use preflight::{PreflightChecker, PreflightRejection, TrustLevel};
