@@ -4,6 +4,10 @@ use deopt_v2_backend::db::PgRepository;
 use deopt_v2_backend::engine::EngineState;
 use deopt_v2_backend::error::BackendError;
 use deopt_v2_backend::execution::{spawn_executor, Executor};
+use deopt_v2_backend::hybrid_v2::config::HybridV2ExecutionConfig;
+use deopt_v2_backend::hybrid_v2::execution::{
+    ExecutionOrchestrator, HttpExecutionRpcClient, HybridV2SignerBuilder, SystemClock, TargetPolicy,
+};
 use deopt_v2_backend::hybrid_v2::{
     spawn_hybrid_v2_indexer_worker, spawn_hybrid_v2_reconciliation_worker,
     HybridV2IndexerWorkerConfig, HybridV2ReconciliationWorkerConfig, IndexerRuntime,
@@ -347,6 +351,36 @@ async fn main() -> deopt_v2_backend::Result<()> {
             );
         }
     }
+    // BACKEND-HYBRID-V2-EXTERNAL-SIGNER-INTEGRATION-AND-LIVE-ORCHESTRATOR-V1
+    // (Package A, Part I). Wire the pre-broadcast execution
+    // orchestrator when HV2_EXECUTION_ENABLED=true AND the projection
+    // store is already attached (established above by the indexer
+    // wiring). Every failure downgrades to `orchestrator = None` +
+    // logs a WARN; the read-side backend keeps serving.
+    match wire_hybrid_v2_execution_orchestrator(&state, config.hybrid_v2.chain_id).await {
+        Ok(Some((orchestrator, exec_cfg))) => {
+            info!(
+                deployment_id = config.hybrid_v2.deployment_id,
+                chain_id = config.hybrid_v2.chain_id,
+                "hybrid_v2 execution orchestrator wired"
+            );
+            state = state.with_hybrid_v2_execution_orchestrator(orchestrator, exec_cfg);
+        }
+        Ok(None) => {
+            // Execution disabled — leave the fail-closed marker in
+            // place. Admin prepare returns 503.
+        }
+        Err(reason) => {
+            warn!(
+                deployment_id = config.hybrid_v2.deployment_id,
+                chain_id = config.hybrid_v2.chain_id,
+                reason = %reason,
+                "hybrid_v2 execution orchestrator wiring FAILED — admin prepare will return 503; \
+                 read-side backend keeps serving"
+            );
+            state = state.with_hybrid_v2_execution_unavailable(reason);
+        }
+    }
     // Build the router AFTER hybrid_v2 wiring so mounted operator
     // admin routes see the projection-store handle attached above.
     let app = router(state.clone());
@@ -406,6 +440,75 @@ fn load_hybrid_v2_manifest(
     let manifest: ManifestParams = serde_json::from_slice(&bytes)
         .map_err(|e| BackendError::Config(format!("hybrid_v2 manifest parse {path}: {e}")))?;
     Ok(manifest)
+}
+
+/// Package A, Part I — construct the pre-broadcast execution
+/// orchestrator from env + AppState's projection store. Fail-closed:
+///
+/// * `Ok(None)` — execution disabled (`HV2_EXECUTION_ENABLED=false`).
+/// * `Ok(Some(_))` — orchestrator constructed successfully.
+/// * `Err(reason)` — validation, signer, or RPC construction failed.
+///   Caller downgrades to `orchestrator = None` + logs a WARN. The
+///   read-side backend keeps serving.
+async fn wire_hybrid_v2_execution_orchestrator(
+    state: &AppState,
+    chain_id: u64,
+) -> std::result::Result<
+    Option<(Arc<ExecutionOrchestrator>, HybridV2ExecutionConfig)>,
+    String,
+> {
+    let execution_config = HybridV2ExecutionConfig::from_env()
+        .map_err(|e| format!("HV2 execution config from_env: {e}"))?;
+    if !execution_config.execution_enabled {
+        return Ok(None);
+    }
+    execution_config
+        .validate_startup(chain_id)
+        .map_err(|e| format!("HV2 execution config validate_startup: {e}"))?;
+    let store = state
+        .hybrid_v2_projection_store
+        .clone()
+        .ok_or_else(|| "HV2 execution requires the projection store; HYBRID_V2_ENABLED=true?".to_string())?;
+    let manifest = state
+        .hybrid_v2_manifest
+        .clone()
+        .ok_or_else(|| "HV2 execution requires a manifest bound to AppState via reconciliation wiring".to_string())?;
+    let rpc_url = execution_config
+        .rpc_url
+        .clone()
+        .ok_or_else(|| "HV2 execution requires HV2_EXECUTION_RPC_URL (or HYBRID_V2_RPC_URL)".to_string())?;
+    let rpc_timeout = Duration::from_millis(execution_config.rpc_timeout_ms);
+    let rpc: Arc<dyn deopt_v2_backend::hybrid_v2::execution::ExecutionRpcClient> = Arc::new(
+        HttpExecutionRpcClient::new(rpc_url.clone(), rpc_timeout, 3)
+            .map_err(|e| format!("HV2 execution RPC construction: {e}"))?,
+    );
+    let target_policy = Arc::new(
+        TargetPolicy::from_manifest(&manifest)
+            .map_err(|e| format!("HV2 execution target policy: {e}"))?,
+    );
+    let signer = HybridV2SignerBuilder::build(&execution_config)
+        .map_err(|e| format!("HV2 execution signer builder: {e}"))?;
+    let gas_policy = Arc::new(execution_config.gas_policy.clone());
+    let deployment_id = state
+        .hybrid_v2_read
+        .list()
+        .into_iter()
+        .next()
+        .map(|entry| entry.deployment_id as i64)
+        .ok_or_else(|| "HV2 execution requires at least one deployment in AppState".to_string())?;
+    let orchestrator = Arc::new(ExecutionOrchestrator {
+        store,
+        rpc,
+        signer,
+        target_policy,
+        gas_policy,
+        deployment_id,
+        chain_id,
+        executor_address: execution_config.executor_address,
+        simulation_max_age_ms: execution_config.simulation_max_age_ms,
+        clock: Arc::new(SystemClock),
+    });
+    Ok(Some((orchestrator, execution_config)))
 }
 
 /// Collect every canonical emitter address declared by the manifest,

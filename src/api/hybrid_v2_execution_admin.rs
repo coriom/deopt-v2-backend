@@ -22,6 +22,7 @@
 use crate::api::http::AppState;
 use crate::hybrid_v2::execution::{ExecutionPhase, ExecutionRequestRow};
 use crate::hybrid_v2::HybridV2ProjectionStore;
+use alloy_primitives::{Address, Bytes, FixedBytes, U256};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -131,6 +132,7 @@ fn refuse_mainnet(chain_id: u64) -> Result<(), Response> {
 /// orchestrator derives execution primitives from the manifest
 /// allowlist + deterministic plan builder.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EnvelopeInput {
     pub owner: String,
     pub subaccount_id: u32,
@@ -149,6 +151,7 @@ pub struct EnvelopeInput {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OrderInput {
     pub series_id: String,
     pub side: u8,
@@ -163,6 +166,7 @@ pub struct OrderInput {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PrepareRequestBody {
     pub buyer_envelope: EnvelopeInput,
     pub buyer_order: OrderInput,
@@ -268,17 +272,20 @@ impl From<ExecutionRequestRow> for SanitizedExecutionRow {
 
 /// `POST /admin/hybrid_v2/deployments/:deployment_id/executions/:canonical_execution_id/prepare`
 ///
-/// Prepares an execution. This milestone does not wire the concrete
-/// orchestrator instance in production paths, so this handler returns
-/// 503 `EXECUTION_ORCHESTRATOR_NOT_WIRED` when no orchestrator is
-/// attached. The full request/response shape is validated up-front so
-/// callers can prove the boundary contract is being enforced (Base
-/// mainnet refused, admin token required, envelope schema honoured).
+/// Prepare-only entry point (Part J). When
+/// `hybrid_v2_execution_orchestrator` is `None`, returns a structured
+/// 503 whose body includes the persisted
+/// `hybrid_v2_execution_unavailable_reason` (redacted upstream).
+/// Otherwise builds a `PreparationIntent` from the caller-supplied
+/// envelopes/orders/fill_qty/active_series (NEVER a target, selector,
+/// calldata, nonce, gas, fee, signer identity, chain, or RPC
+/// endpoint — the `deny_unknown_fields` deserializer rejects any of
+/// those) and drives the orchestrator.
 pub async fn prepare_execution(
     Path((deployment_id, canonical_execution_id)): Path<(i64, String)>,
     headers: HeaderMap,
     State(state): State<AppState>,
-    Json(_body): Json<PrepareRequestBody>,
+    Json(body): Json<PrepareRequestBody>,
 ) -> Response {
     if let Err(resp) = ensure_admin(&state, &headers) {
         return resp;
@@ -303,13 +310,233 @@ pub async fn prepare_execution(
             "canonical_execution_id must be 0x-prefixed 32-byte hex",
         );
     }
-    err_response(
-        StatusCode::SERVICE_UNAVAILABLE,
-        "EXECUTION_ORCHESTRATOR_NOT_WIRED",
-        "the execution orchestrator is not wired to this AppState build; \
-         wire it via a downstream integration milestone that also brings \
-         a production signer",
-    )
+    let Some(orchestrator) = state.hybrid_v2_execution_orchestrator.clone() else {
+        // Structured 503 including the availability reason so an
+        // operator can distinguish "execution disabled" from "signer
+        // config failed startup" from "AWS transport not yet wired".
+        let reason = state
+            .hybrid_v2_execution_unavailable_reason
+            .clone()
+            .unwrap_or_else(|| "EXECUTION_ORCHESTRATOR_NOT_WIRED".to_string());
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "EXECUTION_ORCHESTRATOR_NOT_WIRED",
+                "detail": "no execution orchestrator wired to this AppState build",
+                "availability": {
+                    "state": "NotConfigured",
+                    "reason": reason,
+                },
+            })),
+        )
+            .into_response();
+    };
+    // Build the PreparationIntent from the JSON body. Every field
+    // here is CALLER-INTENT — the orchestrator derives target,
+    // selector, calldata, nonce, gas, chain_id from the manifest
+    // allowlist + deterministic plan builder.
+    let intent = match build_intent_from_body(entry.manifest.clone(), body) {
+        Ok(intent) => intent,
+        Err(err) => {
+            return err_response(
+                StatusCode::BAD_REQUEST,
+                "INVALID_PREPARE_BODY",
+                &err,
+            );
+        }
+    };
+    match orchestrator.prepare(intent).await {
+        Ok(outcome) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "canonical_execution_id": outcome.canonical_execution_id,
+                "terminal_phase": outcome.terminal_phase.as_str(),
+                "failure_class": outcome.failure_class,
+                "failure_detail": outcome.failure_detail,
+                "plan_hash": outcome.plan_hash,
+                "signing_payload_hash": outcome.signing_payload_hash,
+                "simulation_gas_estimate": outcome.simulation_gas_estimate,
+                "reserved_nonce": outcome.reserved_nonce,
+                "attempts": outcome.attempts,
+            })),
+        )
+            .into_response(),
+        Err(err) => match err {
+            crate::hybrid_v2::execution::OrchestrationError::LockContention => err_response(
+                StatusCode::CONFLICT,
+                "EXECUTION_LOCK_CONTENTION",
+                &err.to_string(),
+            ),
+            crate::hybrid_v2::execution::OrchestrationError::StoreFailure(msg) => {
+                err_response(StatusCode::INTERNAL_SERVER_ERROR, "STORE_ERROR", &msg)
+            }
+            crate::hybrid_v2::execution::OrchestrationError::Unrecoverable(msg) => err_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "ORCHESTRATION_UNRECOVERABLE",
+                &msg,
+            ),
+        },
+    }
+}
+
+// -----------------------------------------------------------------
+//              body → PreparationIntent conversion
+// -----------------------------------------------------------------
+
+fn build_intent_from_body(
+    manifest: crate::hybrid_v2::manifest::ManifestParams,
+    body: PrepareRequestBody,
+) -> Result<crate::hybrid_v2::execution::PreparationIntent, String> {
+    let buyer_envelope = parse_envelope("buyer_envelope", &body.buyer_envelope)?;
+    let seller_envelope = parse_envelope("seller_envelope", &body.seller_envelope)?;
+    let buyer_signature = parse_bytes("buyer_envelope.signature", &body.buyer_envelope.signature)?;
+    let seller_signature = parse_bytes("seller_envelope.signature", &body.seller_envelope.signature)?;
+    let buyer_order = parse_order("buyer_order", &body.buyer_order)?;
+    let seller_order = parse_order("seller_order", &body.seller_order)?;
+    let fill_quantity_1e8 = body
+        .fill_quantity_1e8
+        .parse::<u128>()
+        .map_err(|e| format!("fill_quantity_1e8 not u128: {e}"))?;
+    let buyer_active_series = parse_u256_vec("buyer_active_series", &body.buyer_active_series)?;
+    let seller_active_series = parse_u256_vec("seller_active_series", &body.seller_active_series)?;
+    Ok(crate::hybrid_v2::execution::PreparationIntent {
+        manifest,
+        // Runtime state + readiness are treated as ready by the admin
+        // route. The orchestrator's preflight then re-checks against
+        // the store's live cursors — an unhealthy runtime lands in a
+        // PREFLIGHT_REJECTED terminal, not in a silent hang.
+        runtime_state: crate::hybrid_v2::reducer::ProjectionState::default(),
+        readiness: crate::hybrid_v2::readiness::ReadinessReport {
+            runtime: crate::hybrid_v2::readiness::ReadinessState::ready(),
+            rebuild: crate::hybrid_v2::readiness::ReadinessState::ready(),
+            reconciliation: crate::hybrid_v2::readiness::ReadinessState::ready(),
+        },
+        buyer_envelope,
+        buyer_signature,
+        buyer_order,
+        seller_envelope,
+        seller_signature,
+        seller_order,
+        fill_quantity_1e8,
+        buyer_active_series,
+        seller_active_series,
+        buyer_order_hash: body.buyer_order_hash,
+        seller_order_hash: body.seller_order_hash,
+        buyer_subkey: body.buyer_envelope.subkey,
+        seller_subkey: body.seller_envelope.subkey,
+        series_id: body.series_id,
+        premium_amount: body.premium_amount,
+        fee_schedule_epoch: body.fee_schedule_epoch,
+    })
+}
+
+fn parse_envelope(
+    ctx: &str,
+    input: &EnvelopeInput,
+) -> Result<crate::hybrid_v2::execution::plan::SignedActionEnvelope, String> {
+    Ok(crate::hybrid_v2::execution::plan::SignedActionEnvelope {
+        owner: parse_address_field(&format!("{ctx}.owner"), &input.owner)?,
+        subaccountId: input.subaccount_id,
+        subKey: parse_bytes32(&format!("{ctx}.subkey"), &input.subkey)?,
+        signer: parse_address_field(&format!("{ctx}.signer"), &input.signer)?,
+        engine: parse_address_field(&format!("{ctx}.engine"), &input.engine)?,
+        action: parse_bytes32(&format!("{ctx}.action"), &input.action)?,
+        architectureVersion: parse_u256(&format!("{ctx}.architecture_version"), &input.architecture_version)?,
+        nonce: parse_u256(&format!("{ctx}.nonce"), &input.nonce)?,
+        deadline: parse_u256(&format!("{ctx}.deadline"), &input.deadline)?,
+        ownerRecoveryEpoch: parse_u256(&format!("{ctx}.owner_recovery_epoch"), &input.owner_recovery_epoch)?,
+        subaccountRecoveryEpoch: parse_u256(&format!("{ctx}.subaccount_recovery_epoch"), &input.subaccount_recovery_epoch)?,
+        payloadHash: parse_bytes32(&format!("{ctx}.payload_hash"), &input.payload_hash)?,
+    })
+}
+
+fn parse_order(
+    ctx: &str,
+    input: &OrderInput,
+) -> Result<crate::hybrid_v2::execution::plan::OptionOrder, String> {
+    Ok(crate::hybrid_v2::execution::plan::OptionOrder {
+        seriesId: parse_u256(&format!("{ctx}.series_id"), &input.series_id)?,
+        side: input.side,
+        quantity1e8: input
+            .quantity_1e8
+            .parse::<u128>()
+            .map_err(|e| format!("{ctx}.quantity_1e8 not u128: {e}"))?,
+        pricePerContract1e8: input
+            .price_per_contract_1e8
+            .parse::<u128>()
+            .map_err(|e| format!("{ctx}.price_per_contract_1e8 not u128: {e}"))?,
+        limitPricePerContract1e8: input
+            .limit_price_per_contract_1e8
+            .parse::<u128>()
+            .map_err(|e| format!("{ctx}.limit_price_per_contract_1e8 not u128: {e}"))?,
+        premiumToken: parse_address_field(&format!("{ctx}.premium_token"), &input.premium_token)?,
+        timeInForce: input.time_in_force,
+        role: input.role,
+        maxPositiveFeePpm: input.max_positive_fee_ppm,
+        salt: parse_bytes32(&format!("{ctx}.salt"), &input.salt)?,
+    })
+}
+
+fn parse_bytes(ctx: &str, s: &str) -> Result<Bytes, String> {
+    let stripped = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .ok_or_else(|| format!("{ctx} must be 0x-prefixed hex"))?;
+    if stripped.len() % 2 != 0 {
+        return Err(format!("{ctx} hex length must be even"));
+    }
+    let mut out = Vec::with_capacity(stripped.len() / 2);
+    for i in (0..stripped.len()).step_by(2) {
+        out.push(
+            u8::from_str_radix(&stripped[i..i + 2], 16)
+                .map_err(|e| format!("{ctx} hex parse: {e}"))?,
+        );
+    }
+    Ok(Bytes::from(out))
+}
+
+fn parse_bytes32(ctx: &str, s: &str) -> Result<FixedBytes<32>, String> {
+    let stripped = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .ok_or_else(|| format!("{ctx} must be 0x-prefixed 32-byte hex"))?;
+    if stripped.len() != 64 {
+        return Err(format!("{ctx} must be 32 bytes hex"));
+    }
+    let mut out = [0u8; 32];
+    for i in 0..32 {
+        out[i] = u8::from_str_radix(&stripped[2 * i..2 * i + 2], 16)
+            .map_err(|e| format!("{ctx} hex parse: {e}"))?;
+    }
+    Ok(FixedBytes::from(out))
+}
+
+fn parse_address_field(ctx: &str, s: &str) -> Result<Address, String> {
+    let stripped = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .ok_or_else(|| format!("{ctx} must be 0x-prefixed 20-byte hex"))?;
+    if stripped.len() != 40 {
+        return Err(format!("{ctx} must be 20 bytes hex"));
+    }
+    let mut bytes = [0u8; 20];
+    for i in 0..20 {
+        bytes[i] = u8::from_str_radix(&stripped[2 * i..2 * i + 2], 16)
+            .map_err(|e| format!("{ctx} hex parse: {e}"))?;
+    }
+    Ok(Address::from(bytes))
+}
+
+fn parse_u256(ctx: &str, s: &str) -> Result<U256, String> {
+    U256::from_str_radix(s.trim(), 10).map_err(|e| format!("{ctx} not decimal U256: {e}"))
+}
+
+fn parse_u256_vec(ctx: &str, list: &[String]) -> Result<Vec<U256>, String> {
+    let mut out = Vec::with_capacity(list.len());
+    for (i, s) in list.iter().enumerate() {
+        out.push(parse_u256(&format!("{ctx}[{i}]"), s)?);
+    }
+    Ok(out)
 }
 
 /// `GET /admin/hybrid_v2/deployments/:deployment_id/executions/:canonical_execution_id`

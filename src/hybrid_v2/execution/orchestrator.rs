@@ -937,6 +937,26 @@ impl ExecutionOrchestrator {
                 calldata: plan.calldata.clone(),
             };
 
+            // Part L — derive + persist the external-signer
+            // idempotency key BEFORE invoking the signer. The row is
+            // in phase `Signing`; the migration 0050 trigger blocks
+            // any divergent overwrite so a re-derive on retry is a
+            // no-op (same inputs → same key). We use a store-level
+            // "same-phase re-update" via a Signing→Signing edge —
+            // which is illegal — so we persist the key using a plain
+            // `insert_execution_request` idempotent-shape update via
+            // a bespoke helper. Simplest path: attach it to the
+            // upcoming Signing→SignatureVerified patch. If the signer
+            // call fails between derive and persist, the next attempt
+            // will re-derive the same key.
+            let idem_key_bytes = crate::hybrid_v2::execution::signer_kms_bridge::derive_idempotency_key(
+                &self.signer.identity().address,
+                canonical_execution_id.as_bytes(),
+                &request.plan_hash,
+                &request.signing_payload_hash,
+            );
+            let idem_key_hex = format!("0x{}", hex_encode(&idem_key_bytes));
+
             // Idempotency: if the row already carries a signature (from
             // a previous partial attempt) skip signer call.
             let signed = if row.signature_r.is_some() && row.signature_s.is_some() {
@@ -1003,6 +1023,14 @@ impl ExecutionOrchestrator {
                 signature_s: Some(s_hex),
                 signature_v: Some(signed.signature_v as i16),
                 recovered_signer: Some(recovered_hex),
+                // Part L — same-input-same-key idempotency; the
+                // migration 0050 trigger + in-memory store
+                // immutability check both refuse a divergent
+                // overwrite. Setting it here binds the eventual
+                // signature to a deterministic vendor request id so
+                // an operator can correlate CloudTrail events with
+                // this canonical execution.
+                signer_request_idempotency_key: Some(idem_key_hex),
                 ..Default::default()
             };
             self.transition(

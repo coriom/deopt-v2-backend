@@ -244,6 +244,25 @@ pub struct AppState {
     /// bounds). Populated alongside the provider handle.
     pub hybrid_v2_reconciliation_worker_config:
         Option<crate::hybrid_v2::HybridV2ReconciliationWorkerConfig>,
+    /// BACKEND-HYBRID-V2-EXTERNAL-SIGNER-INTEGRATION-AND-LIVE-ORCHESTRATOR-V1
+    /// (Package A, Part I). The live pre-broadcast execution
+    /// orchestrator. `None` when execution is disabled OR when the
+    /// signer config failed validation. When `None`, the admin
+    /// `prepare` route returns a structured 503
+    /// `EXECUTION_ORCHESTRATOR_NOT_WIRED`. Read-side backend keeps
+    /// serving regardless.
+    pub hybrid_v2_execution_orchestrator:
+        Option<std::sync::Arc<crate::hybrid_v2::execution::ExecutionOrchestrator>>,
+    /// Persisted copy of the execution config used to construct the
+    /// orchestrator. Held on AppState so the admin route can surface
+    /// availability metadata (redacted) without re-reading env.
+    pub hybrid_v2_execution_config:
+        Option<crate::hybrid_v2::config::HybridV2ExecutionConfig>,
+    /// Structured reason surfaced by the admin route when the
+    /// orchestrator is not wired. Explains WHY (config validation
+    /// failed, provider not yet integrated, execution disabled, ...).
+    /// Populated at AppState construction time.
+    pub hybrid_v2_execution_unavailable_reason: Option<String>,
 }
 
 impl AppState {
@@ -472,7 +491,38 @@ impl AppState {
             hybrid_v2_runtime: None,
             hybrid_v2_manifest: None,
             hybrid_v2_reconciliation_worker_config: None,
+            hybrid_v2_execution_orchestrator: None,
+            hybrid_v2_execution_config: None,
+            hybrid_v2_execution_unavailable_reason: Some(
+                "EXECUTION_DISABLED: no execution config wired to this AppState".to_string(),
+            ),
         }
+    }
+
+    /// Attach the live Hybrid V2 execution orchestrator (Part I). The
+    /// caller has already validated `config.validate_startup(chain_id)`
+    /// and built the orchestrator via `HybridV2SignerBuilder` +
+    /// `HttpExecutionRpcClient` + `ExecutionOrchestrator::new`. When
+    /// this is unset the admin `prepare` route returns a structured
+    /// 503 including [`Self::hybrid_v2_execution_unavailable_reason`].
+    pub fn with_hybrid_v2_execution_orchestrator(
+        mut self,
+        orchestrator: std::sync::Arc<crate::hybrid_v2::execution::ExecutionOrchestrator>,
+        config: crate::hybrid_v2::config::HybridV2ExecutionConfig,
+    ) -> Self {
+        self.hybrid_v2_execution_orchestrator = Some(orchestrator);
+        self.hybrid_v2_execution_config = Some(config);
+        self.hybrid_v2_execution_unavailable_reason = None;
+        self
+    }
+
+    /// Explicit "wire failed, keep reason" path — mirrors the
+    /// fail-closed posture from Part I when signer config validation
+    /// failed at startup. Backend keeps serving read APIs.
+    pub fn with_hybrid_v2_execution_unavailable(mut self, reason: impl Into<String>) -> Self {
+        self.hybrid_v2_execution_orchestrator = None;
+        self.hybrid_v2_execution_unavailable_reason = Some(reason.into());
+        self
     }
 
     /// Attach the production reconciliation surface — provider,
