@@ -135,10 +135,54 @@ pub enum SignerError {
     ChainMismatch,
 }
 
+/// Availability model surfaced by [`ExecutionSigner::availability`] (Part H).
+///
+/// The orchestrator inspects this before invoking `sign_execution` and
+/// surfaces the reason via the admin route's structured 503 body when
+/// the wired signer is not `Configured`. Signer outage MUST NOT crash
+/// the read-side backend — `AppState` construction downgrades to
+/// `orchestrator = None`, and every non-`Configured` variant carries
+/// enough context for an operator to diagnose the root cause without
+/// re-hitting the vendor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SignerAvailability {
+    /// No production signer wired yet — e.g. `ProductionSignerUnavailable`.
+    NotConfigured,
+    /// Signer is wired and construction succeeded. `probe()` may still
+    /// return a transient/deterministic failure downstream — this is
+    /// the "wire is complete" verdict, not "vendor is definitely up".
+    Configured,
+    /// Last observed health check failed with a transport reason.
+    /// Distinct from `AuthenticationFailed` and `IdentityMismatch`.
+    Unavailable { reason: String },
+    /// Vendor rejected the auth material. Operator must inspect
+    /// `HV2_SIGNER_AUTH_REFERENCE` and the microservice's own auth path.
+    AuthenticationFailed { reason: String },
+    /// Vendor produced a signature that recovered to a different EOA.
+    /// Fatal — DO NOT auto-retry, DO NOT auto-fallback.
+    IdentityMismatch { expected: [u8; 20], observed: [u8; 20] },
+    /// Timeout / 5xx / rate-limit — retryable.
+    TransientFailure { reason: String },
+    /// Deterministic vendor policy refusal (`kms_key_disabled`, etc).
+    /// NOT retryable.
+    DeterministicRefusal { reason: String },
+    /// Operator explicitly disabled the signer via config
+    /// (`execution_enabled = false` or the admin kill-switch).
+    Disabled,
+}
+
 #[async_trait]
 pub trait ExecutionSigner: Send + Sync {
     fn identity(&self) -> SignerIdentity;
     async fn sign_execution(&self, request: SigningRequest) -> Result<SignedTx, SignerError>;
+    /// Availability verdict. Default implementation returns
+    /// `Configured` — every signer that overrides this reports its
+    /// own state. `ProductionSignerUnavailable` overrides to
+    /// `NotConfigured`; the KMS bridge exposes its live status via
+    /// `probe()` and reports `Configured` at construction time.
+    fn availability(&self) -> SignerAvailability {
+        SignerAvailability::Configured
+    }
 }
 
 // -----------------------------------------------------------------

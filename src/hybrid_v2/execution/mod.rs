@@ -35,7 +35,9 @@ pub mod preflight;
 pub mod rpc;
 pub mod signature_verify;
 pub mod signer;
+pub mod signer_builder;
 pub mod signer_firewall;
+pub mod signer_kms_bridge;
 pub mod signer_production;
 pub mod simulator;
 pub mod state;
@@ -60,10 +62,15 @@ pub use rpc::{
 };
 pub use signature_verify::{verify_signed_tx, SigVerifyError, VerifiedSignature};
 pub use signer::{
-    ExecutionSigner, SignedTx, SignerBackend, SignerError, SignerIdentity, SignerKind,
-    SigningRequest,
+    ExecutionSigner, SignedTx, SignerAvailability, SignerBackend, SignerError, SignerIdentity,
+    SignerKind, SigningRequest,
 };
+pub use signer_builder::HybridV2SignerBuilder;
 pub use signer_firewall::{FirewallRejection, SignerPolicyFirewall};
+pub use signer_kms_bridge::{
+    derive_idempotency_key, redacted_endpoint, HybridV2KmsSignerBridge, IDEMPOTENCY_DOMAIN_TAG,
+    IDEMPOTENCY_KEY_LEN,
+};
 pub use signer_production::ProductionSignerUnavailable;
 pub use simulator::{ExecutionSimulator, SimulationError, SimulationOutcome};
 pub use state::{ExecutionPhase, PhaseParseError, PhaseTransitionError};

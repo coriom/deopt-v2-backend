@@ -16,7 +16,8 @@
 //! non-test-gated file in this module tree).
 
 use crate::hybrid_v2::execution::signer::{
-    ExecutionSigner, SignedTx, SignerError, SignerIdentity, SignerKind, SigningRequest,
+    ExecutionSigner, SignedTx, SignerAvailability, SignerError, SignerIdentity, SignerKind,
+    SigningRequest,
 };
 use async_trait::async_trait;
 
@@ -57,6 +58,10 @@ impl ExecutionSigner for ProductionSignerUnavailable {
 
     async fn sign_execution(&self, _: SigningRequest) -> Result<SignedTx, SignerError> {
         Err(SignerError::SignerUnavailable(self.reason.clone()))
+    }
+
+    fn availability(&self) -> SignerAvailability {
+        SignerAvailability::NotConfigured
     }
 }
 
