@@ -198,8 +198,7 @@ impl ExecutionSigner for HybridV2KmsSignerBridge {
         // for the async body below.
         let target_hex = format!("0x{}", hex_encode(&request.target));
         let target_id = AccountId::new(target_hex);
-        let value_wei: u128 =
-            u128_from_u256(&request.value_wei).unwrap_or(0);
+        let value_wei: u128 = u128_from_u256(&request.value_wei).unwrap_or(0);
         let max_fee_str = request.max_fee_per_gas_wei.to_string();
         let max_priority_str = request.max_priority_fee_per_gas_wei.to_string();
         let now_ms = wall_ms();
@@ -319,10 +318,7 @@ pub fn derive_idempotency_key(
     key
 }
 
-fn extract_signed(
-    signature: &RecoverableSignature,
-    tx_type: u8,
-) -> Result<SignedTx, SignerError> {
+fn extract_signed(signature: &RecoverableSignature, tx_type: u8) -> Result<SignedTx, SignerError> {
     if signature.y_parity > 1 {
         return Err(SignerError::MalformedResponse(format!(
             "y_parity {} not in {{0, 1}}",
@@ -350,24 +346,19 @@ fn classify_error(err: &PerpsSignerError, endpoint_redacted: &str) -> SignerErro
         E::KmsUnavailable => SignerError::SignerUnavailable(format!(
             "vendor unavailable at endpoint={endpoint_redacted}"
         )),
-        E::CallerUnauthorized => {
-            SignerError::SignerUnavailable("vendor auth failed".to_string())
+        E::CallerUnauthorized => SignerError::SignerUnavailable("vendor auth failed".to_string()),
+        E::RateLimit => {
+            SignerError::NetworkFailure(format!("rate-limited at endpoint={endpoint_redacted}"))
         }
-        E::RateLimit => SignerError::NetworkFailure(format!(
-            "rate-limited at endpoint={endpoint_redacted}"
-        )),
         E::PolicyFingerprint => SignerError::PolicyViolation(
             "vendor rejected policy fingerprint (idempotency key mismatch)".to_string(),
         ),
-        E::PolicyStale => {
-            SignerError::PolicyViolation("vendor rejected: policy stale".to_string())
-        }
+        E::PolicyStale => SignerError::PolicyViolation("vendor rejected: policy stale".to_string()),
         E::CalldataBindMismatch => SignerError::CalldataHashMismatch,
         E::ChainNotAllowed => SignerError::ChainMismatch,
-        E::TargetNotAllowed | E::SelectorNotAllowed => SignerError::PolicyViolation(format!(
-            "vendor rejected: {}",
-            err.code()
-        )),
+        E::TargetNotAllowed | E::SelectorNotAllowed => {
+            SignerError::PolicyViolation(format!("vendor rejected: {}", err.code()))
+        }
         E::ValueNotZero | E::GasCap | E::NonceMismatch | E::DeadlineExpired => {
             SignerError::PolicyViolation(format!("vendor rejected: {}", err.code()))
         }
@@ -688,10 +679,7 @@ mod tests {
         let identity = bridge.identity();
         assert_eq!(identity.address, test_signer_addr_bytes());
         assert_eq!(identity.kind, SignerKind::RemoteKMS);
-        assert_eq!(
-            identity.uri.as_deref(),
-            Some("https://signer.example.com")
-        );
+        assert_eq!(identity.uri.as_deref(), Some("https://signer.example.com"));
         // Debug must not include /v1/... path fragments even if the
         // caller passes a full URL through by accident.
         let dbg = format!("{bridge:?}");

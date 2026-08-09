@@ -256,8 +256,7 @@ pub struct AppState {
     /// Persisted copy of the execution config used to construct the
     /// orchestrator. Held on AppState so the admin route can surface
     /// availability metadata (redacted) without re-reading env.
-    pub hybrid_v2_execution_config:
-        Option<crate::hybrid_v2::config::HybridV2ExecutionConfig>,
+    pub hybrid_v2_execution_config: Option<crate::hybrid_v2::config::HybridV2ExecutionConfig>,
     /// Structured reason surfaced by the admin route when the
     /// orchestrator is not wired. Explains WHY (config validation
     /// failed, provider not yet integrated, execution disabled, ...).

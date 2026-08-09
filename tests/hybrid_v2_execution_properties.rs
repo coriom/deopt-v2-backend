@@ -972,12 +972,13 @@ fn prop_public_input_cannot_control_envelope_via_admin_types() {
     // calldata / value / nonce / gas / chain_id — this is the
     // audit's non-negotiable public-input contract.
     use deopt_v2_backend::api::hybrid_v2_execution_admin::PrepareRequestBody;
-    // Any JSON body deserialization must fail if it TRIES to inject
-    // one of the reserved fields. Try a handful of hostile bodies —
-    // each MUST parse the allowed intent fields and IGNORE the
-    // reserved fields (serde default: unknown fields ignored, so the
-    // reserved values silently fall away). The contract is that
-    // these fields have no representation in the type.
+    // Any JSON body deserialization must FAIL if it tries to inject
+    // one of the reserved fields — see
+    // BACKEND-HYBRID-V2-EXTERNAL-SIGNER-INTEGRATION-AND-LIVE-ORCHESTRATOR-V1
+    // Part J: the deserializer is `#[serde(deny_unknown_fields)]` so a
+    // hostile body carrying `target_contract`/`calldata`/`chain_id`/
+    // `nonce`/`gas_limit`/`value_wei` is rejected loudly rather than
+    // silently having its extras dropped.
     let hostile = serde_json::json!({
         "buyer_envelope": {
             "owner": "0x00", "subaccount_id": 1, "subkey": "0x00",
@@ -1023,12 +1024,30 @@ fn prop_public_input_cannot_control_envelope_via_admin_types() {
         "gas_limit": 999_999_999,
         "value_wei": 100
     });
-    let parsed: Result<PrepareRequestBody, _> = serde_json::from_value(hostile);
-    // Must parse without complaining — extra fields are ignored.
-    assert!(parsed.is_ok(), "hostile body must parse (extras dropped)");
-    // And the parsed body still surfaces only the intent — verified
-    // via debug format, which lists fields.
-    let dbg = format!("{:?}", parsed.unwrap());
+    let parsed: Result<PrepareRequestBody, _> = serde_json::from_value(hostile.clone());
+    // Must FAIL — a hostile body carrying reserved fields is rejected.
+    let err = parsed.expect_err("hostile body must be rejected via deny_unknown_fields");
+    let err_str = err.to_string();
+    assert!(
+        err_str.contains("unknown field") || err_str.contains("target_contract"),
+        "expected deny_unknown_fields rejection, got {err_str}"
+    );
+    // Same body with reserved fields stripped MUST parse successfully.
+    let mut clean = hostile.clone();
+    let obj = clean.as_object_mut().unwrap();
+    for reserved in [
+        "target_contract",
+        "calldata",
+        "chain_id",
+        "nonce",
+        "gas_limit",
+        "value_wei",
+    ] {
+        obj.remove(reserved);
+    }
+    let parsed_ok: PrepareRequestBody =
+        serde_json::from_value(clean).expect("clean body must parse");
+    let dbg = format!("{parsed_ok:?}");
     assert!(!dbg.contains("ATTACK_TARGET"));
     assert!(!dbg.contains("ATTACK_CALLDATA"));
     // No gas_limit / value_wei field on PrepareRequestBody at all.

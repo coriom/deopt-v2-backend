@@ -27,9 +27,7 @@ use std::time::Duration;
 
 use crate::error::{BackendError, Result};
 use crate::hybrid_v2::config::{HybridV2ExecutionConfig, SignerProvider};
-use crate::hybrid_v2::execution::signer::{
-    ExecutionSigner, SignerBackend, SignerKind,
-};
+use crate::hybrid_v2::execution::signer::{ExecutionSigner, SignerBackend, SignerKind};
 use crate::hybrid_v2::execution::signer_kms_bridge::{redacted_endpoint, HybridV2KmsSignerBridge};
 use crate::hybrid_v2::execution::signer_production::ProductionSignerUnavailable;
 
@@ -191,8 +189,7 @@ impl HybridV2SignerBuilder {
         // is deterministic. Callers that need a specific address for
         // an integration test should either use TestEphemeral or
         // provide expected_signer_address matching this key.
-        const TEST_KEY: &str =
-            "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318";
+        const TEST_KEY: &str = "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318";
         let inner = ExecutorSigner::from_private_key(&PrivateKeySecret::new(TEST_KEY.to_string()))
             .map_err(|e| BackendError::Config(format!("mock inner signer init: {e}")))?;
         let provider = Arc::new(MockVendorSignerProvider::new(
@@ -277,7 +274,10 @@ mod tests {
         cfg.signer_provider = Some(SignerProvider::KmsGcp);
         let signer = HybridV2SignerBuilder::build(&cfg).unwrap();
         // GCP is not yet integrated — availability reports NotConfigured.
-        assert!(matches!(signer.availability(), SignerAvailability::NotConfigured));
+        assert!(matches!(
+            signer.availability(),
+            SignerAvailability::NotConfigured
+        ));
     }
 
     #[cfg(not(feature = "aws-kms-transport"))]
@@ -289,7 +289,10 @@ mod tests {
         cfg.signer_kms_key_id = Some("arn:aws:kms:us-east-1:x:key/y".to_string());
         cfg.signer_provider = Some(SignerProvider::KmsAws);
         let signer = HybridV2SignerBuilder::build(&cfg).unwrap();
-        assert!(matches!(signer.availability(), SignerAvailability::NotConfigured));
+        assert!(matches!(
+            signer.availability(),
+            SignerAvailability::NotConfigured
+        ));
     }
 
     #[test]

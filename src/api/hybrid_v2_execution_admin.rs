@@ -338,11 +338,7 @@ pub async fn prepare_execution(
     let intent = match build_intent_from_body(entry.manifest.clone(), body) {
         Ok(intent) => intent,
         Err(err) => {
-            return err_response(
-                StatusCode::BAD_REQUEST,
-                "INVALID_PREPARE_BODY",
-                &err,
-            );
+            return err_response(StatusCode::BAD_REQUEST, "INVALID_PREPARE_BODY", &err);
         }
     };
     match orchestrator.prepare(intent).await {
@@ -390,7 +386,8 @@ fn build_intent_from_body(
     let buyer_envelope = parse_envelope("buyer_envelope", &body.buyer_envelope)?;
     let seller_envelope = parse_envelope("seller_envelope", &body.seller_envelope)?;
     let buyer_signature = parse_bytes("buyer_envelope.signature", &body.buyer_envelope.signature)?;
-    let seller_signature = parse_bytes("seller_envelope.signature", &body.seller_envelope.signature)?;
+    let seller_signature =
+        parse_bytes("seller_envelope.signature", &body.seller_envelope.signature)?;
     let buyer_order = parse_order("buyer_order", &body.buyer_order)?;
     let seller_order = parse_order("seller_order", &body.seller_order)?;
     let fill_quantity_1e8 = body
@@ -441,11 +438,20 @@ fn parse_envelope(
         signer: parse_address_field(&format!("{ctx}.signer"), &input.signer)?,
         engine: parse_address_field(&format!("{ctx}.engine"), &input.engine)?,
         action: parse_bytes32(&format!("{ctx}.action"), &input.action)?,
-        architectureVersion: parse_u256(&format!("{ctx}.architecture_version"), &input.architecture_version)?,
+        architectureVersion: parse_u256(
+            &format!("{ctx}.architecture_version"),
+            &input.architecture_version,
+        )?,
         nonce: parse_u256(&format!("{ctx}.nonce"), &input.nonce)?,
         deadline: parse_u256(&format!("{ctx}.deadline"), &input.deadline)?,
-        ownerRecoveryEpoch: parse_u256(&format!("{ctx}.owner_recovery_epoch"), &input.owner_recovery_epoch)?,
-        subaccountRecoveryEpoch: parse_u256(&format!("{ctx}.subaccount_recovery_epoch"), &input.subaccount_recovery_epoch)?,
+        ownerRecoveryEpoch: parse_u256(
+            &format!("{ctx}.owner_recovery_epoch"),
+            &input.owner_recovery_epoch,
+        )?,
+        subaccountRecoveryEpoch: parse_u256(
+            &format!("{ctx}.subaccount_recovery_epoch"),
+            &input.subaccount_recovery_epoch,
+        )?,
         payloadHash: parse_bytes32(&format!("{ctx}.payload_hash"), &input.payload_hash)?,
     })
 }

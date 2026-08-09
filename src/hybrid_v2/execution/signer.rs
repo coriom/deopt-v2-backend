@@ -160,7 +160,10 @@ pub enum SignerAvailability {
     AuthenticationFailed { reason: String },
     /// Vendor produced a signature that recovered to a different EOA.
     /// Fatal — DO NOT auto-retry, DO NOT auto-fallback.
-    IdentityMismatch { expected: [u8; 20], observed: [u8; 20] },
+    IdentityMismatch {
+        expected: [u8; 20],
+        observed: [u8; 20],
+    },
     /// Timeout / 5xx / rate-limit — retryable.
     TransientFailure { reason: String },
     /// Deterministic vendor policy refusal (`kms_key_disabled`, etc).

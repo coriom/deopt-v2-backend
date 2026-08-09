@@ -949,12 +949,13 @@ impl ExecutionOrchestrator {
             // upcoming Signing→SignatureVerified patch. If the signer
             // call fails between derive and persist, the next attempt
             // will re-derive the same key.
-            let idem_key_bytes = crate::hybrid_v2::execution::signer_kms_bridge::derive_idempotency_key(
-                &self.signer.identity().address,
-                canonical_execution_id.as_bytes(),
-                &request.plan_hash,
-                &request.signing_payload_hash,
-            );
+            let idem_key_bytes =
+                crate::hybrid_v2::execution::signer_kms_bridge::derive_idempotency_key(
+                    &self.signer.identity().address,
+                    canonical_execution_id.as_bytes(),
+                    &request.plan_hash,
+                    &request.signing_payload_hash,
+                );
             let idem_key_hex = format!("0x{}", hex_encode(&idem_key_bytes));
 
             // Idempotency: if the row already carries a signature (from

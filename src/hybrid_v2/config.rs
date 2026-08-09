@@ -906,9 +906,8 @@ impl HybridV2ExecutionConfig {
         if !enabled {
             return Ok(Self::disabled());
         }
-        let executor_hex = env::var("HV2_EXECUTOR_ADDRESS").map_err(|_| {
-            cfg_err("HV2_EXECUTION_ENABLED=1 but HV2_EXECUTOR_ADDRESS unset")
-        })?;
+        let executor_hex = env::var("HV2_EXECUTOR_ADDRESS")
+            .map_err(|_| cfg_err("HV2_EXECUTION_ENABLED=1 but HV2_EXECUTOR_ADDRESS unset"))?;
         let executor_address = parse_address_hex("HV2_EXECUTOR_ADDRESS", &executor_hex)?;
         let signer_kind = match env::var("HV2_SIGNER_BACKEND").ok().as_deref() {
             None | Some("") | Some("production") | Some("PRODUCTION") => SignerBackend::Production,
@@ -935,12 +934,16 @@ impl HybridV2ExecutionConfig {
                 )));
             }
         };
-        let signer_endpoint = env::var("HV2_SIGNER_ENDPOINT").ok().filter(|s| !s.is_empty());
+        let signer_endpoint = env::var("HV2_SIGNER_ENDPOINT")
+            .ok()
+            .filter(|s| !s.is_empty());
         let expected_signer_address = match env::var("HV2_SIGNER_EXPECTED_ADDRESS") {
             Ok(v) if !v.is_empty() => Some(parse_address_hex("HV2_SIGNER_EXPECTED_ADDRESS", &v)?),
             _ => None,
         };
-        let signer_kms_key_id = env::var("HV2_SIGNER_KMS_KEY_ID").ok().filter(|s| !s.is_empty());
+        let signer_kms_key_id = env::var("HV2_SIGNER_KMS_KEY_ID")
+            .ok()
+            .filter(|s| !s.is_empty());
         let signer_provider = match env::var("HV2_SIGNER_PROVIDER").ok() {
             Some(v) if !v.is_empty() => Some(SignerProvider::parse(&v).map_err(cfg_err)?),
             _ => None,
@@ -956,8 +959,7 @@ impl HybridV2ExecutionConfig {
             .filter(|s| !s.is_empty())
             .or_else(|| env::var("HYBRID_V2_RPC_URL").ok().filter(|s| !s.is_empty()));
         let rpc_timeout_ms: u64 = parse_env("HV2_EXECUTION_RPC_TIMEOUT_MS")?.unwrap_or(10_000);
-        let simulation_max_age_ms: u64 =
-            parse_env("HV2_SIMULATION_MAX_AGE_MS")?.unwrap_or(60_000);
+        let simulation_max_age_ms: u64 = parse_env("HV2_SIMULATION_MAX_AGE_MS")?.unwrap_or(60_000);
         let cfg = Self {
             execution_enabled: true,
             executor_address,
@@ -1036,8 +1038,8 @@ impl HybridV2ExecutionConfig {
         if let Some(endpoint) = self.signer_endpoint.as_deref() {
             let lower = endpoint.to_ascii_lowercase();
             let is_https = lower.starts_with("https://");
-            let is_local_http = lower.starts_with("http://127.0.0.1")
-                || lower.starts_with("http://localhost");
+            let is_local_http =
+                lower.starts_with("http://127.0.0.1") || lower.starts_with("http://localhost");
             if !(is_https || is_local_http) {
                 return Err(cfg_err(
                     "HV2_SIGNER_ENDPOINT must start with https:// (or with \
@@ -1233,10 +1235,16 @@ mod execution_config_tests {
     #[test]
     fn signer_provider_round_trips_via_parse() {
         for value in ["kms_aws", "KMS-AWS", "aws_kms", "aws-kms"] {
-            assert_eq!(SignerProvider::parse(value).unwrap(), SignerProvider::KmsAws);
+            assert_eq!(
+                SignerProvider::parse(value).unwrap(),
+                SignerProvider::KmsAws
+            );
         }
         for value in ["kms_gcp", "GCP-KMS"] {
-            assert_eq!(SignerProvider::parse(value).unwrap(), SignerProvider::KmsGcp);
+            assert_eq!(
+                SignerProvider::parse(value).unwrap(),
+                SignerProvider::KmsGcp
+            );
         }
         assert_eq!(SignerProvider::parse("mock").unwrap(), SignerProvider::Mock);
         assert!(SignerProvider::parse("what").is_err());

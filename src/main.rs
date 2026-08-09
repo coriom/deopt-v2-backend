@@ -453,10 +453,7 @@ fn load_hybrid_v2_manifest(
 async fn wire_hybrid_v2_execution_orchestrator(
     state: &AppState,
     chain_id: u64,
-) -> std::result::Result<
-    Option<(Arc<ExecutionOrchestrator>, HybridV2ExecutionConfig)>,
-    String,
-> {
+) -> std::result::Result<Option<(Arc<ExecutionOrchestrator>, HybridV2ExecutionConfig)>, String> {
     let execution_config = HybridV2ExecutionConfig::from_env()
         .map_err(|e| format!("HV2 execution config from_env: {e}"))?;
     if !execution_config.execution_enabled {
@@ -465,18 +462,15 @@ async fn wire_hybrid_v2_execution_orchestrator(
     execution_config
         .validate_startup(chain_id)
         .map_err(|e| format!("HV2 execution config validate_startup: {e}"))?;
-    let store = state
-        .hybrid_v2_projection_store
-        .clone()
-        .ok_or_else(|| "HV2 execution requires the projection store; HYBRID_V2_ENABLED=true?".to_string())?;
-    let manifest = state
-        .hybrid_v2_manifest
-        .clone()
-        .ok_or_else(|| "HV2 execution requires a manifest bound to AppState via reconciliation wiring".to_string())?;
-    let rpc_url = execution_config
-        .rpc_url
-        .clone()
-        .ok_or_else(|| "HV2 execution requires HV2_EXECUTION_RPC_URL (or HYBRID_V2_RPC_URL)".to_string())?;
+    let store = state.hybrid_v2_projection_store.clone().ok_or_else(|| {
+        "HV2 execution requires the projection store; HYBRID_V2_ENABLED=true?".to_string()
+    })?;
+    let manifest = state.hybrid_v2_manifest.clone().ok_or_else(|| {
+        "HV2 execution requires a manifest bound to AppState via reconciliation wiring".to_string()
+    })?;
+    let rpc_url = execution_config.rpc_url.clone().ok_or_else(|| {
+        "HV2 execution requires HV2_EXECUTION_RPC_URL (or HYBRID_V2_RPC_URL)".to_string()
+    })?;
     let rpc_timeout = Duration::from_millis(execution_config.rpc_timeout_ms);
     let rpc: Arc<dyn deopt_v2_backend::hybrid_v2::execution::ExecutionRpcClient> = Arc::new(
         HttpExecutionRpcClient::new(rpc_url.clone(), rpc_timeout, 3)
