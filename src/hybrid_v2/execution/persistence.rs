@@ -81,6 +81,15 @@ pub struct ExecutionRequestRow {
     // Lock correlation
     pub holder_epoch: Option<i64>,
 
+    // External-signer idempotency key (Part L). 0x-prefixed 16-byte
+    // hex derived from
+    //   keccak256("HV2_SIGNER_IDEMPOTENCY_V1" ‖ expected_signer_address
+    //             ‖ canonical_execution_id ‖ plan_hash
+    //             ‖ signing_payload_hash)[..16]
+    // Immutable once set — enforced by the migration 0050 trigger and
+    // by the store's `update_execution_phase` implementation.
+    pub signer_request_idempotency_key: Option<String>,
+
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
 }
@@ -116,4 +125,7 @@ pub struct ExecutionRequestPatch {
     pub failure_detail: Option<String>,
     pub holder_epoch: Option<i64>,
     pub retry_count: Option<i32>,
+    /// Persisted external-signer idempotency key. Once written, the
+    /// migration 0050 trigger blocks any divergent overwrite.
+    pub signer_request_idempotency_key: Option<String>,
 }

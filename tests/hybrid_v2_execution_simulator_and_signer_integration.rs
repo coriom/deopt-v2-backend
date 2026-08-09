@@ -532,6 +532,7 @@ fn build_execution_row(
         failure_detail: None,
         retry_count: 0,
         holder_epoch: None,
+        signer_request_idempotency_key: None,
         created_at_ms: now_ms,
         updated_at_ms: now_ms,
     }

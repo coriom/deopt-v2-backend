@@ -971,6 +971,7 @@ async fn plan_builder_yields_deterministic_plan_hash() {
         failure_detail: None,
         retry_count: 0,
         holder_epoch: None,
+        signer_request_idempotency_key: None,
         created_at_ms: 0,
         updated_at_ms: 0,
     };

@@ -129,6 +129,7 @@ fn build_row(deployment_id: i64, chain_id: u64, fill: u128, now_ms: i64) -> Exec
         failure_detail: None,
         retry_count: 0,
         holder_epoch: None,
+        signer_request_idempotency_key: None,
         created_at_ms: now_ms,
         updated_at_ms: now_ms,
     }

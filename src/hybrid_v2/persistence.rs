@@ -1951,7 +1951,8 @@ impl HybridV2ProjectionStore for PostgresHybridV2ProjectionStore {
                 signature_r, signature_s, signature_v, recovered_signer,
                 gas_limit, max_fee_per_gas_wei, max_priority_fee_per_gas_wei,
                 reserved_nonce, phase, failure_class, failure_detail,
-                retry_count, holder_epoch, created_at_ms, updated_at_ms
+                retry_count, holder_epoch, signer_request_idempotency_key,
+                created_at_ms, updated_at_ms
              ) VALUES (
                 $1,$2,$3,$4,$5,$6,$7,$8,$9,
                 CAST($10 AS NUMERIC),CAST($11 AS NUMERIC),$12,
@@ -1960,7 +1961,8 @@ impl HybridV2ProjectionStore for PostgresHybridV2ProjectionStore {
                 $23,$24,$25,$26,$27,$28,
                 $29,CAST($30 AS NUMERIC),CAST($31 AS NUMERIC),
                 $32,$33,$34,$35,
-                $36,$37,$38,$39
+                $36,$37,$38,
+                $39,$40
              )
              ON CONFLICT (canonical_execution_id) DO NOTHING",
         )
@@ -2001,6 +2003,7 @@ impl HybridV2ProjectionStore for PostgresHybridV2ProjectionStore {
         .bind(&row.failure_detail)
         .bind(row.retry_count)
         .bind(row.holder_epoch)
+        .bind(&row.signer_request_idempotency_key)
         .bind(row.created_at_ms)
         .bind(row.updated_at_ms)
         .execute(&self.pool)
@@ -2030,7 +2033,8 @@ impl HybridV2ProjectionStore for PostgresHybridV2ProjectionStore {
                     max_fee_per_gas_wei::text AS max_fee_per_gas_wei_txt,
                     max_priority_fee_per_gas_wei::text AS max_priority_fee_per_gas_wei_txt,
                     reserved_nonce, phase, failure_class, failure_detail,
-                    retry_count, holder_epoch, created_at_ms, updated_at_ms
+                    retry_count, holder_epoch, signer_request_idempotency_key,
+                    created_at_ms, updated_at_ms
              FROM hybrid_v2_execution_requests
              WHERE canonical_execution_id = $1",
         )
@@ -2088,6 +2092,8 @@ impl HybridV2ProjectionStore for PostgresHybridV2ProjectionStore {
                 failure_detail               = COALESCE($23, failure_detail),
                 holder_epoch                 = COALESCE($24, holder_epoch),
                 retry_count                  = COALESCE($25, retry_count),
+                signer_request_idempotency_key =
+                    COALESCE($28, signer_request_idempotency_key),
                 phase                        = $26,
                 updated_at_ms                = $27
              WHERE canonical_execution_id = $1 AND phase = $2",
@@ -2119,6 +2125,7 @@ impl HybridV2ProjectionStore for PostgresHybridV2ProjectionStore {
         .bind(patch.retry_count)
         .bind(to.as_str())
         .bind(now_ms)
+        .bind(patch.signer_request_idempotency_key.as_deref())
         .execute(&self.pool)
         .await
         .map_err(pg_err)?;
@@ -2188,7 +2195,8 @@ impl HybridV2ProjectionStore for PostgresHybridV2ProjectionStore {
                     max_fee_per_gas_wei::text AS max_fee_per_gas_wei_txt,
                     max_priority_fee_per_gas_wei::text AS max_priority_fee_per_gas_wei_txt,
                     reserved_nonce, phase, failure_class, failure_detail,
-                    retry_count, holder_epoch, created_at_ms, updated_at_ms
+                    retry_count, holder_epoch, signer_request_idempotency_key,
+                    created_at_ms, updated_at_ms
              FROM hybrid_v2_execution_requests
              WHERE deployment_id = $1
              ORDER BY updated_at_ms DESC
@@ -2313,6 +2321,9 @@ fn row_to_execution_request(
         failure_detail: row.try_get("failure_detail").map_err(pg_err)?,
         retry_count: row.try_get("retry_count").map_err(pg_err)?,
         holder_epoch: row.try_get("holder_epoch").map_err(pg_err)?,
+        signer_request_idempotency_key: row
+            .try_get("signer_request_idempotency_key")
+            .unwrap_or(None),
         created_at_ms: row.try_get("created_at_ms").map_err(pg_err)?,
         updated_at_ms: row.try_get("updated_at_ms").map_err(pg_err)?,
     })
@@ -4509,6 +4520,22 @@ impl HybridV2ProjectionStore for InMemoryProjectionStore {
         }
         if let Some(v) = patch.retry_count {
             row.retry_count = v;
+        }
+        // signer_request_idempotency_key immutability (Part L). Same
+        // pattern as plan_hash: None → Some is fine; Some(x) must not
+        // become Some(y != x). Mirrors migration 0050's trigger.
+        if let Some(new_key) = &patch.signer_request_idempotency_key {
+            match &row.signer_request_idempotency_key {
+                Some(existing) if existing != new_key => {
+                    return Err(BackendError::Persistence(
+                        "signer_request_idempotency_key is immutable once set".to_string(),
+                    ));
+                }
+                _ => {}
+            }
+        }
+        if let Some(v) = patch.signer_request_idempotency_key {
+            row.signer_request_idempotency_key = Some(v);
         }
         row.phase = to;
         row.updated_at_ms = now_ms;

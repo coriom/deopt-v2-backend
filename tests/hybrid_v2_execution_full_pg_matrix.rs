@@ -1366,6 +1366,7 @@ fn seed_row(deployment_id: i64, chain_id: u64, canonical_id: &str) -> ExecutionR
         failure_detail: None,
         retry_count: 0,
         holder_epoch: None,
+        signer_request_idempotency_key: None,
         created_at_ms: 1_700_000_000_000,
         updated_at_ms: 1_700_000_000_000,
     }
