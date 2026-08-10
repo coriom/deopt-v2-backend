@@ -110,3 +110,8 @@ required-features = ["test-signer"]
 name = "hybrid_v2_external_signer_properties"
 path = "tests/hybrid_v2_external_signer_properties.rs"
 required-features = ["test-signer"]
+
+[[test]]
+name = "hybrid_v2_external_signer_performance_bounds"
+path = "tests/hybrid_v2_external_signer_performance_bounds.rs"
+required-features = ["test-signer"]
