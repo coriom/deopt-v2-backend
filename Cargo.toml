@@ -100,3 +100,8 @@ path = "tests/hybrid_v2_external_signer_no_broadcast_scan.rs"
 name = "hybrid_v2_external_signer_harness"
 path = "tests/hybrid_v2_external_signer_harness.rs"
 required-features = ["test-signer"]
+
+[[test]]
+name = "hybrid_v2_external_signer_full_matrix_pg_integration"
+path = "tests/hybrid_v2_external_signer_full_matrix_pg_integration.rs"
+required-features = ["test-signer"]
