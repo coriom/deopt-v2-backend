@@ -86,3 +86,17 @@ required-features = ["test-signer"]
 name = "hybrid_v2_execution_live_orchestrator_pg_integration"
 path = "tests/hybrid_v2_execution_live_orchestrator_pg_integration.rs"
 required-features = ["test-signer"]
+
+# BACKEND-HYBRID-V2-EXTERNAL-SIGNER-INTEGRATION-AND-LIVE-ORCHESTRATOR-V1
+# Package B (Parts M, N) — zero-broadcast source scan (default feature
+# set) + shared external-signer harness (test-signer only). Subsequent
+# Package B commits register the full matrix, properties, and
+# performance test binaries.
+[[test]]
+name = "hybrid_v2_external_signer_no_broadcast_scan"
+path = "tests/hybrid_v2_external_signer_no_broadcast_scan.rs"
+
+[[test]]
+name = "hybrid_v2_external_signer_harness"
+path = "tests/hybrid_v2_external_signer_harness.rs"
+required-features = ["test-signer"]
