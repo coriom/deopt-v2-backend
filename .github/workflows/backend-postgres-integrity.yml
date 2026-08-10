@@ -169,3 +169,37 @@ EOF
             cargo test --features test-signer --test "$suite" -- --test-threads=1
           done
           echo "BACKEND_HYBRID_V2_SIGNER_EXECUTION_CI_GATE_VALIDATED"
+
+      - name: Run BACKEND-HYBRID-V2-EXTERNAL-SIGNER-V1 default-feature scan
+        run: |
+          cd deopt-v2-backend || cd .
+          # No PG required — the external-signer no-broadcast source
+          # scan is a filesystem sweep + a mock-RPC harness sanity
+          # check. Runs on the default feature set.
+          cargo test --test hybrid_v2_external_signer_no_broadcast_scan -- --test-threads=1
+
+      - name: Run BACKEND-HYBRID-V2-EXTERNAL-SIGNER-V1 test-signer suites
+        env:
+          HYBRID_V2_PG_TEST_DATABASE_URL: postgres://deopt_ci:disposable_ci_pw@127.0.0.1:5432/deopt_hybrid_v2_disposable_ci
+          DEOPT_REQUIRE_PG_INTEGRATION: "1"
+        run: |
+          cd deopt-v2-backend || cd .
+          # Package A: live-orchestrator PG suite. Package B: full
+          # external-signer PG matrix, properties, performance bounds,
+          # and the shared harness (its own self-tests). Every suite
+          # requires the `test-signer` cargo feature so the mock
+          # signer provider is visible from the integration crate.
+          for suite in \
+              hybrid_v2_execution_live_orchestrator_pg_integration \
+              hybrid_v2_external_signer_harness \
+              hybrid_v2_external_signer_full_matrix_pg_integration \
+              hybrid_v2_external_signer_properties \
+              hybrid_v2_external_signer_performance_bounds; do
+            PGPASSWORD=disposable_ci_pw psql -h 127.0.0.1 -U deopt_ci -d deopt_hybrid_v2_disposable_ci <<'EOF' >/dev/null
+DROP SCHEMA public CASCADE;
+CREATE SCHEMA public;
+GRANT ALL ON SCHEMA public TO PUBLIC;
+EOF
+            cargo test --features test-signer --test "$suite" -- --test-threads=1
+          done
+          echo "EXTERNAL_SIGNER_CI_GATE_VALIDATED"
