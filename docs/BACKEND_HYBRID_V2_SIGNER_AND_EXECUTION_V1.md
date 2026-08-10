@@ -8,6 +8,13 @@ Status: **CLOSED (pre-broadcast surface). Broadcast is disabled by construction.
 - CI verdict: **`BACKEND_HYBRID_V2_SIGNER_EXECUTION_CI_GATE_VALIDATED`**
 - Documentation verdict: **`BACKEND_HYBRID_V2_SIGNER_EXECUTION_DOCUMENTATION_COMPLETE`**
 
+Follow-on stage: **`BACKEND-HYBRID-V2-EXTERNAL-SIGNER-INTEGRATION-AND-LIVE-ORCHESTRATOR-V1`**
+(CLOSED 2026-08-09) — integrates the perps `RemoteSigner` stack via
+`HybridV2KmsSignerBridge`, persists the signer idempotency key
+(migration 0050), and wires a live `ExecutionOrchestrator` into
+`AppState`. See
+`BACKEND_HYBRID_V2_EXTERNAL_SIGNER_INTEGRATION_AND_LIVE_ORCHESTRATOR_V1.md`.
+
 Next stage: **`BACKEND-HYBRID-V2-BROADCAST-AND-CONFIRMATION-V1`**.
 
 ## 1. Authority model

@@ -1,0 +1,215 @@
+# Hybrid V2 Admin API
+
+Reference for the admin routes served by `src/api/hybrid_v2_admin.rs`
+and `src/api/hybrid_v2_execution_admin.rs`. All routes are behind the
+`x-admin-token` header gate and refuse Base mainnet (chain id 8453)
+at handler entry.
+
+## Auth
+
+Every route calls `ensure_admin(state, headers)` before doing any
+work:
+
+- `state.admin_config.enabled == false` → `403 ADMIN_DISABLED`.
+- `state.admin_config.require_token == true` and the `x-admin-token`
+  header is missing → `403 ADMIN_TOKEN_REQUIRED`.
+- Token mismatch (constant-time compare) → `403 INVALID_ADMIN_TOKEN`.
+
+## Mainnet refusal
+
+Every deployment-scoped route calls `refuse_mainnet(chain_id)` right
+after resolving the deployment; a chain id of 8453 returns
+`403 BASE_MAINNET_FORBIDDEN`.
+
+## Rebuild + reconciliation routes
+
+See `docs/HYBRID_V2_OPERATOR_RUNBOOK.md § 6` and `§ 7` — this
+document covers the execution admin routes.
+
+## Execution admin routes
+
+### `POST /admin/hybrid_v2/deployments/:deployment_id/executions/:canonical_execution_id/prepare`
+
+Prepare (and land at the terminal `BROADCAST_DISABLED` phase) an
+execution row for the given canonical id.
+
+**Request body** — `#[serde(deny_unknown_fields)]`. Any unknown
+field returns `400 INVALID_PREPARE_BODY`. Every downstream execution
+field (target, selector, calldata, value_wei, nonce, gas_limit,
+max_fee_per_gas, max_priority_fee_per_gas, chain_id) is derived
+deterministically from the manifest allowlist + plan builder — the
+body cannot influence any of them.
+
+```json
+{
+  "buyer_envelope": {
+    "owner": "0x…",
+    "subaccount_id": 1,
+    "subkey": "0x…",
+    "signer": "0x…",
+    "engine": "0x…",
+    "action": "0x…",
+    "architecture_version": "1",
+    "nonce": "1",
+    "deadline": "2000000000",
+    "owner_recovery_epoch": "0",
+    "subaccount_recovery_epoch": "0",
+    "payload_hash": "0x…",
+    "signature": "0x…"
+  },
+  "buyer_order": {
+    "series_id": "42",
+    "side": 0,
+    "quantity_1e8": "100000000",
+    "price_per_contract_1e8": "50000000",
+    "limit_price_per_contract_1e8": "60000000",
+    "premium_token": "0x…",
+    "time_in_force": 0,
+    "role": 0,
+    "max_positive_fee_ppm": 100,
+    "salt": "0x…"
+  },
+  "seller_envelope": { … },
+  "seller_order":    { … },
+  "fill_quantity_1e8": "100000000",
+  "buyer_active_series":  ["42"],
+  "seller_active_series": ["42"],
+  "buyer_order_hash":  "0x…",
+  "seller_order_hash": "0x…",
+  "series_id":       "42",
+  "premium_amount":  "50000000",
+  "fee_schedule_epoch": null
+}
+```
+
+**Responses:**
+
+- `200 OK` — terminal outcome. Body:
+
+  ```json
+  {
+    "canonical_execution_id": "0x…",
+    "terminal_phase": "BROADCAST_DISABLED",
+    "failure_class": null,
+    "failure_detail": null,
+    "plan_hash": "0x…",
+    "signing_payload_hash": "0x…",
+    "simulation_gas_estimate": 90000,
+    "reserved_nonce": 7,
+    "attempts": 1
+  }
+  ```
+
+- `400 INVALID_CANONICAL_ID` — `canonical_execution_id` path
+  parameter is not a 0x-prefixed 32-byte hex string.
+- `400 INVALID_PREPARE_BODY` — body validation failed.
+- `403 ADMIN_DISABLED` / `ADMIN_TOKEN_REQUIRED` / `INVALID_ADMIN_TOKEN`.
+- `403 BASE_MAINNET_FORBIDDEN` — deployment is on chain 8453.
+- `409 EXECUTION_LOCK_CONTENTION` — a concurrent request holds the
+  deployment-scoped operation lock.
+- `500 STORE_ERROR` / `ORCHESTRATION_UNRECOVERABLE`.
+- `503 EXECUTION_ORCHESTRATOR_NOT_WIRED` — no live orchestrator
+  wired into this `AppState` build. Body includes an availability
+  reason:
+
+  ```json
+  {
+    "error": "EXECUTION_ORCHESTRATOR_NOT_WIRED",
+    "detail": "no execution orchestrator wired to this AppState build",
+    "availability": {
+      "state": "NotConfigured",
+      "reason": "EXECUTION_DISABLED"
+    }
+  }
+  ```
+
+  Common reasons:
+
+  - `EXECUTION_DISABLED` — `HV2_EXECUTION_ENABLED` is false.
+  - `IncompleteProductionSignerConfig: …` — one of the required
+    `HV2_SIGNER_*` env vars is unset.
+  - `aws-kms-transport feature not enabled at build time` — build
+    was compiled without `--features aws-kms-transport`.
+
+### `GET /admin/hybrid_v2/deployments/:deployment_id/executions/:canonical_execution_id`
+
+Fetch the sanitized execution row. Redacted so operators can inspect
+outcome + phase without leaking `(r, s, v)`. The `recovered_signer`
+public address is included because it is not a secret.
+
+Responses: `200 OK` with a `SanitizedExecutionRow` body, `404
+UNKNOWN_EXECUTION` if the id is not present, or the standard admin/
+mainnet refusals above.
+
+### `GET /admin/hybrid_v2/deployments/:deployment_id/executions?limit=N&offset=M`
+
+Bounded listing. `limit ≤ 1000`, `offset ≥ 0`. Responses: `200 OK`
+with a `Vec<SanitizedExecutionRow>` body.
+
+### `POST /admin/hybrid_v2/deployments/:deployment_id/executions/:canonical_execution_id/cancel`
+
+Cancel the row. Refused past `AWAITING_SIGNATURE`.
+
+### `POST /admin/hybrid_v2/deployments/:deployment_id/executions/:canonical_execution_id/retry`
+
+Currently returns `409 RETRY_MUST_ISSUE_NEW_CANONICAL_ID`. Terminal
+FAILED rows do not resurrect — the operator re-issues `prepare` with
+the original intent, which derives the same canonical id and
+converges on the same row.
+
+## Sanitized execution row schema
+
+```json
+{
+  "canonical_execution_id": "0x…",
+  "deployment_id": 12,
+  "chain_id": 84532,
+  "phase": "BROADCAST_DISABLED",
+  "attempts": 1,
+  "created_at_ms": 1700000000000,
+  "updated_at_ms": 1700000000200,
+  "failure_class": null,
+  "failure_detail": null,
+  "plan_hash": "0x…",
+  "calldata_hash": "0x…",
+  "signing_payload_hash": "0x…",
+  "target": "0x…",
+  "selector": "0x1a2b3c4d",
+  "value_wei": "0",
+  "gas_limit": 108000,
+  "max_fee_per_gas_wei": "…",
+  "max_priority_fee_per_gas_wei": "…",
+  "reserved_nonce": 7,
+  "recovered_signer": "0x…",
+  "signer_request_idempotency_key": "0x…"
+}
+```
+
+Excluded (by construction — the sanitizer strips these before
+serialization): `signature_r`, `signature_s`, `signature_v`, any
+signer-side secret material, raw request body.
+
+## External signer failure classes
+
+| `failure_class` | Meaning | Retryable? |
+|---|---|---|
+| `PREFLIGHT_REJECTED` | Readiness / drift / cancelled / expired | No — fix upstream |
+| `PLAN_BUILD_FAILED` | Manifest mismatch, bad address, wrong chain | No — config regression |
+| `NONCE_RESERVATION_FAILED` | RPC + persistence disagreement | Usually yes — new `prepare` |
+| `SIMULATION_FAILED_DETERMINISTIC` | On-chain revert with decoded selector | No — fix state |
+| `SIMULATION_TRANSPORT_FAILED` | RPC transport blip | Yes — new `prepare` |
+| `GAS_POLICY_REJECTED` | Estimate / fee / total cost out of bounds | Wait for gas normal |
+| `FIREWALL_REJECTED` | Row tampered / plan mutated | Escalate |
+| `SIGNER_UNAVAILABLE` | Signer timeout / 5xx / auth failed / deterministic vendor refusal | Depends on availability sub-reason |
+| `SIGNATURE_VERIFICATION_FAILED` | Signer returned `(r,s,v)` that does not recover to `expected_signer_address` over the orchestrator-derived payload | Escalate — signer compromise or bug |
+| `LOCK_CONTENTION` | Another op holds the deployment lock | Yes — retry later |
+| `STORE_FAILURE` | Postgres error | Check DB health |
+
+## Cross-references
+
+- Runbook Section 17:
+  `docs/HYBRID_V2_OPERATOR_RUNBOOK.md § 17`.
+- V1 closure:
+  `docs/BACKEND_HYBRID_V2_SIGNER_AND_EXECUTION_V1.md`.
+- External signer closure:
+  `docs/BACKEND_HYBRID_V2_EXTERNAL_SIGNER_INTEGRATION_AND_LIVE_ORCHESTRATOR_V1.md`.

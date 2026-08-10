@@ -246,3 +246,16 @@ been analysed and either mitigated in code (with test coverage) or
 documented as out-of-scope with a scheduled follow-up milestone.
 
 **Return value: `BACKEND_HYBRID_V2_SIGNER_EXECUTION_SECURITY_VALIDATED`.**
+
+## 8. Follow-on review
+
+The follow-on milestone
+`BACKEND-HYBRID-V2-EXTERNAL-SIGNER-INTEGRATION-AND-LIVE-ORCHESTRATOR-V1`
+extends this security surface with external-signer integration
+(Pattern C KMS bridge, live orchestrator wiring, persisted signer
+idempotency key). See its paired review:
+`BACKEND_HYBRID_V2_EXTERNAL_SIGNER_INTEGRATION_AND_LIVE_ORCHESTRATOR_V1_SECURITY_REVIEW.md`.
+
+No frozen invariant from V1 has been retracted; every one is
+reaffirmed by the new source-scans and PG matrix in the follow-on
+milestone.

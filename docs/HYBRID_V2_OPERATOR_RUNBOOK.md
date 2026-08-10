@@ -548,3 +548,118 @@ Cross-reference:
 
 - Closure doc: `BACKEND_HYBRID_V2_SIGNER_AND_EXECUTION_V1.md`
 - Security review: `BACKEND_HYBRID_V2_SIGNER_AND_EXECUTION_V1_SECURITY_REVIEW.md`
+
+## 17. External Signer Integration + Live Orchestrator — 2026-08-09
+
+Milestone: `BACKEND-HYBRID-V2-EXTERNAL-SIGNER-INTEGRATION-AND-LIVE-ORCHESTRATOR-V1`
+— see `BACKEND_HYBRID_V2_EXTERNAL_SIGNER_INTEGRATION_AND_LIVE_ORCHESTRATOR_V1.md`
+and the paired security review.
+
+### 17.1 What the milestone added
+
+- A live `HybridV2KmsSignerBridge` sitting between the HV2
+  `ExecutionSigner` trait and the perps `RemoteSigner` stack — the
+  same stack that the perps signer microservice already uses in
+  staging. The bridge holds no private key; it forwards signing
+  requests to the operator-owned signer microservice (Pattern C).
+- A live `ExecutionOrchestrator` wired into `AppState`. When
+  `HV2_EXECUTION_ENABLED=1` and the signer config is complete, the
+  admin `prepare_execution` route drives an end-to-end flow through
+  preflight, plan build, nonce reservation, simulation, gas policy,
+  the signer firewall, the bridge, and local signature verification,
+  landing at the terminal `BROADCAST_DISABLED` phase.
+- A persisted `signer_request_idempotency_key` column
+  (migration 0050) — 16 bytes derived from
+  `keccak256(HV2_SIGNER_IDEMPOTENCY_V1 || expected_signer_address ||
+  canonical_execution_id || plan_hash || signing_payload_hash)[..16]`
+  — immutable via SQL trigger so a retried request converges on the
+  same vendor-side signature.
+
+### 17.2 Startup configuration
+
+Set these env vars (see `HYBRID_V2_ADMIN_API.md § Configuration` for
+bounds):
+
+```
+HV2_EXECUTION_ENABLED=1
+HV2_EXECUTOR_ADDRESS=0x…
+HV2_SIGNER_BACKEND=production
+HV2_SIGNER_PROVIDER=kms_aws
+HV2_SIGNER_ENDPOINT=https://signer.internal.example.com
+HV2_SIGNER_EXPECTED_ADDRESS=0x…
+HV2_SIGNER_KMS_KEY_ID=arn:aws:kms:…
+HV2_SIGNER_REQUEST_TIMEOUT_MS=2500
+HV2_SIGNER_MAX_RETRIES=1
+HV2_SIGNER_AUTH_REFERENCE=arn:aws:iam::…:role/deopt-signer
+HV2_EXECUTION_RPC_URL=https://…
+HV2_EXECUTION_RPC_TIMEOUT_MS=10000
+HV2_SIMULATION_MAX_AGE_MS=60000
+```
+
+At startup, `wire_hybrid_v2_execution_orchestrator` runs
+`HybridV2ExecutionConfig::validate_startup(chain_id)`. Any validation
+failure logs at WARN and leaves `AppState.hybrid_v2_execution_
+orchestrator = None`; the admin route then returns
+`503 EXECUTION_ORCHESTRATOR_NOT_WIRED` with the availability reason
+in the body. This is the honest fail-closed posture.
+
+### 17.3 Common startup-failure availability reasons
+
+- `EXECUTION_DISABLED` — `HV2_EXECUTION_ENABLED` is false.
+- `IncompleteProductionSignerConfig: HV2_SIGNER_EXPECTED_ADDRESS
+  required` (or endpoint/provider) — a required env var is unset.
+- `aws-kms-transport feature not enabled at build time` — the build
+  was compiled without `--features aws-kms-transport`; rebuild with
+  the feature to enable the KMS transport.
+- `HV2_SIGNER_ENDPOINT must start with https://…` — the endpoint is
+  a public non-https host (localhost http is allowed only for dev).
+- `HV2_SIGNER_REQUEST_TIMEOUT_MS must be within [100, 30000]` — see
+  the bounds table in `HYBRID_V2_ADMIN_API.md`.
+
+### 17.4 Signer failure classes and remediation
+
+| `failure_class` | Root cause | Operator action |
+|---|---|---|
+| `SIGNER_UNAVAILABLE (vendor timeout)` | Signer microservice slow / DNS blip | Wait a beat; the bridge already retried once. Check signer's own logs. |
+| `SIGNER_UNAVAILABLE (vendor 5xx)` | Signer microservice unhealthy | Check the signer's health endpoint + Prometheus signals. |
+| `SIGNER_UNAVAILABLE (vendor auth failed)` | IAM role expired or KMS key policy revoked | Rotate `HV2_SIGNER_AUTH_REFERENCE` / verify KMS key policy. NOT retried automatically. |
+| `SIGNER_UNAVAILABLE (vendor policy fingerprint)` | Signer's own policy rejected the request | Inspect the signer's audit log — usually indicates a plan mutation between backend and signer, or a stale operator allowlist. |
+| `SIGNATURE_VERIFICATION_FAILED` | Signer returned a signature that does not recover to `HV2_SIGNER_EXPECTED_ADDRESS` OR does not cover the orchestrator-derived signing payload | **Escalate** — this is either a signer compromise or a code bug. Do NOT auto-retry. |
+
+The bridge is deterministic on retryable vs non-retryable
+classification: transport / KmsTimeout / KmsUnavailable / RateLimit
+retry up to `HV2_SIGNER_MAX_RETRIES + 1` times. Everything else
+fails on the first attempt.
+
+### 17.5 Idempotency + restart safety
+
+Every persisted row that reaches `SignatureVerified` carries the
+`signer_request_idempotency_key` column. A retried `prepare` request
+that lands on the same canonical id short-circuits — the row is
+already terminal. A restart of the backend process picks up the row
+via `resume(canonical_execution_id)` and yields the same terminal
+outcome without re-signing.
+
+The operator visibility for this is the
+`GET /admin/hybrid_v2/deployments/:id/executions/:canonical_execution_id`
+route, which returns the sanitized row including
+`signer_request_idempotency_key` for correlation with signer-side
+audit logs.
+
+### 17.6 Broadcast is STILL disabled
+
+There is intentionally no operator control to submit a signed row
+on-chain. The `BROADCAST_DISABLED` phase remains a first-class
+terminal. The next milestone
+(`BACKEND-HYBRID-V2-BROADCAST-AND-CONFIRMATION-V1`) adds the
+broadcast surface.
+
+### 17.7 Cross-references
+
+- External signer closure:
+  `BACKEND_HYBRID_V2_EXTERNAL_SIGNER_INTEGRATION_AND_LIVE_ORCHESTRATOR_V1.md`.
+- External signer security review:
+  `BACKEND_HYBRID_V2_EXTERNAL_SIGNER_INTEGRATION_AND_LIVE_ORCHESTRATOR_V1_SECURITY_REVIEW.md`.
+- Admin API reference: `HYBRID_V2_ADMIN_API.md`.
+- Pattern C signer design: `MAINNET_BE_SIGNER_SERVICE_DESIGN.md`.
+
