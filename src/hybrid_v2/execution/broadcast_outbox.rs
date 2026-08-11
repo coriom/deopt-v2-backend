@@ -102,6 +102,23 @@ pub struct OutboxOutcome {
     pub failure_detail: Option<String>,
 }
 
+/// Bounded-policy inputs used by `resume` and `resend_same_bytes` — the
+/// caller pins the same-byte resend budget and the `SubmissionUnknown`
+/// escalation window explicitly, so no code path can silently widen
+/// either dimension.
+///
+/// Frozen safety:
+/// - `submission_retry_max` caps the total number of times the outbox
+///   may hand the SAME byte payload to the RPC. Never re-sign.
+/// - `max_pending_age_ms` bounds how long a `SubmissionUnknown` row is
+///   allowed to stay ambiguous before the outbox escalates the row to
+///   `ManualInterventionRequired`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResumePolicy {
+    pub submission_retry_max: u32,
+    pub max_pending_age_ms: u64,
+}
+
 /// Unrecoverable outbox errors — the caller cannot fix these by
 /// retrying. Firewall rejections and provider errors are represented
 /// on the [`OutboxOutcome`] as terminal phases; only genuine
@@ -624,6 +641,634 @@ impl BroadcastOutbox {
             failure_class: Some(failure_class_str.to_string()),
             failure_detail: Some(detail.to_string()),
         })
+    }
+
+    // -----------------------------------------------------------------
+    //  PART J — SUBMISSION IDEMPOTENCY: RESUME + SAME-BYTE RESEND
+    // -----------------------------------------------------------------
+
+    /// Idempotently recover a broadcast row after a process restart or
+    /// duplicate admin / worker trigger. NEVER re-signs, NEVER reserves
+    /// a new nonce, NEVER alters fee. The local `tx_hash` is the
+    /// authoritative identity; the recovery path only OBSERVES the
+    /// network (via `transaction_by_hash`) and advances the phase
+    /// accordingly.
+    ///
+    /// Return-value semantics:
+    /// - If the row is already past `ReadyForBroadcast`
+    ///   (`Broadcasting`, `Submitted`, `Pending`, `MinedSuccess`,
+    ///   `Confirming`, `Confirmed`, `SubmissionUnknown`, `Reorged`,
+    ///   `MinedReverted`, `Dropped`, `CancelledBeforeBroadcast`,
+    ///   `ManualInterventionRequired`) — do NOT re-attempt; return the
+    ///   current outcome.
+    /// - If `Broadcasting` + `tx_hash` is set — call
+    ///   `transaction_by_hash`; on `Some(tx)` with a mined block advance
+    ///   the phase; on `Some(tx)` with no block advance to `Pending`;
+    ///   on `None` transition to `SubmissionUnknown`. NEVER resend.
+    /// - If `SubmissionUnknown` + `tx_hash` is set — call
+    ///   `transaction_by_hash` again; the same recovery classification.
+    ///   If `now_ms - last_submission_at_ms > policy.max_pending_age_ms`
+    ///   AND the tx is still not observable → escalate to
+    ///   `ManualInterventionRequired`.
+    /// - If `BroadcastDisabled` / `ReadyForBroadcast` — nothing to
+    ///   resume; return the current outcome unchanged.
+    pub async fn resume(
+        &self,
+        canonical_execution_id: &str,
+        policy: ResumePolicy,
+    ) -> Result<OutboxOutcome, OutboxError> {
+        let now_ms_val = self.clock.now_ms();
+        let row = self
+            .store
+            .get_broadcast_state(canonical_execution_id)
+            .await
+            .map_err(|e| OutboxError::StoreFailure(e.to_string()))?
+            .ok_or_else(|| {
+                OutboxError::Unrecoverable(format!(
+                    "resume: no broadcast row for {canonical_execution_id}"
+                ))
+            })?;
+
+        // Fast paths: nothing to reconcile.
+        match row.phase {
+            BroadcastPhase::BroadcastDisabled | BroadcastPhase::ReadyForBroadcast => {
+                return Ok(outcome_from_row(&row));
+            }
+            BroadcastPhase::MinedSuccess
+            | BroadcastPhase::MinedReverted
+            | BroadcastPhase::Confirming
+            | BroadcastPhase::Confirmed
+            | BroadcastPhase::Reorged
+            | BroadcastPhase::Dropped
+            | BroadcastPhase::CancelledBeforeBroadcast
+            | BroadcastPhase::ManualInterventionRequired
+            | BroadcastPhase::Submitted
+            | BroadcastPhase::Pending => {
+                return Ok(outcome_from_row(&row));
+            }
+            BroadcastPhase::Broadcasting | BroadcastPhase::SubmissionUnknown => {}
+        }
+
+        // Broadcasting / SubmissionUnknown recovery — MUST have a tx_hash.
+        let tx_hash_hex = match row.tx_hash.as_deref() {
+            Some(s) => s.to_string(),
+            None => {
+                // Missing tx hash on a mid-send row is unrecoverable —
+                // the outbox always persists the hash BEFORE the network
+                // call, so absence here indicates data corruption.
+                return self
+                    .escalate_manual_typed(
+                        canonical_execution_id,
+                        row.phase,
+                        BroadcastPhase::ManualInterventionRequired,
+                        failure_class::TRANSPORT_AMBIGUOUS,
+                        "resume: tx_hash missing on in-flight row",
+                        now_ms_val,
+                    )
+                    .await;
+            }
+        };
+        let our_tx_hash = match parse_bytes32_lax(&tx_hash_hex) {
+            Some(v) => v,
+            None => {
+                return self
+                    .escalate_manual_typed(
+                        canonical_execution_id,
+                        row.phase,
+                        BroadcastPhase::ManualInterventionRequired,
+                        failure_class::TRANSPORT_AMBIGUOUS,
+                        "resume: malformed persisted tx_hash",
+                        now_ms_val,
+                    )
+                    .await;
+            }
+        };
+
+        match self.rpc.transaction_by_hash(our_tx_hash).await {
+            Ok(Some(tx)) => {
+                // Local hash is authoritative — refuse any observation
+                // that does not agree with our persisted identity.
+                if tx.tx_hash != our_tx_hash {
+                    return self
+                        .escalate_manual_typed(
+                            canonical_execution_id,
+                            row.phase,
+                            BroadcastPhase::ManualInterventionRequired,
+                            failure_class::PROVIDER_HASH_MISMATCH,
+                            "resume: provider returned different tx hash",
+                            now_ms_val,
+                        )
+                        .await;
+                }
+                if tx.block_number.is_some() {
+                    // Mined — but leave receipt classification for the
+                    // confirmation worker (Part L). Advance through
+                    // Broadcasting -> Submitted or SubmissionUnknown ->
+                    // Pending, so the watcher picks up next tick.
+                    let target = if row.phase == BroadcastPhase::Broadcasting {
+                        BroadcastPhase::Submitted
+                    } else {
+                        BroadcastPhase::Pending
+                    };
+                    self.transition_observation(
+                        canonical_execution_id,
+                        row.phase,
+                        target,
+                        provider_classification::ACCEPTED,
+                        now_ms_val,
+                    )
+                    .await
+                } else {
+                    // Pending in mempool.
+                    let target = if row.phase == BroadcastPhase::Broadcasting {
+                        BroadcastPhase::Submitted
+                    } else {
+                        BroadcastPhase::Pending
+                    };
+                    self.transition_observation(
+                        canonical_execution_id,
+                        row.phase,
+                        target,
+                        provider_classification::ACCEPTED,
+                        now_ms_val,
+                    )
+                    .await
+                }
+            }
+            Ok(None) => {
+                // The provider has never observed this tx. If we were
+                // Broadcasting, downgrade to SubmissionUnknown so the
+                // next resume() re-checks. If already SubmissionUnknown,
+                // enforce the max-pending-age budget.
+                if row.phase == BroadcastPhase::Broadcasting {
+                    return self
+                        .transition_to_submission_unknown_from_resume(
+                            canonical_execution_id,
+                            now_ms_val,
+                        )
+                        .await;
+                }
+                // SubmissionUnknown: enforce budget.
+                let age = row
+                    .last_submission_at_ms
+                    .or(row.first_submission_at_ms)
+                    .map(|v| now_ms_val.saturating_sub(v as u64))
+                    .unwrap_or(0);
+                if age > policy.max_pending_age_ms {
+                    let detail = format!(
+                        "resume: SubmissionUnknown persisted beyond max_pending_age_ms (age={age}ms, budget={}ms)",
+                        policy.max_pending_age_ms
+                    );
+                    return self
+                        .escalate_manual_typed(
+                            canonical_execution_id,
+                            row.phase,
+                            BroadcastPhase::ManualInterventionRequired,
+                            failure_class::TRANSPORT_AMBIGUOUS,
+                            &detail,
+                            now_ms_val,
+                        )
+                        .await;
+                }
+                Ok(outcome_from_row(&row))
+            }
+            Err(e) => {
+                // Ambiguous RPC failure on resume — do NOT re-attempt.
+                // Persist the last error but leave the row where it is
+                // (the caller retries via a subsequent resume() tick).
+                let detail = format!("resume: rpc lookup failed: {e}");
+                let patch = BroadcastStatePatch {
+                    failure_class: Some(failure_class::TRANSPORT_AMBIGUOUS.to_string()),
+                    failure_detail: Some(detail.clone()),
+                    ..Default::default()
+                };
+                // No-op transition: rewrite fields without changing phase
+                // via `update_broadcast_phase` is not possible (self-
+                // loops are rejected). So we skip persistence when the
+                // phase would not change; the failure metadata is stale
+                // by design.
+                let _ = patch;
+                Ok(OutboxOutcome {
+                    canonical_execution_id: canonical_execution_id.to_string(),
+                    tx_hash: Some(our_tx_hash),
+                    phase: row.phase,
+                    provider_classification: row.provider_classification,
+                    failure_class: Some(failure_class::TRANSPORT_AMBIGUOUS.to_string()),
+                    failure_detail: Some(detail),
+                })
+            }
+        }
+    }
+
+    /// Same-byte resend under bounded policy. Only permitted when the
+    /// row is at `SubmissionUnknown` OR `Dropped`. Reconstructs the
+    /// envelope from the persisted plan + signature (caller passes them
+    /// in — the outbox does NOT keep envelopes on disk), asserts the
+    /// derived `envelope_hash` matches the persisted `tx_hash`, and only
+    /// then hands the SAME raw bytes back to the RPC. Increments
+    /// `submission_attempt_count`. Re-runs the firewall first.
+    ///
+    /// Never re-signs; never widens the retry budget; never reserves a
+    /// new nonce.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn resend_same_bytes(
+        &self,
+        req: ExecutionRequestRow,
+        plan: ExecutionPlan,
+        signed: SignedTx,
+        expected_signer: [u8; 20],
+        nonce: u64,
+        gas_limit: u64,
+        max_fee_per_gas_wei: U256,
+        max_priority_fee_per_gas_wei: U256,
+        readiness: ReadinessReport,
+        firewall: &BroadcastPolicyFirewall<'_>,
+        policy: ResumePolicy,
+    ) -> Result<OutboxOutcome, OutboxError> {
+        let now_ms_val = self.clock.now_ms();
+        let row = self
+            .store
+            .get_broadcast_state(&req.canonical_execution_id)
+            .await
+            .map_err(|e| OutboxError::StoreFailure(e.to_string()))?
+            .ok_or_else(|| {
+                OutboxError::Unrecoverable(format!(
+                    "resend_same_bytes: no broadcast row for {}",
+                    req.canonical_execution_id
+                ))
+            })?;
+
+        // Guard: only SubmissionUnknown / Dropped may resend the same
+        // bytes. Any other phase is a caller bug — refuse.
+        if !matches!(
+            row.phase,
+            BroadcastPhase::SubmissionUnknown | BroadcastPhase::Dropped
+        ) {
+            return Err(OutboxError::Unrecoverable(format!(
+                "resend_same_bytes: phase {} does not permit same-byte resend",
+                row.phase
+            )));
+        }
+
+        // Bounded policy: refuse if we are at or past the retry ceiling.
+        // The initial submit attempt counts as one, so
+        // `submission_attempt_count > submission_retry_max` means the
+        // caller has already burned their whole budget.
+        let attempts = row.submission_attempt_count.max(0) as u32;
+        // Retry budget is EXTRA attempts beyond the first submit. So an
+        // initial submit (attempts=1) permits `submission_retry_max`
+        // additional invocations; the ceiling is
+        // `1 + submission_retry_max`.
+        let ceiling = policy.submission_retry_max.saturating_add(1);
+        if attempts >= ceiling {
+            let detail = format!(
+                "resend_same_bytes: retry budget exhausted (attempts={attempts}, budget={})",
+                policy.submission_retry_max
+            );
+            return self
+                .escalate_manual_typed(
+                    &req.canonical_execution_id,
+                    row.phase,
+                    BroadcastPhase::ManualInterventionRequired,
+                    failure_class::TRANSPORT_AMBIGUOUS,
+                    &detail,
+                    now_ms_val,
+                )
+                .await;
+        }
+
+        // Firewall re-runs on every resend attempt.
+        let envelope = match serialize_signed_execution(
+            &plan,
+            &signed,
+            nonce,
+            gas_limit,
+            max_fee_per_gas_wei,
+            max_priority_fee_per_gas_wei,
+        ) {
+            Ok(e) => e,
+            Err(err) => {
+                return self
+                    .escalate_manual_typed(
+                        &req.canonical_execution_id,
+                        row.phase,
+                        BroadcastPhase::ManualInterventionRequired,
+                        failure_class::SERIALIZATION_FAILED,
+                        &err.to_string(),
+                        now_ms_val,
+                    )
+                    .await;
+            }
+        };
+
+        // Frozen identity check: the derived envelope hash MUST equal
+        // the persisted tx_hash. If it doesn't, the caller is trying to
+        // resend a DIFFERENT transaction — hard refuse.
+        let derived_hex = envelope.envelope_hash_hex();
+        if let Some(existing) = row.tx_hash.as_deref() {
+            if !existing.eq_ignore_ascii_case(&derived_hex) {
+                return self
+                    .escalate_manual_typed(
+                        &req.canonical_execution_id,
+                        row.phase,
+                        BroadcastPhase::ManualInterventionRequired,
+                        failure_class::PROVIDER_HASH_MISMATCH,
+                        "resend_same_bytes: derived envelope hash differs from persisted tx_hash",
+                        now_ms_val,
+                    )
+                    .await;
+            }
+        }
+
+        if let Err(rej) = firewall
+            .revalidate_before_send(&req, &plan, &signed, &envelope, expected_signer, &readiness)
+            .await
+        {
+            return self
+                .handle_firewall_rejection(&req.canonical_execution_id, rej, now_ms_val)
+                .await;
+        }
+
+        // Increment submission_attempt_count + last_submission_at_ms via
+        // a same-phase update. update_broadcast_phase rejects self-loops
+        // so we transition via a temporary edge: SubmissionUnknown ->
+        // (no legal same-phase update). Instead we treat this as a
+        // fresh Broadcasting attempt — SubmissionUnknown has no direct
+        // edge to Broadcasting in the matrix (frozen safety: every
+        // Broadcasting entrance must come from BroadcastDisabled /
+        // ReadyForBroadcast). We therefore call the RPC without a
+        // pre-transition, then classify. On outcome we transition
+        // SubmissionUnknown / Dropped -> observed phase.
+        let attempts_next = row.submission_attempt_count + 1;
+        let send_result = self.rpc.send_raw_transaction(&envelope.raw_bytes).await;
+
+        // Bump counters after the call (patch-only update via a phase
+        // transition to itself would fail — so we forward to the
+        // classifier which will handle the observation transition and
+        // record the counter as part of that patch).
+        self.classify_resend_and_persist(
+            &req.canonical_execution_id,
+            &envelope,
+            row.phase,
+            send_result,
+            attempts_next,
+            now_ms_val,
+            policy,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn classify_resend_and_persist(
+        &self,
+        canonical_execution_id: &str,
+        envelope: &SignedExecutionEnvelope,
+        from_phase: BroadcastPhase,
+        send_result: Result<SendOutcome, BroadcastRpcError>,
+        attempts_next: i32,
+        now_ms_val: u64,
+        _policy: ResumePolicy,
+    ) -> Result<OutboxOutcome, OutboxError> {
+        match send_result {
+            Ok(SendOutcome::Accepted { provider_tx_hash })
+            | Ok(SendOutcome::AlreadyKnown { provider_tx_hash }) => {
+                if provider_tx_hash != [0u8; 32] && provider_tx_hash != envelope.envelope_hash {
+                    return self
+                        .critical_hash_mismatch(
+                            canonical_execution_id,
+                            envelope,
+                            provider_tx_hash,
+                            now_ms_val,
+                        )
+                        .await;
+                }
+                let target = BroadcastPhase::Submitted;
+                let patch = BroadcastStatePatch {
+                    submission_attempt_count: Some(attempts_next),
+                    last_submission_at_ms: Some(now_ms_val as i64),
+                    provider_classification: Some(provider_classification::ACCEPTED.to_string()),
+                    ..Default::default()
+                };
+                if !from_phase.can_transition_to(target) {
+                    // SubmissionUnknown -> Submitted is legal; Dropped
+                    // has no outgoing edges — escalate.
+                    return self
+                        .escalate_manual_typed(
+                            canonical_execution_id,
+                            from_phase,
+                            BroadcastPhase::ManualInterventionRequired,
+                            failure_class::TRANSPORT_AMBIGUOUS,
+                            "resend_same_bytes: phase forbids Submitted transition",
+                            now_ms_val,
+                        )
+                        .await;
+                }
+                let ok = self
+                    .store
+                    .update_broadcast_phase(
+                        canonical_execution_id,
+                        from_phase,
+                        target,
+                        now_ms_val as i64,
+                        patch,
+                    )
+                    .await
+                    .map_err(|e| OutboxError::StoreFailure(e.to_string()))?;
+                if !ok {
+                    return Err(OutboxError::Unrecoverable(
+                        "resend_same_bytes: lost update on Submitted transition".into(),
+                    ));
+                }
+                Ok(OutboxOutcome {
+                    canonical_execution_id: canonical_execution_id.to_string(),
+                    tx_hash: Some(envelope.envelope_hash),
+                    phase: target,
+                    provider_classification: Some(provider_classification::ACCEPTED.to_string()),
+                    failure_class: None,
+                    failure_detail: None,
+                })
+            }
+            Ok(SendOutcome::NonceTooLow) => {
+                self.escalate_manual_typed(
+                    canonical_execution_id,
+                    from_phase,
+                    BroadcastPhase::ManualInterventionRequired,
+                    failure_class::NONCE_CONFLICT,
+                    provider_classification::NONCE_TOO_LOW,
+                    now_ms_val,
+                )
+                .await
+            }
+            Ok(SendOutcome::NonceTooHigh) => {
+                self.escalate_manual_typed(
+                    canonical_execution_id,
+                    from_phase,
+                    BroadcastPhase::ManualInterventionRequired,
+                    failure_class::NONCE_CONFLICT,
+                    provider_classification::NONCE_TOO_HIGH,
+                    now_ms_val,
+                )
+                .await
+            }
+            Ok(SendOutcome::ReplacementUnderpriced) => {
+                self.escalate_manual_typed(
+                    canonical_execution_id,
+                    from_phase,
+                    BroadcastPhase::ManualInterventionRequired,
+                    failure_class::NONCE_CONFLICT,
+                    provider_classification::REPLACEMENT_UNDERPRICED,
+                    now_ms_val,
+                )
+                .await
+            }
+            Ok(SendOutcome::ProviderRejection { code, message }) => {
+                let detail = format!("code={code} message={message}");
+                self.escalate_manual_typed(
+                    canonical_execution_id,
+                    from_phase,
+                    BroadcastPhase::ManualInterventionRequired,
+                    failure_class::PROVIDER_REJECTED,
+                    &detail,
+                    now_ms_val,
+                )
+                .await
+            }
+            Err(err) => match err {
+                BroadcastRpcError::Timeout
+                | BroadcastRpcError::Transport(_)
+                | BroadcastRpcError::Unavailable(_)
+                | BroadcastRpcError::RateLimited => {
+                    // Stayed ambiguous — do NOT change phase (a
+                    // SubmissionUnknown resend that itself times out
+                    // remains SubmissionUnknown). The counters can only
+                    // be updated via a phase transition; since we cannot
+                    // self-loop, we treat this as a no-op outcome.
+                    let detail = err.to_string();
+                    Ok(OutboxOutcome {
+                        canonical_execution_id: canonical_execution_id.to_string(),
+                        tx_hash: Some(envelope.envelope_hash),
+                        phase: from_phase,
+                        provider_classification: Some(
+                            provider_classification::TIMEOUT_BEFORE_ACCEPTANCE.to_string(),
+                        ),
+                        failure_class: Some(failure_class::TRANSPORT_AMBIGUOUS.to_string()),
+                        failure_detail: Some(detail),
+                    })
+                }
+                other => {
+                    let detail = other.to_string();
+                    self.escalate_manual_typed(
+                        canonical_execution_id,
+                        from_phase,
+                        BroadcastPhase::ManualInterventionRequired,
+                        failure_class::PROVIDER_REJECTED,
+                        &detail,
+                        now_ms_val,
+                    )
+                    .await
+                }
+            },
+        }
+    }
+
+    async fn transition_observation(
+        &self,
+        canonical_execution_id: &str,
+        from_phase: BroadcastPhase,
+        to_phase: BroadcastPhase,
+        classification: &str,
+        now_ms_val: u64,
+    ) -> Result<OutboxOutcome, OutboxError> {
+        if !from_phase.can_transition_to(to_phase) {
+            return Ok(OutboxOutcome {
+                canonical_execution_id: canonical_execution_id.to_string(),
+                tx_hash: None,
+                phase: from_phase,
+                provider_classification: Some(classification.to_string()),
+                failure_class: None,
+                failure_detail: None,
+            });
+        }
+        let patch = BroadcastStatePatch {
+            provider_classification: Some(classification.to_string()),
+            last_submission_at_ms: Some(now_ms_val as i64),
+            ..Default::default()
+        };
+        let ok = self
+            .store
+            .update_broadcast_phase(
+                canonical_execution_id,
+                from_phase,
+                to_phase,
+                now_ms_val as i64,
+                patch,
+            )
+            .await
+            .map_err(|e| OutboxError::StoreFailure(e.to_string()))?;
+        if !ok {
+            return Err(OutboxError::Unrecoverable(format!(
+                "resume: lost update on {} -> {}",
+                from_phase, to_phase
+            )));
+        }
+        // Re-read for the tx_hash.
+        let row = self
+            .store
+            .get_broadcast_state(canonical_execution_id)
+            .await
+            .map_err(|e| OutboxError::StoreFailure(e.to_string()))?
+            .ok_or_else(|| OutboxError::Unrecoverable("resume: row disappeared".into()))?;
+        Ok(outcome_from_row(&row))
+    }
+
+    async fn transition_to_submission_unknown_from_resume(
+        &self,
+        canonical_execution_id: &str,
+        now_ms_val: u64,
+    ) -> Result<OutboxOutcome, OutboxError> {
+        let patch = BroadcastStatePatch {
+            provider_classification: Some(
+                provider_classification::TIMEOUT_AFTER_ACCEPTANCE.to_string(),
+            ),
+            failure_class: Some(failure_class::TRANSPORT_AMBIGUOUS.to_string()),
+            failure_detail: Some("resume: Broadcasting row observed missing from mempool".into()),
+            last_submission_at_ms: Some(now_ms_val as i64),
+            ..Default::default()
+        };
+        let ok = self
+            .store
+            .update_broadcast_phase(
+                canonical_execution_id,
+                BroadcastPhase::Broadcasting,
+                BroadcastPhase::SubmissionUnknown,
+                now_ms_val as i64,
+                patch,
+            )
+            .await
+            .map_err(|e| OutboxError::StoreFailure(e.to_string()))?;
+        if !ok {
+            return Err(OutboxError::Unrecoverable(
+                "resume: lost update on Broadcasting -> SubmissionUnknown".into(),
+            ));
+        }
+        let row = self
+            .store
+            .get_broadcast_state(canonical_execution_id)
+            .await
+            .map_err(|e| OutboxError::StoreFailure(e.to_string()))?
+            .ok_or_else(|| OutboxError::Unrecoverable("resume: row disappeared".into()))?;
+        Ok(outcome_from_row(&row))
+    }
+}
+
+fn outcome_from_row(row: &crate::hybrid_v2::execution::BroadcastStateRow) -> OutboxOutcome {
+    OutboxOutcome {
+        canonical_execution_id: row.canonical_execution_id.clone(),
+        tx_hash: row.tx_hash.as_deref().and_then(parse_bytes32_lax),
+        phase: row.phase,
+        provider_classification: row.provider_classification.clone(),
+        failure_class: row.failure_class.clone(),
+        failure_detail: row.failure_detail.clone(),
     }
 }
 

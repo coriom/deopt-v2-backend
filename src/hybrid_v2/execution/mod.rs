@@ -99,7 +99,7 @@ pub use broadcast_firewall::{
 };
 pub use broadcast_outbox::{
     failure_class as broadcast_failure_class, provider_classification, BroadcastOutbox,
-    OutboxError, OutboxOutcome,
+    OutboxError, OutboxOutcome, ResumePolicy,
 };
 pub use broadcast_rpc::{
     BlockHeader as BroadcastBlockHeader, BroadcastRpcError, ExecutionBroadcastRpcClient,
