@@ -642,6 +642,47 @@ pub trait HybridV2ProjectionStore: Send + Sync {
             "set_broadcast_tx_hash unimplemented for this store".to_string(),
         ))
     }
+
+    /// Read the indexer's most-recent canonical head for a deployment,
+    /// as observed on the persisted cursor. Used by the confirmation
+    /// worker's indexer correlation path to detect
+    /// `indexed_head < receipt_block` (i.e. the indexer is still
+    /// catching up to the block the receipt lives on).
+    async fn indexed_head_block(&self, _deployment_id: i64) -> Result<Option<u64>> {
+        Err(BackendError::Persistence(
+            "indexed_head_block unimplemented for this store".to_string(),
+        ))
+    }
+
+    /// Look up a matched execution row by its on-chain `tx_hash`. Used
+    /// by the confirmation worker to correlate a receipt to the indexer
+    /// projection before promoting a row to `Confirmed`.
+    ///
+    /// Returns `Ok(None)` when no row correlates; the caller distinguishes
+    /// "indexer not caught up" (via `indexed_head_block`) from "row
+    /// missing after tolerance ticks" (a fail-closed contradiction).
+    async fn get_matched_execution_by_tx_hash(
+        &self,
+        _deployment_id: i64,
+        _tx_hash: &str,
+    ) -> Result<Option<MatchedExecutionLookup>> {
+        Err(BackendError::Persistence(
+            "get_matched_execution_by_tx_hash unimplemented for this store".to_string(),
+        ))
+    }
+}
+
+/// Compact view of a matched execution row used by the indexer
+/// correlation checker. Distinguished from the reducer's
+/// `MatchedExecutionRow` because that struct is keyed on execution_id
+/// (not tx_hash) and does not surface a stable status token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatchedExecutionLookup {
+    pub matched_execution_id: String,
+    pub tx_hash: String,
+    pub block_number: u64,
+    /// `COMPLETE`, `INCOMPLETE`, or `INVALIDATED_BY_REORG`.
+    pub completion_status: String,
 }
 
 // -----------------------------------------------------------------
@@ -2581,6 +2622,52 @@ impl HybridV2ProjectionStore for PostgresHybridV2ProjectionStore {
         }
         Ok(())
     }
+
+    async fn indexed_head_block(&self, deployment_id: i64) -> Result<Option<u64>> {
+        let row = sqlx::query(
+            "SELECT MAX(indexed_head_block) AS ihb FROM hybrid_v2_cursors
+             WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(pg_err)?;
+        let Some(row) = row else { return Ok(None) };
+        let ihb: Option<i64> = row.try_get("ihb").ok();
+        match ihb {
+            Some(v) => Ok(Some(i64_to_u64("indexed_head_block", v)?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn get_matched_execution_by_tx_hash(
+        &self,
+        deployment_id: i64,
+        tx_hash: &str,
+    ) -> Result<Option<MatchedExecutionLookup>> {
+        let row = sqlx::query(
+            "SELECT execution_id, tx_hash, block_number, completion_status
+             FROM hybrid_v2_matched_executions
+             WHERE deployment_id = $1 AND tx_hash = $2
+             LIMIT 1",
+        )
+        .bind(deployment_id)
+        .bind(tx_hash)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(pg_err)?;
+        let Some(row) = row else { return Ok(None) };
+        let matched_execution_id: String = row.try_get("execution_id").map_err(pg_err)?;
+        let tx_hash_out: String = row.try_get("tx_hash").map_err(pg_err)?;
+        let block_number_i64: i64 = row.try_get("block_number").map_err(pg_err)?;
+        let completion_status: String = row.try_get("completion_status").map_err(pg_err)?;
+        Ok(Some(MatchedExecutionLookup {
+            matched_execution_id,
+            tx_hash: tx_hash_out,
+            block_number: i64_to_u64("block_number", block_number_i64)?,
+            completion_status,
+        }))
+    }
 }
 
 /// Row extractor for `hybrid_v2_broadcast_state`. NUMERIC columns are
@@ -4256,6 +4343,65 @@ impl InMemoryProjectionStore {
     pub fn reorg_events(&self) -> Vec<serde_json::Value> {
         self.inner.lock().unwrap().reorg_events.clone()
     }
+
+    /// Test-only helper: publish the indexed head for a deployment
+    /// (populates a synthetic `hybrid_v2_cursors` row so the broadcast
+    /// worker's `indexed_head_block()` returns the correct value).
+    pub fn set_indexed_head_for_test(&self, deployment_id: i64, indexed_head_block: u64) {
+        let mut inner = self.inner.lock().unwrap();
+        let key = (deployment_id, "test".to_string());
+        let snap = RuntimeCursorSnapshot {
+            cursor_name: "test".to_string(),
+            indexed_head_block,
+            indexed_head_hash: String::new(),
+            indexed_head_parent: String::new(),
+            observed_head_block: indexed_head_block,
+            finalized_head_block: indexed_head_block,
+            last_error: None,
+            reorg_count: 0,
+            max_reorg_depth_seen: 0,
+            decode_failures: 0,
+            projection_failures: 0,
+            unknown_canonical_events: 0,
+            last_success_block: indexed_head_block,
+        };
+        inner.cursors.insert(key, snap);
+    }
+
+    /// Test-only helper: insert one matched execution row for indexer
+    /// correlation testing. Overwrites when the `execution_id` is
+    /// already present.
+    pub fn insert_matched_execution_for_test(
+        &self,
+        deployment_id: i64,
+        execution_id: &str,
+        tx_hash: &str,
+        block_number: u64,
+        completion_status: crate::hybrid_v2::reducer::ExecutionCompletion,
+    ) {
+        let mut inner = self.inner.lock().unwrap();
+        let state = inner
+            .state_snapshots
+            .entry(deployment_id)
+            .or_insert_with(ProjectionState::default);
+        state.matched_executions.insert(
+            execution_id.to_string(),
+            crate::hybrid_v2::reducer::MatchedExecutionRow {
+                buyer_order_hash: String::new(),
+                seller_order_hash: String::new(),
+                buyer_subkey: String::new(),
+                seller_subkey: String::new(),
+                series_id: String::new(),
+                matched_qty_1e8: "0".into(),
+                premium_amount: "0".into(),
+                fee_amount: "0".into(),
+                rebate_amount: "0".into(),
+                block_number,
+                tx_hash: tx_hash.to_string(),
+                completion_status,
+            },
+        );
+    }
 }
 
 #[async_trait::async_trait]
@@ -5245,6 +5391,39 @@ impl HybridV2ProjectionStore for InMemoryProjectionStore {
         row.envelope_bytes_hash = Some(envelope_bytes_hash.to_string());
         row.updated_at_ms = now_ms;
         Ok(())
+    }
+
+    async fn indexed_head_block(&self, deployment_id: i64) -> Result<Option<u64>> {
+        let inner = self.inner.lock().unwrap();
+        let head = inner
+            .cursors
+            .iter()
+            .filter(|((d, _), _)| *d == deployment_id)
+            .map(|(_, s)| s.indexed_head_block)
+            .max();
+        Ok(head)
+    }
+
+    async fn get_matched_execution_by_tx_hash(
+        &self,
+        deployment_id: i64,
+        tx_hash: &str,
+    ) -> Result<Option<MatchedExecutionLookup>> {
+        let inner = self.inner.lock().unwrap();
+        let Some(state) = inner.state_snapshots.get(&deployment_id) else {
+            return Ok(None);
+        };
+        for (exec_id, row) in state.matched_executions.iter() {
+            if row.tx_hash.eq_ignore_ascii_case(tx_hash) {
+                return Ok(Some(MatchedExecutionLookup {
+                    matched_execution_id: exec_id.clone(),
+                    tx_hash: row.tx_hash.clone(),
+                    block_number: row.block_number,
+                    completion_status: row.completion_status.as_str().to_string(),
+                }));
+            }
+        }
+        Ok(None)
     }
 }
 

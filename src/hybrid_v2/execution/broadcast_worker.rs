@@ -576,6 +576,137 @@ impl BroadcastConfirmationWorker {
         let _ = (row, confirmations, head, now_ms_val);
         Ok(())
     }
+
+    // -----------------------------------------------------------------
+    //  Part P — Final confirmation rule
+    // -----------------------------------------------------------------
+
+    /// Return `Some(Confirmed)` ONLY when ALL final-confirmation
+    /// invariants hold:
+    ///   1. `receipt_status = 1` (MinedSuccess-derived);
+    ///   2. Canonical receipt (verify_canonical_receipt returned
+    ///      `Canonical`);
+    ///   3. Confirmation depth reached (`confirmations >=
+    ///      confirmation_depth`);
+    ///   4. `receipt_tx_hash == tx_hash`;
+    ///   5. Indexer has processed the receipt block;
+    ///   6. Correlation = `MatchedRowComplete`;
+    ///   7. Canonicality state = Canonical (no active REORGED transition);
+    ///   8. No contradictory persisted evidence.
+    ///
+    /// On success the row transitions `Confirming -> Confirmed` +
+    /// `terminal_at_ms` is stamped. Otherwise returns `Ok(None)` so the
+    /// worker keeps polling.
+    pub async fn maybe_finalize(
+        &self,
+        row: &BroadcastStateRow,
+    ) -> Result<Option<BroadcastPhase>, WorkerError> {
+        // 0. Row must currently be at Confirming to be a candidate. The
+        //    matrix does not permit a direct MinedSuccess -> Confirmed
+        //    edge, so callers must have already transitioned via
+        //    Confirming.
+        if row.phase != BroadcastPhase::Confirming {
+            return Ok(None);
+        }
+        // 1. Receipt status.
+        if row.receipt_status != Some(1) {
+            return Ok(None);
+        }
+        // Extract receipt-block metadata.
+        let receipt_block = match row.receipt_block_number {
+            Some(v) if v >= 0 => v as u64,
+            _ => return Err(WorkerError::RowMissingReceiptBlock),
+        };
+        let receipt_block_hash_hex = match row.receipt_block_hash.as_deref() {
+            Some(s) => s.to_string(),
+            None => return Err(WorkerError::RowMissingReceiptBlock),
+        };
+        let receipt_block_hash =
+            parse_bytes32_lax(&receipt_block_hash_hex).ok_or(WorkerError::MalformedReceipt(
+                format!("receipt_block_hash malformed: {receipt_block_hash_hex}"),
+            ))?;
+        // 4. receipt_tx_hash MUST equal tx_hash.
+        let our_tx_hash_hex = row
+            .tx_hash
+            .as_deref()
+            .ok_or(WorkerError::RowMissingTxHash)?;
+        if let Some(rtx) = row.receipt_tx_hash.as_deref() {
+            if !rtx.eq_ignore_ascii_case(our_tx_hash_hex) {
+                return Err(WorkerError::ReceiptTxHashMismatch {
+                    queried: our_tx_hash_hex.into(),
+                    received: rtx.into(),
+                });
+            }
+        } else {
+            return Ok(None);
+        }
+        // 2 + 7. Canonicality re-check.
+        let canonicality = self
+            .verify_canonical_receipt(receipt_block, receipt_block_hash)
+            .await?;
+        if !matches!(canonicality, CanonicalityStatus::Canonical) {
+            return Ok(None);
+        }
+        // 3. Confirmation depth reached.
+        let confirmations = self.compute_confirmations(receipt_block).await?;
+        if confirmations < self.confirmation_depth {
+            return Ok(None);
+        }
+        // 5 + 6. Indexer correlation.
+        let checker =
+            crate::hybrid_v2::execution::broadcast_indexer_correlation::IndexerCorrelationChecker {
+                store: self.store.as_ref(),
+                deployment_id: self.deployment_id,
+            };
+        let correlation = checker
+            .check(
+                &row.canonical_execution_id,
+                our_tx_hash_hex,
+                receipt_block,
+                false,
+            )
+            .await
+            .map_err(|e| WorkerError::Persistence(e.to_string()))?;
+        match correlation {
+            crate::hybrid_v2::execution::broadcast_indexer_correlation::CorrelationOutcome::MatchedRowComplete { .. } => {}
+            _ => return Ok(None),
+        }
+        // 8. No contradictory persisted evidence — canonicality_state
+        //    must not be ORPHANED / REORGED.
+        if matches!(row.canonicality_state.as_str(), "ORPHANED" | "REORGED") {
+            return Ok(None);
+        }
+        // Promote.
+        let target = BroadcastPhase::Confirmed;
+        if !row.phase.can_transition_to(target) {
+            return Ok(None);
+        }
+        let now_ms_val = self.clock.now_ms();
+        let patch = BroadcastStatePatch {
+            confirmation_count: Some(confirmations as i32),
+            canonicality_state: Some("CANONICAL".into()),
+            correlated_execution_status: Some("COMPLETE".into()),
+            terminal_at_ms: Some(now_ms_val as i64),
+            ..Default::default()
+        };
+        let ok = self
+            .store
+            .update_broadcast_phase(
+                &row.canonical_execution_id,
+                row.phase,
+                target,
+                now_ms_val as i64,
+                patch,
+            )
+            .await
+            .map_err(|e| WorkerError::Persistence(e.to_string()))?;
+        if !ok {
+            return Err(WorkerError::Persistence(
+                "maybe_finalize: lost update Confirming -> Confirmed".into(),
+            ));
+        }
+        Ok(Some(target))
+    }
 }
 
 // -----------------------------------------------------------------
