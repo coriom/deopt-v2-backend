@@ -165,3 +165,34 @@ required-features = ["test-signer"]
 name = "hybrid_v2_broadcast_lifecycle_pg_integration"
 path = "tests/hybrid_v2_broadcast_lifecycle_pg_integration.rs"
 required-features = ["test-signer"]
+
+# BACKEND-HYBRID-V2-BROADCAST-AND-CONFIRMATION-V1 (Package C, Part Q)
+# Transaction reorg recovery PG coverage: exercises the six deterministic
+# outcomes of BroadcastReorgRecovery against a real PostgreSQL store +
+# the shared MockBroadcastRpc harness. Never re-signs, never fee-bumps,
+# never reserves a fresh nonce.
+[[test]]
+name = "hybrid_v2_broadcast_reorg_recovery_pg_integration"
+path = "tests/hybrid_v2_broadcast_reorg_recovery_pg_integration.rs"
+required-features = ["test-signer"]
+
+# BACKEND-HYBRID-V2-BROADCAST-AND-CONFIRMATION-V1 (Package C, Part R)
+# Restart-safety PG coverage: for every broadcast phase, simulate a
+# crash by dropping the outbox/worker and rebuilding fresh instances
+# from the same PostgreSQL row. Asserts the tx_hash is preserved
+# byte-identically, no fresh nonce is reserved, and no re-signer call
+# is issued.
+[[test]]
+name = "hybrid_v2_broadcast_restart_pg_integration"
+path = "tests/hybrid_v2_broadcast_restart_pg_integration.rs"
+required-features = ["test-signer"]
+
+# BACKEND-HYBRID-V2-BROADCAST-AND-CONFIRMATION-V1 (Package C, Part S)
+# Admin PG coverage: /admin/hybrid_v2/deployments/*/executions/*/broadcast
+# and companion routes. Asserts admin token gating, structured 503 when
+# broadcast is disabled, bounded resend policy, sanitized status
+# response, and rejection of unknown fields at the JSON body boundary.
+[[test]]
+name = "hybrid_v2_broadcast_admin_pg_integration"
+path = "tests/hybrid_v2_broadcast_admin_pg_integration.rs"
+required-features = ["test-signer"]
