@@ -169,23 +169,29 @@ impl BroadcastPhase {
             (Submitted, MinedSuccess) => true,
             (Submitted, MinedReverted) => true,
             (Submitted, Dropped) => true,
+            (Submitted, Reorged) => true,
+            (Submitted, ManualInterventionRequired) => true,
 
             // PENDING
             (Pending, MinedSuccess) => true,
             (Pending, MinedReverted) => true,
             (Pending, Dropped) => true,
             (Pending, Reorged) => true,
+            (Pending, ManualInterventionRequired) => true,
 
             // MINED_SUCCESS
             (MinedSuccess, Confirming) => true,
             (MinedSuccess, Reorged) => true,
+            (MinedSuccess, ManualInterventionRequired) => true,
 
             // CONFIRMING
             (Confirming, Confirmed) => true,
             (Confirming, Reorged) => true,
+            (Confirming, ManualInterventionRequired) => true,
 
             // CONFIRMED — very rare deep reorg
             (Confirmed, Reorged) => true,
+            (Confirmed, ManualInterventionRequired) => true,
 
             // REORGED
             (Reorged, Pending) => true,
@@ -221,11 +227,24 @@ impl BroadcastPhase {
                 Dropped,
                 ManualInterventionRequired,
             ],
-            Submitted => &[Pending, MinedSuccess, MinedReverted, Dropped],
-            Pending => &[MinedSuccess, MinedReverted, Dropped, Reorged],
-            MinedSuccess => &[Confirming, Reorged],
-            Confirming => &[Confirmed, Reorged],
-            Confirmed => &[Reorged],
+            Submitted => &[
+                Pending,
+                MinedSuccess,
+                MinedReverted,
+                Dropped,
+                Reorged,
+                ManualInterventionRequired,
+            ],
+            Pending => &[
+                MinedSuccess,
+                MinedReverted,
+                Dropped,
+                Reorged,
+                ManualInterventionRequired,
+            ],
+            MinedSuccess => &[Confirming, Reorged, ManualInterventionRequired],
+            Confirming => &[Confirmed, Reorged, ManualInterventionRequired],
+            Confirmed => &[Reorged, ManualInterventionRequired],
             Reorged => &[Pending, Confirming, ManualInterventionRequired],
             MinedReverted | Dropped | CancelledBeforeBroadcast | ManualInterventionRequired => &[],
         }
