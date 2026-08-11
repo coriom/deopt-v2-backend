@@ -66,6 +66,11 @@ const ALLOWED_FILES: &[&str] = &[
     "src/hybrid_v2/execution/broadcast_nonce_policy.rs",
     "src/hybrid_v2/execution/broadcast_worker.rs",
     "src/hybrid_v2/execution/broadcast_indexer_correlation.rs",
+    // Package C (Part Q) — reorg recovery module observes the
+    // broadcast RPC (never invokes send_raw_transaction itself) and
+    // documents the recovery paths that reference the token in doc
+    // comments. The token appears in comments only.
+    "src/hybrid_v2/execution/broadcast_reorg_recovery.rs",
 ];
 
 fn crate_root() -> PathBuf {
