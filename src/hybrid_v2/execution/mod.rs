@@ -43,6 +43,15 @@ pub mod signer_production;
 pub mod simulator;
 pub mod state;
 pub mod target_policy;
+pub mod tx_serialization;
+
+// -----------------------------------------------------------------
+//   BACKEND-HYBRID-V2-BROADCAST-AND-CONFIRMATION-V1 (Package A)
+// -----------------------------------------------------------------
+// pub mod broadcast_firewall;
+// pub mod broadcast_outbox;
+// pub mod broadcast_rpc;
+// pub mod broadcast_state;
 
 #[cfg(any(test, feature = "test-signer"))]
 pub mod signer_ephemeral;
@@ -80,3 +89,16 @@ pub use signer_production::ProductionSignerUnavailable;
 pub use simulator::{ExecutionSimulator, SimulationError, SimulationOutcome};
 pub use state::{ExecutionPhase, PhaseParseError, PhaseTransitionError};
 pub use target_policy::{AllowedTarget, PolicyError, TargetPolicy};
+pub use tx_serialization::{
+    eip1559_preimage_hash, serialize_signed_execution, SignedExecutionEnvelope,
+    TxSerializationError,
+};
+
+// pub use broadcast_firewall::{BroadcastPolicyFirewall, BroadcastFirewallRejection};
+// pub use broadcast_outbox::{BroadcastOutbox, OutboxError, OutboxOutcome};
+// pub use broadcast_rpc::{
+//     BlockHeader as BroadcastBlockHeader, BroadcastRpcError, ExecutionBroadcastRpcClient,
+//     HttpExecutionBroadcastRpcClient, SendOutcome, TransactionSummary, TxReceipt,
+//     BROADCAST_ALLOWED_METHODS,
+// };
+// pub use broadcast_state::{BroadcastPhase, BroadcastPhaseParseError, BroadcastStatePatch, BroadcastStateRow};
