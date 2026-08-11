@@ -297,3 +297,31 @@ execution outcome vs the pre-broadcast row. That milestone MUST:
 ---
 
 Return value: **`BACKEND_HYBRID_V2_SIGNER_EXECUTION_DOCUMENTATION_COMPLETE`**.
+
+## Cross-reference — 2026-08-11
+
+The broadcast + confirmation surface predicted by the "Next milestone"
+section above landed in
+`BACKEND-HYBRID-V2-BROADCAST-AND-CONFIRMATION-V1` (Packages A + B + C
++ D). All bullet requirements are satisfied:
+- New RPC trait: `ExecutionBroadcastRpcClient`
+  (`src/hybrid_v2/execution/broadcast_rpc.rs:157`) — separate from
+  the pre-broadcast `ExecutionRpcClient`, preserving the compile-time
+  firewall.
+- Simulation freshness re-check:
+  `BroadcastPolicyFirewall::revalidate_before_send`
+  (`src/hybrid_v2/execution/broadcast_firewall.rs`).
+- Broadcast state machine: 14 phases including `Broadcasting`,
+  `Submitted`, `Pending`, `MinedSuccess`, `Confirming`, `Confirmed`,
+  `Reorged`, `Dropped`, `ManualInterventionRequired`,
+  `CancelledBeforeBroadcast` (`broadcast_state.rs`).
+- Bit-for-bit envelope check: `envelope_hash` persisted BEFORE the
+  network send; every subsequent observation (receipt, tx-by-hash,
+  provider tx hash) compared against it. Any mismatch is a critical
+  `MANUAL_INTERVENTION_REQUIRED`.
+
+Closure doc: `BACKEND_HYBRID_V2_BROADCAST_AND_CONFIRMATION_V1.md`.
+Security review:
+`BACKEND_HYBRID_V2_BROADCAST_AND_CONFIRMATION_V1_SECURITY_REVIEW.md`.
+This milestone performed NO real public-chain broadcast — every
+scenario used a deterministic in-process mock RPC.

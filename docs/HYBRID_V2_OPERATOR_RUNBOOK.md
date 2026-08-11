@@ -663,3 +663,116 @@ broadcast surface.
 - Admin API reference: `HYBRID_V2_ADMIN_API.md`.
 - Pattern C signer design: `MAINNET_BE_SIGNER_SERVICE_DESIGN.md`.
 
+## 19. Broadcast Operations — 2026-08-11
+
+Closure: `BACKEND_HYBRID_V2_BROADCAST_AND_CONFIRMATION_V1.md`.
+Security review:
+`BACKEND_HYBRID_V2_BROADCAST_AND_CONFIRMATION_V1_SECURITY_REVIEW.md`.
+
+**Frozen safety:** this milestone performed NO real public-chain
+broadcast. All tests used the deterministic in-process
+`MockBroadcastRpc`. Base mainnet chain id `8453` is refused at
+three independent gates (env validation, RPC constructor, wire
+helper). Every mock-based test asserts
+`broadcast_mock.write_method_calls()` contains ONLY
+`"eth_sendRawTransaction"`.
+
+### 19.1 Environment variables
+
+* `HV2_BROADCAST_ENABLED` (default `false`) — master switch. When
+  `false`, `AppState::hybrid_v2_broadcast_outbox = None` and admin
+  routes return a structured 503 including the
+  `hybrid_v2_broadcast_unavailable_reason`.
+* `HV2_BROADCAST_RPC_URL` — MANDATORY when `HV2_BROADCAST_ENABLED=true`.
+  Must be `https://...` (loopback `http://127.0.0.1:*` also accepted
+  for local integration testing). Never a Base mainnet endpoint.
+* `HV2_BROADCAST_RPC_TIMEOUT_MS` (bounded `[500, 60000]`, default `5000`).
+* `HV2_BROADCAST_RPC_MAX_RETRIES` (bounded `[0, 5]`, default `1`).
+  ONLY Timeout / Transport / Unavailable / RateLimited retry;
+  deterministic errors surface.
+* `HV2_BROADCAST_CONFIRMATION_DEPTH` (bounded `[1, 64]`, default `3`
+  for Base Sepolia).
+* `HV2_BROADCAST_RECEIPT_POLL_INTERVAL_MS` (bounded `[500, 30000]`,
+  default `2000`).
+* `HV2_BROADCAST_RECEIPT_POLL_TIMEOUT_MS` (bounded `[60000, 3600000]`,
+  default `300000`).
+* `HV2_BROADCAST_SUBMISSION_RETRY_MAX` (bounded `[0, 3]`, default `0`
+  — frozen posture: NO auto-retry).
+* `HV2_BROADCAST_TRANSIENT_RETRY_BACKOFF_MS` (bounded `[100, 10000]`,
+  default `500`).
+* `HV2_BROADCAST_MAX_PENDING_AGE_MS` (bounded `[60000, 86400000]`,
+  default `3600000` — one hour before a stuck `SubmissionUnknown`
+  escalates).
+* `HV2_BROADCAST_ALLOWED_CHAIN_IDS` (comma-separated, default `84532`
+  — Base Sepolia). Chain id `8453` is refused regardless.
+* `HV2_BROADCAST_PRE_SEND_HASH_PROBE` (default `false`).
+
+### 19.2 Admin API routes
+
+Every route below is gated by `AdminConfig::require_token` and
+refuses Base mainnet at handler entry. Full route + body reference:
+`HYBRID_V2_ADMIN_API.md`.
+
+* `POST /admin/hybrid_v2/deployments/:id/executions/:cid/broadcast`
+  — drives `outbox.resume(cid)`. Body: `{}` (deny_unknown_fields).
+  First-submission via plan+signed reconstruction is deferred to
+  `BACKEND-HYBRID-V2-BASE-SEPOLIA-EXECUTION-E2E-V1`.
+* `GET /admin/hybrid_v2/deployments/:id/executions/:cid/broadcast_status`
+  — sanitized broadcast row (no signature bytes, no raw envelope
+  bytes, no provider connection details).
+* `GET /admin/hybrid_v2/deployments/:id/broadcast_pending?limit=N`
+  — list rows in observable phases.
+* `POST /admin/hybrid_v2/deployments/:id/executions/:cid/broadcast_recheck`
+  — drives `worker.tick_single(cid)`. Body: `{}`.
+* `POST /admin/hybrid_v2/deployments/:id/executions/:cid/broadcast_resend_same_bytes`
+  — returns 503 (honest deferral pending plan hydrator).
+* `POST /admin/hybrid_v2/deployments/:id/executions/:cid/broadcast_manual_intervention`
+  — operator escalation to `MANUAL_INTERVENTION_REQUIRED`. Body:
+  `{ "action": "MARK_MANUAL", "detail": "..." }`.
+
+### 19.3 Failure classes and remediation
+
+* `PROVIDER_HASH_MISMATCH` — critical. The provider returned an
+  `Accepted` reply with a different tx hash than our envelope. The
+  row is terminal. Investigate provider misbehaviour; do NOT
+  attempt a resend.
+* `NONCE_CONFLICT_*` — nonce collision. Investigate
+  `signer.reserved_nonce`, on-chain nonce, and pending txs on the
+  signer address. Manual intervention required.
+* `PROVIDER_REJECTED` — RPC returned a JSON-RPC error. Inspect
+  `broadcast_status.failure_detail`.
+* `TRANSPORT_AMBIGUOUS` — Timeout / Transport / Unavailable →
+  `SubmissionUnknown`. The confirmation worker will re-poll via
+  `transaction_by_hash(envelope_hash)`. If unresolved after
+  `HV2_BROADCAST_MAX_PENDING_AGE_MS` the row escalates.
+* `RECEIPT_HASH_MISMATCH` — mined receipt's `tx_hash` disagrees
+  with our persisted envelope hash. Critical; row → MANUAL.
+* `CORRELATION_MISSING` — the row reached the confirmation depth
+  threshold but the indexer never observed a matched execution row.
+  Required for the final `Confirmed` transition (the "final rule").
+
+### 19.4 Deferred for Base Sepolia E2E
+
+* **Plan + signed reconstruction helper** — required for
+  `admin_broadcast_execution` first-submission path.
+* **Periodic worker tick spawn** — main.rs currently does NOT spawn
+  a long-running loop; every advancement is admin-triggered via
+  `broadcast_recheck`. Cancel-token + graceful-shutdown wiring lands
+  in the next milestone.
+* **Live broadcast provider bring-up** — an operator-owned Base
+  Sepolia endpoint replaces the mock in the follow-up CI job. Base
+  mainnet remains refused at every gate.
+
+### 19.5 Cross-references
+
+- Closure doc: `BACKEND_HYBRID_V2_BROADCAST_AND_CONFIRMATION_V1.md`.
+- Security review:
+  `BACKEND_HYBRID_V2_BROADCAST_AND_CONFIRMATION_V1_SECURITY_REVIEW.md`.
+- Admin API reference: `HYBRID_V2_ADMIN_API.md`.
+- Signer & Execution closure:
+  `BACKEND_HYBRID_V2_SIGNER_AND_EXECUTION_V1.md`.
+- External Signer + Live Orchestrator:
+  `BACKEND_HYBRID_V2_EXTERNAL_SIGNER_INTEGRATION_AND_LIVE_ORCHESTRATOR_V1.md`.
+- Production Signer Bootstrap:
+  `BACKEND_HYBRID_V2_PRODUCTION_SIGNER_BOOTSTRAP_AND_STARTUP_WIRING_V1.md`.
+

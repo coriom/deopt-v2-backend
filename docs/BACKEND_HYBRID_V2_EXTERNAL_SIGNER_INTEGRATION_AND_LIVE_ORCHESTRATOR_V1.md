@@ -219,8 +219,13 @@ existing ones fire correctly for external-signer failure modes.
   wiring milestone assembles it from `aws-config` and injects a
   fully-wired `HybridV2KmsSignerBridge`.
 - **Broadcast + confirmation.**
-  `BACKEND-HYBRID-V2-BROADCAST-AND-CONFIRMATION-V1` is the next
-  milestone.
+  `BACKEND-HYBRID-V2-BROADCAST-AND-CONFIRMATION-V1` — LANDED
+  2026-08-11 (Packages A + B + C + D). Closure:
+  `BACKEND_HYBRID_V2_BROADCAST_AND_CONFIRMATION_V1.md`. Security
+  review:
+  `BACKEND_HYBRID_V2_BROADCAST_AND_CONFIRMATION_V1_SECURITY_REVIEW.md`.
+  This milestone performed NO real public-chain broadcast; all
+  scenarios used a deterministic in-process mock RPC.
 - **Live signer connectivity smoke test.** The integration tests in
   this milestone all target the mock provider; a real staging KMS
   smoke is scoped to the operator-wiring milestone.

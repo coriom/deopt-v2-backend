@@ -205,11 +205,91 @@ signer-side secret material, raw request body.
 | `LOCK_CONTENTION` | Another op holds the deployment lock | Yes — retry later |
 | `STORE_FAILURE` | Postgres error | Check DB health |
 
+## Broadcast routes — 2026-08-11
+
+Added by `BACKEND-HYBRID-V2-BROADCAST-AND-CONFIRMATION-V1` Package D.
+Every route below is gated by `AdminConfig::require_token`, refuses
+Base mainnet at handler entry, and returns a structured 503 with the
+`hybrid_v2_broadcast_unavailable_reason` when broadcast is disabled
+or not wired.
+
+### `POST /admin/hybrid_v2/deployments/:id/executions/:cid/broadcast`
+
+Drives `BroadcastOutbox::resume(cid)`. Body: `{}` (deny_unknown_fields
+— any extra field returns 400). Response body includes the current
+`phase`, `tx_hash`, `provider_classification`, `failure_class`,
+`failure_detail`, and a `note` documenting that first-submission via
+plan+signed reconstruction is deferred to
+`BACKEND-HYBRID-V2-BASE-SEPOLIA-EXECUTION-E2E-V1`.
+
+### `GET /admin/hybrid_v2/deployments/:id/executions/:cid/broadcast_status`
+
+Returns a `SanitizedBroadcastRow`: canonical id, phase, tx hash,
+envelope hash, envelope bytes hash, submission attempt count,
+first / last submission timestamps, provider classification, receipt
+fields, gas fields, confirmation count, canonicality state, reorg
+count, failure class + detail, terminal timestamp. Excludes
+signature bytes, raw envelope bytes, provider connection details.
+
+### `GET /admin/hybrid_v2/deployments/:id/broadcast_pending?limit=N`
+
+Lists rows in observable phases (Submitted, Pending,
+SubmissionUnknown, MinedSuccess, Confirming, Reorged). Returns a
+`SanitizedBroadcastRow` array. `limit` bounded to `[1, 500]`.
+
+### `POST /admin/hybrid_v2/deployments/:id/executions/:cid/broadcast_recheck`
+
+Drives `BroadcastConfirmationWorker::tick_single(cid)`. Body: `{}`.
+Response returns the new `phase`. Never invokes any signer function
+and never sends a raw transaction; only receipt / tx-by-hash /
+block header lookups.
+
+### `POST /admin/hybrid_v2/deployments/:id/executions/:cid/broadcast_resend_same_bytes`
+
+Currently returns 503 with the wired-broadcast state — an honest
+deferral pending the plan hydrator scheduled for
+`BACKEND-HYBRID-V2-BASE-SEPOLIA-EXECUTION-E2E-V1`. The
+`BroadcastOutbox::resend_same_bytes` API itself is complete +
+tested; only the admin-route reconstruction step is deferred.
+
+Body: `{}`. Guard responses: 404 when no broadcast row exists; 409
+`RESEND_WRONG_PHASE` when the row is not `SubmissionUnknown` /
+`Dropped`; 409 `RESEND_BUDGET_EXHAUSTED` when
+`submission_attempt_count > submission_retry_max`.
+
+### `POST /admin/hybrid_v2/deployments/:id/executions/:cid/broadcast_manual_intervention`
+
+Operator escalation to `MANUAL_INTERVENTION_REQUIRED`. Body:
+`{ "action": "MARK_MANUAL", "detail": "<free-form operator note>" }`
+(deny_unknown_fields). Only `MARK_MANUAL` is accepted.
+
+## Broadcast failure classes
+
+| `failure_class` | Meaning | Retryable? |
+|---|---|---|
+| `PROVIDER_HASH_MISMATCH` | Provider `Accepted` with divergent tx hash | No — critical, investigate provider |
+| `NONCE_CONFLICT_NONCE_TOO_LOW` | On-chain nonce past the reserved value | No — inspect signer nonce |
+| `NONCE_CONFLICT_NONCE_TOO_HIGH` | Reserved nonce is future | No — wait / re-plan |
+| `NONCE_CONFLICT_REPLACEMENT_UNDERPRICED` | Higher-fee pending tx already occupies the slot | No — investigate |
+| `NONCE_CONFLICT_OUR_TX_*` | Investigator classified the situation | Case-by-case |
+| `PROVIDER_REJECTED` | Provider JSON-RPC error | Case-by-case |
+| `TRANSPORT_AMBIGUOUS` | Timeout / Transport / Unavailable | Yes — worker resume path |
+| `SERIALIZATION_FAILED` | Local envelope build error | No — data bug |
+| `FIREWALL_REJECTED` | Firewall revalidation rejected | Escalate |
+| `RECEIPT_HASH_MISMATCH` | Receipt tx hash disagrees with envelope hash | No — critical |
+| `CORRELATION_MISSING` | Depth threshold reached but no matched indexer row | Investigate indexer |
+| `ADMIN_MANUAL_INTERVENTION` | Operator-issued escalation | Manual |
+
 ## Cross-references
 
-- Runbook Section 17:
-  `docs/HYBRID_V2_OPERATOR_RUNBOOK.md § 17`.
+- Runbook Section 17: `docs/HYBRID_V2_OPERATOR_RUNBOOK.md § 17`.
+- Runbook Section 19 (broadcast operations):
+  `docs/HYBRID_V2_OPERATOR_RUNBOOK.md § 19`.
 - V1 closure:
   `docs/BACKEND_HYBRID_V2_SIGNER_AND_EXECUTION_V1.md`.
 - External signer closure:
   `docs/BACKEND_HYBRID_V2_EXTERNAL_SIGNER_INTEGRATION_AND_LIVE_ORCHESTRATOR_V1.md`.
+- Broadcast closure:
+  `docs/BACKEND_HYBRID_V2_BROADCAST_AND_CONFIRMATION_V1.md`.
+- Broadcast security review:
+  `docs/BACKEND_HYBRID_V2_BROADCAST_AND_CONFIRMATION_V1_SECURITY_REVIEW.md`.

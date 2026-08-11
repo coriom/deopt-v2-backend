@@ -244,3 +244,19 @@ Verdict: `BACKEND_HYBRID_V2_REMOTE_SIGNER_SERVICE_CUSTODY_BOUNDARY_VALIDATED`.
 - Base mainnet 8453 is refused at 3 layers: config validator,
   bootstrap probe (main.rs), and bridge boundary
   (`HybridV2KmsSignerBridge::sign_execution`).
+
+## Cross-reference — 2026-08-11
+
+`BACKEND-HYBRID-V2-BROADCAST-AND-CONFIRMATION-V1` extends the same
+`wire_hybrid_v2_execution_orchestrator` startup path with a sibling
+`wire_hybrid_v2_broadcast` helper (`src/hybrid_v2/startup.rs`) that
+constructs the `BroadcastOutbox` + `BroadcastConfirmationWorker` and
+attaches them to `AppState` via `with_hybrid_v2_broadcast(...)`. The
+broadcast wiring follows the identical three-outcome contract as the
+production signer wiring (`Ok(None)` / `Ok(Some(_))` / `Err(reason)`)
+and refuses Base mainnet at its own boundary in addition to the
+config validator + RPC constructor gates.
+
+Closure: `BACKEND_HYBRID_V2_BROADCAST_AND_CONFIRMATION_V1.md`.
+Security review:
+`BACKEND_HYBRID_V2_BROADCAST_AND_CONFIRMATION_V1_SECURITY_REVIEW.md`.
