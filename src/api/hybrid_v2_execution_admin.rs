@@ -1079,25 +1079,27 @@ pub async fn admin_broadcast_execution(
             "canonical_execution_id must be 0x-prefixed 32-byte hex",
         );
     }
-    if state.hybrid_v2_execution_orchestrator.is_none() {
+    // Package D — this handler drives `BroadcastOutbox::resume(...)`.
+    // The pre-broadcast orchestrator is a separate, independently-wired
+    // subsystem; a resume-only observation path needs the outbox but
+    // not the orchestrator. When the outbox is absent OR the broadcast
+    // config is missing, return the 503 sentinel below.
+    if state.hybrid_v2_broadcast_outbox.is_none() {
         let reason = state
-            .hybrid_v2_execution_unavailable_reason
+            .hybrid_v2_broadcast_unavailable_reason
             .clone()
-            .unwrap_or_else(|| "EXECUTION_ORCHESTRATOR_NOT_WIRED".to_string());
+            .or_else(|| state.hybrid_v2_execution_unavailable_reason.clone())
+            .unwrap_or_else(|| "BROADCAST_OUTBOX_NOT_WIRED".to_string());
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({
                 "error": "EXECUTION_ORCHESTRATOR_NOT_WIRED",
-                "detail": "no execution orchestrator wired to this AppState build",
+                "detail": "no broadcast outbox wired to this AppState build",
                 "availability": { "state": "NotConfigured", "reason": reason },
             })),
         )
             .into_response();
     }
-    let _cfg = match broadcast_config_or_disabled(&state) {
-        Ok(c) => c,
-        Err(resp) => return resp,
-    };
 
     // Read + validate the execution request row.
     let exec_row = match store.get_execution_request(&canonical_execution_id).await {
