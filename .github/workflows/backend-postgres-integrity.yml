@@ -20,6 +20,15 @@ on:
       - "tests/hybrid_v2_production_signer_app_restart_pg_integration.rs"
       - "tests/hybrid_v2_production_signer_full_startup_matrix_pg_integration.rs"
       - "tests/hybrid_v2_production_signer_support.rs"
+      - "tests/hybrid_v2_broadcast_foundation_pg_integration.rs"
+      - "tests/hybrid_v2_broadcast_lifecycle_pg_integration.rs"
+      - "tests/hybrid_v2_broadcast_reorg_recovery_pg_integration.rs"
+      - "tests/hybrid_v2_broadcast_restart_pg_integration.rs"
+      - "tests/hybrid_v2_broadcast_admin_pg_integration.rs"
+      - "tests/hybrid_v2_broadcast_full_matrix_pg_integration.rs"
+      - "tests/hybrid_v2_broadcast_properties.rs"
+      - "tests/hybrid_v2_broadcast_performance_bounds.rs"
+      - "tests/hybrid_v2_broadcast_mock_rpc.rs"
       - ".github/workflows/backend-postgres-integrity.yml"
   push:
     branches:
@@ -207,6 +216,52 @@ EOF
             cargo test --features test-signer --test "$suite" -- --test-threads=1
           done
           echo "EXTERNAL_SIGNER_CI_GATE_VALIDATED"
+
+      - name: Run BACKEND-HYBRID-V2-BROADCAST-AND-CONFIRMATION-V1 default-feature suites
+        env:
+          HYBRID_V2_PG_TEST_DATABASE_URL: postgres://deopt_ci:disposable_ci_pw@127.0.0.1:5432/deopt_hybrid_v2_disposable_ci
+          DEOPT_REQUIRE_PG_INTEGRATION: "1"
+        run: |
+          cd deopt-v2-backend || cd .
+          # BACKEND-HYBRID-V2-BROADCAST-AND-CONFIRMATION-V1 default-feature
+          # gate: the foundation binary exercises the persistence layer
+          # + narrow RPC allowlist without needing test-signer.
+          for suite in \
+              hybrid_v2_broadcast_foundation_pg_integration; do
+            PGPASSWORD=disposable_ci_pw psql -h 127.0.0.1 -U deopt_ci -d deopt_hybrid_v2_disposable_ci <<'EOF' >/dev/null
+DROP SCHEMA public CASCADE;
+CREATE SCHEMA public;
+GRANT ALL ON SCHEMA public TO PUBLIC;
+EOF
+            cargo test --test "$suite" -- --test-threads=1
+          done
+
+      - name: Run BACKEND-HYBRID-V2-BROADCAST-AND-CONFIRMATION-V1 test-signer suites
+        env:
+          HYBRID_V2_PG_TEST_DATABASE_URL: postgres://deopt_ci:disposable_ci_pw@127.0.0.1:5432/deopt_hybrid_v2_disposable_ci
+          DEOPT_REQUIRE_PG_INTEGRATION: "1"
+        run: |
+          cd deopt-v2-backend || cd .
+          # BACKEND-HYBRID-V2-BROADCAST-AND-CONFIRMATION-V1 Packages B+C+D.
+          # Every suite runs against the deterministic in-process
+          # MockBroadcastRpc; NO real public-chain traffic. Reset schema
+          # between suites so tests do not observe residual rows.
+          for suite in \
+              hybrid_v2_broadcast_lifecycle_pg_integration \
+              hybrid_v2_broadcast_reorg_recovery_pg_integration \
+              hybrid_v2_broadcast_restart_pg_integration \
+              hybrid_v2_broadcast_admin_pg_integration \
+              hybrid_v2_broadcast_full_matrix_pg_integration \
+              hybrid_v2_broadcast_properties \
+              hybrid_v2_broadcast_performance_bounds; do
+            PGPASSWORD=disposable_ci_pw psql -h 127.0.0.1 -U deopt_ci -d deopt_hybrid_v2_disposable_ci <<'EOF' >/dev/null
+DROP SCHEMA public CASCADE;
+CREATE SCHEMA public;
+GRANT ALL ON SCHEMA public TO PUBLIC;
+EOF
+            cargo test --features test-signer --test "$suite" -- --test-threads=1
+          done
+          echo "BROADCAST_CONFIRMATION_CI_GATE_VALIDATED"
 
       - name: Run BACKEND-HYBRID-V2-PRODUCTION-SIGNER-BOOTSTRAP-AND-STARTUP-WIRING-V1 test-signer suites
         env:
