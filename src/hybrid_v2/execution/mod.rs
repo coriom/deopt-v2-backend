@@ -51,7 +51,7 @@ pub mod tx_serialization;
 // pub mod broadcast_firewall;
 // pub mod broadcast_outbox;
 // pub mod broadcast_rpc;
-// pub mod broadcast_state;
+pub mod broadcast_state;
 
 #[cfg(any(test, feature = "test-signer"))]
 pub mod signer_ephemeral;
@@ -101,4 +101,6 @@ pub use tx_serialization::{
 //     HttpExecutionBroadcastRpcClient, SendOutcome, TransactionSummary, TxReceipt,
 //     BROADCAST_ALLOWED_METHODS,
 // };
-// pub use broadcast_state::{BroadcastPhase, BroadcastPhaseParseError, BroadcastStatePatch, BroadcastStateRow};
+pub use broadcast_state::{
+    BroadcastPhase, BroadcastPhaseParseError, BroadcastStatePatch, BroadcastStateRow,
+};

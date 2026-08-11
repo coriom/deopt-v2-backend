@@ -553,6 +553,95 @@ pub trait HybridV2ProjectionStore: Send + Sync {
             "get_reserved_nonces_for unimplemented for this store".to_string(),
         ))
     }
+
+    // -----------------------------------------------------------------
+    //  BACKEND-HYBRID-V2-BROADCAST-AND-CONFIRMATION-V1 (Part E)
+    //  Broadcast state — migration 0051.
+    // -----------------------------------------------------------------
+
+    /// Idempotently insert a `hybrid_v2_broadcast_state` row keyed on
+    /// `canonical_execution_id`. The initial phase is
+    /// `BROADCAST_DISABLED`; the outbox conditionally advances it.
+    /// Returns `Ok(true)` when the row was newly inserted, `Ok(false)`
+    /// on ON CONFLICT DO NOTHING.
+    async fn insert_broadcast_state(
+        &self,
+        _canonical_execution_id: &str,
+        _now_ms: i64,
+    ) -> Result<bool> {
+        Err(BackendError::Persistence(
+            "insert_broadcast_state unimplemented for this store".to_string(),
+        ))
+    }
+
+    /// Point read.
+    async fn get_broadcast_state(
+        &self,
+        _canonical_execution_id: &str,
+    ) -> Result<Option<crate::hybrid_v2::execution::BroadcastStateRow>> {
+        Err(BackendError::Persistence(
+            "get_broadcast_state unimplemented for this store".to_string(),
+        ))
+    }
+
+    /// Point read by tx_hash (0x-prefixed lowercase hex). Returns the
+    /// unique broadcast row that owns that hash if any.
+    async fn get_broadcast_state_by_tx_hash(
+        &self,
+        _tx_hash: &str,
+    ) -> Result<Option<crate::hybrid_v2::execution::BroadcastStateRow>> {
+        Err(BackendError::Persistence(
+            "get_broadcast_state_by_tx_hash unimplemented for this store".to_string(),
+        ))
+    }
+
+    /// Conditional forward phase update guarded by the state-machine
+    /// matrix (`can_transition_to`). Returns `Ok(true)` on success,
+    /// `Ok(false)` on lost update.
+    async fn update_broadcast_phase(
+        &self,
+        _canonical_execution_id: &str,
+        _from: crate::hybrid_v2::execution::BroadcastPhase,
+        _to: crate::hybrid_v2::execution::BroadcastPhase,
+        _now_ms: i64,
+        _patch: crate::hybrid_v2::execution::BroadcastStatePatch,
+    ) -> Result<bool> {
+        Err(BackendError::Persistence(
+            "update_broadcast_phase unimplemented for this store".to_string(),
+        ))
+    }
+
+    /// Deployment-scoped listing filtered by phase set. Ordered by
+    /// `updated_at_ms DESC`. Bounded by `limit` (defaulting to 100 if
+    /// `limit <= 0`).
+    async fn list_pending_broadcast_states(
+        &self,
+        _deployment_id: i64,
+        _phase_set: &[crate::hybrid_v2::execution::BroadcastPhase],
+        _limit: i64,
+    ) -> Result<Vec<crate::hybrid_v2::execution::BroadcastStateRow>> {
+        Err(BackendError::Persistence(
+            "list_pending_broadcast_states unimplemented for this store".to_string(),
+        ))
+    }
+
+    /// Set `tx_hash` + `envelope_hash` + `envelope_bytes_hash` on the
+    /// broadcast row. IMMUTABLE once set — enforced by the SQL trigger
+    /// (`hybrid_v2_broadcast_state_immutability_tr`) AND by the
+    /// in-memory store. A repeat call with the same hash is a no-op;
+    /// a divergent hash returns a `BackendError::Persistence`.
+    async fn set_broadcast_tx_hash(
+        &self,
+        _canonical_execution_id: &str,
+        _tx_hash: &str,
+        _envelope_hash: &str,
+        _envelope_bytes_hash: &str,
+        _now_ms: i64,
+    ) -> Result<()> {
+        Err(BackendError::Persistence(
+            "set_broadcast_tx_hash unimplemented for this store".to_string(),
+        ))
+    }
 }
 
 // -----------------------------------------------------------------
@@ -2270,6 +2359,268 @@ impl HybridV2ProjectionStore for PostgresHybridV2ProjectionStore {
         .map_err(pg_err)?;
         Ok(rows)
     }
+
+    // -----------------------------------------------------------------
+    //  BACKEND-HYBRID-V2-BROADCAST-AND-CONFIRMATION-V1 (Part E) — PG impls
+    // -----------------------------------------------------------------
+
+    async fn insert_broadcast_state(
+        &self,
+        canonical_execution_id: &str,
+        now_ms: i64,
+    ) -> Result<bool> {
+        let res = sqlx::query(
+            "INSERT INTO hybrid_v2_broadcast_state
+                (canonical_execution_id, phase, created_at_ms, updated_at_ms)
+             VALUES ($1, 'BROADCAST_DISABLED', $2, $2)
+             ON CONFLICT (canonical_execution_id) DO NOTHING",
+        )
+        .bind(canonical_execution_id)
+        .bind(now_ms)
+        .execute(&self.pool)
+        .await
+        .map_err(pg_err)?;
+        Ok(res.rows_affected() == 1)
+    }
+
+    async fn get_broadcast_state(
+        &self,
+        canonical_execution_id: &str,
+    ) -> Result<Option<crate::hybrid_v2::execution::BroadcastStateRow>> {
+        let row = sqlx::query(
+            "SELECT canonical_execution_id, tx_hash, envelope_hash, envelope_bytes_hash,
+                    phase, submission_attempt_count, first_submission_at_ms,
+                    last_submission_at_ms, provider_classification,
+                    receipt_tx_hash, receipt_block_number, receipt_block_hash,
+                    receipt_status, gas_used,
+                    effective_gas_price_wei::text AS effective_gas_price_wei_txt,
+                    actual_tx_cost_wei::text AS actual_tx_cost_wei_txt,
+                    confirmation_count, canonicality_state, correlated_execution_status,
+                    last_checked_head, last_checked_finalized_head, reorg_count,
+                    failure_class, failure_detail, terminal_at_ms,
+                    created_at_ms, updated_at_ms
+             FROM hybrid_v2_broadcast_state
+             WHERE canonical_execution_id = $1",
+        )
+        .bind(canonical_execution_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(pg_err)?;
+        row.map(row_to_broadcast_state).transpose()
+    }
+
+    async fn get_broadcast_state_by_tx_hash(
+        &self,
+        tx_hash: &str,
+    ) -> Result<Option<crate::hybrid_v2::execution::BroadcastStateRow>> {
+        let row = sqlx::query(
+            "SELECT canonical_execution_id, tx_hash, envelope_hash, envelope_bytes_hash,
+                    phase, submission_attempt_count, first_submission_at_ms,
+                    last_submission_at_ms, provider_classification,
+                    receipt_tx_hash, receipt_block_number, receipt_block_hash,
+                    receipt_status, gas_used,
+                    effective_gas_price_wei::text AS effective_gas_price_wei_txt,
+                    actual_tx_cost_wei::text AS actual_tx_cost_wei_txt,
+                    confirmation_count, canonicality_state, correlated_execution_status,
+                    last_checked_head, last_checked_finalized_head, reorg_count,
+                    failure_class, failure_detail, terminal_at_ms,
+                    created_at_ms, updated_at_ms
+             FROM hybrid_v2_broadcast_state
+             WHERE tx_hash = $1",
+        )
+        .bind(tx_hash)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(pg_err)?;
+        row.map(row_to_broadcast_state).transpose()
+    }
+
+    async fn update_broadcast_phase(
+        &self,
+        canonical_execution_id: &str,
+        from: crate::hybrid_v2::execution::BroadcastPhase,
+        to: crate::hybrid_v2::execution::BroadcastPhase,
+        now_ms: i64,
+        patch: crate::hybrid_v2::execution::BroadcastStatePatch,
+    ) -> Result<bool> {
+        if !from.can_transition_to(to) {
+            return Err(BackendError::Persistence(format!(
+                "illegal broadcast phase transition {} -> {}",
+                from.as_str(),
+                to.as_str()
+            )));
+        }
+        let res = sqlx::query(
+            "UPDATE hybrid_v2_broadcast_state SET
+                submission_attempt_count    = COALESCE($3, submission_attempt_count),
+                first_submission_at_ms      = COALESCE($4, first_submission_at_ms),
+                last_submission_at_ms       = COALESCE($5, last_submission_at_ms),
+                provider_classification     = COALESCE($6, provider_classification),
+                receipt_tx_hash             = COALESCE($7, receipt_tx_hash),
+                receipt_block_number        = COALESCE($8, receipt_block_number),
+                receipt_block_hash          = COALESCE($9, receipt_block_hash),
+                receipt_status              = COALESCE($10, receipt_status),
+                gas_used                    = COALESCE($11, gas_used),
+                effective_gas_price_wei     = COALESCE(CAST($12 AS NUMERIC), effective_gas_price_wei),
+                actual_tx_cost_wei          = COALESCE(CAST($13 AS NUMERIC), actual_tx_cost_wei),
+                confirmation_count          = COALESCE($14, confirmation_count),
+                canonicality_state          = COALESCE($15, canonicality_state),
+                correlated_execution_status = COALESCE($16, correlated_execution_status),
+                last_checked_head           = COALESCE($17, last_checked_head),
+                last_checked_finalized_head = COALESCE($18, last_checked_finalized_head),
+                reorg_count                 = COALESCE($19, reorg_count),
+                failure_class               = COALESCE($20, failure_class),
+                failure_detail              = COALESCE($21, failure_detail),
+                terminal_at_ms              = COALESCE($22, terminal_at_ms),
+                phase                       = $23,
+                updated_at_ms               = $24
+             WHERE canonical_execution_id = $1 AND phase = $2",
+        )
+        .bind(canonical_execution_id)
+        .bind(from.as_str())
+        .bind(patch.submission_attempt_count)
+        .bind(patch.first_submission_at_ms)
+        .bind(patch.last_submission_at_ms)
+        .bind(patch.provider_classification.as_deref())
+        .bind(patch.receipt_tx_hash.as_deref())
+        .bind(patch.receipt_block_number)
+        .bind(patch.receipt_block_hash.as_deref())
+        .bind(patch.receipt_status)
+        .bind(patch.gas_used)
+        .bind(patch.effective_gas_price_wei.as_deref())
+        .bind(patch.actual_tx_cost_wei.as_deref())
+        .bind(patch.confirmation_count)
+        .bind(patch.canonicality_state.as_deref())
+        .bind(patch.correlated_execution_status.as_deref())
+        .bind(patch.last_checked_head)
+        .bind(patch.last_checked_finalized_head)
+        .bind(patch.reorg_count)
+        .bind(patch.failure_class.as_deref())
+        .bind(patch.failure_detail.as_deref())
+        .bind(patch.terminal_at_ms)
+        .bind(to.as_str())
+        .bind(now_ms)
+        .execute(&self.pool)
+        .await
+        .map_err(pg_err)?;
+        Ok(res.rows_affected() == 1)
+    }
+
+    async fn list_pending_broadcast_states(
+        &self,
+        deployment_id: i64,
+        phase_set: &[crate::hybrid_v2::execution::BroadcastPhase],
+        limit: i64,
+    ) -> Result<Vec<crate::hybrid_v2::execution::BroadcastStateRow>> {
+        let effective_limit = if limit <= 0 { 100 } else { limit.min(10_000) };
+        if phase_set.is_empty() {
+            return Ok(Vec::new());
+        }
+        let phase_strs: Vec<&'static str> = phase_set.iter().map(|p| p.as_str()).collect();
+        let rows = sqlx::query(
+            "SELECT bs.canonical_execution_id, bs.tx_hash, bs.envelope_hash, bs.envelope_bytes_hash,
+                    bs.phase, bs.submission_attempt_count, bs.first_submission_at_ms,
+                    bs.last_submission_at_ms, bs.provider_classification,
+                    bs.receipt_tx_hash, bs.receipt_block_number, bs.receipt_block_hash,
+                    bs.receipt_status, bs.gas_used,
+                    bs.effective_gas_price_wei::text AS effective_gas_price_wei_txt,
+                    bs.actual_tx_cost_wei::text AS actual_tx_cost_wei_txt,
+                    bs.confirmation_count, bs.canonicality_state, bs.correlated_execution_status,
+                    bs.last_checked_head, bs.last_checked_finalized_head, bs.reorg_count,
+                    bs.failure_class, bs.failure_detail, bs.terminal_at_ms,
+                    bs.created_at_ms, bs.updated_at_ms
+             FROM hybrid_v2_broadcast_state bs
+             JOIN hybrid_v2_execution_requests er
+                 ON er.canonical_execution_id = bs.canonical_execution_id
+             WHERE er.deployment_id = $1 AND bs.phase = ANY($2)
+             ORDER BY bs.updated_at_ms DESC
+             LIMIT $3",
+        )
+        .bind(deployment_id)
+        .bind(&phase_strs[..])
+        .bind(effective_limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(pg_err)?;
+        rows.into_iter().map(row_to_broadcast_state).collect()
+    }
+
+    async fn set_broadcast_tx_hash(
+        &self,
+        canonical_execution_id: &str,
+        tx_hash: &str,
+        envelope_hash: &str,
+        envelope_bytes_hash: &str,
+        now_ms: i64,
+    ) -> Result<()> {
+        // The immutability trigger rejects a divergent overwrite as a
+        // hard exception. An idempotent re-write of the same hash is a
+        // no-op — the WHERE clause matches only the row with either
+        // NULL tx_hash OR the same tx_hash.
+        let res = sqlx::query(
+            "UPDATE hybrid_v2_broadcast_state
+                SET tx_hash = $2,
+                    envelope_hash = $3,
+                    envelope_bytes_hash = $4,
+                    updated_at_ms = $5
+              WHERE canonical_execution_id = $1
+                AND (tx_hash IS NULL OR tx_hash = $2)",
+        )
+        .bind(canonical_execution_id)
+        .bind(tx_hash)
+        .bind(envelope_hash)
+        .bind(envelope_bytes_hash)
+        .bind(now_ms)
+        .execute(&self.pool)
+        .await
+        .map_err(pg_err)?;
+        if res.rows_affected() == 0 {
+            return Err(BackendError::Persistence(format!(
+                "set_broadcast_tx_hash: no matching row or immutable hash conflict for {canonical_execution_id}"
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Row extractor for `hybrid_v2_broadcast_state`. NUMERIC columns are
+/// read as text via `::text` to avoid a `BigDecimal` dependency.
+fn row_to_broadcast_state(
+    row: sqlx::postgres::PgRow,
+) -> Result<crate::hybrid_v2::execution::BroadcastStateRow> {
+    use crate::hybrid_v2::execution::BroadcastPhase;
+    let phase_str: String = row.try_get("phase").map_err(pg_err)?;
+    let phase = BroadcastPhase::parse(&phase_str)
+        .map_err(|e| BackendError::Persistence(format!("unknown broadcast phase in row: {e}")))?;
+    Ok(crate::hybrid_v2::execution::BroadcastStateRow {
+        canonical_execution_id: row.try_get("canonical_execution_id").map_err(pg_err)?,
+        tx_hash: row.try_get("tx_hash").map_err(pg_err)?,
+        envelope_hash: row.try_get("envelope_hash").map_err(pg_err)?,
+        envelope_bytes_hash: row.try_get("envelope_bytes_hash").map_err(pg_err)?,
+        phase,
+        submission_attempt_count: row.try_get("submission_attempt_count").map_err(pg_err)?,
+        first_submission_at_ms: row.try_get("first_submission_at_ms").map_err(pg_err)?,
+        last_submission_at_ms: row.try_get("last_submission_at_ms").map_err(pg_err)?,
+        provider_classification: row.try_get("provider_classification").map_err(pg_err)?,
+        receipt_tx_hash: row.try_get("receipt_tx_hash").map_err(pg_err)?,
+        receipt_block_number: row.try_get("receipt_block_number").map_err(pg_err)?,
+        receipt_block_hash: row.try_get("receipt_block_hash").map_err(pg_err)?,
+        receipt_status: row.try_get("receipt_status").map_err(pg_err)?,
+        gas_used: row.try_get("gas_used").map_err(pg_err)?,
+        effective_gas_price_wei: row.try_get("effective_gas_price_wei_txt").map_err(pg_err)?,
+        actual_tx_cost_wei: row.try_get("actual_tx_cost_wei_txt").map_err(pg_err)?,
+        confirmation_count: row.try_get("confirmation_count").map_err(pg_err)?,
+        canonicality_state: row.try_get("canonicality_state").map_err(pg_err)?,
+        correlated_execution_status: row.try_get("correlated_execution_status").map_err(pg_err)?,
+        last_checked_head: row.try_get("last_checked_head").map_err(pg_err)?,
+        last_checked_finalized_head: row.try_get("last_checked_finalized_head").map_err(pg_err)?,
+        reorg_count: row.try_get("reorg_count").map_err(pg_err)?,
+        failure_class: row.try_get("failure_class").map_err(pg_err)?,
+        failure_detail: row.try_get("failure_detail").map_err(pg_err)?,
+        terminal_at_ms: row.try_get("terminal_at_ms").map_err(pg_err)?,
+        created_at_ms: row.try_get("created_at_ms").map_err(pg_err)?,
+        updated_at_ms: row.try_get("updated_at_ms").map_err(pg_err)?,
+    })
 }
 
 /// Row extractor for `hybrid_v2_execution_requests`. Numeric columns
@@ -3866,6 +4217,12 @@ struct InMemoryInner {
     next_execution_attempt_id: i64,
     // (chain_id, signer, nonce) -> (canonical_execution_id, reserved_at_ms, status)
     executor_nonces: std::collections::BTreeMap<(i64, String, i64), (Option<String>, i64, String)>,
+    // BACKEND-HYBRID-V2-BROADCAST-AND-CONFIRMATION-V1 (Part E):
+    // in-memory mirror of migration 0051 keyed on
+    // canonical_execution_id. `tx_hash` immutability + phase-guarded
+    // updates mirror the PG trigger semantics.
+    broadcast_states:
+        std::collections::BTreeMap<String, crate::hybrid_v2::execution::BroadcastStateRow>,
 }
 
 impl InMemoryProjectionStore {
@@ -4649,6 +5006,245 @@ impl HybridV2ProjectionStore for InMemoryProjectionStore {
             .collect();
         out.sort_unstable();
         Ok(out)
+    }
+
+    // -----------------------------------------------------------------
+    //  Broadcast state (in-memory mirror of migration 0051)
+    // -----------------------------------------------------------------
+
+    async fn insert_broadcast_state(
+        &self,
+        canonical_execution_id: &str,
+        now_ms: i64,
+    ) -> Result<bool> {
+        use crate::hybrid_v2::execution::{BroadcastPhase, BroadcastStateRow};
+        use std::collections::btree_map::Entry;
+        let mut inner = self.inner.lock().unwrap();
+        // FK parity: reject if the parent execution row is absent.
+        if !inner
+            .execution_requests
+            .contains_key(canonical_execution_id)
+        {
+            return Err(BackendError::Persistence(format!(
+                "insert_broadcast_state: no execution row for {canonical_execution_id}"
+            )));
+        }
+        match inner
+            .broadcast_states
+            .entry(canonical_execution_id.to_string())
+        {
+            Entry::Occupied(_) => Ok(false),
+            Entry::Vacant(v) => {
+                v.insert(BroadcastStateRow {
+                    canonical_execution_id: canonical_execution_id.to_string(),
+                    tx_hash: None,
+                    envelope_hash: None,
+                    envelope_bytes_hash: None,
+                    phase: BroadcastPhase::BroadcastDisabled,
+                    submission_attempt_count: 0,
+                    first_submission_at_ms: None,
+                    last_submission_at_ms: None,
+                    provider_classification: None,
+                    receipt_tx_hash: None,
+                    receipt_block_number: None,
+                    receipt_block_hash: None,
+                    receipt_status: None,
+                    gas_used: None,
+                    effective_gas_price_wei: None,
+                    actual_tx_cost_wei: None,
+                    confirmation_count: 0,
+                    canonicality_state: "UNKNOWN".to_string(),
+                    correlated_execution_status: None,
+                    last_checked_head: None,
+                    last_checked_finalized_head: None,
+                    reorg_count: 0,
+                    failure_class: None,
+                    failure_detail: None,
+                    terminal_at_ms: None,
+                    created_at_ms: now_ms,
+                    updated_at_ms: now_ms,
+                });
+                Ok(true)
+            }
+        }
+    }
+
+    async fn get_broadcast_state(
+        &self,
+        canonical_execution_id: &str,
+    ) -> Result<Option<crate::hybrid_v2::execution::BroadcastStateRow>> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner.broadcast_states.get(canonical_execution_id).cloned())
+    }
+
+    async fn get_broadcast_state_by_tx_hash(
+        &self,
+        tx_hash: &str,
+    ) -> Result<Option<crate::hybrid_v2::execution::BroadcastStateRow>> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner
+            .broadcast_states
+            .values()
+            .find(|r| r.tx_hash.as_deref() == Some(tx_hash))
+            .cloned())
+    }
+
+    async fn update_broadcast_phase(
+        &self,
+        canonical_execution_id: &str,
+        from: crate::hybrid_v2::execution::BroadcastPhase,
+        to: crate::hybrid_v2::execution::BroadcastPhase,
+        now_ms: i64,
+        patch: crate::hybrid_v2::execution::BroadcastStatePatch,
+    ) -> Result<bool> {
+        if !from.can_transition_to(to) {
+            return Err(BackendError::Persistence(format!(
+                "illegal broadcast phase transition {} -> {}",
+                from.as_str(),
+                to.as_str()
+            )));
+        }
+        let mut inner = self.inner.lock().unwrap();
+        let row = match inner.broadcast_states.get_mut(canonical_execution_id) {
+            Some(r) => r,
+            None => return Ok(false),
+        };
+        if row.phase != from {
+            return Ok(false);
+        }
+        if let Some(v) = patch.submission_attempt_count {
+            row.submission_attempt_count = v;
+        }
+        if let Some(v) = patch.first_submission_at_ms {
+            row.first_submission_at_ms = Some(v);
+        }
+        if let Some(v) = patch.last_submission_at_ms {
+            row.last_submission_at_ms = Some(v);
+        }
+        if let Some(v) = patch.provider_classification {
+            row.provider_classification = Some(v);
+        }
+        if let Some(v) = patch.receipt_tx_hash {
+            row.receipt_tx_hash = Some(v);
+        }
+        if let Some(v) = patch.receipt_block_number {
+            row.receipt_block_number = Some(v);
+        }
+        if let Some(v) = patch.receipt_block_hash {
+            row.receipt_block_hash = Some(v);
+        }
+        if let Some(v) = patch.receipt_status {
+            row.receipt_status = Some(v);
+        }
+        if let Some(v) = patch.gas_used {
+            row.gas_used = Some(v);
+        }
+        if let Some(v) = patch.effective_gas_price_wei {
+            row.effective_gas_price_wei = Some(v);
+        }
+        if let Some(v) = patch.actual_tx_cost_wei {
+            row.actual_tx_cost_wei = Some(v);
+        }
+        if let Some(v) = patch.confirmation_count {
+            row.confirmation_count = v;
+        }
+        if let Some(v) = patch.canonicality_state {
+            row.canonicality_state = v;
+        }
+        if let Some(v) = patch.correlated_execution_status {
+            row.correlated_execution_status = Some(v);
+        }
+        if let Some(v) = patch.last_checked_head {
+            row.last_checked_head = Some(v);
+        }
+        if let Some(v) = patch.last_checked_finalized_head {
+            row.last_checked_finalized_head = Some(v);
+        }
+        if let Some(v) = patch.reorg_count {
+            row.reorg_count = v;
+        }
+        if let Some(v) = patch.failure_class {
+            row.failure_class = Some(v);
+        }
+        if let Some(v) = patch.failure_detail {
+            row.failure_detail = Some(v);
+        }
+        if let Some(v) = patch.terminal_at_ms {
+            row.terminal_at_ms = Some(v);
+        }
+        row.phase = to;
+        row.updated_at_ms = now_ms;
+        Ok(true)
+    }
+
+    async fn list_pending_broadcast_states(
+        &self,
+        deployment_id: i64,
+        phase_set: &[crate::hybrid_v2::execution::BroadcastPhase],
+        limit: i64,
+    ) -> Result<Vec<crate::hybrid_v2::execution::BroadcastStateRow>> {
+        let inner = self.inner.lock().unwrap();
+        let mut out: Vec<_> = inner
+            .broadcast_states
+            .values()
+            .filter(|r| {
+                inner
+                    .execution_requests
+                    .get(&r.canonical_execution_id)
+                    .map(|er| er.deployment_id == deployment_id)
+                    .unwrap_or(false)
+                    && phase_set.contains(&r.phase)
+            })
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| b.updated_at_ms.cmp(&a.updated_at_ms));
+        if limit > 0 {
+            out.truncate(limit as usize);
+        }
+        Ok(out)
+    }
+
+    async fn set_broadcast_tx_hash(
+        &self,
+        canonical_execution_id: &str,
+        tx_hash: &str,
+        envelope_hash: &str,
+        envelope_bytes_hash: &str,
+        now_ms: i64,
+    ) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        let row = inner
+            .broadcast_states
+            .get_mut(canonical_execution_id)
+            .ok_or_else(|| {
+                BackendError::Persistence(format!(
+                    "set_broadcast_tx_hash: no row for {canonical_execution_id}"
+                ))
+            })?;
+        // Immutability: allow None -> Some, or Some(x) -> Some(x) (no-op).
+        // Reject Some(x) -> Some(y != x) as hard error.
+        for (field, existing, incoming) in [
+            ("tx_hash", row.tx_hash.as_deref(), tx_hash),
+            ("envelope_hash", row.envelope_hash.as_deref(), envelope_hash),
+            (
+                "envelope_bytes_hash",
+                row.envelope_bytes_hash.as_deref(),
+                envelope_bytes_hash,
+            ),
+        ] {
+            if let Some(existing) = existing {
+                if existing != incoming {
+                    return Err(BackendError::Persistence(format!(
+                        "hybrid_v2_broadcast_state.{field} is immutable once set (canonical_execution_id={canonical_execution_id})"
+                    )));
+                }
+            }
+        }
+        row.tx_hash = Some(tx_hash.to_string());
+        row.envelope_hash = Some(envelope_hash.to_string());
+        row.envelope_bytes_hash = Some(envelope_bytes_hash.to_string());
+        row.updated_at_ms = now_ms;
+        Ok(())
     }
 }
 
