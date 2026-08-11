@@ -52,6 +52,7 @@ pub mod broadcast_firewall;
 pub mod broadcast_indexer_correlation;
 pub mod broadcast_nonce_policy;
 pub mod broadcast_outbox;
+pub mod broadcast_reorg_recovery;
 pub mod broadcast_rpc;
 pub mod broadcast_state;
 pub mod broadcast_worker;
@@ -105,6 +106,9 @@ pub use broadcast_nonce_policy::{BroadcastNonceInvestigator, NonceInvestigationO
 pub use broadcast_outbox::{
     failure_class as broadcast_failure_class, provider_classification, BroadcastOutbox,
     OutboxError, OutboxOutcome, ResumePolicy,
+};
+pub use broadcast_reorg_recovery::{
+    reorg_failure_class, BroadcastReorgRecovery, ReorgRecoveryError, ReorgRecoveryOutcome,
 };
 pub use broadcast_rpc::{
     BlockHeader as BroadcastBlockHeader, BroadcastRpcError, ExecutionBroadcastRpcClient,
