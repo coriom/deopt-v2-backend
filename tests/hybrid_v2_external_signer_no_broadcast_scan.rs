@@ -48,13 +48,19 @@ const FORBIDDEN_TOKENS: &[&str] = &[
 /// extended for the external-signer integration surface. If a source
 /// file listed here disappears, the test fails loudly rather than
 /// silently passing on a scan of nothing.
+///
+/// `BACKEND-HYBRID-V2-PRODUCTION-SIGNER-BOOTSTRAP-AND-STARTUP-WIRING-V1`
+/// added `signer_http_transport.rs` and the `wire_hybrid_v2_execution_orchestrator`
+/// region of `src/main.rs`; both are covered here.
 const FILES_UNDER_SCAN: &[&str] = &[
     "src/hybrid_v2/execution/signer_kms_bridge.rs",
     "src/hybrid_v2/execution/signer_builder.rs",
+    "src/hybrid_v2/execution/signer_http_transport.rs",
     "src/hybrid_v2/config.rs",
     "src/api/hybrid_v2_execution_admin.rs",
     "src/hybrid_v2/execution/signer.rs",
     "src/hybrid_v2/execution/orchestrator.rs",
+    "src/main.rs",
 ];
 
 fn crate_root() -> PathBuf {

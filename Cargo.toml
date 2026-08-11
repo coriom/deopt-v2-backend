@@ -115,3 +115,11 @@ required-features = ["test-signer"]
 name = "hybrid_v2_external_signer_performance_bounds"
 path = "tests/hybrid_v2_external_signer_performance_bounds.rs"
 required-features = ["test-signer"]
+
+# BACKEND-HYBRID-V2-PRODUCTION-SIGNER-BOOTSTRAP-AND-STARTUP-WIRING-V1
+# Parts G + I — end-to-end HTTP transport + bridge round trip against
+# a local axum mock signer microservice.
+[[test]]
+name = "hybrid_v2_production_signer_http_e2e"
+path = "tests/hybrid_v2_production_signer_http_e2e.rs"
+required-features = ["test-signer"]
