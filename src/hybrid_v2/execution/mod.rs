@@ -53,6 +53,7 @@ pub mod broadcast_nonce_policy;
 pub mod broadcast_outbox;
 pub mod broadcast_rpc;
 pub mod broadcast_state;
+pub mod broadcast_worker;
 
 #[cfg(any(test, feature = "test-signer"))]
 pub mod signer_ephemeral;
@@ -110,4 +111,7 @@ pub use broadcast_rpc::{
 };
 pub use broadcast_state::{
     BroadcastPhase, BroadcastPhaseParseError, BroadcastStatePatch, BroadcastStateRow,
+};
+pub use broadcast_worker::{
+    BroadcastConfirmationWorker, CanonicalityStatus, WorkerCancel, WorkerError, WorkerTickOutcome,
 };
