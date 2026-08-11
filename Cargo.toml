@@ -145,3 +145,13 @@ required-features = ["test-signer"]
 name = "hybrid_v2_production_signer_full_startup_matrix_pg_integration"
 path = "tests/hybrid_v2_production_signer_full_startup_matrix_pg_integration.rs"
 required-features = ["test-signer"]
+
+# BACKEND-HYBRID-V2-BROADCAST-AND-CONFIRMATION-V1 (Package A, Parts C-I)
+# PostgreSQL coverage for the broadcast state table (migration 0051),
+# phase machine, immutability trigger, and outbox flows against a
+# deterministic in-process mock RPC. NO REAL EXTERNAL CHAIN TRANSACTION
+# IS EVER BROADCAST.
+[[test]]
+name = "hybrid_v2_broadcast_foundation_pg_integration"
+path = "tests/hybrid_v2_broadcast_foundation_pg_integration.rs"
+required-features = ["test-signer"]
