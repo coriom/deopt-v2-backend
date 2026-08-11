@@ -1388,7 +1388,7 @@ pub async fn admin_broadcast_recheck(
     // Package D wire — if the confirmation worker is attached, run one
     // observation cycle via `tick_single`. The worker only touches the
     // broadcast RPC (receipt / tx_by_hash / block header lookups) —
-    // never `eth_sendRawTransaction`. When the worker is not attached
+    // never the write method. When the worker is not attached
     // return the 503 EXECUTION_ORCHESTRATOR_NOT_WIRED sentinel.
     let worker = match state.hybrid_v2_broadcast_worker.as_ref() {
         Some(w) => w.clone(),
