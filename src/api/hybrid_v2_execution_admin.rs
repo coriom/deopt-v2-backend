@@ -1148,24 +1148,53 @@ pub async fn admin_broadcast_execution(
             &e.to_string(),
         );
     }
-    // The BroadcastOutbox needs the deterministic plan bytes + signed
-    // envelope, which the orchestrator owns. Downstream milestones
-    // (Package D) will attach a broadcast outbox factory to AppState;
-    // for now, expose the row with its current phase and instruct the
-    // caller to observe status via `broadcast_status`.
-    let row = match store.get_broadcast_state(&canonical_execution_id).await {
-        Ok(Some(r)) => r,
-        Ok(None) => {
-            return err_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "STORE_ERROR",
-                "broadcast row disappeared after insert",
-            );
+    // Package D wire — if the broadcast outbox is attached, drive
+    // `resume(...)` which observes any in-flight tx on the RPC and
+    // advances the phase (Broadcasting -> Submitted / Pending, or
+    // SubmissionUnknown escalation). The first-submission path (which
+    // requires the deterministic plan bytes + signed envelope) is
+    // still a deferred capability: the admin route does NOT hydrate
+    // plan/signed from persisted rows in this milestone — that
+    // requires a plan+signed reconstruction helper coming in the
+    // BASE-SEPOLIA-EXECUTION-E2E follow-up. Callers should invoke
+    // `broadcast_resend_same_bytes` after operator-side reconstruction
+    // wiring is completed.
+    let outbox = match state.hybrid_v2_broadcast_outbox.as_ref() {
+        Some(o) => o.clone(),
+        None => {
+            let reason = state
+                .hybrid_v2_broadcast_unavailable_reason
+                .clone()
+                .unwrap_or_else(|| "BROADCAST_OUTBOX_NOT_WIRED".to_string());
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "BROADCAST_OUTBOX_NOT_WIRED",
+                    "detail": "no broadcast outbox wired to this AppState build",
+                    "availability": { "state": "NotConfigured", "reason": reason },
+                })),
+            )
+                .into_response();
         }
+    };
+    let cfg = state.hybrid_v2_broadcast_config.clone().unwrap_or_else(|| {
+        // Should be unreachable when outbox is Some, but treat
+        // defensively — fall back to safe caps.
+        state
+            .hybrid_v2_execution_config
+            .clone()
+            .unwrap_or_else(crate::hybrid_v2::config::HybridV2ExecutionConfig::disabled)
+    });
+    let policy = crate::hybrid_v2::execution::broadcast_outbox::ResumePolicy {
+        submission_retry_max: cfg.submission_retry_max,
+        max_pending_age_ms: cfg.max_pending_age_ms,
+    };
+    let outcome = match outbox.resume(&canonical_execution_id, policy).await {
+        Ok(o) => o,
         Err(e) => {
             return err_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "STORE_ERROR",
+                "BROADCAST_OUTBOX_ERROR",
                 &e.to_string(),
             );
         }
@@ -1173,16 +1202,24 @@ pub async fn admin_broadcast_execution(
     (
         StatusCode::ACCEPTED,
         Json(serde_json::json!({
-            "canonical_execution_id": row.canonical_execution_id,
-            "phase": row.phase.as_str(),
-            "tx_hash": row.tx_hash,
-            "provider_classification": row.provider_classification,
-            "failure_class": row.failure_class,
-            "failure_detail": row.failure_detail,
-            "note": "row observed; broadcast outbox factory attached in follow-up milestone",
+            "canonical_execution_id": outcome.canonical_execution_id,
+            "phase": outcome.phase.as_str(),
+            "tx_hash": outcome.tx_hash.map(|h| format!("0x{}", hex_hash(&h))),
+            "provider_classification": outcome.provider_classification,
+            "failure_class": outcome.failure_class,
+            "failure_detail": outcome.failure_detail,
+            "note": "outbox resume observed; first-submission path via plan+signed hydrator remains deferred to base-sepolia E2E",
         })),
     )
         .into_response()
+}
+
+fn hex_hash(bytes: &[u8; 32]) -> String {
+    let mut s = String::with_capacity(64);
+    for b in bytes.iter() {
+        s.push_str(&format!("{:02x}", b));
+    }
+    s
 }
 
 /// `GET /admin/hybrid_v2/deployments/:deployment_id/executions/:canonical_execution_id/broadcast_status`
@@ -1346,23 +1383,44 @@ pub async fn admin_broadcast_recheck(
     if let Err(resp) = broadcast_config_or_disabled(&state) {
         return resp;
     }
-    // The worker requires a live broadcast RPC client. AppState does
-    // not currently expose one — return 503 EXECUTION_ORCHESTRATOR_NOT_WIRED
-    // (parallel to the /prepare + /broadcast pattern). The row itself
-    // is unchanged.
-    let reason = state
-        .hybrid_v2_execution_unavailable_reason
-        .clone()
-        .unwrap_or_else(|| "EXECUTION_ORCHESTRATOR_NOT_WIRED".to_string());
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        Json(serde_json::json!({
-            "error": "EXECUTION_ORCHESTRATOR_NOT_WIRED",
-            "detail": "confirmation worker not attached to AppState",
-            "availability": { "state": "NotConfigured", "reason": reason },
-        })),
-    )
-        .into_response()
+    // Package D wire — if the confirmation worker is attached, run one
+    // observation cycle via `tick_single`. The worker only touches the
+    // broadcast RPC (receipt / tx_by_hash / block header lookups) —
+    // never `eth_sendRawTransaction`. When the worker is not attached
+    // return the 503 EXECUTION_ORCHESTRATOR_NOT_WIRED sentinel.
+    let worker = match state.hybrid_v2_broadcast_worker.as_ref() {
+        Some(w) => w.clone(),
+        None => {
+            let reason = state
+                .hybrid_v2_broadcast_unavailable_reason
+                .clone()
+                .unwrap_or_else(|| "EXECUTION_ORCHESTRATOR_NOT_WIRED".to_string());
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "EXECUTION_ORCHESTRATOR_NOT_WIRED",
+                    "detail": "confirmation worker not attached to AppState",
+                    "availability": { "state": "NotConfigured", "reason": reason },
+                })),
+            )
+                .into_response();
+        }
+    };
+    match worker.tick_single(&canonical_execution_id).await {
+        Ok(phase) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "canonical_execution_id": canonical_execution_id,
+                "phase": phase.as_str(),
+            })),
+        )
+            .into_response(),
+        Err(e) => err_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "CONFIRMATION_WORKER_ERROR",
+            &e.to_string(),
+        ),
+    }
 }
 
 /// `POST /admin/hybrid_v2/deployments/:deployment_id/executions/:canonical_execution_id/broadcast_resend_same_bytes`
@@ -1440,17 +1498,37 @@ pub async fn admin_broadcast_resend_same_bytes(
             ),
         );
     }
-    // Same 503 rationale as broadcast_recheck — no RPC wired yet.
+    // Package D — honest deferral. `resend_same_bytes` on
+    // `BroadcastOutbox` requires the deterministic plan bytes + signed
+    // envelope + gas params to reconstruct the exact serialized tx.
+    // Those primitives are NOT stored on the broadcast row (only the
+    // envelope hash is persisted, by design — see broadcast_outbox.rs
+    // module docs on "NEVER re-sign"). A plan+signed hydrator that
+    // reconstructs from `execution_requests` columns is scheduled for
+    // BACKEND-HYBRID-V2-BASE-SEPOLIA-EXECUTION-E2E-V1; until then the
+    // route returns a 503 that surfaces the wired-broadcast state.
+    let broadcast_state = if state.hybrid_v2_broadcast_outbox.is_some() {
+        "Wired"
+    } else {
+        "NotConfigured"
+    };
     let reason = state
-        .hybrid_v2_execution_unavailable_reason
+        .hybrid_v2_broadcast_unavailable_reason
         .clone()
-        .unwrap_or_else(|| "EXECUTION_ORCHESTRATOR_NOT_WIRED".to_string());
+        .unwrap_or_else(|| {
+            "RESEND_SAME_BYTES_REQUIRES_PLAN_HYDRATOR: deferred to base-sepolia E2E".to_string()
+        });
     (
         StatusCode::SERVICE_UNAVAILABLE,
         Json(serde_json::json!({
             "error": "EXECUTION_ORCHESTRATOR_NOT_WIRED",
-            "detail": "broadcast outbox not attached to AppState",
-            "availability": { "state": "NotConfigured", "reason": reason },
+            "detail": "same-byte resend requires plan+signed reconstruction from persisted execution row — deferred to BACKEND-HYBRID-V2-BASE-SEPOLIA-EXECUTION-E2E-V1",
+            "availability": { "state": broadcast_state, "reason": reason },
+            "row": {
+                "phase": row.phase.as_str(),
+                "submission_attempt_count": row.submission_attempt_count,
+                "submission_retry_max": cfg.submission_retry_max,
+            },
         })),
     )
         .into_response()

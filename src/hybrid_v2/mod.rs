@@ -100,6 +100,9 @@ pub use runtime::{
     BootstrapResult, IndexerRuntime, PendingReorgAudit, RuntimeError, RuntimeMetrics,
 };
 pub use snapshot::{PinnedSnapshots, SourceMetadata};
-pub use startup::{bootstrap_probe_signer_identity, wire_hybrid_v2_execution_orchestrator};
+pub use startup::{
+    bootstrap_probe_signer_identity, wire_hybrid_v2_broadcast,
+    wire_hybrid_v2_execution_orchestrator,
+};
 pub use topics::TopicCatalogue;
 pub use worker::{spawn_hybrid_v2_indexer_worker, HybridV2IndexerWorkerConfig};

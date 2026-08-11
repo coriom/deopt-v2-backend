@@ -6,7 +6,7 @@ use deopt_v2_backend::error::BackendError;
 use deopt_v2_backend::execution::{spawn_executor, Executor};
 use deopt_v2_backend::hybrid_v2::{
     spawn_hybrid_v2_indexer_worker, spawn_hybrid_v2_reconciliation_worker,
-    wire_hybrid_v2_execution_orchestrator, HybridV2IndexerWorkerConfig,
+    wire_hybrid_v2_broadcast, wire_hybrid_v2_execution_orchestrator, HybridV2IndexerWorkerConfig,
     HybridV2ReconciliationWorkerConfig, IndexerRuntime, ManifestParams,
     PostgresHybridV2ProjectionStore, RpcChainViewProvider, RpcHybridV2ChainSource, RpcSourceConfig,
 };
@@ -375,6 +375,42 @@ async fn main() -> deopt_v2_backend::Result<()> {
                  read-side backend keeps serving"
             );
             state = state.with_hybrid_v2_execution_unavailable(reason);
+        }
+    }
+    // BACKEND-HYBRID-V2-BROADCAST-AND-CONFIRMATION-V1 (Package D). Wire
+    // the broadcast outbox + confirmation worker when
+    // HV2_BROADCAST_ENABLED=true AND HV2_EXECUTION_ENABLED=true. Every
+    // failure downgrades to `outbox = None` + logs a WARN; the
+    // read-side backend keeps serving. Base mainnet is refused at every
+    // gate (env validation, RPC constructor, and here).
+    match wire_hybrid_v2_broadcast(&state, config.hybrid_v2.chain_id).await {
+        Ok(Some((outbox, worker, rpc, cfg))) => {
+            info!(
+                deployment_id = config.hybrid_v2.deployment_id,
+                chain_id = config.hybrid_v2.chain_id,
+                confirmation_depth = cfg.confirmation_depth,
+                receipt_poll_interval_ms = cfg.receipt_poll_interval_ms,
+                "hybrid_v2 broadcast outbox + confirmation worker wired"
+            );
+            state = state.with_hybrid_v2_broadcast(outbox, worker, rpc, cfg);
+        }
+        Ok(None) => {
+            // Broadcast disabled by env — leave the fail-closed marker
+            // in place. Admin broadcast routes return 503.
+            state = state.with_hybrid_v2_broadcast_unavailable(
+                "BROADCAST_DISABLED_BY_ENV: HV2_BROADCAST_ENABLED=false or execution disabled"
+                    .to_string(),
+            );
+        }
+        Err(reason) => {
+            warn!(
+                deployment_id = config.hybrid_v2.deployment_id,
+                chain_id = config.hybrid_v2.chain_id,
+                reason = %reason,
+                "hybrid_v2 broadcast wiring FAILED — admin broadcast routes will return 503; \
+                 read-side backend keeps serving"
+            );
+            state = state.with_hybrid_v2_broadcast_unavailable(reason);
         }
     }
     // Build the router AFTER hybrid_v2 wiring so mounted operator

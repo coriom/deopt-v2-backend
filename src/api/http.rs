@@ -262,6 +262,35 @@ pub struct AppState {
     /// failed, provider not yet integrated, execution disabled, ...).
     /// Populated at AppState construction time.
     pub hybrid_v2_execution_unavailable_reason: Option<String>,
+    /// BACKEND-HYBRID-V2-BROADCAST-AND-CONFIRMATION-V1 (Package D).
+    /// The broadcast outbox handle. `None` when broadcast is disabled
+    /// OR when the broadcast config failed validation. When `None` the
+    /// admin `broadcast` / `broadcast_recheck` /
+    /// `broadcast_resend_same_bytes` routes return a structured 503.
+    pub hybrid_v2_broadcast_outbox:
+        Option<std::sync::Arc<crate::hybrid_v2::execution::broadcast_outbox::BroadcastOutbox>>,
+    /// Confirmation worker handle. Same fail-closed posture as
+    /// [`Self::hybrid_v2_broadcast_outbox`]. Admin `broadcast_recheck`
+    /// invokes `tick_single(...)` on this worker per request; the
+    /// periodic tick loop (if any) is spawned separately from a clone.
+    pub hybrid_v2_broadcast_worker: Option<
+        std::sync::Arc<crate::hybrid_v2::execution::broadcast_worker::BroadcastConfirmationWorker>,
+    >,
+    /// Live broadcast RPC handle. Retained on AppState so admin routes
+    /// and downstream tooling can inspect / re-use the same RPC layer
+    /// the outbox + worker are bound to.
+    pub hybrid_v2_broadcast_rpc: Option<
+        std::sync::Arc<dyn crate::hybrid_v2::execution::broadcast_rpc::ExecutionBroadcastRpcClient>,
+    >,
+    /// Persisted copy of the broadcast-relevant config used to
+    /// construct the outbox + worker. Held on AppState so the admin
+    /// route can surface availability metadata (redacted) without
+    /// re-reading env.
+    pub hybrid_v2_broadcast_config: Option<crate::hybrid_v2::config::HybridV2ExecutionConfig>,
+    /// Structured reason surfaced by the admin route when the outbox
+    /// is not wired. Explains WHY (config missing, base mainnet
+    /// refused, RPC construction failed, broadcast_enabled = false).
+    pub hybrid_v2_broadcast_unavailable_reason: Option<String>,
 }
 
 impl AppState {
@@ -495,6 +524,13 @@ impl AppState {
             hybrid_v2_execution_unavailable_reason: Some(
                 "EXECUTION_DISABLED: no execution config wired to this AppState".to_string(),
             ),
+            hybrid_v2_broadcast_outbox: None,
+            hybrid_v2_broadcast_worker: None,
+            hybrid_v2_broadcast_rpc: None,
+            hybrid_v2_broadcast_config: None,
+            hybrid_v2_broadcast_unavailable_reason: Some(
+                "BROADCAST_DISABLED: no broadcast wiring attached to this AppState".to_string(),
+            ),
         }
     }
 
@@ -521,6 +557,45 @@ impl AppState {
     pub fn with_hybrid_v2_execution_unavailable(mut self, reason: impl Into<String>) -> Self {
         self.hybrid_v2_execution_orchestrator = None;
         self.hybrid_v2_execution_unavailable_reason = Some(reason.into());
+        self
+    }
+
+    /// BACKEND-HYBRID-V2-BROADCAST-AND-CONFIRMATION-V1 (Package D). Attach
+    /// the live broadcast outbox + confirmation worker. Callers must
+    /// have already validated `config.validate_startup(chain_id)` AND
+    /// constructed the outbox / worker via
+    /// `crate::hybrid_v2::startup::wire_hybrid_v2_broadcast`. When this
+    /// is unset the admin broadcast routes return a structured 503
+    /// including [`Self::hybrid_v2_broadcast_unavailable_reason`].
+    pub fn with_hybrid_v2_broadcast(
+        mut self,
+        outbox: std::sync::Arc<crate::hybrid_v2::execution::broadcast_outbox::BroadcastOutbox>,
+        worker: std::sync::Arc<
+            crate::hybrid_v2::execution::broadcast_worker::BroadcastConfirmationWorker,
+        >,
+        rpc: std::sync::Arc<
+            dyn crate::hybrid_v2::execution::broadcast_rpc::ExecutionBroadcastRpcClient,
+        >,
+        config: crate::hybrid_v2::config::HybridV2ExecutionConfig,
+    ) -> Self {
+        self.hybrid_v2_broadcast_outbox = Some(outbox);
+        self.hybrid_v2_broadcast_worker = Some(worker);
+        self.hybrid_v2_broadcast_rpc = Some(rpc);
+        self.hybrid_v2_broadcast_config = Some(config);
+        self.hybrid_v2_broadcast_unavailable_reason = None;
+        self
+    }
+
+    /// Explicit "broadcast wire failed / disabled, keep reason" path —
+    /// mirrors [`Self::with_hybrid_v2_execution_unavailable`]. Backend
+    /// keeps serving read APIs; admin broadcast routes surface the
+    /// reason via the structured 503.
+    pub fn with_hybrid_v2_broadcast_unavailable(mut self, reason: impl Into<String>) -> Self {
+        self.hybrid_v2_broadcast_outbox = None;
+        self.hybrid_v2_broadcast_worker = None;
+        self.hybrid_v2_broadcast_rpc = None;
+        self.hybrid_v2_broadcast_config = None;
+        self.hybrid_v2_broadcast_unavailable_reason = Some(reason.into());
         self
     }
 
