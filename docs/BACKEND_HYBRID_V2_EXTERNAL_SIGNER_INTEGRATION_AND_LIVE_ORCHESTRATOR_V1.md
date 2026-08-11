@@ -1,5 +1,15 @@
 # BACKEND-HYBRID-V2-EXTERNAL-SIGNER-INTEGRATION-AND-LIVE-ORCHESTRATOR-V1
 
+> **2026-08-10 CORRECTION** — the prior report described this milestone
+> as fully closed "Pattern C" but `SignerBuilder::build_kms_aws` still
+> returned `ProductionSignerUnavailable` and required an operator to
+> manually inject the bridge into `AppState`. The follow-on milestone
+> `BACKEND-HYBRID-V2-PRODUCTION-SIGNER-BOOTSTRAP-AND-STARTUP-WIRING-V1`
+> (see `docs/BACKEND_HYBRID_V2_PRODUCTION_SIGNER_BOOTSTRAP_AND_STARTUP_WIRING_V1.md`)
+> closes that gap: `HttpSignerTransport` implemented, `SignerBuilder`
+> constructs a real bridge, `wire_hybrid_v2_execution_orchestrator`
+> runs an identity bootstrap probe, no manual injection required.
+
 Milestone status: **CLOSED (pre-broadcast, external signer integrated).**
 
 **Verdicts:**
