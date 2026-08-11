@@ -142,6 +142,9 @@ impl BroadcastPhase {
             // BroadcastDisabled -> Broadcasting when broadcast is enabled
             // AND we go straight to the send path in one lock hold.
             (BroadcastDisabled, Broadcasting) => true,
+            // Firewall reject before any submission — the outbox escalates
+            // straight to manual intervention.
+            (BroadcastDisabled, ManualInterventionRequired) => true,
 
             // READY_FOR_BROADCAST
             (ReadyForBroadcast, Broadcasting) => true,
@@ -198,7 +201,12 @@ impl BroadcastPhase {
     pub fn legal_successors(self) -> &'static [BroadcastPhase] {
         use BroadcastPhase::*;
         match self {
-            BroadcastDisabled => &[ReadyForBroadcast, CancelledBeforeBroadcast, Broadcasting],
+            BroadcastDisabled => &[
+                ReadyForBroadcast,
+                CancelledBeforeBroadcast,
+                Broadcasting,
+                ManualInterventionRequired,
+            ],
             ReadyForBroadcast => &[
                 Broadcasting,
                 CancelledBeforeBroadcast,

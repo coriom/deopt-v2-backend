@@ -49,7 +49,7 @@ pub mod tx_serialization;
 //   BACKEND-HYBRID-V2-BROADCAST-AND-CONFIRMATION-V1 (Package A)
 // -----------------------------------------------------------------
 pub mod broadcast_firewall;
-// pub mod broadcast_outbox;
+pub mod broadcast_outbox;
 pub mod broadcast_rpc;
 pub mod broadcast_state;
 
@@ -97,7 +97,10 @@ pub use tx_serialization::{
 pub use broadcast_firewall::{
     BroadcastFirewallConfig, BroadcastFirewallRejection, BroadcastPolicyFirewall,
 };
-// pub use broadcast_outbox::{BroadcastOutbox, OutboxError, OutboxOutcome};
+pub use broadcast_outbox::{
+    failure_class as broadcast_failure_class, provider_classification, BroadcastOutbox,
+    OutboxError, OutboxOutcome,
+};
 pub use broadcast_rpc::{
     BlockHeader as BroadcastBlockHeader, BroadcastRpcError, ExecutionBroadcastRpcClient,
     HttpExecutionBroadcastRpcClient, SendOutcome, TransactionSummary, TxReceipt,
