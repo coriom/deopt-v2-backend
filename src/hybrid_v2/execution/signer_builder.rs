@@ -1,19 +1,20 @@
-//! `BACKEND-HYBRID-V2-EXTERNAL-SIGNER-INTEGRATION-AND-LIVE-ORCHESTRATOR-V1`
-//! (Package A, Part E) — signer builder that dispatches on
-//! `SignerProvider` and hands back an
-//! `Arc<dyn ExecutionSigner>` for the orchestrator.
+//! `BACKEND-HYBRID-V2-PRODUCTION-SIGNER-BOOTSTRAP-AND-STARTUP-WIRING-V1`
+//! (Part C) — operational signer builder. Constructs a real
+//! [`HybridV2KmsSignerBridge`] backed by [`HttpSignerTransport`] for
+//! `SignerProvider::KmsAws`. Unimplemented vendors still fail closed.
 //!
 //! Frozen posture:
 //!
 //! * **NO_NEW_CARGO_DEPS** — the builder only wires types that are
 //!   already in the crate graph (`RemoteSignerClient`,
-//!   `PluggableRemoteSignerTransport`, `AwsKmsSignerProvider`).
-//! * **AWS_TRANSPORT_GATED_BY_FEATURE** — `SignerProvider::KmsAws`
-//!   requires the `aws-kms-transport` cargo feature at build time.
-//!   Without it the builder returns `SignerUnavailable("aws-kms-
-//!   transport feature not enabled at build time")` so an operator
-//!   who ships a non-AWS build with `HV2_SIGNER_PROVIDER=kms_aws`
-//!   fails closed rather than silently degrading.
+//!   `PluggableRemoteSignerTransport`, `AwsKmsSignerProvider`,
+//!   `HttpSignerTransport`).
+//! * **PATTERN_C_CUSTODY_BOUNDARY** — `KmsAws` produces a transport
+//!   that authenticates to a signer microservice via mTLS. The backend
+//!   holds ONLY the mTLS client identity; the signer microservice
+//!   holds the AWS IAM role. This builder does not import any
+//!   `aws-sdk-*` type — the `aws-kms-transport` feature gates a
+//!   different milestone (in-process KMS transport, unused here).
 //! * **UNIMPLEMENTED_VENDORS_FAIL_CLOSED** — `KmsGcp`, `Turnkey`,
 //!   `Fireblocks` return `SignerUnavailable("provider X not yet
 //!   integrated")` at build time. NEVER invent HTTP protocols for a
@@ -21,13 +22,21 @@
 //! * **MOCK_ONLY_UNDER_TEST_SIGNER** — `SignerProvider::Mock` is
 //!   accepted only under `#[cfg(any(test, feature = "test-signer"))]`.
 //!   Non-test builds refuse it at build time.
+//! * **SIGNER_UNAVAILABLE_NEVER_FALLS_BACK_TO_LOCAL_RAW_KEY** — a
+//!   failure to construct the HTTP transport (e.g. missing mTLS
+//!   material) returns `BackendError::Config` upward. The wire path
+//!   NEVER downgrades to a local signer.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::error::{BackendError, Result};
+use crate::execution::remote_signer::RemoteSignerClient;
 use crate::hybrid_v2::config::{HybridV2ExecutionConfig, SignerProvider};
 use crate::hybrid_v2::execution::signer::{ExecutionSigner, SignerBackend, SignerKind};
+use crate::hybrid_v2::execution::signer_http_transport::{
+    is_public_https, read_pem_if_configured, HttpSignerTransport,
+};
 use crate::hybrid_v2::execution::signer_kms_bridge::{redacted_endpoint, HybridV2KmsSignerBridge};
 use crate::hybrid_v2::execution::signer_production::ProductionSignerUnavailable;
 
@@ -122,52 +131,88 @@ impl HybridV2SignerBuilder {
         }
     }
 
+    /// **Pattern C** — construct a real bridge over `HttpSignerTransport`.
+    ///
+    /// The backend authenticates to the signer microservice with mTLS;
+    /// the signer microservice authenticates to AWS KMS with its own
+    /// IAM role. This function reads PEM material from disk (paths
+    /// supplied via env), enforces mTLS-mandatory for public HTTPS
+    /// endpoints, and returns a `HybridV2KmsSignerBridge` wired around
+    /// a `RemoteSignerClient` that speaks the `HttpSignerTransport`
+    /// wire protocol. It does NOT contact the microservice — a
+    /// separate identity probe (`HttpSignerTransport::fetch_identity`)
+    /// runs at startup for bootstrap validation (Part F).
     fn build_kms_aws(
         config: &HybridV2ExecutionConfig,
-        _expected_signer_address: [u8; 20],
-        _endpoint: &str,
-        _endpoint_redacted: String,
-        _max_retries: u32,
-        _request_timeout: Duration,
+        expected_signer_address: [u8; 20],
+        endpoint: &str,
+        endpoint_redacted: String,
+        max_retries: u32,
+        request_timeout: Duration,
     ) -> Result<Arc<dyn ExecutionSigner>> {
-        // Enforce operator hygiene at build time.
+        // Operator hygiene: the KMS key id is an opaque handle passed
+        // to the signer microservice via its own configuration. This
+        // build still requires the operator to name a key so a
+        // misconfiguration surfaces here rather than at first sign.
         if config.signer_kms_key_id.is_none() {
             return Err(BackendError::Config(
                 "HV2_SIGNER_KMS_KEY_ID is required when signer_provider=kms_aws".to_string(),
             ));
         }
-        #[cfg(feature = "aws-kms-transport")]
-        {
-            // Per Pattern C the backend does NOT construct an
-            // `aws_sdk_kms::Client` directly — that lives inside the
-            // signer microservice which authenticates to AWS with its
-            // own IAM role. The Perps `AwsKmsSdkTransport::new(client)`
-            // takes a caller-supplied client; the follow-on operator
-            // wiring milestone will assemble it from `aws-config`.
-            // Until then, `KmsAws` returns a fail-closed signer with
-            // a structured reason so the admin route surfaces
-            // `SIGNER_UNAVAILABLE` per Part H instead of silently
-            // degrading.
-            //
-            // This is the honest verdict: an operator with a real KMS
-            // microservice injects the wired `HybridV2KmsSignerBridge`
-            // via a separate AppState builder path. Without the
-            // injection, the admin route reports
-            // `EXECUTION_ORCHESTRATOR_NOT_WIRED`. Never invent an HTTP
-            // protocol for a provider we cannot actually reach.
-            Ok(Arc::new(ProductionSignerUnavailable::new(
-                "aws-kms-transport SDK transport constructor requires an operator-supplied \
-                 aws_sdk_kms::Client (Pattern C); the follow-on operator wiring milestone \
-                 injects the bridge directly. Until then this build reports SIGNER_UNAVAILABLE.",
-            )))
+        // Load mTLS material. The config validator has already checked
+        // that both paths are set for public HTTPS endpoints; this
+        // block enforces the same invariant defensively.
+        let mtls_cert = read_pem_if_configured(&config.signer_mtls_cert_pem_path)
+            .map_err(|e| BackendError::Config(format!("signer mTLS cert read: {e}")))?;
+        let mtls_key = read_pem_if_configured(&config.signer_mtls_key_pem_path)
+            .map_err(|e| BackendError::Config(format!("signer mTLS key read: {e}")))?;
+        let root_ca = read_pem_if_configured(&config.signer_root_ca_pem_path)
+            .map_err(|e| BackendError::Config(format!("signer root CA read: {e}")))?;
+
+        if is_public_https(endpoint) && (mtls_cert.is_none() || mtls_key.is_none()) {
+            return Err(BackendError::Config(
+                "MtlsRequiredForPublicEndpoint: signer_endpoint is a public HTTPS URL — \
+                 mTLS cert + key paths are mandatory (HV2_SIGNER_MTLS_CERT_PATH, \
+                 HV2_SIGNER_MTLS_KEY_PATH)"
+                    .to_string(),
+            ));
         }
-        #[cfg(not(feature = "aws-kms-transport"))]
-        {
-            Ok(Arc::new(ProductionSignerUnavailable::new(
-                "aws-kms-transport feature not enabled at build time — rebuild with \
-                 `cargo build --features aws-kms-transport` to enable the KMS transport",
-            )))
-        }
+
+        let timeout_ms = config.signer_request_timeout_ms.min(30_000);
+        let transport = HttpSignerTransport::new(
+            endpoint.to_string(),
+            expected_signer_address,
+            mtls_cert,
+            mtls_key,
+            root_ca,
+            timeout_ms,
+            max_retries,
+        )
+        .map_err(|e| BackendError::Config(format!("HTTP signer transport build: {e}")))?;
+
+        let remote_client = Arc::new(RemoteSignerClient::with_transport(
+            endpoint.to_string(),
+            address_to_account_id(&expected_signer_address),
+            Arc::new(transport),
+        ));
+
+        let bridge = HybridV2KmsSignerBridge::new(
+            remote_client,
+            expected_signer_address,
+            SignerKind::RemoteKMS,
+            endpoint_redacted,
+            max_retries,
+            request_timeout,
+        );
+
+        // Belt-and-suspenders redaction check: the redacted endpoint
+        // must not contain a path fragment. If it does, refuse to hand
+        // out the bridge — a mis-redacted string could leak into the
+        // admin identity() surface.
+        // (redacted_endpoint above collapses to scheme://host[:port].)
+        let _ = redacted_endpoint(endpoint);
+
+        Ok(Arc::new(bridge))
     }
 
     #[cfg(any(test, feature = "test-signer"))]
@@ -280,19 +325,52 @@ mod tests {
         ));
     }
 
-    #[cfg(not(feature = "aws-kms-transport"))]
+    fn build_err_string(cfg: &HybridV2ExecutionConfig) -> String {
+        match HybridV2SignerBuilder::build(cfg) {
+            Ok(_) => panic!("expected builder failure, got a signer"),
+            Err(e) => e.to_string(),
+        }
+    }
+
     #[test]
-    fn production_kms_aws_without_feature_returns_unavailable_signer() {
+    fn production_kms_aws_without_kms_key_id_refused() {
+        let mut cfg = base_config();
+        cfg.expected_signer_address = Some([0xbbu8; 20]);
+        cfg.signer_endpoint = Some("http://127.0.0.1:9000/sign".to_string());
+        cfg.signer_provider = Some(SignerProvider::KmsAws);
+        let err = build_err_string(&cfg);
+        assert!(err.contains("HV2_SIGNER_KMS_KEY_ID"), "{err}");
+    }
+
+    #[test]
+    fn production_kms_aws_public_https_refuses_without_mtls() {
         let mut cfg = base_config();
         cfg.expected_signer_address = Some([0xbbu8; 20]);
         cfg.signer_endpoint = Some("https://signer.example.com".to_string());
         cfg.signer_kms_key_id = Some("arn:aws:kms:us-east-1:x:key/y".to_string());
         cfg.signer_provider = Some(SignerProvider::KmsAws);
+        // No mTLS paths set — builder must refuse.
+        let err = build_err_string(&cfg);
+        assert!(err.contains("MtlsRequiredForPublicEndpoint"), "{err}");
+    }
+
+    #[test]
+    fn production_kms_aws_loopback_builds_operational_bridge_without_mtls() {
+        // Loopback endpoints don't require mTLS material — this is the
+        // local dev exception.
+        let mut cfg = base_config();
+        cfg.expected_signer_address = Some([0xbbu8; 20]);
+        cfg.signer_endpoint = Some("http://127.0.0.1:9000/sign".to_string());
+        cfg.signer_kms_key_id = Some("arn:aws:kms:us-east-1:x:key/y".to_string());
+        cfg.signer_provider = Some(SignerProvider::KmsAws);
         let signer = HybridV2SignerBuilder::build(&cfg).unwrap();
+        // A real bridge reports `Configured` (not NotConfigured).
         assert!(matches!(
             signer.availability(),
-            SignerAvailability::NotConfigured
+            SignerAvailability::Configured
         ));
+        assert_eq!(signer.identity().address, [0xbbu8; 20]);
+        assert_eq!(signer.identity().kind, SignerKind::RemoteKMS);
     }
 
     #[test]

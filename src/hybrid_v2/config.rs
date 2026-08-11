@@ -794,6 +794,21 @@ pub struct HybridV2ExecutionConfig {
     /// secret manager path, HashiCorp Vault key). NEVER a raw secret.
     /// Fully redacted in every `Debug` / panic / error surface.
     pub signer_auth_reference: Option<String>,
+    /// Path to the mTLS client certificate PEM the transport presents
+    /// to the signer microservice. MANDATORY when `signer_endpoint`
+    /// is a public HTTPS URL (i.e. not loopback). NEVER contains PEM
+    /// bytes directly; NEVER logged (Debug redacts to `<set>`).
+    /// Env: `HV2_SIGNER_MTLS_CERT_PATH`.
+    pub signer_mtls_cert_pem_path: Option<String>,
+    /// Path to the mTLS client key PEM. MANDATORY when
+    /// `signer_endpoint` is a public HTTPS URL. NEVER logged.
+    /// Env: `HV2_SIGNER_MTLS_KEY_PATH`.
+    pub signer_mtls_key_pem_path: Option<String>,
+    /// Optional path to a root CA PEM used to pin the signer
+    /// microservice's server certificate. When present, the transport
+    /// adds this CA to the roots trusted by the underlying `reqwest`
+    /// client. Env: `HV2_SIGNER_ROOT_CA_PATH`.
+    pub signer_root_ca_pem_path: Option<String>,
 }
 
 impl std::fmt::Debug for HybridV2ExecutionConfig {
@@ -840,6 +855,18 @@ impl std::fmt::Debug for HybridV2ExecutionConfig {
             .field(
                 "signer_auth_reference",
                 &self.signer_auth_reference.as_deref().map(|_| "<redacted>"),
+            )
+            .field(
+                "signer_mtls_cert_pem_path",
+                &self.signer_mtls_cert_pem_path.as_deref().map(|_| "<set>"),
+            )
+            .field(
+                "signer_mtls_key_pem_path",
+                &self.signer_mtls_key_pem_path.as_deref().map(|_| "<set>"),
+            )
+            .field(
+                "signer_root_ca_pem_path",
+                &self.signer_root_ca_pem_path.as_deref().map(|_| "<set>"),
             )
             .finish()
     }
@@ -892,6 +919,9 @@ impl HybridV2ExecutionConfig {
             signer_request_timeout_ms: 2_500,
             signer_max_retries: 1,
             signer_auth_reference: None,
+            signer_mtls_cert_pem_path: None,
+            signer_mtls_key_pem_path: None,
+            signer_root_ca_pem_path: None,
         }
     }
 
@@ -954,6 +984,15 @@ impl HybridV2ExecutionConfig {
         let signer_auth_reference = env::var("HV2_SIGNER_AUTH_REFERENCE")
             .ok()
             .filter(|s| !s.is_empty());
+        let signer_mtls_cert_pem_path = env::var("HV2_SIGNER_MTLS_CERT_PATH")
+            .ok()
+            .filter(|s| !s.is_empty());
+        let signer_mtls_key_pem_path = env::var("HV2_SIGNER_MTLS_KEY_PATH")
+            .ok()
+            .filter(|s| !s.is_empty());
+        let signer_root_ca_pem_path = env::var("HV2_SIGNER_ROOT_CA_PATH")
+            .ok()
+            .filter(|s| !s.is_empty());
         let rpc_url = env::var("HV2_EXECUTION_RPC_URL")
             .ok()
             .filter(|s| !s.is_empty())
@@ -975,6 +1014,9 @@ impl HybridV2ExecutionConfig {
             signer_request_timeout_ms,
             signer_max_retries,
             signer_auth_reference,
+            signer_mtls_cert_pem_path,
+            signer_mtls_key_pem_path,
+            signer_root_ca_pem_path,
         };
         // Validation is caller-driven so main.rs can log a WARN + fall
         // back to `orchestrator = None` instead of crashing.
@@ -1047,6 +1089,19 @@ impl HybridV2ExecutionConfig {
                      value refused.",
                 ));
             }
+            // Public HTTPS → mTLS material is MANDATORY. Loopback
+            // (127.0.0.1 / localhost / ::1) is exempt for local dev.
+            if is_public_https_endpoint(&lower) {
+                if self.signer_mtls_cert_pem_path.is_none()
+                    || self.signer_mtls_key_pem_path.is_none()
+                {
+                    return Err(cfg_err(
+                        "MtlsRequiredForPublicEndpoint: HV2_SIGNER_ENDPOINT is a public \
+                         HTTPS URL — HV2_SIGNER_MTLS_CERT_PATH and HV2_SIGNER_MTLS_KEY_PATH \
+                         are mandatory. Loopback endpoints are exempt.",
+                    ));
+                }
+            }
         }
         // Production posture: every field MUST be present.
         if self.signer_kind == SignerBackend::Production {
@@ -1093,6 +1148,26 @@ impl HybridV2ExecutionConfig {
         }
         Ok(())
     }
+}
+
+/// Returns true when `endpoint` (already lower-cased) is HTTPS AND
+/// the host is NOT a loopback. Loopback endpoints (127.0.0.1,
+/// localhost, ::1) are exempt from the mTLS-mandatory rule so that
+/// local dev signer microservices can run without cert material.
+fn is_public_https_endpoint(lower: &str) -> bool {
+    if !lower.starts_with("https://") {
+        return false;
+    }
+    let after_scheme = &lower["https://".len()..];
+    let host_part = after_scheme
+        .split('/')
+        .next()
+        .unwrap_or(after_scheme)
+        .split('?')
+        .next()
+        .unwrap_or("");
+    let host_only = host_part.split(':').next().unwrap_or(host_part);
+    !(host_only == "127.0.0.1" || host_only == "localhost" || host_only == "::1")
 }
 
 fn default_disabled_gas_policy() -> GasFeePolicy {
@@ -1146,7 +1221,9 @@ mod execution_config_tests {
         let err = cfg.validate_startup(84532).unwrap_err().to_string();
         assert!(err.contains("HV2_SIGNER_ENDPOINT"), "{err}");
 
-        cfg.signer_endpoint = Some("https://signer.example/sign".to_string());
+        // Loopback endpoint avoids mTLS-mandatory rule for this
+        // provider-required test.
+        cfg.signer_endpoint = Some("http://127.0.0.1:9000/sign".to_string());
         let err = cfg.validate_startup(84532).unwrap_err().to_string();
         assert!(err.contains("HV2_SIGNER_PROVIDER"), "{err}");
 
@@ -1155,10 +1232,38 @@ mod execution_config_tests {
     }
 
     #[test]
+    fn production_public_https_requires_mtls_paths() {
+        let mut cfg = base();
+        cfg.expected_signer_address = Some([0xbbu8; 20]);
+        cfg.signer_endpoint = Some("https://signer.example.com/sign".to_string());
+        cfg.signer_provider = Some(SignerProvider::KmsAws);
+        // No mTLS material set → refuse.
+        let err = cfg.validate_startup(84532).unwrap_err().to_string();
+        assert!(err.contains("MtlsRequiredForPublicEndpoint"), "{err}");
+        // Set both paths → passes (paths are string handles; the
+        // validator does not read the files, only checks presence).
+        cfg.signer_mtls_cert_pem_path = Some("/etc/tls/cert.pem".to_string());
+        cfg.signer_mtls_key_pem_path = Some("/etc/tls/key.pem".to_string());
+        assert!(cfg.validate_startup(84532).is_ok());
+    }
+
+    #[test]
+    fn loopback_https_is_exempt_from_mtls_requirement() {
+        let mut cfg = base();
+        cfg.expected_signer_address = Some([0xbbu8; 20]);
+        cfg.signer_endpoint = Some("https://127.0.0.1:9000/sign".to_string());
+        cfg.signer_provider = Some(SignerProvider::KmsAws);
+        assert!(cfg.validate_startup(84532).is_ok());
+        cfg.signer_endpoint = Some("https://localhost:9000/sign".to_string());
+        assert!(cfg.validate_startup(84532).is_ok());
+    }
+
+    #[test]
     fn signer_request_timeout_bounds_enforced() {
         let mut cfg = base();
         cfg.expected_signer_address = Some([0xbbu8; 20]);
-        cfg.signer_endpoint = Some("https://signer.example/sign".to_string());
+        // Loopback endpoint avoids mTLS-mandatory noise.
+        cfg.signer_endpoint = Some("http://127.0.0.1:9000/sign".to_string());
         cfg.signer_provider = Some(SignerProvider::KmsAws);
         cfg.signer_request_timeout_ms = 50;
         assert!(cfg.validate_startup(84532).is_err());
@@ -1172,7 +1277,7 @@ mod execution_config_tests {
     fn signer_max_retries_bounded() {
         let mut cfg = base();
         cfg.expected_signer_address = Some([0xbbu8; 20]);
-        cfg.signer_endpoint = Some("https://signer.example/sign".to_string());
+        cfg.signer_endpoint = Some("http://127.0.0.1:9000/sign".to_string());
         cfg.signer_provider = Some(SignerProvider::KmsAws);
         cfg.signer_max_retries = 6;
         assert!(cfg.validate_startup(84532).is_err());
@@ -1198,16 +1303,9 @@ mod execution_config_tests {
     #[cfg(not(feature = "test-signer"))]
     #[test]
     fn mock_provider_refused_outside_test_signer_feature() {
-        // In `cargo test` unit-test builds, `#[cfg(test)]` is on so the
-        // mock branch is permitted. This test only runs under a build
-        // WITHOUT the `test-signer` feature — which for the lib unit
-        // tests is still gated by `#[cfg(test)]`, so this specific
-        // guard is exercised primarily by the integration surface.
-        // The following pins the fact that once `test-signer` and
-        // `test` are both off, the mock refusal path exists.
         let mut cfg = base();
         cfg.expected_signer_address = Some([0xbbu8; 20]);
-        cfg.signer_endpoint = Some("https://signer.example/sign".to_string());
+        cfg.signer_endpoint = Some("http://127.0.0.1:9000/sign".to_string());
         cfg.signer_provider = Some(SignerProvider::Mock);
         // Under `cargo test` the `test` cfg is on so mock is permitted;
         // we assert that a KmsAws is still permitted so the test does

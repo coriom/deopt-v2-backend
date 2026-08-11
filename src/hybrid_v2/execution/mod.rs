@@ -37,6 +37,7 @@ pub mod signature_verify;
 pub mod signer;
 pub mod signer_builder;
 pub mod signer_firewall;
+pub mod signer_http_transport;
 pub mod signer_kms_bridge;
 pub mod signer_production;
 pub mod simulator;
@@ -67,6 +68,10 @@ pub use signer::{
 };
 pub use signer_builder::HybridV2SignerBuilder;
 pub use signer_firewall::{FirewallRejection, SignerPolicyFirewall};
+pub use signer_http_transport::{
+    is_public_https, read_pem_if_configured, redact_endpoint as redact_signer_endpoint,
+    HttpSignerTransport, SignerIdentityProbe, TransportBuildError,
+};
 pub use signer_kms_bridge::{
     derive_idempotency_key, redacted_endpoint, HybridV2KmsSignerBridge, IDEMPOTENCY_DOMAIN_TAG,
     IDEMPOTENCY_KEY_LEN,
