@@ -159,7 +159,10 @@ async fn seed_execution_and_broadcast_row(
     dyn_store.insert_broadcast_state(CID, 1_000).await.unwrap();
 }
 
-async fn build_app_state(pool: &PgPool, broadcast_enabled: bool) -> (i64, deopt_v2_backend::api::http::AppState) {
+async fn build_app_state(
+    pool: &PgPool,
+    broadcast_enabled: bool,
+) -> (i64, deopt_v2_backend::api::http::AppState) {
     let store = Arc::new(PostgresHybridV2ProjectionStore::new(pool.clone()));
     let manifest = baseline_manifest(CHAIN_ID);
     let dyn_store: &dyn HybridV2ProjectionStore = store.as_ref();
@@ -180,7 +183,8 @@ async fn build_app_state(pool: &PgPool, broadcast_enabled: bool) -> (i64, deopt_
     // Use with_store + EmptyReadStore so the read state is metadata-only
     // (no runtime backing needed for admin routes).
     let read_state = HybridV2ApiState::with_store(
-        Arc::new(EmptyReadStore) as Arc<dyn deopt_v2_backend::hybrid_v2::read_store::HybridV2ReadStore>,
+        Arc::new(EmptyReadStore)
+            as Arc<dyn deopt_v2_backend::hybrid_v2::read_store::HybridV2ReadStore>,
         vec![entry],
     );
     state = state
@@ -232,9 +236,7 @@ async fn broadcast_route_requires_admin_token() {
     };
     let pool = fresh_pool(&url).await;
     let (deployment_id, state) = build_app_state(&pool, true).await;
-    let path = format!(
-        "/admin/hybrid_v2/deployments/{deployment_id}/executions/{CID}/broadcast"
-    );
+    let path = format!("/admin/hybrid_v2/deployments/{deployment_id}/executions/{CID}/broadcast");
     let response = router_for(state)
         .oneshot(post(&path, None, serde_json::json!({})))
         .await
@@ -253,9 +255,7 @@ async fn broadcast_route_returns_503_before_any_row_lookup() {
     };
     let pool = fresh_pool(&url).await;
     let (deployment_id, state) = build_app_state(&pool, true).await;
-    let path = format!(
-        "/admin/hybrid_v2/deployments/{deployment_id}/executions/{CID}/broadcast"
-    );
+    let path = format!("/admin/hybrid_v2/deployments/{deployment_id}/executions/{CID}/broadcast");
     let response = router_for(state)
         .oneshot(post(&path, Some(ADMIN_TOKEN), serde_json::json!({})))
         .await
@@ -269,15 +269,13 @@ async fn broadcast_route_returns_503_before_any_row_lookup() {
 async fn broadcast_status_returns_404_for_unknown_execution() {
     // The /broadcast_status route needs neither an orchestrator nor an
     // RPC — it only reads the store. Unknown execution → 404.
-    let Some(url) = get_pg_url_or_skip("broadcast_status_returns_404_for_unknown_execution")
-    else {
+    let Some(url) = get_pg_url_or_skip("broadcast_status_returns_404_for_unknown_execution") else {
         return;
     };
     let pool = fresh_pool(&url).await;
     let (deployment_id, state) = build_app_state(&pool, true).await;
-    let path = format!(
-        "/admin/hybrid_v2/deployments/{deployment_id}/executions/{CID}/broadcast_status"
-    );
+    let path =
+        format!("/admin/hybrid_v2/deployments/{deployment_id}/executions/{CID}/broadcast_status");
     let response = router_for(state)
         .oneshot(get(&path, Some(ADMIN_TOKEN)))
         .await
@@ -298,9 +296,8 @@ async fn broadcast_recheck_returns_503_when_broadcast_disabled() {
     };
     let pool = fresh_pool(&url).await;
     let (deployment_id, state) = build_app_state(&pool, false).await;
-    let path = format!(
-        "/admin/hybrid_v2/deployments/{deployment_id}/executions/{CID}/broadcast_recheck"
-    );
+    let path =
+        format!("/admin/hybrid_v2/deployments/{deployment_id}/executions/{CID}/broadcast_recheck");
     let response = router_for(state)
         .oneshot(post(&path, Some(ADMIN_TOKEN), serde_json::json!({})))
         .await
@@ -312,16 +309,13 @@ async fn broadcast_recheck_returns_503_when_broadcast_disabled() {
 
 #[tokio::test]
 async fn broadcast_route_returns_503_when_orchestrator_not_wired() {
-    let Some(url) =
-        get_pg_url_or_skip("broadcast_route_returns_503_when_orchestrator_not_wired")
+    let Some(url) = get_pg_url_or_skip("broadcast_route_returns_503_when_orchestrator_not_wired")
     else {
         return;
     };
     let pool = fresh_pool(&url).await;
     let (deployment_id, state) = build_app_state(&pool, true).await;
-    let path = format!(
-        "/admin/hybrid_v2/deployments/{deployment_id}/executions/{CID}/broadcast"
-    );
+    let path = format!("/admin/hybrid_v2/deployments/{deployment_id}/executions/{CID}/broadcast");
     let response = router_for(state)
         .oneshot(post(&path, Some(ADMIN_TOKEN), serde_json::json!({})))
         .await
@@ -338,9 +332,7 @@ async fn broadcast_route_rejects_unknown_body_fields() {
     };
     let pool = fresh_pool(&url).await;
     let (deployment_id, state) = build_app_state(&pool, true).await;
-    let path = format!(
-        "/admin/hybrid_v2/deployments/{deployment_id}/executions/{CID}/broadcast"
-    );
+    let path = format!("/admin/hybrid_v2/deployments/{deployment_id}/executions/{CID}/broadcast");
     // Body contains a raw tx bytes field — must be rejected at the
     // deserializer boundary as 400 / 422.
     let response = router_for(state)
@@ -357,7 +349,10 @@ async fn broadcast_route_rejects_unknown_body_fields() {
         "raw tx bytes body must be rejected as 4xx; got {status}"
     );
     let text = body_text(response).await;
-    assert!(!text.contains("0xdeadbeef"), "response should not echo the injected raw tx bytes: {text}");
+    assert!(
+        !text.contains("0xdeadbeef"),
+        "response should not echo the injected raw tx bytes: {text}"
+    );
 }
 
 #[tokio::test]
@@ -369,15 +364,10 @@ async fn broadcast_status_returns_sanitized_row() {
     let (deployment_id, state) = build_app_state(&pool, true).await;
     let store = state.hybrid_v2_projection_store.clone().unwrap();
     let store_pg: &PostgresHybridV2ProjectionStore = downcast(&*store);
-    seed_execution_and_broadcast_row(
-        store_pg,
-        deployment_id,
-        ExecutionPhase::SignatureVerified,
-    )
-    .await;
-    let path = format!(
-        "/admin/hybrid_v2/deployments/{deployment_id}/executions/{CID}/broadcast_status"
-    );
+    seed_execution_and_broadcast_row(store_pg, deployment_id, ExecutionPhase::SignatureVerified)
+        .await;
+    let path =
+        format!("/admin/hybrid_v2/deployments/{deployment_id}/executions/{CID}/broadcast_status");
     let response = router_for(state)
         .oneshot(get(&path, Some(ADMIN_TOKEN)))
         .await
@@ -385,7 +375,13 @@ async fn broadcast_status_returns_sanitized_row() {
     assert_eq!(response.status(), StatusCode::OK);
     let text = body_text(response).await;
     // Sanitized: no signature bytes or raw envelope bytes surfaced.
-    for forbidden in ["signature_r", "signature_s", "signature_v", "raw_tx_bytes", "raw_envelope"] {
+    for forbidden in [
+        "signature_r",
+        "signature_s",
+        "signature_v",
+        "raw_tx_bytes",
+        "raw_envelope",
+    ] {
         assert!(
             !text.contains(forbidden),
             "sanitized broadcast_status contains `{forbidden}`: {text}"
@@ -403,9 +399,7 @@ async fn broadcast_pending_is_bounded_by_limit() {
     };
     let pool = fresh_pool(&url).await;
     let (deployment_id, state) = build_app_state(&pool, true).await;
-    let path = format!(
-        "/admin/hybrid_v2/deployments/{deployment_id}/broadcast_pending?limit=25"
-    );
+    let path = format!("/admin/hybrid_v2/deployments/{deployment_id}/broadcast_pending?limit=25");
     let response = router_for(state)
         .oneshot(get(&path, Some(ADMIN_TOKEN)))
         .await
@@ -425,9 +419,8 @@ async fn broadcast_recheck_returns_503_when_worker_not_wired() {
     };
     let pool = fresh_pool(&url).await;
     let (deployment_id, state) = build_app_state(&pool, true).await;
-    let path = format!(
-        "/admin/hybrid_v2/deployments/{deployment_id}/executions/{CID}/broadcast_recheck"
-    );
+    let path =
+        format!("/admin/hybrid_v2/deployments/{deployment_id}/executions/{CID}/broadcast_recheck");
     let response = router_for(state)
         .oneshot(post(&path, Some(ADMIN_TOKEN), serde_json::json!({})))
         .await
@@ -444,9 +437,8 @@ async fn broadcast_recheck_rejects_unknown_body_fields() {
     };
     let pool = fresh_pool(&url).await;
     let (deployment_id, state) = build_app_state(&pool, true).await;
-    let path = format!(
-        "/admin/hybrid_v2/deployments/{deployment_id}/executions/{CID}/broadcast_recheck"
-    );
+    let path =
+        format!("/admin/hybrid_v2/deployments/{deployment_id}/executions/{CID}/broadcast_recheck");
     let response = router_for(state)
         .oneshot(post(
             &path,
@@ -456,7 +448,10 @@ async fn broadcast_recheck_rejects_unknown_body_fields() {
         .await
         .unwrap();
     let status = response.status();
-    assert!(status.is_client_error(), "unknown fields must be 4xx; got {status}");
+    assert!(
+        status.is_client_error(),
+        "unknown fields must be 4xx; got {status}"
+    );
     let text = body_text(response).await;
     assert!(
         !text.contains("attacker"),
@@ -474,12 +469,8 @@ async fn resend_same_bytes_refuses_wrong_phase() {
     // Broadcast row exists but is at BROADCAST_DISABLED — not eligible.
     let store = state.hybrid_v2_projection_store.clone().unwrap();
     let store_pg: &PostgresHybridV2ProjectionStore = downcast(&*store);
-    seed_execution_and_broadcast_row(
-        store_pg,
-        deployment_id,
-        ExecutionPhase::SignatureVerified,
-    )
-    .await;
+    seed_execution_and_broadcast_row(store_pg, deployment_id, ExecutionPhase::SignatureVerified)
+        .await;
     let path = format!(
         "/admin/hybrid_v2/deployments/{deployment_id}/executions/{CID}/broadcast_resend_same_bytes"
     );
@@ -501,12 +492,8 @@ async fn resend_same_bytes_refuses_when_budget_exhausted() {
     let (deployment_id, state) = build_app_state(&pool, true).await;
     let store = state.hybrid_v2_projection_store.clone().unwrap();
     let store_pg: &PostgresHybridV2ProjectionStore = downcast(&*store);
-    seed_execution_and_broadcast_row(
-        store_pg,
-        deployment_id,
-        ExecutionPhase::SignatureVerified,
-    )
-    .await;
+    seed_execution_and_broadcast_row(store_pg, deployment_id, ExecutionPhase::SignatureVerified)
+        .await;
     // Advance the row into SubmissionUnknown with attempt_count above
     // submission_retry_max (= 1 in the test config).
     let dyn_store: &dyn HybridV2ProjectionStore = store_pg;
@@ -563,12 +550,8 @@ async fn manual_intervention_transitions_row_and_stamps_failure_class() {
     let (deployment_id, state) = build_app_state(&pool, true).await;
     let store = state.hybrid_v2_projection_store.clone().unwrap();
     let store_pg: &PostgresHybridV2ProjectionStore = downcast(&*store);
-    seed_execution_and_broadcast_row(
-        store_pg,
-        deployment_id,
-        ExecutionPhase::SignatureVerified,
-    )
-    .await;
+    seed_execution_and_broadcast_row(store_pg, deployment_id, ExecutionPhase::SignatureVerified)
+        .await;
     let path = format!(
         "/admin/hybrid_v2/deployments/{deployment_id}/executions/{CID}/broadcast_manual_intervention"
     );
@@ -585,7 +568,10 @@ async fn manual_intervention_transitions_row_and_stamps_failure_class() {
     let dyn_store: &dyn HybridV2ProjectionStore = store_pg;
     let row = dyn_store.get_broadcast_state(CID).await.unwrap().unwrap();
     assert_eq!(row.phase, BroadcastPhase::ManualInterventionRequired);
-    assert_eq!(row.failure_class.as_deref(), Some("ADMIN_MANUAL_INTERVENTION"));
+    assert_eq!(
+        row.failure_class.as_deref(),
+        Some("ADMIN_MANUAL_INTERVENTION")
+    );
 }
 
 #[tokio::test]
@@ -680,6 +666,7 @@ fn default_row(deployment_id: i64) -> ExecutionRequestRow {
 fn downcast(store: &dyn HybridV2ProjectionStore) -> &PostgresHybridV2ProjectionStore {
     // SAFETY: tests always attach the Postgres store to AppState. The
     // reference lifetime is bounded by the caller's borrow.
-    unsafe { &*(store as *const dyn HybridV2ProjectionStore as *const PostgresHybridV2ProjectionStore) }
+    unsafe {
+        &*(store as *const dyn HybridV2ProjectionStore as *const PostgresHybridV2ProjectionStore)
+    }
 }
-

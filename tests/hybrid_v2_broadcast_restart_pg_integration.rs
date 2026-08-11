@@ -331,7 +331,10 @@ async fn read_reserved_nonce(store: &PostgresHybridV2ProjectionStore, cid: &str)
         .and_then(|r| r.reserved_nonce)
 }
 
-async fn read_signature(store: &PostgresHybridV2ProjectionStore, cid: &str) -> (Option<String>, Option<String>, Option<i16>) {
+async fn read_signature(
+    store: &PostgresHybridV2ProjectionStore,
+    cid: &str,
+) -> (Option<String>, Option<String>, Option<i16>) {
     let dyn_store: &dyn HybridV2ProjectionStore = store;
     let row = dyn_store
         .get_execution_request(cid)
@@ -438,15 +441,18 @@ async fn restart_after_broadcasting_persisted_before_send() {
         .await
         .expect("resume");
     assert_eq!(resumed.phase, BroadcastPhase::SubmissionUnknown);
-    assert_eq!(read_tx_hash(&store, &cid).await.as_deref(), Some(tx_hex.as_str()));
+    assert_eq!(
+        read_tx_hash(&store, &cid).await.as_deref(),
+        Some(tx_hex.as_str())
+    );
     assert!(rpc.write_method_calls().is_empty());
 }
 
 #[tokio::test]
 async fn restart_after_rpc_request_issued_provider_accepted_response_lost() {
-    let Some(url) = get_pg_url_or_skip(
-        "restart_after_rpc_request_issued_provider_accepted_response_lost",
-    ) else {
+    let Some(url) =
+        get_pg_url_or_skip("restart_after_rpc_request_issued_provider_accepted_response_lost")
+    else {
         return;
     };
     let pool = fresh_pool(&url).await;
@@ -573,7 +579,10 @@ async fn restart_after_submission_unknown_persistent() {
         .await
         .expect("resume");
     assert_eq!(resumed.phase, BroadcastPhase::ManualInterventionRequired);
-    assert_eq!(resumed.failure_class.as_deref(), Some(bfc::TRANSPORT_AMBIGUOUS));
+    assert_eq!(
+        resumed.failure_class.as_deref(),
+        Some(bfc::TRANSPORT_AMBIGUOUS)
+    );
     // Only the initial submit hit the wire.
     assert_eq!(rpc.write_method_calls(), vec!["eth_sendRawTransaction"]);
 }
@@ -654,7 +663,8 @@ async fn restart_after_submitted_worker_advances_to_confirming() {
 
 #[tokio::test]
 async fn restart_after_pending_receipt_arrives_between_ticks() {
-    let Some(url) = get_pg_url_or_skip("restart_after_pending_receipt_arrives_between_ticks") else {
+    let Some(url) = get_pg_url_or_skip("restart_after_pending_receipt_arrives_between_ticks")
+    else {
         return;
     };
     let pool = fresh_pool(&url).await;
@@ -733,8 +743,7 @@ async fn restart_after_pending_receipt_arrives_between_ticks() {
 
 #[tokio::test]
 async fn restart_after_mined_success_worker_resumes_confirmation() {
-    let Some(url) =
-        get_pg_url_or_skip("restart_after_mined_success_worker_resumes_confirmation")
+    let Some(url) = get_pg_url_or_skip("restart_after_mined_success_worker_resumes_confirmation")
     else {
         return;
     };
@@ -1056,7 +1065,10 @@ async fn restart_preserves_tx_hash_across_all_phases() {
     assert_eq!(observed, env.envelope_hash_hex());
     // Drop outbox / worker, verify hash persists.
     drop(outbox);
-    assert_eq!(read_tx_hash(&store, &cid).await.as_deref(), Some(observed.as_str()));
+    assert_eq!(
+        read_tx_hash(&store, &cid).await.as_deref(),
+        Some(observed.as_str())
+    );
     // A fresh worker tick preserves the hash too.
     rpc.set_receipt_response(
         env.envelope_hash,
@@ -1321,9 +1333,9 @@ async fn restart_after_reorged_recovers_via_reorg_recovery() {
 
 #[tokio::test]
 async fn restart_after_confirmation_threshold_reached_before_db_commit() {
-    let Some(url) = get_pg_url_or_skip(
-        "restart_after_confirmation_threshold_reached_before_db_commit",
-    ) else {
+    let Some(url) =
+        get_pg_url_or_skip("restart_after_confirmation_threshold_reached_before_db_commit")
+    else {
         return;
     };
     let pool = fresh_pool(&url).await;

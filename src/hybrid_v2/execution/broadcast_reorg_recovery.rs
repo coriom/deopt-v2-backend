@@ -238,7 +238,9 @@ impl BroadcastReorgRecovery<'_> {
         // Receipt existing at block_number 0 with an all-zero hash is
         // the "pending shape" some providers return — treat as pending.
         if receipt.block_number == 0 && receipt.block_hash == [0u8; 32] {
-            return self.transition_to_pending(canonical_execution_id, row).await;
+            return self
+                .transition_to_pending(canonical_execution_id, row)
+                .await;
         }
         // Verify the new receipt block is canonical.
         let header = self
@@ -252,14 +254,13 @@ impl BroadcastReorgRecovery<'_> {
         };
 
         // Compare against the row's previously-observed receipt block.
-        let previous_block = row.receipt_block_number.and_then(|v| {
-            if v >= 0 {
-                Some(v as u64)
-            } else {
-                None
-            }
-        });
-        let previous_hash = row.receipt_block_hash.as_deref().and_then(parse_bytes32_lax);
+        let previous_block =
+            row.receipt_block_number
+                .and_then(|v| if v >= 0 { Some(v as u64) } else { None });
+        let previous_hash = row
+            .receipt_block_hash
+            .as_deref()
+            .and_then(parse_bytes32_lax);
         let same_slot = previous_block == Some(receipt.block_number)
             && previous_hash == Some(receipt.block_hash);
 
@@ -394,7 +395,9 @@ impl BroadcastReorgRecovery<'_> {
                         .handle_receipt_present(canonical_execution_id, row, &synthetic)
                         .await;
                 }
-                return self.transition_to_pending(canonical_execution_id, row).await;
+                return self
+                    .transition_to_pending(canonical_execution_id, row)
+                    .await;
             }
             Ok(_) => {}
             Err(e) => return Err(ReorgRecoveryError::RpcFailure(e.to_string())),
@@ -437,7 +440,8 @@ impl BroadcastReorgRecovery<'_> {
                     .await
             }
             NonceInvestigationOutcome::OurTxPending => {
-                self.transition_to_pending(canonical_execution_id, row).await
+                self.transition_to_pending(canonical_execution_id, row)
+                    .await
             }
             NonceInvestigationOutcome::NonceReleasedNoTxFound => {
                 // Row stays Reorged; stamp failure_class so operators can

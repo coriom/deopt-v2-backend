@@ -268,12 +268,7 @@ impl MockBroadcastRpc {
     /// simulates the receipt block hash / number changing under a
     /// reorg. The stored receipt is mutated in place; the setter is
     /// idempotent.
-    pub fn set_receipt_block_reorg(
-        &self,
-        tx_hash: [u8; 32],
-        new_block: u64,
-        new_hash: [u8; 32],
-    ) {
+    pub fn set_receipt_block_reorg(&self, tx_hash: [u8; 32], new_block: u64, new_hash: [u8; 32]) {
         self.inner
             .lock()
             .unwrap()
@@ -284,7 +279,11 @@ impl MockBroadcastRpc {
     /// `tx_by_hash` returns `None` for this hash regardless of any
     /// prior `set_transaction_response`. Simulates a dropped tx.
     pub fn set_transaction_dropped(&self, tx_hash: [u8; 32]) {
-        self.inner.lock().unwrap().dropped_transactions.insert(tx_hash);
+        self.inner
+            .lock()
+            .unwrap()
+            .dropped_transactions
+            .insert(tx_hash);
     }
 
     /// The next `n` receipt / transaction lookups return an unavailable
