@@ -171,7 +171,7 @@ impl HybridV2ApiState {
 /// Every canonical read reports the deployment as absent — combined
 /// with the empty deployment registry this produces structured 404
 /// (`DEPLOYMENT_NOT_FOUND`) / 503 responses at the handler layer.
-struct EmptyReadStore;
+pub struct EmptyReadStore;
 
 #[async_trait::async_trait]
 impl HybridV2ReadStore for EmptyReadStore {

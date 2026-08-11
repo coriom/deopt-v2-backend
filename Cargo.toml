@@ -123,3 +123,14 @@ required-features = ["test-signer"]
 name = "hybrid_v2_production_signer_http_e2e"
 path = "tests/hybrid_v2_production_signer_http_e2e.rs"
 required-features = ["test-signer"]
+
+# BACKEND-HYBRID-V2-PRODUCTION-SIGNER-BOOTSTRAP-AND-STARTUP-WIRING-V1
+# Part H — restart-safety PG proofs for the production signer startup
+# path. Every test drives `wire_hybrid_v2_execution_orchestrator` +
+# a mock signer microservice + a mock JSON-RPC harness, rebuilds the
+# orchestrator across a simulated main.rs restart, and asserts
+# deterministic outcomes with ZERO broadcast RPCs.
+[[test]]
+name = "hybrid_v2_production_signer_app_restart_pg_integration"
+path = "tests/hybrid_v2_production_signer_app_restart_pg_integration.rs"
+required-features = ["test-signer"]

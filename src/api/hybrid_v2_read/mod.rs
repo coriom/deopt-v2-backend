@@ -29,4 +29,4 @@ pub use history::{HistoryDirection, HistoryEvent, HistoryEventPayload, HistoryFi
 pub use metadata::{CanonicalityLevel, CanonicalityMetadata, ConsistencyMode};
 pub use openapi::openapi_spec_json;
 pub use router::build_hybrid_v2_read_router;
-pub use state::{DeploymentEntry, HybridV2ApiState};
+pub use state::{DeploymentEntry, EmptyReadStore, HybridV2ApiState};

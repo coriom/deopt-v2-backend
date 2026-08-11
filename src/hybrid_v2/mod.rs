@@ -40,6 +40,7 @@ pub mod rpc_chain_view;
 pub mod runtime;
 pub mod runtime_backed_read_store;
 pub mod snapshot;
+pub mod startup;
 pub mod topics;
 pub mod worker;
 
@@ -99,5 +100,6 @@ pub use runtime::{
     BootstrapResult, IndexerRuntime, PendingReorgAudit, RuntimeError, RuntimeMetrics,
 };
 pub use snapshot::{PinnedSnapshots, SourceMetadata};
+pub use startup::{bootstrap_probe_signer_identity, wire_hybrid_v2_execution_orchestrator};
 pub use topics::TopicCatalogue;
 pub use worker::{spawn_hybrid_v2_indexer_worker, HybridV2IndexerWorkerConfig};

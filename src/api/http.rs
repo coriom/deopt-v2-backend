@@ -585,6 +585,18 @@ impl AppState {
         self
     }
 
+    /// BACKEND-HYBRID-V2-PRODUCTION-SIGNER-BOOTSTRAP-AND-STARTUP-WIRING-V1
+    /// — attach a manifest handle without wiring the full
+    /// reconciliation surface (provider + runtime). Used by the
+    /// production-signer startup PG matrix + restart tests to exercise
+    /// the wire path (`wire_hybrid_v2_execution_orchestrator`) without
+    /// bringing up a full indexer runtime. Production callers still go
+    /// through `with_hybrid_v2_reconciliation`.
+    pub fn with_hybrid_v2_manifest(mut self, manifest: crate::hybrid_v2::ManifestParams) -> Self {
+        self.hybrid_v2_manifest = Some(manifest);
+        self
+    }
+
     pub fn with_rfq_config(engine: EngineState, rfq_config: RfqConfig) -> Self {
         Self::with_all_config(
             engine,
