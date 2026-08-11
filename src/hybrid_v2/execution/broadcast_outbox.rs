@@ -71,10 +71,34 @@ use thiserror::Error;
 pub mod failure_class {
     pub const PROVIDER_HASH_MISMATCH: &str = "PROVIDER_HASH_MISMATCH";
     pub const NONCE_CONFLICT: &str = "NONCE_CONFLICT";
+    /// Emitted after the nonce investigator classifies the network state
+    /// as `OurTxMined` — our reserved nonce belongs to the local tx.
+    pub const NONCE_CONFLICT_OUR_TX_MINED: &str = "NONCE_CONFLICT_OUR_TX_MINED";
+    /// Emitted after the nonce investigator classifies as `OurTxPending`.
+    pub const NONCE_CONFLICT_OUR_TX_PENDING: &str = "NONCE_CONFLICT_OUR_TX_PENDING";
+    /// Emitted after `NonceReleasedNoTxFound`.
+    pub const NONCE_CONFLICT_NONCE_RELEASED: &str = "NONCE_CONFLICT_NONCE_RELEASED";
+    /// Emitted after `DifferentTxConsumedNonce` — operator investigation.
+    pub const NONCE_CONFLICT_DIFFERENT_TX_CONSUMED_NONCE: &str =
+        "NONCE_CONFLICT_DIFFERENT_TX_CONSUMED_NONCE";
+    /// Emitted after `Ambiguous` outcome.
+    pub const NONCE_CONFLICT_AMBIGUOUS: &str = "NONCE_CONFLICT_AMBIGUOUS";
+    /// Legacy tokens retained for backwards-grep compatibility.
+    pub const NONCE_CONFLICT_NONCE_TOO_LOW: &str = "NONCE_CONFLICT_NONCE_TOO_LOW";
+    pub const NONCE_CONFLICT_NONCE_TOO_HIGH: &str = "NONCE_CONFLICT_NONCE_TOO_HIGH";
+    pub const NONCE_CONFLICT_REPLACEMENT_UNDERPRICED: &str =
+        "NONCE_CONFLICT_REPLACEMENT_UNDERPRICED";
     pub const PROVIDER_REJECTED: &str = "PROVIDER_REJECTED";
     pub const TRANSPORT_AMBIGUOUS: &str = "TRANSPORT_AMBIGUOUS";
     pub const FIREWALL_REJECTED: &str = "FIREWALL_REJECTED";
     pub const SERIALIZATION_FAILED: &str = "SERIALIZATION_FAILED";
+    /// Emitted when the receipt watcher observes a receipt whose
+    /// `tx_hash` disagrees with our local envelope hash. Critical.
+    pub const RECEIPT_HASH_MISMATCH: &str = "RECEIPT_HASH_MISMATCH";
+    /// Emitted when the indexer catches up past the receipt block but
+    /// the expected canonical evidence (matched execution row) is
+    /// missing after tolerance ticks.
+    pub const CORRELATION_MISSING: &str = "CORRELATION_MISSING";
 }
 
 /// Provider-classification strings the outbox writes to
@@ -373,33 +397,30 @@ impl BroadcastOutbox {
                 .await
             }
             Ok(SendOutcome::NonceTooLow) => {
-                self.escalate_manual_typed(
+                self.escalate_nonce_conflict(
                     canonical_execution_id,
-                    BroadcastPhase::Broadcasting,
-                    BroadcastPhase::ManualInterventionRequired,
-                    failure_class::NONCE_CONFLICT,
+                    envelope,
+                    "NONCE_CONFLICT_NONCE_TOO_LOW",
                     provider_classification::NONCE_TOO_LOW,
                     now_ms_val,
                 )
                 .await
             }
             Ok(SendOutcome::NonceTooHigh) => {
-                self.escalate_manual_typed(
+                self.escalate_nonce_conflict(
                     canonical_execution_id,
-                    BroadcastPhase::Broadcasting,
-                    BroadcastPhase::ManualInterventionRequired,
-                    failure_class::NONCE_CONFLICT,
+                    envelope,
+                    "NONCE_CONFLICT_NONCE_TOO_HIGH",
                     provider_classification::NONCE_TOO_HIGH,
                     now_ms_val,
                 )
                 .await
             }
             Ok(SendOutcome::ReplacementUnderpriced) => {
-                self.escalate_manual_typed(
+                self.escalate_nonce_conflict(
                     canonical_execution_id,
-                    BroadcastPhase::Broadcasting,
-                    BroadcastPhase::ManualInterventionRequired,
-                    failure_class::NONCE_CONFLICT,
+                    envelope,
+                    "NONCE_CONFLICT_REPLACEMENT_UNDERPRICED",
                     provider_classification::REPLACEMENT_UNDERPRICED,
                     now_ms_val,
                 )
@@ -641,6 +662,81 @@ impl BroadcastOutbox {
             failure_class: Some(failure_class_str.to_string()),
             failure_detail: Some(detail.to_string()),
         })
+    }
+
+    // -----------------------------------------------------------------
+    //  PART K — NONCE CONFLICT INVESTIGATION
+    // -----------------------------------------------------------------
+
+    /// Escalate a nonce-error `SendOutcome` after invoking the
+    /// [`crate::hybrid_v2::execution::broadcast_nonce_policy::BroadcastNonceInvestigator`]
+    /// against the persisted request row. The investigation itself is
+    /// READ-ONLY on the local nonce reservation — the outbox NEVER
+    /// releases a reservation while the outcome is ambiguous. The
+    /// resulting `failure_class` carries the specific classification
+    /// (`NONCE_CONFLICT_*`) so operators can grep on a stable token
+    /// rather than a wire message.
+    async fn escalate_nonce_conflict(
+        &self,
+        canonical_execution_id: &str,
+        envelope: &SignedExecutionEnvelope,
+        base_failure_class: &str,
+        classification: &str,
+        now_ms_val: u64,
+    ) -> Result<OutboxOutcome, OutboxError> {
+        // Read the persisted execution row to recover the executor
+        // address + our reserved nonce. If the row is absent (unexpected
+        // — the outbox inserts before send) skip the investigation.
+        let exec_row = self
+            .store
+            .get_execution_request(canonical_execution_id)
+            .await
+            .map_err(|e| OutboxError::StoreFailure(e.to_string()))?;
+        let mut investigation_detail = String::new();
+        let mut refined_failure_class = base_failure_class.to_string();
+        if let Some(row) = exec_row.as_ref() {
+            if let (Some(sig_hex), Some(nonce_i64)) =
+                (row.signer_identity.as_deref(), row.reserved_nonce)
+            {
+                if let (Some(executor), Ok(nonce_u64)) =
+                    (parse_addr_lax(sig_hex), u64::try_from(nonce_i64))
+                {
+                    let investigator = crate::hybrid_v2::execution::broadcast_nonce_policy::BroadcastNonceInvestigator {
+                        store: self.store.as_ref(),
+                        rpc: self.rpc.as_ref(),
+                        executor_address: executor,
+                        chain_id: envelope.chain_id,
+                    };
+                    match investigator
+                        .investigate(envelope.envelope_hash, nonce_u64)
+                        .await
+                    {
+                        Ok(outcome) => {
+                            let (suffix, human) = classify_nonce_outcome(&outcome);
+                            refined_failure_class = format!("{}_{}", "NONCE_CONFLICT", suffix);
+                            investigation_detail = human;
+                        }
+                        Err(e) => {
+                            investigation_detail = format!("investigation rpc error: {e}");
+                        }
+                    }
+                }
+            }
+        }
+        let detail = if investigation_detail.is_empty() {
+            classification.to_string()
+        } else {
+            format!("{classification} :: {investigation_detail}")
+        };
+        self.escalate_manual_typed(
+            canonical_execution_id,
+            BroadcastPhase::Broadcasting,
+            BroadcastPhase::ManualInterventionRequired,
+            &refined_failure_class,
+            &detail,
+            now_ms_val,
+        )
+        .await
     }
 
     // -----------------------------------------------------------------
@@ -1294,6 +1390,56 @@ fn parse_bytes32_lax(s: &str) -> Option<[u8; 32]> {
         out[i] = u8::from_str_radix(&stripped[2 * i..2 * i + 2], 16).ok()?;
     }
     Some(out)
+}
+
+fn parse_addr_lax(s: &str) -> Option<[u8; 20]> {
+    let stripped = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X"))?;
+    if stripped.len() != 40 {
+        return None;
+    }
+    let mut out = [0u8; 20];
+    for i in 0..20 {
+        out[i] = u8::from_str_radix(&stripped[2 * i..2 * i + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+fn classify_nonce_outcome(
+    outcome: &crate::hybrid_v2::execution::broadcast_nonce_policy::NonceInvestigationOutcome,
+) -> (&'static str, String) {
+    use crate::hybrid_v2::execution::broadcast_nonce_policy::NonceInvestigationOutcome as N;
+    match outcome {
+        N::OurTxMined {
+            block_number,
+            block_hash,
+        } => (
+            "OUR_TX_MINED",
+            format!(
+                "investigator: our tx mined at block {} hash 0x{}",
+                block_number,
+                hex_encode(block_hash)
+            ),
+        ),
+        N::OurTxPending => (
+            "OUR_TX_PENDING",
+            "investigator: our tx observed in mempool".to_string(),
+        ),
+        N::NonceReleasedNoTxFound => (
+            "NONCE_RELEASED",
+            "investigator: pending_nonce < our_nonce (nobody consumed the slot)".to_string(),
+        ),
+        N::DifferentTxConsumedNonce { observed_tx_hash } => (
+            "DIFFERENT_TX_CONSUMED_NONCE",
+            format!(
+                "investigator: different tx consumed our nonce (observed=0x{})",
+                hex_encode(observed_tx_hash)
+            ),
+        ),
+        N::Ambiguous => (
+            "AMBIGUOUS",
+            "investigator: pending_nonce and mempool observations do not agree".to_string(),
+        ),
+    }
 }
 
 // -----------------------------------------------------------------

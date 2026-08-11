@@ -59,6 +59,13 @@ const ALLOWED_FILES: &[&str] = &[
     // the destination of the raw payload it builds; the file itself
     // does no I/O.
     "src/hybrid_v2/execution/tx_serialization.rs",
+    // Package B (Parts J–P) — lifecycle files that observe / classify
+    // the network state around the narrow send capability. The nonce
+    // investigator and receipt worker never issue writes but their
+    // doc comments and test mocks legitimately reference the token.
+    "src/hybrid_v2/execution/broadcast_nonce_policy.rs",
+    "src/hybrid_v2/execution/broadcast_worker.rs",
+    "src/hybrid_v2/execution/broadcast_indexer_correlation.rs",
 ];
 
 fn crate_root() -> PathBuf {
