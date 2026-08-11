@@ -50,7 +50,7 @@ pub mod tx_serialization;
 // -----------------------------------------------------------------
 // pub mod broadcast_firewall;
 // pub mod broadcast_outbox;
-// pub mod broadcast_rpc;
+pub mod broadcast_rpc;
 pub mod broadcast_state;
 
 #[cfg(any(test, feature = "test-signer"))]
@@ -96,11 +96,11 @@ pub use tx_serialization::{
 
 // pub use broadcast_firewall::{BroadcastPolicyFirewall, BroadcastFirewallRejection};
 // pub use broadcast_outbox::{BroadcastOutbox, OutboxError, OutboxOutcome};
-// pub use broadcast_rpc::{
-//     BlockHeader as BroadcastBlockHeader, BroadcastRpcError, ExecutionBroadcastRpcClient,
-//     HttpExecutionBroadcastRpcClient, SendOutcome, TransactionSummary, TxReceipt,
-//     BROADCAST_ALLOWED_METHODS,
-// };
+pub use broadcast_rpc::{
+    BlockHeader as BroadcastBlockHeader, BroadcastRpcError, ExecutionBroadcastRpcClient,
+    HttpExecutionBroadcastRpcClient, SendOutcome, TransactionSummary, TxReceipt,
+    BROADCAST_ALLOWED_METHODS,
+};
 pub use broadcast_state::{
     BroadcastPhase, BroadcastPhaseParseError, BroadcastStatePatch, BroadcastStateRow,
 };
