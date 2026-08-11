@@ -809,6 +809,73 @@ pub struct HybridV2ExecutionConfig {
     /// adds this CA to the roots trusted by the underlying `reqwest`
     /// client. Env: `HV2_SIGNER_ROOT_CA_PATH`.
     pub signer_root_ca_pem_path: Option<String>,
+
+    // -----------------------------------------------------------------
+    //  BACKEND-HYBRID-V2-BROADCAST-AND-CONFIRMATION-V1 (Part F).
+    //  Every field below governs the broadcast pipeline; every timeout
+    //  / retry / depth is bounded by `validate_startup`.
+    // -----------------------------------------------------------------
+    /// Master broadcast switch. When `false` (default) the broadcast
+    /// outbox refuses to submit — the firewall rejects with
+    /// `BroadcastConfigDisabled`.
+    /// Env: `HV2_BROADCAST_ENABLED`.
+    pub broadcast_enabled: bool,
+    /// JSON-RPC endpoint dedicated to the broadcast pipeline. Held
+    /// separately from `rpc_url` so operators can route submit traffic
+    /// through a distinct provider / rate-limit tier. MANDATORY when
+    /// `broadcast_enabled = true`. Redacted in the `Debug` impl.
+    /// Env: `HV2_BROADCAST_RPC_URL`.
+    pub broadcast_rpc_url: Option<String>,
+    /// Per-request timeout for the broadcast RPC (ms). Bounded to
+    /// [500, 60_000]. Default 5000.
+    /// Env: `HV2_BROADCAST_RPC_TIMEOUT_MS`.
+    pub broadcast_rpc_timeout_ms: u64,
+    /// Additional retry attempts for transient RPC errors. Bounded to
+    /// [0, 5]. Default 1. Only Timeout / Transport / Unavailable /
+    /// RateLimited errors retry; deterministic errors are surfaced.
+    /// Env: `HV2_BROADCAST_RPC_MAX_RETRIES`.
+    pub broadcast_rpc_max_retries: u32,
+    /// Depth (in blocks) required to promote a MINED_SUCCESS row to
+    /// CONFIRMING → CONFIRMED. Bounded to [1, 64]. Default 3
+    /// (Base Sepolia).
+    /// Env: `HV2_BROADCAST_CONFIRMATION_DEPTH`.
+    pub confirmation_depth: u32,
+    /// Cadence (ms) at which the receipt watcher polls the broadcast
+    /// RPC for a receipt. Bounded to [500, 30_000]. Default 2000.
+    /// Env: `HV2_BROADCAST_RECEIPT_POLL_INTERVAL_MS`.
+    pub receipt_poll_interval_ms: u64,
+    /// Total wall-clock budget (ms) for receipt polling before the
+    /// watcher escalates to `MANUAL_INTERVENTION_REQUIRED`. Bounded to
+    /// [60_000, 3_600_000]. Default 300_000 (5 minutes).
+    /// Env: `HV2_BROADCAST_RECEIPT_POLL_TIMEOUT_MS`.
+    pub receipt_poll_timeout_ms: u64,
+    /// Additional broadcast attempts allowed after a rejection. Bounded
+    /// to [0, 3]. Default 0 — the frozen posture is NO AUTO-RETRY of
+    /// the send call. Operator must intervene.
+    /// Env: `HV2_BROADCAST_SUBMISSION_RETRY_MAX`.
+    pub submission_retry_max: u32,
+    /// Backoff (ms) between the retries governed by
+    /// `submission_retry_max`. Bounded to [100, 10_000]. Default 500.
+    /// Env: `HV2_BROADCAST_TRANSIENT_RETRY_BACKOFF_MS`.
+    pub transient_retry_backoff_ms: u64,
+    /// Wall-clock ceiling (ms) beyond which a PENDING or
+    /// SUBMISSION_UNKNOWN row is treated as stalled and escalated.
+    /// Bounded to [60_000, 86_400_000]. Default 3_600_000 (1 hour).
+    /// Env: `HV2_BROADCAST_MAX_PENDING_AGE_MS`.
+    pub max_pending_age_ms: u64,
+    /// Chain-id allowlist for broadcast. Enforced at every boundary
+    /// (config validation, RPC construction, firewall). Base mainnet
+    /// (8453) is refused regardless of allowlist content.
+    /// Default: [84532] (Base Sepolia).
+    /// Env: `HV2_BROADCAST_ALLOWED_CHAIN_IDS` (comma-separated).
+    pub allowed_broadcast_chain_ids: Vec<u64>,
+    /// Opt-in mempool probe before send. When true, the outbox calls
+    /// `transaction_by_hash(envelope_hash)` first; if the tx is already
+    /// known, the row moves straight to SUBMITTED with
+    /// `provider_classification=ALREADY_KNOWN`. Default false — the
+    /// probe is optional (Part I marks it explicit).
+    /// Env: `HV2_BROADCAST_PRE_SEND_HASH_PROBE`.
+    pub pre_send_hash_probe: bool,
 }
 
 impl std::fmt::Debug for HybridV2ExecutionConfig {
@@ -868,6 +935,31 @@ impl std::fmt::Debug for HybridV2ExecutionConfig {
                 "signer_root_ca_pem_path",
                 &self.signer_root_ca_pem_path.as_deref().map(|_| "<set>"),
             )
+            .field("broadcast_enabled", &self.broadcast_enabled)
+            .field(
+                "broadcast_rpc_url",
+                &self
+                    .broadcast_rpc_url
+                    .as_deref()
+                    .map(redact_rpc_url)
+                    .unwrap_or_else(|| "<unset>".to_string()),
+            )
+            .field("broadcast_rpc_timeout_ms", &self.broadcast_rpc_timeout_ms)
+            .field("broadcast_rpc_max_retries", &self.broadcast_rpc_max_retries)
+            .field("confirmation_depth", &self.confirmation_depth)
+            .field("receipt_poll_interval_ms", &self.receipt_poll_interval_ms)
+            .field("receipt_poll_timeout_ms", &self.receipt_poll_timeout_ms)
+            .field("submission_retry_max", &self.submission_retry_max)
+            .field(
+                "transient_retry_backoff_ms",
+                &self.transient_retry_backoff_ms,
+            )
+            .field("max_pending_age_ms", &self.max_pending_age_ms)
+            .field(
+                "allowed_broadcast_chain_ids",
+                &self.allowed_broadcast_chain_ids,
+            )
+            .field("pre_send_hash_probe", &self.pre_send_hash_probe)
             .finish()
     }
 }
@@ -922,6 +1014,18 @@ impl HybridV2ExecutionConfig {
             signer_mtls_cert_pem_path: None,
             signer_mtls_key_pem_path: None,
             signer_root_ca_pem_path: None,
+            broadcast_enabled: false,
+            broadcast_rpc_url: None,
+            broadcast_rpc_timeout_ms: 5_000,
+            broadcast_rpc_max_retries: 1,
+            confirmation_depth: 3,
+            receipt_poll_interval_ms: 2_000,
+            receipt_poll_timeout_ms: 300_000,
+            submission_retry_max: 0,
+            transient_retry_backoff_ms: 500,
+            max_pending_age_ms: 3_600_000,
+            allowed_broadcast_chain_ids: vec![BASE_SEPOLIA_CHAIN_ID],
+            pre_send_hash_probe: false,
         }
     }
 
@@ -999,6 +1103,39 @@ impl HybridV2ExecutionConfig {
             .or_else(|| env::var("HYBRID_V2_RPC_URL").ok().filter(|s| !s.is_empty()));
         let rpc_timeout_ms: u64 = parse_env("HV2_EXECUTION_RPC_TIMEOUT_MS")?.unwrap_or(10_000);
         let simulation_max_age_ms: u64 = parse_env("HV2_SIMULATION_MAX_AGE_MS")?.unwrap_or(60_000);
+        // ---- broadcast surface (Part F) --------------------------------
+        let broadcast_enabled = parse_bool_env("HV2_BROADCAST_ENABLED")?.unwrap_or(false);
+        let broadcast_rpc_url = env::var("HV2_BROADCAST_RPC_URL")
+            .ok()
+            .filter(|s| !s.is_empty());
+        let broadcast_rpc_timeout_ms: u64 =
+            parse_env("HV2_BROADCAST_RPC_TIMEOUT_MS")?.unwrap_or(5_000);
+        let broadcast_rpc_max_retries: u32 =
+            parse_env("HV2_BROADCAST_RPC_MAX_RETRIES")?.unwrap_or(1);
+        let confirmation_depth: u32 = parse_env("HV2_BROADCAST_CONFIRMATION_DEPTH")?.unwrap_or(3);
+        let receipt_poll_interval_ms: u64 =
+            parse_env("HV2_BROADCAST_RECEIPT_POLL_INTERVAL_MS")?.unwrap_or(2_000);
+        let receipt_poll_timeout_ms: u64 =
+            parse_env("HV2_BROADCAST_RECEIPT_POLL_TIMEOUT_MS")?.unwrap_or(300_000);
+        let submission_retry_max: u32 =
+            parse_env("HV2_BROADCAST_SUBMISSION_RETRY_MAX")?.unwrap_or(0);
+        let transient_retry_backoff_ms: u64 =
+            parse_env("HV2_BROADCAST_TRANSIENT_RETRY_BACKOFF_MS")?.unwrap_or(500);
+        let max_pending_age_ms: u64 =
+            parse_env("HV2_BROADCAST_MAX_PENDING_AGE_MS")?.unwrap_or(3_600_000);
+        let allowed_broadcast_chain_ids: Vec<u64> = env::var("HV2_BROADCAST_ALLOWED_CHAIN_IDS")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(|raw| {
+                raw.split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .filter_map(|s| s.parse::<u64>().ok())
+                    .collect()
+            })
+            .unwrap_or_else(|| vec![BASE_SEPOLIA_CHAIN_ID]);
+        let pre_send_hash_probe =
+            parse_bool_env("HV2_BROADCAST_PRE_SEND_HASH_PROBE")?.unwrap_or(false);
         let cfg = Self {
             execution_enabled: true,
             executor_address,
@@ -1017,6 +1154,18 @@ impl HybridV2ExecutionConfig {
             signer_mtls_cert_pem_path,
             signer_mtls_key_pem_path,
             signer_root_ca_pem_path,
+            broadcast_enabled,
+            broadcast_rpc_url,
+            broadcast_rpc_timeout_ms,
+            broadcast_rpc_max_retries,
+            confirmation_depth,
+            receipt_poll_interval_ms,
+            receipt_poll_timeout_ms,
+            submission_retry_max,
+            transient_retry_backoff_ms,
+            max_pending_age_ms,
+            allowed_broadcast_chain_ids,
+            pre_send_hash_probe,
         };
         // Validation is caller-driven so main.rs can log a WARN + fall
         // back to `orchestrator = None` instead of crashing.
@@ -1144,6 +1293,98 @@ impl HybridV2ExecutionConfig {
             return Err(cfg_err(format!(
                 "HV2_SIMULATION_MAX_AGE_MS must be within [1000, 3600000], got {}",
                 self.simulation_max_age_ms
+            )));
+        }
+        // ---- broadcast surface validation (Part F) --------------------
+        self.validate_broadcast_surface(chain_id)?;
+        Ok(())
+    }
+
+    /// Split out for readability. Applied by [`validate_startup`] only
+    /// when `execution_enabled = true`; also invoked in isolation by
+    /// broadcast-focused tests.
+    fn validate_broadcast_surface(&self, chain_id: u64) -> Result<()> {
+        // Base mainnet is refused unconditionally, everywhere.
+        if chain_id == BASE_MAINNET_CHAIN_ID
+            || self
+                .allowed_broadcast_chain_ids
+                .contains(&BASE_MAINNET_CHAIN_ID)
+        {
+            return Err(cfg_err(format!(
+                "BaseMainnetForbidden: chain_id 8453 (Base mainnet) is refused unconditionally \
+                 for Hybrid V2 broadcast (chain_id={chain_id})"
+            )));
+        }
+        if !self.broadcast_enabled {
+            return Ok(());
+        }
+        // Broadcast RPC URL mandatory + scheme/host check.
+        let rpc = self
+            .broadcast_rpc_url
+            .as_deref()
+            .ok_or_else(|| cfg_err("HV2_BROADCAST_ENABLED=1 but HV2_BROADCAST_RPC_URL unset"))?;
+        let lower = rpc.to_ascii_lowercase();
+        let is_https = lower.starts_with("https://");
+        let is_local_http =
+            lower.starts_with("http://127.0.0.1") || lower.starts_with("http://localhost");
+        if !(is_https || is_local_http) {
+            return Err(cfg_err(
+                "HV2_BROADCAST_RPC_URL must start with https:// (or http://127.0.0.1 / \
+                 http://localhost for local dev). Redacted value refused.",
+            ));
+        }
+        if !self.allowed_broadcast_chain_ids.contains(&chain_id) {
+            return Err(cfg_err(format!(
+                "ChainNotAllowed: chain_id {chain_id} not in HV2_BROADCAST_ALLOWED_CHAIN_IDS={:?}",
+                self.allowed_broadcast_chain_ids
+            )));
+        }
+        if self.confirmation_depth == 0 || self.confirmation_depth > 64 {
+            return Err(cfg_err(format!(
+                "HV2_BROADCAST_CONFIRMATION_DEPTH must be in [1, 64], got {}",
+                self.confirmation_depth
+            )));
+        }
+        if !(500..=60_000).contains(&self.broadcast_rpc_timeout_ms) {
+            return Err(cfg_err(format!(
+                "HV2_BROADCAST_RPC_TIMEOUT_MS must be in [500, 60000], got {}",
+                self.broadcast_rpc_timeout_ms
+            )));
+        }
+        if self.broadcast_rpc_max_retries > 5 {
+            return Err(cfg_err(format!(
+                "HV2_BROADCAST_RPC_MAX_RETRIES must be <= 5, got {}",
+                self.broadcast_rpc_max_retries
+            )));
+        }
+        if !(500..=30_000).contains(&self.receipt_poll_interval_ms) {
+            return Err(cfg_err(format!(
+                "HV2_BROADCAST_RECEIPT_POLL_INTERVAL_MS must be in [500, 30000], got {}",
+                self.receipt_poll_interval_ms
+            )));
+        }
+        if !(60_000..=3_600_000).contains(&self.receipt_poll_timeout_ms) {
+            return Err(cfg_err(format!(
+                "HV2_BROADCAST_RECEIPT_POLL_TIMEOUT_MS must be in [60000, 3600000], got {}",
+                self.receipt_poll_timeout_ms
+            )));
+        }
+        if self.submission_retry_max > 3 {
+            return Err(cfg_err(format!(
+                "HV2_BROADCAST_SUBMISSION_RETRY_MAX must be <= 3, got {}",
+                self.submission_retry_max
+            )));
+        }
+        if !(100..=10_000).contains(&self.transient_retry_backoff_ms) {
+            return Err(cfg_err(format!(
+                "HV2_BROADCAST_TRANSIENT_RETRY_BACKOFF_MS must be in [100, 10000], got {}",
+                self.transient_retry_backoff_ms
+            )));
+        }
+        if !(60_000..=86_400_000).contains(&self.max_pending_age_ms) {
+            return Err(cfg_err(format!(
+                "HV2_BROADCAST_MAX_PENDING_AGE_MS must be in [60000, 86400000], got {}",
+                self.max_pending_age_ms
             )));
         }
         Ok(())
@@ -1328,6 +1569,142 @@ mod execution_config_tests {
         assert!(!dbg.contains("deopt-signer"), "{dbg}");
         assert!(!dbg.contains("/v1/keys/1234/sign"), "{dbg}");
         assert!(dbg.contains("<redacted>") || dbg.contains("<set>"));
+    }
+
+    // -----------------------------------------------------------------
+    //  Broadcast surface (Part F) — validation matrix.
+    // -----------------------------------------------------------------
+
+    fn base_broadcast_ready() -> HybridV2ExecutionConfig {
+        let mut cfg = base();
+        cfg.expected_signer_address = Some([0xbbu8; 20]);
+        cfg.signer_endpoint = Some("http://127.0.0.1:9000/sign".to_string());
+        cfg.signer_provider = Some(SignerProvider::KmsAws);
+        cfg.broadcast_enabled = true;
+        cfg.broadcast_rpc_url = Some("https://sepolia.example/rpc".to_string());
+        cfg
+    }
+
+    #[test]
+    fn broadcast_disabled_skips_broadcast_validation() {
+        let mut cfg = base();
+        cfg.expected_signer_address = Some([0xbbu8; 20]);
+        cfg.signer_endpoint = Some("http://127.0.0.1:9000/sign".to_string());
+        cfg.signer_provider = Some(SignerProvider::KmsAws);
+        // No broadcast_rpc_url — with broadcast disabled that must
+        // still validate successfully.
+        assert!(cfg.validate_startup(84532).is_ok());
+    }
+
+    #[test]
+    fn broadcast_enabled_requires_rpc_url() {
+        let mut cfg = base_broadcast_ready();
+        cfg.broadcast_rpc_url = None;
+        let err = cfg.validate_startup(84532).unwrap_err().to_string();
+        assert!(err.contains("HV2_BROADCAST_RPC_URL"), "{err}");
+    }
+
+    #[test]
+    fn broadcast_rpc_url_refuses_non_loopback_http() {
+        let mut cfg = base_broadcast_ready();
+        cfg.broadcast_rpc_url = Some("http://example.com/rpc".to_string());
+        assert!(cfg.validate_startup(84532).is_err());
+        cfg.broadcast_rpc_url = Some("http://127.0.0.1:8545".to_string());
+        assert!(cfg.validate_startup(84532).is_ok());
+        cfg.broadcast_rpc_url = Some("http://localhost:8545".to_string());
+        assert!(cfg.validate_startup(84532).is_ok());
+        cfg.broadcast_rpc_url = Some("https://sepolia.example/rpc".to_string());
+        assert!(cfg.validate_startup(84532).is_ok());
+    }
+
+    #[test]
+    fn broadcast_base_mainnet_forbidden_at_both_chain_id_and_allowlist() {
+        let mut cfg = base_broadcast_ready();
+        cfg.allowed_broadcast_chain_ids = vec![84532];
+        // 1. chain_id == 8453 refused (already caught by the top-level
+        //    Base mainnet check; either error is acceptable).
+        let err = cfg
+            .validate_startup(BASE_MAINNET_CHAIN_ID)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("Base mainnet") || err.contains("BaseMainnetForbidden"),
+            "{err}"
+        );
+        // 2. allowlist containing 8453 refused for a permitted chain_id.
+        cfg.allowed_broadcast_chain_ids = vec![84532, BASE_MAINNET_CHAIN_ID];
+        let err = cfg.validate_startup(84532).unwrap_err().to_string();
+        assert!(err.contains("BaseMainnetForbidden"), "{err}");
+    }
+
+    #[test]
+    fn broadcast_refuses_chain_not_in_allowlist() {
+        let mut cfg = base_broadcast_ready();
+        cfg.allowed_broadcast_chain_ids = vec![84532];
+        let err = cfg.validate_startup(11155111).unwrap_err().to_string();
+        assert!(err.contains("ChainNotAllowed"), "{err}");
+    }
+
+    #[test]
+    fn broadcast_bounds_are_enforced() {
+        let mut cfg = base_broadcast_ready();
+        cfg.confirmation_depth = 0;
+        assert!(cfg.validate_startup(84532).is_err());
+        cfg.confirmation_depth = 65;
+        assert!(cfg.validate_startup(84532).is_err());
+        cfg.confirmation_depth = 3;
+        assert!(cfg.validate_startup(84532).is_ok());
+
+        cfg.broadcast_rpc_timeout_ms = 100;
+        assert!(cfg.validate_startup(84532).is_err());
+        cfg.broadcast_rpc_timeout_ms = 60_001;
+        assert!(cfg.validate_startup(84532).is_err());
+        cfg.broadcast_rpc_timeout_ms = 5_000;
+        assert!(cfg.validate_startup(84532).is_ok());
+
+        cfg.broadcast_rpc_max_retries = 6;
+        assert!(cfg.validate_startup(84532).is_err());
+        cfg.broadcast_rpc_max_retries = 1;
+
+        cfg.receipt_poll_interval_ms = 100;
+        assert!(cfg.validate_startup(84532).is_err());
+        cfg.receipt_poll_interval_ms = 40_000;
+        assert!(cfg.validate_startup(84532).is_err());
+        cfg.receipt_poll_interval_ms = 2_000;
+
+        cfg.receipt_poll_timeout_ms = 59_000;
+        assert!(cfg.validate_startup(84532).is_err());
+        cfg.receipt_poll_timeout_ms = 3_600_001;
+        assert!(cfg.validate_startup(84532).is_err());
+        cfg.receipt_poll_timeout_ms = 300_000;
+
+        cfg.submission_retry_max = 4;
+        assert!(cfg.validate_startup(84532).is_err());
+        cfg.submission_retry_max = 0;
+
+        cfg.transient_retry_backoff_ms = 50;
+        assert!(cfg.validate_startup(84532).is_err());
+        cfg.transient_retry_backoff_ms = 10_001;
+        assert!(cfg.validate_startup(84532).is_err());
+        cfg.transient_retry_backoff_ms = 500;
+
+        cfg.max_pending_age_ms = 59_000;
+        assert!(cfg.validate_startup(84532).is_err());
+        cfg.max_pending_age_ms = 86_400_001;
+        assert!(cfg.validate_startup(84532).is_err());
+        cfg.max_pending_age_ms = 3_600_000;
+
+        assert!(cfg.validate_startup(84532).is_ok());
+    }
+
+    #[test]
+    fn broadcast_debug_redacts_broadcast_rpc_url() {
+        let mut cfg = base_broadcast_ready();
+        cfg.broadcast_rpc_url = Some("https://rpc.example.com/v3/SECRET_KEY".to_string());
+        let dbg = format!("{cfg:?}");
+        assert!(!dbg.contains("SECRET_KEY"), "{dbg}");
+        // Redaction should still surface scheme + host.
+        assert!(dbg.contains("rpc.example.com"), "{dbg}");
     }
 
     #[test]
