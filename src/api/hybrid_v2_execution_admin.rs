@@ -20,6 +20,7 @@
 //! influence any of those.
 
 use crate::api::http::AppState;
+use crate::hybrid_v2::execution::broadcast_state::{BroadcastPhase, BroadcastStatePatch};
 use crate::hybrid_v2::execution::{ExecutionPhase, ExecutionRequestRow};
 use crate::hybrid_v2::HybridV2ProjectionStore;
 use alloy_primitives::{Address, Bytes, FixedBytes, U256};
@@ -903,4 +904,659 @@ fn wall_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+// -----------------------------------------------------------------
+//   BACKEND-HYBRID-V2-BROADCAST-AND-CONFIRMATION-V1 (Part S) —
+//   BROADCAST ADMIN CONTROLS
+//
+//   Every request body carries NO wire-format execution primitive.
+//   `#[serde(deny_unknown_fields)]` on every struct guarantees the
+//   handler refuses payloads that try to inject raw tx bytes, r/s/v,
+//   nonce, gas, fee, chain, signer identity, or RPC endpoint. Refused
+//   payloads return 400 INVALID_ADMIN_BODY before any store or RPC
+//   interaction.
+// -----------------------------------------------------------------
+
+/// Empty request body for `/broadcast` — the handler derives all
+/// execution primitives from the persisted execution + broadcast rows.
+/// `deny_unknown_fields` refuses any extraneous field (raw tx, r/s/v,
+/// nonce, target, etc.).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BroadcastRequestBody {}
+
+/// Empty body for the recheck / resend endpoints. Same
+/// `deny_unknown_fields` rule as `BroadcastRequestBody`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EmptyAdminBody {}
+
+/// Manual-intervention body — only `action` + `detail` are accepted.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManualInterventionBody {
+    pub action: String,
+    pub detail: String,
+}
+
+/// Sanitized broadcast state row surfaced to admin observers. Signature
+/// bytes, raw envelope bytes, and provider connection details are
+/// deliberately omitted.
+#[derive(Debug, Clone, Serialize)]
+pub struct SanitizedBroadcastRow {
+    pub canonical_execution_id: String,
+    pub phase: String,
+    pub tx_hash: Option<String>,
+    pub envelope_hash: Option<String>,
+    pub envelope_bytes_hash: Option<String>,
+    pub submission_attempt_count: i32,
+    pub first_submission_at_ms: Option<i64>,
+    pub last_submission_at_ms: Option<i64>,
+    pub provider_classification: Option<String>,
+    pub receipt_tx_hash: Option<String>,
+    pub receipt_block_number: Option<i64>,
+    pub receipt_block_hash: Option<String>,
+    pub receipt_status: Option<i16>,
+    pub gas_used: Option<i64>,
+    pub effective_gas_price_wei: Option<String>,
+    pub actual_tx_cost_wei: Option<String>,
+    pub confirmation_count: i32,
+    pub canonicality_state: String,
+    pub correlated_execution_status: Option<String>,
+    pub last_checked_head: Option<i64>,
+    pub last_checked_finalized_head: Option<i64>,
+    pub reorg_count: i32,
+    pub failure_class: Option<String>,
+    pub failure_detail: Option<String>,
+    pub terminal_at_ms: Option<i64>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+impl From<crate::hybrid_v2::execution::BroadcastStateRow> for SanitizedBroadcastRow {
+    fn from(row: crate::hybrid_v2::execution::BroadcastStateRow) -> Self {
+        SanitizedBroadcastRow {
+            canonical_execution_id: row.canonical_execution_id,
+            phase: row.phase.as_str().to_string(),
+            tx_hash: row.tx_hash,
+            envelope_hash: row.envelope_hash,
+            envelope_bytes_hash: row.envelope_bytes_hash,
+            submission_attempt_count: row.submission_attempt_count,
+            first_submission_at_ms: row.first_submission_at_ms,
+            last_submission_at_ms: row.last_submission_at_ms,
+            provider_classification: row.provider_classification,
+            receipt_tx_hash: row.receipt_tx_hash,
+            receipt_block_number: row.receipt_block_number,
+            receipt_block_hash: row.receipt_block_hash,
+            receipt_status: row.receipt_status,
+            gas_used: row.gas_used,
+            effective_gas_price_wei: row.effective_gas_price_wei,
+            actual_tx_cost_wei: row.actual_tx_cost_wei,
+            confirmation_count: row.confirmation_count,
+            canonicality_state: row.canonicality_state,
+            correlated_execution_status: row.correlated_execution_status,
+            last_checked_head: row.last_checked_head,
+            last_checked_finalized_head: row.last_checked_finalized_head,
+            reorg_count: row.reorg_count,
+            failure_class: row.failure_class,
+            failure_detail: row.failure_detail,
+            terminal_at_ms: row.terminal_at_ms,
+            created_at_ms: row.created_at_ms,
+            updated_at_ms: row.updated_at_ms,
+        }
+    }
+}
+
+fn broadcast_config_or_disabled(
+    state: &AppState,
+) -> Result<crate::hybrid_v2::config::HybridV2ExecutionConfig, Response> {
+    let cfg = state.hybrid_v2_execution_config.clone().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "BROADCAST_DISABLED",
+                "detail": "hybrid_v2_execution_config not attached to AppState",
+                "reason": "CONFIG_MISSING",
+            })),
+        )
+            .into_response()
+    })?;
+    if !cfg.broadcast_enabled {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "BROADCAST_DISABLED",
+                "detail": "broadcast_enabled = false in hybrid_v2_execution_config",
+                "reason": "BROADCAST_DISABLED_BY_CONFIG",
+            })),
+        )
+            .into_response());
+    }
+    // Extra defense-in-depth: refuse Base mainnet at the config layer.
+    if cfg
+        .allowed_broadcast_chain_ids
+        .contains(&BASE_MAINNET_CHAIN_ID)
+    {
+        return Err(err_response(
+            StatusCode::FORBIDDEN,
+            "BASE_MAINNET_FORBIDDEN",
+            "allowed_broadcast_chain_ids contains 8453 — refused",
+        ));
+    }
+    Ok(cfg)
+}
+
+/// `POST /admin/hybrid_v2/deployments/:deployment_id/executions/:canonical_execution_id/broadcast`
+///
+/// Empty body (`{}`) — any extraneous field is rejected by the
+/// deserializer. When the execution orchestrator is not wired the
+/// handler returns 503 `EXECUTION_ORCHESTRATOR_NOT_WIRED`.
+pub async fn admin_broadcast_execution(
+    Path((deployment_id, canonical_execution_id)): Path<(i64, String)>,
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(_body): Json<BroadcastRequestBody>,
+) -> Response {
+    if let Err(resp) = ensure_admin(&state, &headers) {
+        return resp;
+    }
+    let store = match require_store(&state) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let entry = match resolve_deployment(&state, deployment_id) {
+        Ok(e) => e,
+        Err(resp) => return resp,
+    };
+    if let Err(resp) = refuse_mainnet(entry.manifest.chain_id) {
+        return resp;
+    }
+    if !is_valid_hash32(&canonical_execution_id) {
+        return err_response(
+            StatusCode::BAD_REQUEST,
+            "INVALID_CANONICAL_ID",
+            "canonical_execution_id must be 0x-prefixed 32-byte hex",
+        );
+    }
+    if state.hybrid_v2_execution_orchestrator.is_none() {
+        let reason = state
+            .hybrid_v2_execution_unavailable_reason
+            .clone()
+            .unwrap_or_else(|| "EXECUTION_ORCHESTRATOR_NOT_WIRED".to_string());
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "EXECUTION_ORCHESTRATOR_NOT_WIRED",
+                "detail": "no execution orchestrator wired to this AppState build",
+                "availability": { "state": "NotConfigured", "reason": reason },
+            })),
+        )
+            .into_response();
+    }
+    let _cfg = match broadcast_config_or_disabled(&state) {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
+
+    // Read + validate the execution request row.
+    let exec_row = match store.get_execution_request(&canonical_execution_id).await {
+        Ok(Some(r)) if r.deployment_id == deployment_id => r,
+        Ok(Some(_)) => {
+            return err_response(
+                StatusCode::NOT_FOUND,
+                "EXECUTION_NOT_IN_DEPLOYMENT",
+                "canonical execution id belongs to a different deployment",
+            );
+        }
+        Ok(None) => {
+            return err_response(
+                StatusCode::NOT_FOUND,
+                "EXECUTION_NOT_FOUND",
+                "no execution row for the given canonical id",
+            );
+        }
+        Err(e) => {
+            return err_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "STORE_ERROR",
+                &e.to_string(),
+            );
+        }
+    };
+    if !matches!(
+        exec_row.phase,
+        ExecutionPhase::SignatureVerified | ExecutionPhase::ReadyForBroadcast
+    ) {
+        return err_response(
+            StatusCode::CONFLICT,
+            "EXECUTION_WRONG_PHASE",
+            &format!(
+                "broadcast requires phase SignatureVerified or ReadyForBroadcast; got {}",
+                exec_row.phase.as_str()
+            ),
+        );
+    }
+    // Idempotent insert of the broadcast row.
+    if let Err(e) = store
+        .insert_broadcast_state(&canonical_execution_id, wall_ms())
+        .await
+    {
+        return err_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "STORE_ERROR",
+            &e.to_string(),
+        );
+    }
+    // The BroadcastOutbox needs the deterministic plan bytes + signed
+    // envelope, which the orchestrator owns. Downstream milestones
+    // (Package D) will attach a broadcast outbox factory to AppState;
+    // for now, expose the row with its current phase and instruct the
+    // caller to observe status via `broadcast_status`.
+    let row = match store.get_broadcast_state(&canonical_execution_id).await {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return err_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "STORE_ERROR",
+                "broadcast row disappeared after insert",
+            );
+        }
+        Err(e) => {
+            return err_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "STORE_ERROR",
+                &e.to_string(),
+            );
+        }
+    };
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "canonical_execution_id": row.canonical_execution_id,
+            "phase": row.phase.as_str(),
+            "tx_hash": row.tx_hash,
+            "provider_classification": row.provider_classification,
+            "failure_class": row.failure_class,
+            "failure_detail": row.failure_detail,
+            "note": "row observed; broadcast outbox factory attached in follow-up milestone",
+        })),
+    )
+        .into_response()
+}
+
+/// `GET /admin/hybrid_v2/deployments/:deployment_id/executions/:canonical_execution_id/broadcast_status`
+pub async fn admin_broadcast_status(
+    Path((deployment_id, canonical_execution_id)): Path<(i64, String)>,
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(resp) = ensure_admin(&state, &headers) {
+        return resp;
+    }
+    let store = match require_store(&state) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let entry = match resolve_deployment(&state, deployment_id) {
+        Ok(e) => e,
+        Err(resp) => return resp,
+    };
+    if let Err(resp) = refuse_mainnet(entry.manifest.chain_id) {
+        return resp;
+    }
+    if !is_valid_hash32(&canonical_execution_id) {
+        return err_response(
+            StatusCode::BAD_REQUEST,
+            "INVALID_CANONICAL_ID",
+            "canonical_execution_id must be 0x-prefixed 32-byte hex",
+        );
+    }
+    // Verify execution row exists in this deployment so an admin cannot
+    // enumerate broadcast rows across deployments via hash guessing.
+    match store.get_execution_request(&canonical_execution_id).await {
+        Ok(Some(r)) if r.deployment_id == deployment_id => {}
+        Ok(Some(_)) => {
+            return err_response(
+                StatusCode::NOT_FOUND,
+                "EXECUTION_NOT_IN_DEPLOYMENT",
+                "canonical execution id belongs to a different deployment",
+            );
+        }
+        Ok(None) => {
+            return err_response(
+                StatusCode::NOT_FOUND,
+                "EXECUTION_NOT_FOUND",
+                "no execution row for the given canonical id",
+            );
+        }
+        Err(e) => {
+            return err_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "STORE_ERROR",
+                &e.to_string(),
+            );
+        }
+    }
+    match store.get_broadcast_state(&canonical_execution_id).await {
+        Ok(Some(row)) => (StatusCode::OK, Json(SanitizedBroadcastRow::from(row))).into_response(),
+        Ok(None) => err_response(
+            StatusCode::NOT_FOUND,
+            "BROADCAST_ROW_NOT_FOUND",
+            "no broadcast state row for this execution",
+        ),
+        Err(e) => err_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "STORE_ERROR",
+            &e.to_string(),
+        ),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BroadcastPendingQuery {
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
+/// `GET /admin/hybrid_v2/deployments/:deployment_id/broadcast_pending?limit=N`
+pub async fn admin_list_broadcast_pending(
+    Path(deployment_id): Path<i64>,
+    Query(q): Query<BroadcastPendingQuery>,
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(resp) = ensure_admin(&state, &headers) {
+        return resp;
+    }
+    let store = match require_store(&state) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let entry = match resolve_deployment(&state, deployment_id) {
+        Ok(e) => e,
+        Err(resp) => return resp,
+    };
+    if let Err(resp) = refuse_mainnet(entry.manifest.chain_id) {
+        return resp;
+    }
+    let limit = q.limit.unwrap_or(50).clamp(1, 500);
+    let pending = [
+        BroadcastPhase::Broadcasting,
+        BroadcastPhase::SubmissionUnknown,
+        BroadcastPhase::Submitted,
+        BroadcastPhase::Pending,
+        BroadcastPhase::MinedSuccess,
+        BroadcastPhase::Confirming,
+        BroadcastPhase::Reorged,
+    ];
+    match store
+        .list_pending_broadcast_states(deployment_id, &pending, limit)
+        .await
+    {
+        Ok(rows) => {
+            let sanitized: Vec<SanitizedBroadcastRow> =
+                rows.into_iter().map(SanitizedBroadcastRow::from).collect();
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "deployment_id": deployment_id,
+                    "limit": limit,
+                    "rows": sanitized,
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => err_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "STORE_ERROR",
+            &e.to_string(),
+        ),
+    }
+}
+
+/// `POST /admin/hybrid_v2/deployments/:deployment_id/executions/:canonical_execution_id/broadcast_recheck`
+pub async fn admin_broadcast_recheck(
+    Path((deployment_id, canonical_execution_id)): Path<(i64, String)>,
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(_body): Json<EmptyAdminBody>,
+) -> Response {
+    if let Err(resp) = ensure_admin(&state, &headers) {
+        return resp;
+    }
+    let _store = match require_store(&state) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let entry = match resolve_deployment(&state, deployment_id) {
+        Ok(e) => e,
+        Err(resp) => return resp,
+    };
+    if let Err(resp) = refuse_mainnet(entry.manifest.chain_id) {
+        return resp;
+    }
+    if !is_valid_hash32(&canonical_execution_id) {
+        return err_response(
+            StatusCode::BAD_REQUEST,
+            "INVALID_CANONICAL_ID",
+            "canonical_execution_id must be 0x-prefixed 32-byte hex",
+        );
+    }
+    if let Err(resp) = broadcast_config_or_disabled(&state) {
+        return resp;
+    }
+    // The worker requires a live broadcast RPC client. AppState does
+    // not currently expose one — return 503 EXECUTION_ORCHESTRATOR_NOT_WIRED
+    // (parallel to the /prepare + /broadcast pattern). The row itself
+    // is unchanged.
+    let reason = state
+        .hybrid_v2_execution_unavailable_reason
+        .clone()
+        .unwrap_or_else(|| "EXECUTION_ORCHESTRATOR_NOT_WIRED".to_string());
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({
+            "error": "EXECUTION_ORCHESTRATOR_NOT_WIRED",
+            "detail": "confirmation worker not attached to AppState",
+            "availability": { "state": "NotConfigured", "reason": reason },
+        })),
+    )
+        .into_response()
+}
+
+/// `POST /admin/hybrid_v2/deployments/:deployment_id/executions/:canonical_execution_id/broadcast_resend_same_bytes`
+pub async fn admin_broadcast_resend_same_bytes(
+    Path((deployment_id, canonical_execution_id)): Path<(i64, String)>,
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(_body): Json<EmptyAdminBody>,
+) -> Response {
+    if let Err(resp) = ensure_admin(&state, &headers) {
+        return resp;
+    }
+    let store = match require_store(&state) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let entry = match resolve_deployment(&state, deployment_id) {
+        Ok(e) => e,
+        Err(resp) => return resp,
+    };
+    if let Err(resp) = refuse_mainnet(entry.manifest.chain_id) {
+        return resp;
+    }
+    if !is_valid_hash32(&canonical_execution_id) {
+        return err_response(
+            StatusCode::BAD_REQUEST,
+            "INVALID_CANONICAL_ID",
+            "canonical_execution_id must be 0x-prefixed 32-byte hex",
+        );
+    }
+    let cfg = match broadcast_config_or_disabled(&state) {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
+    // Guard: row phase must be SubmissionUnknown or Dropped AND the
+    // retry budget must not be exhausted.
+    let row = match store.get_broadcast_state(&canonical_execution_id).await {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return err_response(
+                StatusCode::NOT_FOUND,
+                "BROADCAST_ROW_NOT_FOUND",
+                "no broadcast state row for this execution",
+            );
+        }
+        Err(e) => {
+            return err_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "STORE_ERROR",
+                &e.to_string(),
+            );
+        }
+    };
+    if !matches!(
+        row.phase,
+        BroadcastPhase::SubmissionUnknown | BroadcastPhase::Dropped
+    ) {
+        return err_response(
+            StatusCode::CONFLICT,
+            "RESEND_WRONG_PHASE",
+            &format!(
+                "resend_same_bytes requires phase SubmissionUnknown or Dropped; got {}",
+                row.phase.as_str()
+            ),
+        );
+    }
+    let attempts = row.submission_attempt_count.max(0) as u32;
+    if attempts > cfg.submission_retry_max {
+        return err_response(
+            StatusCode::CONFLICT,
+            "RESEND_BUDGET_EXHAUSTED",
+            &format!(
+                "submission_attempt_count {} exceeds submission_retry_max {}",
+                attempts, cfg.submission_retry_max
+            ),
+        );
+    }
+    // Same 503 rationale as broadcast_recheck — no RPC wired yet.
+    let reason = state
+        .hybrid_v2_execution_unavailable_reason
+        .clone()
+        .unwrap_or_else(|| "EXECUTION_ORCHESTRATOR_NOT_WIRED".to_string());
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({
+            "error": "EXECUTION_ORCHESTRATOR_NOT_WIRED",
+            "detail": "broadcast outbox not attached to AppState",
+            "availability": { "state": "NotConfigured", "reason": reason },
+        })),
+    )
+        .into_response()
+}
+
+/// `POST /admin/hybrid_v2/deployments/:deployment_id/executions/:canonical_execution_id/broadcast_manual_intervention`
+///
+/// Operator-issued escalation. Body only accepts `action` + `detail`.
+pub async fn admin_broadcast_manual_intervention(
+    Path((deployment_id, canonical_execution_id)): Path<(i64, String)>,
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(body): Json<ManualInterventionBody>,
+) -> Response {
+    if let Err(resp) = ensure_admin(&state, &headers) {
+        return resp;
+    }
+    let store = match require_store(&state) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let entry = match resolve_deployment(&state, deployment_id) {
+        Ok(e) => e,
+        Err(resp) => return resp,
+    };
+    if let Err(resp) = refuse_mainnet(entry.manifest.chain_id) {
+        return resp;
+    }
+    if !is_valid_hash32(&canonical_execution_id) {
+        return err_response(
+            StatusCode::BAD_REQUEST,
+            "INVALID_CANONICAL_ID",
+            "canonical_execution_id must be 0x-prefixed 32-byte hex",
+        );
+    }
+    if body.action != "MARK_MANUAL" {
+        return err_response(
+            StatusCode::BAD_REQUEST,
+            "UNKNOWN_MANUAL_ACTION",
+            "only MARK_MANUAL is accepted",
+        );
+    }
+    let row = match store.get_broadcast_state(&canonical_execution_id).await {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return err_response(
+                StatusCode::NOT_FOUND,
+                "BROADCAST_ROW_NOT_FOUND",
+                "no broadcast state row for this execution",
+            );
+        }
+        Err(e) => {
+            return err_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "STORE_ERROR",
+                &e.to_string(),
+            );
+        }
+    };
+    if !row
+        .phase
+        .can_transition_to(BroadcastPhase::ManualInterventionRequired)
+    {
+        return err_response(
+            StatusCode::CONFLICT,
+            "MANUAL_INTERVENTION_INVALID_TRANSITION",
+            &format!(
+                "phase {} cannot escalate to MANUAL_INTERVENTION_REQUIRED",
+                row.phase.as_str()
+            ),
+        );
+    }
+    let now = wall_ms();
+    let patch = BroadcastStatePatch {
+        failure_class: Some("ADMIN_MANUAL_INTERVENTION".into()),
+        failure_detail: Some(body.detail),
+        terminal_at_ms: Some(now),
+        ..Default::default()
+    };
+    match store
+        .update_broadcast_phase(
+            &canonical_execution_id,
+            row.phase,
+            BroadcastPhase::ManualInterventionRequired,
+            now,
+            patch,
+        )
+        .await
+    {
+        Ok(true) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "canonical_execution_id": canonical_execution_id,
+                "phase": "MANUAL_INTERVENTION_REQUIRED",
+            })),
+        )
+            .into_response(),
+        Ok(false) => err_response(
+            StatusCode::CONFLICT,
+            "MANUAL_INTERVENTION_LOST_UPDATE",
+            "another writer advanced the row concurrently; re-read and retry",
+        ),
+        Err(e) => err_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "STORE_ERROR",
+            &e.to_string(),
+        ),
+    }
 }

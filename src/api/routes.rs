@@ -642,6 +642,34 @@ pub fn router(state: AppState) -> Router {
             "/admin/hybrid_v2/deployments/:deployment_id/executions/:canonical_execution_id/retry",
             post(crate::api::hybrid_v2_execution_admin::retry_execution),
         )
+        // BACKEND-HYBRID-V2-BROADCAST-AND-CONFIRMATION-V1 (Part S) —
+        // broadcast admin surface. Every route is behind the admin-token
+        // gate, refuses Base mainnet, and returns structured 503 when
+        // the broadcast pipeline is not yet wired to AppState.
+        .route(
+            "/admin/hybrid_v2/deployments/:deployment_id/executions/:canonical_execution_id/broadcast",
+            post(crate::api::hybrid_v2_execution_admin::admin_broadcast_execution),
+        )
+        .route(
+            "/admin/hybrid_v2/deployments/:deployment_id/executions/:canonical_execution_id/broadcast_status",
+            get(crate::api::hybrid_v2_execution_admin::admin_broadcast_status),
+        )
+        .route(
+            "/admin/hybrid_v2/deployments/:deployment_id/broadcast_pending",
+            get(crate::api::hybrid_v2_execution_admin::admin_list_broadcast_pending),
+        )
+        .route(
+            "/admin/hybrid_v2/deployments/:deployment_id/executions/:canonical_execution_id/broadcast_recheck",
+            post(crate::api::hybrid_v2_execution_admin::admin_broadcast_recheck),
+        )
+        .route(
+            "/admin/hybrid_v2/deployments/:deployment_id/executions/:canonical_execution_id/broadcast_resend_same_bytes",
+            post(crate::api::hybrid_v2_execution_admin::admin_broadcast_resend_same_bytes),
+        )
+        .route(
+            "/admin/hybrid_v2/deployments/:deployment_id/executions/:canonical_execution_id/broadcast_manual_intervention",
+            post(crate::api::hybrid_v2_execution_admin::admin_broadcast_manual_intervention),
+        )
         .route("/admin/status", get(admin_status))
         .route("/admin/config", get(admin_config))
         .route("/admin/db", get(admin_db))
