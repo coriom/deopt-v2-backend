@@ -517,6 +517,7 @@ mod tests {
             target_contract: TARGET_HEX.to_string(),
             selector: to_hex_lowercase_prefixed(&executeMatchCall::SELECTOR),
             calldata_hash: None,
+            calldata_bytes: None,
             plan_hash: None,
             tx_value_wei: "0".to_string(),
             simulation_block_number: None,

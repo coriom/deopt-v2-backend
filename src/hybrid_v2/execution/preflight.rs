@@ -379,6 +379,7 @@ mod tests {
             target_contract: format!("0x{}", "5a".repeat(20)),
             selector: "0x00000000".to_string(),
             calldata_hash: None,
+            calldata_bytes: None,
             plan_hash: None,
             tx_value_wei: "0".to_string(),
             simulation_block_number: None,

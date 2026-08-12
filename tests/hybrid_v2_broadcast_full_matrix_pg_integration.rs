@@ -197,6 +197,7 @@ fn make_row(
         target_contract: format!("0x{}", hex_encode(&plan.target)),
         selector: format!("0x{}", hex_encode(&plan.selector)),
         calldata_hash: Some(format!("0x{}", hex_encode(&plan.calldata_hash))),
+        calldata_bytes: None,
         plan_hash: Some(format!("0x{}", hex_encode(&plan.plan_hash))),
         tx_value_wei: "0".into(),
         simulation_block_number: Some(100),

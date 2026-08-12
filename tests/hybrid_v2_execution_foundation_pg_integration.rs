@@ -108,6 +108,7 @@ fn build_row(deployment_id: i64, chain_id: u64, fill: u128, now_ms: i64) -> Exec
         target_contract: format!("0x{}", "5a".repeat(20)),
         selector: "0xdeadbeef".to_string(),
         calldata_hash: None,
+        calldata_bytes: None,
         plan_hash: None,
         tx_value_wei: "0".to_string(),
         simulation_block_number: None,

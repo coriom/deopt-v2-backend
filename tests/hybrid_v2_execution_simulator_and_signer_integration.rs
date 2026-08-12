@@ -505,6 +505,7 @@ fn build_execution_row(
                 .map(|b| format!("{b:02x}"))
                 .collect::<String>()
         )),
+        calldata_bytes: Some(plan.calldata.clone()),
         plan_hash: Some(format!(
             "0x{}",
             plan.plan_hash

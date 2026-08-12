@@ -352,6 +352,7 @@ async fn restart_after_execution_row_discovered_but_no_signer_call() {
         target_contract: manifest.module_addresses.option_matching_engine.clone(),
         selector: format!("0x{}", hex_encode_bytes(&executeMatchCall::SELECTOR)),
         calldata_hash: None,
+        calldata_bytes: None,
         plan_hash: None,
         tx_value_wei: "0".to_string(),
         simulation_block_number: None,

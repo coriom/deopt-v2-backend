@@ -2068,6 +2068,11 @@ impl HybridV2ProjectionStore for PostgresHybridV2ProjectionStore {
         &self,
         row: &crate::hybrid_v2::execution::ExecutionRequestRow,
     ) -> Result<bool> {
+        // BACKEND-HYBRID-V2-BROADCAST-LIVE-WIRING-CLOSURE-V1 (migration
+        // 0052): also bind `calldata_bytes`. Nullable BYTEA — legacy
+        // rows written before the migration keep NULL; new rows may
+        // carry the full serialized calldata for admin fresh-submit
+        // hydration.
         let res = sqlx::query(
             "INSERT INTO hybrid_v2_execution_requests (
                 canonical_execution_id, deployment_id, chain_id, execution_kind,
@@ -2082,6 +2087,7 @@ impl HybridV2ProjectionStore for PostgresHybridV2ProjectionStore {
                 gas_limit, max_fee_per_gas_wei, max_priority_fee_per_gas_wei,
                 reserved_nonce, phase, failure_class, failure_detail,
                 retry_count, holder_epoch, signer_request_idempotency_key,
+                calldata_bytes,
                 created_at_ms, updated_at_ms
              ) VALUES (
                 $1,$2,$3,$4,$5,$6,$7,$8,$9,
@@ -2092,7 +2098,8 @@ impl HybridV2ProjectionStore for PostgresHybridV2ProjectionStore {
                 $29,CAST($30 AS NUMERIC),CAST($31 AS NUMERIC),
                 $32,$33,$34,$35,
                 $36,$37,$38,
-                $39,$40
+                $39,
+                $40,$41
              )
              ON CONFLICT (canonical_execution_id) DO NOTHING",
         )
@@ -2134,6 +2141,7 @@ impl HybridV2ProjectionStore for PostgresHybridV2ProjectionStore {
         .bind(row.retry_count)
         .bind(row.holder_epoch)
         .bind(&row.signer_request_idempotency_key)
+        .bind(row.calldata_bytes.as_deref())
         .bind(row.created_at_ms)
         .bind(row.updated_at_ms)
         .execute(&self.pool)
@@ -2164,6 +2172,7 @@ impl HybridV2ProjectionStore for PostgresHybridV2ProjectionStore {
                     max_priority_fee_per_gas_wei::text AS max_priority_fee_per_gas_wei_txt,
                     reserved_nonce, phase, failure_class, failure_detail,
                     retry_count, holder_epoch, signer_request_idempotency_key,
+                    calldata_bytes,
                     created_at_ms, updated_at_ms
              FROM hybrid_v2_execution_requests
              WHERE canonical_execution_id = $1",
@@ -2197,6 +2206,10 @@ impl HybridV2ProjectionStore for PostgresHybridV2ProjectionStore {
         // The WHERE clause enforces state-machine safety at the SQL
         // layer (from-phase must match); the plan_hash immutability
         // trigger blocks divergent hash updates.
+        // BACKEND-HYBRID-V2-BROADCAST-LIVE-WIRING-CLOSURE-V1 (migration
+        // 0052): also COALESCE the new `calldata_bytes` field. The
+        // immutability trigger on migration 0052 additionally guards
+        // divergent rewrites at the DB layer.
         let res = sqlx::query(
             "UPDATE hybrid_v2_execution_requests SET
                 target_contract              = COALESCE($3, target_contract),
@@ -2224,6 +2237,7 @@ impl HybridV2ProjectionStore for PostgresHybridV2ProjectionStore {
                 retry_count                  = COALESCE($25, retry_count),
                 signer_request_idempotency_key =
                     COALESCE($28, signer_request_idempotency_key),
+                calldata_bytes               = COALESCE($29, calldata_bytes),
                 phase                        = $26,
                 updated_at_ms                = $27
              WHERE canonical_execution_id = $1 AND phase = $2",
@@ -2256,6 +2270,7 @@ impl HybridV2ProjectionStore for PostgresHybridV2ProjectionStore {
         .bind(to.as_str())
         .bind(now_ms)
         .bind(patch.signer_request_idempotency_key.as_deref())
+        .bind(patch.calldata_bytes.as_deref())
         .execute(&self.pool)
         .await
         .map_err(pg_err)?;
@@ -2326,6 +2341,7 @@ impl HybridV2ProjectionStore for PostgresHybridV2ProjectionStore {
                     max_priority_fee_per_gas_wei::text AS max_priority_fee_per_gas_wei_txt,
                     reserved_nonce, phase, failure_class, failure_detail,
                     retry_count, holder_epoch, signer_request_idempotency_key,
+                    calldata_bytes,
                     created_at_ms, updated_at_ms
              FROM hybrid_v2_execution_requests
              WHERE deployment_id = $1
@@ -2736,6 +2752,14 @@ fn row_to_execution_request(
         target_contract: row.try_get("target_contract").map_err(pg_err)?,
         selector: row.try_get("selector").map_err(pg_err)?,
         calldata_hash: row.try_get("calldata_hash").map_err(pg_err)?,
+        // BACKEND-HYBRID-V2-BROADCAST-LIVE-WIRING-CLOSURE-V1 (migration
+        // 0052). `calldata_bytes` is NULL for legacy rows and Some for
+        // new rows written after the migration + orchestrator update.
+        // `unwrap_or(None)` tolerates schemas where the column has not
+        // yet been added — the caller re-checks `calldata_bytes.is_some`.
+        calldata_bytes: row
+            .try_get::<Option<Vec<u8>>, _>("calldata_bytes")
+            .unwrap_or(None),
         plan_hash: row.try_get("plan_hash").map_err(pg_err)?,
         tx_value_wei: row.try_get("tx_value_wei_txt").map_err(pg_err)?,
         simulation_block_number: row.try_get("simulation_block_number").map_err(pg_err)?,
@@ -4954,6 +4978,19 @@ impl HybridV2ProjectionStore for InMemoryProjectionStore {
                 _ => {}
             }
         }
+        // BACKEND-HYBRID-V2-BROADCAST-LIVE-WIRING-CLOSURE-V1 (migration
+        // 0052): `calldata_bytes` follows the same None -> Some-once
+        // immutability rule as `calldata_hash`. Mirrors the PG trigger.
+        if let Some(new_cb) = &patch.calldata_bytes {
+            match &row.calldata_bytes {
+                Some(existing) if existing != new_cb => {
+                    return Err(BackendError::Persistence(
+                        "calldata_bytes is immutable once set".to_string(),
+                    ));
+                }
+                _ => {}
+            }
+        }
         // Apply patch (only Some fields).
         if let Some(v) = patch.target_contract {
             row.target_contract = v;
@@ -4963,6 +5000,9 @@ impl HybridV2ProjectionStore for InMemoryProjectionStore {
         }
         if let Some(v) = patch.calldata_hash {
             row.calldata_hash = Some(v);
+        }
+        if let Some(v) = patch.calldata_bytes {
+            row.calldata_bytes = Some(v);
         }
         if let Some(v) = patch.plan_hash {
             row.plan_hash = Some(v);

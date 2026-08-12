@@ -304,6 +304,7 @@ impl ExecutionOrchestrator {
             target_contract: target_hex,
             selector: selector_hex,
             calldata_hash: None,
+            calldata_bytes: None,
             plan_hash: None,
             tx_value_wei: "0".to_string(),
             simulation_block_number: None,
@@ -527,6 +528,7 @@ impl ExecutionOrchestrator {
             let selector_hex = format!("0x{}", hex_encode(&plan.selector));
             let patch = ExecutionRequestPatch {
                 calldata_hash: Some(calldata_hash_hex),
+                calldata_bytes: None,
                 plan_hash: Some(plan_hash_hex),
                 target_contract: Some(target_hex),
                 selector: Some(selector_hex),
@@ -627,12 +629,21 @@ impl ExecutionOrchestrator {
             };
 
             // Persist plan + nonce and advance to Simulating.
+            //
+            // BACKEND-HYBRID-V2-BROADCAST-LIVE-WIRING-CLOSURE-V1 (Part
+            // D): also persist the raw `calldata_bytes` alongside the
+            // hash. The admin fresh-submit path uses these bytes to
+            // reconstruct a complete `ExecutionPlan` from the row and
+            // re-verifies the keccak256 matches `calldata_hash` before
+            // handing anything to the outbox. Migration 0052 enforces
+            // immutability once set.
             let calldata_hash_hex = format!("0x{}", hex_encode(&plan.calldata_hash));
             let plan_hash_hex = format!("0x{}", hex_encode(&plan.plan_hash));
             let target_hex = format!("0x{}", hex_encode(&plan.target));
             let selector_hex = format!("0x{}", hex_encode(&plan.selector));
             let patch = ExecutionRequestPatch {
                 calldata_hash: Some(calldata_hash_hex),
+                calldata_bytes: Some(plan.calldata.clone()),
                 plan_hash: Some(plan_hash_hex),
                 target_contract: Some(target_hex),
                 selector: Some(selector_hex),

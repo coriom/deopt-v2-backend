@@ -1074,6 +1074,7 @@ mod tests {
             target_contract: format!("0x{}", "ee".repeat(20)),
             selector: "0x00000000".into(),
             calldata_hash: Some(format!("0x{}", "cd".repeat(32))),
+            calldata_bytes: None,
             plan_hash: Some(format!("0x{}", "ee".repeat(32))),
             tx_value_wei: "0".into(),
             simulation_block_number: Some(1),

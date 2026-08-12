@@ -49,6 +49,14 @@ pub struct ExecutionRequestRow {
     pub target_contract: String,
     pub selector: String,
     pub calldata_hash: Option<String>,
+    /// BACKEND-HYBRID-V2-BROADCAST-LIVE-WIRING-CLOSURE-V1 (migration
+    /// 0052): raw calldata bytes persisted alongside `calldata_hash`.
+    /// The admin fresh-submit path uses these bytes to rebuild a
+    /// complete `ExecutionPlan` from the row and MUST re-hash them to
+    /// verify parity with `calldata_hash` before serializing an
+    /// envelope. Legacy rows may be `None`; new rows written by the
+    /// orchestrator carry the bytes at insert-time.
+    pub calldata_bytes: Option<Vec<u8>>,
     pub plan_hash: Option<String>,
     pub tx_value_wei: String,
 
@@ -105,6 +113,11 @@ pub struct ExecutionRequestPatch {
     pub target_contract: Option<String>,
     pub selector: Option<String>,
     pub calldata_hash: Option<String>,
+    /// BACKEND-HYBRID-V2-BROADCAST-LIVE-WIRING-CLOSURE-V1 (migration
+    /// 0052): raw calldata bytes. Same immutability semantics as
+    /// `calldata_hash` — once persisted, subsequent patches must omit
+    /// the field or match the persisted value exactly.
+    pub calldata_bytes: Option<Vec<u8>>,
     pub plan_hash: Option<String>,
     pub tx_value_wei: Option<String>,
     pub simulation_block_number: Option<i64>,

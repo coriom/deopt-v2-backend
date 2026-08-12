@@ -950,6 +950,7 @@ async fn plan_builder_yields_deterministic_plan_hash() {
                 .collect::<String>()
         ),
         calldata_hash: None,
+        calldata_bytes: None,
         plan_hash: None,
         tx_value_wei: "0".into(),
         simulation_block_number: None,

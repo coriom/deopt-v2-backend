@@ -525,6 +525,7 @@ mod tests {
             target_contract: format!("0x{}", hex_encode(&plan.target)),
             selector: format!("0x{}", hex_encode(&plan.selector)),
             calldata_hash: Some(format!("0x{}", hex_encode(&plan.calldata_hash))),
+            calldata_bytes: None,
             plan_hash: Some(format!("0x{}", hex_encode(&plan.plan_hash))),
             tx_value_wei: "0".to_string(),
             simulation_block_number: Some(100),
