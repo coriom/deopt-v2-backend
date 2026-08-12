@@ -52,6 +52,7 @@ pub mod broadcast_firewall;
 pub mod broadcast_indexer_correlation;
 pub mod broadcast_nonce_policy;
 pub mod broadcast_outbox;
+pub mod broadcast_reconstruction;
 pub mod broadcast_reorg_recovery;
 pub mod broadcast_rpc;
 pub mod broadcast_state;
