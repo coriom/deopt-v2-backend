@@ -245,6 +245,41 @@ impl BroadcastConfirmationWorker {
         })
     }
 
+    /// BACKEND-HYBRID-V2-BROADCAST-LIVE-WIRING-CLOSURE-V1 (Part G+H):
+    /// spawn a supervised tick loop that respects BOTH a
+    /// [`WorkerCancel`] handle AND a `watch::Receiver<bool>` shutdown
+    /// signal. The two-signal design mirrors the existing hybrid_v2
+    /// indexer/reconciliation worker pattern in main.rs — the
+    /// watch-channel is the process-wide graceful shutdown signal, the
+    /// WorkerCancel is a per-worker override the outbox / admin route
+    /// can flip for surgical shutdowns.
+    ///
+    /// The loop performs an initial `tick()` before the first sleep so
+    /// admin-issued `broadcast_recheck` requests are not the sole way
+    /// to advance a fresh row on startup. Between ticks we `select!`
+    /// on the sleep + a `changed()` await on the shutdown receiver, so
+    /// SIGTERM is honoured within one poll interval regardless of
+    /// where the loop is parked.
+    pub fn spawn_supervised(
+        self: Arc<Self>,
+        cancel: WorkerCancel,
+        mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    ) -> JoinHandle<()> {
+        let interval = tokio::time::Duration::from_millis(self.poll_interval_ms.max(1));
+        tokio::spawn(async move {
+            loop {
+                if cancel.is_cancelled() || *shutdown_rx.borrow() {
+                    break;
+                }
+                let _ = self.tick().await;
+                tokio::select! {
+                    _ = tokio::time::sleep(interval) => {}
+                    _ = shutdown_rx.changed() => { break; }
+                }
+            }
+        })
+    }
+
     // -----------------------------------------------------------------
     //  No-receipt path — remain / degrade to Dropped
     // -----------------------------------------------------------------

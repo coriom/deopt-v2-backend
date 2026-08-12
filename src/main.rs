@@ -383,6 +383,14 @@ async fn main() -> deopt_v2_backend::Result<()> {
     // failure downgrades to `outbox = None` + logs a WARN; the
     // read-side backend keeps serving. Base mainnet is refused at every
     // gate (env validation, RPC constructor, and here).
+    // Broadcast confirmation worker supervision handle + cancel token.
+    // Both are `None` when broadcast wiring fails / is disabled; the
+    // graceful-shutdown block below tolerates None.
+    let mut broadcast_worker_handle: Option<tokio::task::JoinHandle<()>> = None;
+    let mut broadcast_worker_cancel: Option<
+        deopt_v2_backend::hybrid_v2::execution::broadcast_worker::WorkerCancel,
+    > = None;
+    let mut broadcast_worker_shutdown_tx: Option<watch::Sender<bool>> = None;
     match wire_hybrid_v2_broadcast(&state, config.hybrid_v2.chain_id).await {
         Ok(Some((outbox, worker, rpc, cfg))) => {
             info!(
@@ -392,7 +400,27 @@ async fn main() -> deopt_v2_backend::Result<()> {
                 receipt_poll_interval_ms = cfg.receipt_poll_interval_ms,
                 "hybrid_v2 broadcast outbox + confirmation worker wired"
             );
-            state = state.with_hybrid_v2_broadcast(outbox, worker, rpc, cfg);
+            state = state.with_hybrid_v2_broadcast(outbox, worker.clone(), rpc, cfg);
+            // BACKEND-HYBRID-V2-BROADCAST-LIVE-WIRING-CLOSURE-V1 (Part
+            // G+H): spawn the supervised confirmation-worker tick loop
+            // so it drives every phase advance (Submitted -> Pending ->
+            // MinedSuccess -> Confirming -> Confirmed / MinedReverted).
+            // Prior milestones constructed the worker on AppState but
+            // never spawned; the admin `broadcast_recheck` route was
+            // the only way to advance a row. That leaves the recheck
+            // handler as a diagnostic (kept intentionally — see docs
+            // update for Part I).
+            let cancel =
+                deopt_v2_backend::hybrid_v2::execution::broadcast_worker::WorkerCancel::new();
+            let (worker_shutdown_tx, worker_shutdown_rx) = watch::channel(false);
+            let handle = worker.spawn_supervised(cancel.clone(), worker_shutdown_rx);
+            broadcast_worker_handle = Some(handle);
+            broadcast_worker_cancel = Some(cancel);
+            broadcast_worker_shutdown_tx = Some(worker_shutdown_tx);
+            info!(
+                deployment_id = config.hybrid_v2.deployment_id,
+                "hybrid_v2 broadcast confirmation worker supervised task spawned"
+            );
         }
         Ok(None) => {
             // Broadcast disabled by env — leave the fail-closed marker
@@ -450,8 +478,35 @@ async fn main() -> deopt_v2_backend::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(|error| deopt_v2_backend::error::BackendError::Config(error.to_string()))?;
-    axum::serve(listener, app)
-        .await
+    // BACKEND-HYBRID-V2-BROADCAST-LIVE-WIRING-CLOSURE-V1 (Part H):
+    // graceful shutdown that broadcasts to the confirmation worker.
+    // On Ctrl+C (or serve error) we flip both the WorkerCancel and
+    // the shutdown watch channel, then await the JoinHandle with a
+    // bounded timeout so a stuck poll cannot block process exit.
+    let serve_fut = axum::serve(listener, app);
+    let shutdown = async {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            warn!("ctrl_c signal listener failed: {e}");
+        }
+    };
+    let serve_result = tokio::select! {
+        r = serve_fut => r,
+        _ = shutdown => Ok(()),
+    };
+    if let Some(tx) = broadcast_worker_shutdown_tx.take() {
+        let _ = tx.send(true);
+    }
+    if let Some(cancel) = broadcast_worker_cancel.take() {
+        cancel.cancel();
+    }
+    if let Some(handle) = broadcast_worker_handle.take() {
+        match tokio::time::timeout(Duration::from_secs(5), handle).await {
+            Ok(Ok(())) => info!("hybrid_v2 broadcast confirmation worker joined cleanly"),
+            Ok(Err(e)) => warn!("broadcast worker join failed: {e}"),
+            Err(_) => warn!("broadcast worker join timeout after 5s — abandoning"),
+        }
+    }
+    serve_result
         .map_err(|error| deopt_v2_backend::error::BackendError::Config(error.to_string()))?;
     Ok(())
 }
