@@ -29,6 +29,7 @@ on:
       - "tests/hybrid_v2_broadcast_properties.rs"
       - "tests/hybrid_v2_broadcast_performance_bounds.rs"
       - "tests/hybrid_v2_broadcast_mock_rpc.rs"
+      - "tests/hybrid_v2_broadcast_live_wiring_e2e_pg_integration.rs"
       - ".github/workflows/backend-postgres-integrity.yml"
   push:
     branches:
@@ -253,7 +254,8 @@ EOF
               hybrid_v2_broadcast_admin_pg_integration \
               hybrid_v2_broadcast_full_matrix_pg_integration \
               hybrid_v2_broadcast_properties \
-              hybrid_v2_broadcast_performance_bounds; do
+              hybrid_v2_broadcast_performance_bounds \
+              hybrid_v2_broadcast_live_wiring_e2e_pg_integration; do
             PGPASSWORD=disposable_ci_pw psql -h 127.0.0.1 -U deopt_ci -d deopt_hybrid_v2_disposable_ci <<'EOF' >/dev/null
 DROP SCHEMA public CASCADE;
 CREATE SCHEMA public;

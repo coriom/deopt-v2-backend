@@ -215,3 +215,41 @@ Modified (6):
   an honest 503 pending the plan hydrator.
 * `.github/workflows/backend-postgres-integrity.yml` — 2 new CI
   steps + expanded PR path filter.
+
+---
+
+## 2026-08-11 — closure addendum
+
+The broadcast engine + mock validation shipped by this milestone landed
+with two explicitly-deferred operational gaps:
+
+1. The admin `POST .../broadcast` route only invoked `outbox.resume()`,
+   the recovery/observation path. First-submission required a plan +
+   signed reconstruction that the milestone did not deliver — see the
+   handler's docstring at the time reading "first-submission path via
+   plan+signed hydrator remains deferred to base-sepolia E2E".
+2. `wire_hybrid_v2_broadcast` constructed a
+   `BroadcastConfirmationWorker` but nothing in `main.rs` spawned it.
+   Confirmation progress relied on operator-driven
+   `broadcast_recheck` calls.
+
+`BACKEND-HYBRID-V2-BROADCAST-LIVE-WIRING-CLOSURE-V1` closes both gaps:
+
+* Migration `0052_hybrid_v2_execution_calldata_bytes.sql` persists the
+  raw calldata bytes (with an immutability trigger) so the fresh-submit
+  path can hydrate a full `ExecutionPlan` from the persisted row.
+* `src/hybrid_v2/execution/broadcast_reconstruction.rs` reconstructs
+  `ExecutionPlan` + `SignedTx` from `(row, manifest)` with keccak +
+  plan_hash + target + value + chain-id integrity checks.
+* `admin_broadcast_execution` now branches on the broadcast phase:
+  fresh submit → `outbox.submit`; recovery → `outbox.resume`;
+  in-flight/terminal → current status.
+* `BroadcastConfirmationWorker::spawn_supervised(WorkerCancel,
+  watch::Receiver<bool>)` respects both the per-worker cancel and the
+  process-wide graceful shutdown signal; `main.rs` captures the
+  `JoinHandle` and joins it with a 5s bounded timeout on Ctrl+C.
+* `admin_broadcast_recheck` is retained as an operator diagnostic —
+  no longer the sole progress driver.
+
+See `docs/BACKEND_HYBRID_V2_BROADCAST_LIVE_WIRING_CLOSURE_V1.md` and
+its security-review companion for the full scope + evidence.
