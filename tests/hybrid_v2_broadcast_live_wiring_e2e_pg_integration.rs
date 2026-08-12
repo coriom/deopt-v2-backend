@@ -396,9 +396,8 @@ async fn admin_post_broadcast(
     let resp = router.clone().oneshot(req).await.unwrap();
     let status = resp.status();
     let body_bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
-    let body_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap_or(
-        serde_json::json!({ "raw": String::from_utf8_lossy(&body_bytes).to_string() }),
-    );
+    let body_json: serde_json::Value = serde_json::from_slice(&body_bytes)
+        .unwrap_or(serde_json::json!({ "raw": String::from_utf8_lossy(&body_bytes).to_string() }));
     (status, body_json)
 }
 
@@ -425,8 +424,7 @@ async fn fresh_admin_broadcast_advances_to_confirmed_via_supervised_worker() {
 
     // Seed the row + compute the deterministic envelope so we can set
     // up the RPC's Accepted outcome + receipt with the matching hash.
-    let (_calldata, plan) =
-        seed_ready_row(&store, deployment_id, &cid, signer, 42).await;
+    let (_calldata, plan) = seed_ready_row(&store, deployment_id, &cid, signer, 42).await;
     let signed = deopt_v2_backend::hybrid_v2::execution::signer::SignedTx {
         signature_r: [0x11; 32],
         signature_s: [0x22; 32],
@@ -481,8 +479,14 @@ async fn fresh_admin_broadcast_advances_to_confirmed_via_supervised_worker() {
     let router = router_for(state.clone());
     let (status, body) = admin_post_broadcast(&router, deployment_id, &cid).await;
     assert_eq!(status, StatusCode::ACCEPTED, "body={body}");
-    assert_eq!(body.get("path").and_then(|v| v.as_str()), Some("fresh_submit"));
-    assert_eq!(body.get("phase").and_then(|v| v.as_str()), Some("SUBMITTED"));
+    assert_eq!(
+        body.get("path").and_then(|v| v.as_str()),
+        Some("fresh_submit")
+    );
+    assert_eq!(
+        body.get("phase").and_then(|v| v.as_str()),
+        Some("SUBMITTED")
+    );
 
     // Wait for the supervised worker to advance past SUBMITTED to
     // MINED_SUCCESS via the receipt observation. The tick loop runs
@@ -543,10 +547,8 @@ async fn admin_broadcast_returns_current_status_when_terminal() {
     let rpc = Arc::new(MockBroadcastRpc::new());
     rpc.set_chain_id(CHAIN_ID);
     let rpc_dyn: Arc<dyn ExecutionBroadcastRpcClient> = rpc.clone();
-    let (state, store, _outbox, _worker, deployment_id) =
-        build_state(&pool, rpc_dyn.clone()).await;
-    let (_calldata, _plan) =
-        seed_ready_row(&store, deployment_id, &cid, signer, 42).await;
+    let (state, store, _outbox, _worker, deployment_id) = build_state(&pool, rpc_dyn.clone()).await;
+    let (_calldata, _plan) = seed_ready_row(&store, deployment_id, &cid, signer, 42).await;
 
     // Advance the broadcast row directly to Confirmed via the store —
     // simulate a race where a prior admin call already drove finalization.
@@ -566,7 +568,10 @@ async fn admin_broadcast_returns_current_status_when_terminal() {
     // -> Confirming -> Confirmed via update_broadcast_phase for the test.
     use deopt_v2_backend::hybrid_v2::execution::broadcast_state::BroadcastStatePatch;
     let sequence = [
-        (BroadcastPhase::BroadcastDisabled, BroadcastPhase::Broadcasting),
+        (
+            BroadcastPhase::BroadcastDisabled,
+            BroadcastPhase::Broadcasting,
+        ),
         (BroadcastPhase::Broadcasting, BroadcastPhase::Submitted),
         (BroadcastPhase::Submitted, BroadcastPhase::Pending),
         (BroadcastPhase::Pending, BroadcastPhase::MinedSuccess),
@@ -583,8 +588,14 @@ async fn admin_broadcast_returns_current_status_when_terminal() {
     let router = router_for(state.clone());
     let (status, body) = admin_post_broadcast(&router, deployment_id, &cid).await;
     assert_eq!(status, StatusCode::OK, "body={body}");
-    assert_eq!(body.get("path").and_then(|v| v.as_str()), Some("current_status"));
-    assert_eq!(body.get("phase").and_then(|v| v.as_str()), Some("CONFIRMED"));
+    assert_eq!(
+        body.get("path").and_then(|v| v.as_str()),
+        Some("current_status")
+    );
+    assert_eq!(
+        body.get("phase").and_then(|v| v.as_str()),
+        Some("CONFIRMED")
+    );
     // No write RPC contact.
     assert!(rpc.write_method_calls().is_empty());
 }
@@ -594,8 +605,7 @@ async fn admin_broadcast_returns_current_status_when_terminal() {
 /// RPC contact.
 #[tokio::test]
 async fn admin_broadcast_refuses_legacy_row_missing_calldata_bytes() {
-    let Some(url) =
-        get_pg_url_or_skip("admin_broadcast_refuses_legacy_row_missing_calldata_bytes")
+    let Some(url) = get_pg_url_or_skip("admin_broadcast_refuses_legacy_row_missing_calldata_bytes")
     else {
         return;
     };
@@ -606,10 +616,8 @@ async fn admin_broadcast_refuses_legacy_row_missing_calldata_bytes() {
     let rpc = Arc::new(MockBroadcastRpc::new());
     rpc.set_chain_id(CHAIN_ID);
     let rpc_dyn: Arc<dyn ExecutionBroadcastRpcClient> = rpc.clone();
-    let (state, store, _outbox, _worker, deployment_id) =
-        build_state(&pool, rpc_dyn.clone()).await;
-    let (_calldata, _plan) =
-        seed_ready_row(&store, deployment_id, &cid, signer, 42).await;
+    let (state, store, _outbox, _worker, deployment_id) = build_state(&pool, rpc_dyn.clone()).await;
+    let (_calldata, _plan) = seed_ready_row(&store, deployment_id, &cid, signer, 42).await;
     // Overwrite the row to strip calldata_bytes (simulates a pre-0052
     // legacy row). The immutability trigger blocks Some -> NULL as
     // well as Some -> different-Some; disable it just for this
@@ -661,10 +669,8 @@ async fn admin_broadcast_refuses_on_calldata_hash_tamper() {
     let rpc = Arc::new(MockBroadcastRpc::new());
     rpc.set_chain_id(CHAIN_ID);
     let rpc_dyn: Arc<dyn ExecutionBroadcastRpcClient> = rpc.clone();
-    let (state, store, _outbox, _worker, deployment_id) =
-        build_state(&pool, rpc_dyn.clone()).await;
-    let (_calldata, _plan) =
-        seed_ready_row(&store, deployment_id, &cid, signer, 42).await;
+    let (state, store, _outbox, _worker, deployment_id) = build_state(&pool, rpc_dyn.clone()).await;
+    let (_calldata, _plan) = seed_ready_row(&store, deployment_id, &cid, signer, 42).await;
     // Tamper the calldata_bytes to break the hash match. The
     // immutability trigger only blocks a divergent overwrite when
     // the column was already Some — insert path stamped it, but for
