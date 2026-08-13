@@ -207,3 +207,15 @@ required-features = ["test-signer"]
 name = "hybrid_v2_broadcast_live_wiring_app_restart_pg_integration"
 path = "tests/hybrid_v2_broadcast_live_wiring_app_restart_pg_integration.rs"
 required-features = ["test-signer"]
+
+# BACKEND-HYBRID-V2-BROADCAST-LIVE-WIRING-CLOSURE-V1 — Part L.
+# Full live-wiring PG matrix. Exercises startup + config, admin surface,
+# outbox contract, automatic worker progression, nonce conflict,
+# shutdown / restart, deployment isolation, RPC + PG outage, recheck
+# semantics, and RPC discipline — every test drives the production
+# `wire_hybrid_v2_broadcast` path against `MockBroadcastRpc`.
+# NO REAL PUBLIC-CHAIN TRANSACTION IS EVER SENT.
+[[test]]
+name = "hybrid_v2_broadcast_live_wiring_matrix_pg_integration"
+path = "tests/hybrid_v2_broadcast_live_wiring_matrix_pg_integration.rs"
+required-features = ["test-signer"]
