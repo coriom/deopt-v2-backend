@@ -1,5 +1,19 @@
 # BACKEND-HYBRID-V2-BROADCAST-LIVE-WIRING-CLOSURE-V1
 
+> **Addendum 2026-08-13 — Real Base Sepolia E2E pending operator provisioning.**
+> The follow-up milestone
+> `BACKEND-HYBRID-V2-BASE-SEPOLIA-EXECUTION-E2E-AND-SUBACCOUNT-V1-CLOSURE`
+> was **partially closed** on 2026-08-13. The live wiring covered by
+> this document remains proven end-to-end against `MockBroadcastRpc`
+> and the disposable PG 16 job. A real Base Sepolia broadcast +
+> confirmation cycle has NOT been executed — the signer microservice
+> is not deployed, no mTLS material is provisioned, the executor is
+> not funded, and the explicit
+> `HV2_E2E_ALLOW_REAL_BASE_SEPOLIA_BROADCAST` gate is absent. See
+> `BACKEND_HYBRID_V2_BASE_SEPOLIA_EXECUTION_E2E_AND_SUBACCOUNT_V1_CLOSURE.md`
+> for the full closure record and operator provisioning checklist.
+> Frozen safety (0 real `eth_sendRawTransaction` calls) is preserved.
+
 Milestone closes two operational gaps left open by
 `BACKEND-HYBRID-V2-BROADCAST-AND-CONFIRMATION-V1`:
 

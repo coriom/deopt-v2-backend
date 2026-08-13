@@ -776,3 +776,99 @@ refuses Base mainnet at handler entry. Full route + body reference:
 - Production Signer Bootstrap:
   `BACKEND_HYBRID_V2_PRODUCTION_SIGNER_BOOTSTRAP_AND_STARTUP_WIRING_V1.md`.
 
+## 20. Base Sepolia E2E prerequisites — 2026-08-13
+
+Added as part of the PARTIAL closure of
+`BACKEND-HYBRID-V2-BASE-SEPOLIA-EXECUTION-E2E-AND-SUBACCOUNT-V1-CLOSURE`.
+See `BACKEND_HYBRID_V2_BASE_SEPOLIA_EXECUTION_E2E_AND_SUBACCOUNT_V1_CLOSURE.md`
+for the full closure record. This section is the operator-facing
+checklist to prepare an environment capable of performing a real
+Base Sepolia broadcast + confirmation cycle. Without every step
+below, the milestone remains partially closed and the
+`HV2_E2E_ALLOW_REAL_BASE_SEPOLIA_BROADCAST` gate MUST NOT be set.
+
+### 20.1 Signer microservice deployment
+
+* Deploy the AWS KMS-backed signer microservice per
+  `AWS_KMS_OPERATOR_SETUP_PACK.md` and
+  `AWS_KMS_IAM_AND_KEY_POLICY_TEMPLATE.md`.
+* The microservice MUST expose HTTPS on a publicly reachable
+  hostname (loopback `http://127.0.0.1:*` is accepted for local
+  integration testing only — never Base mainnet, never a public
+  cleartext endpoint).
+* The microservice's `GET /hybrid_v2/identity` route MUST return
+  the executor address whose private key material is held in KMS.
+  Any mismatch against `HV2_EXPECTED_SIGNER_ADDRESS` refuses
+  startup with `IDENTITY_MISMATCH`.
+
+### 20.2 mTLS cert issuance workflow
+
+* Issue a private CA (or reuse an operator-managed CA) with a
+  short lifetime and a documented rotation cadence.
+* Generate a server certificate for the signer microservice.
+* Issue a client certificate + key for the backend host. **The
+  backend never holds the KMS IAM role**; its sole custody
+  responsibility is the mTLS client identity.
+* Store PEM material at operator-managed paths and expose them
+  via:
+  - `HV2_SIGNER_CLIENT_CERT_PEM_PATH`
+  - `HV2_SIGNER_CLIENT_KEY_PEM_PATH`
+  - `HV2_SIGNER_CA_PEM_PATH`
+* Files MUST be readable only by the backend process user
+  (`chmod 0400` recommended; the wire helper does NOT enforce
+  this — operator responsibility).
+* Rotation: re-issue client cert + key, atomically swap the file,
+  restart the backend. `spawn_supervised` picks up the new file
+  on next process launch.
+
+### 20.3 HV2 env vars
+
+| Variable | Required value |
+|---|---|
+| `HV2_SIGNER_ENDPOINT` | `https://<signer-host>/hybrid_v2` (mTLS) |
+| `HV2_SIGNER_PROVIDER` | `kms_aws` (only integrated provider) |
+| `HV2_EXPECTED_SIGNER_ADDRESS` | `0x<funded-executor>` |
+| `HV2_BROADCAST_ENABLED` | `true` |
+| `HV2_BROADCAST_RPC_URL` | `https://<base-sepolia-rpc>` |
+| `HV2_BROADCAST_ALLOWED_CHAIN_IDS` | `84532` (Base Sepolia; `8453` is refused regardless) |
+| `HV2_BROADCAST_CONFIRMATION_DEPTH` | `3` (or per operator policy, bounded `[1,64]`) |
+| `HV2_E2E_ALLOW_REAL_BASE_SEPOLIA_BROADCAST` | `true` — **only after every above item is verified** |
+
+### 20.4 Funded executor address
+
+* Fund the executor from an operator-owned faucet or bridged
+  testnet ETH.
+* Sanity: `cast balance <executor> --rpc-url $HV2_BROADCAST_RPC_URL`
+  MUST show `≥ 0.05 ETH` for a comfortable margin over any
+  single broadcast (typical `executeMatch` costs << 1 mETH; the
+  0.05 ETH buffer covers ~50 broadcast attempts before top-up).
+
+### 20.5 Deployment manifest promotion
+
+* Confirm the target row exists in `deployment_manifests` with
+  `chain_id = 84532` and a valid `option_matching_engine`.
+* Promote from `draft` → `active` via the admin route, or
+  directly in PG if operator-managed:
+  `UPDATE deployment_manifests SET status = 'active' WHERE …`.
+* The backend refuses to wire the orchestrator against a `draft`
+  manifest at startup.
+
+### 20.6 Explicit broadcast gate
+
+* `HV2_E2E_ALLOW_REAL_BASE_SEPOLIA_BROADCAST=true` is the
+  last-mile human-in-the-loop switch. Without it, the E2E
+  harness refuses to open the RPC connection; every prior
+  wiring step is proven but no real send occurs.
+* This gate exists **specifically** so an operator has a single
+  atomic switch to authorize public-chain writes.
+
+### 20.7 Cross-references
+
+* Closure doc: `BACKEND_HYBRID_V2_BASE_SEPOLIA_EXECUTION_E2E_AND_SUBACCOUNT_V1_CLOSURE.md`.
+* Workspace-level result doc:
+  `~/DEOPT/docs/BACKEND_HYBRID_V2_BASE_SEPOLIA_EXECUTION_E2E_AND_SUBACCOUNT_V1_CLOSURE_RESULT.md`.
+* AWS KMS operator setup pack: `AWS_KMS_OPERATOR_SETUP_PACK.md`.
+* AWS KMS IAM template: `AWS_KMS_IAM_AND_KEY_POLICY_TEMPLATE.md`.
+* Signer runtime config template: `AWS_KMS_SIGNER_RUNTIME_CONFIG_TEMPLATE.md`.
+* KMS setup validation checklist: `AWS_KMS_SETUP_VALIDATION_CHECKLIST.md`.
+
