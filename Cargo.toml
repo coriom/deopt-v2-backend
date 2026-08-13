@@ -219,3 +219,17 @@ required-features = ["test-signer"]
 name = "hybrid_v2_broadcast_live_wiring_matrix_pg_integration"
 path = "tests/hybrid_v2_broadcast_live_wiring_matrix_pg_integration.rs"
 required-features = ["test-signer"]
+
+# BACKEND-HYBRID-V2-BROADCAST-LIVE-WIRING-CLOSURE-V1 — Part M.
+# Bounded property tests over the live broadcast wiring path. Every
+# property is exercised across a small deterministic sample set
+# driven by fixed seed material — no new Cargo deps are introduced
+# (no `proptest` crate; follows the same deterministic-loop
+# convention as `tests/hybrid_v2_broadcast_properties.rs`). Every
+# mock-driven property asserts `mock.write_method_calls()` contains
+# only `eth_sendRawTransaction` on exit. NO REAL PUBLIC-CHAIN
+# TRANSACTION IS EVER SENT.
+[[test]]
+name = "hybrid_v2_broadcast_live_wiring_properties"
+path = "tests/hybrid_v2_broadcast_live_wiring_properties.rs"
+required-features = ["test-signer"]
