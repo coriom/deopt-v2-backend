@@ -196,3 +196,14 @@ required-features = ["test-signer"]
 name = "hybrid_v2_broadcast_admin_pg_integration"
 path = "tests/hybrid_v2_broadcast_admin_pg_integration.rs"
 required-features = ["test-signer"]
+
+# BACKEND-HYBRID-V2-BROADCAST-LIVE-WIRING-CLOSURE-V1 — Part K.
+# Full-application restart matrix. Drops the entire AppState between
+# every phase transition and rebuilds via the production
+# `wire_hybrid_v2_broadcast` path + `spawn_supervised` worker. Asserts
+# tx_hash / nonce / signature identity are preserved and no re-signer
+# ever runs. NO REAL PUBLIC-CHAIN TRANSACTION IS EVER SENT.
+[[test]]
+name = "hybrid_v2_broadcast_live_wiring_app_restart_pg_integration"
+path = "tests/hybrid_v2_broadcast_live_wiring_app_restart_pg_integration.rs"
+required-features = ["test-signer"]
