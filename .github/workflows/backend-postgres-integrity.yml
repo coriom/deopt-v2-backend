@@ -30,6 +30,9 @@ on:
       - "tests/hybrid_v2_broadcast_performance_bounds.rs"
       - "tests/hybrid_v2_broadcast_mock_rpc.rs"
       - "tests/hybrid_v2_broadcast_live_wiring_e2e_pg_integration.rs"
+      - "tests/hybrid_v2_broadcast_live_wiring_app_restart_pg_integration.rs"
+      - "tests/hybrid_v2_broadcast_live_wiring_matrix_pg_integration.rs"
+      - "tests/hybrid_v2_broadcast_live_wiring_properties.rs"
       - ".github/workflows/backend-postgres-integrity.yml"
   push:
     branches:
@@ -264,6 +267,32 @@ EOF
             cargo test --features test-signer --test "$suite" -- --test-threads=1
           done
           echo "BROADCAST_CONFIRMATION_CI_GATE_VALIDATED"
+
+      - name: Run BACKEND-HYBRID-V2-BROADCAST-LIVE-WIRING-CLOSURE-V1 deferred suites
+        env:
+          HYBRID_V2_PG_TEST_DATABASE_URL: postgres://deopt_ci:disposable_ci_pw@127.0.0.1:5432/deopt_hybrid_v2_disposable_ci
+          DEOPT_REQUIRE_PG_INTEGRATION: "1"
+        run: |
+          cd deopt-v2-backend || cd .
+          # BACKEND-HYBRID-V2-BROADCAST-LIVE-WIRING-CLOSURE-V1 Parts K + L + M.
+          # Full-application app-restart matrix, full live-wiring PG
+          # matrix, and bounded properties. Every suite drives the
+          # production wire path (`wire_hybrid_v2_broadcast`,
+          # `spawn_supervised`) against the deterministic in-process
+          # `MockBroadcastRpc`. Reset schema between suites so tests
+          # observe no residual rows. NO REAL PUBLIC-CHAIN TRAFFIC.
+          for suite in \
+              hybrid_v2_broadcast_live_wiring_app_restart_pg_integration \
+              hybrid_v2_broadcast_live_wiring_matrix_pg_integration \
+              hybrid_v2_broadcast_live_wiring_properties; do
+            PGPASSWORD=disposable_ci_pw psql -h 127.0.0.1 -U deopt_ci -d deopt_hybrid_v2_disposable_ci <<'EOF' >/dev/null
+DROP SCHEMA public CASCADE;
+CREATE SCHEMA public;
+GRANT ALL ON SCHEMA public TO PUBLIC;
+EOF
+            cargo test --features test-signer --test "$suite" -- --test-threads=1
+          done
+          echo "LIVE_BROADCAST_WIRING_CLOSURE_CI_GATE_VALIDATED"
 
       - name: Run BACKEND-HYBRID-V2-PRODUCTION-SIGNER-BOOTSTRAP-AND-STARTUP-WIRING-V1 test-signer suites
         env:
