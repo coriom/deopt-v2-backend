@@ -4,6 +4,7 @@ pub mod broadcast_policy_data;
 pub mod canonical_identity;
 pub mod conditional_orders;
 pub mod confirmation_worker;
+pub mod correlation_repository;
 pub mod event_indexer;
 pub mod execution;
 pub mod lifecycle;
