@@ -913,6 +913,16 @@ pub struct OptionOrder {
     pub terminal_reason_message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_reason_source: Option<String>,
+    // OPTIONS-HYBRID-V2-IDENTITY-AND-CORRELATION-WIRING-V1 —
+    // backend-derived canonical order hash per
+    // `src/options/canonical_identity.rs::derive_canonical_order_hash`.
+    // NULL for pre-migration rows (migration 0053 added the column
+    // additively) and for legacy code paths that predate identity
+    // wiring. Every canonical new-order path populates this field at
+    // INSERT time. Never rename to `signed_order_hash` — this hash is
+    // NOT a user signature. Immutable-once-set per DB trigger.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_order_hash: Option<String>,
     pub created_at_ms: TimestampMs,
     pub updated_at_ms: TimestampMs,
 }
@@ -1086,6 +1096,15 @@ pub struct OptionFill {
     pub taker_side: Side,
     pub price_1e8: Price1e8,
     pub size_1e8: Size1e8,
+    // OPTIONS-HYBRID-V2-IDENTITY-AND-CORRELATION-WIRING-V1 —
+    // backend-derived canonical execution identity per
+    // `src/options/canonical_identity.rs::derive_canonical_execution_id_from_fill`.
+    // Populated at fill INSERT when both maker and taker orders carry
+    // a `canonical_order_hash`. NULL for legacy rows and for fills
+    // whose maker or taker predates identity wiring. Immutable-once-set
+    // per DB trigger (migration 0053). This is NOT a user signature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_execution_id: Option<String>,
     pub created_at_ms: TimestampMs,
 }
 

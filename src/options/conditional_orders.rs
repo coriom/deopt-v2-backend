@@ -837,7 +837,7 @@ pub fn execute_triggered_in_store(
 
     // 4. Build the child IOC limit order. Side = opposite of position.
     let now_ms_signed = now_ms;
-    let child = OptionOrder {
+    let mut child = OptionOrder {
         order_id: OrderId::new(),
         option_series_id: order.option_series_id.clone(),
         account: order.account.clone(),
@@ -860,9 +860,15 @@ pub fn execute_triggered_in_store(
         terminal_reason_code: None,
         terminal_reason_message: None,
         terminal_reason_source: None,
+        canonical_order_hash: None,
         created_at_ms: now_ms_signed,
         updated_at_ms: now_ms_signed,
     };
+    // OPTIONS-HYBRID-V2-IDENTITY-AND-CORRELATION-WIRING-V1 — TP/SL
+    // child orders receive the canonical identity too, so their
+    // subsequent fills correlate through the same hash chain.
+    child.canonical_order_hash =
+        Some(crate::options::canonical_identity::canonical_order_hash_for(&child));
 
     // Mirror the matcher's plan-then-execute so the conditional path
     // honours the same TIF semantics already proven for direct

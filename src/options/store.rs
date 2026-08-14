@@ -2144,6 +2144,18 @@ fn option_fill_from_match(
         Side::Buy => (incoming, maker),
         Side::Sell => (maker, incoming),
     };
+    // OPTIONS-HYBRID-V2-IDENTITY-AND-CORRELATION-WIRING-V1 —
+    // canonical execution id derived from both orders' canonical
+    // order hashes. Mirrors the DB-matcher helper in
+    // `src/db/repository.rs::option_fill_from_match`; legacy
+    // counterparties (no canonical_order_hash) produce fills with
+    // canonical_execution_id = None.
+    let canonical_execution_id =
+        crate::options::canonical_identity::canonical_execution_id_for_fill(
+            buy_order.canonical_order_hash.as_deref(),
+            sell_order.canonical_order_hash.as_deref(),
+            size_1e8,
+        );
     OptionFill {
         fill_id: Uuid::new_v4(),
         option_series_id: incoming.option_series_id.clone(),
@@ -2162,6 +2174,7 @@ fn option_fill_from_match(
         taker_side: incoming.side,
         price_1e8: maker.price_1e8,
         size_1e8,
+        canonical_execution_id,
         created_at_ms,
     }
 }

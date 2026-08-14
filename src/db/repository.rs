@@ -2429,9 +2429,9 @@ impl PgRepository {
                 remaining_size_1e8, time_in_force, post_only, client_order_id, nonce,
                 deadline_ms, signature, status,
                 terminal_reason_code, terminal_reason_message, terminal_reason_source,
-                created_at_ms, updated_at_ms, subaccount_id
+                created_at_ms, updated_at_ms, subaccount_id, canonical_order_hash
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-                      $15, $16, $17, $18, $19, $20)",
+                      $15, $16, $17, $18, $19, $20, $21)",
             ),
             order,
         )
@@ -2457,7 +2457,7 @@ impl PgRepository {
                     remaining_size_1e8, time_in_force, post_only, client_order_id, nonce,
                     deadline_ms, signature, status,
                     terminal_reason_code, terminal_reason_message, terminal_reason_source,
-                    created_at_ms, updated_at_ms, subaccount_id
+                    created_at_ms, updated_at_ms, subaccount_id, canonical_order_hash
              FROM option_orders
              WHERE option_series_id = $1
                AND side = $2
@@ -2538,7 +2538,7 @@ impl PgRepository {
                     remaining_size_1e8, time_in_force, post_only, client_order_id, nonce,
                     deadline_ms, signature, status,
                     terminal_reason_code, terminal_reason_message, terminal_reason_source,
-                    created_at_ms, updated_at_ms, subaccount_id
+                    created_at_ms, updated_at_ms, subaccount_id, canonical_order_hash
              FROM option_orders
              ORDER BY created_at_ms ASC, order_id ASC",
         )
@@ -2554,7 +2554,7 @@ impl PgRepository {
                     remaining_size_1e8, time_in_force, post_only, client_order_id, nonce,
                     deadline_ms, signature, status,
                     terminal_reason_code, terminal_reason_message, terminal_reason_source,
-                    created_at_ms, updated_at_ms, subaccount_id
+                    created_at_ms, updated_at_ms, subaccount_id, canonical_order_hash
              FROM option_orders
              WHERE order_id = $1",
         )
@@ -2582,7 +2582,7 @@ impl PgRepository {
                        remaining_size_1e8, time_in_force, post_only, client_order_id, nonce,
                        deadline_ms, signature, status,
                        terminal_reason_code, terminal_reason_message, terminal_reason_source,
-                       created_at_ms, updated_at_ms",
+                       created_at_ms, updated_at_ms, subaccount_id, canonical_order_hash",
         )
         .bind(order_id.to_string())
         .bind(timestamp_to_i64(updated_at_ms))
@@ -2629,7 +2629,7 @@ impl PgRepository {
                        remaining_size_1e8, time_in_force, post_only, client_order_id, nonce,
                        deadline_ms, signature, status,
                        terminal_reason_code, terminal_reason_message, terminal_reason_source,
-                       created_at_ms, updated_at_ms",
+                       created_at_ms, updated_at_ms, subaccount_id, canonical_order_hash",
         )
         .bind(timestamp_to_i64(now_ms))
         .bind(terminal_reason::EXPIRED)
@@ -3140,7 +3140,7 @@ impl PgRepository {
                     remaining_size_1e8, time_in_force, post_only, client_order_id, nonce,
                     deadline_ms, signature, status,
                     terminal_reason_code, terminal_reason_message, terminal_reason_source,
-                    created_at_ms, updated_at_ms, subaccount_id
+                    created_at_ms, updated_at_ms, subaccount_id, canonical_order_hash
              FROM option_orders
              WHERE option_series_id = $1 AND status IN ('open', 'partially_filled')
              ORDER BY created_at_ms ASC, order_id ASC",
@@ -3157,7 +3157,7 @@ impl PgRepository {
             "SELECT fill_id, option_series_id, buy_order_id, sell_order_id, buyer, seller,
                     buyer_subaccount_id, seller_subaccount_id,
                     maker_order_id, taker_order_id, taker_side, price_1e8, size_1e8,
-                    created_at_ms
+                    created_at_ms, canonical_execution_id
              FROM option_fills
              ORDER BY created_at_ms ASC, fill_id ASC",
         )
@@ -3179,7 +3179,7 @@ impl PgRepository {
             "SELECT fill_id, option_series_id, buy_order_id, sell_order_id, buyer, seller,
                     buyer_subaccount_id, seller_subaccount_id,
                     maker_order_id, taker_order_id, taker_side, price_1e8, size_1e8,
-                    created_at_ms
+                    created_at_ms, canonical_execution_id
              FROM option_fills
              WHERE option_series_id = $1
                AND (lower(buyer) = lower($2) OR lower(seller) = lower($2))
@@ -3198,7 +3198,7 @@ impl PgRepository {
             "SELECT fill_id, option_series_id, buy_order_id, sell_order_id, buyer, seller,
                     buyer_subaccount_id, seller_subaccount_id,
                     maker_order_id, taker_order_id, taker_side, price_1e8, size_1e8,
-                    created_at_ms
+                    created_at_ms, canonical_execution_id
              FROM option_fills
              WHERE fill_id = $1",
         )
@@ -3214,7 +3214,7 @@ impl PgRepository {
             "SELECT fill_id, option_series_id, buy_order_id, sell_order_id, buyer, seller,
                     buyer_subaccount_id, seller_subaccount_id,
                     maker_order_id, taker_order_id, taker_side, price_1e8, size_1e8,
-                    created_at_ms
+                    created_at_ms, canonical_execution_id
              FROM option_fills
              WHERE buy_order_id = $1
                 OR sell_order_id = $1
@@ -6681,6 +6681,12 @@ fn option_order_from_row(row: PgRow) -> Result<OptionOrder> {
         terminal_reason_code: row_get(&row, "terminal_reason_code")?,
         terminal_reason_message: row_get(&row, "terminal_reason_message")?,
         terminal_reason_source: row_get(&row, "terminal_reason_source")?,
+        // OPTIONS-HYBRID-V2-IDENTITY-AND-CORRELATION-WIRING-V1 —
+        // column added by migration 0053. NULL for pre-migration
+        // rows and for legacy code-path inserts; populated by every
+        // canonical new-order path.
+        canonical_order_hash: row_get::<Option<String>>(&row, "canonical_order_hash")
+            .unwrap_or(None),
         created_at_ms: row_get(&row, "created_at_ms")?,
         updated_at_ms: row_get(&row, "updated_at_ms")?,
     })
@@ -6907,6 +6913,11 @@ fn option_fill_from_row(row: PgRow) -> Result<OptionFill> {
             .map_err(|error| {
                 BackendError::Persistence(format!("invalid option fill size: {error}"))
             })?,
+        // OPTIONS-HYBRID-V2-IDENTITY-AND-CORRELATION-WIRING-V1 —
+        // column added by migration 0053. NULL for legacy rows;
+        // populated by every canonical new-fill path.
+        canonical_execution_id: row_get::<Option<String>>(&row, "canonical_execution_id")
+            .unwrap_or(None),
         created_at_ms: row_get(&row, "created_at_ms")?,
     })
 }
@@ -7564,6 +7575,9 @@ fn insert_option_order_query<'q>(
         .bind(timestamp_to_i64(order.created_at_ms))
         .bind(timestamp_to_i64(order.updated_at_ms))
         .bind(u32_to_i32("subaccount_id", order.subaccount_id).unwrap_or(1))
+        // OPTIONS-HYBRID-V2-IDENTITY-AND-CORRELATION-WIRING-V1 —
+        // additive $21: canonical order hash. NULL for legacy paths.
+        .bind(order.canonical_order_hash.as_deref())
 }
 
 async fn insert_option_order_tx(
@@ -7577,9 +7591,9 @@ async fn insert_option_order_tx(
                 remaining_size_1e8, time_in_force, post_only, client_order_id, nonce,
                 deadline_ms, signature, status,
                 terminal_reason_code, terminal_reason_message, terminal_reason_source,
-                created_at_ms, updated_at_ms, subaccount_id
+                created_at_ms, updated_at_ms, subaccount_id, canonical_order_hash
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-                      $15, $16, $17, $18, $19, $20)",
+                      $15, $16, $17, $18, $19, $20, $21)",
         ),
         order,
     )
@@ -7616,8 +7630,8 @@ async fn insert_option_fill_tx(
         "INSERT INTO option_fills (
             fill_id, option_series_id, buy_order_id, sell_order_id, buyer, seller,
             maker_order_id, taker_order_id, taker_side, price_1e8, size_1e8, created_at_ms,
-            buyer_subaccount_id, seller_subaccount_id
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+            buyer_subaccount_id, seller_subaccount_id, canonical_execution_id
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
     )
     .bind(fill.fill_id.to_string())
     .bind(&fill.option_series_id)
@@ -7633,6 +7647,10 @@ async fn insert_option_fill_tx(
     .bind(timestamp_to_i64(fill.created_at_ms))
     .bind(u32_to_i32("buyer_subaccount_id", fill.buyer_subaccount_id).unwrap_or(1))
     .bind(u32_to_i32("seller_subaccount_id", fill.seller_subaccount_id).unwrap_or(1))
+    // OPTIONS-HYBRID-V2-IDENTITY-AND-CORRELATION-WIRING-V1 — bind
+    // additive canonical_execution_id column. NULL for legacy fills
+    // whose maker or taker predates identity wiring.
+    .bind(fill.canonical_execution_id.as_deref())
     .execute(&mut **tx)
     .await
     .map_err(|error| BackendError::Persistence(error.to_string()))?;
@@ -7717,6 +7735,18 @@ fn option_fill_from_match(
         Side::Buy => (incoming, maker),
         Side::Sell => (maker, incoming),
     };
+    // OPTIONS-HYBRID-V2-IDENTITY-AND-CORRELATION-WIRING-V1 —
+    // derive canonical execution id from the two orders' canonical
+    // order hashes. Returns Some(id) only when BOTH orders carry a
+    // hash; for legacy pre-wiring counterparties the fill's
+    // canonical_execution_id remains NULL. Same posture as
+    // `src/options/store.rs::option_fill_from_match`.
+    let canonical_execution_id =
+        crate::options::canonical_identity::canonical_execution_id_for_fill(
+            buy_order.canonical_order_hash.as_deref(),
+            sell_order.canonical_order_hash.as_deref(),
+            size_1e8,
+        );
     OptionFill {
         fill_id: Uuid::new_v4(),
         option_series_id: incoming.option_series_id.clone(),
@@ -7735,6 +7765,7 @@ fn option_fill_from_match(
         taker_side: incoming.side,
         price_1e8: maker.price_1e8,
         size_1e8,
+        canonical_execution_id,
         created_at_ms,
     }
 }

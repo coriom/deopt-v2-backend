@@ -133,6 +133,58 @@ pub fn derive_canonical_execution_id_from_fill(
     )
 }
 
+/// OPTIONS-HYBRID-V2-IDENTITY-AND-CORRELATION-WIRING-V1 — canonical
+/// deployment id used when Options constructs order/execution
+/// identities. Options today does not yet resolve a per-request
+/// Hybrid V2 deployment (the schema does not carry `deployment_id`
+/// on `option_orders` / `option_fills`), so a stable constant is
+/// used. Changing this constant would invalidate every existing
+/// canonical order hash and canonical execution id and must be
+/// gated behind a versioned migration.
+pub const OPTIONS_CANONICAL_DEPLOYMENT_ID: i64 = 1;
+
+/// OPTIONS-HYBRID-V2-IDENTITY-AND-CORRELATION-WIRING-V1 — canonical
+/// chain id used when Options constructs order/execution identities.
+/// Base Sepolia (84532) matches the default in
+/// `OptionsConfig::execution_eip712_domain.chain_id`. Cross-chain
+/// deployment requires a follow-up milestone that plumbs the
+/// per-request chain id (see closure doc F-series).
+pub const OPTIONS_CANONICAL_CHAIN_ID: u64 = 84532;
+
+/// Compute the canonical order hash for an `OptionOrder` using the
+/// stable Options deployment + chain constants. Called at INSERT
+/// time in every canonical Options order creation path.
+pub fn canonical_order_hash_for(order: &OptionOrder) -> String {
+    let inputs = OptionOrderHashInputs::from_order(
+        order,
+        OPTIONS_CANONICAL_DEPLOYMENT_ID,
+        OPTIONS_CANONICAL_CHAIN_ID,
+    );
+    derive_canonical_order_hash(&inputs)
+}
+
+/// Compute the canonical execution id for a matched fill given the
+/// two orders' `canonical_order_hash` values. Returns `Some(id)`
+/// only when BOTH order hashes are present; returns `None` for
+/// fills involving one or more legacy (pre-wiring) orders.
+pub fn canonical_execution_id_for_fill(
+    buyer_canonical_order_hash: Option<&str>,
+    seller_canonical_order_hash: Option<&str>,
+    fill_quantity_1e8: Size1e8,
+) -> Option<String> {
+    let (buyer, seller) = (buyer_canonical_order_hash?, seller_canonical_order_hash?);
+    Some(
+        derive_canonical_execution_id_from_fill(
+            OPTIONS_CANONICAL_DEPLOYMENT_ID,
+            OPTIONS_CANONICAL_CHAIN_ID,
+            buyer,
+            seller,
+            fill_quantity_1e8,
+        )
+        .0,
+    )
+}
+
 fn side_discriminant(side: Side) -> u8 {
     match side {
         Side::Buy => 1,

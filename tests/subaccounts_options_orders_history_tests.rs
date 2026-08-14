@@ -688,6 +688,7 @@ fn fills_filter_matches_buyer_subaccount() {
         taker_side: deopt_v2_backend::types::Side::Buy,
         price_1e8: 1_000_000_000,
         size_1e8: 100_000_000,
+        canonical_execution_id: None,
         created_at_ms: 0,
     };
 
@@ -752,6 +753,7 @@ fn fills_filter_matches_seller_subaccount_side() {
         taker_side: deopt_v2_backend::types::Side::Buy,
         price_1e8: 1_000_000_000,
         size_1e8: 100_000_000,
+        canonical_execution_id: None,
         created_at_ms: 0,
     };
     let filter = OptionFillFilter {
@@ -792,6 +794,7 @@ fn fill_from_match_carries_both_side_subaccounts() {
         taker_side: deopt_v2_backend::types::Side::Buy,
         price_1e8: 1_000_000_000,
         size_1e8: 100_000_000,
+        canonical_execution_id: None,
         created_at_ms: 0,
     };
     assert_eq!(fill.buyer_subaccount_id, 1);
@@ -991,6 +994,7 @@ fn history_orders_filter_defaults_to_subaccount_one() {
         terminal_reason_code: None,
         terminal_reason_message: None,
         terminal_reason_source: None,
+        canonical_order_hash: None,
         created_at_ms: 0,
         updated_at_ms: 0,
     };

@@ -3335,6 +3335,7 @@ mod tests {
             terminal_reason_code: Some("ioc_remainder_cancelled".to_string()),
             terminal_reason_message: None,
             terminal_reason_source: Some("tif_policy".to_string()),
+            canonical_order_hash: None,
             created_at_ms: now,
             updated_at_ms: now,
         };
@@ -3358,6 +3359,7 @@ mod tests {
             terminal_reason_code: Some("user_cancelled".to_string()),
             terminal_reason_message: None,
             terminal_reason_source: Some("user".to_string()),
+            canonical_order_hash: None,
             created_at_ms: now,
             updated_at_ms: now,
         };
@@ -3383,6 +3385,7 @@ mod tests {
             terminal_reason_code: None,
             terminal_reason_message: None,
             terminal_reason_source: None,
+            canonical_order_hash: None,
             created_at_ms: now,
             updated_at_ms: now,
         };
@@ -3523,6 +3526,7 @@ mod tests {
                 taker_side: Side::Buy,
                 price_1e8: 100_00000000,
                 size_1e8: 2_00000000,
+                canonical_execution_id: None,
                 created_at_ms: now,
             },
             OptionFill {
@@ -3539,6 +3543,7 @@ mod tests {
                 taker_side: Side::Buy,
                 price_1e8: 100_00000000,
                 size_1e8: 2_00000000,
+                canonical_execution_id: None,
                 created_at_ms: now,
             },
         ];

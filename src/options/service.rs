@@ -439,7 +439,7 @@ async fn submit_option_order_inner(
     // input into `order` so we can run the post-fill materializer
     // without re-fetching it from the request body.
     let attached_tp_sl = input.attached_tp_sl.clone();
-    let order = OptionOrder {
+    let mut order = OptionOrder {
         order_id: OrderId::new(),
         option_series_id: input.option_series_id,
         account: input.account,
@@ -458,9 +458,18 @@ async fn submit_option_order_inner(
         terminal_reason_code: None,
         terminal_reason_message: None,
         terminal_reason_source: None,
+        canonical_order_hash: None,
         created_at_ms: now,
         updated_at_ms: now,
     };
+    // OPTIONS-HYBRID-V2-IDENTITY-AND-CORRELATION-WIRING-V1 —
+    // populate the canonical order hash BEFORE the persistence
+    // transaction so it is written atomically with the order row.
+    // Every new canonical Options order carries the identity; only
+    // legacy pre-migration rows remain NULL. See
+    // `src/options/canonical_identity.rs` for derivation semantics.
+    order.canonical_order_hash =
+        Some(crate::options::canonical_identity::canonical_order_hash_for(&order));
 
     let (order, fills) = if let Some(repository) = state.repository.clone() {
         repository.submit_option_order_and_match(order, now).await?
@@ -7535,6 +7544,7 @@ mod tests {
             taker_side: Side::Buy,
             price_1e8: 10_000_000,
             size_1e8: 100_000_000,
+            canonical_execution_id: None,
             created_at_ms: 123,
         }
     }
