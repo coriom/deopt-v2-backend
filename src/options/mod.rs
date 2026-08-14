@@ -1,6 +1,7 @@
 pub mod broadcast_observability;
 pub mod broadcast_policy;
 pub mod broadcast_policy_data;
+pub mod canonical_identity;
 pub mod conditional_orders;
 pub mod confirmation_worker;
 pub mod event_indexer;
