@@ -143,40 +143,70 @@ pub fn derive_canonical_execution_id_from_fill(
 /// gated behind a versioned migration.
 pub const OPTIONS_CANONICAL_DEPLOYMENT_ID: i64 = 1;
 
-/// OPTIONS-HYBRID-V2-IDENTITY-AND-CORRELATION-WIRING-V1 — canonical
-/// chain id used when Options constructs order/execution identities.
-/// Base Sepolia (84532) matches the default in
-/// `OptionsConfig::execution_eip712_domain.chain_id`. Cross-chain
-/// deployment requires a follow-up milestone that plumbs the
-/// per-request chain id (see closure doc F-series).
-pub const OPTIONS_CANONICAL_CHAIN_ID: u64 = 84532;
+/// OPTIONS-HYBRID-V2-EXECUTION-CORRELATION-CLOSURE-V1 (Part B fix):
+/// domain struct grouping the identity-relevant deployment + chain
+/// context. Constructed from live `OptionsConfig` so identities
+/// automatically track a chain id change in configuration rather
+/// than silently diverging from a stale process-global constant.
+///
+/// Deployment id remains a compile-time constant because Options
+/// schema does not yet persist `deployment_id` per row. Multi-
+/// deployment on the same chain requires an additive schema step
+/// (documented in closure doc as follow-up F2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OptionsCanonicalDomain {
+    pub deployment_id: i64,
+    pub chain_id: u64,
+}
 
-/// Compute the canonical order hash for an `OptionOrder` using the
-/// stable Options deployment + chain constants. Called at INSERT
-/// time in every canonical Options order creation path.
-pub fn canonical_order_hash_for(order: &OptionOrder) -> String {
-    let inputs = OptionOrderHashInputs::from_order(
-        order,
-        OPTIONS_CANONICAL_DEPLOYMENT_ID,
-        OPTIONS_CANONICAL_CHAIN_ID,
-    );
+impl OptionsCanonicalDomain {
+    /// Build the canonical domain from a live `OptionsConfig`. Chain
+    /// id is sourced from `execution_eip712_domain.chain_id` so it
+    /// matches the domain the EIP-712 signer will actually use.
+    /// Deployment id is the stable `OPTIONS_CANONICAL_DEPLOYMENT_ID`.
+    pub fn from_options_config(config: &crate::options::types::OptionsConfig) -> Self {
+        Self {
+            deployment_id: OPTIONS_CANONICAL_DEPLOYMENT_ID,
+            chain_id: config.execution_eip712_domain.chain_id,
+        }
+    }
+
+    /// Compile-time-constant domain kept for pure unit tests + for
+    /// legacy call sites that predate the config-plumbed helpers.
+    /// New production code MUST use `from_options_config`.
+    pub const fn constant_test_domain() -> Self {
+        Self {
+            deployment_id: OPTIONS_CANONICAL_DEPLOYMENT_ID,
+            chain_id: 84532,
+        }
+    }
+}
+
+/// Compute the canonical order hash for an `OptionOrder` scoped to
+/// the supplied deployment + chain context. Called at INSERT time
+/// in every canonical Options order creation path with a domain
+/// built from the live `OptionsConfig`.
+pub fn canonical_order_hash_for(order: &OptionOrder, domain: OptionsCanonicalDomain) -> String {
+    let inputs = OptionOrderHashInputs::from_order(order, domain.deployment_id, domain.chain_id);
     derive_canonical_order_hash(&inputs)
 }
 
 /// Compute the canonical execution id for a matched fill given the
-/// two orders' `canonical_order_hash` values. Returns `Some(id)`
-/// only when BOTH order hashes are present; returns `None` for
-/// fills involving one or more legacy (pre-wiring) orders.
+/// two orders' `canonical_order_hash` values and the canonical
+/// domain context. Returns `Some(id)` only when BOTH order hashes
+/// are present; returns `None` for fills involving one or more
+/// legacy (pre-wiring) orders.
 pub fn canonical_execution_id_for_fill(
     buyer_canonical_order_hash: Option<&str>,
     seller_canonical_order_hash: Option<&str>,
     fill_quantity_1e8: Size1e8,
+    domain: OptionsCanonicalDomain,
 ) -> Option<String> {
     let (buyer, seller) = (buyer_canonical_order_hash?, seller_canonical_order_hash?);
     Some(
         derive_canonical_execution_id_from_fill(
-            OPTIONS_CANONICAL_DEPLOYMENT_ID,
-            OPTIONS_CANONICAL_CHAIN_ID,
+            domain.deployment_id,
+            domain.chain_id,
             buyer,
             seller,
             fill_quantity_1e8,

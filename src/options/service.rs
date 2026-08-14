@@ -468,8 +468,17 @@ async fn submit_option_order_inner(
     // Every new canonical Options order carries the identity; only
     // legacy pre-migration rows remain NULL. See
     // `src/options/canonical_identity.rs` for derivation semantics.
-    order.canonical_order_hash =
-        Some(crate::options::canonical_identity::canonical_order_hash_for(&order));
+    //
+    // OPTIONS-HYBRID-V2-EXECUTION-CORRELATION-CLOSURE-V1 Part B:
+    // domain sourced from live OptionsConfig (chain id follows
+    // execution EIP-712 domain), not a stale process-global constant.
+    let canonical_domain =
+        crate::options::canonical_identity::OptionsCanonicalDomain::from_options_config(
+            &state.options_config,
+        );
+    order.canonical_order_hash = Some(
+        crate::options::canonical_identity::canonical_order_hash_for(&order, canonical_domain),
+    );
 
     let (order, fills) = if let Some(repository) = state.repository.clone() {
         repository.submit_option_order_and_match(order, now).await?

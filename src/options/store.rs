@@ -2150,11 +2150,19 @@ fn option_fill_from_match(
     // `src/db/repository.rs::option_fill_from_match`; legacy
     // counterparties (no canonical_order_hash) produce fills with
     // canonical_execution_id = None.
+    //
+    // OPTIONS-HYBRID-V2-EXECUTION-CORRELATION-CLOSURE-V1 Part B:
+    // in-memory matcher runs only in test/local mode; the constant
+    // test domain matches the domain used by orders inserted via
+    // the store's in-memory `submit_option_order` path (which also
+    // uses the constant when no OptionsConfig is threaded). See
+    // `OptionsCanonicalDomain::constant_test_domain`.
     let canonical_execution_id =
         crate::options::canonical_identity::canonical_execution_id_for_fill(
             buy_order.canonical_order_hash.as_deref(),
             sell_order.canonical_order_hash.as_deref(),
             size_1e8,
+            crate::options::canonical_identity::OptionsCanonicalDomain::constant_test_domain(),
         );
     OptionFill {
         fill_id: Uuid::new_v4(),

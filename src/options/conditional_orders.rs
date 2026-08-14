@@ -867,8 +867,18 @@ pub fn execute_triggered_in_store(
     // OPTIONS-HYBRID-V2-IDENTITY-AND-CORRELATION-WIRING-V1 — TP/SL
     // child orders receive the canonical identity too, so their
     // subsequent fills correlate through the same hash chain.
+    //
+    // OPTIONS-HYBRID-V2-EXECUTION-CORRELATION-CLOSURE-V1 Part B: the
+    // in-store TP/SL execution path is only reached in in-memory
+    // (test/local) mode; production runs `execute_triggered_via_repo`
+    // which routes through `submit_option_order` and sources the
+    // canonical domain from live `OptionsConfig`. Using the constant
+    // test domain here is intentional and does NOT affect the
+    // production identity chain.
+    let child_domain =
+        crate::options::canonical_identity::OptionsCanonicalDomain::constant_test_domain();
     child.canonical_order_hash =
-        Some(crate::options::canonical_identity::canonical_order_hash_for(&child));
+        Some(crate::options::canonical_identity::canonical_order_hash_for(&child, child_domain));
 
     // Mirror the matcher's plan-then-execute so the conditional path
     // honours the same TIF semantics already proven for direct

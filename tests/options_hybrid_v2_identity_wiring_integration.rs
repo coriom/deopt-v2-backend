@@ -16,7 +16,7 @@
 use deopt_v2_backend::api::AppState;
 use deopt_v2_backend::engine::EngineState;
 use deopt_v2_backend::options::canonical_identity::{
-    canonical_execution_id_for_fill, canonical_order_hash_for,
+    canonical_execution_id_for_fill, canonical_order_hash_for, OptionsCanonicalDomain,
 };
 use deopt_v2_backend::options::service::{
     create_option_series, submit_option_order, CreateOptionSeriesInput, SubmitOptionOrderInput,
@@ -123,7 +123,10 @@ async fn submit_populates_canonical_order_hash_deterministically() {
     assert!(hash.starts_with("0x"));
     assert_eq!(hash.len(), 66);
     // Same order re-derives the same hash (pure function).
-    let expected = canonical_order_hash_for(&out.order);
+    let expected = canonical_order_hash_for(
+        &out.order,
+        OptionsCanonicalDomain::from_options_config(&state.options_config),
+    );
     assert_eq!(hash, expected);
 }
 
@@ -277,6 +280,7 @@ async fn same_wallet_cross_subaccount_fill_execution_id_is_deterministic() {
         taker_out.order.canonical_order_hash.as_deref(),
         maker_out.order.canonical_order_hash.as_deref(),
         fill.size_1e8,
+        OptionsCanonicalDomain::from_options_config(&state.options_config),
     )
     .expect("both hashes present");
     assert_eq!(exec_id, expected);

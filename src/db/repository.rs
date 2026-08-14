@@ -7741,11 +7741,23 @@ fn option_fill_from_match(
     // hash; for legacy pre-wiring counterparties the fill's
     // canonical_execution_id remains NULL. Same posture as
     // `src/options/store.rs::option_fill_from_match`.
+    //
+    // OPTIONS-HYBRID-V2-EXECUTION-CORRELATION-CLOSURE-V1 Part B:
+    // DB matcher does not have direct access to `OptionsConfig`
+    // (repository operates below the service layer). The constant
+    // test domain here matches what `submit_option_order` used when
+    // it wrote the order rows via `canonical_order_hash_for(order,
+    // OptionsCanonicalDomain::from_options_config(&state.
+    // options_config))` — and today `execution_eip712_domain.
+    // chain_id` defaults to 84532, so the constant produces the same
+    // execution id. A future multi-chain milestone must thread the
+    // domain through repository transactions.
     let canonical_execution_id =
         crate::options::canonical_identity::canonical_execution_id_for_fill(
             buy_order.canonical_order_hash.as_deref(),
             sell_order.canonical_order_hash.as_deref(),
             size_1e8,
+            crate::options::canonical_identity::OptionsCanonicalDomain::constant_test_domain(),
         );
     OptionFill {
         fill_id: Uuid::new_v4(),
