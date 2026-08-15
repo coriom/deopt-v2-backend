@@ -40,8 +40,9 @@ pub use signer::ExecutorSigner;
 pub use simulator::{simulate_execution_intent, SimulationResult};
 pub use transaction::{
     assemble_eip1559_signed_transaction, build_execution_transaction_request,
-    eip1559_transaction_prehash, ensure_no_submitted_transaction, sign_eip1559_transaction,
-    ExecutionTransaction, ExecutionTransactionRequest, ExecutionTransactionStatus,
+    derive_signed_transaction_hash, eip1559_transaction_prehash, ensure_no_submitted_transaction,
+    sign_eip1559_transaction, ExecutionTransaction, ExecutionTransactionRequest,
+    ExecutionTransactionStatus,
 };
 pub use tx_builder::{
     build_perp_execution_call, build_perp_execution_call_from_intent,

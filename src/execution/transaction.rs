@@ -150,6 +150,43 @@ pub fn assemble_eip1559_signed_transaction(
     Ok(hex_0x(&raw))
 }
 
+/// Compute the canonical Ethereum transaction hash of a signed
+/// EIP-1559 (type 0x02) raw transaction. The hash equals
+/// `keccak256(raw_bytes)` where `raw_bytes` is the full raw signed
+/// transaction envelope (type-byte + RLP-encoded body) as returned
+/// by `assemble_eip1559_signed_transaction`.
+///
+/// OPTIONS-HYBRID-V2-BACKEND-CLOSURE-SPRINT-V1 Part A1 — enables the
+/// backend to persist the authoritative transaction identity BEFORE
+/// invoking `eth_sendRawTransaction`, closing the RPC-succeeds /
+/// DB-fails crash window.
+pub fn derive_signed_transaction_hash(raw_hex: &str) -> Result<String> {
+    let stripped = raw_hex.strip_prefix("0x").unwrap_or(raw_hex);
+    if stripped.is_empty() || stripped.len() % 2 != 0 {
+        return Err(BackendError::Config(
+            "derive_signed_transaction_hash: expected non-empty 0x-hex raw tx".to_string(),
+        ));
+    }
+    let mut bytes = Vec::with_capacity(stripped.len() / 2);
+    for chunk in stripped.as_bytes().chunks(2) {
+        let hi = decode_nibble(chunk[0])?;
+        let lo = decode_nibble(chunk[1])?;
+        bytes.push((hi << 4) | lo);
+    }
+    Ok(hex_0x(&keccak256(&bytes)))
+}
+
+fn decode_nibble(byte: u8) -> Result<u8> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(BackendError::Config(
+            "derive_signed_transaction_hash: invalid hex nibble".to_string(),
+        )),
+    }
+}
+
 pub fn sign_eip1559_transaction(
     request: &ExecutionTransactionRequest,
     nonce: u64,
