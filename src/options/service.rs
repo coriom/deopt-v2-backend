@@ -8,6 +8,7 @@ use super::broadcast_policy_data::{
 };
 use super::canonical_identity::OptionsCanonicalDomain;
 use super::correlation_repository::{
+    attach_local_tx_identity as correlation_attach_local_tx_identity,
     attach_tx_hash as correlation_attach_tx_hash, AwaitingCorrelationInput, OptionExecutionKind,
 };
 use super::series_id::{option_series_id, OptionSeriesIdInput};
@@ -39,11 +40,11 @@ use crate::error::{BackendError, Result};
 use crate::execution::transaction::hex_0x;
 use crate::execution::EthBalanceProvider;
 use crate::execution::{
-    assemble_eip1559_signed_transaction, eip1559_transaction_prehash, policy_fingerprint,
-    EthCallProvider, ExecutionTransactionRequest, ExecutionTransactionStatus, ExecutorSigner,
-    GasEstimateProvider, HttpJsonRpcProvider, LocalDevSigner, RemoteSigner, RemoteSignerClient,
-    SignerBackendKind, SignerError, SignerRequest, TransactionBroadcastProvider,
-    TransactionReceiptProvider, MAINNET_CHAIN_ID,
+    assemble_eip1559_signed_transaction, derive_signed_transaction_hash,
+    eip1559_transaction_prehash, policy_fingerprint, EthCallProvider, ExecutionTransactionRequest,
+    ExecutionTransactionStatus, ExecutorSigner, GasEstimateProvider, HttpJsonRpcProvider,
+    LocalDevSigner, RemoteSigner, RemoteSignerClient, SignerBackendKind, SignerError,
+    SignerRequest, TransactionBroadcastProvider, TransactionReceiptProvider, MAINNET_CHAIN_ID,
 };
 use crate::mm::protocol::{
     NotificationEnvelope, OptionRfqQuoteAcceptedPayload, OptionRfqQuoteRejectedPayload,
@@ -2981,13 +2982,81 @@ where
     state
         .broadcast_observability
         .record_signer_success(signer_kind.as_str(), now);
+
+    // OPTIONS-HYBRID-V2-BACKEND-CLOSURE-SPRINT-V1 Part A1 — derive
+    // the authoritative tx_hash locally from the exact signed raw
+    // transaction bytes BEFORE calling `send_raw_transaction`. If
+    // the intent carries a canonical execution identity, persist the
+    // tx_hash against the correlation row and transition it to
+    // SUBMISSION_UNKNOWN. This closes the crash window between the
+    // RPC accepting the raw tx (which may already be on chain) and
+    // the backend learning of the hash: the tx_hash is durable
+    // regardless of what happens next. On DB failure at this step
+    // we fail closed BEFORE broadcast so no tx is ever sent without
+    // a durable identity.
+    let local_tx_hash = derive_signed_transaction_hash(&raw_transaction)?;
+    if let (Some(canonical_id), Some(repository)) = (
+        intent.canonical_execution_id.as_deref(),
+        state.repository.as_ref(),
+    ) {
+        // Only attempt pre-broadcast attach when a correlation row
+        // was atomically inserted with the intent (post-Part-E
+        // matcher-derived path). Historical intents pre-dating the
+        // atomic writer carry a canonical_execution_id without a
+        // correlation row; those degrade to the legacy post-RPC
+        // attach path below without a hard failure.
+        let correlation_exists =
+            crate::options::correlation_repository::get_by_canonical_execution_id(
+                repository.pool(),
+                canonical_id,
+            )
+            .await
+            .ok()
+            .flatten()
+            .is_some();
+        if correlation_exists {
+            if let Err(err) = correlation_attach_local_tx_identity(
+                repository.pool(),
+                canonical_id,
+                &local_tx_hash,
+                now,
+            )
+            .await
+            {
+                // Correlation row EXISTS but attach failed — this
+                // indicates either a conflicting tx_hash on the row
+                // (e.g. a prior signer produced a different signed
+                // tx) or a DB fault. Fail closed BEFORE any RPC call
+                // so no tx is ever sent while the correlation is in
+                // an inconsistent state.
+                let reason = format!("attach_local_tx_identity failed pre-broadcast: {err}");
+                warn!(
+                    target: "option_execution_correlation",
+                    intent_id = %intent_id,
+                    canonical_execution_id = %canonical_id,
+                    error = %err,
+                    "pre-broadcast tx identity persistence failed; broadcast aborted"
+                );
+                update_option_execution_intent_status(
+                    state,
+                    intent_id,
+                    OptionExecutionIntentStatus::BroadcastFailed,
+                    Some(reason.clone()),
+                    now,
+                )
+                .await?;
+                return Err(BackendError::BroadcastRejected(reason));
+            }
+        }
+    }
+
     let tx_hash = match provider.send_raw_transaction(raw_transaction).await {
         Ok(tx_hash) => {
             if !is_valid_tx_hash(&tx_hash) {
                 let error = "broadcast provider returned an invalid transaction hash".to_string();
                 let transaction = option_execution_transaction_from_request(
                     &request,
-                    from,
+                    from.clone(),
                     None,
                     Some(error.clone()),
                     now,
@@ -3004,7 +3073,38 @@ where
                 .await?;
                 return Err(BackendError::BroadcastRejected(error));
             }
-            tx_hash.to_ascii_lowercase()
+            let lower = tx_hash.to_ascii_lowercase();
+            // Part A1 — provider MUST agree with locally-derived hash.
+            // Any disagreement indicates a signer/provider divergence
+            // (e.g., signer signed different bytes than were sent, or
+            // the provider replaced/wrapped the tx). Fail closed
+            // rather than trusting the provider hash silently: the
+            // durable correlation already binds `local_tx_hash`.
+            if lower != local_tx_hash {
+                let reason = format!(
+                    "broadcast provider tx_hash disagreed with locally-derived hash \
+                     (canonical binding preserved on local hash)"
+                );
+                let transaction = option_execution_transaction_from_request(
+                    &request,
+                    from.clone(),
+                    Some(local_tx_hash.clone()),
+                    Some(reason.clone()),
+                    now,
+                    Some(&gas_check),
+                );
+                insert_option_execution_transaction(state, transaction).await?;
+                update_option_execution_intent_status(
+                    state,
+                    intent_id,
+                    OptionExecutionIntentStatus::BroadcastFailed,
+                    Some(reason.clone()),
+                    now,
+                )
+                .await?;
+                return Err(BackendError::BroadcastRejected(reason));
+            }
+            lower
         }
         Err(error) => {
             let transaction = option_execution_transaction_from_request(
@@ -3037,14 +3137,16 @@ where
         Some(&gas_check),
     );
     let transaction = insert_option_execution_transaction(state, transaction).await?;
-    // OPTIONS-HYBRID-V2-CORRELATION-ATOMIC-WIRING-V1 Part H — attach
-    // the authoritative tx_hash from the just-executed
-    // `send_raw_transaction` to the pre-chain correlation row. The
-    // backend relayer path is the trust boundary — the RPC provider's
-    // reply is the authoritative first observation of the tx_hash. If
-    // the intent has no canonical_execution_id (legacy pre-wiring or
-    // user-initiated quote flow) the correlation row does not exist
-    // and there is nothing to attach; skip silently.
+    // OPTIONS-HYBRID-V2-CORRELATION-ATOMIC-WIRING-V1 Part H (extended
+    // by BACKEND-CLOSURE-SPRINT-V1 Part A1): transition the
+    // correlation row to SUBMITTED after RPC ack. The tx_hash was
+    // already persisted pre-broadcast (SUBMISSION_UNKNOWN); this
+    // call confirms the successful submission. Same-value re-attach
+    // is idempotent — this call is safe even if the correlation
+    // already advanced (e.g. reducer promoted it directly to
+    // CORRELATED_CANONICAL during a crash-window race). If the
+    // intent has no canonical_execution_id, no correlation row
+    // exists and there is nothing to update; skip silently.
     if let (Some(canonical_id), Some(repository)) = (
         intent.canonical_execution_id.as_deref(),
         state.repository.as_ref(),
@@ -5436,9 +5538,23 @@ mod tests {
             let tx_hash = self.tx_hash.clone();
             let fail_send = self.fail_send;
             Box::pin(async move {
-                calls.lock().unwrap().push(raw_transaction);
+                calls.lock().unwrap().push(raw_transaction.clone());
                 if fail_send {
                     return Err(BackendError::Simulation("mock send failed".to_string()));
+                }
+                // BACKEND-CLOSURE-SPRINT-V1 A1 — production code
+                // rejects broadcast when the provider-returned hash
+                // disagrees with the hash derived locally from the
+                // signed raw bytes. Mock derives from the same bytes
+                // so happy-path tests mirror production. Tests that
+                // want to exercise the disagreement path can
+                // override with a canned invalid string via
+                // `MockBroadcastProvider::invalid_hash`.
+                if !tx_hash.starts_with("0xnot") && tx_hash.len() == 66 {
+                    match derive_signed_transaction_hash(&raw_transaction) {
+                        Ok(derived) => return Ok(derived),
+                        Err(_) => return Ok(tx_hash),
+                    }
                 }
                 Ok(tx_hash)
             })
@@ -5865,9 +5981,16 @@ mod tests {
 
         assert!(outcome.submitted);
         assert!(!outcome.duplicate);
-        assert_eq!(
-            outcome.transaction.tx_hash.as_deref(),
-            Some("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        // BACKEND-CLOSURE-SPRINT-V1 A1 — tx_hash is now derived
+        // locally from the signed raw bytes and must agree with what
+        // the mock provider returns; both come from
+        // `derive_signed_transaction_hash`, so the concrete value
+        // depends on the intent's signed calldata. Assert shape
+        // (0x-prefixed 32-byte hex) rather than a canned constant.
+        let hash = outcome.transaction.tx_hash.as_deref().expect("tx_hash");
+        assert!(
+            hash.starts_with("0x") && hash.len() == 66,
+            "tx_hash must be 0x-prefixed 32-byte hex, got {hash}"
         );
         assert_eq!(
             stored.status,
@@ -5878,10 +6001,10 @@ mod tests {
             transactions[0].status,
             ExecutionTransactionStatus::Submitted
         );
-        assert_eq!(
-            transactions[0].tx_hash.as_deref(),
-            Some("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-        );
+        // A1 — tx_hash is derived from raw signed bytes; assert the
+        // persisted hash agrees with the outcome (both flow from the
+        // same derivation).
+        assert_eq!(transactions[0].tx_hash.as_deref(), Some(hash));
         assert_eq!(provider.send_count(), 1);
 
         let duplicate =

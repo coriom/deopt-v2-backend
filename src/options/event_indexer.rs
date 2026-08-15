@@ -16,6 +16,12 @@ use super::{OptionEventIndexerState, OptionExecutionEvent};
 pub const OPTION_EVENT_INDEXER_STATE_ID: &str = "option_events_base_sepolia";
 pub const OPTION_TRADE_EXECUTED_SIGNATURE: &str =
     "OptionTradeExecuted(bytes32,address,address,uint256,uint128,uint128,bool,uint256,uint256)";
+/// OPTIONS-HYBRID-V2-BACKEND-CLOSURE-SPRINT-V1 Part A2/A3 — V2G-O
+/// added the RFQ-flow execution event. Same field layout as
+/// `OptionTradeExecuted`, distinct signature so the decoder can
+/// disambiguate orderbook vs RFQ execution kind at ingest time.
+pub const OPTION_RFQ_TRADE_EXECUTED_SIGNATURE: &str =
+    "OptionRfqTradeExecuted(bytes32,address,address,uint256,uint128,uint128,bool,uint256,uint256)";
 pub const MARGIN_TRADE_EXECUTED_SIGNATURE: &str =
     "TradeExecuted(address,address,uint256,uint128,uint128)";
 pub const TRADING_FEE_CHARGED_SIGNATURE: &str =
@@ -245,6 +251,9 @@ pub struct OptionEventIndexerTickResult {
     pub last_indexed_block: u64,
 }
 
+pub fn option_rfq_trade_executed_topic0() -> String {
+    hex_0x(&keccak256(OPTION_RFQ_TRADE_EXECUTED_SIGNATURE.as_bytes()))
+}
 pub fn option_trade_executed_topic0() -> String {
     hex_0x(&keccak256(OPTION_TRADE_EXECUTED_SIGNATURE.as_bytes()))
 }
@@ -368,7 +377,10 @@ pub fn default_option_event_counts() -> BTreeMap<String, u64> {
 
 fn event_topics_for_emitter_role(role: &str) -> Vec<String> {
     match role {
-        "matching_engine" => vec![option_trade_executed_topic0()],
+        "matching_engine" => vec![
+            option_trade_executed_topic0(),
+            option_rfq_trade_executed_topic0(),
+        ],
         "margin_engine" => vec![
             margin_trade_executed_topic0(),
             trading_fee_charged_topic0(),
@@ -643,6 +655,9 @@ pub fn decode_option_execution_event(
     if topic0.eq_ignore_ascii_case(&option_trade_executed_topic0()) {
         return decode_option_trade_executed_log(log, chain_id).map(Some);
     }
+    if topic0.eq_ignore_ascii_case(&option_rfq_trade_executed_topic0()) {
+        return decode_option_rfq_trade_executed_log(log, chain_id).map(Some);
+    }
     if topic0.eq_ignore_ascii_case(&margin_trade_executed_topic0()) {
         return decode_margin_trade_executed_log(log, chain_id).map(Some);
     }
@@ -771,6 +786,80 @@ fn decode_option_trade_executed_log(log: &EthLog, chain_id: u64) -> Result<Optio
         block_hash: log.block_hash.clone(),
         event_name: "OptionTradeExecuted".to_string(),
         event_signature: OPTION_TRADE_EXECUTED_SIGNATURE.to_string(),
+        intent_id: None,
+        onchain_intent_id: Some(onchain_intent_id.clone()),
+        option_execution_transaction_id: None,
+        buyer: Some(buyer.clone()),
+        seller: Some(seller.clone()),
+        account: None,
+        option_id: Some(option_id.clone()),
+        quantity_contracts: Some(quantity_contracts.clone()),
+        premium_per_contract_native: Some(premium_per_contract_native.clone()),
+        raw_topics: serde_json::Value::Array(
+            log.topics
+                .iter()
+                .cloned()
+                .map(serde_json::Value::String)
+                .collect(),
+        ),
+        raw_data: log.data.clone(),
+        decoded: Some(serde_json::json!({
+            "intentId": onchain_intent_id,
+            "buyer": buyer,
+            "seller": seller,
+            "optionId": option_id,
+            "quantity": quantity_contracts,
+            "premiumPerContract": premium_per_contract_native,
+            "buyerIsMaker": buyer_is_maker,
+            "buyerNonce": buyer_nonce,
+            "sellerNonce": seller_nonce
+        })),
+        created_at_ms: now,
+        updated_at_ms: now,
+    })
+}
+
+fn decode_option_rfq_trade_executed_log(
+    log: &EthLog,
+    chain_id: u64,
+) -> Result<OptionExecutionEvent> {
+    if log.topics.len() != 4 {
+        return Err(BackendError::Indexer(
+            "OptionRfqTradeExecuted log must have four topics".to_string(),
+        ));
+    }
+    let tx_hash =
+        required_field(log.transaction_hash.as_ref(), "transactionHash")?.to_ascii_lowercase();
+    let log_index = parse_hex_quantity(required_field(log.log_index.as_ref(), "logIndex")?)?;
+    let block_number =
+        parse_hex_quantity(required_field(log.block_number.as_ref(), "blockNumber")?)?;
+    let data = decode_hex_bytes(&log.data)?;
+    if data.len() != 32 * 6 {
+        return Err(BackendError::Indexer(
+            "OptionRfqTradeExecuted data must contain six ABI words".to_string(),
+        ));
+    }
+    let onchain_intent_id = decode_topic_bytes32(&log.topics[1])?;
+    let buyer = decode_topic_address(&log.topics[2])?;
+    let seller = decode_topic_address(&log.topics[3])?;
+    let option_id = decode_data_u256(&data, 0)?.to_string();
+    let quantity_contracts = decode_data_u256(&data, 1)?.to_string();
+    let premium_per_contract_native = decode_data_u256(&data, 2)?.to_string();
+    let buyer_is_maker = decode_bool(&data, 3)?;
+    let buyer_nonce = decode_data_u256(&data, 4)?.to_string();
+    let seller_nonce = decode_data_u256(&data, 5)?.to_string();
+    let now = now_ms();
+
+    Ok(OptionExecutionEvent {
+        id: Uuid::new_v4(),
+        chain_id,
+        contract_address: log.address.to_ascii_lowercase(),
+        tx_hash,
+        log_index,
+        block_number,
+        block_hash: log.block_hash.clone(),
+        event_name: "OptionRfqTradeExecuted".to_string(),
+        event_signature: OPTION_RFQ_TRADE_EXECUTED_SIGNATURE.to_string(),
         intent_id: None,
         onchain_intent_id: Some(onchain_intent_id.clone()),
         option_execution_transaction_id: None,
@@ -2007,7 +2096,10 @@ mod tests {
         assert_eq!(result.from_block, 1);
         assert_eq!(result.to_block, 10);
         let filters = provider.filters();
-        assert_eq!(filters.len(), 9);
+        // BACKEND-CLOSURE-SPRINT-V1 A3 — matching_engine role now
+        // registers OptionTradeExecuted + OptionRfqTradeExecuted so RFQ
+        // executions land in the correlation pipeline.
+        assert_eq!(filters.len(), 10);
         assert_eq!(filters[0].from_block, "0x1");
         assert_eq!(filters[0].to_block, "0xa");
         assert_no_generic_execution_rows(&state);
@@ -2299,7 +2391,7 @@ mod tests {
 
         assert_eq!(*mock_broadcast_send_count.lock().unwrap(), 0);
         assert_eq!(provider.block_call_count(), 1);
-        assert_eq!(provider.filters().len(), 9);
+        assert_eq!(provider.filters().len(), 10);
         assert_no_generic_execution_rows(&state);
     }
 
