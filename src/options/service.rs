@@ -3511,6 +3511,10 @@ where
         buyer_nonce,
         seller_nonce,
         fill.created_at_ms,
+        // OPTIONS-HYBRID-V2-CORRELATION-OPERATIONAL-CORE-V1 Part E:
+        // thread the canonical execution identity from the fill row
+        // so the persisted intent references its economic origin.
+        fill.canonical_execution_id.clone(),
     )?;
     insert_option_execution_intent(state, intent)
         .await
@@ -3553,6 +3557,13 @@ where
         buyer_nonce,
         seller_nonce,
         fill.created_at_ms,
+        // OPTIONS-HYBRID-V2-CORRELATION-OPERATIONAL-CORE-V1 Part E:
+        // RFQ fills do NOT yet carry canonical_execution_id
+        // (`OptionRfqFill` predates the identity wiring). Passing
+        // None preserves backward-compat until F-order 3 lands the
+        // RFQ-side derivation. Legacy pre-migration rows remain
+        // NULL by design.
+        None,
     )?;
     insert_option_execution_intent(state, intent)
         .await
@@ -3649,6 +3660,13 @@ pub async fn create_user_initiated_execution_intent_from_quote(
         buyer_nonce,
         seller_nonce,
         now_ms(),
+        // OPTIONS-HYBRID-V2-CORRELATION-OPERATIONAL-CORE-V1 Part E:
+        // user-initiated intent creation from a signed quote is
+        // NOT tied to an on-book matcher fill, so no
+        // canonical_execution_id is populated here. The frontend
+        // signing flow creates the intent standalone; correlation
+        // wiring for this path is F-order 3.
+        None,
     )?;
     insert_option_execution_intent(state, intent).await
 }
@@ -3928,6 +3946,12 @@ fn build_option_execution_intent(
     buyer_nonce: u128,
     seller_nonce: u128,
     source_created_at_ms: TimestampMs,
+    // OPTIONS-HYBRID-V2-CORRELATION-OPERATIONAL-CORE-V1 Part E —
+    // canonical execution identity threaded from the source fill.
+    // NULL for legacy pre-wiring paths + for the user-initiated
+    // quote-based intent creation which is not tied to a matcher
+    // fill row (documented as F-order 3 for later linkage).
+    canonical_execution_id: Option<String>,
 ) -> Result<OptionExecutionIntent> {
     let metadata = validate_executable_option_series(state, series)?;
     let quantity_contracts = quantity_contracts_from_size(source_size_1e8)?;
@@ -3972,6 +3996,7 @@ fn build_option_execution_intent(
         simulation_revert_data: None,
         simulation_revert_selector: None,
         simulated_at_ms: None,
+        canonical_execution_id,
         created_at_ms: source_created_at_ms,
         updated_at_ms: now,
     })
@@ -7636,6 +7661,7 @@ mod tests {
             simulation_revert_data: None,
             simulation_revert_selector: None,
             simulated_at_ms: None,
+            canonical_execution_id: None,
             created_at_ms: 1,
             updated_at_ms: 1,
         }

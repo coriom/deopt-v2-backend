@@ -3240,10 +3240,10 @@ impl PgRepository {
                 strike_1e8, is_call, contract_size_1e8, quantity_contracts, source_size_1e8,
                 source_price_1e8, premium_per_contract_native, buyer_is_maker, buyer_nonce,
                 seller_nonce, deadline, buyer_signature, seller_signature, calldata, status,
-                error, created_at_ms, updated_at_ms
+                error, created_at_ms, updated_at_ms, canonical_execution_id
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
-                $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29
+                $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30
             )
             ON CONFLICT (source_type, source_id) DO NOTHING",
         )
@@ -3276,6 +3276,11 @@ impl PgRepository {
         .bind(&intent.error)
         .bind(timestamp_to_i64(intent.created_at_ms))
         .bind(timestamp_to_i64(intent.updated_at_ms))
+        // OPTIONS-HYBRID-V2-CORRELATION-OPERATIONAL-CORE-V1 Part E:
+        // additive $30 canonical_execution_id — NULL for legacy /
+        // RFQ / user-initiated intents; populated for orderbook
+        // fills that carry a canonical execution identity.
+        .bind(intent.canonical_execution_id.as_deref())
         .execute(&self.pool)
         .await
         .map_err(|error| BackendError::Persistence(error.to_string()))?;
@@ -6923,6 +6928,9 @@ fn option_fill_from_row(row: PgRow) -> Result<OptionFill> {
 }
 
 fn option_execution_intent_select_sql(suffix: &str) -> String {
+    // OPTIONS-HYBRID-V2-CORRELATION-OPERATIONAL-CORE-V1 Part E:
+    // include `canonical_execution_id` (migration 0054) so reads
+    // populate the field. NULL for legacy pre-migration rows.
     format!(
         "SELECT intent_id, onchain_intent_id, source_type, source_id, option_series_id,
                 onchain_option_id, buyer, seller, underlying, settlement_asset, expiry,
@@ -6931,6 +6939,7 @@ fn option_execution_intent_select_sql(suffix: &str) -> String {
                 seller_nonce, deadline, buyer_signature, seller_signature, calldata, status,
                 error, simulation_status, simulation_error, simulation_block_number,
                 simulation_revert_data, simulation_revert_selector, simulated_at_ms,
+                canonical_execution_id,
                 created_at_ms, updated_at_ms
          FROM option_execution_intents {suffix}"
     )
@@ -7037,6 +7046,11 @@ fn option_execution_intent_from_row(row: PgRow) -> Result<OptionExecutionIntent>
         simulation_revert_data: row_get(&row, "simulation_revert_data")?,
         simulation_revert_selector: row_get(&row, "simulation_revert_selector")?,
         simulated_at_ms: row_get(&row, "simulated_at_ms")?,
+        // OPTIONS-HYBRID-V2-CORRELATION-OPERATIONAL-CORE-V1 Part E —
+        // column added by migration 0054. Defensively read to
+        // tolerate SELECTs that don't include the column yet.
+        canonical_execution_id: row_get::<Option<String>>(&row, "canonical_execution_id")
+            .unwrap_or(None),
         created_at_ms: row_get(&row, "created_at_ms")?,
         updated_at_ms: row_get(&row, "updated_at_ms")?,
     })

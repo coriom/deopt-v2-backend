@@ -456,6 +456,16 @@ pub struct OptionExecutionIntent {
     pub simulation_revert_data: Option<String>,
     pub simulation_revert_selector: Option<String>,
     pub simulated_at_ms: Option<TimestampMs>,
+    // OPTIONS-HYBRID-V2-CORRELATION-OPERATIONAL-CORE-V1 Part E —
+    // backend-derived canonical execution identity that binds this
+    // intent to the originating `option_fills.canonical_execution_id`.
+    // NULL for pre-migration intents and for intents whose source
+    // fill predates identity wiring. Immutable-once-set per
+    // migration 0054 trigger. Never treated as user authorization —
+    // the intent still carries buyer_signature + seller_signature
+    // for EIP-712 settlement authorization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_execution_id: Option<String>,
     pub created_at_ms: TimestampMs,
     pub updated_at_ms: TimestampMs,
 }

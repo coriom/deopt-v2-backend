@@ -1625,6 +1625,7 @@ mod tests {
             simulation_revert_data: None,
             simulation_revert_selector: None,
             simulated_at_ms: Some(1),
+            canonical_execution_id: None,
             created_at_ms: 1,
             updated_at_ms: 1,
         }
