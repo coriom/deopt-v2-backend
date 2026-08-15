@@ -3233,54 +3233,10 @@ impl PgRepository {
         &self,
         intent: &OptionExecutionIntent,
     ) -> Result<OptionExecutionIntent> {
-        sqlx::query(
-            "INSERT INTO option_execution_intents (
-                intent_id, onchain_intent_id, source_type, source_id, option_series_id,
-                onchain_option_id, buyer, seller, underlying, settlement_asset, expiry,
-                strike_1e8, is_call, contract_size_1e8, quantity_contracts, source_size_1e8,
-                source_price_1e8, premium_per_contract_native, buyer_is_maker, buyer_nonce,
-                seller_nonce, deadline, buyer_signature, seller_signature, calldata, status,
-                error, created_at_ms, updated_at_ms, canonical_execution_id
-            ) VALUES (
-                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
-                $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30
-            )
-            ON CONFLICT (source_type, source_id) DO NOTHING",
-        )
-        .bind(intent.intent_id.to_string())
-        .bind(&intent.onchain_intent_id)
-        .bind(intent.source_type.as_str())
-        .bind(&intent.source_id)
-        .bind(&intent.option_series_id)
-        .bind(&intent.onchain_option_id)
-        .bind(&intent.buyer.0)
-        .bind(&intent.seller.0)
-        .bind(&intent.underlying.0)
-        .bind(&intent.settlement_asset.0)
-        .bind(u64_to_i64("expiry", intent.expiry)?)
-        .bind(intent.strike_1e8.to_string())
-        .bind(intent.is_call)
-        .bind(intent.contract_size_1e8.to_string())
-        .bind(intent.quantity_contracts.to_string())
-        .bind(intent.source_size_1e8.to_string())
-        .bind(intent.source_price_1e8.to_string())
-        .bind(intent.premium_per_contract_native.to_string())
-        .bind(intent.buyer_is_maker)
-        .bind(intent.buyer_nonce.map(|value| value.to_string()))
-        .bind(intent.seller_nonce.map(|value| value.to_string()))
-        .bind(u64_to_i64("deadline", intent.deadline)?)
-        .bind(&intent.buyer_signature)
-        .bind(&intent.seller_signature)
-        .bind(&intent.calldata)
-        .bind(intent.status.as_str())
-        .bind(&intent.error)
-        .bind(timestamp_to_i64(intent.created_at_ms))
-        .bind(timestamp_to_i64(intent.updated_at_ms))
-        // OPTIONS-HYBRID-V2-CORRELATION-OPERATIONAL-CORE-V1 Part E:
-        // additive $30 canonical_execution_id — NULL for legacy /
-        // RFQ / user-initiated intents; populated for orderbook
-        // fills that carry a canonical execution identity.
-        .bind(intent.canonical_execution_id.as_deref())
+        insert_option_execution_intent_query(
+            sqlx::query(OPTION_EXECUTION_INTENT_INSERT_SQL),
+            intent,
+        )?
         .execute(&self.pool)
         .await
         .map_err(|error| BackendError::Persistence(error.to_string()))?;
@@ -3292,6 +3248,63 @@ impl PgRepository {
                     "option execution intent insert did not return a row".to_string(),
                 )
             })
+    }
+
+    /// OPTIONS-HYBRID-V2-CORRELATION-ATOMIC-WIRING-V1 Part C — insert
+    /// an execution intent AND its `AWAITING_CHAIN_EVIDENCE`
+    /// correlation row inside a single PostgreSQL transaction. If
+    /// either INSERT fails, both roll back — no half-state is ever
+    /// observable.
+    ///
+    /// Idempotency:
+    ///   * Intent INSERT uses `ON CONFLICT (source_type, source_id)
+    ///     DO NOTHING` — retry against an already-persisted intent is
+    ///     silent.
+    ///   * Correlation INSERT uses `upsert_awaiting_correlation_tx`
+    ///     which respects the sparse UNIQUE index on
+    ///     `canonical_execution_id` and returns the existing ACTIVE
+    ///     row on retry (with identity cross-check).
+    ///
+    /// Precondition: `intent.canonical_execution_id` MUST equal
+    /// `corr_input.canonical_execution_id`. Violation aborts before
+    /// any SQL runs.
+    pub async fn insert_option_execution_intent_with_awaiting_correlation(
+        &self,
+        intent: &OptionExecutionIntent,
+        corr_input: &crate::options::correlation_repository::AwaitingCorrelationInput,
+    ) -> Result<(
+        OptionExecutionIntent,
+        crate::options::correlation_repository::OptionExecutionCorrelation,
+    )> {
+        if intent.canonical_execution_id.as_deref()
+            != Some(corr_input.canonical_execution_id.as_str())
+        {
+            return Err(BackendError::Persistence(
+                "intent.canonical_execution_id does not match correlation input".to_string(),
+            ));
+        }
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        insert_option_execution_intent_tx(&mut tx, intent).await?;
+        let correlation = crate::options::correlation_repository::upsert_awaiting_correlation_tx(
+            &mut tx, corr_input,
+        )
+        .await?;
+        tx.commit()
+            .await
+            .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        let intent = self
+            .get_option_execution_intent_by_source(intent.source_type, &intent.source_id)
+            .await?
+            .ok_or_else(|| {
+                BackendError::Persistence(
+                    "option execution intent insert did not return a row".to_string(),
+                )
+            })?;
+        Ok((intent, correlation))
     }
 
     pub async fn list_option_execution_intents(&self) -> Result<Vec<OptionExecutionIntent>> {
@@ -7633,6 +7646,75 @@ async fn update_option_order_tx(
     .execute(&mut **tx)
     .await
     .map_err(|error| BackendError::Persistence(error.to_string()))?;
+    Ok(())
+}
+
+const OPTION_EXECUTION_INTENT_INSERT_SQL: &str = "INSERT INTO option_execution_intents (
+    intent_id, onchain_intent_id, source_type, source_id, option_series_id,
+    onchain_option_id, buyer, seller, underlying, settlement_asset, expiry,
+    strike_1e8, is_call, contract_size_1e8, quantity_contracts, source_size_1e8,
+    source_price_1e8, premium_per_contract_native, buyer_is_maker, buyer_nonce,
+    seller_nonce, deadline, buyer_signature, seller_signature, calldata, status,
+    error, created_at_ms, updated_at_ms, canonical_execution_id
+) VALUES (
+    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
+    $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30
+)
+ON CONFLICT (source_type, source_id) DO NOTHING";
+
+/// Shared bind projection used by both the pool-level and
+/// transaction-level insert paths for `option_execution_intents`. Keeps
+/// the two writers in exact sync — a schema change lands in one place.
+fn insert_option_execution_intent_query<'q>(
+    query: Query<'q, Postgres, PgArguments>,
+    intent: &'q OptionExecutionIntent,
+) -> Result<Query<'q, Postgres, PgArguments>> {
+    Ok(query
+        .bind(intent.intent_id.to_string())
+        .bind(&intent.onchain_intent_id)
+        .bind(intent.source_type.as_str())
+        .bind(&intent.source_id)
+        .bind(&intent.option_series_id)
+        .bind(&intent.onchain_option_id)
+        .bind(&intent.buyer.0)
+        .bind(&intent.seller.0)
+        .bind(&intent.underlying.0)
+        .bind(&intent.settlement_asset.0)
+        .bind(u64_to_i64("expiry", intent.expiry)?)
+        .bind(intent.strike_1e8.to_string())
+        .bind(intent.is_call)
+        .bind(intent.contract_size_1e8.to_string())
+        .bind(intent.quantity_contracts.to_string())
+        .bind(intent.source_size_1e8.to_string())
+        .bind(intent.source_price_1e8.to_string())
+        .bind(intent.premium_per_contract_native.to_string())
+        .bind(intent.buyer_is_maker)
+        .bind(intent.buyer_nonce.map(|value| value.to_string()))
+        .bind(intent.seller_nonce.map(|value| value.to_string()))
+        .bind(u64_to_i64("deadline", intent.deadline)?)
+        .bind(&intent.buyer_signature)
+        .bind(&intent.seller_signature)
+        .bind(&intent.calldata)
+        .bind(intent.status.as_str())
+        .bind(&intent.error)
+        .bind(timestamp_to_i64(intent.created_at_ms))
+        .bind(timestamp_to_i64(intent.updated_at_ms))
+        .bind(intent.canonical_execution_id.as_deref()))
+}
+
+/// Transactional variant of `PgRepository::insert_option_execution_intent`
+/// — used when the intent INSERT must be atomic with additional writes
+/// (e.g. an `option_execution_correlations` row inserted in the same
+/// transaction). Mirrors the pool-level `ON CONFLICT (source_type,
+/// source_id) DO NOTHING` idempotency.
+async fn insert_option_execution_intent_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    intent: &OptionExecutionIntent,
+) -> Result<()> {
+    insert_option_execution_intent_query(sqlx::query(OPTION_EXECUTION_INTENT_INSERT_SQL), intent)?
+        .execute(&mut **tx)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
     Ok(())
 }
 

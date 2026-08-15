@@ -134,6 +134,17 @@ impl OptionCorrelationStatus {
             ))),
         }
     }
+
+    /// States covered by the sparse UNIQUE index on
+    /// `canonical_execution_id`. An ACTIVE correlation is the
+    /// authoritative pre-chain / post-chain binding; only ORPHANED /
+    /// CONFLICT / MANUAL_REVIEW rows may co-exist with a fresh insert.
+    pub fn is_active(self) -> bool {
+        matches!(
+            self,
+            Self::AwaitingChainEvidence | Self::Submitted | Self::CorrelatedCanonical
+        )
+    }
 }
 
 /// Inputs to `insert_awaiting_correlation` — the minimum information
@@ -569,4 +580,102 @@ pub async fn insert_awaiting_correlation_tx(
     .await
     .map_err(|e| BackendError::Persistence(e.to_string()))?;
     correlation_from_row(row)
+}
+
+/// Idempotent upsert-in-transaction variant. Used by the atomic
+/// intent+correlation writer so a duplicated service invocation
+/// (client retry, request de-duplication race) never fails on the
+/// sparse UNIQUE index and never creates a duplicate row.
+///
+/// Semantics:
+///   * If NO ACTIVE correlation exists for `canonical_execution_id`,
+///     insert one in `AWAITING_CHAIN_EVIDENCE` and return it.
+///   * If ONE already exists (any active status), return the existing
+///     row unchanged. Fingerprint cross-check verifies the caller's
+///     input agrees on `(deployment_id, chain_id, execution_kind)`;
+///     mismatch raises `BackendError::Persistence` and aborts the tx.
+///
+/// The ACTIVE definition is `AWAITING_CHAIN_EVIDENCE | SUBMITTED |
+/// CORRELATED_CANONICAL` — matching the sparse UNIQUE index. Rows in
+/// ORPHANED / CONFLICT / MANUAL_REVIEW never block a fresh insert.
+pub async fn upsert_awaiting_correlation_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    input: &AwaitingCorrelationInput,
+) -> Result<OptionExecutionCorrelation> {
+    let inserted = sqlx::query(
+        "INSERT INTO option_execution_correlations (
+             canonical_execution_id, deployment_id, chain_id, execution_kind,
+             onchain_buyer_order_id, onchain_seller_order_id, fill_quantity_1e8,
+             correlation_status, first_seen_at_ms, last_updated_at_ms
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'AWAITING_CHAIN_EVIDENCE', $8, $8)
+         ON CONFLICT (canonical_execution_id)
+             WHERE correlation_status IN
+                 ('AWAITING_CHAIN_EVIDENCE', 'SUBMITTED', 'CORRELATED_CANONICAL')
+             DO NOTHING
+         RETURNING correlation_id, canonical_execution_id, deployment_id, chain_id,
+                   execution_kind, onchain_buyer_order_id, onchain_seller_order_id,
+                   onchain_execution_id, fill_quantity_1e8, tx_hash,
+                   canonical_block_number, canonical_block_hash, log_index,
+                   correlation_status, terminal_reason, first_seen_at_ms, last_updated_at_ms",
+    )
+    .bind(&input.canonical_execution_id)
+    .bind(input.deployment_id)
+    .bind(input.chain_id)
+    .bind(input.execution_kind.as_str())
+    .bind(input.onchain_buyer_order_id.as_deref())
+    .bind(input.onchain_seller_order_id.as_deref())
+    .bind(input.fill_quantity_1e8.as_deref())
+    .bind(input.now_ms)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|e| BackendError::Persistence(e.to_string()))?;
+    if let Some(row) = inserted {
+        return correlation_from_row(row);
+    }
+    // ON CONFLICT DO NOTHING fired → an active row already exists.
+    // Look it up in the same tx and cross-check identity fields.
+    let existing = sqlx::query(
+        "SELECT correlation_id, canonical_execution_id, deployment_id, chain_id,
+                execution_kind, onchain_buyer_order_id, onchain_seller_order_id,
+                onchain_execution_id, fill_quantity_1e8, tx_hash,
+                canonical_block_number, canonical_block_hash, log_index,
+                correlation_status, terminal_reason, first_seen_at_ms, last_updated_at_ms
+         FROM option_execution_correlations
+         WHERE canonical_execution_id = $1
+           AND correlation_status IN
+               ('AWAITING_CHAIN_EVIDENCE', 'SUBMITTED', 'CORRELATED_CANONICAL')
+         LIMIT 1",
+    )
+    .bind(&input.canonical_execution_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|e| BackendError::Persistence(e.to_string()))?
+    .ok_or_else(|| {
+        BackendError::Persistence(format!(
+            "upsert_awaiting_correlation_tx: conflict fired but no ACTIVE row found for {}",
+            input.canonical_execution_id
+        ))
+    })?;
+    let row = correlation_from_row(existing)?;
+    // Cross-check identity so a retry with mismatched fingerprint
+    // cannot silently succeed.
+    if row.deployment_id != input.deployment_id {
+        return Err(BackendError::Persistence(format!(
+            "upsert_awaiting_correlation_tx: deployment_id mismatch on retry (existing={}, input={})",
+            row.deployment_id, input.deployment_id
+        )));
+    }
+    if row.chain_id != input.chain_id {
+        return Err(BackendError::Persistence(format!(
+            "upsert_awaiting_correlation_tx: chain_id mismatch on retry (existing={}, input={})",
+            row.chain_id, input.chain_id
+        )));
+    }
+    if row.execution_kind != input.execution_kind {
+        return Err(BackendError::Persistence(format!(
+            "upsert_awaiting_correlation_tx: execution_kind mismatch on retry (existing={:?}, input={:?})",
+            row.execution_kind, input.execution_kind
+        )));
+    }
+    Ok(row)
 }
