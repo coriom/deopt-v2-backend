@@ -15,8 +15,8 @@ use super::reservation_formulas::{
     buy_reservation, short_call_reservation_physical, short_put_reservation,
 };
 use super::reservation_repository::{
-    insert_open_order_reservation, release_open_order, OpenOrderReservationInput,
-    OptionReservationSide,
+    release_open_order, MatcherReservationPlan, OpenOrderReservationInput, OptionReservationSide,
+    PendingSettlementScaffold,
 };
 use super::series_id::{option_series_id, OptionSeriesIdInput};
 use super::signing::{
@@ -492,8 +492,20 @@ async fn submit_option_order_inner(
         crate::options::canonical_identity::canonical_order_hash_for(&order, canonical_domain),
     );
 
+    // OPTIONS-HYBRID-V2-MATCH-PENDING-AND-CANONICAL-SETTLEMENT-CLOSURE-V1
+    // Part B — build the matcher's reservation plan BEFORE entering
+    // the DB transaction. The plan carries:
+    //   * the taker's OPEN_ORDER reservation input (used only if the
+    //     taker leaves resting residual after match), and
+    //   * a PendingSettlementScaffold that lets the matcher build
+    //     PENDING_SETTLEMENT rows per fill inside the same tx.
+    // In-memory / no-repository callers pass None and get the legacy
+    // behaviour (the in-memory matcher has no reservation ledger).
+    let reservation_plan = build_matcher_reservation_plan(state, &order, now).await;
     let (order, fills) = if let Some(repository) = state.repository.clone() {
-        repository.submit_option_order_and_match(order, now).await?
+        repository
+            .submit_option_order_and_match_with_reservations(order, now, reservation_plan)
+            .await?
     } else {
         state
             .options_store
@@ -501,20 +513,6 @@ async fn submit_option_order_inner(
             .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?
             .submit_order_and_match(order, now)?
     };
-    // OPTIONS-HYBRID-V2-RESERVATIONS-PENDING-SETTLEMENT-AND-CANONICAL-RELEASE-V1
-    // Package E — reserve OPEN_ORDER risk for the accepted resting
-    // residual. Best-effort post-match insert (see the module doc for
-    // atomicity trade-off notes): the matcher tx already committed
-    // the order + fills, and this insert happens outside that tx.
-    // Failure logs `warn!` and does not surface as an order-submission
-    // error — the order remains accepted (no accounting corruption
-    // possible because no downstream code currently reads
-    // `option_reservations` as an authoritative gate). A future
-    // atomicity milestone will move this INSIDE the matcher tx by
-    // extending `submit_option_order_and_match`'s signature. The
-    // ledger, formulas, and available-collateral algorithm are all
-    // in place; this call site is the on/off switch.
-    reserve_open_order_risk_if_resting(state, &order, now).await;
     create_option_orderbook_execution_intents(state, &fills).await?;
     crate::fees::service::record_option_order_fills(state, &fills).await?;
     // ATTACHED-TP-SL-ON-ENTRY-V1 — after the parent + fills are
@@ -3984,24 +3982,18 @@ async fn update_option_execution_intent_status(
 // gating failure — matched intent creation and broadcast still
 // proceed. See the Package E notes in the milestone doc for the
 // atomicity trade-off (post-match insert vs matcher-tx insert).
-async fn reserve_open_order_risk_if_resting(
+// OPTIONS-HYBRID-V2-MATCH-PENDING-AND-CANONICAL-SETTLEMENT-CLOSURE-V1
+// Part B — build the reservation plan the matcher tx uses to insert
+// OPEN_ORDER + PENDING_SETTLEMENT rows atomically with the order and
+// fills. Returns `None` to fall back to the legacy no-reservation
+// matcher path (in-memory / legacy / missing metadata).
+async fn build_matcher_reservation_plan(
     state: &AppState,
     order: &OptionOrder,
     now: TimestampMs,
-) {
-    let Some(repository) = state.repository.as_ref() else {
-        // In-memory path — reservation ledger is PG-only. Skip.
-        return;
-    };
-    if order.remaining_size_1e8 == 0 {
-        // Fully filled at match — nothing left to reserve.
-        return;
-    }
-    let Some(canonical_order_hash) = order.canonical_order_hash.clone() else {
-        // Legacy order without canonical identity — skip.
-        return;
-    };
-    // Series metadata to derive the formula inputs + collateral token.
+) -> Option<MatcherReservationPlan> {
+    state.repository.as_ref()?;
+    let canonical_order_hash = order.canonical_order_hash.clone()?;
     let series = match get_option_series(state, &order.option_series_id).await {
         Ok(s) => s,
         Err(err) => {
@@ -4009,30 +4001,21 @@ async fn reserve_open_order_risk_if_resting(
                 target: "option_reservation",
                 order_id = %order.order_id,
                 error = %err,
-                "reserve_open_order_risk_if_resting: series lookup failed; skipping"
+                "build_matcher_reservation_plan: series lookup failed; skipping reservations"
             );
-            return;
+            return None;
         }
     };
-    let (side_enum, reservation_side, collateral_token, reserved_amount) =
-        match derive_reservation_inputs(&series, order) {
-            Some(v) => v,
-            None => {
-                warn!(
-                    target: "option_reservation",
-                    order_id = %order.order_id,
-                    "reserve_open_order_risk_if_resting: could not derive reservation inputs; skipping"
-                );
-                return;
-            }
-        };
-    let _ = side_enum;
+    let (reservation_side, collateral_token, reserved_amount) =
+        derive_taker_reservation_inputs(&series, order)?;
     let domain = crate::options::canonical_identity::OptionsCanonicalDomain::from_options_config(
         &state.options_config,
     );
-    let input = OpenOrderReservationInput {
-        deployment_id: domain.deployment_id,
-        chain_id: i64::try_from(domain.chain_id).unwrap_or(i64::MAX),
+    let deployment_id = domain.deployment_id;
+    let chain_id = i64::try_from(domain.chain_id).unwrap_or(i64::MAX);
+    let taker_open_order = Some(OpenOrderReservationInput {
+        deployment_id,
+        chain_id,
         owner: order.account.0.clone(),
         subaccount_id: i32::try_from(order.subaccount_id).unwrap_or(1),
         collateral_token,
@@ -4040,16 +4023,57 @@ async fn reserve_open_order_risk_if_resting(
         option_series_id: order.option_series_id.clone(),
         side: reservation_side,
         reserved_amount: reserved_amount.to_string(),
-        quantity_1e8: order.remaining_size_1e8.to_string(),
+        quantity_1e8: order.size_1e8.to_string(),
         now_ms: now as i64,
+    });
+    // For calls seller posts underlying (physical). For puts seller
+    // posts settlement asset (cash-collateralised). Buyer always posts
+    // settlement asset (premium obligation).
+    let seller_collateral_token = if series.is_call {
+        series.underlying.clone()
+    } else {
+        series.settlement_asset.clone()
     };
-    if let Err(err) = insert_open_order_reservation(repository.pool(), &input).await {
-        warn!(
-            target: "option_reservation",
-            order_id = %order.order_id,
-            error = %err,
-            "reserve_open_order_risk_if_resting: insert failed; order accepted without reservation"
-        );
+    let pending_scaffold = Some(PendingSettlementScaffold {
+        deployment_id,
+        chain_id,
+        buyer_collateral_token: series.settlement_asset.clone(),
+        seller_collateral_token,
+        option_series_id: series.option_series_id.clone(),
+        contract_size_1e8: series.contract_size_1e8,
+        is_call: series.is_call,
+        strike_1e8: series.strike_1e8,
+    });
+    Some(MatcherReservationPlan {
+        taker_open_order,
+        pending_scaffold,
+    })
+}
+
+fn derive_taker_reservation_inputs(
+    series: &OptionSeries,
+    order: &OptionOrder,
+) -> Option<(OptionReservationSide, String, u128)> {
+    let quantity = order.size_1e8;
+    let contract_size = series.contract_size_1e8;
+    let premium = order.price_1e8;
+    let strike = series.strike_1e8;
+    match order.side {
+        Side::Buy => Some((
+            OptionReservationSide::Buy,
+            series.settlement_asset.clone(),
+            buy_reservation(quantity, contract_size, premium).ok()?,
+        )),
+        Side::Sell if series.is_call => Some((
+            OptionReservationSide::Sell,
+            series.underlying.clone(),
+            short_call_reservation_physical(quantity, contract_size).ok()?,
+        )),
+        Side::Sell => Some((
+            OptionReservationSide::Sell,
+            series.settlement_asset.clone(),
+            short_put_reservation(quantity, contract_size, strike).ok()?,
+        )),
     }
 }
 
@@ -4085,40 +4109,6 @@ async fn release_open_order_reservation_for(
 /// inputs are inconsistent (e.g. zero contract size) so the caller
 /// can log and skip. Cash-settled short-call semantics defer to the
 /// short-put formula (settlement-asset denominated); physical
-/// short-call semantics use the underlying formula.
-///
-/// This is intentionally simple for the first landing: buy paths use
-/// premium (order price); short-put uses strike; short-call defaults
-/// to physical. A follow-up milestone will thread MarginEngine
-/// required-collateral semantics for cash-settled paths.
-fn derive_reservation_inputs(
-    series: &OptionSeries,
-    order: &OptionOrder,
-) -> Option<(Side, OptionReservationSide, String, u128)> {
-    let quantity = order.remaining_size_1e8;
-    let contract_size = series.contract_size_1e8;
-    let premium = order.price_1e8;
-    let strike = series.strike_1e8;
-    let (reservation_side, token, amount) = match order.side {
-        Side::Buy => (
-            OptionReservationSide::Buy,
-            series.settlement_asset.clone(),
-            buy_reservation(quantity, contract_size, premium).ok()?,
-        ),
-        Side::Sell if series.is_call => (
-            OptionReservationSide::Sell,
-            series.underlying.clone(),
-            short_call_reservation_physical(quantity, contract_size).ok()?,
-        ),
-        Side::Sell => (
-            OptionReservationSide::Sell,
-            series.settlement_asset.clone(),
-            short_put_reservation(quantity, contract_size, strike).ok()?,
-        ),
-    };
-    Some((order.side, reservation_side, token, amount))
-}
-
 async fn insert_option_execution_transaction(
     state: &AppState,
     transaction: OptionExecutionTransaction,

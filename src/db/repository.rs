@@ -2441,10 +2441,46 @@ impl PgRepository {
         .map_err(option_order_insert_error)
     }
 
+    /// OPTIONS-HYBRID-V2-MATCH-PENDING-AND-CANONICAL-SETTLEMENT-CLOSURE-V1
+    /// Part B — atomic match + risk transition.
+    ///
+    /// When `reservation_plan` is `Some`, this method also inserts (all
+    /// inside the same PostgreSQL transaction as the order + fills):
+    ///
+    ///   * The taker's OPEN_ORDER reservation IF the taker leaves any
+    ///     resting residual after the match plan executes.
+    ///   * For each fill leg: one PENDING_SETTLEMENT row for the buyer
+    ///     and one for the seller.
+    ///   * For each maker that is fully consumed by the match: a
+    ///     CONVERTED transition on its ACTIVE OPEN_ORDER reservation.
+    ///
+    /// If ANY of these inserts fail the whole tx rolls back — order,
+    /// fills, and every reservation state change disappear together.
+    /// This closes the pre-existing crash window between
+    /// "match commit" and "OPEN_ORDER reservation insert" that the
+    /// previous milestone flagged as a follow-up.
+    ///
+    /// When `reservation_plan` is `None`, the method preserves the
+    /// legacy behaviour (no reservation writes) so in-memory / legacy
+    /// callers that do not participate in the reservation ledger are
+    /// unchanged.
     pub async fn submit_option_order_and_match(
+        &self,
+        incoming: OptionOrder,
+        updated_at_ms: TimestampMs,
+    ) -> Result<(OptionOrder, Vec<OptionFill>)> {
+        self.submit_option_order_and_match_with_reservations(incoming, updated_at_ms, None)
+            .await
+    }
+
+    /// OPTIONS-HYBRID-V2-MATCH-PENDING-AND-CANONICAL-SETTLEMENT-CLOSURE-V1
+    /// Part B/D — the atomic variant. Callers that participate in the
+    /// off-chain reservation ledger use this entry point.
+    pub async fn submit_option_order_and_match_with_reservations(
         &self,
         mut incoming: OptionOrder,
         updated_at_ms: TimestampMs,
+        reservation_plan: Option<crate::options::reservation_repository::MatcherReservationPlan>,
     ) -> Result<(OptionOrder, Vec<OptionFill>)> {
         let mut tx = self.begin().await?;
 
@@ -2509,6 +2545,10 @@ impl PgRepository {
         let mut maker_by_id: HashMap<_, _> =
             candidates.into_iter().map(|m| (m.order_id, m)).collect();
         let mut fills = Vec::with_capacity(plan.legs.len());
+        // Track which maker rows are fully consumed by the match so
+        // their OPEN_ORDER reservations can be transitioned to
+        // CONVERTED inside this same tx.
+        let mut fully_consumed_maker_hashes: Vec<String> = Vec::new();
         for leg in &plan.legs {
             let Some(maker) = maker_by_id.get_mut(&leg.maker_id) else {
                 return Err(BackendError::Persistence(format!(
@@ -2523,7 +2563,62 @@ impl PgRepository {
             maker.updated_at_ms = updated_at_ms;
             update_option_order_tx(&mut tx, maker).await?;
             insert_option_fill_tx(&mut tx, &fill).await?;
+            if maker.remaining_size_1e8 == 0 {
+                if let Some(hash) = maker.canonical_order_hash.clone() {
+                    fully_consumed_maker_hashes.push(hash);
+                }
+            }
             fills.push(fill);
+        }
+
+        // OPTIONS-HYBRID-V2-MATCH-PENDING-AND-CANONICAL-SETTLEMENT-CLOSURE-V1
+        // Parts B + D — same-tx reservation ledger writes.
+        //
+        // Order matters: taker's OPEN_ORDER reservation goes in first
+        // (only if the taker will REST after the match — no residual
+        // means no need for OPEN_ORDER). Then every fully-consumed
+        // maker's ACTIVE OPEN_ORDER is transitioned to CONVERTED so it
+        // stops contributing to available-collateral deduction. Then
+        // for each fill, two PENDING_SETTLEMENT rows are inserted (one
+        // per counterparty) tied to the fill's canonical_execution_id.
+        // Any failure here rolls the entire match back.
+        if let Some(plan) = reservation_plan {
+            if final_taker.remaining_size_1e8 > 0 {
+                if let Some(taker_input) = plan.taker_open_order.as_ref() {
+                    crate::options::reservation_repository::insert_open_order_reservation_tx(
+                        &mut tx,
+                        taker_input,
+                    )
+                    .await?;
+                }
+            }
+            for maker_hash in &fully_consumed_maker_hashes {
+                // Ignore None (no ACTIVE OPEN_ORDER — legacy maker or
+                // already terminal); only the successful transition
+                // path errors.
+                crate::options::reservation_repository::mark_open_order_converted_tx(
+                    &mut tx,
+                    maker_hash,
+                    updated_at_ms as i64,
+                )
+                .await?;
+            }
+            if let Some(scaffold) = plan.pending_scaffold.as_ref() {
+                for fill in &fills {
+                    let (buyer_input, seller_input) =
+                        scaffold.build_pending_pair(fill, updated_at_ms as i64)?;
+                    crate::options::reservation_repository::insert_pending_settlement_reservation_tx(
+                        &mut tx,
+                        &buyer_input,
+                    )
+                    .await?;
+                    crate::options::reservation_repository::insert_pending_settlement_reservation_tx(
+                        &mut tx,
+                        &seller_input,
+                    )
+                    .await?;
+                }
+            }
         }
 
         tx.commit()

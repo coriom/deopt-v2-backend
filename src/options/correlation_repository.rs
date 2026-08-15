@@ -835,6 +835,55 @@ pub async fn correlate_canonical_option_event(
     Ok(CorrelationReducerOutcome::Promoted(promoted))
 }
 
+/// OPTIONS-HYBRID-V2-MATCH-PENDING-AND-CANONICAL-SETTLEMENT-CLOSURE-V1
+/// Part K — combined canonical event correlation + pending settlement
+/// release.
+///
+/// Runs `correlate_canonical_option_event` first. If the outcome is
+/// `Promoted`, ALSO calls `settle_pending` for the same
+/// `canonical_execution_id` — transitioning every ACTIVE
+/// PENDING_SETTLEMENT row for that execution to `SETTLED`.
+///
+/// Not strictly a single PostgreSQL transaction (each helper opens
+/// its own), but both operations are idempotent under replay:
+///
+///   * A repeat of the same canonical event returns
+///     `AlreadyCorrelated` from the reducer — this wrapper still
+///     invokes `settle_pending` on that path, and `settle_pending` is
+///     a no-op when every PENDING row is already SETTLED (the
+///     UPDATE's WHERE `status = 'ACTIVE'` returns zero rows).
+///   * If the process crashes AFTER correlation promoted but BEFORE
+///     pending settlement, the next replay of the canonical event
+///     re-enters this wrapper, correlation is `AlreadyCorrelated`,
+///     and settle_pending completes the outstanding release.
+///
+/// Returns the reducer outcome plus the list of settled pending rows
+/// (empty for non-Promoted / non-AlreadyCorrelated outcomes and for
+/// executions with no pending rows — e.g. legacy pre-Part-E intents).
+pub async fn correlate_canonical_option_event_and_settle(
+    pool: &PgPool,
+    input: &CanonicalExecutionEventInput<'_>,
+) -> Result<(
+    CorrelationReducerOutcome,
+    Vec<crate::options::reservation_repository::OptionReservation>,
+)> {
+    let outcome = correlate_canonical_option_event(pool, input).await?;
+    let settled = match &outcome {
+        CorrelationReducerOutcome::Promoted(_)
+        | CorrelationReducerOutcome::AlreadyCorrelated(_) => {
+            crate::options::reservation_repository::settle_pending(
+                pool,
+                input.canonical_execution_id,
+                input.now_ms,
+            )
+            .await?
+        }
+        CorrelationReducerOutcome::NoCorrelationForIntent
+        | CorrelationReducerOutcome::Conflict(_) => Vec::new(),
+    };
+    Ok((outcome, settled))
+}
+
 /// OPTIONS-HYBRID-V2-BACKEND-CLOSURE-SPRINT-V1 Part A6 — canonical
 /// branch reorg: the previously-canonical event no longer sits on
 /// the canonical chain. Transitions `CORRELATED_CANONICAL →

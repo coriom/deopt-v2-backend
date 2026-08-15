@@ -161,6 +161,121 @@ pub struct OptionReservation {
     pub updated_at_ms: i64,
 }
 
+/// OPTIONS-HYBRID-V2-MATCH-PENDING-AND-CANONICAL-SETTLEMENT-CLOSURE-V1
+/// Part B/D — carrier for the matcher's atomic risk transition.
+/// Passed to `submit_option_order_and_match_with_reservations`; every
+/// insert happens inside the matcher's PG transaction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MatcherReservationPlan {
+    /// Reservation to insert for the incoming (taker) order — only
+    /// applied when the taker leaves resting residual after match.
+    /// `None` when the caller does not want a taker reservation
+    /// (in-memory path, legacy path, self-attribution, etc.).
+    pub taker_open_order: Option<OpenOrderReservationInput>,
+    /// Scaffold used to build one PENDING_SETTLEMENT row per fill per
+    /// counterparty. `None` skips pending-settlement writes entirely.
+    pub pending_scaffold: Option<PendingSettlementScaffold>,
+}
+
+/// Immutable per-series context used by the matcher tx to compute
+/// PENDING_SETTLEMENT reservation amounts from each fill. The matcher
+/// applies the frozen reservation formulas (`buy_reservation`,
+/// `short_call_reservation_physical`, `short_put_reservation`) with
+/// this scaffold's fields as the constant part of the formula input;
+/// the fill's `size_1e8` and `price_1e8` are the per-fill part.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingSettlementScaffold {
+    pub deployment_id: i64,
+    pub chain_id: i64,
+    /// Collateral token the buyer must post (settlement asset for
+    /// buys — the buyer pays premium).
+    pub buyer_collateral_token: String,
+    /// Collateral token the seller must post — underlying for
+    /// physical short calls, settlement asset for short puts.
+    pub seller_collateral_token: String,
+    pub option_series_id: String,
+    pub contract_size_1e8: u128,
+    pub is_call: bool,
+    /// Strike in 1e8 fixed-point, used by the short-put formula.
+    pub strike_1e8: u128,
+}
+
+impl PendingSettlementScaffold {
+    /// Compute one PENDING_SETTLEMENT input for the buyer + one for
+    /// the seller of the given fill. The buyer's reserved amount is
+    /// the premium obligation `ceil_div(size × contract × price, 1e16)`
+    /// in the buyer's collateral token; the seller's reserved amount
+    /// is the physical short-call amount for calls, else the
+    /// cash-collateralised short-put amount.
+    ///
+    /// Returns `Err` if the fill's canonical_execution_id is missing —
+    /// PENDING_SETTLEMENT is bound to that identity so an unbound fill
+    /// cannot be tracked.
+    pub fn build_pending_pair(
+        &self,
+        fill: &crate::options::OptionFill,
+        now_ms: i64,
+    ) -> Result<(
+        PendingSettlementReservationInput,
+        PendingSettlementReservationInput,
+    )> {
+        let canonical = fill
+            .canonical_execution_id
+            .as_deref()
+            .ok_or_else(|| {
+                BackendError::Persistence(
+                    "PendingSettlementScaffold::build_pending_pair: fill missing canonical_execution_id"
+                        .to_string(),
+                )
+            })?
+            .to_string();
+        let buyer_amount = crate::options::reservation_formulas::buy_reservation(
+            fill.size_1e8,
+            self.contract_size_1e8,
+            fill.price_1e8,
+        )?;
+        let seller_amount = if self.is_call {
+            crate::options::reservation_formulas::short_call_reservation_physical(
+                fill.size_1e8,
+                self.contract_size_1e8,
+            )?
+        } else {
+            crate::options::reservation_formulas::short_put_reservation(
+                fill.size_1e8,
+                self.contract_size_1e8,
+                self.strike_1e8,
+            )?
+        };
+        let buyer_input = PendingSettlementReservationInput {
+            deployment_id: self.deployment_id,
+            chain_id: self.chain_id,
+            owner: fill.buyer.0.clone(),
+            subaccount_id: i32::try_from(fill.buyer_subaccount_id).unwrap_or(1),
+            collateral_token: self.buyer_collateral_token.clone(),
+            canonical_execution_id: canonical.clone(),
+            option_series_id: self.option_series_id.clone(),
+            side: OptionReservationSide::Buy,
+            reserved_amount: buyer_amount.to_string(),
+            quantity_1e8: fill.size_1e8.to_string(),
+            now_ms,
+        };
+        let seller_input = PendingSettlementReservationInput {
+            deployment_id: self.deployment_id,
+            chain_id: self.chain_id,
+            owner: fill.seller.0.clone(),
+            subaccount_id: i32::try_from(fill.seller_subaccount_id).unwrap_or(1),
+            collateral_token: self.seller_collateral_token.clone(),
+            canonical_execution_id: canonical,
+            option_series_id: self.option_series_id.clone(),
+            side: OptionReservationSide::Sell,
+            reserved_amount: seller_amount.to_string(),
+            quantity_1e8: fill.size_1e8.to_string(),
+            now_ms,
+        };
+        Ok((buyer_input, seller_input))
+    }
+}
+
 /// Input for creating an OPEN_ORDER reservation atomically with a new
 /// order.
 #[derive(Clone, Debug, PartialEq, Eq)]
