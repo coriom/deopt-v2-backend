@@ -11,6 +11,8 @@ pub mod lifecycle;
 pub mod multi_leg;
 pub mod multi_leg_service;
 pub mod reconciliation_worker;
+pub mod reservation_formulas;
+pub mod reservation_repository;
 pub mod rfq_operator_packet;
 pub mod series_id;
 pub mod service;
