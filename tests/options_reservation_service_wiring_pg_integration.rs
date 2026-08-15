@@ -30,6 +30,7 @@ use deopt_v2_backend::options::{
     option_product_registry_option_id, OptionOrder, OptionOrderStatus, OptionsConfig,
 };
 use deopt_v2_backend::signing::Eip712Domain;
+use uuid::Uuid;
 use deopt_v2_backend::types::{now_ms, AccountId, Side, TimeInForce};
 
 const URL_ENV: &str = "OPTIONS_ATOMIC_WIRING_PG_URL";
@@ -172,7 +173,7 @@ async fn w01_resting_order_creates_active_open_order_reservation() {
     let Some(state) = require_state().await else {
         return;
     };
-    let series = seed_series(&state, "w01").await;
+    let series = seed_series(&state, &format!("{}-{}", "w01", Uuid::new_v4())).await;
     let account = AccountId::new("0x0000000000000000000000000000000000000001");
     // GTC sell that will REST (no counterparty on the book).
     let submitted = submit_option_order(
@@ -184,7 +185,7 @@ async fn w01_resting_order_creates_active_open_order_reservation() {
             1_000_000_000,
             100_000_000,
             1,
-            "w01-order",
+            &format!("{}-{}", "w01-order", Uuid::new_v4()),
             TimeInForce::Gtc,
         ),
     )
@@ -213,7 +214,7 @@ async fn w02_cancel_releases_open_order_reservation() {
     let Some(state) = require_state().await else {
         return;
     };
-    let series = seed_series(&state, "w02").await;
+    let series = seed_series(&state, &format!("{}-{}", "w02", Uuid::new_v4())).await;
     let account = AccountId::new("0x0000000000000000000000000000000000000002");
     let submitted = submit_option_order(
         &state,
@@ -224,7 +225,7 @@ async fn w02_cancel_releases_open_order_reservation() {
             1_000_000_000,
             100_000_000,
             2,
-            "w02-order",
+            &format!("{}-{}", "w02-order", Uuid::new_v4()),
             TimeInForce::Gtc,
         ),
     )
@@ -258,7 +259,7 @@ async fn w03_fully_matched_ioc_creates_no_open_order_reservation() {
     let Some(state) = require_state().await else {
         return;
     };
-    let series = seed_series(&state, "w03").await;
+    let series = seed_series(&state, &format!("{}-{}", "w03", Uuid::new_v4())).await;
     let maker = AccountId::new("0x0000000000000000000000000000000000000003");
     let taker = AccountId::new("0x0000000000000000000000000000000000000004");
     // Resting sell.
@@ -271,7 +272,7 @@ async fn w03_fully_matched_ioc_creates_no_open_order_reservation() {
             1_000_000_000,
             100_000_000,
             3,
-            "w03-maker",
+            &format!("{}-{}", "w03-maker", Uuid::new_v4()),
             TimeInForce::Gtc,
         ),
     )
@@ -287,7 +288,7 @@ async fn w03_fully_matched_ioc_creates_no_open_order_reservation() {
             1_000_000_000,
             100_000_000,
             4,
-            "w03-taker",
+            &format!("{}-{}", "w03-taker", Uuid::new_v4()),
             TimeInForce::Ioc,
         ),
     )
