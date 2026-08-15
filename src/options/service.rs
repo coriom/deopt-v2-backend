@@ -6,6 +6,10 @@ use super::broadcast_policy_data::{
     BroadcastPolicyDataProvider, BroadcastPolicyInputs, LiveBroadcastPolicyDataProvider,
     StubBroadcastPolicyDataProvider,
 };
+use super::canonical_identity::OptionsCanonicalDomain;
+use super::correlation_repository::{
+    attach_tx_hash as correlation_attach_tx_hash, AwaitingCorrelationInput, OptionExecutionKind,
+};
 use super::series_id::{option_series_id, OptionSeriesIdInput};
 use super::signing::{
     option_rfq_id_to_b256, option_rfq_quote_digest, option_rfq_quote_digest_bytes,
@@ -3027,12 +3031,44 @@ where
     let transaction = option_execution_transaction_from_request(
         &request,
         from,
-        Some(tx_hash),
+        Some(tx_hash.clone()),
         None,
         now,
         Some(&gas_check),
     );
     let transaction = insert_option_execution_transaction(state, transaction).await?;
+    // OPTIONS-HYBRID-V2-CORRELATION-ATOMIC-WIRING-V1 Part H — attach
+    // the authoritative tx_hash from the just-executed
+    // `send_raw_transaction` to the pre-chain correlation row. The
+    // backend relayer path is the trust boundary — the RPC provider's
+    // reply is the authoritative first observation of the tx_hash. If
+    // the intent has no canonical_execution_id (legacy pre-wiring or
+    // user-initiated quote flow) the correlation row does not exist
+    // and there is nothing to attach; skip silently.
+    if let (Some(canonical_id), Some(repository)) = (
+        intent.canonical_execution_id.as_deref(),
+        state.repository.as_ref(),
+    ) {
+        if let Err(err) =
+            correlation_attach_tx_hash(repository.pool(), canonical_id, &tx_hash, now).await
+        {
+            // Correlation attachment failing after a successful RPC
+            // submission is a soft error: the tx is live on chain and
+            // the operator must reconcile. We log at warn and fall
+            // through to return the successful broadcast outcome so
+            // the caller sees the tx_hash. The reducer's canonical
+            // event ingestion (F4) will still bind the tx via
+            // `(tx_hash, log_index)` on the AWAITING row.
+            warn!(
+                target: "option_execution_correlation",
+                intent_id = %intent_id,
+                canonical_execution_id = %canonical_id,
+                tx_hash = %tx_hash,
+                error = %err,
+                "attach_tx_hash post-broadcast failed; correlation row remains AWAITING_CHAIN_EVIDENCE"
+            );
+        }
+    }
     let updated_intent = update_option_execution_intent_status(
         state,
         intent_id,
@@ -3516,9 +3552,28 @@ where
         // so the persisted intent references its economic origin.
         fill.canonical_execution_id.clone(),
     )?;
-    insert_option_execution_intent(state, intent)
-        .await
-        .map(Some)
+    // OPTIONS-HYBRID-V2-CORRELATION-ATOMIC-WIRING-V1 Part E — when
+    // the intent carries a canonical execution identity (matcher
+    // fill with both order-side hashes present), persist the intent
+    // AND its `AWAITING_CHAIN_EVIDENCE` correlation atomically. For
+    // legacy fills without a canonical id we keep the previous
+    // intent-only path so pre-wiring counterparties still get an
+    // intent (correlation is only meaningful when the identity chain
+    // is complete).
+    let persisted = match intent.canonical_execution_id.clone() {
+        Some(canonical_id) => {
+            let corr_input = build_awaiting_correlation_input(
+                state,
+                &canonical_id,
+                OptionExecutionSourceType::OptionOrderbookFill,
+                fill.size_1e8,
+            );
+            insert_option_execution_intent_with_awaiting_correlation(state, intent, corr_input)
+                .await?
+        }
+        None => insert_option_execution_intent(state, intent).await?,
+    };
+    Ok(Some(persisted))
 }
 
 pub async fn create_option_rfq_execution_intent(
@@ -3683,6 +3738,78 @@ async fn insert_option_execution_intent(
         .lock()
         .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?
         .insert_option_execution_intent(intent))
+}
+
+/// OPTIONS-HYBRID-V2-CORRELATION-ATOMIC-WIRING-V1 Part E — atomic
+/// intent + AWAITING correlation persistence path used by every
+/// canonical matcher-derived execution-intent creation flow. On
+/// production (PG-backed) the insert pair is committed in a single
+/// transaction so the invariant `NEW canonical execution intent
+/// implies pre-chain correlation` never observes a half-state. In
+/// the in-memory `options_store` used by unit tests the store is
+/// mutated under a single lock, giving the same all-or-nothing
+/// semantics for the intent (correlation is a PG-only concept).
+async fn insert_option_execution_intent_with_awaiting_correlation(
+    state: &AppState,
+    intent: OptionExecutionIntent,
+    corr_input: AwaitingCorrelationInput,
+) -> Result<OptionExecutionIntent> {
+    if let Some(repository) = state.repository.clone() {
+        let (intent, _correlation) = repository
+            .insert_option_execution_intent_with_awaiting_correlation(&intent, &corr_input)
+            .await?;
+        return Ok(intent);
+    }
+    // In-memory fallback: correlation table is PG-only, so we degrade
+    // to the intent-only insert. Callers that require the correlation
+    // row (production hot path) always run with a repository present.
+    Ok(state
+        .options_store
+        .lock()
+        .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?
+        .insert_option_execution_intent(intent))
+}
+
+/// Build the pre-chain fingerprint that populates the AWAITING
+/// correlation row. Only fields known BEFORE the transaction is mined
+/// are populated:
+///   * `canonical_execution_id` — backend economic identity
+///   * `deployment_id`, `chain_id` — canonical domain scope
+///   * `execution_kind` — mapped from source_type (Trade | RfqTrade)
+///   * `fill_quantity_1e8` — the fill quantity that will settle on chain
+///
+/// Post-mining fields (`onchain_execution_id`, `tx_hash`,
+/// `canonical_block_number`, `canonical_block_hash`, `log_index`) are
+/// left NULL — the reducer populates them when the canonical event
+/// lands (F4 milestone).
+///
+/// Pre-chain envelope digests (`onchain_buyer_order_id` /
+/// `onchain_seller_order_id`) are left NULL for this milestone: the
+/// production execution surface today is the legacy
+/// `OptionMatchingEngine.executeTrade` path which emits
+/// `OptionTradeExecuted` (no envelope digest topics). The reducer
+/// binds via `(tx_hash, log_index)` (Part C uniqueness proof).
+fn build_awaiting_correlation_input(
+    state: &AppState,
+    canonical_execution_id: &str,
+    source_type: OptionExecutionSourceType,
+    fill_quantity_1e8: Size1e8,
+) -> AwaitingCorrelationInput {
+    let domain = OptionsCanonicalDomain::from_options_config(&state.options_config);
+    let execution_kind = match source_type {
+        OptionExecutionSourceType::OptionOrderbookFill => OptionExecutionKind::Trade,
+        OptionExecutionSourceType::OptionRfqFill => OptionExecutionKind::RfqTrade,
+    };
+    AwaitingCorrelationInput {
+        canonical_execution_id: canonical_execution_id.to_string(),
+        deployment_id: domain.deployment_id,
+        chain_id: i64::try_from(domain.chain_id).unwrap_or(i64::MAX),
+        execution_kind,
+        onchain_buyer_order_id: None,
+        onchain_seller_order_id: None,
+        fill_quantity_1e8: Some(fill_quantity_1e8.to_string()),
+        now_ms: now_ms() as i64,
+    }
 }
 
 async fn persist_option_execution_simulation_result(
