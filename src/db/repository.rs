@@ -2549,6 +2549,16 @@ impl PgRepository {
         // their OPEN_ORDER reservations can be transitioned to
         // CONVERTED inside this same tx.
         let mut fully_consumed_maker_hashes: Vec<String> = Vec::new();
+        // OPTIONS-HYBRID-V2-ECONOMIC-RUNTIME-FINAL-CLOSURE-V1 Part C —
+        // maker snapshots for the partial-fill resize path. Keyed by
+        // maker_id so multiple legs against the same maker collapse to
+        // the LAST snapshot (which reflects the final residual). A
+        // maker that transitions to zero residual on a later leg is
+        // removed from this map and instead recorded as fully consumed.
+        let mut partially_consumed_makers: HashMap<
+            crate::types::OrderId,
+            crate::options::OptionOrder,
+        > = HashMap::new();
         for leg in &plan.legs {
             let Some(maker) = maker_by_id.get_mut(&leg.maker_id) else {
                 return Err(BackendError::Persistence(format!(
@@ -2563,10 +2573,15 @@ impl PgRepository {
             maker.updated_at_ms = updated_at_ms;
             update_option_order_tx(&mut tx, maker).await?;
             insert_option_fill_tx(&mut tx, &fill).await?;
+            // Refresh the maker's classification: a later leg may
+            // move a maker from partial to fully-consumed.
+            partially_consumed_makers.remove(&maker.order_id);
             if maker.remaining_size_1e8 == 0 {
                 if let Some(hash) = maker.canonical_order_hash.clone() {
                     fully_consumed_maker_hashes.push(hash);
                 }
+            } else {
+                partially_consumed_makers.insert(maker.order_id, maker.clone());
             }
             fills.push(fill);
         }
@@ -2602,6 +2617,26 @@ impl PgRepository {
                     updated_at_ms as i64,
                 )
                 .await?;
+            }
+            // OPTIONS-HYBRID-V2-ECONOMIC-RUNTIME-FINAL-CLOSURE-V1
+            // Part C — resize partially-consumed makers to their
+            // deterministic residual reserved_amount. The scaffold
+            // carries series contract-size / is_call / strike + the
+            // per-side collateral tokens; the maker's own order row
+            // supplies price, side, owner, subaccount, hash.
+            if let Some(scaffold) = plan.pending_scaffold.as_ref() {
+                for maker in partially_consumed_makers.values() {
+                    let residual_input = scaffold
+                        .build_maker_residual_open_order_input(maker, updated_at_ms as i64)?;
+                    let hash = residual_input.canonical_order_hash.clone();
+                    crate::options::reservation_repository::resize_open_order_on_partial_fill_tx(
+                        &mut tx,
+                        &hash,
+                        &residual_input,
+                        updated_at_ms as i64,
+                    )
+                    .await?;
+                }
             }
             if let Some(scaffold) = plan.pending_scaffold.as_ref() {
                 for fill in &fills {

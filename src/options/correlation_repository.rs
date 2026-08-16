@@ -900,6 +900,47 @@ pub async fn reorg_orphan_canonical_correlation(
     mark_orphaned(pool, canonical_execution_id, &terminal, now_ms).await
 }
 
+/// OPTIONS-HYBRID-V2-ECONOMIC-RUNTIME-FINAL-CLOSURE-V1 Part N —
+/// combined orphan + reservation reactivation.
+///
+/// When a canonical settlement is orphaned by a chain reorg, the
+/// SETTLED PENDING_SETTLEMENT rows for that execution must be
+/// re-protected: the on-chain settlement is no longer authoritative
+/// and the buyer/seller obligation is once again outstanding. This
+/// wrapper:
+///   1. Transitions the correlation `CORRELATED_CANONICAL → ORPHANED`
+///      (delegates to `reorg_orphan_canonical_correlation`).
+///   2. Invokes `reorg_reactivate_pending` to append-only insert
+///      successor ACTIVE PENDING_SETTLEMENT rows for the same
+///      canonical_execution_id, preserving the SETTLED audit rows.
+///
+/// Not single-tx, but replay-safe by construction:
+///   * Orphan is idempotent (mark_orphaned WHERE
+///     correlation_status='CORRELATED_CANONICAL' returns unchanged row
+///     on repeat).
+///   * Reactivate is idempotent (skips tuples with an existing ACTIVE
+///     successor).
+/// A crash between orphan and reactivate is recovered by the next
+/// reorg-event replay — the successor holds are still absent, so
+/// reactivate inserts them.
+pub async fn reorg_orphan_canonical_correlation_and_reactivate(
+    pool: &PgPool,
+    canonical_execution_id: &str,
+    now_ms: i64,
+) -> Result<(
+    OptionExecutionCorrelation,
+    Vec<crate::options::reservation_repository::OptionReservation>,
+)> {
+    let orphaned = reorg_orphan_canonical_correlation(pool, canonical_execution_id, now_ms).await?;
+    let successors = crate::options::reservation_repository::reorg_reactivate_pending(
+        pool,
+        canonical_execution_id,
+        now_ms,
+    )
+    .await?;
+    Ok((orphaned, successors))
+}
+
 /// Idempotent upsert-in-transaction variant. Used by the atomic
 /// intent+correlation writer so a duplicated service invocation
 /// (client retry, request de-duplication race) never fails on the

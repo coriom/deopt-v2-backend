@@ -30,8 +30,8 @@ use deopt_v2_backend::options::{
     option_product_registry_option_id, OptionOrder, OptionOrderStatus, OptionsConfig,
 };
 use deopt_v2_backend::signing::Eip712Domain;
-use uuid::Uuid;
 use deopt_v2_backend::types::{now_ms, AccountId, Side, TimeInForce};
+use uuid::Uuid;
 
 const URL_ENV: &str = "OPTIONS_ATOMIC_WIRING_PG_URL";
 const SKIP_ENV: &str = "OPTIONS_ATOMIC_WIRING_PG_ALLOW_SKIP";

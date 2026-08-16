@@ -274,6 +274,69 @@ impl PendingSettlementScaffold {
         };
         Ok((buyer_input, seller_input))
     }
+
+    /// OPTIONS-HYBRID-V2-ECONOMIC-RUNTIME-FINAL-CLOSURE-V1 Part C —
+    /// derive the residual OPEN_ORDER reservation input for a maker
+    /// that was PARTIALLY consumed by a matcher pass. Called by the
+    /// matcher tx alongside `resize_open_order_on_partial_fill_tx` to
+    /// keep the maker's ACTIVE reserved_amount aligned with the current
+    /// residual quantity (no perpetual over-lock).
+    ///
+    /// Returns `Err` when the maker lacks a canonical_order_hash — a
+    /// pre-canonical-identity order cannot be tracked in the reservation
+    /// ledger.
+    pub fn build_maker_residual_open_order_input(
+        &self,
+        maker: &crate::options::OptionOrder,
+        now_ms: i64,
+    ) -> Result<OpenOrderReservationInput> {
+        use crate::options::reservation_formulas::{
+            buy_reservation, short_call_reservation_physical, short_put_reservation,
+        };
+        use crate::types::Side;
+        let canonical_order_hash = maker.canonical_order_hash.clone().ok_or_else(|| {
+            BackendError::Persistence(
+                "build_maker_residual_open_order_input: maker missing canonical_order_hash"
+                    .to_string(),
+            )
+        })?;
+        let residual = maker.remaining_size_1e8;
+        if residual == 0 {
+            return Err(BackendError::Persistence(
+                "build_maker_residual_open_order_input: maker has zero residual".to_string(),
+            ));
+        }
+        let (reservation_side, collateral_token, reserved_amount) = match maker.side {
+            Side::Buy => (
+                OptionReservationSide::Buy,
+                self.buyer_collateral_token.clone(),
+                buy_reservation(residual, self.contract_size_1e8, maker.price_1e8)?,
+            ),
+            Side::Sell if self.is_call => (
+                OptionReservationSide::Sell,
+                self.seller_collateral_token.clone(),
+                short_call_reservation_physical(residual, self.contract_size_1e8)?,
+            ),
+            Side::Sell => (
+                OptionReservationSide::Sell,
+                self.seller_collateral_token.clone(),
+                short_put_reservation(residual, self.contract_size_1e8, self.strike_1e8)?,
+            ),
+        };
+        Ok(OpenOrderReservationInput {
+            deployment_id: self.deployment_id,
+            chain_id: self.chain_id,
+            owner: maker.account.0.clone(),
+            subaccount_id: i32::try_from(maker.subaccount_id).unwrap_or(1),
+            collateral_token,
+            canonical_order_hash,
+            option_series_id: self.option_series_id.clone(),
+            side: reservation_side,
+            reserved_amount: reserved_amount.to_string(),
+            quantity_1e8: residual.to_string(),
+            now_ms,
+        })
+    }
 }
 
 /// Input for creating an OPEN_ORDER reservation atomically with a new
@@ -586,6 +649,58 @@ pub async fn mark_open_order_converted_tx(
     row.map(reservation_from_row).transpose()
 }
 
+/// OPTIONS-HYBRID-V2-ECONOMIC-RUNTIME-FINAL-CLOSURE-V1 Part C —
+/// resize an ACTIVE OPEN_ORDER after a PARTIAL fill.
+///
+/// The old ACTIVE row is transitioned to `CONVERTED` with the
+/// distinct terminal reason `PARTIAL_FILL_RESIZED` (audit-preserving,
+/// distinguishable from the full-consume `MATCHED_TO_PENDING_SETTLEMENT`
+/// path). A successor ACTIVE OPEN_ORDER row is then inserted for the
+/// residual quantity — sharing the same `canonical_order_hash` — using
+/// the reservation formulas applied to the residual `size_1e8`.
+///
+/// The sparse UNIQUE index `WHERE status='ACTIVE' AND purpose='OPEN_ORDER'`
+/// is satisfied because the UPDATE moves the previous row out of the
+/// index scope before the INSERT statement runs.
+///
+/// If no ACTIVE OPEN_ORDER row is found for the given
+/// `canonical_order_hash`, both slots of the tuple are `None` and NO
+/// successor is inserted — a maker that predates the reservation
+/// ledger must not receive a phantom hold with no original allocation.
+pub async fn resize_open_order_on_partial_fill_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    canonical_order_hash: &str,
+    residual_input: &OpenOrderReservationInput,
+    now_ms: i64,
+) -> Result<(Option<OptionReservation>, Option<OptionReservation>)> {
+    debug_assert_eq!(
+        canonical_order_hash, residual_input.canonical_order_hash,
+        "residual_input.canonical_order_hash must match target"
+    );
+    let converted = sqlx::query(&format!(
+        "UPDATE option_reservations
+         SET status = 'CONVERTED',
+             terminal_reason = 'PARTIAL_FILL_RESIZED',
+             updated_at_ms = $2
+         WHERE canonical_order_hash = $1
+           AND status = 'ACTIVE'
+           AND purpose = 'OPEN_ORDER'
+         RETURNING {SELECT_COLUMNS}"
+    ))
+    .bind(canonical_order_hash)
+    .bind(now_ms)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|e| BackendError::Persistence(e.to_string()))?
+    .map(reservation_from_row)
+    .transpose()?;
+    if converted.is_none() {
+        return Ok((None, None));
+    }
+    let successor = insert_open_order_reservation_tx(tx, residual_input).await?;
+    Ok((converted, Some(successor)))
+}
+
 /// PENDING_SETTLEMENT → SETTLED. Called by the canonical event
 /// reducer's `Promoted` outcome to release the exposure after
 /// on-chain settlement.
@@ -623,6 +738,101 @@ pub async fn settle_pending(
         .await
         .map_err(|e| BackendError::Persistence(e.to_string()))?;
     let rows = settle_pending_tx(&mut tx, canonical_execution_id, now_ms).await?;
+    tx.commit()
+        .await
+        .map_err(|e| BackendError::Persistence(e.to_string()))?;
+    Ok(rows)
+}
+
+/// OPTIONS-HYBRID-V2-ECONOMIC-RUNTIME-FINAL-CLOSURE-V1 Part N —
+/// reactivate PENDING_SETTLEMENT exposure after a canonical settlement
+/// reorg orphans the on-chain evidence. For every SETTLED row bound to
+/// `canonical_execution_id`, insert an append-only successor ACTIVE
+/// PENDING_SETTLEMENT row that shares the same scope + reserved_amount
+/// + quantity + canonical_execution_id. The original SETTLED row is
+/// left in place as audit evidence of the (now-orphaned) settlement.
+///
+/// Idempotent under replay: if a successor ACTIVE row already exists
+/// for a given `(canonical_execution_id, owner, subaccount_id,
+/// collateral_token)` tuple, that tuple is skipped and the existing
+/// ACTIVE row is included in the returned list.
+///
+/// Safety invariant: the successor row is inserted as ACTIVE even when
+/// the owner may not have enough canonical collateral to cover the
+/// hold. Available-collateral read paths fail closed on the resulting
+/// deficit (underflow → error), surfacing the discrepancy for operator
+/// escalation via `mark_manual_review_tx`. Never returns without a
+/// successor row when SETTLED input rows exist — under-locking after
+/// reorg is prohibited.
+pub async fn reorg_reactivate_pending_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    canonical_execution_id: &str,
+    now_ms: i64,
+) -> Result<Vec<OptionReservation>> {
+    let settled_rows = sqlx::query(&format!(
+        "SELECT {SELECT_COLUMNS} FROM option_reservations
+         WHERE canonical_execution_id = $1
+           AND status = 'SETTLED'
+           AND purpose = 'PENDING_SETTLEMENT'"
+    ))
+    .bind(canonical_execution_id)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(|e| BackendError::Persistence(e.to_string()))?;
+    let mut successors = Vec::with_capacity(settled_rows.len());
+    for row in settled_rows {
+        let old = reservation_from_row(row)?;
+        let existing_active = sqlx::query(&format!(
+            "SELECT {SELECT_COLUMNS} FROM option_reservations
+             WHERE canonical_execution_id = $1
+               AND owner = $2
+               AND subaccount_id = $3
+               AND collateral_token = $4
+               AND purpose = 'PENDING_SETTLEMENT'
+               AND status = 'ACTIVE'
+             LIMIT 1"
+        ))
+        .bind(canonical_execution_id)
+        .bind(&old.owner)
+        .bind(old.subaccount_id)
+        .bind(&old.collateral_token)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|e| BackendError::Persistence(e.to_string()))?;
+        if let Some(active_row) = existing_active {
+            successors.push(reservation_from_row(active_row)?);
+            continue;
+        }
+        let successor_input = PendingSettlementReservationInput {
+            deployment_id: old.deployment_id,
+            chain_id: old.chain_id,
+            owner: old.owner.clone(),
+            subaccount_id: old.subaccount_id,
+            collateral_token: old.collateral_token.clone(),
+            canonical_execution_id: canonical_execution_id.to_string(),
+            option_series_id: old.option_series_id.clone(),
+            side: old.side,
+            reserved_amount: old.reserved_amount.clone(),
+            quantity_1e8: old.quantity_1e8.clone(),
+            now_ms,
+        };
+        let new_active = insert_pending_settlement_reservation_tx(tx, &successor_input).await?;
+        successors.push(new_active);
+    }
+    Ok(successors)
+}
+
+/// Pool-level convenience for reorg reactivation.
+pub async fn reorg_reactivate_pending(
+    pool: &PgPool,
+    canonical_execution_id: &str,
+    now_ms: i64,
+) -> Result<Vec<OptionReservation>> {
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| BackendError::Persistence(e.to_string()))?;
+    let rows = reorg_reactivate_pending_tx(&mut tx, canonical_execution_id, now_ms).await?;
     tx.commit()
         .await
         .map_err(|e| BackendError::Persistence(e.to_string()))?;
