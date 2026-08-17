@@ -2598,7 +2598,14 @@ impl PgRepository {
         // per counterparty) tied to the fill's canonical_execution_id.
         // Any failure here rolls the entire match back.
         if let Some(plan) = reservation_plan {
-            if final_taker.remaining_size_1e8 > 0 {
+            // OPTIONS-HYBRID-V2-MATCH-SETTLEMENT-EXHAUSTIVE-COVERAGE-V1
+            // Part D — an IOC or FOK order can leave residual quantity
+            // without actually resting (status → Cancelled). Only
+            // insert the OPEN_ORDER reservation when the order truly
+            // rests on the book, i.e. status is live (Open / partially
+            // filled). Otherwise the residual is discarded per TIF
+            // semantics and must not book collateral.
+            if final_taker.remaining_size_1e8 > 0 && final_taker.status.is_live() {
                 if let Some(taker_input) = plan.taker_open_order.as_ref() {
                     crate::options::reservation_repository::insert_open_order_reservation_tx(
                         &mut tx,
