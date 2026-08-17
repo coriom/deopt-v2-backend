@@ -611,8 +611,25 @@ async fn handle_auth_verify(
 
     // Success: bind the session to the canonical lower-cased form so
     // every downstream auth check uses an identical string.
+    //
+    // OPTIONS-HYBRID-V2-BACKEND-FINAL-CLOSURE-V1 Part M — if a session
+    // rebinds to a different address, its existing subscriptions
+    // become stale. Clear them so the client must re-subscribe under
+    // the new identity. Data leakage was already prevented by the
+    // two-gate filter in `handler.rs::forward_lifecycle_event`; this
+    // is defense-in-depth against UI-side confusion when a session's
+    // wallet identity changes.
     let bound_address = recovered.0.to_ascii_lowercase();
-    session.account = Some(AccountId::new(bound_address.clone()));
+    let new_account = AccountId::new(bound_address.clone());
+    let identity_changed = session
+        .account
+        .as_ref()
+        .map(|prev| !prev.0.eq_ignore_ascii_case(&new_account.0))
+        .unwrap_or(false);
+    session.account = Some(new_account);
+    if identity_changed {
+        session.subscriptions.clear();
+    }
 
     DispatchOutcome {
         response: ServerResponse::ok(
