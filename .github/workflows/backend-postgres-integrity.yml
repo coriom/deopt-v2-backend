@@ -33,6 +33,19 @@ on:
       - "tests/hybrid_v2_broadcast_live_wiring_app_restart_pg_integration.rs"
       - "tests/hybrid_v2_broadcast_live_wiring_matrix_pg_integration.rs"
       - "tests/hybrid_v2_broadcast_live_wiring_properties.rs"
+      - "src/options/**"
+      - "tests/options_hybrid_v2_atomic_wiring_pg_integration.rs"
+      - "tests/options_hybrid_v2_atomic_wiring_properties.rs"
+      - "tests/options_hybrid_v2_canonical_event_reducer_pg_integration.rs"
+      - "tests/options_hybrid_v2_correlation_repository_pg_integration.rs"
+      - "tests/options_hybrid_v2_prebroadcast_tx_identity_pg_integration.rs"
+      - "tests/options_reservation_ledger_pg_integration.rs"
+      - "tests/options_reservation_service_wiring_pg_integration.rs"
+      - "tests/options_match_pending_settlement_pg_integration.rs"
+      - "tests/options_economic_runtime_final_closure_pg_integration.rs"
+      - "tests/options_exhaustive_coverage_pg_integration.rs"
+      - "tests/options_economic_runtime_final_validation_pg_integration.rs"
+      - "tests/options_economic_runtime_properties.rs"
       - ".github/workflows/backend-postgres-integrity.yml"
   push:
     branches:
@@ -321,3 +334,39 @@ EOF
             cargo test --features test-signer --test "$suite" -- --test-threads=1
           done
           echo "PRODUCTION_SIGNER_STARTUP_CI_GATE_VALIDATED"
+
+      - name: Run OPTIONS-HYBRID-V2 economic runtime PG suites
+        env:
+          OPTIONS_ATOMIC_WIRING_PG_URL: postgres://deopt_ci:disposable_ci_pw@127.0.0.1:5432/deopt_hybrid_v2_disposable_ci
+        run: |
+          cd deopt-v2-backend || cd .
+          # OPTIONS-HYBRID-V2-ECONOMIC-RUNTIME-FINAL-VALIDATION-V1 CI
+          # gate. Every options economic-runtime PG suite runs against
+          # the disposable PostgreSQL 16 instance with a schema reset
+          # between suites so tests observe no residual rows. Loud-fail
+          # on missing PG (`OPTIONS_ATOMIC_WIRING_PG_URL` unset). No
+          # public-chain traffic; no real KMS. Order matters: reservation
+          # ledger + service wiring + atomic wiring first, then matcher
+          # + settlement + reducer, then exhaustive coverage + final
+          # closure + final validation + bounded properties.
+          for suite in \
+              options_reservation_ledger_pg_integration \
+              options_reservation_service_wiring_pg_integration \
+              options_hybrid_v2_atomic_wiring_pg_integration \
+              options_hybrid_v2_atomic_wiring_properties \
+              options_hybrid_v2_prebroadcast_tx_identity_pg_integration \
+              options_hybrid_v2_correlation_repository_pg_integration \
+              options_hybrid_v2_canonical_event_reducer_pg_integration \
+              options_match_pending_settlement_pg_integration \
+              options_economic_runtime_final_closure_pg_integration \
+              options_exhaustive_coverage_pg_integration \
+              options_economic_runtime_final_validation_pg_integration \
+              options_economic_runtime_properties; do
+            PGPASSWORD=disposable_ci_pw psql -h 127.0.0.1 -U deopt_ci -d deopt_hybrid_v2_disposable_ci <<'EOF' >/dev/null
+DROP SCHEMA public CASCADE;
+CREATE SCHEMA public;
+GRANT ALL ON SCHEMA public TO PUBLIC;
+EOF
+            cargo test --test "$suite" -- --test-threads=1
+          done
+          echo "OPTIONS_HYBRID_V2_ECONOMIC_RUNTIME_CI_GATE_VALIDATED"
