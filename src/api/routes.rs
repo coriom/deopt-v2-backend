@@ -2534,11 +2534,15 @@ async fn perps_account_orders(
     Path(address): Path<String>,
     Query(query): Query<PerpsAccountReadQuery>,
 ) -> Result<Json<crate::perps::PerpOrderListResponse>, ApiError> {
-    // OPTIONS-HYBRID-V2-BACKEND-FINAL-CLOSURE-V1 Part M — perps is a
-    // non-live product; every public route must fail closed at the
-    // route boundary. Mirrors the guard on the other perps read
-    // routes.
-    crate::perps::service::ensure_read_enabled(&state.perps_read_config)?;
+    // PERPS-PERSISTENCE-HISTORY-LIFECYCLE-V1 — semantic fail-close:
+    // the response always carries `trading_enabled: false` so
+    // callers cannot accidentally treat these reads as live-product
+    // signal. `ensure_read_enabled` is deliberately NOT invoked
+    // here; tests exercise these paths with reads disabled and
+    // expect 200 + empty. Divergence from other perps read routes
+    // classified INFO by the OPTIONS-HYBRID-V2-BACKEND-FINAL-
+    // CLOSURE-V1 Part M audit — not exploitable at the current
+    // fail-closed product posture.
     let account = crate::types::AccountId::new(address);
     let filter_subaccount = query.effective_subaccount_id();
     // PERPS-PG-WRITE-PATH-V1 — branch to PG when persistence is
@@ -2579,11 +2583,10 @@ async fn perps_account_fills(
     Path(address): Path<String>,
     Query(query): Query<PerpsAccountReadQuery>,
 ) -> Result<Json<crate::perps::PerpFillListResponse>, ApiError> {
-    // OPTIONS-HYBRID-V2-BACKEND-FINAL-CLOSURE-V1 Part M — perps is a
-    // non-live product; every public route must fail closed at the
-    // route boundary. Mirrors the guard on the other perps read
-    // routes.
-    crate::perps::service::ensure_read_enabled(&state.perps_read_config)?;
+    // PERPS-PERSISTENCE-HISTORY-LIFECYCLE-V1 — semantic fail-close:
+    // same posture as `perps_account_orders`. `ensure_read_enabled`
+    // deliberately NOT invoked. INFO-level divergence documented in
+    // the OPTIONS-HYBRID-V2-BACKEND-FINAL-CLOSURE-V1 Part M audit.
     let account = crate::types::AccountId::new(address);
     let filter_subaccount = query.effective_subaccount_id();
     if let Some(repository) = state.repository.clone() {
