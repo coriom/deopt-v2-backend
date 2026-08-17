@@ -146,9 +146,16 @@ fn unique_canonical_order_hash(prefix: &str) -> String {
     )
 }
 fn unique_tx(seed: u32) -> String {
+    // UUID-derived so parallel test-binary runs whose `run_salt()`
+    // bases collide within the same microsecond window still produce
+    // distinct values.
+    let uuid = uuid::Uuid::new_v4();
+    let raw = uuid.as_u128();
     format!(
-        "0x{:064x}",
-        u128::from(seed).wrapping_add(u128::from(run_salt())) & u128::from(u64::MAX)
+        "0x{:016x}{:016x}{:032x}",
+        raw >> 64,
+        raw & 0xFFFF_FFFF_FFFF_FFFFu128,
+        u128::from(seed).wrapping_add(u128::from(run_salt()))
     )
 }
 fn addr(prefix: u32, seed: u32) -> AccountId {
@@ -1986,12 +1993,10 @@ async fn push05_tx_hash_correlation_lookup_indexed() {
         insert_awaiting_correlation(&pool, &awaiting_input(&cid, now))
             .await
             .expect("insert n");
-        let tx = format!(
-            "0x{:064x}",
-            (i as u128)
-                .wrapping_add(0xabcd_0000)
-                .wrapping_add(run_salt() as u128)
-        );
+        // UUID-derived for the same reason as `unique_tx` — avoid
+        // cross-binary collisions when workspace test runs share a
+        // microsecond BASE.
+        let tx = unique_tx(0xabcd_0000_u32.wrapping_add(i));
         let fp = fingerprint(&tx, i as i32, 1_000 + i as i64, now + 2);
         mark_correlated_canonical(&pool, &cid, &fp)
             .await
@@ -2002,10 +2007,7 @@ async fn push05_tx_hash_correlation_lookup_indexed() {
     insert_awaiting_correlation(&pool, &awaiting_input(&target_cid, now))
         .await
         .expect("insert target");
-    let target_tx = format!(
-        "0x{:064x}",
-        0xdead_beef_u128.wrapping_add(run_salt() as u128)
-    );
+    let target_tx = unique_tx(0xdead_beef_u32);
     let target_log = 42_i32;
     let fp = fingerprint(&target_tx, target_log, 9_999, now + 3);
     mark_correlated_canonical(&pool, &target_cid, &fp)
