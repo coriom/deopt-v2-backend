@@ -1,5 +1,13 @@
 # OPTIONS-HYBRID-V2-ECONOMIC-RUNTIME-FINAL-CLOSURE-V1 — Correctness + Reorg + Failure Closure Only
 
+> **CLOSED 2026-08-17.** Every outstanding verdict listed below is
+> now delivered by `OPTIONS-HYBRID-V2-ECONOMIC-RUNTIME-FINAL-VALIDATION-V1`
+> (see `docs/OPTIONS_HYBRID_V2_ECONOMIC_RUNTIME_FINAL_VALIDATION_V1.md`).
+> Milestone verdict `OPTIONS_HYBRID_V2_ECONOMIC_RUNTIME_FINAL_CLOSURE_V1_COMPLETE`
+> returned as a parent closure. This document is retained as historical
+> record of the correctness + reorg + failure closure phase.
+
+
 Honest partial closure. This sprint authorized "correctness + reorg +
 failure closure" — Parts B, C, D, M, N, O plus a limited real-PG
 matrix (~18 focused scenarios) and full workspace regression. Parts E
