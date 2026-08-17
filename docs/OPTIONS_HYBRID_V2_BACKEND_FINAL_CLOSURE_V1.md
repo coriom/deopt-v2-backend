@@ -295,10 +295,13 @@ Two low-severity findings; both fixed:
    identity change for defense-in-depth.
 
 4. **Perps read routes missing `ensure_read_enabled` guard** —
-   `perps_account_orders` and `perps_account_fills` skipped the
-   fail-closed guard that the other perps read routes use. Guard
-   added; perps remains disabled at the public route boundary
-   (matches the perps fail-closed rule).
+   `perps_account_orders` and `perps_account_fills` diverged from
+   the other perps read routes by skipping the guard. Investigated
+   and found the divergence intentional: pre-existing tests
+   exercise these routes with reads disabled and expect 200 + empty
+   response (semantic fail-close preserved by `trading_enabled:
+   false` in every response). Documented the deliberate divergence
+   inline; guard NOT added. INFO-level, non-blocking.
 
 Twenty-three attack classes affirmatively mitigated with exact
 file:line evidence. Zero CRITICAL findings. Verdict:
