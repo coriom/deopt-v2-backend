@@ -1364,24 +1364,49 @@ pub(crate) fn emit_option_order_lifecycle(
     }
 }
 
+/// OPTIONS-HYBRID-V2-BACKEND-FINAL-CLOSURE-V1 Part M — hard cap on
+/// public list endpoints. Prevents an unauthenticated caller from
+/// requesting an unbounded fetch that would materialize the entire
+/// order/fill history in memory. Mirrors `MAX_PAGE_LIMIT` in
+/// `src/hybrid_v2/repository.rs`.
+pub const MAX_OPTIONS_LIST_LIMIT: i64 = 1000;
+
 pub async fn list_option_orders(
     state: &AppState,
     filter: OptionOrderFilter,
 ) -> Result<Vec<OptionOrder>> {
     ensure_enabled(state)?;
     if let Some(repository) = state.repository.clone() {
-        return Ok(repository
-            .list_option_orders()
-            .await?
-            .into_iter()
-            .filter(|order| filter.matches(order))
-            .collect());
+        // OPTIONS-HYBRID-V2-BACKEND-FINAL-CLOSURE-V1 Part M — push
+        // filter + LIMIT into SQL. The prior implementation fetched
+        // the full option_orders table into memory and then applied
+        // the filter in Rust, an unauthenticated DoS vector.
+        let account_lower = filter.account.as_ref().map(|a| a.0.to_ascii_lowercase());
+        let status_str = filter.status.map(|s| s.as_str());
+        let side_str = filter.side.map(side_to_str);
+        return repository
+            .list_option_orders_filtered(
+                filter.option_series_id.as_deref(),
+                account_lower.as_deref(),
+                filter.subaccount_id.map(|s| s as i32),
+                status_str,
+                side_str,
+                MAX_OPTIONS_LIST_LIMIT,
+            )
+            .await;
     }
     Ok(state
         .options_store
         .lock()
         .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?
         .list_orders(&filter))
+}
+
+fn side_to_str(side: crate::types::Side) -> &'static str {
+    match side {
+        crate::types::Side::Buy => "buy",
+        crate::types::Side::Sell => "sell",
+    }
 }
 
 pub async fn get_option_order(state: &AppState, order_id: OptionOrderId) -> Result<OptionOrder> {
@@ -1497,12 +1522,21 @@ pub async fn list_option_fills(
 ) -> Result<Vec<OptionFill>> {
     ensure_enabled(state)?;
     if let Some(repository) = state.repository.clone() {
-        return Ok(repository
-            .list_option_fills()
-            .await?
-            .into_iter()
-            .filter(|fill| filter.matches(fill))
-            .collect());
+        // OPTIONS-HYBRID-V2-BACKEND-FINAL-CLOSURE-V1 Part M — push
+        // filter + LIMIT into SQL. The prior implementation fetched
+        // the full option_fills table into memory and then applied
+        // the filter in Rust, an unauthenticated DoS vector.
+        let account_lower = filter.account.as_ref().map(|a| a.0.to_ascii_lowercase());
+        let order_id_str = filter.order_id.map(|id| id.to_string());
+        return repository
+            .list_option_fills_filtered(
+                filter.option_series_id.as_deref(),
+                account_lower.as_deref(),
+                filter.subaccount_id.map(|s| s as i32),
+                order_id_str.as_deref(),
+                MAX_OPTIONS_LIST_LIMIT,
+            )
+            .await;
     }
     Ok(state
         .options_store

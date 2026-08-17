@@ -2534,6 +2534,11 @@ async fn perps_account_orders(
     Path(address): Path<String>,
     Query(query): Query<PerpsAccountReadQuery>,
 ) -> Result<Json<crate::perps::PerpOrderListResponse>, ApiError> {
+    // OPTIONS-HYBRID-V2-BACKEND-FINAL-CLOSURE-V1 Part M — perps is a
+    // non-live product; every public route must fail closed at the
+    // route boundary. Mirrors the guard on the other perps read
+    // routes.
+    crate::perps::service::ensure_read_enabled(&state.perps_read_config)?;
     let account = crate::types::AccountId::new(address);
     let filter_subaccount = query.effective_subaccount_id();
     // PERPS-PG-WRITE-PATH-V1 — branch to PG when persistence is
@@ -2574,6 +2579,11 @@ async fn perps_account_fills(
     Path(address): Path<String>,
     Query(query): Query<PerpsAccountReadQuery>,
 ) -> Result<Json<crate::perps::PerpFillListResponse>, ApiError> {
+    // OPTIONS-HYBRID-V2-BACKEND-FINAL-CLOSURE-V1 Part M — perps is a
+    // non-live product; every public route must fail closed at the
+    // route boundary. Mirrors the guard on the other perps read
+    // routes.
+    crate::perps::service::ensure_read_enabled(&state.perps_read_config)?;
     let account = crate::types::AccountId::new(address);
     let filter_subaccount = query.effective_subaccount_id();
     if let Some(repository) = state.repository.clone() {
@@ -3665,7 +3675,12 @@ struct OptionOrderResponse {
     client_order_id: Option<String>,
     nonce: Option<String>,
     deadline_ms: Option<i64>,
-    signature: Option<String>,
+    // OPTIONS-HYBRID-V2-BACKEND-FINAL-CLOSURE-V1 Part M — raw
+    // EIP-712 signature bytes are never echoed. Public
+    // `GET /options/orders?account=X` and `GET /options/orders/{id}`
+    // must not leak the signer's raw sig to third parties. Callers
+    // that need the signature already possess it (they signed it).
+    signature_present: bool,
     status: OptionOrderStatus,
     // HISTORY-V2-TERMINAL-REASONS-V1
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3701,7 +3716,7 @@ impl From<OptionOrder> for OptionOrderResponse {
             client_order_id: order.client_order_id,
             nonce: order.nonce.map(|value| value.to_string()),
             deadline_ms: order.deadline_ms,
-            signature: order.signature,
+            signature_present: order.signature.is_some(),
             status: order.status,
             terminal_reason_code: order.terminal_reason_code,
             terminal_reason_message: order.terminal_reason_message,

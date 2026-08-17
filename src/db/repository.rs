@@ -2709,6 +2709,49 @@ impl PgRepository {
         rows.into_iter().map(option_order_from_row).collect()
     }
 
+    /// OPTIONS-HYBRID-V2-BACKEND-FINAL-CLOSURE-V1 Part M — filtered
+    /// list with SQL-level WHERE + LIMIT push-down. Every optional
+    /// filter is passed as a nullable bind; NULL disables the
+    /// predicate. Used by the public `GET /options/orders` route to
+    /// prevent an unauthenticated full-table SELECT from becoming a
+    /// DoS vector.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn list_option_orders_filtered(
+        &self,
+        option_series_id: Option<&str>,
+        account_lower: Option<&str>,
+        subaccount_id: Option<i32>,
+        status: Option<&str>,
+        side: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<OptionOrder>> {
+        let rows = sqlx::query(
+            "SELECT order_id, option_series_id, account, side, price_1e8, size_1e8,
+                    remaining_size_1e8, time_in_force, post_only, client_order_id, nonce,
+                    deadline_ms, signature, status,
+                    terminal_reason_code, terminal_reason_message, terminal_reason_source,
+                    created_at_ms, updated_at_ms, subaccount_id, canonical_order_hash
+             FROM option_orders
+             WHERE ($1::text IS NULL OR option_series_id = $1)
+               AND ($2::text IS NULL OR LOWER(account) = $2)
+               AND ($3::int IS NULL OR subaccount_id = $3)
+               AND ($4::text IS NULL OR status = $4)
+               AND ($5::text IS NULL OR side = $5)
+             ORDER BY created_at_ms ASC, order_id ASC
+             LIMIT $6",
+        )
+        .bind(option_series_id)
+        .bind(account_lower)
+        .bind(subaccount_id)
+        .bind(status)
+        .bind(side)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        rows.into_iter().map(option_order_from_row).collect()
+    }
+
     pub async fn get_option_order(&self, order_id: OptionOrderId) -> Result<Option<OptionOrder>> {
         let row = sqlx::query(
             "SELECT order_id, option_series_id, account, side, price_1e8, size_1e8,
@@ -3322,6 +3365,52 @@ impl PgRepository {
              FROM option_fills
              ORDER BY created_at_ms ASC, fill_id ASC",
         )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        rows.into_iter().map(option_fill_from_row).collect()
+    }
+
+    /// OPTIONS-HYBRID-V2-BACKEND-FINAL-CLOSURE-V1 Part M — filtered
+    /// list with SQL-level WHERE + LIMIT push-down. Every optional
+    /// filter is passed as a nullable bind; NULL disables the
+    /// predicate. Account matches when the address is buyer OR
+    /// seller, subaccount matches on whichever side matched the
+    /// account. Used by the public `GET /options/fills` route to
+    /// prevent an unauthenticated full-table SELECT from becoming a
+    /// DoS vector.
+    pub async fn list_option_fills_filtered(
+        &self,
+        option_series_id: Option<&str>,
+        account_lower: Option<&str>,
+        subaccount_id: Option<i32>,
+        order_id: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<OptionFill>> {
+        let rows = sqlx::query(
+            "SELECT fill_id, option_series_id, buy_order_id, sell_order_id, buyer, seller,
+                    buyer_subaccount_id, seller_subaccount_id,
+                    maker_order_id, taker_order_id, taker_side, price_1e8, size_1e8,
+                    created_at_ms, canonical_execution_id
+             FROM option_fills
+             WHERE ($1::text IS NULL OR option_series_id = $1)
+               AND ($2::text IS NULL OR LOWER(buyer) = $2 OR LOWER(seller) = $2)
+               AND ($3::int IS NULL OR (
+                        ($2::text IS NULL) OR
+                        (LOWER(buyer) = $2 AND buyer_subaccount_id = $3) OR
+                        (LOWER(seller) = $2 AND seller_subaccount_id = $3)
+                   ))
+               AND ($4::text IS NULL OR
+                        buy_order_id = $4 OR sell_order_id = $4 OR
+                        maker_order_id = $4 OR taker_order_id = $4)
+             ORDER BY created_at_ms ASC, fill_id ASC
+             LIMIT $5",
+        )
+        .bind(option_series_id)
+        .bind(account_lower)
+        .bind(subaccount_id)
+        .bind(order_id)
+        .bind(limit)
         .fetch_all(&self.pool)
         .await
         .map_err(|error| BackendError::Persistence(error.to_string()))?;
