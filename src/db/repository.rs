@@ -2469,18 +2469,36 @@ impl PgRepository {
         incoming: OptionOrder,
         updated_at_ms: TimestampMs,
     ) -> Result<(OptionOrder, Vec<OptionFill>)> {
-        self.submit_option_order_and_match_with_reservations(incoming, updated_at_ms, None)
-            .await
+        // OPTIONS-HYBRID-V2-BACKEND-FINAL-CLOSURE-V1 Part J: the
+        // legacy no-plan wrapper is used only by internal tests /
+        // non-production callers that predate the reservation ledger.
+        // The constant test domain preserves the prior semantics for
+        // those paths.
+        self.submit_option_order_and_match_with_reservations(
+            incoming,
+            updated_at_ms,
+            None,
+            crate::options::canonical_identity::OptionsCanonicalDomain::constant_test_domain(),
+        )
+        .await
     }
 
     /// OPTIONS-HYBRID-V2-MATCH-PENDING-AND-CANONICAL-SETTLEMENT-CLOSURE-V1
     /// Part B/D — the atomic variant. Callers that participate in the
     /// off-chain reservation ledger use this entry point.
+    ///
+    /// `execution_domain` is the canonical Options domain used to
+    /// derive each fill's `canonical_execution_id`. Production
+    /// callers pass the live domain constructed from
+    /// `OptionsConfig`; the legacy wrapper above passes the constant
+    /// test domain for backward compatibility with pre-ledger tests.
+    /// See OPTIONS-HYBRID-V2-BACKEND-FINAL-CLOSURE-V1 Part J.
     pub async fn submit_option_order_and_match_with_reservations(
         &self,
         mut incoming: OptionOrder,
         updated_at_ms: TimestampMs,
         reservation_plan: Option<crate::options::reservation_repository::MatcherReservationPlan>,
+        execution_domain: crate::options::canonical_identity::OptionsCanonicalDomain,
     ) -> Result<(OptionOrder, Vec<OptionFill>)> {
         let mut tx = self.begin().await?;
 
@@ -2566,7 +2584,13 @@ impl PgRepository {
                     leg.maker_id
                 )));
             };
-            let fill = option_fill_from_match(&incoming, maker, leg.fill_size_1e8, updated_at_ms);
+            let fill = option_fill_from_match(
+                &incoming,
+                maker,
+                leg.fill_size_1e8,
+                updated_at_ms,
+                execution_domain,
+            );
             incoming.remaining_size_1e8 -= leg.fill_size_1e8;
             maker.remaining_size_1e8 -= leg.fill_size_1e8;
             maker.status = status_for_remaining(maker.size_1e8, maker.remaining_size_1e8);
@@ -7963,6 +7987,7 @@ fn option_fill_from_match(
     maker: &OptionOrder,
     size_1e8: u128,
     created_at_ms: TimestampMs,
+    execution_domain: crate::options::canonical_identity::OptionsCanonicalDomain,
 ) -> OptionFill {
     let (buy_order, sell_order) = match incoming.side {
         Side::Buy => (incoming, maker),
@@ -7975,22 +8000,17 @@ fn option_fill_from_match(
     // canonical_execution_id remains NULL. Same posture as
     // `src/options/store.rs::option_fill_from_match`.
     //
-    // OPTIONS-HYBRID-V2-EXECUTION-CORRELATION-CLOSURE-V1 Part B:
-    // DB matcher does not have direct access to `OptionsConfig`
-    // (repository operates below the service layer). The constant
-    // test domain here matches what `submit_option_order` used when
-    // it wrote the order rows via `canonical_order_hash_for(order,
-    // OptionsCanonicalDomain::from_options_config(&state.
-    // options_config))` — and today `execution_eip712_domain.
-    // chain_id` defaults to 84532, so the constant produces the same
-    // execution id. A future multi-chain milestone must thread the
-    // domain through repository transactions.
+    // OPTIONS-HYBRID-V2-BACKEND-FINAL-CLOSURE-V1 Part J: the
+    // canonical execution domain is now threaded through the
+    // matcher entry point from `submit_option_order_inner` in
+    // `src/options/service.rs`, which builds it from the live
+    // `OptionsConfig`. Multi-chain deployments are now safe.
     let canonical_execution_id =
         crate::options::canonical_identity::canonical_execution_id_for_fill(
             buy_order.canonical_order_hash.as_deref(),
             sell_order.canonical_order_hash.as_deref(),
             size_1e8,
-            crate::options::canonical_identity::OptionsCanonicalDomain::constant_test_domain(),
+            execution_domain,
         );
     OptionFill {
         fill_id: Uuid::new_v4(),

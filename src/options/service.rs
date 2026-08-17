@@ -503,8 +503,18 @@ async fn submit_option_order_inner(
     // behaviour (the in-memory matcher has no reservation ledger).
     let reservation_plan = build_matcher_reservation_plan(state, &order, now).await;
     let (order, fills) = if let Some(repository) = state.repository.clone() {
+        // OPTIONS-HYBRID-V2-BACKEND-FINAL-CLOSURE-V1 Part J: thread
+        // the live canonical Options domain into the matcher tx so
+        // each fill's `canonical_execution_id` is bound to the
+        // running chain / deployment. Reuses the `canonical_domain`
+        // already built above for the order-hash preimage.
         repository
-            .submit_option_order_and_match_with_reservations(order, now, reservation_plan)
+            .submit_option_order_and_match_with_reservations(
+                order,
+                now,
+                reservation_plan,
+                canonical_domain,
+            )
             .await?
     } else {
         state
