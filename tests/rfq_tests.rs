@@ -21,13 +21,19 @@ use tokio::sync::mpsc;
 use tower::ServiceExt;
 
 fn rfq_config() -> RfqConfig {
+    // NOTE: TTL caps intentionally set well above the wall-clock latency of
+    // any single test path. Historically these were 1_000 / 500 ms, which
+    // caused RFQ / quote expiry flakes under parallel workspace load
+    // (see: `accept_quote_*` returning `quote has expired`). Individual
+    // expiry-behavior tests still override `ttl_ms` / `quote_ttl_ms`
+    // explicitly to force expiration.
     RfqConfig {
         enabled: true,
         require_persistence: false,
         default_ttl_ms: 100,
-        max_ttl_ms: 1_000,
+        max_ttl_ms: 60_000,
         min_quote_ttl_ms: 1,
-        max_quote_ttl_ms: 500,
+        max_quote_ttl_ms: 30_000,
         max_quotes_per_rfq: 50,
         ..RfqConfig::disabled()
     }
@@ -52,17 +58,21 @@ fn mm() -> AccountId {
 }
 
 fn create_input(side: Side) -> CreateRfqInput {
+    // ttl_ms deliberately generous to keep parallel test runs deterministic.
+    // Expiry-behavior tests override `ttl_ms` to a tiny value locally.
     CreateRfqInput {
         taker: taker(),
         market_id: 1,
         side,
         size_1e8: 100_000_000,
         limit_price_1e8: Some(300_000_000_000),
-        ttl_ms: Some(500),
+        ttl_ms: Some(30_000),
     }
 }
 
 fn quote_input(rfq_id: uuid::Uuid) -> SubmitQuoteInput {
+    // quote_ttl_ms deliberately generous to keep parallel test runs
+    // deterministic. Expiry-behavior tests override `quote_ttl_ms` locally.
     SubmitQuoteInput {
         rfq_id,
         mm_account: mm(),
@@ -71,7 +81,7 @@ fn quote_input(rfq_id: uuid::Uuid) -> SubmitQuoteInput {
         price_1e8: 299_000_000_000,
         size_1e8: 100_000_000,
         quote_nonce: None,
-        quote_ttl_ms: 100,
+        quote_ttl_ms: 10_000,
         signature: None,
     }
 }
@@ -161,11 +171,13 @@ async fn create_rfq_rejects_zero_size() {
 
 #[tokio::test]
 async fn create_rfq_caps_ttl() {
+    // Verify that an over-cap request gets capped to the configured max
+    // (see `rfq_config()` above — currently 60_000 ms).
     let mut input = create_input(Side::Buy);
-    input.ttl_ms = Some(10_000);
+    input.ttl_ms = Some(600_000);
     let rfq = create_rfq(&state(), input).await.unwrap();
 
-    assert!(rfq.expires_at_ms - rfq.created_at_ms <= 1_000);
+    assert!(rfq.expires_at_ms - rfq.created_at_ms <= 60_000);
 }
 
 #[tokio::test]

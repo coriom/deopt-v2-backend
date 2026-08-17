@@ -34,10 +34,13 @@ fn mm() -> AccountId {
 }
 
 fn state_with_flag(flag: bool) -> AppState {
+    // NOTE: `rfq_max_quote_ttl_ms` intentionally generous. Historically 500 ms,
+    // which caused `part3_maker_cannot_cancel_accepted_quote` to flake under
+    // parallel workspace load with "multi-leg option RFQ quote is not active".
     let mut cfg = OptionsConfig::enabled_in_memory_for_tests();
     cfg.rfq_enabled = true;
     cfg.rfq_min_quote_ttl_ms = 1;
-    cfg.rfq_max_quote_ttl_ms = 500;
+    cfg.rfq_max_quote_ttl_ms = 30_000;
     cfg.rfq_multi_leg_enabled = flag;
     AppState::with_options_config(EngineState::with_default_markets(), cfg)
 }
@@ -103,6 +106,8 @@ async fn seed_subaccount_two(state: &AppState, owner: &AccountId) {
 }
 
 fn quote_message(rfq_id: uuid::Uuid, extra: Option<serde_json::Value>) -> ClientMessage {
+    // quote_ttl_ms deliberately generous so downstream accept steps are not
+    // racing wall-clock expiry under parallel workspace load.
     let mut payload = json!({
         "option_rfq_id": rfq_id,
         "mm_account": MM_ACCOUNT_HEX,
@@ -112,7 +117,7 @@ fn quote_message(rfq_id: uuid::Uuid, extra: Option<serde_json::Value>) -> Client
             { "leg_index": 0, "price_1e8": "12000000000" },
             { "leg_index": 1, "price_1e8": "11500000000" }
         ],
-        "quote_ttl_ms": 100
+        "quote_ttl_ms": 10_000
     });
     if let (Some(obj), Some(extra_obj)) = (
         payload.as_object_mut(),
