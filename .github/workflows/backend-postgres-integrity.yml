@@ -46,6 +46,8 @@ on:
       - "tests/options_exhaustive_coverage_pg_integration.rs"
       - "tests/options_economic_runtime_final_validation_pg_integration.rs"
       - "tests/options_economic_runtime_properties.rs"
+      - "tests/options_backend_product_surface_pg_integration.rs"
+      - "src/api/**"
       - ".github/workflows/backend-postgres-integrity.yml"
   push:
     branches:
@@ -361,7 +363,8 @@ EOF
               options_economic_runtime_final_closure_pg_integration \
               options_exhaustive_coverage_pg_integration \
               options_economic_runtime_final_validation_pg_integration \
-              options_economic_runtime_properties; do
+              options_economic_runtime_properties \
+              options_backend_product_surface_pg_integration; do
             PGPASSWORD=disposable_ci_pw psql -h 127.0.0.1 -U deopt_ci -d deopt_hybrid_v2_disposable_ci <<'EOF' >/dev/null
 DROP SCHEMA public CASCADE;
 CREATE SCHEMA public;
@@ -370,3 +373,4 @@ EOF
             cargo test --test "$suite" -- --test-threads=1
           done
           echo "OPTIONS_HYBRID_V2_ECONOMIC_RUNTIME_CI_GATE_VALIDATED"
+          echo "OPTIONS_HYBRID_V2_BACKEND_PRODUCT_CI_GATE_VALIDATED"
