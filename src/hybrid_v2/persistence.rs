@@ -4289,7 +4289,13 @@ struct InMemoryInner {
     reorg_events: Vec<serde_json::Value>,
     reorg_recovery:
         std::collections::BTreeMap<i64, crate::hybrid_v2::reorg_recovery::ReorgRecoveryState>,
-    reorg_locks: std::collections::BTreeMap<i64, (i64, i64)>,
+    // LOCAL-BACKEND-WARNING-CLEANUP: the in-memory sibling of the
+    // legacy `hybrid_v2_reorg_locks` SQL table was removed. That
+    // table remains in Postgres (unpopulated) for backup /
+    // introspection continuity per `reorg_recovery.rs:274` and
+    // `persistence.rs:307`, but no Rust code path reads or writes it
+    // — reorg + rebuild + reconciliation all use `operation_locks`
+    // below.
     // Unified operation-lock table: deployment → (operation, epoch, acquired_at_ms).
     // Reorg + rebuild + reconciliation contend for the single row per deployment.
     operation_locks: std::collections::BTreeMap<
