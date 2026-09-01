@@ -62,6 +62,8 @@ fn base_input(
         reduce_only: false,
         isolated_margin_1e8: MARGIN_10X_ETH,
         client_order_id: None,
+        max_execution_price_1e8: 0,
+        min_execution_price_1e8: 0,
     }
 }
 

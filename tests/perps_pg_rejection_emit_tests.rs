@@ -77,6 +77,8 @@ fn base_input(
         reduce_only: false,
         isolated_margin_1e8: MARGIN_10X_ETH,
         client_order_id: None,
+        max_execution_price_1e8: 0,
+        min_execution_price_1e8: 0,
     }
 }
 
@@ -377,6 +379,8 @@ async fn perp_order_rejected_frame_has_no_secret_fields() {
         SubmitPerpOrderInput {
             post_only: true,
             client_order_id: Some("cli-1".to_string()),
+            max_execution_price_1e8: 0,
+            min_execution_price_1e8: 0,
             ..base_input(
                 addr("0x000000000000000000000000000000000000bbbb"),
                 PerpOrderSide::Buy,

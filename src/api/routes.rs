@@ -2920,6 +2920,14 @@ async fn admin_perps_liquidations_tick(
 // as `isolated_margin_1e8`.
 // =====================================================================
 
+/// PERPS-PRICING-AND-EXECUTION-SAFETY-CORE-V1 — serde default for the
+/// user execution-price bound fields. Matches the "strict" wire
+/// sentinel used by the Solidity struct (`0` = must equal signed exec
+/// price, legacy V1 behaviour).
+fn zero_price_1e8_string() -> String {
+    "0".to_string()
+}
+
 #[derive(Clone, Debug, Deserialize)]
 struct PerpsSubmitOrderHttpRequest {
     market_id: String,
@@ -2935,6 +2943,15 @@ struct PerpsSubmitOrderHttpRequest {
     isolated_margin_1e8: String,
     #[serde(default)]
     client_order_id: Option<String>,
+    // PERPS-PRICING-AND-EXECUTION-SAFETY-CORE-V1 — user execution-price
+    // envelope. `serde(default)` accepts requests that predate the
+    // milestone (older clients) and treats missing fields as `"0"` (strict,
+    // legacy). Non-zero threads into the on-chain `PerpTrade` payload
+    // verbatim; no server-side widening.
+    #[serde(default = "zero_price_1e8_string")]
+    max_execution_price_1e8: String,
+    #[serde(default = "zero_price_1e8_string")]
+    min_execution_price_1e8: String,
     // PERPS-SUBACCOUNTS-CORE-ROUTING-V1 — subaccount the order runs
     // under. Optional at the wire so the default fail-closed path (both
     // Perps flags off) can 503 without needing the field. Required and
@@ -3146,6 +3163,14 @@ async fn perps_submit_order(
             reduce_only: req.reduce_only,
             isolated_margin_1e8,
             client_order_id: req.client_order_id,
+            max_execution_price_1e8: parse_u128_field(
+                "max_execution_price_1e8",
+                &req.max_execution_price_1e8,
+            )?,
+            min_execution_price_1e8: parse_u128_field(
+                "min_execution_price_1e8",
+                &req.min_execution_price_1e8,
+            )?,
         },
     )
     .await?;
@@ -7038,6 +7063,11 @@ struct SigningPayloadMessage {
     size_delta_1e8: String,
     #[serde(rename = "executionPrice1e8")]
     execution_price_1e8: String,
+    // PERPS-PRICING-AND-EXECUTION-SAFETY-CORE-V1 — user execution-price envelope.
+    #[serde(rename = "maxExecutionPrice1e8")]
+    max_execution_price_1e8: String,
+    #[serde(rename = "minExecutionPrice1e8")]
+    min_execution_price_1e8: String,
     #[serde(rename = "buyerIsMaker")]
     buyer_is_maker: bool,
     #[serde(rename = "buyerNonce")]
@@ -8257,6 +8287,9 @@ fn signing_payload_message(payload: PerpTradePayload) -> SigningPayloadMessage {
         market_id: payload.market_id.to_string(),
         size_delta_1e8: payload.size_delta_1e8.to_string(),
         execution_price_1e8: payload.execution_price_1e8.to_string(),
+        // PERPS-PRICING-AND-EXECUTION-SAFETY-CORE-V1 — user envelope.
+        max_execution_price_1e8: payload.max_execution_price_1e8.to_string(),
+        min_execution_price_1e8: payload.min_execution_price_1e8.to_string(),
         buyer_is_maker: payload.buyer_is_maker,
         buyer_nonce: payload.buyer_nonce.to_string(),
         seller_nonce: payload.seller_nonce.to_string(),
@@ -13575,6 +13608,19 @@ fn perp_trade_type_fields() -> Vec<SigningPayloadTypeField> {
             name: "executionPrice1e8",
             type_name: "uint128",
         },
+        // PERPS-PRICING-AND-EXECUTION-SAFETY-CORE-V1 — user execution-
+        // price envelope. Inserted between `executionPrice1e8` and
+        // `buyerIsMaker` to mirror the Solidity struct field order
+        // (locked TRADE_TYPEHASH
+        // `0x9ccd368c748c5e85df8e96f94ac1d47316abde07a2d78c4f1b10b91cb98942c3`).
+        SigningPayloadTypeField {
+            name: "maxExecutionPrice1e8",
+            type_name: "uint128",
+        },
+        SigningPayloadTypeField {
+            name: "minExecutionPrice1e8",
+            type_name: "uint128",
+        },
         SigningPayloadTypeField {
             name: "buyerIsMaker",
             type_name: "bool",
@@ -15083,6 +15129,20 @@ impl From<BackendError> for ApiError {
             // Deviation-exceeded fails the same way stale-oracle does:
             // the market is temporarily unsafe → 503.
             BackendError::PerpOracleDeviationExceeded(_) => StatusCode::SERVICE_UNAVAILABLE,
+            // PERPS-PRICING-AND-EXECUTION-SAFETY-CORE-V1 — user-bound envelope
+            // rejections and market-order liquidity gaps are BAD_REQUEST / 422:
+            // the request is well-formed but cannot be honoured at the requested
+            // bounds. Protocol reference-price unavailability is fail-closed 503
+            // (same rationale as PerpOracleDeviationExceeded).
+            BackendError::PerpsUserBoundAboveLimit(_)
+            | BackendError::PerpsUserBoundBelowLimit(_)
+            | BackendError::PerpsInvalidBoundForSide(_)
+            | BackendError::PerpsMarketOrderNoAcceptableLiquidity(_) => {
+                StatusCode::UNPROCESSABLE_ENTITY
+            }
+            BackendError::PerpsProtocolReferencePriceUnavailable(_) => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
             // PERPS-ORDER-EXECUTION-INTERNAL-V1
             BackendError::PerpOrderNotFound(_) => StatusCode::NOT_FOUND,
             BackendError::PerpInvalidOrderState(_)

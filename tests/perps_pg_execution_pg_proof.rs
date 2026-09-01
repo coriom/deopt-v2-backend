@@ -138,6 +138,8 @@ fn base_input(
         reduce_only: false,
         isolated_margin_1e8: MARGIN_10X_ETH,
         client_order_id: Some(format!("cli-{tag}")),
+        max_execution_price_1e8: 0,
+        min_execution_price_1e8: 0,
     }
 }
 
@@ -461,6 +463,8 @@ async fn pg_duplicate_client_order_id_rejects() {
         &reader,
         SubmitPerpOrderInput {
             client_order_id: Some(cli.clone()),
+            max_execution_price_1e8: 0,
+            min_execution_price_1e8: 0,
             ..base_input(
                 alice.clone(),
                 deopt_v2_backend::perps::PerpOrderSide::Buy,
@@ -477,6 +481,8 @@ async fn pg_duplicate_client_order_id_rejects() {
         &reader,
         SubmitPerpOrderInput {
             client_order_id: Some(cli.clone()),
+            max_execution_price_1e8: 0,
+            min_execution_price_1e8: 0,
             ..base_input(
                 alice.clone(),
                 deopt_v2_backend::perps::PerpOrderSide::Buy,

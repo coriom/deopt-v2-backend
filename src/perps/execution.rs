@@ -49,6 +49,9 @@ pub struct SubmitPerpOrderInput {
     pub subaccount_id: u32,
     pub market_id: String,
     pub side: PerpOrderSide,
+    /// `0` marks a market order — requires the matching-side user bound
+    /// (`max_execution_price_1e8` for Buy, `min_execution_price_1e8` for
+    /// Sell) to be non-zero. Non-zero acts as a Limit price (legacy).
     pub price_1e8: u128,
     pub size_1e8: u128,
     pub time_in_force: PerpTimeInForce,
@@ -59,6 +62,19 @@ pub struct SubmitPerpOrderInput {
     /// margin requirement at the order's own price.
     pub isolated_margin_1e8: u128,
     pub client_order_id: Option<String>,
+    /// PERPS-PRICING-AND-EXECUTION-SAFETY-CORE-V1 — user execution-price
+    /// bound envelope. Mirrors the Solidity `PerpTrade` fields verbatim
+    /// (locked TRADE_TYPEHASH `0x9ccd368c748c5e85df8e96f94ac1d47316abde07a2d78c4f1b10b91cb98942c3`).
+    /// `0` == strict / no user bound (legacy V1 exact-price behaviour).
+    /// Non-zero == inclusive user-chosen bound:
+    ///   * Buy  → `max_execution_price_1e8` caps how high the fill can
+    ///     print; sell-side field MUST be `0`.
+    ///   * Sell → `min_execution_price_1e8` floors how low the fill can
+    ///     print; buy-side field MUST be `0`.
+    /// Market orders (`price_1e8 == 0`) require the matching-side bound
+    /// to be non-zero; the walker uses it as the effective limit.
+    pub max_execution_price_1e8: u128,
+    pub min_execution_price_1e8: u128,
 }
 
 /// Outcome of a successful submit — the (possibly resting) order row
@@ -121,13 +137,20 @@ pub async fn submit_perp_order_internal<P: PerpOraclePriceReader + ?Sized>(
     // Now insert the order (status=Open). The store dedupes by
     // client_order_id, so a duplicate here surfaces before we do any
     // matching or position work.
+    //
+    // PERPS-PRICING-AND-EXECUTION-SAFETY-CORE-V1 — market orders
+    // (`input.price_1e8 == 0`) substitute the matching-side user bound
+    // as the stored `price_1e8` so `plan_fills` walks the book up to
+    // (buy) / down to (sell) that bound. `validate_input_basics` has
+    // already asserted the bound is non-zero for market orders.
+    let effective_price_1e8 = effective_limit_price_1e8(&input);
     let now = now_ms();
     let mut order = PerpOrder::new(
         input.account.clone(),
         input.subaccount_id,
         input.market_id.clone(),
         input.side,
-        input.price_1e8,
+        effective_price_1e8,
         input.size_1e8,
         input.time_in_force,
         input.post_only,
@@ -394,10 +417,85 @@ fn validate_input_basics(input: &SubmitPerpOrderInput) -> Result<()> {
     if input.size_1e8 == 0 {
         return Err(BackendError::PerpZeroSize);
     }
+    // PERPS-PRICING-AND-EXECUTION-SAFETY-CORE-V1 — user-bound envelope
+    // validation. Each side may set ONLY its own matching bound
+    // (buy → max; sell → min). The wrong-side bound is a hard reject;
+    // silently ignoring it would let a malformed request slip through.
+    match input.side {
+        PerpOrderSide::Buy => {
+            if input.min_execution_price_1e8 != 0 {
+                return Err(BackendError::PerpsInvalidBoundForSide(
+                    "buy orders may not set min_execution_price_1e8".to_string(),
+                ));
+            }
+        }
+        PerpOrderSide::Sell => {
+            if input.max_execution_price_1e8 != 0 {
+                return Err(BackendError::PerpsInvalidBoundForSide(
+                    "sell orders may not set max_execution_price_1e8".to_string(),
+                ));
+            }
+        }
+    }
     if input.price_1e8 == 0 {
-        return Err(BackendError::PerpZeroPrice);
+        // Market order: the matching-side user bound MUST be non-zero.
+        // Otherwise the walker has no bound to stop it filling at any
+        // adversarial price — reject fail-closed.
+        let has_bound = match input.side {
+            PerpOrderSide::Buy => input.max_execution_price_1e8 != 0,
+            PerpOrderSide::Sell => input.min_execution_price_1e8 != 0,
+        };
+        if !has_bound {
+            return Err(BackendError::PerpsInvalidBoundForSide(
+                "market orders require a non-zero user execution-price bound".to_string(),
+            ));
+        }
+    } else {
+        // Limit order: if the trader ALSO sets a matching-side bound,
+        // require the bound is at least as generous as the limit
+        // (never let backend widen; catch the inverse mistake here).
+        match input.side {
+            PerpOrderSide::Buy => {
+                if input.max_execution_price_1e8 != 0
+                    && input.max_execution_price_1e8 < input.price_1e8
+                {
+                    return Err(BackendError::PerpsUserBoundAboveLimit(format!(
+                        "buy max_execution_price_1e8 {} below limit price_1e8 {}",
+                        input.max_execution_price_1e8, input.price_1e8
+                    )));
+                }
+            }
+            PerpOrderSide::Sell => {
+                if input.min_execution_price_1e8 != 0
+                    && input.min_execution_price_1e8 > input.price_1e8
+                {
+                    return Err(BackendError::PerpsUserBoundBelowLimit(format!(
+                        "sell min_execution_price_1e8 {} above limit price_1e8 {}",
+                        input.min_execution_price_1e8, input.price_1e8
+                    )));
+                }
+            }
+        }
     }
     Ok(())
+}
+
+/// PERPS-PRICING-AND-EXECUTION-SAFETY-CORE-V1 — resolve the effective
+/// limit price the matching walker should use.
+///
+/// Limit orders keep their own signed `price_1e8`. Market orders
+/// (`price_1e8 == 0`) substitute the matching-side user bound, which
+/// validate_input_basics has already guaranteed non-zero. `plan_fills`
+/// then naturally walks the book up to (buy) / down to (sell) this
+/// effective bound — no separate market-order code path needed.
+pub(crate) fn effective_limit_price_1e8(input: &SubmitPerpOrderInput) -> u128 {
+    if input.price_1e8 != 0 {
+        return input.price_1e8;
+    }
+    match input.side {
+        PerpOrderSide::Buy => input.max_execution_price_1e8,
+        PerpOrderSide::Sell => input.min_execution_price_1e8,
+    }
 }
 
 fn validate_tif_combinations(input: &SubmitPerpOrderInput) -> Result<()> {

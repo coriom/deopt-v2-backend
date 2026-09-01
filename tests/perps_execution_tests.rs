@@ -82,6 +82,8 @@ fn base_input(
         reduce_only: false,
         isolated_margin_1e8: MARGIN_10X_ETH, // $300 → 10x on 1 ETH @ $3000
         client_order_id: None,
+        max_execution_price_1e8: 0,
+        min_execution_price_1e8: 0,
     }
 }
 
@@ -548,9 +550,14 @@ async fn zero_price_rejected() {
     )
     .await
     .unwrap_err();
+    // PERPS-PRICING-AND-EXECUTION-SAFETY-CORE-V1 — `price_1e8 == 0` now
+    // marks a MARKET order (not a hard reject). Without a matching-side
+    // user bound, validate_input_basics fail-closes with
+    // `PerpsInvalidBoundForSide` instead of the pre-milestone
+    // `PerpZeroPrice`.
     assert!(matches!(
         err,
-        deopt_v2_backend::error::BackendError::PerpZeroPrice
+        deopt_v2_backend::error::BackendError::PerpsInvalidBoundForSide(_)
     ));
 }
 
@@ -888,4 +895,298 @@ async fn public_perp_submit_still_fail_closed_after_internal_execution_ships() {
         .unwrap_or("")
         .to_lowercase()
         .contains("perp"));
+}
+
+// =====================================================================
+// H. PERPS-PRICING-AND-EXECUTION-SAFETY-CORE-V1 — Market-order attack
+//    scenarios (Part G, scenarios 9-12). Covers user-bound gating,
+//    liquidity exhaustion, and no-fabrication guarantees. The walker
+//    reuses `plan_fills` — market orders substitute the user bound as
+//    the effective limit price (see `effective_limit_price_1e8`).
+// =====================================================================
+
+/// Scenario 9 — market order exhausts allowed liquidity: taker size
+/// exceeds available depth within the user bound → walker takes what
+/// exists, cancels the remainder (IOC-like). No fabricated fill; the
+/// taker's leftover is visible in `remaining_size_1e8`.
+#[tokio::test]
+async fn scenario_9_market_order_exhausts_allowed_liquidity() {
+    let state = state();
+    let cfg = state.perps_read_config.clone();
+    let reader = fresh_price_reader();
+    // Two small resting asks at the top of book, both within a
+    // permissive user bound. Total available: 0.75 ETH.
+    {
+        let mut orders = state.perp_order_store.lock().unwrap();
+        let mut positions = state.perp_positions_store.lock().unwrap();
+        submit_perp_order_internal(
+            &cfg,
+            &mut orders,
+            &mut positions,
+            &reader,
+            base_input(
+                addr("0x0000000000000000000000000000000000000aaa"),
+                PerpOrderSide::Sell,
+                PRICE_ETH_3000,
+                ONE / 2,
+            ),
+        )
+        .await
+        .unwrap();
+        submit_perp_order_internal(
+            &cfg,
+            &mut orders,
+            &mut positions,
+            &reader,
+            base_input(
+                addr("0x0000000000000000000000000000000000000aab"),
+                PerpOrderSide::Sell,
+                PRICE_ETH_3100,
+                ONE / 4,
+            ),
+        )
+        .await
+        .unwrap();
+    }
+    // Market buy for 2 ETH with a bound above both asks. Walker
+    // consumes both levels, cancels the 1.25 ETH remainder — the
+    // user's bound authorises higher prints but the book is empty.
+    let outcome = {
+        let mut orders = state.perp_order_store.lock().unwrap();
+        let mut positions = state.perp_positions_store.lock().unwrap();
+        submit_perp_order_internal(
+            &cfg,
+            &mut orders,
+            &mut positions,
+            &reader,
+            SubmitPerpOrderInput {
+                price_1e8: 0, // market
+                max_execution_price_1e8: PRICE_ETH_3100 + ONE, // above both asks
+                time_in_force: PerpTimeInForce::Ioc,
+                // 3x MARGIN_10X_ETH: safely covers the blended
+                // pro-rated initial margin across two levels ($3000
+                // + $3100) even though only 0.75 ETH will fill.
+                isolated_margin_1e8: 3 * MARGIN_10X_ETH,
+                ..base_input(
+                    addr("0x0000000000000000000000000000000000000bbb"),
+                    PerpOrderSide::Buy,
+                    0,
+                    2 * ONE,
+                )
+            },
+        )
+        .await
+        .unwrap()
+    };
+    assert_eq!(outcome.fills.len(), 2, "walker consumed both resting asks");
+    let total_filled: u128 = outcome.fills.iter().map(|f| f.size_1e8).sum();
+    assert_eq!(total_filled, ONE / 2 + ONE / 4);
+    assert_eq!(
+        outcome.order.remaining_size_1e8,
+        2 * ONE - total_filled,
+        "residual size visible; walker did NOT fabricate a fill"
+    );
+    assert_eq!(outcome.order.status, PerpOrderStatus::Cancelled);
+}
+
+/// Scenario 10 — market order stops walking at the user's slippage
+/// bound. Book has one ask at the bound and a second ask above it.
+/// The walker takes the first, refuses the second, cancels the rest.
+#[tokio::test]
+async fn scenario_10_market_order_stops_at_user_slippage_boundary() {
+    let state = state();
+    let cfg = state.perps_read_config.clone();
+    let reader = fresh_price_reader();
+    // First ask AT the bound; second ask ABOVE.
+    {
+        let mut orders = state.perp_order_store.lock().unwrap();
+        let mut positions = state.perp_positions_store.lock().unwrap();
+        submit_perp_order_internal(
+            &cfg,
+            &mut orders,
+            &mut positions,
+            &reader,
+            base_input(
+                addr("0x0000000000000000000000000000000000000aaa"),
+                PerpOrderSide::Sell,
+                PRICE_ETH_3000,
+                ONE / 2,
+            ),
+        )
+        .await
+        .unwrap();
+        submit_perp_order_internal(
+            &cfg,
+            &mut orders,
+            &mut positions,
+            &reader,
+            base_input(
+                addr("0x0000000000000000000000000000000000000aab"),
+                PerpOrderSide::Sell,
+                PRICE_ETH_3100, // above bound
+                ONE,
+            ),
+        )
+        .await
+        .unwrap();
+    }
+    // Market buy 2 ETH with a tight bound at $3000 exactly — walker
+    // fills the first level (equal to bound is inclusive), stops
+    // before crossing the second (above bound).
+    let outcome = {
+        let mut orders = state.perp_order_store.lock().unwrap();
+        let mut positions = state.perp_positions_store.lock().unwrap();
+        submit_perp_order_internal(
+            &cfg,
+            &mut orders,
+            &mut positions,
+            &reader,
+            SubmitPerpOrderInput {
+                price_1e8: 0,
+                max_execution_price_1e8: PRICE_ETH_3000, // strict cap
+                time_in_force: PerpTimeInForce::Ioc,
+                isolated_margin_1e8: 2 * MARGIN_10X_ETH, // 10x on 2 ETH
+                ..base_input(
+                    addr("0x0000000000000000000000000000000000000bbb"),
+                    PerpOrderSide::Buy,
+                    0,
+                    2 * ONE,
+                )
+            },
+        )
+        .await
+        .unwrap()
+    };
+    assert_eq!(outcome.fills.len(), 1, "only the at-bound level fills");
+    assert_eq!(outcome.fills[0].price_1e8, PRICE_ETH_3000);
+    assert_eq!(outcome.fills[0].size_1e8, ONE / 2);
+    assert_eq!(outcome.order.status, PerpOrderStatus::Cancelled);
+    assert_eq!(outcome.order.remaining_size_1e8, 2 * ONE - ONE / 2);
+}
+
+/// Scenario 11 — partial market fill semantics: one resting ask of
+/// less size than requested; walker fills what exists, cancels the
+/// rest. Symmetric to Scenario 9 but with a single level for
+/// clarity of the partial-fill assertion.
+#[tokio::test]
+async fn scenario_11_market_order_partial_fill() {
+    let state = state();
+    let cfg = state.perps_read_config.clone();
+    let reader = fresh_price_reader();
+    // Single resting ask of 0.3 ETH.
+    {
+        let mut orders = state.perp_order_store.lock().unwrap();
+        let mut positions = state.perp_positions_store.lock().unwrap();
+        submit_perp_order_internal(
+            &cfg,
+            &mut orders,
+            &mut positions,
+            &reader,
+            base_input(
+                addr("0x0000000000000000000000000000000000000aaa"),
+                PerpOrderSide::Sell,
+                PRICE_ETH_3000,
+                (3 * ONE) / 10,
+            ),
+        )
+        .await
+        .unwrap();
+    }
+    // Market buy 1 ETH.
+    let outcome = {
+        let mut orders = state.perp_order_store.lock().unwrap();
+        let mut positions = state.perp_positions_store.lock().unwrap();
+        submit_perp_order_internal(
+            &cfg,
+            &mut orders,
+            &mut positions,
+            &reader,
+            SubmitPerpOrderInput {
+                price_1e8: 0,
+                max_execution_price_1e8: PRICE_ETH_3000 + ONE,
+                time_in_force: PerpTimeInForce::Ioc,
+                ..base_input(
+                    addr("0x0000000000000000000000000000000000000bbb"),
+                    PerpOrderSide::Buy,
+                    0,
+                    ONE,
+                )
+            },
+        )
+        .await
+        .unwrap()
+    };
+    assert_eq!(outcome.fills.len(), 1);
+    assert_eq!(outcome.fills[0].size_1e8, (3 * ONE) / 10);
+    assert_eq!(outcome.order.filled_size_1e8, (3 * ONE) / 10);
+    assert_eq!(outcome.order.remaining_size_1e8, ONE - (3 * ONE) / 10);
+    assert_eq!(outcome.order.status, PerpOrderStatus::Cancelled);
+}
+
+/// Scenario 12 — no acceptable liquidity within the user's bound:
+/// resting ask above the bound, walker refuses to cross and cancels
+/// the entire taker. Zero fills. No fabricated position.
+#[tokio::test]
+async fn scenario_12_market_order_no_acceptable_liquidity() {
+    let state = state();
+    let cfg = state.perps_read_config.clone();
+    let reader = fresh_price_reader();
+    // Sole ask sits ABOVE the user's slippage bound.
+    {
+        let mut orders = state.perp_order_store.lock().unwrap();
+        let mut positions = state.perp_positions_store.lock().unwrap();
+        submit_perp_order_internal(
+            &cfg,
+            &mut orders,
+            &mut positions,
+            &reader,
+            base_input(
+                addr("0x0000000000000000000000000000000000000aaa"),
+                PerpOrderSide::Sell,
+                PRICE_ETH_3100,
+                ONE,
+            ),
+        )
+        .await
+        .unwrap();
+    }
+    // Market buy 1 ETH with a bound BELOW the only ask. Walker
+    // refuses to cross. Zero fills. Order cancelled. No fabricated
+    // position for the taker.
+    let outcome = {
+        let mut orders = state.perp_order_store.lock().unwrap();
+        let mut positions = state.perp_positions_store.lock().unwrap();
+        submit_perp_order_internal(
+            &cfg,
+            &mut orders,
+            &mut positions,
+            &reader,
+            SubmitPerpOrderInput {
+                price_1e8: 0,
+                max_execution_price_1e8: PRICE_ETH_3000, // below the ask
+                time_in_force: PerpTimeInForce::Ioc,
+                ..base_input(
+                    addr("0x0000000000000000000000000000000000000bbb"),
+                    PerpOrderSide::Buy,
+                    0,
+                    ONE,
+                )
+            },
+        )
+        .await
+        .unwrap()
+    };
+    assert!(outcome.fills.is_empty(), "walker refuses to cross bound");
+    assert_eq!(outcome.order.filled_size_1e8, 0);
+    assert_eq!(outcome.order.remaining_size_1e8, ONE);
+    assert_eq!(outcome.order.status, PerpOrderStatus::Cancelled);
+    // Sanity: no position created for the taker.
+    let positions = state.perp_positions_store.lock().unwrap();
+    assert!(positions
+        .get_active(
+            &addr("0x0000000000000000000000000000000000000bbb"),
+            1,
+            "ETH-PERP"
+        )
+        .is_none());
 }

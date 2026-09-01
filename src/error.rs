@@ -226,6 +226,17 @@ pub enum BackendError {
     PerpOpenInterestCap(String),
     #[error("perp market oracle deviation exceeds threshold: {0}")]
     PerpOracleDeviationExceeded(String),
+    // PERPS-PRICING-AND-EXECUTION-SAFETY-CORE-V1 — user execution-price bound envelope.
+    #[error("perp user max execution price bound violated: {0}")]
+    PerpsUserBoundAboveLimit(String),
+    #[error("perp user min execution price bound violated: {0}")]
+    PerpsUserBoundBelowLimit(String),
+    #[error("perp user execution-price bound is invalid for this side: {0}")]
+    PerpsInvalidBoundForSide(String),
+    #[error("perp market order found no acceptable liquidity: {0}")]
+    PerpsMarketOrderNoAcceptableLiquidity(String),
+    #[error("perp protocol reference price is unavailable: {0}")]
+    PerpsProtocolReferencePriceUnavailable(String),
     // SUBACCOUNTS-CORE-BACKEND-V1
     #[error("subaccount not found")]
     SubaccountNotFound,

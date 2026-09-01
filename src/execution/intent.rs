@@ -52,6 +52,10 @@ impl ExecutionIntent {
         let deadline = u128::try_from(deadline_ms)
             .map_err(|_| BackendError::MissingExecutionMetadata("deadline".to_string()))?;
 
+        // PERPS-PRICING-AND-EXECUTION-SAFETY-CORE-V1 — legacy intent shape has no
+        // user bounds. Pass `0, 0` (strict): validate_shape() reproduces V1 exact-
+        // price behaviour when both bounds are zero. Once the higher intent model
+        // carries user-signed bounds, thread them through instead of hard-coding 0.
         PerpTradePayload::new(
             intent_id_to_b256(&self.intent_id.to_string())?,
             self.buyer.clone(),
@@ -59,6 +63,8 @@ impl ExecutionIntent {
             u128::from(self.market_id),
             self.size_1e8,
             self.price_1e8,
+            0,
+            0,
             buyer_is_maker,
             u128::from(buyer_nonce),
             u128::from(seller_nonce),

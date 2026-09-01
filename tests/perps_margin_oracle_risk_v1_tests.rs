@@ -93,6 +93,8 @@ fn base_input(
         reduce_only: false,
         isolated_margin_1e8: IM_10X,
         client_order_id: None,
+        max_execution_price_1e8: 0,
+        min_execution_price_1e8: 0,
     }
 }
 
@@ -505,6 +507,8 @@ async fn order_notional_cap_rejects_when_price_pushes_over_100k() {
             reduce_only: false,
             isolated_margin_1e8: 15_000 * ONE,
             client_order_id: None,
+            max_execution_price_1e8: 0,
+            min_execution_price_1e8: 0,
         },
     )
     .await

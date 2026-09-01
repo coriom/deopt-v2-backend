@@ -12,6 +12,18 @@ pub struct PerpTradePayload {
     pub market_id: u128,
     pub size_delta_1e8: u128,
     pub execution_price_1e8: u128,
+    /// PERPS-PRICING-AND-EXECUTION-SAFETY-CORE-V1 — buyer's max
+    /// acceptable execution price (`1e8`). `0` == strict (must equal
+    /// `execution_price_1e8`, legacy V1 behaviour). Non-zero requires
+    /// `execution_price_1e8 <= max_execution_price_1e8` (inclusive).
+    /// Inserted between `execution_price_1e8` and `buyer_is_maker` to
+    /// mirror the Solidity `PerpTrade` struct field order exactly.
+    pub max_execution_price_1e8: u128,
+    /// PERPS-PRICING-AND-EXECUTION-SAFETY-CORE-V1 — seller's min
+    /// acceptable execution price (`1e8`). `0` == strict. Non-zero
+    /// requires `execution_price_1e8 >= min_execution_price_1e8`
+    /// (inclusive).
+    pub min_execution_price_1e8: u128,
     pub buyer_is_maker: bool,
     pub buyer_nonce: u128,
     pub seller_nonce: u128,
@@ -27,6 +39,8 @@ impl PerpTradePayload {
         market_id: u128,
         size_delta_1e8: u128,
         execution_price_1e8: u128,
+        max_execution_price_1e8: u128,
+        min_execution_price_1e8: u128,
         buyer_is_maker: bool,
         buyer_nonce: u128,
         seller_nonce: u128,
@@ -39,6 +53,8 @@ impl PerpTradePayload {
             market_id,
             size_delta_1e8,
             execution_price_1e8,
+            max_execution_price_1e8,
+            min_execution_price_1e8,
             buyer_is_maker,
             buyer_nonce,
             seller_nonce,
@@ -59,6 +75,27 @@ impl PerpTradePayload {
         }
         if self.execution_price_1e8 == 0 {
             return Err(BackendError::ZeroPrice);
+        }
+        // PERPS-PRICING-AND-EXECUTION-SAFETY-CORE-V1 — user-bound
+        // envelope checks. `0` reproduces V1 exact-price behaviour;
+        // non-zero enforces the inclusive bound. NEVER widen — a
+        // request whose bounds cannot honour the execution price is
+        // rejected here rather than silently relaxed.
+        if self.max_execution_price_1e8 != 0
+            && self.execution_price_1e8 > self.max_execution_price_1e8
+        {
+            return Err(BackendError::PerpsUserBoundAboveLimit(format!(
+                "execution_price_1e8 {} exceeds max_execution_price_1e8 {}",
+                self.execution_price_1e8, self.max_execution_price_1e8
+            )));
+        }
+        if self.min_execution_price_1e8 != 0
+            && self.execution_price_1e8 < self.min_execution_price_1e8
+        {
+            return Err(BackendError::PerpsUserBoundBelowLimit(format!(
+                "execution_price_1e8 {} below min_execution_price_1e8 {}",
+                self.execution_price_1e8, self.min_execution_price_1e8
+            )));
         }
         Ok(())
     }
@@ -179,7 +216,28 @@ impl PerpTradeDomain {
     }
 }
 
-pub const PERP_TRADE_TYPE: &str = "PerpTrade(bytes32 intentId,address buyer,address seller,uint256 marketId,uint128 sizeDelta1e8,uint128 executionPrice1e8,bool buyerIsMaker,uint256 buyerNonce,uint256 sellerNonce,uint256 deadline)";
+/// PERPS-PRICING-AND-EXECUTION-SAFETY-CORE-V1 — canonical Solidity
+/// `PerpTrade` type string. 12 fields; `maxExecutionPrice1e8` and
+/// `minExecutionPrice1e8` are inserted between `executionPrice1e8`
+/// and `buyerIsMaker`. Byte-frozen against the Solidity source of
+/// truth — the keccak256 of this string is
+/// `PERP_TRADE_TYPEHASH_HEX` below.
+pub const PERP_TRADE_TYPE: &str = "PerpTrade(bytes32 intentId,address buyer,address seller,uint256 marketId,uint128 sizeDelta1e8,uint128 executionPrice1e8,uint128 maxExecutionPrice1e8,uint128 minExecutionPrice1e8,bool buyerIsMaker,uint256 buyerNonce,uint256 sellerNonce,uint256 deadline)";
+
+/// PERPS-PRICING-AND-EXECUTION-SAFETY-CORE-V1 — the on-chain
+/// `TRADE_TYPEHASH` locked by the Solidity side. Any drift here means
+/// signatures the backend previews will NOT verify on-chain. Pinned
+/// by `perp_trade_typehash_matches_locked_value` below.
+pub const PERP_TRADE_TYPEHASH_HEX: &str =
+    "0x9ccd368c748c5e85df8e96f94ac1d47316abde07a2d78c4f1b10b91cb98942c3";
+
+/// Returns the runtime-computed EIP-712 typehash for `PerpTrade`.
+/// Prefer the constant `PERP_TRADE_TYPEHASH_HEX` when you need the
+/// hex form; this helper is here so integration tests can prove the
+/// runtime keccak matches the pinned constant byte-for-byte.
+pub fn perp_trade_typehash() -> [u8; 32] {
+    keccak256(PERP_TRADE_TYPE.as_bytes())
+}
 
 pub fn perp_trade_digest(payload: &PerpTradePayload, domain: &PerpTradeDomain) -> Result<String> {
     let domain_separator = domain_separator(domain)?;
@@ -224,14 +282,21 @@ fn perp_trade_hash(payload: &PerpTradePayload) -> Result<[u8; 32]> {
     let buyer = parse_evm_address(&payload.buyer)?;
     let seller = parse_evm_address(&payload.seller)?;
 
-    let mut encoded = Vec::with_capacity(352);
-    encoded.extend_from_slice(&keccak256(PERP_TRADE_TYPE.as_bytes()));
+    // PERPS-PRICING-AND-EXECUTION-SAFETY-CORE-V1 — the encoded body
+    // includes `maxExecutionPrice1e8` + `minExecutionPrice1e8` in the
+    // SAME POSITION as the Solidity struct (between
+    // `executionPrice1e8` and `buyerIsMaker`). Field count grows from
+    // 10 → 12; capacity bumped accordingly.
+    let mut encoded = Vec::with_capacity(416);
+    encoded.extend_from_slice(&perp_trade_typehash());
     encoded.extend_from_slice(payload.intent_id.as_slice());
     encoded.extend_from_slice(&encode_address(&buyer));
     encoded.extend_from_slice(&encode_address(&seller));
     encoded.extend_from_slice(&encode_u128(payload.market_id));
     encoded.extend_from_slice(&encode_u128(payload.size_delta_1e8));
     encoded.extend_from_slice(&encode_u128(payload.execution_price_1e8));
+    encoded.extend_from_slice(&encode_u128(payload.max_execution_price_1e8));
+    encoded.extend_from_slice(&encode_u128(payload.min_execution_price_1e8));
     encoded.extend_from_slice(&encode_bool(payload.buyer_is_maker));
     encoded.extend_from_slice(&encode_u128(payload.buyer_nonce));
     encoded.extend_from_slice(&encode_u128(payload.seller_nonce));
@@ -347,6 +412,8 @@ mod tests {
             1,
             10,
             100,
+            0, // max_execution_price_1e8 — strict (legacy V1 shape)
+            0, // min_execution_price_1e8 — strict
             true,
             11,
             12,
@@ -366,6 +433,8 @@ mod tests {
             1,
             10,
             100,
+            0, // max_execution_price_1e8 — strict (legacy V1 shape)
+            0, // min_execution_price_1e8 — strict
             true,
             11,
             12,
@@ -385,6 +454,8 @@ mod tests {
             1,
             10,
             100,
+            0, // max_execution_price_1e8 — strict (legacy V1 shape)
+            0, // min_execution_price_1e8 — strict
             true,
             11,
             12,
@@ -445,6 +516,8 @@ mod tests {
                 1,
                 10,
                 100,
+                0, // max_execution_price_1e8 — strict (legacy V1 shape)
+                0, // min_execution_price_1e8 — strict
                 true,
                 11,
                 12,
@@ -471,6 +544,93 @@ mod tests {
         );
     }
 
+    /// PERPS-PRICING-AND-EXECUTION-SAFETY-CORE-V1 — wire-lock. Freezes
+    /// the byte value of `PERP_TRADE_TYPEHASH_HEX` against the Solidity
+    /// source of truth (`PerpMatchingEngine.TRADE_TYPEHASH`). Any drift
+    /// here means backend-generated signature previews will NOT verify
+    /// on-chain. This test is the earliest place the ripple surfaces.
+    #[test]
+    fn perp_trade_typehash_matches_locked_value() {
+        let expected = "0x9ccd368c748c5e85df8e96f94ac1d47316abde07a2d78c4f1b10b91cb98942c3";
+        assert_eq!(PERP_TRADE_TYPEHASH_HEX, expected);
+        let computed = perp_trade_typehash();
+        let mut hex = String::with_capacity(66);
+        hex.push_str("0x");
+        for byte in computed {
+            hex.push_str(&format!("{byte:02x}"));
+        }
+        assert_eq!(hex.as_str(), expected);
+    }
+
+    /// PERPS-PRICING-AND-EXECUTION-SAFETY-CORE-V1 — user-bound envelope
+    /// fail-closed. A payload whose executionPrice exceeds the buyer's
+    /// max MUST be rejected by validate_shape(); silent passthrough
+    /// would let the matcher forge a fill outside the user's tolerance.
+    #[test]
+    fn validate_shape_rejects_execution_price_above_max_bound() {
+        // `new()` runs `validate()` internally; the error surfaces
+        // at construction time before any state is captured.
+        let err = PerpTradePayload::new(
+            intent_id_to_b256("00000000-0000-0000-0000-000000000001").unwrap(),
+            AccountId::new("0x0000000000000000000000000000000000000001"),
+            AccountId::new("0x0000000000000000000000000000000000000002"),
+            1,
+            10,
+            200,
+            150, // max: 150; execution: 200 → out of band
+            0,
+            true,
+            11,
+            12,
+            123,
+        )
+        .unwrap_err();
+        assert!(matches!(err, BackendError::PerpsUserBoundAboveLimit(_)));
+    }
+
+    /// Symmetric: executionPrice below seller's min bound.
+    #[test]
+    fn validate_shape_rejects_execution_price_below_min_bound() {
+        let err = PerpTradePayload::new(
+            intent_id_to_b256("00000000-0000-0000-0000-000000000001").unwrap(),
+            AccountId::new("0x0000000000000000000000000000000000000001"),
+            AccountId::new("0x0000000000000000000000000000000000000002"),
+            1,
+            10,
+            80,
+            0,
+            100, // min: 100; execution: 80 → out of band
+            true,
+            11,
+            12,
+            123,
+        )
+        .unwrap_err();
+        assert!(matches!(err, BackendError::PerpsUserBoundBelowLimit(_)));
+    }
+
+    /// Both bounds set + executionPrice inside → passes. Confirms the
+    /// legacy-strict path (both 0) and the new bounded path both work.
+    #[test]
+    fn validate_shape_accepts_execution_price_inside_bounds() {
+        let payload = PerpTradePayload::new(
+            intent_id_to_b256("00000000-0000-0000-0000-000000000001").unwrap(),
+            AccountId::new("0x0000000000000000000000000000000000000001"),
+            AccountId::new("0x0000000000000000000000000000000000000002"),
+            1,
+            10,
+            100,
+            110, // max: 110
+            90,  // min: 90 — execution 100 sits inside
+            true,
+            11,
+            12,
+            123,
+        )
+        .unwrap();
+        payload.validate().unwrap();
+    }
+
     fn valid_payload() -> PerpTradePayload {
         PerpTradePayload::new(
             intent_id_to_b256("00000000-0000-0000-0000-000000000001").unwrap(),
@@ -479,6 +639,8 @@ mod tests {
             1,
             10,
             100,
+            0, // max_execution_price_1e8 — strict (legacy V1 shape)
+            0, // min_execution_price_1e8 — strict
             true,
             11,
             12,

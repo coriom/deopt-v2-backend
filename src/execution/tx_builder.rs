@@ -196,6 +196,8 @@ mod tests {
             1,
             100_000_000,
             300_000_000_000,
+            0, // max_execution_price_1e8 — strict (legacy V1 shape)
+            0, // min_execution_price_1e8 — strict
             true,
             11,
             12,

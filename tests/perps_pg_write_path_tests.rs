@@ -129,6 +129,8 @@ async fn in_memory_execution_still_works_when_repository_is_absent() {
                 reduce_only: false,
                 isolated_margin_1e8: 300 * ONE,
                 client_order_id: None,
+                max_execution_price_1e8: 0,
+                min_execution_price_1e8: 0,
             },
         )
         .await
