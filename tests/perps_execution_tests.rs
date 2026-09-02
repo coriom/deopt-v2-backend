@@ -1190,3 +1190,92 @@ async fn scenario_12_market_order_no_acceptable_liquidity() {
         )
         .is_none());
 }
+
+/// Scenario 13 — Market Sell sweeps bids best→worse (high price
+/// first, low price last). Symmetric to scenario 9 for the sell side.
+/// Two resting bids at $3100 and $3000. Market sell 0.75 ETH with a
+/// `min_execution_price_1e8` bound BELOW both bids: walker consumes
+/// the top bid ($3100 for 0.5 ETH), then the second ($3000 for 0.25
+/// ETH), cancels any remainder. Proves the walker's bid-side sort +
+/// stop-conditions mirror the ask-side path.
+#[tokio::test]
+async fn scenario_13_market_sell_sweeps_bids_best_to_worst() {
+    let state = state();
+    let cfg = state.perps_read_config.clone();
+    let reader = fresh_price_reader();
+    // Two resting bids. Insertion order deliberately not best-first:
+    // the walker MUST use price-time priority (bids descending), so
+    // the $3100 bid ships FIRST even though it was submitted SECOND.
+    {
+        let mut orders = state.perp_order_store.lock().unwrap();
+        let mut positions = state.perp_positions_store.lock().unwrap();
+        // $3000 bid, 0.25 ETH (submitted first).
+        submit_perp_order_internal(
+            &cfg,
+            &mut orders,
+            &mut positions,
+            &reader,
+            base_input(
+                addr("0x0000000000000000000000000000000000000aaa"),
+                PerpOrderSide::Buy,
+                PRICE_ETH_3000,
+                ONE / 4,
+            ),
+        )
+        .await
+        .unwrap();
+        // $3100 bid, 0.5 ETH (submitted second — higher price, better bid).
+        submit_perp_order_internal(
+            &cfg,
+            &mut orders,
+            &mut positions,
+            &reader,
+            base_input(
+                addr("0x0000000000000000000000000000000000000aab"),
+                PerpOrderSide::Buy,
+                PRICE_ETH_3100,
+                ONE / 2,
+            ),
+        )
+        .await
+        .unwrap();
+    }
+    // Market sell 0.75 ETH with a bound at $3000 (accepts both bids).
+    let outcome = {
+        let mut orders = state.perp_order_store.lock().unwrap();
+        let mut positions = state.perp_positions_store.lock().unwrap();
+        submit_perp_order_internal(
+            &cfg,
+            &mut orders,
+            &mut positions,
+            &reader,
+            SubmitPerpOrderInput {
+                price_1e8: 0, // market
+                min_execution_price_1e8: PRICE_ETH_3000, // accepts both
+                time_in_force: PerpTimeInForce::Ioc,
+                isolated_margin_1e8: MARGIN_10X_ETH,
+                ..base_input(
+                    addr("0x0000000000000000000000000000000000000bbb"),
+                    PerpOrderSide::Sell,
+                    0,
+                    (3 * ONE) / 4,
+                )
+            },
+        )
+        .await
+        .unwrap()
+    };
+    assert_eq!(outcome.fills.len(), 2, "walker consumed both resting bids");
+    // First fill MUST be the $3100 bid (best-first sort), NOT the
+    // $3000 bid even though $3000 was submitted first in wall time.
+    assert_eq!(
+        outcome.fills[0].price_1e8, PRICE_ETH_3100,
+        "walker took the top bid first"
+    );
+    assert_eq!(outcome.fills[0].size_1e8, ONE / 2);
+    assert_eq!(outcome.fills[1].price_1e8, PRICE_ETH_3000);
+    assert_eq!(outcome.fills[1].size_1e8, ONE / 4);
+    assert_eq!(outcome.order.filled_size_1e8, (3 * ONE) / 4);
+    assert_eq!(outcome.order.remaining_size_1e8, 0);
+    assert_eq!(outcome.order.status, PerpOrderStatus::Filled);
+}

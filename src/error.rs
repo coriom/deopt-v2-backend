@@ -237,6 +237,27 @@ pub enum BackendError {
     PerpsMarketOrderNoAcceptableLiquidity(String),
     #[error("perp protocol reference price is unavailable: {0}")]
     PerpsProtocolReferencePriceUnavailable(String),
+    // PERPS-FULLSTACK-RUNTIME-INTEGRATION-V1 Part D — closed-test
+    // signed-intent endpoint failures. These sit alongside the
+    // existing Perps errors so operators can distinguish an EIP-712
+    // signature failure from a shape mismatch from a replay from a
+    // stale deadline. `PerpsIntentSignatureInvalid` is deliberately
+    // opaque (401) — it collapses ecrecover / parse / trader-mismatch
+    // so callers cannot use the endpoint as a signature oracle. The
+    // separate `PerpsIntentTraderMismatch` variant exists for internal
+    // clarity but is currently only used by the pure-Rust
+    // `verify_perp_order_intent` helper's return value; the HTTP
+    // handler maps both to the same 401 response.
+    #[error("perp order intent signature is invalid")]
+    PerpsIntentSignatureInvalid,
+    #[error("perp order intent trader does not match recovered signer")]
+    PerpsIntentTraderMismatch,
+    #[error("perp order intent deadline has expired")]
+    PerpsIntentDeadlineExpired,
+    #[error("perp order intent nonce has already been consumed")]
+    PerpsIntentNonceReplay,
+    #[error("perp order intent side/bound configuration is inconsistent: {0}")]
+    PerpsIntentSideBoundInconsistent(String),
     // SUBACCOUNTS-CORE-BACKEND-V1
     #[error("subaccount not found")]
     SubaccountNotFound,

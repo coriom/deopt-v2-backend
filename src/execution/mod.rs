@@ -2,6 +2,7 @@ pub mod abi;
 pub mod config;
 pub mod executor;
 pub mod intent;
+pub mod perp_order_intent;
 pub mod perp_trade;
 pub mod queue;
 pub mod remote_signer;
@@ -18,6 +19,12 @@ pub use abi::{encode_execute_trade_calldata, execute_trade_selector};
 pub use config::{ExecutionConfig, ExecutionStatus, PrivateKeySecret};
 pub use executor::{ExecutionIntentRepository, ExecutionTickResult, Executor, RepositoryFuture};
 pub use intent::{ExecutionIntent, ExecutionIntentStatus};
+pub use perp_order_intent::{
+    perp_order_intent_digest, perp_order_intent_hash, perp_order_intent_typehash,
+    validate_shape as validate_perp_order_intent_shape, verify_perp_order_intent, PerpOrderIntent,
+    PERP_ORDER_INTENT_SIDE_BUY, PERP_ORDER_INTENT_SIDE_SELL, PERP_ORDER_INTENT_TYPE,
+    PERP_ORDER_INTENT_TYPEHASH_HEX,
+};
 pub use perp_trade::{
     b256_to_hex_bytes32, intent_id_to_b256, intent_id_to_hex_bytes32, perp_trade_digest,
     PerpTradeDomain, PerpTradePayload, PerpTradeSignatureBundle, StoredTradeSignatures,

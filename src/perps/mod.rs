@@ -28,6 +28,10 @@ pub mod execution_pg;
 pub mod fills;
 pub mod funding;
 pub mod funding_pg;
+pub mod impact_mid;
+pub mod impact_mid_cache;
+pub mod impact_mid_keeper;
+pub mod intent_nonce_store;
 pub mod lifecycle;
 pub mod liquidation;
 pub mod liquidation_pg;
@@ -104,3 +108,13 @@ pub use workers::{
     spawn_perps_liquidation_worker, PerpsFundingWorkerConfig, PerpsLiquidationWorkerConfig,
     PerpsWorkerStaleOraclePolicy, PerpsWorkerTickRecord,
 };
+
+pub use impact_mid::{
+    impact_mid, impact_price_walk, ImpactMidSample, InsufficientDepth, Level as ImpactMidLevel,
+};
+pub use impact_mid_cache::{ImpactMidCache, ImpactMidState, ImpactMidUnavailableReason};
+pub use impact_mid_keeper::{
+    run_perps_impact_mid_tick_once, spawn_perps_impact_mid_keeper, PerpsImpactMidKeeperConfig,
+    PerpsImpactMidMarketConfig,
+};
+pub use intent_nonce_store::PerpOrderIntentNonceStore;

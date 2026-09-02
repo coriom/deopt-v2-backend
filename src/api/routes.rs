@@ -15,10 +15,11 @@ use crate::db::PgRepository;
 use crate::error::{BackendError, Result as BackendResult};
 use crate::execution::{
     b256_to_hex_bytes32, build_execution_transaction_request, ensure_no_submitted_transaction,
-    perp_trade_digest, simulate_execution_intent, DecodedRevertError, ExecutionIntentStatus,
-    ExecutionTransaction, ExecutionTransactionStatus, Executor, ExecutorSigner,
-    HttpJsonRpcProvider, PerpTradeDomain, PerpTradePayload, SimulationResult,
-    StoredTradeSignatures, TransactionBroadcastProvider, TransactionReceiptProvider,
+    perp_trade_digest, simulate_execution_intent, verify_perp_order_intent, DecodedRevertError,
+    ExecutionIntentStatus, ExecutionTransaction, ExecutionTransactionStatus, Executor,
+    ExecutorSigner, HttpJsonRpcProvider, PerpOrderIntent, PerpTradeDomain, PerpTradePayload,
+    SimulationResult, StoredTradeSignatures, TransactionBroadcastProvider,
+    TransactionReceiptProvider, PERP_ORDER_INTENT_SIDE_BUY, PERP_ORDER_INTENT_SIDE_SELL,
     PERP_TRADE_TYPE,
 };
 use crate::fees::service::{
@@ -352,6 +353,14 @@ pub fn router(state: AppState) -> Router {
         // permanently fail-closed regardless of this flag.
         .route("/perps/orders", post(perps_submit_order))
         .route("/perps/orders/:order_id", delete(perps_cancel_order))
+        // PERPS-FULLSTACK-RUNTIME-INTEGRATION-V1 Part D — closed-test
+        // signed-intent submit surface. Default fail-closed:
+        // returns 503 `PerpsNotLive` when the closed-test flag is off
+        // or when the caller isn't allowlisted. Not exposed to
+        // mainnet (startup validation refuses `perps_closed_test_enabled`
+        // on mainnet chain ids). Public trading MUST be off — this
+        // endpoint is closed-test only for V1.
+        .route("/perps/orders/signed", post(perps_submit_signed_order))
         .route("/orderbook/:market_id", get(orderbook))
         .route(
             "/options/series",
@@ -3286,6 +3295,313 @@ async fn perps_cancel_order(
         order: crate::perps::service::build_perp_order_view(&order),
         chain_id: state.perps_read_config.chain_id,
         trading_enabled: true,
+    }))
+}
+
+// =====================================================================
+// PERPS-FULLSTACK-RUNTIME-INTEGRATION-V1 Part D — signed `PerpOrderIntent`
+// closed-test endpoint.
+// =====================================================================
+
+/// Wire body for `POST /perps/orders/signed`. All 1e8 / u128 fields are
+/// serialised as decimal strings to avoid the JSON number precision
+/// cliff at 2^53. Field names match the Solidity struct exactly so
+/// off-chain signing tooling can share JSON shapes.
+#[derive(Clone, Debug, Deserialize)]
+struct PerpsSubmitSignedOrderHttpRequest {
+    intent: PerpOrderIntentWire,
+    signature: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct PerpOrderIntentWire {
+    #[serde(rename = "intentId")]
+    intent_id: String,
+    trader: String,
+    #[serde(rename = "subaccountId")]
+    subaccount_id: u32,
+    /// Decimal string; matches the on-chain `uint256 marketId`. Backend
+    /// resolves this to a seeded `PerpsReadMarket.onchain_market_id` to
+    /// recover the human symbol used by the internal execution engine.
+    #[serde(rename = "marketId")]
+    market_id: String,
+    /// `0` = buy, `1` = sell.
+    side: u8,
+    #[serde(rename = "size1e8")]
+    size_1e8: String,
+    #[serde(rename = "limitPrice1e8")]
+    limit_price_1e8: String,
+    #[serde(rename = "maxExecPrice1e8")]
+    max_exec_price_1e8: String,
+    #[serde(rename = "minExecPrice1e8")]
+    min_exec_price_1e8: String,
+    /// Decimal string; per-trader monotonic nonce.
+    nonce: String,
+    /// Decimal string; unix seconds.
+    deadline: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct PerpsSubmitSignedOrderHttpResponse {
+    status: &'static str,
+    order: crate::perps::PerpOrderView,
+    fills: Vec<crate::perps::PerpFillView>,
+    chain_id: u64,
+    trading_enabled: bool,
+    /// Whether the closed-test surface accepted the request; always
+    /// `true` when this body is returned. `false` never appears — the
+    /// closed-test rejection path returns a structured error status.
+    closed_test_accepted: bool,
+}
+
+fn parse_u128_intent_field(field: &str, raw: &str) -> Result<u128, ApiError> {
+    raw.parse::<u128>().map_err(|_| {
+        ApiError::from(BackendError::Config(format!(
+            "perps signed intent: {field} must be a base-10 u128; got `{raw}`"
+        )))
+    })
+}
+
+fn parse_b256_from_hex(field: &str, raw: &str) -> Result<alloy_primitives::B256, ApiError> {
+    let stripped = raw.strip_prefix("0x").ok_or_else(|| {
+        ApiError::from(BackendError::Config(format!(
+            "perps signed intent: {field} must be a 0x-prefixed 32-byte hex; got `{raw}`"
+        )))
+    })?;
+    if stripped.len() != 64 {
+        return Err(ApiError::from(BackendError::Config(format!(
+            "perps signed intent: {field} must be exactly 32 bytes (64 hex chars); got `{raw}`"
+        ))));
+    }
+    let mut bytes = [0u8; 32];
+    for (i, b) in bytes.iter_mut().enumerate() {
+        let hi = decode_hex_nibble(stripped.as_bytes()[i * 2]).ok_or_else(|| {
+            ApiError::from(BackendError::Config(format!(
+                "perps signed intent: {field} has non-hex character"
+            )))
+        })?;
+        let lo = decode_hex_nibble(stripped.as_bytes()[i * 2 + 1]).ok_or_else(|| {
+            ApiError::from(BackendError::Config(format!(
+                "perps signed intent: {field} has non-hex character"
+            )))
+        })?;
+        *b = (hi << 4) | lo;
+    }
+    Ok(alloy_primitives::B256::from(bytes))
+}
+
+fn decode_hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+impl PerpOrderIntentWire {
+    fn into_intent(self) -> Result<PerpOrderIntent, ApiError> {
+        Ok(PerpOrderIntent {
+            intent_id: parse_b256_from_hex("intentId", &self.intent_id)?,
+            trader: crate::types::AccountId::new(self.trader),
+            subaccount_id: self.subaccount_id,
+            market_id: parse_u128_intent_field("marketId", &self.market_id)?,
+            side: self.side,
+            size_1e8: parse_u128_intent_field("size1e8", &self.size_1e8)?,
+            limit_price_1e8: parse_u128_intent_field("limitPrice1e8", &self.limit_price_1e8)?,
+            max_exec_price_1e8: parse_u128_intent_field(
+                "maxExecPrice1e8",
+                &self.max_exec_price_1e8,
+            )?,
+            min_exec_price_1e8: parse_u128_intent_field(
+                "minExecPrice1e8",
+                &self.min_exec_price_1e8,
+            )?,
+            nonce: parse_u128_intent_field("nonce", &self.nonce)?,
+            deadline: parse_u128_intent_field("deadline", &self.deadline)?,
+        })
+    }
+}
+
+/// PERPS-FULLSTACK-RUNTIME-INTEGRATION-V1 Part D — closed-test surface
+/// for submitting a signed `PerpOrderIntent`. The layered fail-closed
+/// order matches the specification verbatim:
+///
+/// 1. `perps_closed_test_enabled` off → 503 `PerpsNotLive`. (Layer 1)
+/// 2. `perps_public_trading_enabled` on → 503 `PerpsNotLive` — this
+///    endpoint is closed-test-only for V1. (Layer 2)
+/// 3. Parse the intent + signature.
+/// 4. EIP-712 verify: recovered signer must equal `intent.trader`.
+///    Failures collapse to 401 `PerpsIntentSignatureInvalid` so the
+///    endpoint cannot be used as a signature oracle.
+/// 5. Allowlist gate: non-listed trader → 503 `PerpsNotLive` (mirrors
+///    the closed-test posture; does NOT reveal allowlist membership
+///    via a distinct 401/403).
+/// 6. Shape gate: `validate_shape` (side / bound consistency).
+/// 7. Deadline gate: `now_sec > deadline` → 422
+///    `PerpsIntentDeadlineExpired`.
+/// 8. Nonce gate: `try_consume` on the process-local store → 409
+///    `PerpsIntentNonceReplay` on collision.
+/// 9. Convert to `SubmitPerpOrderInput`; dispatch to the internal
+///    engine (PG when repository present, otherwise in-memory).
+async fn perps_submit_signed_order(
+    State(state): State<AppState>,
+    Json(req): Json<PerpsSubmitSignedOrderHttpRequest>,
+) -> Result<Json<PerpsSubmitSignedOrderHttpResponse>, ApiError> {
+    // Layer 1 — closed-test off → 503. Public-trading flag alone does
+    // NOT enable this endpoint; the closed-test posture requires the
+    // dedicated flag.
+    if !state.perps_closed_test_enabled {
+        state.perps_observability.record_perps_not_live_reject();
+        return Err(BackendError::PerpsNotLive.into());
+    }
+    // Layer 2 — this endpoint is closed-test-only for V1. If public
+    // trading is on we fail closed rather than silently promoting the
+    // signed-intent surface (public trading has its own submit path).
+    if state.perps_public_trading_enabled {
+        state.perps_observability.record_perps_not_live_reject();
+        return Err(BackendError::PerpsNotLive.into());
+    }
+
+    // Layer 3 — parse the intent (before touching signature verification).
+    let intent = req.intent.into_intent()?;
+    let signature = req.signature;
+
+    // Layer 4 — EIP-712 verify. Recovered signer must match the
+    // declared trader. Any failure collapses to 401
+    // `PerpsIntentSignatureInvalid`. We do NOT differentiate between
+    // "malformed signature", "recovery failed", and "signer mismatch"
+    // — collapsing them prevents the endpoint from being probed as a
+    // signature oracle.
+    let domain = PerpTradeDomain::new(
+        state.perps_read_config.chain_id,
+        state.execution_config.perp_matching_engine_address.clone(),
+    );
+    verify_perp_order_intent(&intent, &domain, &signature)
+        .map_err(|_| ApiError::from(BackendError::PerpsIntentSignatureInvalid))?;
+
+    // Layer 5 — allowlist gate. We fail with `PerpsNotLive` (not a
+    // 401/403) so the endpoint cannot be probed for allowlist
+    // membership. `perps_closed_test_allows` also checks the flag; we
+    // already gated on the flag in Layer 1 but re-check for safety.
+    if !state.perps_closed_test_allows(&intent.trader) {
+        state.perps_observability.record_closed_test_access_denied();
+        return Err(BackendError::PerpsNotLive.into());
+    }
+
+    // Layer 6 — pure-Rust shape validation.
+    crate::execution::validate_perp_order_intent_shape(&intent)?;
+
+    // Layer 7 — deadline. `now_ms() / 1000` matches the on-chain
+    // `block.timestamp` comparison the Solidity path performs.
+    let now_sec = (crate::types::now_ms() / 1000) as u128;
+    if now_sec > intent.deadline {
+        return Err(BackendError::PerpsIntentDeadlineExpired.into());
+    }
+
+    // Layer 8 — atomic nonce consumption. The store is process-local;
+    // a duplicate `(trader, nonce)` within one process lifetime is
+    // rejected. Restart-clears (see module doc).
+    state
+        .perp_order_intent_nonce_store
+        .try_consume(&intent.trader, intent.nonce)?;
+
+    // Layer 9 — resolve the u128 on-chain market id back to the human
+    // symbol used by the internal engine. A market the backend hasn't
+    // been configured with is rejected with `PerpsMarketNotFound`.
+    let market_row = state
+        .perps_read_config
+        .markets
+        .iter()
+        .find(|m| (m.onchain_market_id as u128) == intent.market_id)
+        .ok_or_else(|| {
+            ApiError::from(BackendError::PerpsMarketNotFound(intent.market_id.to_string()))
+        })?;
+    let market_symbol = market_row.symbol.clone();
+
+    let side = match intent.side {
+        PERP_ORDER_INTENT_SIDE_BUY => crate::perps::PerpOrderSide::Buy,
+        PERP_ORDER_INTENT_SIDE_SELL => crate::perps::PerpOrderSide::Sell,
+        other => {
+            return Err(BackendError::PerpsIntentSideBoundInconsistent(format!(
+                "unknown side sentinel {other}"
+            ))
+            .into());
+        }
+    };
+
+    let submit_input = crate::perps::SubmitPerpOrderInput {
+        account: intent.trader.clone(),
+        subaccount_id: intent.subaccount_id,
+        market_id: market_symbol,
+        side,
+        price_1e8: intent.limit_price_1e8,
+        size_1e8: intent.size_1e8,
+        // V1 signed-intent endpoint fixes TIF at GTC — the intent
+        // struct does not carry a TIF field; matching-engine execution
+        // semantics stay identical to the existing internal path.
+        time_in_force: crate::perps::PerpTimeInForce::Gtc,
+        post_only: false,
+        reduce_only: false,
+        // The signed-intent surface does not carry isolated margin
+        // in the intent struct (mirrors the Solidity struct). Callers
+        // seed a fixed development margin at intent construction time
+        // through a separate deposit path; V1 accepts `0` here so the
+        // internal engine's own margin path can gate. Non-reduce
+        // fills against a zero-margin account will fail-closed at the
+        // margin-check stage — this is honest, not fake.
+        isolated_margin_1e8: 0,
+        client_order_id: None,
+        max_execution_price_1e8: intent.max_exec_price_1e8,
+        min_execution_price_1e8: intent.min_exec_price_1e8,
+    };
+
+    // Layer 10 — dispatch to the internal engine.
+    //
+    // Enabled-path submit is durable-only (mirrors the public
+    // `POST /perps/orders` handler): the in-memory dispatcher holds
+    // `std::sync::MutexGuard`s across `.await` and produces a
+    // non-`Send` future which axum cannot accept as a handler. When
+    // no PG repository is wired, we return 503 `PerpsNotLive`. The
+    // pure Rust intent verification path (typehash / digest / verify /
+    // validate_shape / nonce-consume / deadline) is exercised by the
+    // unit tests in `execution::perp_order_intent::tests` and by the
+    // handler-level fail-closed tests that short-circuit BEFORE this
+    // dispatch.
+    let Some(repository) = state.repository.clone() else {
+        return Err(BackendError::PerpsNotLive.into());
+    };
+
+    // RPC-backed oracle reader (production shape). Matches the
+    // public `/perps/orders` handler exactly — the in-memory reader
+    // override (`state.perps_signed_intent_price_reader`) is intended
+    // for the test harness path invoked at the module level in
+    // `tests/perps_signed_intent_v1_tests.rs`, not through the axum
+    // Handler surface (a two-branch generic dispatch here breaks the
+    // Send bound on the returned future).
+    let reader = build_perp_oracle_price_reader(&state)?;
+    let outcome = crate::perps::submit_perp_order_via_repository(
+        &state.perps_read_config,
+        &repository,
+        &reader,
+        &state.lifecycle_events,
+        submit_input,
+    )
+    .await?;
+
+    let order_view = crate::perps::service::build_perp_order_view(&outcome.order);
+    let fills: Vec<crate::perps::PerpFillView> = outcome
+        .fills
+        .iter()
+        .map(|f| crate::perps::service::build_perp_fill_view(f, &intent.trader))
+        .collect();
+    Ok(Json(PerpsSubmitSignedOrderHttpResponse {
+        status: "ok",
+        order: order_view,
+        fills,
+        chain_id: state.perps_read_config.chain_id,
+        trading_enabled: false,
+        closed_test_accepted: true,
     }))
 }
 
@@ -15153,6 +15469,16 @@ impl From<BackendError> for ApiError {
             | BackendError::PerpInvalidTifCombination(_)
             | BackendError::PerpSelfTrade => StatusCode::UNPROCESSABLE_ENTITY,
             BackendError::PerpDuplicateClientOrderId(_) => StatusCode::CONFLICT,
+            // PERPS-FULLSTACK-RUNTIME-INTEGRATION-V1 Part D — signed
+            // intent endpoint. Signature failures collapse to 401 so
+            // the endpoint cannot be probed as a signature oracle.
+            // Deadline is 422 (request well-formed, cannot honour).
+            // Nonce replay is 409 (conflict). Shape mismatch is 422.
+            BackendError::PerpsIntentSignatureInvalid
+            | BackendError::PerpsIntentTraderMismatch => StatusCode::UNAUTHORIZED,
+            BackendError::PerpsIntentDeadlineExpired => StatusCode::UNPROCESSABLE_ENTITY,
+            BackendError::PerpsIntentNonceReplay => StatusCode::CONFLICT,
+            BackendError::PerpsIntentSideBoundInconsistent(_) => StatusCode::UNPROCESSABLE_ENTITY,
             // SUBACCOUNTS-CORE-BACKEND-V1
             BackendError::SubaccountNotFound => StatusCode::NOT_FOUND,
             BackendError::InvalidSubaccountRequest(_) => StatusCode::BAD_REQUEST,

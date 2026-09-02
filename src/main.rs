@@ -19,7 +19,9 @@ use deopt_v2_backend::options::{
     spawn_option_confirmation_worker, spawn_option_event_indexer,
     spawn_option_reconciliation_worker,
 };
-use deopt_v2_backend::perps::{spawn_perps_funding_worker, spawn_perps_liquidation_worker};
+use deopt_v2_backend::perps::{
+    spawn_perps_funding_worker, spawn_perps_impact_mid_keeper, spawn_perps_liquidation_worker,
+};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{watch, RwLock};
@@ -139,6 +141,10 @@ async fn main() -> deopt_v2_backend::Result<()> {
     // ticks in `routes.rs` consult `tick_enabled` too.
     state.perps_funding_worker_config = config.perps_funding_worker.clone();
     state.perps_liquidation_worker_config = config.perps_liquidation_worker.clone();
+    // PERPS-FULLSTACK-RUNTIME-INTEGRATION-V1 Part B — impact-mid keeper
+    // config. Cache stays as-constructed (`ImpactMidCache::new()` at
+    // AppState build); the keeper populates it once spawned.
+    state.perps_impact_mid_keeper_config = config.perps_impact_mid_keeper.clone();
     // OPTIONS-CONDITIONAL-ORDERS-PERSISTENT-E2E-V1 — read worker env
     // vars. Defaults are safe (enabled=false) so this is a no-op for
     // any operator who has not opted in.
@@ -172,6 +178,55 @@ async fn main() -> deopt_v2_backend::Result<()> {
     // HTTP ticks so the two surfaces cannot diverge.
     spawn_perps_funding_worker(state.clone());
     spawn_perps_liquidation_worker(state.clone());
+    // PERPS-FULLSTACK-RUNTIME-INTEGRATION-V1 Part B — impact-mid keeper.
+    // Off by default. Requires an RPC URL for the oracle index read;
+    // when `enabled=true` but no RPC is configured we downgrade to a
+    // WARN + no spawn (matches the executor / liquidation worker
+    // posture: never fabricate a reader). Base mainnet was already
+    // refused by `PerpsImpactMidKeeperConfig::validate_startup` above.
+    if state.perps_impact_mid_keeper_config.enabled {
+        match state.perps_read_config.rpc_url.clone() {
+            Some(rpc_url) => {
+                let provider =
+                    deopt_v2_backend::execution::rpc::HttpJsonRpcProvider::new(rpc_url);
+                match deopt_v2_backend::perps::PerpOracleRouterRpcReader::new(
+                    provider,
+                    &state.perps_read_config,
+                ) {
+                    Ok(reader) => {
+                        let _keeper_handle = spawn_perps_impact_mid_keeper(
+                            state.perps_impact_mid_keeper_config.clone(),
+                            state.perps_read_config.clone(),
+                            state.perp_order_store.clone(),
+                            std::sync::Arc::new(reader),
+                            state.perp_impact_mid_cache.clone(),
+                            None,
+                        );
+                        info!(
+                            worker = "perps_impact_mid_keeper",
+                            enabled = true,
+                            markets = state.perps_impact_mid_keeper_config.markets.len(),
+                            interval_ms = state.perps_impact_mid_keeper_config.tick_interval_ms,
+                            "perps impact-mid keeper spawned"
+                        );
+                    }
+                    Err(err) => {
+                        warn!(
+                            worker = "perps_impact_mid_keeper",
+                            %err,
+                            "perps impact-mid keeper: could not construct oracle reader; not spawning"
+                        );
+                    }
+                }
+            }
+            None => {
+                warn!(
+                    worker = "perps_impact_mid_keeper",
+                    "perps impact-mid keeper is enabled but PERPS/RPC_URL is unset; not spawning"
+                );
+            }
+        }
+    }
     // BACKEND-HYBRID-V2-LIVE-CHAIN-SOURCE-AND-WORKER-ACTIVATION-V1 —
     // Real live-chain worker spawn. When `HYBRID_V2_ENABLED=true`:
     //   1. Persistence must be enabled (canonical route contract).

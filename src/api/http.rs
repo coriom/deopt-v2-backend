@@ -165,6 +165,21 @@ pub struct AppState {
     /// closed-test guard on Perps mutations. Env:
     /// `PERPS_CLOSED_TEST_ALLOWLIST` (comma-separated hex).
     pub perps_closed_test_allowlist: Vec<AccountId>,
+    /// PERPS-FULLSTACK-RUNTIME-INTEGRATION-V1 Part D — process-local
+    /// nonce consumption ledger for signed `PerpOrderIntent` requests
+    /// on `POST /perps/orders/signed`. Prevents replay within one
+    /// process lifetime; restart-clears (acceptable for the closed-test
+    /// posture — see module doc). Persistent ledgering lands with the
+    /// public-trading flip in a future milestone.
+    pub perp_order_intent_nonce_store: Arc<crate::perps::PerpOrderIntentNonceStore>,
+    /// PERPS-FULLSTACK-RUNTIME-INTEGRATION-V1 Part D — optional in-
+    /// memory oracle price reader used ONLY by the closed-test signed
+    /// intent endpoint when the RPC-backed reader cannot be constructed
+    /// (typical closed-test posture: no RPC url configured). Never
+    /// consulted by the public `/perps/orders` handler — that path
+    /// continues to require the RPC-backed reader. Default: `None`.
+    pub perps_signed_intent_price_reader:
+        Option<std::sync::Arc<dyn crate::perps::PerpOraclePriceReader + Send + Sync>>,
     /// PERPS-FUNDING-LIQUIDATION-WORKERS-V1 — periodic funding worker
     /// configuration. Default `disabled()`: both `worker_enabled` and
     /// `tick_enabled` are `false`. Both the periodic worker AND the
@@ -176,6 +191,20 @@ pub struct AppState {
     /// worker configuration. Same defaults + kill-switch semantics as
     /// `perps_funding_worker_config`.
     pub perps_liquidation_worker_config: crate::perps::PerpsLiquidationWorkerConfig,
+    /// PERPS-FULLSTACK-RUNTIME-INTEGRATION-V1 Part B — impact-mid
+    /// keeper configuration. Default `disabled()`: `enabled=false` and
+    /// no markets configured. The keeper is spawned in `main.rs` when
+    /// `enabled=true`; the tick is otherwise a no-op even if
+    /// `run_perps_impact_mid_tick_once` is called directly (defensive
+    /// second gate).
+    pub perps_impact_mid_keeper_config: crate::perps::PerpsImpactMidKeeperConfig,
+    /// PERPS-FULLSTACK-RUNTIME-INTEGRATION-V1 Part B — per-market
+    /// impact-mid cache. Populated by the keeper each tick; readable
+    /// by a future funding worker (which stays disabled in this
+    /// milestone) and by integration tests / diagnostic surfaces.
+    /// Cloneable via inner `Arc`; every producer + consumer shares
+    /// the same underlying map.
+    pub perp_impact_mid_cache: crate::perps::ImpactMidCache,
     /// PERPS-FUNDING-LIQUIDATION-WORKERS-V1 — last funding tick record.
     /// Written after every funding tick (periodic OR admin-triggered)
     /// and read by the readiness endpoint. Never contains wallets,
@@ -503,12 +532,25 @@ impl AppState {
             // mutation surface fail-closed for every wallet.
             perps_closed_test_enabled: false,
             perps_closed_test_allowlist: Vec::new(),
+            // PERPS-FULLSTACK-RUNTIME-INTEGRATION-V1 Part D — start
+            // with an empty in-memory nonce store; the closed-test
+            // signed endpoint mutates it under `try_consume`.
+            perp_order_intent_nonce_store: Arc::new(
+                crate::perps::PerpOrderIntentNonceStore::new(),
+            ),
+            perps_signed_intent_price_reader: None,
             // PERPS-FUNDING-LIQUIDATION-WORKERS-V1 — periodic workers
             // start disabled; kill-switches start off. AppState-based
             // fixture tests can flip flags per-test without ever
             // touching mainnet-refusal validation.
             perps_funding_worker_config: crate::perps::PerpsFundingWorkerConfig::disabled(),
             perps_liquidation_worker_config: crate::perps::PerpsLiquidationWorkerConfig::disabled(),
+            // PERPS-FULLSTACK-RUNTIME-INTEGRATION-V1 Part B — impact-mid
+            // keeper starts disabled with no markets; the cache starts
+            // empty. Both are safe defaults — the keeper does no work
+            // until env-wired.
+            perps_impact_mid_keeper_config: crate::perps::PerpsImpactMidKeeperConfig::disabled(),
+            perp_impact_mid_cache: crate::perps::ImpactMidCache::new(),
             perp_funding_last_tick: Arc::new(Mutex::new(None)),
             perp_liquidation_last_tick: Arc::new(Mutex::new(None)),
             perps_observability: Arc::new(crate::perps::PerpsObservability::new()),

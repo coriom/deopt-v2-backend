@@ -99,6 +99,19 @@ pub struct AppConfig {
     /// * `PERPS_LIQUIDATION_MAX_POSITIONS_PER_TICK` (default 500)
     /// * `PERPS_LIQUIDATION_STALE_ORACLE_POLICY=skip`
     pub perps_liquidation_worker: crate::perps::PerpsLiquidationWorkerConfig,
+    /// PERPS-FULLSTACK-RUNTIME-INTEGRATION-V1 Part B — impact-mid
+    /// keeper configuration. Defaults `disabled()`. Env:
+    ///
+    /// * `PERPS_IMPACT_MID_KEEPER_ENABLED=true` (spawns the periodic loop)
+    /// * `PERPS_IMPACT_MID_KEEPER_INTERVAL_MS` (default 5000)
+    /// * `PERPS_ETH_IMPACT_NOTIONAL_1E8` (non-zero to enable ETH-PERP)
+    /// * `PERPS_BTC_IMPACT_NOTIONAL_1E8` (non-zero to enable BTC-PERP)
+    /// * `PERPS_ETH_IMPACT_MAX_INDEX_DEVIATION_BPS` (default 500 = 5%)
+    /// * `PERPS_BTC_IMPACT_MAX_INDEX_DEVIATION_BPS` (default 500 = 5%)
+    ///
+    /// Refused on mainnet (chain_id ∈ {1, 8453}) when enabled — same
+    /// posture as the funding + liquidation workers.
+    pub perps_impact_mid_keeper: crate::perps::PerpsImpactMidKeeperConfig,
     /// BACKEND-HYBRID-V2-PERSISTED-RUNTIME-CORE-V1 — Hybrid V2 indexer
     /// worker configuration. Defaults `disabled()`. When
     /// `HYBRID_V2_ENABLED=true`, `HybridV2Config::from_env` also reads
@@ -887,6 +900,29 @@ impl AppConfig {
         };
         perps_liquidation_worker.validate_startup(chain_id)?;
 
+        // PERPS-FULLSTACK-RUNTIME-INTEGRATION-V1 Part B — impact-mid
+        // keeper. All defaults safe (`enabled=false`, no markets).
+        // Per-market rows are populated ONLY when the operator sets a
+        // non-zero notional env var for that market — an empty
+        // notional is treated as "market not configured for the
+        // keeper" (silent skip in the tick loop), matching the
+        // fail-closed posture where turning the keeper on for a single
+        // market must be an explicit action.
+        let impact_mid_enabled: bool =
+            parse_env(&mut lookup, "PERPS_IMPACT_MID_KEEPER_ENABLED", "false")?;
+        let impact_mid_interval_ms: u64 = parse_env(
+            &mut lookup,
+            "PERPS_IMPACT_MID_KEEPER_INTERVAL_MS",
+            "5000",
+        )?;
+        let impact_mid_markets = collect_impact_mid_markets(&mut lookup)?;
+        let perps_impact_mid_keeper = crate::perps::PerpsImpactMidKeeperConfig {
+            enabled: impact_mid_enabled,
+            tick_interval_ms: impact_mid_interval_ms,
+            markets: impact_mid_markets,
+        };
+        perps_impact_mid_keeper.validate_startup(chain_id)?;
+
         // BACKEND-HYBRID-V2-PERSISTED-RUNTIME-CORE-V1 — load + validate
         // the Hybrid V2 indexer worker config. `HybridV2Config::from_env`
         // reads its own `HYBRID_V2_*` vars via `std::env::var` (dotenv
@@ -929,6 +965,7 @@ impl AppConfig {
             perps_closed_test_allowlist,
             perps_funding_worker,
             perps_liquidation_worker,
+            perps_impact_mid_keeper,
             hybrid_v2,
         })
     }
@@ -995,6 +1032,55 @@ where
     value
         .parse()
         .map_err(|error| BackendError::Config(format!("invalid {key}: {error}")))
+}
+
+/// PERPS-FULLSTACK-RUNTIME-INTEGRATION-V1 Part B — collect per-market
+/// impact-mid keeper rows from env. A market is included ONLY when its
+/// `PERPS_{ETH,BTC}_IMPACT_NOTIONAL_1E8` env var is set to a non-empty,
+/// non-zero value. Missing / empty / `0` → the market is silently
+/// omitted from the keeper's configured markets vec (which in turn
+/// means the keeper tick loop skips it — no cache write, no metric).
+/// Per-market deviation defaults to
+/// `PerpsImpactMidKeeperConfig::DEFAULT_MAX_INDEX_DEVIATION_BPS`.
+fn collect_impact_mid_markets(
+    lookup: &mut impl FnMut(&str) -> Option<String>,
+) -> Result<Vec<crate::perps::PerpsImpactMidMarketConfig>> {
+    // (symbol, notional-env-var, deviation-env-var). The prefix order
+    // is (ETH, BTC) to match the read-config's `enabled_in_memory_for_tests`.
+    let entries: &[(&str, &str, &str)] = &[
+        (
+            "ETH-PERP",
+            "PERPS_ETH_IMPACT_NOTIONAL_1E8",
+            "PERPS_ETH_IMPACT_MAX_INDEX_DEVIATION_BPS",
+        ),
+        (
+            "BTC-PERP",
+            "PERPS_BTC_IMPACT_NOTIONAL_1E8",
+            "PERPS_BTC_IMPACT_MAX_INDEX_DEVIATION_BPS",
+        ),
+    ];
+    let mut markets = Vec::new();
+    for (symbol, notional_key, deviation_key) in entries {
+        let notional_raw = match lookup(notional_key).filter(|v| !v.is_empty()) {
+            Some(v) => v,
+            None => continue,
+        };
+        let notional: u128 = notional_raw.parse().map_err(|error| {
+            BackendError::Config(format!("invalid {notional_key}: {error}"))
+        })?;
+        if notional == 0 {
+            continue;
+        }
+        let deviation_default =
+            crate::perps::impact_mid_keeper::DEFAULT_MAX_INDEX_DEVIATION_BPS.to_string();
+        let deviation: u32 = parse_env(lookup, deviation_key, &deviation_default)?;
+        markets.push(crate::perps::PerpsImpactMidMarketConfig {
+            symbol: (*symbol).to_string(),
+            impact_notional_1e8: notional,
+            max_index_deviation_bps: deviation,
+        });
+    }
+    Ok(markets)
 }
 
 fn validate_option_execution_broadcast_startup(
