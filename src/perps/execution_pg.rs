@@ -442,11 +442,65 @@ struct PlannedFill {
 }
 
 fn validate_input_basics(input: &SubmitPerpOrderInput) -> Result<()> {
+    // PERPS-CLOSED-TEST-E2E-V1 Part A gap fix — mirror the in-memory
+    // `execution.rs::validate_input_basics` (PERPS-PRICING-AND-
+    // EXECUTION-SAFETY-CORE-V1 Part C semantics). The PG-native path
+    // must accept market orders (`price_1e8 == 0` with matching-side
+    // bound) just like the in-memory path; otherwise the signed-intent
+    // surface silently rejects every market order despite the intent
+    // being valid.
     if input.size_1e8 == 0 {
         return Err(BackendError::PerpZeroSize);
     }
+    match input.side {
+        PerpOrderSide::Buy => {
+            if input.min_execution_price_1e8 != 0 {
+                return Err(BackendError::PerpsInvalidBoundForSide(
+                    "buy orders may not set min_execution_price_1e8".to_string(),
+                ));
+            }
+        }
+        PerpOrderSide::Sell => {
+            if input.max_execution_price_1e8 != 0 {
+                return Err(BackendError::PerpsInvalidBoundForSide(
+                    "sell orders may not set max_execution_price_1e8".to_string(),
+                ));
+            }
+        }
+    }
     if input.price_1e8 == 0 {
-        return Err(BackendError::PerpZeroPrice);
+        let has_bound = match input.side {
+            PerpOrderSide::Buy => input.max_execution_price_1e8 != 0,
+            PerpOrderSide::Sell => input.min_execution_price_1e8 != 0,
+        };
+        if !has_bound {
+            return Err(BackendError::PerpsInvalidBoundForSide(
+                "market orders require a non-zero user execution-price bound".to_string(),
+            ));
+        }
+    } else {
+        match input.side {
+            PerpOrderSide::Buy => {
+                if input.max_execution_price_1e8 != 0
+                    && input.max_execution_price_1e8 < input.price_1e8
+                {
+                    return Err(BackendError::PerpsUserBoundAboveLimit(format!(
+                        "buy max_execution_price_1e8 {} below limit price_1e8 {}",
+                        input.max_execution_price_1e8, input.price_1e8
+                    )));
+                }
+            }
+            PerpOrderSide::Sell => {
+                if input.min_execution_price_1e8 != 0
+                    && input.min_execution_price_1e8 > input.price_1e8
+                {
+                    return Err(BackendError::PerpsUserBoundBelowLimit(format!(
+                        "sell min_execution_price_1e8 {} above limit price_1e8 {}",
+                        input.min_execution_price_1e8, input.price_1e8
+                    )));
+                }
+            }
+        }
     }
     Ok(())
 }
