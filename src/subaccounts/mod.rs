@@ -255,6 +255,60 @@ pub async fn create_subaccount(
     Ok(record)
 }
 
+/// Ownership predicate: returns `true` iff `subaccount_id` is
+/// registered against `owner` in the persistence layer.
+///
+/// PERPS-CLOSED-TEST-HARDENING-V1 Part C #15 — the closed-test
+/// signed-intent submit path calls this AFTER signature verification
+/// and BEFORE market resolution. The signed `PerpOrderIntent`
+/// EIP-712 struct binds `subaccountId`; the signature attests the
+/// declared trader authorized that specific subaccount. But without
+/// this ownership predicate a valid signature from wallet W could
+/// reference a subaccount owned by wallet W' ≠ W. The predicate
+/// closes that gap: only subaccounts owned by W are authorized.
+///
+/// Behaviour:
+///
+/// * `DEFAULT_SUBACCOUNT_ID` (`1`) is lazily ensured before the
+///   lookup — the default account is created on the first
+///   authenticated interaction, matching the module-level doc, and
+///   the signed-intent submit is an authenticated interaction (the
+///   signature has already been verified when this is called).
+/// * Any other `subaccount_id` MUST have been previously allocated
+///   via `create_subaccount` for `owner`. A cross-owner id returns
+///   `false` (deterministic reject) rather than propagating an
+///   error, so the caller can map the negative result to a specific
+///   HTTP status without leaking whether the id exists under a
+///   different owner.
+/// * `subaccount_id == 0` is reserved for future system use (see
+///   `DEFAULT_SUBACCOUNT_ID` doc). It is never a legitimate
+///   subaccount and this function returns `false` for it without
+///   touching persistence.
+/// * Persistence errors (connection loss, poisoned in-memory mutex)
+///   propagate as `Err(_)` — the caller MUST treat that as a hard
+///   reject rather than a `false` denial.
+pub async fn is_owned_by(
+    store: &dyn SubaccountStore,
+    owner: &AccountId,
+    subaccount_id: u32,
+) -> Result<bool> {
+    if subaccount_id == 0 {
+        // `0` is reserved for future system use; never a legitimate
+        // per-wallet subaccount. Cheap short-circuit before touching
+        // the store.
+        return Ok(false);
+    }
+    if subaccount_id == DEFAULT_SUBACCOUNT_ID {
+        // Lazy-create the default subaccount on the first
+        // authenticated interaction. The signed-intent path has
+        // already verified the caller's signature by the time this
+        // runs so the "authenticated interaction" precondition is met.
+        let _ = ensure_default_subaccount(store, owner).await?;
+        return Ok(true);
+    }
+    Ok(store.get(owner, subaccount_id).await?.is_some())
+}
+
 /// Set the `name` of an existing subaccount. Empty / too-long names
 /// are rejected. Unknown composite keys return `NotFound`.
 pub async fn rename_subaccount(
@@ -573,6 +627,68 @@ mod tests {
         let _ = list_subaccounts(&store, &mixed).await.unwrap();
         let rows = list_subaccounts(&store, &lower).await.unwrap();
         assert_eq!(rows.len(), 1);
+    }
+
+    // -----------------------------------------------------------------
+    // PERPS-CLOSED-TEST-HARDENING-V1 Part C #15 — is_owned_by unit tests
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn is_owned_by_default_id_is_lazy_true_for_any_owner() {
+        let store = InMemorySubaccountStore::new();
+        // No subaccounts exist yet. `is_owned_by` for the default id
+        // must lazy-create and return true.
+        assert!(is_owned_by(&store, &owner_a(), DEFAULT_SUBACCOUNT_ID)
+            .await
+            .expect("is_owned_by default"));
+        // Post-condition: the row was actually written.
+        let rows = store.list_by_owner(&owner_a()).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].subaccount_id, DEFAULT_SUBACCOUNT_ID);
+    }
+
+    #[tokio::test]
+    async fn is_owned_by_zero_id_is_always_false() {
+        let store = InMemorySubaccountStore::new();
+        assert!(!is_owned_by(&store, &owner_a(), 0)
+            .await
+            .expect("is_owned_by 0"));
+        // No lazy-create side effect for id 0.
+        assert!(store.list_by_owner(&owner_a()).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn is_owned_by_returns_true_for_owned_non_default_id() {
+        let store = InMemorySubaccountStore::new();
+        let _ = list_subaccounts(&store, &owner_a()).await.unwrap();
+        let created = create_subaccount(&store, &owner_a(), Some("Desk".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(created.subaccount_id, 2);
+        assert!(is_owned_by(&store, &owner_a(), 2).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn is_owned_by_rejects_cross_owner_id() {
+        let store = InMemorySubaccountStore::new();
+        // Owner A gets subaccount 2; owner B does NOT.
+        let _ = list_subaccounts(&store, &owner_a()).await.unwrap();
+        let _ = create_subaccount(&store, &owner_a(), None).await.unwrap();
+        // Owner B has only the default subaccount 1 (lazy) — id 2 is
+        // not theirs.
+        assert!(!is_owned_by(&store, &owner_b(), 2).await.unwrap());
+        // And owner B's default is still theirs.
+        assert!(is_owned_by(&store, &owner_b(), DEFAULT_SUBACCOUNT_ID)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn is_owned_by_rejects_never_allocated_non_default_id() {
+        let store = InMemorySubaccountStore::new();
+        let _ = list_subaccounts(&store, &owner_a()).await.unwrap();
+        // Only id 1 exists; id 42 was never allocated.
+        assert!(!is_owned_by(&store, &owner_a(), 42).await.unwrap());
     }
 
     #[test]

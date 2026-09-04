@@ -3437,13 +3437,34 @@ impl PerpOrderIntentWire {
 /// 5. Allowlist gate: non-listed trader → 503 `PerpsNotLive` (mirrors
 ///    the closed-test posture; does NOT reveal allowlist membership
 ///    via a distinct 401/403).
-/// 6. Shape gate: `validate_shape` (side / bound consistency).
-/// 7. Deadline gate: `now_sec > deadline` → 422
+/// 6. Subaccount ownership gate (PERPS-CLOSED-TEST-HARDENING-V1 Part C
+///    #15): the recovered signer wallet MUST own the subaccount named
+///    in the signed intent. `subaccount_id == 0` and cross-owner
+///    references both collapse to 401 `PerpsIntentSubaccountUnauthorized`.
+///    Runs AFTER the allowlist gate (so an unlisted trader still sees
+///    `PerpsNotLive` regardless of subaccount id) and BEFORE the shape
+///    gate. The signed intent's EIP-712 struct binds `subaccountId`,
+///    so tamper detection is already signature-mediated; this gate
+///    additionally proves the wallet is entitled to trade under that
+///    subaccount.
+/// 7. Shape gate: `validate_shape` (side / bound consistency).
+/// 8. Deadline gate: `now_sec > deadline` → 422
 ///    `PerpsIntentDeadlineExpired`.
-/// 8. Nonce gate: `try_consume` on the process-local store → 409
-///    `PerpsIntentNonceReplay` on collision.
-/// 9. Convert to `SubmitPerpOrderInput`; dispatch to the internal
-///    engine (PG when repository present, otherwise in-memory).
+/// 9. Nonce gate: `try_consume` on the trait-shaped ledger (PG-backed
+///    when a repository is wired; in-memory fallback otherwise) → 409
+///    `PerpsIntentNonceReplay` on collision. DB error → 503
+///    `Persistence` (fail-closed).
+/// 10. Convert to `SubmitPerpOrderInput`; dispatch to the internal
+///     engine (PG when repository present, otherwise in-memory).
+/// 11a. PERPS-CLOSED-TEST-HARDENING-V1 Part B — `record_intent` on
+///      the PG-backed `PgIntentFillsLedger` BEFORE dispatch. First
+///      submit inserts a row; re-registration with a different
+///      signed_size for the same hash → 500
+///      `PerpsIntentCumulativeOverfill`.
+/// 11b. AFTER dispatch — `try_add_fill(intent_hash, sum(fills.size))`
+///      inside a transactional `SELECT ... FOR UPDATE`. Overfill →
+///      500 `PerpsIntentCumulativeOverfill` (matching-logic bug, not
+///      user error, hence 5xx not 4xx).
 async fn perps_submit_signed_order(
     State(state): State<AppState>,
     Json(req): Json<PerpsSubmitSignedOrderHttpRequest>,
@@ -3489,24 +3510,50 @@ async fn perps_submit_signed_order(
         return Err(BackendError::PerpsNotLive.into());
     }
 
-    // Layer 6 — pure-Rust shape validation.
+    // Layer 6 — subaccount ownership gate
+    // (PERPS-CLOSED-TEST-HARDENING-V1 Part C #15). The signed intent
+    // binds `subaccountId` via EIP-712 so tamper detection is already
+    // signature-mediated. But without this predicate a valid
+    // signature from wallet W could reference a subaccount owned by
+    // wallet W' ≠ W. We reject cross-owner references at the
+    // authoritative execution boundary. See
+    // `crate::subaccounts::is_owned_by` for the ownership semantics
+    // (default id is lazy-created; id 0 is never owned; other ids
+    // must have been previously allocated for `intent.trader`).
+    if !crate::subaccounts::is_owned_by(
+        state.subaccounts.as_ref(),
+        &intent.trader,
+        intent.subaccount_id,
+    )
+    .await?
+    {
+        return Err(BackendError::PerpsIntentSubaccountUnauthorized.into());
+    }
+
+    // Layer 7 — pure-Rust shape validation.
     crate::execution::validate_perp_order_intent_shape(&intent)?;
 
-    // Layer 7 — deadline. `now_ms() / 1000` matches the on-chain
+    // Layer 8 — deadline. `now_ms() / 1000` matches the on-chain
     // `block.timestamp` comparison the Solidity path performs.
     let now_sec = (crate::types::now_ms() / 1000) as u128;
     if now_sec > intent.deadline {
         return Err(BackendError::PerpsIntentDeadlineExpired.into());
     }
 
-    // Layer 8 — atomic nonce consumption. The store is process-local;
-    // a duplicate `(trader, nonce)` within one process lifetime is
-    // rejected. Restart-clears (see module doc).
+    // Layer 9 — atomic nonce consumption via the trait-shaped
+    // ledger. When PG is wired (`AppState::with_all_config` +
+    // repository) this is a `PgNonceLedger` and the consumption
+    // survives restart AND is atomic under concurrent submissions
+    // (PG's own UNIQUE constraint serialises). Without PG this
+    // falls back to `InMemoryNonceLedger` (unit-test only). Any DB
+    // error collapses to 503 (fail-closed) — never silent success.
+    let intent_hash_bytes = crate::execution::perp_order_intent_hash(&intent)?;
     state
-        .perp_order_intent_nonce_store
-        .try_consume(&intent.trader, intent.nonce)?;
+        .perp_order_intent_nonce_ledger
+        .try_consume(&intent.trader, intent.nonce, intent_hash_bytes)
+        .await?;
 
-    // Layer 9 — resolve the u128 on-chain market id back to the human
+    // Layer 10 — resolve the u128 on-chain market id back to the human
     // symbol used by the internal engine. A market the backend hasn't
     // been configured with is rejected with `PerpsMarketNotFound`.
     let market_row = state
@@ -3556,7 +3603,7 @@ async fn perps_submit_signed_order(
         min_execution_price_1e8: intent.min_exec_price_1e8,
     };
 
-    // Layer 10 — dispatch to the internal engine.
+    // Layer 11 — dispatch to the internal engine.
     //
     // Enabled-path submit is durable-only (mirrors the public
     // `POST /perps/orders` handler): the in-memory dispatcher holds
@@ -3571,6 +3618,28 @@ async fn perps_submit_signed_order(
     let Some(repository) = state.repository.clone() else {
         return Err(BackendError::PerpsNotLive.into());
     };
+
+    // Layer 11a — PERPS-CLOSED-TEST-HARDENING-V1 Part B — cumulative-fill
+    // ledger. Register the intent hash BEFORE dispatch so a matching-
+    // logic bug that produces more fills than authorised is caught by
+    // the ledger's `try_add_fill` below rather than silently accumulating
+    // across successive submits. The PG row is idempotent per intent
+    // hash — a duplicate submit (same hash, same signed_size) no-ops.
+    // The registration mirrors the on-chain `intentFilled[intentHash]`
+    // mapping and shares the exact intent-hash key (`perp_order_intent_hash`
+    // is the EIP-712 struct hash used on both sides).
+    let ledger =
+        crate::perps::PgIntentFillsLedger::new(repository.clone());
+    let now_ms_i64 = crate::types::now_ms() as i64;
+    ledger
+        .record_intent(
+            intent_hash_bytes,
+            &intent.trader,
+            intent.size_1e8,
+            0,
+            now_ms_i64,
+        )
+        .await?;
 
     // RPC-backed oracle reader (production shape). Matches the
     // public `/perps/orders` handler exactly — the in-memory reader
@@ -3588,6 +3657,39 @@ async fn perps_submit_signed_order(
         submit_input,
     )
     .await?;
+
+    // Layer 11b — PERPS-CLOSED-TEST-HARDENING-V1 Part B — accumulate the
+    // produced fills' total size into the intent's ledger row. A
+    // matching-logic bug that produced `sum(fills) > intent.size_1e8`
+    // would push the ledger past its bound and surface
+    // `PerpsIntentCumulativeOverfill` (500) — deliberately distinct
+    // from any 4xx so operators see the invariant break, not a masked
+    // user error. `validate_input_basics` + effective_limit_price paths
+    // in the internal engine already cap `total_filled <= intent.size_1e8`
+    // so this add is expected to succeed on the happy path; the check
+    // exists to catch the OPPOSITE case (a regression that removes the
+    // cap).
+    let total_filled: u128 = outcome
+        .fills
+        .iter()
+        .try_fold(0u128, |acc, f| acc.checked_add(f.size_1e8))
+        .ok_or_else(|| {
+            BackendError::PerpsIntentCumulativeOverfill(format!(
+                "fills sum overflow for intent hash 0x{}",
+                intent_hash_bytes
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
+            ))
+        })?;
+    if total_filled > 0 {
+        // Fires PerpsIntentCumulativeOverfill (500) if sum(fills)
+        // exceeded the signed size — this is a bug in the matching
+        // logic, not a user error.
+        ledger
+            .try_add_fill(intent_hash_bytes, total_filled, now_ms_i64)
+            .await?;
+    }
 
     let order_view = crate::perps::service::build_perp_order_view(&outcome.order);
     let fills: Vec<crate::perps::PerpFillView> = outcome
@@ -15476,9 +15578,18 @@ impl From<BackendError> for ApiError {
             // Nonce replay is 409 (conflict). Shape mismatch is 422.
             BackendError::PerpsIntentSignatureInvalid
             | BackendError::PerpsIntentTraderMismatch => StatusCode::UNAUTHORIZED,
+            // PERPS-CLOSED-TEST-HARDENING-V1 Part C #15 — cross-owner
+            // subaccount reference. 401 so callers cannot probe
+            // subaccount existence under a different owner.
+            BackendError::PerpsIntentSubaccountUnauthorized => StatusCode::UNAUTHORIZED,
             BackendError::PerpsIntentDeadlineExpired => StatusCode::UNPROCESSABLE_ENTITY,
             BackendError::PerpsIntentNonceReplay => StatusCode::CONFLICT,
             BackendError::PerpsIntentSideBoundInconsistent(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            // PERPS-CLOSED-TEST-HARDENING-V1 Part B — cumulative fill
+            // exceeds signed size. This is a matching-logic bug (the
+            // internal engine capped incorrectly), not a user error, so
+            // we surface 500 to make it observably distinct from any 4xx.
+            BackendError::PerpsIntentCumulativeOverfill(_) => StatusCode::INTERNAL_SERVER_ERROR,
             // SUBACCOUNTS-CORE-BACKEND-V1
             BackendError::SubaccountNotFound => StatusCode::NOT_FOUND,
             BackendError::InvalidSubaccountRequest(_) => StatusCode::BAD_REQUEST,

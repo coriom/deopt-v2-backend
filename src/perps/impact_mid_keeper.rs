@@ -46,6 +46,7 @@ use crate::error::{BackendError, Result};
 use crate::perps::config::{PerpsReadConfig, PerpsReadMarket};
 use crate::perps::impact_mid::{impact_mid, Level};
 use crate::perps::impact_mid_cache::{ImpactMidCache, ImpactMidState, ImpactMidUnavailableReason};
+use crate::perps::impact_mid_publisher::{ImpactMidPublisher, PublishOutcome};
 use crate::perps::order_store::PerpOrderStore;
 use crate::perps::orderbook::{active_asks_sorted, active_bids_sorted};
 use crate::perps::price_reader::PerpOraclePriceReader;
@@ -106,7 +107,7 @@ pub struct PerpsImpactMidMarketConfig {
 /// * `PERPS_BTC_IMPACT_NOTIONAL_1E8=...`
 /// * `PERPS_ETH_IMPACT_MAX_INDEX_DEVIATION_BPS=500` (per-market)
 /// * `PERPS_BTC_IMPACT_MAX_INDEX_DEVIATION_BPS=500`
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct PerpsImpactMidKeeperConfig {
     /// When `false`, `spawn_perps_impact_mid_keeper` returns immediately.
     /// The tick itself is a no-op when this flag is false (defensive
@@ -120,16 +121,47 @@ pub struct PerpsImpactMidKeeperConfig {
     /// Per-market rows. Empty in the disabled/default config; populated
     /// from env at startup.
     pub markets: Vec<PerpsImpactMidMarketConfig>,
+    /// PERPS-CLOSED-TEST-HARDENING-V1 Part E — optional on-chain
+    /// publisher handle. When `Some`, the keeper broadcasts each fresh
+    /// sample to the on-chain `PerpEngine.updateImpactMid` writer after
+    /// the cache write succeeds. `None` (V1 default) keeps the keeper
+    /// cache-only — no broadcast, no signer, no RPC. Publish errors are
+    /// LOGGED but never poison the keeper tick.
+    pub publisher: Option<Arc<dyn ImpactMidPublisher>>,
 }
 
+impl PartialEq for PerpsImpactMidKeeperConfig {
+    /// Equality ignores the `publisher` trait object — a runtime
+    /// handle is not a value that can be meaningfully compared. All
+    /// other fields (enabled, tick_interval_ms, markets) are compared
+    /// structurally. Tests that need to prove "publisher wired" should
+    /// call `.publisher.is_some()` directly.
+    fn eq(&self, other: &Self) -> bool {
+        self.enabled == other.enabled
+            && self.tick_interval_ms == other.tick_interval_ms
+            && self.markets == other.markets
+    }
+}
+
+impl Eq for PerpsImpactMidKeeperConfig {}
+
 impl PerpsImpactMidKeeperConfig {
-    /// The safe default: disabled, no markets configured, safe interval.
+    /// The safe default: disabled, no markets configured, safe interval,
+    /// no publisher.
     pub fn disabled() -> Self {
         Self {
             enabled: false,
             tick_interval_ms: DEFAULT_TICK_INTERVAL_MS,
             markets: Vec::new(),
+            publisher: None,
         }
+    }
+
+    /// Attach an on-chain publisher. Consumes-and-returns for the
+    /// builder-style wiring in `main.rs` / test setup.
+    pub fn with_publisher(mut self, publisher: Arc<dyn ImpactMidPublisher>) -> Self {
+        self.publisher = Some(publisher);
+        self
     }
 
     /// Refuses obviously-invalid configuration at startup. Runs even
@@ -402,6 +434,49 @@ pub async fn run_perps_impact_mid_tick_once<P>(
             changed,
             "perps impact-mid keeper: published sample"
         );
+
+        // Phase 6: on-chain publisher (PERPS-CLOSED-TEST-HARDENING-V1
+        // Part E). Optional; runs only when the keeper config carries
+        // a `publisher`. The cache write already succeeded above — a
+        // transient RPC error here must NOT poison the tick, so we
+        // log at warn level and continue. The publisher path is
+        // idempotent per (market_id, mid, timestamp) so a re-broadcast
+        // on a later tick is safe.
+        if let Some(publisher) = config.publisher.as_ref() {
+            match publisher
+                .publish(market.onchain_market_id, sample.mid_1e8, now)
+                .await
+            {
+                Ok(PublishOutcome::Published { tx_hash, block_number }) => {
+                    tracing::info!(
+                        market = %market.symbol,
+                        onchain_market_id = market.onchain_market_id,
+                        mid_1e8 = sample.mid_1e8,
+                        tx_hash = %tx_hash,
+                        block_number,
+                        "perps impact-mid keeper: on-chain publish confirmed"
+                    );
+                }
+                Ok(PublishOutcome::Skipped { reason }) => {
+                    tracing::debug!(
+                        market = %market.symbol,
+                        onchain_market_id = market.onchain_market_id,
+                        mid_1e8 = sample.mid_1e8,
+                        reason = %reason,
+                        "perps impact-mid keeper: on-chain publish skipped"
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        market = %market.symbol,
+                        onchain_market_id = market.onchain_market_id,
+                        mid_1e8 = sample.mid_1e8,
+                        error = %err,
+                        "perps impact-mid keeper: on-chain publish failed (cache write still succeeded)"
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -543,9 +618,30 @@ mod tests {
                 impact_notional_1e8: 10_000 * 100_000_000,
                 max_index_deviation_bps: 500,
             }],
+            publisher: None,
         };
         assert!(cfg.market_by_symbol("ETH-PERP").is_some());
         assert!(cfg.market_by_symbol("BTC-PERP").is_none());
+    }
+
+    #[test]
+    fn disabled_config_has_no_publisher_by_default() {
+        // PERPS-CLOSED-TEST-HARDENING-V1 Part E — the safe default
+        // starts without an on-chain publisher; operators must opt in
+        // explicitly via `with_publisher(...)` or env wiring.
+        let cfg = PerpsImpactMidKeeperConfig::disabled();
+        assert!(cfg.publisher.is_none());
+    }
+
+    #[test]
+    fn with_publisher_attaches_handle() {
+        let cfg = PerpsImpactMidKeeperConfig::disabled()
+            .with_publisher(Arc::new(crate::perps::NoOpPublisher::new()));
+        assert!(cfg.publisher.is_some());
+        // PartialEq ignores the publisher — a `with_publisher`-derived
+        // config still compares equal to the `disabled()` baseline on
+        // the structural fields.
+        assert_eq!(cfg, PerpsImpactMidKeeperConfig::disabled());
     }
 
     #[test]

@@ -258,6 +258,24 @@ pub enum BackendError {
     PerpsIntentNonceReplay,
     #[error("perp order intent side/bound configuration is inconsistent: {0}")]
     PerpsIntentSideBoundInconsistent(String),
+    // PERPS-CLOSED-TEST-HARDENING-V1 Part C #15 — the signed intent's
+    // `subaccountId` names a subaccount that is NOT registered under
+    // the recovered signer's wallet. This is distinct from
+    // `PerpsIntentSignatureInvalid`: the signature is valid; the
+    // signer just isn't authorized to trade under the referenced
+    // subaccount. Kept as a 401 so cross-owner probing does not leak
+    // whether the subaccount exists under a different owner.
+    #[error("perp order intent references a subaccount not owned by the signer")]
+    PerpsIntentSubaccountUnauthorized,
+    // PERPS-CLOSED-TEST-HARDENING-V1 Part B — cumulative-fill invariant
+    // (`filled_size <= signed_size`) violation detected by
+    // `perps_intent_fills_ledger`. This is NEVER a user error — a signed
+    // intent goes through matching in a single submit and the internal
+    // engine caps the fill size at `size_1e8`, so cumulative overfill
+    // implies a matching-logic bug. We fail closed with a 500 so
+    // operators see a distinct signal instead of masking as 4xx.
+    #[error("perp order intent cumulative fill exceeds signed size: {0}")]
+    PerpsIntentCumulativeOverfill(String),
     // SUBACCOUNTS-CORE-BACKEND-V1
     #[error("subaccount not found")]
     SubaccountNotFound,

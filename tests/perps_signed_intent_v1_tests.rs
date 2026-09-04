@@ -37,7 +37,9 @@ use deopt_v2_backend::execution::{
     PERP_ORDER_INTENT_SIDE_SELL,
 };
 use deopt_v2_backend::perps::price_reader::{InMemoryPerpOraclePriceReader, RawPriceRead};
-use deopt_v2_backend::perps::{PerpOrderIntentNonceStore, PerpsReadConfig};
+use deopt_v2_backend::perps::{
+    InMemoryNonceLedger, PerpOrderIntentNonceLedger, PerpsReadConfig,
+};
 use deopt_v2_backend::signing::eip712::keccak256;
 use deopt_v2_backend::types::{now_ms, AccountId};
 use k256::ecdsa::signature::hazmat::PrehashSigner;
@@ -389,12 +391,13 @@ async fn expired_deadline_rejected() {
 //    (see PG happy-path section below).
 // ---------------------------------------------------------------------
 
-#[test]
-fn nonce_store_rejects_replay_within_process() {
-    let store = PerpOrderIntentNonceStore::new();
+#[tokio::test]
+async fn nonce_store_rejects_replay_within_process() {
+    let store = InMemoryNonceLedger::new();
     let trader = AccountId::new("0x00000000000000000000000000000000000000ab");
-    store.try_consume(&trader, 42).unwrap();
-    let err = store.try_consume(&trader, 42).unwrap_err();
+    let hash = [1u8; 32];
+    store.try_consume(&trader, 42, hash).await.unwrap();
+    let err = store.try_consume(&trader, 42, hash).await.unwrap_err();
     assert!(matches!(err, BackendError::PerpsIntentNonceReplay));
 }
 
@@ -415,9 +418,13 @@ async fn nonce_replay_via_http_returns_conflict() {
     let state = state_with_closed_test(&[trader.clone()]);
     let intent = buy_intent(trader.clone());
     // Pre-consume the nonce so the endpoint's try_consume fails.
+    // Use a placeholder intent_hash; the in-memory ledger ignores it
+    // (the endpoint recomputes the real hash before calling
+    // try_consume, but the (trader, nonce) key alone gates replay).
     state
-        .perp_order_intent_nonce_store
-        .try_consume(&trader, intent.nonce)
+        .perp_order_intent_nonce_ledger
+        .try_consume(&trader, intent.nonce, [0u8; 32])
+        .await
         .unwrap();
     let domain = domain_for(&state);
     let digest = perp_order_intent_digest(&intent, &domain).unwrap();
@@ -507,6 +514,250 @@ async fn happy_path_sell_signed_submit_returns_ok() {
     let body = intent_body_json(&intent, &sig);
     let response = post_signed(state, body).await;
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+// ---------------------------------------------------------------------
+// PERPS-CLOSED-TEST-HARDENING-V1 Part C #15 — subaccount ownership
+// gate. The signed intent's EIP-712 struct binds `subaccountId`, so
+// tamper detection is signature-mediated. But nothing previously
+// enforced that the signing WALLET owns the referenced subaccount.
+// These tests prove the ownership check at the authoritative
+// execution boundary (`perps_submit_signed_order`, Layer 6).
+//
+// Notes:
+// * Layer 6 runs AFTER Layer 5 (allowlist), so both traders must be
+//   allowlisted for the subaccount-owner check to surface as the
+//   rejecter (otherwise the allowlist gate wins with `PerpsNotLive`).
+// * The signed-intent test path uses `state_with_closed_test` which
+//   defaults to `InMemorySubaccountStore` — the ownership store the
+//   handler consults is the same `AppState.subaccounts` field.
+// * We seed subaccounts by calling the module-level helpers directly
+//   against `state.subaccounts.as_ref()`, mirroring the pattern in
+//   `tests/perps_v2_write_auth_enforcement_v1_tests.rs`.
+// ---------------------------------------------------------------------
+
+async fn seed_default_subaccount(state: &AppState, owner: &AccountId) {
+    let _ = deopt_v2_backend::subaccounts::ensure_default_subaccount(
+        state.subaccounts.as_ref(),
+        owner,
+    )
+    .await
+    .expect("seed default subaccount");
+}
+
+async fn seed_second_subaccount(state: &AppState, owner: &AccountId) -> u32 {
+    seed_default_subaccount(state, owner).await;
+    let created = deopt_v2_backend::subaccounts::create_subaccount(
+        state.subaccounts.as_ref(),
+        owner,
+        None,
+    )
+    .await
+    .expect("allocate second subaccount");
+    assert_eq!(created.subaccount_id, 2, "expected id=2, got {created:?}");
+    created.subaccount_id
+}
+
+/// Part C #15.a — trader signs an intent naming THEIR OWN default
+/// subaccount (id 1). The ownership gate must not reject. The
+/// request may still fail later at engine dispatch (503 `PerpsNotLive`
+/// when no PG is wired) but MUST NOT be 401 for subaccount reasons.
+#[tokio::test]
+async fn part_c_own_subaccount_accepted() {
+    let key = signing_key(0xe0);
+    let trader = signer_address(&key);
+    let state = state_with_closed_test(&[trader.clone()]);
+    // Lazy-created by the handler on Layer 6, but seeding explicitly
+    // pins the invariant (id 1 is present) BEFORE the request runs.
+    seed_default_subaccount(&state, &trader).await;
+    let intent = buy_intent(trader);
+    let domain = domain_for(&state);
+    let digest = perp_order_intent_digest(&intent, &domain).unwrap();
+    let sig = sign_digest(&key, &digest);
+    let body = intent_body_json(&intent, &sig);
+    let response = post_signed(state, body).await;
+    // Without PG wired the handler returns `PerpsNotLive` at engine
+    // dispatch (Layer 11). What matters is that we did NOT collapse
+    // to 401 for subaccount reasons.
+    assert_ne!(
+        response.status(),
+        StatusCode::UNAUTHORIZED,
+        "own default subaccount must not be rejected as unauthorized"
+    );
+    let text = body_text(response).await;
+    assert!(
+        !text.contains("subaccount not owned"),
+        "own default subaccount must not surface the ownership reject: {text}"
+    );
+}
+
+/// Part C #15.b — trader1 (allowlisted) signs an intent naming a
+/// subaccount that is owned by trader2 (also allowlisted, so the
+/// allowlist gate lets both through). The ownership gate MUST reject
+/// with 401 `PerpsIntentSubaccountUnauthorized`.
+#[tokio::test]
+async fn part_c_another_wallets_subaccount_rejected() {
+    let key1 = signing_key(0xe1);
+    let key2 = signing_key(0xe2);
+    let trader1 = signer_address(&key1);
+    let trader2 = signer_address(&key2);
+    // Both are allowlisted so Layer 5 doesn't win.
+    let state = state_with_closed_test(&[trader1.clone(), trader2.clone()]);
+    // Seed subaccount 2 for trader2. trader1 does NOT own id 2.
+    let id2 = seed_second_subaccount(&state, &trader2).await;
+    assert_eq!(id2, 2);
+    // Also ensure trader1 has a default so we're proving the gate on
+    // id 2 specifically (not just "trader1 has no rows at all").
+    seed_default_subaccount(&state, &trader1).await;
+    // trader1 signs an intent referencing subaccount id 2 (trader2's).
+    let intent = PerpOrderIntent {
+        intent_id: intent_id_hex_from("part-c-cross-owner"),
+        trader: trader1.clone(),
+        subaccount_id: 2,
+        market_id: ETH_ONCHAIN_MARKET_ID,
+        side: PERP_ORDER_INTENT_SIDE_BUY,
+        size_1e8: ONE_1E8,
+        limit_price_1e8: 0,
+        max_exec_price_1e8: 3200 * ONE_1E8,
+        min_exec_price_1e8: 0,
+        nonce: 1,
+        deadline: far_future_deadline(),
+    };
+    let domain = domain_for(&state);
+    let digest = perp_order_intent_digest(&intent, &domain).unwrap();
+    let sig = sign_digest(&key1, &digest);
+    let body = intent_body_json(&intent, &sig);
+    let response = post_signed(state, body).await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let text = body_text(response).await;
+    assert!(
+        text.contains("subaccount not owned"),
+        "expected subaccount ownership rejection; got: {text}"
+    );
+}
+
+/// Part C #15.c — `subaccountId == 0` is reserved for future system
+/// use (see `crate::subaccounts::DEFAULT_SUBACCOUNT_ID` doc). It is
+/// never a legitimate per-wallet subaccount and the ownership gate
+/// MUST reject it with 401.
+#[tokio::test]
+async fn part_c_malformed_subaccount_id_rejected() {
+    let key = signing_key(0xe3);
+    let trader = signer_address(&key);
+    let state = state_with_closed_test(&[trader.clone()]);
+    seed_default_subaccount(&state, &trader).await;
+    let intent = PerpOrderIntent {
+        intent_id: intent_id_hex_from("part-c-subaccount-zero"),
+        trader: trader.clone(),
+        // 0 is reserved; MUST be rejected.
+        subaccount_id: 0,
+        market_id: ETH_ONCHAIN_MARKET_ID,
+        side: PERP_ORDER_INTENT_SIDE_BUY,
+        size_1e8: ONE_1E8,
+        limit_price_1e8: 0,
+        max_exec_price_1e8: 3200 * ONE_1E8,
+        min_exec_price_1e8: 0,
+        nonce: 1,
+        deadline: far_future_deadline(),
+    };
+    let domain = domain_for(&state);
+    let digest = perp_order_intent_digest(&intent, &domain).unwrap();
+    let sig = sign_digest(&key, &digest);
+    let body = intent_body_json(&intent, &sig);
+    let response = post_signed(state, body).await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let text = body_text(response).await;
+    assert!(
+        text.contains("subaccount not owned"),
+        "expected subaccount ownership rejection for id=0; got: {text}"
+    );
+}
+
+/// Part C #15.d — a trader that owns MULTIPLE subaccounts (ids 1 and
+/// 2) can sign intents naming either one. Both are accepted at the
+/// SIGNING path. Downstream position/order isolation is Part D
+/// territory; here we only prove Layer 6 does not incorrectly deny.
+#[tokio::test]
+async fn part_c_same_wallet_multiple_subaccounts_isolated() {
+    let key = signing_key(0xe4);
+    let trader = signer_address(&key);
+    let state = state_with_closed_test(&[trader.clone()]);
+    let id2 = seed_second_subaccount(&state, &trader).await;
+    assert_eq!(id2, 2);
+    let domain = domain_for(&state);
+
+    // Intent A: signed by trader for subaccount 1 (their default).
+    let mut intent_a = buy_intent(trader.clone());
+    intent_a.subaccount_id = 1;
+    intent_a.nonce = 100;
+    intent_a.intent_id = intent_id_hex_from("part-c-multi-sa-a");
+    let digest_a = perp_order_intent_digest(&intent_a, &domain).unwrap();
+    let sig_a = sign_digest(&key, &digest_a);
+    let body_a = intent_body_json(&intent_a, &sig_a);
+    let response_a = post_signed(state.clone(), body_a).await;
+    assert_ne!(
+        response_a.status(),
+        StatusCode::UNAUTHORIZED,
+        "own subaccount 1 must not be rejected as unauthorized"
+    );
+
+    // Intent B: signed by trader for subaccount 2 (also theirs).
+    let mut intent_b = buy_intent(trader.clone());
+    intent_b.subaccount_id = 2;
+    intent_b.nonce = 101;
+    intent_b.intent_id = intent_id_hex_from("part-c-multi-sa-b");
+    let digest_b = perp_order_intent_digest(&intent_b, &domain).unwrap();
+    let sig_b = sign_digest(&key, &digest_b);
+    let body_b = intent_body_json(&intent_b, &sig_b);
+    let response_b = post_signed(state, body_b).await;
+    assert_ne!(
+        response_b.status(),
+        StatusCode::UNAUTHORIZED,
+        "own subaccount 2 must not be rejected as unauthorized"
+    );
+}
+
+/// Part C #15.e — layered fail-closed ordering: an UNLISTED trader
+/// referencing another wallet's subaccount MUST still surface the
+/// allowlist rejection (503 `PerpsNotLive`), NOT the ownership
+/// rejection (401). Ensures Layer 5 (allowlist) runs BEFORE Layer 6
+/// (subaccount ownership) and the endpoint never leaks whether a
+/// subaccount exists to a non-allowlisted caller.
+#[tokio::test]
+async fn part_c_allowlist_gate_precedes_subaccount_gate() {
+    let key1 = signing_key(0xe5);
+    let key2 = signing_key(0xe6);
+    let trader1 = signer_address(&key1);
+    let trader2 = signer_address(&key2);
+    // Only trader2 is allowlisted; trader1 is NOT.
+    let state = state_with_closed_test(&[trader2.clone()]);
+    // Seed subaccount 2 for trader2.
+    let id2 = seed_second_subaccount(&state, &trader2).await;
+    assert_eq!(id2, 2);
+    // trader1 (unlisted) signs an intent referencing trader2's
+    // subaccount 2.
+    let intent = PerpOrderIntent {
+        intent_id: intent_id_hex_from("part-c-allowlist-before-sub"),
+        trader: trader1.clone(),
+        subaccount_id: 2,
+        market_id: ETH_ONCHAIN_MARKET_ID,
+        side: PERP_ORDER_INTENT_SIDE_BUY,
+        size_1e8: ONE_1E8,
+        limit_price_1e8: 0,
+        max_exec_price_1e8: 3200 * ONE_1E8,
+        min_exec_price_1e8: 0,
+        nonce: 1,
+        deadline: far_future_deadline(),
+    };
+    let domain = domain_for(&state);
+    let digest = perp_order_intent_digest(&intent, &domain).unwrap();
+    let sig = sign_digest(&key1, &digest);
+    let body = intent_body_json(&intent, &sig);
+    let response = post_signed(state, body).await;
+    // Allowlist gate wins first — 503 `PerpsNotLive`. If subaccount
+    // gate had run first the response would be 401 and we'd leak the
+    // existence of trader2's subaccount 2 to an unlisted probe.
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
 
 #[tokio::test]

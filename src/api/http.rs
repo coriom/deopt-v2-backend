@@ -165,13 +165,17 @@ pub struct AppState {
     /// closed-test guard on Perps mutations. Env:
     /// `PERPS_CLOSED_TEST_ALLOWLIST` (comma-separated hex).
     pub perps_closed_test_allowlist: Vec<AccountId>,
-    /// PERPS-FULLSTACK-RUNTIME-INTEGRATION-V1 Part D — process-local
-    /// nonce consumption ledger for signed `PerpOrderIntent` requests
-    /// on `POST /perps/orders/signed`. Prevents replay within one
-    /// process lifetime; restart-clears (acceptable for the closed-test
-    /// posture — see module doc). Persistent ledgering lands with the
-    /// public-trading flip in a future milestone.
-    pub perp_order_intent_nonce_store: Arc<crate::perps::PerpOrderIntentNonceStore>,
+    /// PERPS-FULLSTACK-RUNTIME-INTEGRATION-V1 Part D +
+    /// PERPS-CLOSED-TEST-HARDENING-V1 Part A — nonce consumption
+    /// ledger for signed `PerpOrderIntent` requests on
+    /// `POST /perps/orders/signed`. Prevents replay across restarts
+    /// when PG is wired (default `PgNonceLedger`), or within one
+    /// process lifetime when no repository is configured (fallback
+    /// `InMemoryNonceLedger` — unit-test only). Failed DB writes
+    /// collapse to 503 (fail-closed); the caller NEVER silently passes
+    /// on database uncertainty.
+    pub perp_order_intent_nonce_ledger:
+        Arc<dyn crate::perps::PerpOrderIntentNonceLedger + Send + Sync>,
     /// PERPS-FULLSTACK-RUNTIME-INTEGRATION-V1 Part D — optional in-
     /// memory oracle price reader used ONLY by the closed-test signed
     /// intent endpoint when the RPC-backed reader cannot be constructed
@@ -467,6 +471,15 @@ impl AppState {
             Some(repo) => Arc::new(repo.clone()),
             None => Arc::new(InMemorySubaccountStore::new()),
         };
+        // PERPS-CLOSED-TEST-HARDENING-V1 Part A — durable ledger when
+        // PG is wired, HashSet fallback otherwise. Built here so the
+        // move of `repository` into the struct below sees no borrow.
+        let perp_order_intent_nonce_ledger: Arc<
+            dyn crate::perps::PerpOrderIntentNonceLedger + Send + Sync,
+        > = match repository.as_ref() {
+            Some(repo) => Arc::new(crate::perps::PgNonceLedger::new(repo.clone())),
+            None => Arc::new(crate::perps::InMemoryNonceLedger::new()),
+        };
         Self {
             engine: Arc::new(Mutex::new(engine)),
             nonces: Arc::new(Mutex::new(NonceStore::new())),
@@ -532,12 +545,12 @@ impl AppState {
             // mutation surface fail-closed for every wallet.
             perps_closed_test_enabled: false,
             perps_closed_test_allowlist: Vec::new(),
-            // PERPS-FULLSTACK-RUNTIME-INTEGRATION-V1 Part D — start
-            // with an empty in-memory nonce store; the closed-test
-            // signed endpoint mutates it under `try_consume`.
-            perp_order_intent_nonce_store: Arc::new(
-                crate::perps::PerpOrderIntentNonceStore::new(),
-            ),
+            // PERPS-FULLSTACK-RUNTIME-INTEGRATION-V1 Part D +
+            // PERPS-CLOSED-TEST-HARDENING-V1 Part A — durable nonce
+            // ledger backed by the PG repository when one is wired;
+            // in-memory HashSet fallback for unit-test AppStates that
+            // do not attach persistence.
+            perp_order_intent_nonce_ledger,
             perps_signed_intent_price_reader: None,
             // PERPS-FUNDING-LIQUIDATION-WORKERS-V1 — periodic workers
             // start disabled; kill-switches start off. AppState-based

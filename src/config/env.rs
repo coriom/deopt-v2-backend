@@ -920,6 +920,11 @@ impl AppConfig {
             enabled: impact_mid_enabled,
             tick_interval_ms: impact_mid_interval_ms,
             markets: impact_mid_markets,
+            // PERPS-CLOSED-TEST-HARDENING-V1 Part E — publisher is
+            // wired POST-config in main.rs when
+            // `PERPS_IMPACT_MID_PUBLISHER != none`. Env-parse layer
+            // leaves this as `None`; the safe cache-only default.
+            publisher: None,
         };
         perps_impact_mid_keeper.validate_startup(chain_id)?;
 

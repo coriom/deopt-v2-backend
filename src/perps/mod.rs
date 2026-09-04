@@ -31,6 +31,8 @@ pub mod funding_pg;
 pub mod impact_mid;
 pub mod impact_mid_cache;
 pub mod impact_mid_keeper;
+pub mod impact_mid_publisher;
+pub mod intent_fills_ledger;
 pub mod intent_nonce_store;
 pub mod lifecycle;
 pub mod liquidation;
@@ -117,4 +119,11 @@ pub use impact_mid_keeper::{
     run_perps_impact_mid_tick_once, spawn_perps_impact_mid_keeper, PerpsImpactMidKeeperConfig,
     PerpsImpactMidMarketConfig,
 };
-pub use intent_nonce_store::PerpOrderIntentNonceStore;
+pub use impact_mid_publisher::{
+    ImpactMidPublisher, LocalAnvilPublisher, LocalAnvilPublisherConfig, NoOpPublisher,
+    PublishOutcome, SharedImpactMidPublisher,
+};
+pub use intent_fills_ledger::PgIntentFillsLedger;
+pub use intent_nonce_store::{
+    InMemoryNonceLedger, PerpOrderIntentNonceLedger, PerpOrderIntentNonceStore, PgNonceLedger,
+};

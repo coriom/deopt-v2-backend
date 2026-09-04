@@ -145,6 +145,91 @@ async fn main() -> deopt_v2_backend::Result<()> {
     // config. Cache stays as-constructed (`ImpactMidCache::new()` at
     // AppState build); the keeper populates it once spawned.
     state.perps_impact_mid_keeper_config = config.perps_impact_mid_keeper.clone();
+    // PERPS-CLOSED-TEST-HARDENING-V1 Part E — optional on-chain
+    // publisher wiring. Env: `PERPS_IMPACT_MID_PUBLISHER=none|local-anvil`.
+    // Defaults to `none` (NoOpPublisher). Mainnet chain ids refuse
+    // `local-anvil` at construction. When the keeper is disabled we
+    // still allow `NoOpPublisher` to be attached (harmless), but never
+    // construct a `LocalAnvilPublisher` in that case — there is no
+    // producer to invoke it.
+    match std::env::var("PERPS_IMPACT_MID_PUBLISHER")
+        .unwrap_or_else(|_| "none".to_string())
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "none" | "noop" | "" => {
+            // Explicit noop wiring so the attach path is visible in the
+            // logs / process metrics even for the default posture.
+            state.perps_impact_mid_keeper_config = state
+                .perps_impact_mid_keeper_config
+                .clone()
+                .with_publisher(Arc::new(
+                    deopt_v2_backend::perps::NoOpPublisher::new(),
+                ));
+            info!(
+                worker = "perps_impact_mid_keeper",
+                publisher = "noop",
+                "perps impact-mid publisher: noop (no on-chain broadcast)"
+            );
+        }
+        "local-anvil" => {
+            if config.chain_id == 1 || config.chain_id == 8453 {
+                return Err(BackendError::Config(format!(
+                    "PERPS_IMPACT_MID_PUBLISHER=local-anvil refused on \
+                     mainnet chain id {}",
+                    config.chain_id
+                )));
+            }
+            let anvil_rpc_url = std::env::var("PERPS_IMPACT_MID_PUBLISHER_RPC_URL")
+                .map_err(|_| {
+                    BackendError::Config(
+                        "PERPS_IMPACT_MID_PUBLISHER_RPC_URL is required when \
+                         PERPS_IMPACT_MID_PUBLISHER=local-anvil"
+                            .to_string(),
+                    )
+                })?;
+            let signer_hex = std::env::var("PERPS_IMPACT_MID_PUBLISHER_SIGNER_KEY")
+                .map_err(|_| {
+                    BackendError::Config(
+                        "PERPS_IMPACT_MID_PUBLISHER_SIGNER_KEY is required when \
+                         PERPS_IMPACT_MID_PUBLISHER=local-anvil"
+                            .to_string(),
+                    )
+                })?;
+            let signer_bytes = parse_signer_hex(&signer_hex)?;
+            let engine_addr = std::env::var("PERPS_IMPACT_MID_PUBLISHER_ENGINE_ADDRESS")
+                .map_err(|_| {
+                    BackendError::Config(
+                        "PERPS_IMPACT_MID_PUBLISHER_ENGINE_ADDRESS is required when \
+                         PERPS_IMPACT_MID_PUBLISHER=local-anvil"
+                            .to_string(),
+                    )
+                })?;
+            let cfg = deopt_v2_backend::perps::LocalAnvilPublisherConfig::new(
+                anvil_rpc_url,
+                signer_bytes,
+                deopt_v2_backend::types::AccountId::new(engine_addr),
+                config.chain_id,
+            );
+            let publisher = deopt_v2_backend::perps::LocalAnvilPublisher::new(cfg)?;
+            state.perps_impact_mid_keeper_config = state
+                .perps_impact_mid_keeper_config
+                .clone()
+                .with_publisher(Arc::new(publisher));
+            info!(
+                worker = "perps_impact_mid_keeper",
+                publisher = "local_anvil",
+                chain_id = config.chain_id,
+                "perps impact-mid publisher: local-anvil wired"
+            );
+        }
+        other => {
+            return Err(BackendError::Config(format!(
+                "PERPS_IMPACT_MID_PUBLISHER: unknown mode `{other}` \
+                 (expected `none` or `local-anvil`)"
+            )));
+        }
+    }
     // OPTIONS-CONDITIONAL-ORDERS-PERSISTENT-E2E-V1 — read worker env
     // vars. Defaults are safe (enabled=false) so this is a no-op for
     // any operator who has not opted in.
@@ -564,6 +649,39 @@ async fn main() -> deopt_v2_backend::Result<()> {
     serve_result
         .map_err(|error| deopt_v2_backend::error::BackendError::Config(error.to_string()))?;
     Ok(())
+}
+
+/// Parse a 32-byte signer private key from a hex string (with or
+/// without `0x` prefix). Never logs the input value on failure — the
+/// error message is opaque so a bad key material does not appear in
+/// the process log.
+fn parse_signer_hex(hex: &str) -> deopt_v2_backend::Result<[u8; 32]> {
+    let stripped = hex.trim().strip_prefix("0x").unwrap_or(hex.trim());
+    if stripped.len() != 64 {
+        return Err(BackendError::Config(
+            "PERPS_IMPACT_MID_PUBLISHER_SIGNER_KEY: expected 32-byte hex \
+             (64 hex chars, optional 0x prefix)"
+                .to_string(),
+        ));
+    }
+    let mut out = [0u8; 32];
+    for (i, chunk) in stripped.as_bytes().chunks(2).enumerate() {
+        let hi = decode_nibble(chunk[0])?;
+        let lo = decode_nibble(chunk[1])?;
+        out[i] = (hi << 4) | lo;
+    }
+    Ok(out)
+}
+
+fn decode_nibble(byte: u8) -> deopt_v2_backend::Result<u8> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(BackendError::Config(
+            "PERPS_IMPACT_MID_PUBLISHER_SIGNER_KEY: invalid hex nibble".to_string(),
+        )),
+    }
 }
 
 /// Load a Hybrid V2 deployment manifest from `HYBRID_V2_MANIFEST_PATH`.
