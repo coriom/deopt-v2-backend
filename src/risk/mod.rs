@@ -24,6 +24,8 @@
 
 use crate::config::collateral::{CollateralConfig, COLLATERAL_FACTOR_BPS_MAX};
 
+pub mod closed_test_flows;
+
 pub const USD_1E8: u128 = 100_000_000;
 pub const BPS_DENOMINATOR: u128 = 10_000;
 
