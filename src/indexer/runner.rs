@@ -3,6 +3,7 @@ use super::decoder::{
     decode_trade_executed_log, hex_quantity, parse_hex_quantity, trade_executed_topic0,
 };
 use super::events::EthLog;
+use crate::chain_runtime::ChainRuntimeHandle;
 use crate::db::PgRepository;
 use crate::error::{BackendError, Result};
 use serde::{Deserialize, Serialize};
@@ -161,9 +162,13 @@ where
         }
 
         let current_block = self.provider.block_number().await?;
+        // DEOPT_MULTICHAIN_SCHEMA_HARDENING_V1 — cursor lookup is
+        // now `(chain_id, name)`-scoped. V1 has exactly one chain
+        // runtime (Base Sepolia via `v1_default`).
+        let chain_id = ChainRuntimeHandle::v1_default().chain_id();
         let last_indexed_block = self
             .repository
-            .get_indexer_cursor(PERP_MATCHING_ENGINE_CURSOR)
+            .get_indexer_cursor(chain_id, PERP_MATCHING_ENGINE_CURSOR)
             .await?
             .unwrap_or(self.config.start_block);
         let from_block = last_indexed_block.saturating_add(1);
@@ -197,7 +202,12 @@ where
             .collect::<Result<Vec<_>>>()?;
         let events_indexed = self
             .repository
-            .persist_indexed_perp_trades_and_cursor(PERP_MATCHING_ENGINE_CURSOR, &trades, to_block)
+            .persist_indexed_perp_trades_and_cursor(
+                chain_id,
+                PERP_MATCHING_ENGINE_CURSOR,
+                &trades,
+                to_block,
+            )
             .await?;
 
         info!(

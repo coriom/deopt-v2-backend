@@ -1437,12 +1437,24 @@ impl PgRepository {
             .map_err(|error| BackendError::Persistence(error.to_string()))
     }
 
-    pub async fn get_indexer_cursor(&self, name: &str) -> Result<Option<u64>> {
-        let row = sqlx::query("SELECT last_indexed_block FROM indexer_cursors WHERE name = $1")
-            .bind(name)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|error| BackendError::Persistence(error.to_string()))?;
+    /// Read the last-indexed block for a (chain, cursor) pair.
+    ///
+    /// DEOPT_MULTICHAIN_SCHEMA_HARDENING_V1 — the cursor is now
+    /// scoped by `chain_id` so future multi-chain deployments can run
+    /// per-chain indexers off the same cursor name without collision.
+    /// Callers pass the chain id of the runtime that owns the cursor
+    /// (currently always Base Sepolia via
+    /// `crate::chain_runtime::ChainRuntimeHandle::v1_default`).
+    pub async fn get_indexer_cursor(&self, chain_id: u64, name: &str) -> Result<Option<u64>> {
+        let row = sqlx::query(
+            "SELECT last_indexed_block FROM indexer_cursors
+             WHERE chain_id = $1 AND name = $2",
+        )
+        .bind(u64_to_i64("chain_id", chain_id)?)
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
 
         row.map(|row| {
             let value: i64 = row_get(&row, "last_indexed_block")?;
@@ -1451,8 +1463,11 @@ impl PgRepository {
         .transpose()
     }
 
+    /// Persist a batch of indexed Perp trades + advance the indexer
+    /// cursor for `(chain_id, cursor_name)` in a single transaction.
     pub async fn persist_indexed_perp_trades_and_cursor(
         &self,
+        chain_id: u64,
         cursor_name: &str,
         trades: &[IndexedPerpTrade],
         last_indexed_block: u64,
@@ -1460,9 +1475,10 @@ impl PgRepository {
         let mut tx = self.begin().await?;
         let mut inserted = 0u64;
         for trade in trades {
-            inserted += insert_indexed_perp_trade(&mut tx, trade).await?;
+            inserted += insert_indexed_perp_trade(&mut tx, chain_id, trade).await?;
         }
-        upsert_indexer_cursor(&mut tx, cursor_name, last_indexed_block, now_ms()).await?;
+        upsert_indexer_cursor(&mut tx, chain_id, cursor_name, last_indexed_block, now_ms())
+            .await?;
         tx.commit()
             .await
             .map_err(|error| BackendError::Persistence(error.to_string()))?;
@@ -5686,19 +5702,24 @@ async fn insert_execution_simulation(
 
 async fn insert_indexed_perp_trade(
     tx: &mut Transaction<'_, Postgres>,
+    chain_id: u64,
     trade: &IndexedPerpTrade,
 ) -> Result<u64> {
     let onchain_intent_id = trade
         .onchain_intent_id
         .as_deref()
         .and_then(normalize_onchain_intent_id);
+    // DEOPT_MULTICHAIN_SCHEMA_HARDENING_V1 — ON CONFLICT now names the
+    // chain-scoped composite so cross-chain (tx_hash, log_index)
+    // reuse is legitimately deduplicated per chain instead of blocked
+    // globally.
     let result = sqlx::query(
         "INSERT INTO indexed_perp_trades (
             event_id, tx_hash, log_index, block_number, block_hash, buyer, seller,
             onchain_intent_id, market_id, size_delta_1e8, execution_price_1e8, buyer_is_maker,
-            buyer_nonce, seller_nonce, created_at_ms
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
-        ON CONFLICT (tx_hash, log_index) DO NOTHING",
+            buyer_nonce, seller_nonce, created_at_ms, chain_id
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+        ON CONFLICT (chain_id, tx_hash, log_index) DO NOTHING",
     )
     .bind(&trade.event_id)
     .bind(&trade.tx_hash)
@@ -5715,6 +5736,7 @@ async fn insert_indexed_perp_trade(
     .bind(&trade.buyer_nonce)
     .bind(&trade.seller_nonce)
     .bind(timestamp_to_i64(trade.created_at_ms))
+    .bind(u64_to_i64("chain_id", chain_id)?)
     .execute(&mut **tx)
     .await
     .map_err(|error| BackendError::Persistence(error.to_string()))?;
@@ -5723,17 +5745,19 @@ async fn insert_indexed_perp_trade(
 
 async fn upsert_indexer_cursor(
     tx: &mut Transaction<'_, Postgres>,
+    chain_id: u64,
     name: &str,
     last_indexed_block: u64,
     updated_at_ms: i64,
 ) -> Result<()> {
     sqlx::query(
-        "INSERT INTO indexer_cursors (name, last_indexed_block, updated_at_ms)
-         VALUES ($1, $2, $3)
-         ON CONFLICT (name) DO UPDATE
+        "INSERT INTO indexer_cursors (chain_id, name, last_indexed_block, updated_at_ms)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (chain_id, name) DO UPDATE
          SET last_indexed_block = EXCLUDED.last_indexed_block,
              updated_at_ms = EXCLUDED.updated_at_ms",
     )
+    .bind(u64_to_i64("chain_id", chain_id)?)
     .bind(name)
     .bind(u64_to_i64("last_indexed_block", last_indexed_block)?)
     .bind(timestamp_to_i64(updated_at_ms))

@@ -8414,8 +8414,12 @@ fn missing_submitted_transaction_decision(state: &AppState) -> ConfirmationDecis
 
 async fn indexer_status(State(state): State<AppState>) -> Result<Json<IndexerStatus>, ApiError> {
     let last_indexed_block = if let Some(repository) = state.repository.clone() {
+        // DEOPT_MULTICHAIN_SCHEMA_HARDENING_V1 — cursor is
+        // (chain_id, name)-scoped; V1 always reads the sole active
+        // runtime's chain id.
+        let chain_id = crate::chain_runtime::ChainRuntimeHandle::v1_default().chain_id();
         repository
-            .get_indexer_cursor(crate::indexer::runner::PERP_MATCHING_ENGINE_CURSOR)
+            .get_indexer_cursor(chain_id, crate::indexer::runner::PERP_MATCHING_ENGINE_CURSOR)
             .await?
             .unwrap_or(state.indexer_config.start_block)
     } else {
