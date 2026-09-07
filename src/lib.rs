@@ -3,6 +3,7 @@
 pub mod admin;
 pub mod api;
 pub mod auth;
+pub mod chain_runtime;
 pub mod config;
 pub mod confirmation;
 pub mod db;
