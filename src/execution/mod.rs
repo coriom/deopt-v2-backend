@@ -1,4 +1,5 @@
 pub mod abi;
+pub mod broadcast_policy;
 pub mod config;
 pub mod executor;
 pub mod intent;
@@ -16,6 +17,11 @@ pub mod transaction;
 pub mod tx_builder;
 
 pub use abi::{encode_execute_trade_calldata, execute_trade_selector};
+pub use broadcast_policy::{
+    classify_send_error, preflight_pme_state, BroadcastOutcome, BroadcastPolicy, BroadcastSigner,
+    GateMatrix, PmeState, ReconcileSummary, SendErrorClass, PME_IS_EXECUTOR_SELECTOR,
+    PME_PAUSED_SELECTOR,
+};
 pub use config::{ExecutionConfig, ExecutionStatus, PrivateKeySecret};
 pub use executor::{ExecutionIntentRepository, ExecutionTickResult, Executor, RepositoryFuture};
 pub use intent::{ExecutionIntent, ExecutionIntentStatus};

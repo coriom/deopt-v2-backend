@@ -31,6 +31,81 @@ pub trait ExecutionIntentRepository: Clone + Send + Sync {
         &self,
         intent_id: Uuid,
     ) -> RepositoryFuture<'_, StoredTradeSignatures>;
+
+    /// Persist `(intent_id, tx_hash, nonce, raw_tx_hex)` BEFORE the
+    /// `eth_sendRawTransaction` call. Enables restart-safe
+    /// reconciliation via [`get_submitted_tx_hash`] +
+    /// [`list_submitted_execution_intents`]. Default impl fails closed
+    /// so existing repositories that don't opt into real broadcast
+    /// surface the missing wiring loudly.
+    fn record_submitted_transaction(
+        &self,
+        intent_id: Uuid,
+        tx_hash: String,
+        nonce: u64,
+        raw_tx_hex: String,
+        submitted_at_ms: TimestampMs,
+    ) -> RepositoryFuture<'_, ()> {
+        let _ = (intent_id, tx_hash, nonce, raw_tx_hex, submitted_at_ms);
+        Box::pin(async move {
+            Err(BackendError::Persistence(
+                "record_submitted_transaction is not implemented for this repository".to_string(),
+            ))
+        })
+    }
+
+    /// Return the tx_hash previously persisted by
+    /// [`record_submitted_transaction`], if any. The default `None`
+    /// preserves dry-run semantics for repos that don't wire the
+    /// real-broadcast path.
+    fn get_submitted_tx_hash(&self, intent_id: Uuid) -> RepositoryFuture<'_, Option<String>> {
+        let _ = intent_id;
+        Box::pin(async move { Ok(None) })
+    }
+
+    /// Return the intents currently in [`ExecutionIntentStatus::Submitted`]
+    /// so [`crate::execution::broadcast_policy::BroadcastPolicy::reconcile_submitted`]
+    /// can resolve them on restart.
+    fn list_submitted_execution_intents(
+        &self,
+        limit: u32,
+    ) -> RepositoryFuture<'_, Vec<ExecutionIntent>> {
+        let _ = limit;
+        Box::pin(async move { Ok(Vec::new()) })
+    }
+
+    /// Transition an intent from `Submitted` to
+    /// [`ExecutionIntentStatus::Confirmed`] carrying the receipt block.
+    fn mark_intent_confirmed(
+        &self,
+        intent_id: Uuid,
+        receipt_block_number: u64,
+        confirmed_at_ms: TimestampMs,
+    ) -> RepositoryFuture<'_, ()> {
+        let _ = (intent_id, receipt_block_number, confirmed_at_ms);
+        Box::pin(async move {
+            Err(BackendError::Persistence(
+                "mark_intent_confirmed is not implemented for this repository".to_string(),
+            ))
+        })
+    }
+
+    /// Transition an intent to [`ExecutionIntentStatus::Failed`] with
+    /// a durable reason. Callers include: reverted receipt, unclassified
+    /// send failure, receipt/tx_hash mismatch.
+    fn mark_intent_failed(
+        &self,
+        intent_id: Uuid,
+        reason: String,
+        failed_at_ms: TimestampMs,
+    ) -> RepositoryFuture<'_, ()> {
+        let _ = (intent_id, reason, failed_at_ms);
+        Box::pin(async move {
+            Err(BackendError::Persistence(
+                "mark_intent_failed is not implemented for this repository".to_string(),
+            ))
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -51,12 +126,21 @@ where
         if !self.config.execution_enabled {
             return Ok(ExecutionTickResult::default());
         }
-        if !self.config.dry_run {
+        if !self.config.dry_run && !self.config.real_broadcast_enabled {
             return Err(BackendError::Config(
-                "real on-chain execution is not implemented yet; set EXECUTOR_DRY_RUN=true"
+                "real on-chain broadcast requires EXECUTOR_REAL_BROADCAST_ENABLED=true; set \
+                 EXECUTOR_DRY_RUN=true to remain in preview mode"
                     .to_string(),
             ));
         }
+        // PERPS-BASE-SEPOLIA-BACKEND-BROADCAST-WORKER-V1: when the
+        // operator has explicitly enabled real broadcast, the executor
+        // tick delegates dequeue-and-broadcast to
+        // `BroadcastPolicy::broadcast_intent` (constructed and driven
+        // by the runtime wiring in `main.rs`). This function still
+        // enumerates candidates for the dry-run preview surface used
+        // by operators to sanity-check calldata before flipping the
+        // flag. The real path lives in `broadcast_policy.rs`.
 
         let intents = self
             .repository
