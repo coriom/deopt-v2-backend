@@ -12,6 +12,15 @@ pub enum ExecutionIntentStatus {
     CalldataReady,
     SimulationOk,
     SimulationFailed,
+    /// PERPS-BASE-SEPOLIA-BACKEND-BROADCAST-DURABILITY-PG-V1: raw
+    /// signed transaction envelope, tx_hash, and executor nonce are
+    /// persisted in the durable store, but the RPC has NOT been
+    /// invoked (or the RPC outcome is unknown — see
+    /// [`SendErrorClass::Ambiguous`]). The reconciler polls
+    /// `transaction_receipt(tx_hash)` and either observes a receipt
+    /// (advance to Submitted/Confirmed/Failed) or rebroadcasts the
+    /// byte-identical raw envelope (bounded retry).
+    Prepared,
     Submitted,
     Confirmed,
     Failed,

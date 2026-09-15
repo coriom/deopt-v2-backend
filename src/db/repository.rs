@@ -8,7 +8,8 @@ use crate::engine::EngineEvent;
 use crate::error::{BackendError, Result};
 use crate::execution::{
     ExecutionIntent, ExecutionIntentRepository, ExecutionIntentStatus, ExecutionTransaction,
-    ExecutionTransactionStatus, SimulationResult, StoredTradeSignatures,
+    ExecutionTransactionStatus, PreparedBroadcastRow, PreparedTransactionRecord, SimulationResult,
+    StoredTradeSignatures,
 };
 use crate::fees::{
     FeeEvent, FeeFlowType, FeeMarketType, FeeSourceType, FeeStatus, RebateAccrual, VolumeBucket,
@@ -1350,6 +1351,254 @@ impl PgRepository {
         .await
         .map_err(|error| BackendError::Persistence(error.to_string()))?;
         Ok(())
+    }
+
+    /// PERPS_BASE_SEPOLIA_BACKEND_BROADCAST_DURABILITY_PG_V1 —
+    /// persist the raw signed EIP-1559 envelope + derived tx_hash +
+    /// nonce BEFORE `eth_sendRawTransaction`. Enforces:
+    ///   * one row per intent (PRIMARY KEY intent_id);
+    ///   * one tx_hash globally (uq_execution_intent_broadcasts_tx_hash);
+    ///   * one (chain_id, executor, nonce) tuple
+    ///     (uq_execution_intent_broadcasts_executor_nonce) → multi-worker
+    ///     nonce safety at the DB level.
+    /// A unique-violation returns
+    /// `BackendError::BroadcastRejected` so the caller does not
+    /// silently retry with a fresh envelope.
+    pub async fn record_prepared_transaction(
+        &self,
+        record: PreparedTransactionRecord,
+    ) -> Result<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|error| BackendError::Persistence(error.to_string()))?;
+
+        // Acquire an executor-level advisory lock inside the same
+        // transaction so concurrent workers serialize their nonce
+        // allocation against a shared key. The lock releases when the
+        // transaction commits/rolls back.
+        let lock_key = executor_advisory_lock_key(record.chain_id, &record.executor_address);
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(lock_key)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| BackendError::Persistence(error.to_string()))?;
+
+        let nonce_i64 = i64::try_from(record.nonce).map_err(|_| {
+            BackendError::Persistence("nonce exceeds BIGINT range".to_string())
+        })?;
+        let chain_id_i64 = i64::try_from(record.chain_id).map_err(|_| {
+            BackendError::Persistence("chain_id exceeds BIGINT range".to_string())
+        })?;
+        let result = sqlx::query(
+            "INSERT INTO execution_intent_broadcasts (
+                intent_id, chain_id, executor_address, target_address,
+                tx_hash, nonce, raw_tx_hex, status,
+                prepared_at_ms, send_attempts, updated_at_ms
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'prepared', $8, 0, $8)",
+        )
+        .bind(record.intent_id.to_string())
+        .bind(chain_id_i64)
+        .bind(&record.executor_address.0)
+        .bind(&record.target_address.0)
+        .bind(&record.tx_hash)
+        .bind(nonce_i64)
+        .bind(&record.raw_tx_hex)
+        .bind(timestamp_to_i64(record.prepared_at_ms))
+        .execute(&mut *tx)
+        .await;
+
+        match result {
+            Ok(_) => tx
+                .commit()
+                .await
+                .map_err(|error| BackendError::Persistence(error.to_string())),
+            Err(error) if is_unique_violation(&error) => Err(BackendError::BroadcastRejected(
+                "execution_intent_broadcasts unique constraint violation (intent_id, tx_hash, or executor nonce)"
+                    .to_string(),
+            )),
+            Err(error) => Err(BackendError::Persistence(error.to_string())),
+        }
+    }
+
+    pub async fn bump_send_attempt(
+        &self,
+        intent_id: Uuid,
+        last_send_at_ms: TimestampMs,
+    ) -> Result<u32> {
+        let row = sqlx::query(
+            "UPDATE execution_intent_broadcasts \
+             SET send_attempts = send_attempts + 1, \
+                 last_send_at_ms = $2, \
+                 updated_at_ms = $2 \
+             WHERE intent_id = $1 \
+             RETURNING send_attempts",
+        )
+        .bind(intent_id.to_string())
+        .bind(timestamp_to_i64(last_send_at_ms))
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        match row {
+            Some(row) => {
+                let attempts: i32 = row_get(&row, "send_attempts")?;
+                Ok(u32::try_from(attempts).unwrap_or(0))
+            }
+            None => Ok(0),
+        }
+    }
+
+    pub async fn get_prepared_broadcast(
+        &self,
+        intent_id: Uuid,
+    ) -> Result<Option<PreparedBroadcastRow>> {
+        let row = sqlx::query(
+            "SELECT intent_id, chain_id, executor_address, target_address, tx_hash, nonce, \
+             raw_tx_hex, status, prepared_at_ms, first_submission_at_ms, last_send_at_ms, \
+             send_attempts, receipt_block_number, receipt_status, confirmed_at_ms, \
+             failure_class, failure_reason, failed_at_ms \
+             FROM execution_intent_broadcasts WHERE intent_id = $1",
+        )
+        .bind(intent_id.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        row.map(prepared_broadcast_row_from_pg).transpose()
+    }
+
+    pub async fn list_unfinalized_broadcasts(&self, limit: u32) -> Result<Vec<ExecutionIntent>> {
+        let rows = sqlx::query(
+            "SELECT ei.intent_id, ei.onchain_intent_id, ei.market_id, ei.buyer, ei.seller, \
+             ei.price_1e8, ei.size_1e8, ei.buy_order_id, ei.sell_order_id, ei.buyer_is_maker, \
+             ei.buyer_nonce, ei.seller_nonce, ei.deadline_ms, ei.status, ei.created_at_ms, \
+             ei.updated_at_ms \
+             FROM execution_intents ei \
+             INNER JOIN execution_intent_broadcasts eib ON eib.intent_id = ei.intent_id \
+             WHERE eib.status IN ('prepared', 'submitted') \
+             ORDER BY eib.prepared_at_ms ASC \
+             LIMIT $1",
+        )
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        rows.into_iter()
+            .map(db_execution_intent_from_row)
+            .map(|result| result.and_then(ExecutionIntent::try_from))
+            .collect()
+    }
+
+    pub async fn mark_intent_submitted(
+        &self,
+        intent_id: Uuid,
+        first_submission_at_ms: TimestampMs,
+    ) -> Result<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        sqlx::query(
+            "UPDATE execution_intent_broadcasts \
+             SET status = 'submitted', \
+                 first_submission_at_ms = COALESCE(first_submission_at_ms, $2), \
+                 updated_at_ms = $2 \
+             WHERE intent_id = $1",
+        )
+        .bind(intent_id.to_string())
+        .bind(timestamp_to_i64(first_submission_at_ms))
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        update_execution_intent_status_tx(
+            &mut tx,
+            &intent_id.to_string(),
+            ExecutionIntentStatus::Submitted,
+            timestamp_to_i64(first_submission_at_ms),
+        )
+        .await?;
+        tx.commit()
+            .await
+            .map_err(|error| BackendError::Persistence(error.to_string()))
+    }
+
+    pub async fn mark_intent_confirmed(
+        &self,
+        intent_id: Uuid,
+        receipt_block_number: u64,
+        confirmed_at_ms: TimestampMs,
+    ) -> Result<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        let block_i64 = i64::try_from(receipt_block_number).map_err(|_| {
+            BackendError::Persistence("receipt_block_number exceeds BIGINT range".to_string())
+        })?;
+        sqlx::query(
+            "UPDATE execution_intent_broadcasts \
+             SET status = 'confirmed', \
+                 receipt_block_number = $2, \
+                 receipt_status = 1, \
+                 confirmed_at_ms = $3, \
+                 updated_at_ms = $3 \
+             WHERE intent_id = $1",
+        )
+        .bind(intent_id.to_string())
+        .bind(block_i64)
+        .bind(timestamp_to_i64(confirmed_at_ms))
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        update_execution_intent_status_tx(
+            &mut tx,
+            &intent_id.to_string(),
+            ExecutionIntentStatus::Confirmed,
+            timestamp_to_i64(confirmed_at_ms),
+        )
+        .await?;
+        tx.commit()
+            .await
+            .map_err(|error| BackendError::Persistence(error.to_string()))
+    }
+
+    pub async fn mark_intent_failed(
+        &self,
+        intent_id: Uuid,
+        reason: String,
+        failed_at_ms: TimestampMs,
+    ) -> Result<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        sqlx::query(
+            "UPDATE execution_intent_broadcasts \
+             SET status = 'failed', \
+                 failure_reason = $2, \
+                 failed_at_ms = $3, \
+                 updated_at_ms = $3 \
+             WHERE intent_id = $1",
+        )
+        .bind(intent_id.to_string())
+        .bind(&reason)
+        .bind(timestamp_to_i64(failed_at_ms))
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        update_execution_intent_status_tx(
+            &mut tx,
+            &intent_id.to_string(),
+            ExecutionIntentStatus::Failed,
+            timestamp_to_i64(failed_at_ms),
+        )
+        .await?;
+        tx.commit()
+            .await
+            .map_err(|error| BackendError::Persistence(error.to_string()))
     }
 
     pub async fn get_execution_intent(&self, intent_id: Uuid) -> Result<Option<ExecutionIntent>> {
@@ -5591,6 +5840,75 @@ impl ExecutionIntentRepository for PgRepository {
             async move { PgRepository::get_execution_intent_signatures(self, intent_id).await },
         )
     }
+
+    fn record_prepared_transaction(
+        &self,
+        record: PreparedTransactionRecord,
+    ) -> crate::execution::RepositoryFuture<'_, ()> {
+        Box::pin(async move { PgRepository::record_prepared_transaction(self, record).await })
+    }
+
+    fn bump_send_attempt(
+        &self,
+        intent_id: Uuid,
+        last_send_at_ms: TimestampMs,
+    ) -> crate::execution::RepositoryFuture<'_, u32> {
+        Box::pin(async move {
+            PgRepository::bump_send_attempt(self, intent_id, last_send_at_ms).await
+        })
+    }
+
+    fn get_prepared_broadcast(
+        &self,
+        intent_id: Uuid,
+    ) -> crate::execution::RepositoryFuture<'_, Option<PreparedBroadcastRow>> {
+        Box::pin(async move { PgRepository::get_prepared_broadcast(self, intent_id).await })
+    }
+
+    fn list_unfinalized_broadcasts(
+        &self,
+        limit: u32,
+    ) -> crate::execution::RepositoryFuture<'_, Vec<ExecutionIntent>> {
+        Box::pin(async move { PgRepository::list_unfinalized_broadcasts(self, limit).await })
+    }
+
+    fn mark_intent_submitted(
+        &self,
+        intent_id: Uuid,
+        first_submission_at_ms: TimestampMs,
+    ) -> crate::execution::RepositoryFuture<'_, ()> {
+        Box::pin(async move {
+            PgRepository::mark_intent_submitted(self, intent_id, first_submission_at_ms).await
+        })
+    }
+
+    fn mark_intent_confirmed(
+        &self,
+        intent_id: Uuid,
+        receipt_block_number: u64,
+        confirmed_at_ms: TimestampMs,
+    ) -> crate::execution::RepositoryFuture<'_, ()> {
+        Box::pin(async move {
+            PgRepository::mark_intent_confirmed(
+                self,
+                intent_id,
+                receipt_block_number,
+                confirmed_at_ms,
+            )
+            .await
+        })
+    }
+
+    fn mark_intent_failed(
+        &self,
+        intent_id: Uuid,
+        reason: String,
+        failed_at_ms: TimestampMs,
+    ) -> crate::execution::RepositoryFuture<'_, ()> {
+        Box::pin(async move {
+            PgRepository::mark_intent_failed(self, intent_id, reason, failed_at_ms).await
+        })
+    }
 }
 
 async fn insert_order(tx: &mut Transaction<'_, Postgres>, order: &DbOrder) -> Result<()> {
@@ -9396,5 +9714,77 @@ fn option_multi_leg_rfq_fill_leg_from_row(row: PgRow) -> Result<OptionMultiLegRf
                     "invalid multi-leg option RFQ fill leg price: {error}"
                 ))
             })?,
+    })
+}
+
+/// PERPS_BASE_SEPOLIA_BACKEND_BROADCAST_DURABILITY_PG_V1 — derive a
+/// deterministic 64-bit key for `pg_advisory_xact_lock` from
+/// (chain_id, executor_address). Two concurrent transactions
+/// operating on the same (chain, executor) will serialize; the lock
+/// releases automatically on commit/rollback.
+fn executor_advisory_lock_key(chain_id: u64, executor: &crate::types::AccountId) -> i64 {
+    use sha3::{Digest, Keccak256};
+    let mut hasher = Keccak256::new();
+    hasher.update(b"deopt.execution.broadcast.executor_lock.v1");
+    hasher.update(chain_id.to_be_bytes());
+    hasher.update(
+        executor
+            .0
+            .trim()
+            .trim_start_matches("0x")
+            .to_ascii_lowercase()
+            .as_bytes(),
+    );
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    i64::from_be_bytes(bytes)
+}
+
+fn prepared_broadcast_row_from_pg(row: PgRow) -> Result<PreparedBroadcastRow> {
+    use crate::db::models::execution_status_from_str_public;
+    let intent_id_text: String = row_get(&row, "intent_id")?;
+    let intent_id = Uuid::parse_str(&intent_id_text)
+        .map_err(|error| BackendError::Persistence(format!("invalid intent_id uuid: {error}")))?;
+    let chain_id_i64: i64 = row_get(&row, "chain_id")?;
+    let executor_address: String = row_get(&row, "executor_address")?;
+    let target_address: String = row_get(&row, "target_address")?;
+    let tx_hash: String = row_get(&row, "tx_hash")?;
+    let nonce_i64: i64 = row_get(&row, "nonce")?;
+    let raw_tx_hex: String = row_get(&row, "raw_tx_hex")?;
+    let status_str: String = row_get(&row, "status")?;
+    let prepared_at_ms_i64: i64 = row_get(&row, "prepared_at_ms")?;
+    let first_submission_at_ms: Option<i64> = row_get(&row, "first_submission_at_ms")?;
+    let last_send_at_ms: Option<i64> = row_get(&row, "last_send_at_ms")?;
+    let send_attempts_i32: i32 = row_get(&row, "send_attempts")?;
+    let receipt_block_number: Option<i64> = row_get(&row, "receipt_block_number")?;
+    let receipt_status: Option<i64> = row_get(&row, "receipt_status")?;
+    let confirmed_at_ms: Option<i64> = row_get(&row, "confirmed_at_ms")?;
+    let failure_class: Option<String> = row_get(&row, "failure_class")?;
+    let failure_reason: Option<String> = row_get(&row, "failure_reason")?;
+    let failed_at_ms: Option<i64> = row_get(&row, "failed_at_ms")?;
+
+    Ok(PreparedBroadcastRow {
+        intent_id,
+        chain_id: u64::try_from(chain_id_i64)
+            .map_err(|_| BackendError::Persistence("chain_id negative".to_string()))?,
+        executor_address: crate::types::AccountId::new(executor_address),
+        target_address: crate::types::AccountId::new(target_address),
+        tx_hash,
+        nonce: u64::try_from(nonce_i64)
+            .map_err(|_| BackendError::Persistence("nonce negative".to_string()))?,
+        raw_tx_hex,
+        status: execution_status_from_str_public(&status_str)?,
+        prepared_at_ms: prepared_at_ms_i64,
+        first_submission_at_ms,
+        last_send_at_ms,
+        send_attempts: u32::try_from(send_attempts_i32).unwrap_or(0),
+        receipt_block_number: receipt_block_number
+            .map(|v| u64::try_from(v).unwrap_or(0)),
+        receipt_status: receipt_status.map(|v| u64::try_from(v).unwrap_or(0)),
+        confirmed_at_ms,
+        failure_class,
+        failure_reason,
+        failed_at_ms,
     })
 }

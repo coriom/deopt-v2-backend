@@ -2173,6 +2173,7 @@ fn execution_status_key(status: ExecutionIntentStatus) -> &'static str {
         ExecutionIntentStatus::CalldataReady => "calldata_ready",
         ExecutionIntentStatus::SimulationOk => "simulation_ok",
         ExecutionIntentStatus::SimulationFailed => "simulation_failed",
+        ExecutionIntentStatus::Prepared => "prepared",
         ExecutionIntentStatus::Submitted => "submitted",
         ExecutionIntentStatus::Confirmed => "confirmed",
         ExecutionIntentStatus::Failed => "failed",

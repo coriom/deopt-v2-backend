@@ -18,12 +18,16 @@ pub mod tx_builder;
 
 pub use abi::{encode_execute_trade_calldata, execute_trade_selector};
 pub use broadcast_policy::{
-    classify_send_error, preflight_pme_state, BroadcastOutcome, BroadcastPolicy, BroadcastSigner,
-    GateMatrix, PmeState, ReconcileSummary, SendErrorClass, PME_IS_EXECUTOR_SELECTOR,
-    PME_PAUSED_SELECTOR,
+    classify_send_error, preflight_intent_filled, preflight_pme_state, validate_signer_triad,
+    BroadcastOutcome, BroadcastPolicy, BroadcastSigner, GateMatrix, PmeState, ReconcileSummary,
+    SendErrorClass, PME_INTENT_FILLED_SELECTOR, PME_IS_EXECUTOR_SELECTOR, PME_PAUSED_SELECTOR,
+    PME_TRADE_EXECUTED_FROM_INTENTS_TOPIC0, PME_TRADE_EXECUTED_TOPIC0,
 };
 pub use config::{ExecutionConfig, ExecutionStatus, PrivateKeySecret};
-pub use executor::{ExecutionIntentRepository, ExecutionTickResult, Executor, RepositoryFuture};
+pub use executor::{
+    ExecutionIntentRepository, ExecutionTickResult, Executor, PreparedBroadcastRow,
+    PreparedTransactionRecord, RepositoryFuture,
+};
 pub use intent::{ExecutionIntent, ExecutionIntentStatus};
 pub use perp_order_intent::{
     perp_order_intent_digest, perp_order_intent_hash, perp_order_intent_typehash,

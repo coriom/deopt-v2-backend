@@ -32,41 +32,79 @@ pub trait ExecutionIntentRepository: Clone + Send + Sync {
         intent_id: Uuid,
     ) -> RepositoryFuture<'_, StoredTradeSignatures>;
 
-    /// Persist `(intent_id, tx_hash, nonce, raw_tx_hex)` BEFORE the
-    /// `eth_sendRawTransaction` call. Enables restart-safe
-    /// reconciliation via [`get_submitted_tx_hash`] +
-    /// [`list_submitted_execution_intents`]. Default impl fails closed
-    /// so existing repositories that don't opt into real broadcast
-    /// surface the missing wiring loudly.
-    fn record_submitted_transaction(
+    /// Persist the raw signed envelope + tx_hash + nonce BEFORE the
+    /// `eth_sendRawTransaction` call. Transitions the intent to
+    /// [`ExecutionIntentStatus::Prepared`]. Enforces DB uniqueness on
+    /// `(intent_id)` and `(tx_hash)` and `(chain_id, executor, nonce)`.
+    /// Default impl fails closed.
+    fn record_prepared_transaction(
         &self,
-        intent_id: Uuid,
-        tx_hash: String,
-        nonce: u64,
-        raw_tx_hex: String,
-        submitted_at_ms: TimestampMs,
+        record: PreparedTransactionRecord,
     ) -> RepositoryFuture<'_, ()> {
-        let _ = (intent_id, tx_hash, nonce, raw_tx_hex, submitted_at_ms);
+        let _ = record;
         Box::pin(async move {
             Err(BackendError::Persistence(
-                "record_submitted_transaction is not implemented for this repository".to_string(),
+                "record_prepared_transaction is not implemented for this repository".to_string(),
             ))
         })
     }
 
-    /// Return the tx_hash previously persisted by
-    /// [`record_submitted_transaction`], if any. The default `None`
-    /// preserves dry-run semantics for repos that don't wire the
-    /// real-broadcast path.
-    fn get_submitted_tx_hash(&self, intent_id: Uuid) -> RepositoryFuture<'_, Option<String>> {
+    /// Transition Prepared → Submitted after `eth_sendRawTransaction`
+    /// succeeded (or returned an idempotent-replay class such as
+    /// `AlreadyKnown` / `NonceTooLow`). The default impl reuses
+    /// [`update_execution_intent_status`] so simple in-memory repos
+    /// still work.
+    fn mark_intent_submitted(
+        &self,
+        intent_id: Uuid,
+        first_submission_at_ms: TimestampMs,
+    ) -> RepositoryFuture<'_, ()> {
+        self.update_execution_intent_status(
+            intent_id,
+            ExecutionIntentStatus::Submitted,
+            first_submission_at_ms,
+        )
+    }
+
+    /// Bump the `send_attempts` counter + `last_send_at_ms` for a
+    /// Prepared intent. Used by ambiguous / retry paths so restart
+    /// policy can enforce a bounded retry budget.
+    fn bump_send_attempt(
+        &self,
+        intent_id: Uuid,
+        last_send_at_ms: TimestampMs,
+    ) -> RepositoryFuture<'_, u32> {
+        let _ = (intent_id, last_send_at_ms);
+        Box::pin(async move { Ok(1) })
+    }
+
+    /// Return the durable broadcast row (raw_tx / nonce / hash /
+    /// attempts) associated with an intent, if any.
+    fn get_prepared_broadcast(
+        &self,
+        intent_id: Uuid,
+    ) -> RepositoryFuture<'_, Option<PreparedBroadcastRow>> {
         let _ = intent_id;
         Box::pin(async move { Ok(None) })
     }
 
-    /// Return the intents currently in [`ExecutionIntentStatus::Submitted`]
-    /// so [`crate::execution::broadcast_policy::BroadcastPolicy::reconcile_submitted`]
-    /// can resolve them on restart.
-    fn list_submitted_execution_intents(
+    /// Legacy shim used by
+    /// [`crate::execution::transaction::ensure_no_submitted_transaction`]
+    /// callers — returns the persisted tx_hash if one exists.
+    fn get_submitted_tx_hash(&self, intent_id: Uuid) -> RepositoryFuture<'_, Option<String>> {
+        let intent_id_owned = intent_id;
+        Box::pin(async move {
+            let row = self.get_prepared_broadcast(intent_id_owned).await?;
+            Ok(row.map(|r| r.tx_hash))
+        })
+    }
+
+    /// Return intents whose durable broadcast lifecycle has not yet
+    /// converged — i.e. status ∈ {Prepared, Submitted}. Reconciliation
+    /// polls each row for a receipt and either finalizes or (for
+    /// Prepared rows past a retry window) rebroadcasts the exact
+    /// persisted raw envelope.
+    fn list_unfinalized_broadcasts(
         &self,
         limit: u32,
     ) -> RepositoryFuture<'_, Vec<ExecutionIntent>> {
@@ -74,8 +112,17 @@ pub trait ExecutionIntentRepository: Clone + Send + Sync {
         Box::pin(async move { Ok(Vec::new()) })
     }
 
-    /// Transition an intent from `Submitted` to
-    /// [`ExecutionIntentStatus::Confirmed`] carrying the receipt block.
+    /// Legacy alias — kept as a default that delegates so pre-existing
+    /// callers do not break.
+    fn list_submitted_execution_intents(
+        &self,
+        limit: u32,
+    ) -> RepositoryFuture<'_, Vec<ExecutionIntent>> {
+        self.list_unfinalized_broadcasts(limit)
+    }
+
+    /// Transition an intent to [`ExecutionIntentStatus::Confirmed`]
+    /// carrying the receipt block.
     fn mark_intent_confirmed(
         &self,
         intent_id: Uuid,
@@ -90,9 +137,10 @@ pub trait ExecutionIntentRepository: Clone + Send + Sync {
         })
     }
 
-    /// Transition an intent to [`ExecutionIntentStatus::Failed`] with
-    /// a durable reason. Callers include: reverted receipt, unclassified
-    /// send failure, receipt/tx_hash mismatch.
+    /// Transition an intent to [`ExecutionIntentStatus::Failed`] with a
+    /// durable failure classification + reason. Callers: reverted
+    /// receipt, tx_hash mismatch, deterministic RPC rejection, event
+    /// verification failure.
     fn mark_intent_failed(
         &self,
         intent_id: Uuid,
@@ -106,6 +154,46 @@ pub trait ExecutionIntentRepository: Clone + Send + Sync {
             ))
         })
     }
+}
+
+/// Durable broadcast record persisted by
+/// [`ExecutionIntentRepository::record_prepared_transaction`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreparedTransactionRecord {
+    pub intent_id: Uuid,
+    pub chain_id: u64,
+    pub executor_address: crate::types::AccountId,
+    pub target_address: crate::types::AccountId,
+    pub tx_hash: String,
+    pub nonce: u64,
+    pub raw_tx_hex: String,
+    pub prepared_at_ms: TimestampMs,
+}
+
+/// Row shape returned by
+/// [`ExecutionIntentRepository::get_prepared_broadcast`]. Provides the
+/// exact byte-identical raw envelope so reconciliation can rebroadcast
+/// without allocating a new nonce or building a different transaction.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreparedBroadcastRow {
+    pub intent_id: Uuid,
+    pub chain_id: u64,
+    pub executor_address: crate::types::AccountId,
+    pub target_address: crate::types::AccountId,
+    pub tx_hash: String,
+    pub nonce: u64,
+    pub raw_tx_hex: String,
+    pub status: ExecutionIntentStatus,
+    pub prepared_at_ms: TimestampMs,
+    pub first_submission_at_ms: Option<TimestampMs>,
+    pub last_send_at_ms: Option<TimestampMs>,
+    pub send_attempts: u32,
+    pub receipt_block_number: Option<u64>,
+    pub receipt_status: Option<u64>,
+    pub confirmed_at_ms: Option<TimestampMs>,
+    pub failure_class: Option<String>,
+    pub failure_reason: Option<String>,
+    pub failed_at_ms: Option<TimestampMs>,
 }
 
 #[derive(Clone)]

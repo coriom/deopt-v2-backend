@@ -1255,6 +1255,7 @@ fn execution_status_key(status: crate::execution::ExecutionIntentStatus) -> &'st
         crate::execution::ExecutionIntentStatus::CalldataReady => "calldata_ready",
         crate::execution::ExecutionIntentStatus::SimulationOk => "simulation_ok",
         crate::execution::ExecutionIntentStatus::SimulationFailed => "simulation_failed",
+        crate::execution::ExecutionIntentStatus::Prepared => "prepared",
         crate::execution::ExecutionIntentStatus::Submitted => "submitted",
         crate::execution::ExecutionIntentStatus::Confirmed => "confirmed",
         crate::execution::ExecutionIntentStatus::Failed => "failed",

@@ -257,10 +257,15 @@ pub fn execution_status_to_str(status: ExecutionIntentStatus) -> &'static str {
         ExecutionIntentStatus::CalldataReady => "calldata_ready",
         ExecutionIntentStatus::SimulationOk => "simulation_ok",
         ExecutionIntentStatus::SimulationFailed => "simulation_failed",
+        ExecutionIntentStatus::Prepared => "prepared",
         ExecutionIntentStatus::Submitted => "submitted",
         ExecutionIntentStatus::Confirmed => "confirmed",
         ExecutionIntentStatus::Failed => "failed",
     }
+}
+
+pub fn execution_status_from_str_public(value: &str) -> Result<ExecutionIntentStatus> {
+    execution_status_from_str(value)
 }
 
 fn execution_status_from_str(value: &str) -> Result<ExecutionIntentStatus> {
@@ -270,6 +275,7 @@ fn execution_status_from_str(value: &str) -> Result<ExecutionIntentStatus> {
         "calldata_ready" => Ok(ExecutionIntentStatus::CalldataReady),
         "simulation_ok" => Ok(ExecutionIntentStatus::SimulationOk),
         "simulation_failed" => Ok(ExecutionIntentStatus::SimulationFailed),
+        "prepared" => Ok(ExecutionIntentStatus::Prepared),
         "submitted" => Ok(ExecutionIntentStatus::Submitted),
         "confirmed" => Ok(ExecutionIntentStatus::Confirmed),
         "failed" => Ok(ExecutionIntentStatus::Failed),
