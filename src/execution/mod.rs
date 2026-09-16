@@ -48,8 +48,9 @@ pub use perp_order_intent::{
 };
 pub use perp_trade::{
     b256_to_hex_bytes32, intent_id_to_b256, intent_id_to_hex_bytes32, perp_trade_digest,
-    PerpTradeDomain, PerpTradePayload, PerpTradeSignatureBundle, StoredTradeSignatures,
-    TradeSignatureStatus, PERP_TRADE_TYPE,
+    perp_trade_v1_digest, perp_trade_v1_digest_bytes, perp_trade_v1_typehash, PerpTradeDomain,
+    PerpTradePayload, PerpTradeSignatureBundle, StoredTradeSignatures, TradeSignatureStatus,
+    PERP_TRADE_TYPE, PERP_TRADE_V1_TYPE, PERP_TRADE_V1_TYPEHASH_HEX,
 };
 pub use queue::ExecutionQueue;
 pub use remote_signer::{

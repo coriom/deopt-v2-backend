@@ -5,6 +5,7 @@ pub mod hybrid_v2_admin;
 pub mod hybrid_v2_execution_admin;
 pub mod hybrid_v2_read;
 pub mod local_test_fixtures;
+pub mod perps_cosign;
 pub mod public_ws;
 pub mod routes;
 pub mod trading;

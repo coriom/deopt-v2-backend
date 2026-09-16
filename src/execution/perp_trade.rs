@@ -249,6 +249,100 @@ pub fn perp_trade_digest(payload: &PerpTradePayload, domain: &PerpTradeDomain) -
     Ok(hex_0x(&keccak256(&encoded)))
 }
 
+// ================================================================
+// PERPS_BASE_SEPOLIA_CLOSED_TEST_COSIGN_ROUTE_V1
+// ================================================================
+//
+// The DEPLOYED Base Sepolia PME at 0x774d96…F165 uses a 10-field
+// PerpTrade (NO maxExecutionPrice1e8 / minExecutionPrice1e8). The
+// 12-field `PERP_TRADE_TYPE` above corresponds to a WIP V2 PME that is
+// NOT yet deployed. Signatures produced against the 12-field typehash
+// WILL NOT verify on the deployed V1 PME.
+//
+// The helpers below (`_v1` suffix) compute the DEPLOYED-V1 EIP-712
+// digest. The co-sign closed-test route uses these exclusively.
+// Do not swap them without a governance-timelock PME upgrade.
+
+/// DEPLOYED V1 `PerpTrade` EIP-712 type string. 10 fields; no
+/// max/min execution-price bounds. Frozen against the deployed
+/// bytecode at 0x774d96E5739bffadEE91508b4D3D74F5BE29F165 —
+/// `TRADE_TYPEHASH()` on-chain returns
+/// [`PERP_TRADE_V1_TYPEHASH_HEX`].
+pub const PERP_TRADE_V1_TYPE: &str = "PerpTrade(bytes32 intentId,address buyer,address seller,uint256 marketId,uint128 sizeDelta1e8,uint128 executionPrice1e8,bool buyerIsMaker,uint256 buyerNonce,uint256 sellerNonce,uint256 deadline)";
+
+/// keccak256 of [`PERP_TRADE_V1_TYPE`]. Verified live against the
+/// deployed PME at Base Sepolia block ≥ 46 900 000. Any drift here
+/// means the co-sign route emits signatures that will NOT verify
+/// on-chain — locked by
+/// `perp_trade_v1_typehash_matches_deployed_value` regression test.
+pub const PERP_TRADE_V1_TYPEHASH_HEX: &str =
+    "0xfb345c17e97266a4c9efdc53b5baf04e3df8166f6fce15dc415758759d2e8293";
+
+/// Runtime-computed 10-field typehash. Test-only; production code
+/// should prefer the const to avoid re-hashing on every call.
+pub fn perp_trade_v1_typehash() -> [u8; 32] {
+    keccak256(PERP_TRADE_V1_TYPE.as_bytes())
+}
+
+/// EIP-712 structHash for the DEPLOYED 10-field `PerpTrade`. Encodes
+/// ONLY the 10 fields — `max_execution_price_1e8` and
+/// `min_execution_price_1e8` on the Rust payload are IGNORED (they
+/// have no on-chain counterpart in the V1 struct).
+fn perp_trade_v1_hash(payload: &PerpTradePayload) -> Result<[u8; 32]> {
+    payload.validate()?;
+    let buyer = parse_evm_address(&payload.buyer)?;
+    let seller = parse_evm_address(&payload.seller)?;
+    let mut encoded = Vec::with_capacity(11 * 32);
+    encoded.extend_from_slice(&perp_trade_v1_typehash());
+    encoded.extend_from_slice(payload.intent_id.as_slice());
+    encoded.extend_from_slice(&encode_address(&buyer));
+    encoded.extend_from_slice(&encode_address(&seller));
+    encoded.extend_from_slice(&encode_u128(payload.market_id));
+    encoded.extend_from_slice(&encode_u128(payload.size_delta_1e8));
+    encoded.extend_from_slice(&encode_u128(payload.execution_price_1e8));
+    encoded.extend_from_slice(&encode_bool(payload.buyer_is_maker));
+    encoded.extend_from_slice(&encode_u128(payload.buyer_nonce));
+    encoded.extend_from_slice(&encode_u128(payload.seller_nonce));
+    encoded.extend_from_slice(&encode_u128(payload.deadline));
+    Ok(keccak256(&encoded))
+}
+
+/// Full EIP-712 digest for the DEPLOYED V1 `PerpTrade`:
+/// `keccak256(0x1901 || domainSeparator || structHash_v1)`. This is
+/// the 32-byte value that Trader A + Trader B MUST sign with
+/// their EOA keys.
+///
+/// Returned as a `0x…` hex string (66 chars) for interop with the
+/// existing signer bin / typed-data preview APIs.
+pub fn perp_trade_v1_digest(
+    payload: &PerpTradePayload,
+    domain: &PerpTradeDomain,
+) -> Result<String> {
+    let domain_separator = domain_separator(domain)?;
+    let trade_hash = perp_trade_v1_hash(payload)?;
+    let mut encoded = Vec::with_capacity(66);
+    encoded.extend_from_slice(b"\x19\x01");
+    encoded.extend_from_slice(&domain_separator);
+    encoded.extend_from_slice(&trade_hash);
+    Ok(hex_0x(&keccak256(&encoded)))
+}
+
+/// Returns the raw 32-byte V1 digest (no hex prefix). Same value as
+/// [`perp_trade_v1_digest`] but decoded — used by the ECDSA
+/// signer/recover path where a `[u8; 32]` prehash is required.
+pub fn perp_trade_v1_digest_bytes(
+    payload: &PerpTradePayload,
+    domain: &PerpTradeDomain,
+) -> Result<[u8; 32]> {
+    let domain_separator = domain_separator(domain)?;
+    let trade_hash = perp_trade_v1_hash(payload)?;
+    let mut encoded = Vec::with_capacity(66);
+    encoded.extend_from_slice(b"\x19\x01");
+    encoded.extend_from_slice(&domain_separator);
+    encoded.extend_from_slice(&trade_hash);
+    Ok(keccak256(&encoded))
+}
+
 fn validate_signature_hex(signature: &str) -> Result<()> {
     decode_signature(signature).map(|_| ())
 }
