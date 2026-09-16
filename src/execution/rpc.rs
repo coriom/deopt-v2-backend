@@ -1,4 +1,4 @@
-use crate::confirmation::ConfirmationReceipt;
+use crate::confirmation::{ConfirmationReceipt, ReceiptLog};
 use crate::error::{BackendError, Result};
 use crate::execution::revert::diagnostics_from_rpc_error;
 use crate::types::AccountId;
@@ -425,6 +425,18 @@ struct EthTransactionReceipt {
     cumulative_gas_used: Option<String>,
     block_hash: Option<String>,
     transaction_index: Option<String>,
+    #[serde(default)]
+    logs: Vec<EthLog>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EthLog {
+    address: String,
+    #[serde(default)]
+    topics: Vec<String>,
+    #[serde(default)]
+    data: String,
 }
 
 impl TryFrom<EthTransactionReceipt> for ConfirmationReceipt {
@@ -461,6 +473,19 @@ impl TryFrom<EthTransactionReceipt> for ConfirmationReceipt {
                 .as_deref()
                 .map(parse_hex_quantity_u64)
                 .transpose()?,
+            logs: value
+                .logs
+                .into_iter()
+                .map(|log| ReceiptLog {
+                    address: log.address.to_ascii_lowercase(),
+                    topics: log
+                        .topics
+                        .into_iter()
+                        .map(|t| t.to_ascii_lowercase())
+                        .collect(),
+                    data: log.data,
+                })
+                .collect(),
         })
     }
 }

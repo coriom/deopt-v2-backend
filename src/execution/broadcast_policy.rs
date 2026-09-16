@@ -545,6 +545,32 @@ where
         }
         match receipt.status {
             Some(1) => {
+                // Semantic PME event verification. `receipt.status = 1`
+                // alone is NOT sufficient — the tx must have emitted an
+                // expected PME settlement event from the configured PME
+                // address. Without this check a status=1 tx that
+                // executed on a non-PME target could be mistaken for a
+                // confirmed fill.
+                if self.verify_pme_event {
+                    if let Err(err) = verify_pme_event_in_receipt(
+                        &receipt,
+                        &self.config.perp_matching_engine_address,
+                        &self.expected_pme_topic0,
+                    ) {
+                        let error = format!("semantic_event_verification: {err}");
+                        repository
+                            .mark_intent_failed(intent_id, error.clone(), now_ms())
+                            .await?;
+                        return Ok(BroadcastOutcome {
+                            intent_id,
+                            tx_hash: expected_tx_hash.to_string(),
+                            nonce,
+                            status: ExecutionIntentStatus::Failed,
+                            receipt_block_number: receipt.block_number,
+                            error: Some(error),
+                        });
+                    }
+                }
                 let block = receipt.block_number.unwrap_or_default();
                 repository
                     .mark_intent_confirmed(intent_id, block, now_ms())
@@ -678,6 +704,67 @@ where
     {
         self.reconcile_unfinalized(repository, max_intents).await
     }
+}
+
+/// Verify that a mined receipt contains at least one log emitted by
+/// the configured PerpMatchingEngine with `topic0` matching the
+/// canonical settlement event (or the intent-based variant). Returns
+/// Ok on success; error message names the specific predicate that
+/// failed for operator inspection.
+///
+/// PERPS_BASE_SEPOLIA_BACKEND_BROADCAST_RUNTIME_WIRING_V1: closes the
+/// "receipt.status = 1 but wrong contract executed" attack surface.
+/// Even with a status=1 receipt whose `tx_hash` matches, the caller
+/// MAY have been tricked into signing a tx that landed on a different
+/// contract. This check refuses to mark Confirmed unless the log
+/// stream demonstrably includes a PME settlement event.
+pub fn verify_pme_event_in_receipt(
+    receipt: &ConfirmationReceipt,
+    expected_pme: &AccountId,
+    expected_topic0: &[u8; 32],
+) -> Result<()> {
+    if receipt.logs.is_empty() {
+        return Err(BackendError::BroadcastRejected(
+            "receipt contains no logs — expected PME settlement event missing".to_string(),
+        ));
+    }
+    let pme_lower = expected_pme
+        .0
+        .trim()
+        .trim_start_matches("0x")
+        .to_ascii_lowercase();
+    let expected_topic_hex = format!("0x{}", hex_encode(expected_topic0));
+    let alt_topic_hex = format!("0x{}", hex_encode(&PME_TRADE_EXECUTED_FROM_INTENTS_TOPIC0));
+    for log in &receipt.logs {
+        let addr_lower = log
+            .address
+            .trim()
+            .trim_start_matches("0x")
+            .to_ascii_lowercase();
+        if addr_lower != pme_lower {
+            continue;
+        }
+        let Some(topic0) = log.topics.first() else {
+            continue;
+        };
+        let topic0_lower = topic0.trim().to_ascii_lowercase();
+        if topic0_lower == expected_topic_hex || topic0_lower == alt_topic_hex {
+            return Ok(());
+        }
+    }
+    Err(BackendError::BroadcastRejected(format!(
+        "no matching PME event in receipt (expected emitter {expected_pme:?} + topic0 {expected_topic_hex})",
+    )))
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        s.push(HEX[(byte >> 4) as usize] as char);
+        s.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    s
 }
 
 fn addresses_equal(a: &AccountId, b: &AccountId) -> bool {
@@ -1294,7 +1381,20 @@ mod tests {
             cumulative_gas_used: Some(400_000),
             block_hash: Some("0xabc".to_string()),
             transaction_index: Some(0),
+            logs: Vec::new(),
         }
+    }
+
+    /// Receipt with a valid PME TradeExecuted event log — for tests
+    /// that toggle `verify_pme_event = true`.
+    fn happy_receipt_with_pme_event(tx_hash: &str) -> ConfirmationReceipt {
+        let mut receipt = happy_receipt(tx_hash);
+        receipt.logs.push(crate::confirmation::ReceiptLog {
+            address: PME.to_ascii_lowercase(),
+            topics: vec![format!("0x{}", hex_encode(&PME_TRADE_EXECUTED_TOPIC0))],
+            data: "0x".to_string(),
+        });
+        receipt
     }
 
     fn reverted_receipt(tx_hash: &str) -> ConfirmationReceipt {
@@ -1307,6 +1407,7 @@ mod tests {
             cumulative_gas_used: Some(21_000),
             block_hash: Some("0xabc".to_string()),
             transaction_index: Some(0),
+            logs: Vec::new(),
         }
     }
 
@@ -1793,6 +1894,151 @@ mod tests {
         let c = AccountId::new("0xaaa0000000000000000000000000000000000001".to_string());
         let err = validate_signer_triad(&a, &b, &c).unwrap_err();
         assert!(matches!(err, BackendError::Config(msg) if msg.contains("triad disagreement")));
+    }
+
+    // ---- semantic PME event verification (T series) ----
+
+    // (T1) status=1 + expected event => Confirmed.
+    #[tokio::test]
+    async fn t1_status1_with_pme_event_confirms() {
+        let config = make_config(TEST_KEY_ADDRESS, true, false);
+        let signer = make_signer();
+        let intent = make_intent();
+        let signatures = make_signatures();
+        let request = build_execution_transaction_request(&config, &intent, &signatures).unwrap();
+        let raw = sign_transaction(&request, 0, signer.as_ref()).unwrap();
+        let tx_hash = derive_signed_transaction_hash(&raw).unwrap();
+
+        let rpc = MockRpc::new().with_receipt(happy_receipt_with_pme_event(&tx_hash));
+        let mut policy = make_policy_with(rpc, TEST_KEY_ADDRESS);
+        policy.verify_pme_event = true;
+        let repo = MockRepo::with(intent.clone(), signatures.clone());
+
+        let outcome = policy
+            .broadcast_intent(&repo, &intent, &signatures)
+            .await
+            .unwrap();
+        assert_eq!(outcome.status, ExecutionIntentStatus::Confirmed);
+    }
+
+    // (T2) status=1 + no PME event => NOT Confirmed.
+    #[tokio::test]
+    async fn t2_status1_missing_pme_event_fails() {
+        let config = make_config(TEST_KEY_ADDRESS, true, false);
+        let signer = make_signer();
+        let intent = make_intent();
+        let signatures = make_signatures();
+        let request = build_execution_transaction_request(&config, &intent, &signatures).unwrap();
+        let raw = sign_transaction(&request, 0, signer.as_ref()).unwrap();
+        let tx_hash = derive_signed_transaction_hash(&raw).unwrap();
+
+        // happy_receipt has empty logs — event verification must fail
+        let rpc = MockRpc::new().with_receipt(happy_receipt(&tx_hash));
+        let mut policy = make_policy_with(rpc, TEST_KEY_ADDRESS);
+        policy.verify_pme_event = true;
+        let repo = MockRepo::with(intent.clone(), signatures.clone());
+
+        let outcome = policy
+            .broadcast_intent(&repo, &intent, &signatures)
+            .await
+            .unwrap();
+        assert_eq!(outcome.status, ExecutionIntentStatus::Failed);
+        assert!(outcome
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("semantic_event_verification"));
+    }
+
+    // (T3) status=1 + event from wrong emitter => NOT Confirmed.
+    #[tokio::test]
+    async fn t3_status1_wrong_emitter_fails() {
+        let config = make_config(TEST_KEY_ADDRESS, true, false);
+        let signer = make_signer();
+        let intent = make_intent();
+        let signatures = make_signatures();
+        let request = build_execution_transaction_request(&config, &intent, &signatures).unwrap();
+        let raw = sign_transaction(&request, 0, signer.as_ref()).unwrap();
+        let tx_hash = derive_signed_transaction_hash(&raw).unwrap();
+
+        let mut r = happy_receipt(&tx_hash);
+        r.logs.push(crate::confirmation::ReceiptLog {
+            address: "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string(),
+            topics: vec![format!("0x{}", hex_encode(&PME_TRADE_EXECUTED_TOPIC0))],
+            data: "0x".to_string(),
+        });
+        let rpc = MockRpc::new().with_receipt(r);
+        let mut policy = make_policy_with(rpc, TEST_KEY_ADDRESS);
+        policy.verify_pme_event = true;
+        let repo = MockRepo::with(intent.clone(), signatures.clone());
+
+        let outcome = policy
+            .broadcast_intent(&repo, &intent, &signatures)
+            .await
+            .unwrap();
+        assert_eq!(outcome.status, ExecutionIntentStatus::Failed);
+    }
+
+    // (T4) status=1 + wrong topic0 => NOT Confirmed.
+    #[tokio::test]
+    async fn t4_status1_wrong_topic0_fails() {
+        let config = make_config(TEST_KEY_ADDRESS, true, false);
+        let signer = make_signer();
+        let intent = make_intent();
+        let signatures = make_signatures();
+        let request = build_execution_transaction_request(&config, &intent, &signatures).unwrap();
+        let raw = sign_transaction(&request, 0, signer.as_ref()).unwrap();
+        let tx_hash = derive_signed_transaction_hash(&raw).unwrap();
+
+        let mut r = happy_receipt(&tx_hash);
+        r.logs.push(crate::confirmation::ReceiptLog {
+            address: PME.to_ascii_lowercase(),
+            topics: vec![
+                "0x0000000000000000000000000000000000000000000000000000000000000001".to_string(),
+            ],
+            data: "0x".to_string(),
+        });
+        let rpc = MockRpc::new().with_receipt(r);
+        let mut policy = make_policy_with(rpc, TEST_KEY_ADDRESS);
+        policy.verify_pme_event = true;
+        let repo = MockRepo::with(intent.clone(), signatures.clone());
+
+        let outcome = policy
+            .broadcast_intent(&repo, &intent, &signatures)
+            .await
+            .unwrap();
+        assert_eq!(outcome.status, ExecutionIntentStatus::Failed);
+    }
+
+    // (T5) receipt appears only after restart (reconciler path)
+    #[tokio::test]
+    async fn t5_reconciler_confirms_when_event_present() {
+        let config = make_config(TEST_KEY_ADDRESS, true, false);
+        let signer = make_signer();
+        let intent = make_intent();
+        let signatures = make_signatures();
+        let request = build_execution_transaction_request(&config, &intent, &signatures).unwrap();
+        let raw = sign_transaction(&request, 0, signer.as_ref()).unwrap();
+        let tx_hash = derive_signed_transaction_hash(&raw).unwrap();
+
+        let rpc = MockRpc::new().with_receipt(happy_receipt_with_pme_event(&tx_hash));
+        let mut policy = make_policy_with(rpc, TEST_KEY_ADDRESS);
+        policy.verify_pme_event = true;
+        let repo = MockRepo::with(
+            ExecutionIntent {
+                status: ExecutionIntentStatus::Prepared,
+                ..intent.clone()
+            },
+            signatures.clone(),
+        );
+        repo.preset_prepared_row(intent.intent_id, tx_hash.clone(), raw.clone());
+
+        let summary = policy.reconcile_unfinalized(&repo, 10).await.unwrap();
+        assert_eq!(summary.confirmed, 1);
+        assert_eq!(
+            repo.status(intent.intent_id),
+            ExecutionIntentStatus::Confirmed
+        );
     }
 
     #[test]

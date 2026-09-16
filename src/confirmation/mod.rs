@@ -1,5 +1,5 @@
 use crate::error::{BackendError, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConfirmationConfig {
@@ -102,6 +102,29 @@ pub struct ConfirmationReceipt {
     pub cumulative_gas_used: Option<u64>,
     pub block_hash: Option<String>,
     pub transaction_index: Option<u64>,
+    /// Log entries emitted by the transaction. Populated by
+    /// `eth_getTransactionReceipt` in the HTTP RPC provider.
+    /// PERPS_BASE_SEPOLIA_BACKEND_BROADCAST_RUNTIME_WIRING_V1: consumed
+    /// by
+    /// [`crate::execution::broadcast_policy::BroadcastPolicy::finalize_receipt`]
+    /// for semantic PME event verification.
+    pub logs: Vec<ReceiptLog>,
+}
+
+/// Minimal event-log surface consumed by the broadcast worker's
+/// semantic PME event verification. Only the fields required by the
+/// verifier are modeled.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReceiptLog {
+    /// Emitter contract address (0x-prefixed lowercase hex).
+    pub address: String,
+    /// Log topics — topic0 is the event signature keccak; topic1..3
+    /// are indexed args. Byte32 0x-hex strings.
+    pub topics: Vec<String>,
+    /// Non-indexed event data. Byte hex string. Preserved for future
+    /// consumers.
+    #[serde(default)]
+    pub data: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -362,6 +385,7 @@ mod tests {
             cumulative_gas_used: None,
             block_hash: None,
             transaction_index: None,
+            logs: Vec::new(),
         }
     }
 }

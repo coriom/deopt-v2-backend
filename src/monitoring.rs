@@ -1248,6 +1248,39 @@ fn bump_count(counts: &mut BTreeMap<String, u64>, key: &str) {
     *counts.entry(key.to_string()).or_default() += 1;
 }
 
+/// PERPS_BASE_SEPOLIA_BACKEND_BROADCAST_RUNTIME_WIRING_V1 — structured
+/// observation of a reconciler tick. Emits a tracing event carrying
+/// counts + oldest-unfinalized-age which operators scrape via
+/// journald / OTEL / Grafana. NO SECRET LABELS: only non-secret
+/// integer counters + status counts.
+pub fn observe_broadcast_reconcile_tick(summary: &crate::execution::ReconcileSummary) {
+    tracing::info!(
+        target: "deopt_perps_broadcast_reconcile",
+        inspected = summary.inspected,
+        confirmed = summary.confirmed,
+        failed = summary.failed,
+        still_pending = summary.still_pending,
+        rebroadcast_attempted = summary.rebroadcast_attempted,
+        "perps broadcast reconcile tick"
+    );
+}
+
+/// PERPS_BASE_SEPOLIA_BACKEND_BROADCAST_RUNTIME_WIRING_V1 — observe a
+/// single broadcast outcome. Called from the broadcast worker after
+/// each intent lifecycle transition. Emits a structured tracing event
+/// (no secret labels) sufficient for operators to alert on failures.
+pub fn observe_broadcast_outcome(outcome: &crate::execution::BroadcastOutcome) {
+    tracing::info!(
+        target: "deopt_perps_broadcast_outcome",
+        intent_id = %outcome.intent_id,
+        nonce = outcome.nonce,
+        status = ?outcome.status,
+        receipt_block_number = ?outcome.receipt_block_number,
+        error = ?outcome.error,
+        "perps broadcast outcome"
+    );
+}
+
 fn execution_status_key(status: crate::execution::ExecutionIntentStatus) -> &'static str {
     match status {
         crate::execution::ExecutionIntentStatus::Pending => "pending",

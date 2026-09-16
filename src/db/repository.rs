@@ -1385,12 +1385,10 @@ impl PgRepository {
             .await
             .map_err(|error| BackendError::Persistence(error.to_string()))?;
 
-        let nonce_i64 = i64::try_from(record.nonce).map_err(|_| {
-            BackendError::Persistence("nonce exceeds BIGINT range".to_string())
-        })?;
-        let chain_id_i64 = i64::try_from(record.chain_id).map_err(|_| {
-            BackendError::Persistence("chain_id exceeds BIGINT range".to_string())
-        })?;
+        let nonce_i64 = i64::try_from(record.nonce)
+            .map_err(|_| BackendError::Persistence("nonce exceeds BIGINT range".to_string()))?;
+        let chain_id_i64 = i64::try_from(record.chain_id)
+            .map_err(|_| BackendError::Persistence("chain_id exceeds BIGINT range".to_string()))?;
         let result = sqlx::query(
             "INSERT INTO execution_intent_broadcasts (
                 intent_id, chain_id, executor_address, target_address,
@@ -1489,6 +1487,10 @@ impl PgRepository {
             .collect()
     }
 
+    /// Prepared → Submitted transition. Monotonicity enforced via
+    /// `WHERE status IN ('prepared', 'submitted')` — a Confirmed or
+    /// Failed row cannot regress. Idempotent: already-Submitted rows
+    /// are unchanged (COALESCE preserves the first-submission timestamp).
     pub async fn mark_intent_submitted(
         &self,
         intent_id: Uuid,
@@ -1504,7 +1506,8 @@ impl PgRepository {
              SET status = 'submitted', \
                  first_submission_at_ms = COALESCE(first_submission_at_ms, $2), \
                  updated_at_ms = $2 \
-             WHERE intent_id = $1",
+             WHERE intent_id = $1 \
+               AND status IN ('prepared', 'submitted')",
         )
         .bind(intent_id.to_string())
         .bind(timestamp_to_i64(first_submission_at_ms))
@@ -1523,6 +1526,9 @@ impl PgRepository {
             .map_err(|error| BackendError::Persistence(error.to_string()))
     }
 
+    /// {Prepared, Submitted} → Confirmed transition. Monotonicity
+    /// enforced via `WHERE status IN (...)` — Confirmed / Failed rows
+    /// cannot regress.
     pub async fn mark_intent_confirmed(
         &self,
         intent_id: Uuid,
@@ -1544,7 +1550,8 @@ impl PgRepository {
                  receipt_status = 1, \
                  confirmed_at_ms = $3, \
                  updated_at_ms = $3 \
-             WHERE intent_id = $1",
+             WHERE intent_id = $1 \
+               AND status IN ('prepared', 'submitted')",
         )
         .bind(intent_id.to_string())
         .bind(block_i64)
@@ -1564,6 +1571,9 @@ impl PgRepository {
             .map_err(|error| BackendError::Persistence(error.to_string()))
     }
 
+    /// {Prepared, Submitted} → Failed transition. Monotonicity
+    /// enforced via `WHERE status IN (...)`. Failure classification
+    /// stored in `failure_reason`.
     pub async fn mark_intent_failed(
         &self,
         intent_id: Uuid,
@@ -1581,7 +1591,8 @@ impl PgRepository {
                  failure_reason = $2, \
                  failed_at_ms = $3, \
                  updated_at_ms = $3 \
-             WHERE intent_id = $1",
+             WHERE intent_id = $1 \
+               AND status IN ('prepared', 'submitted')",
         )
         .bind(intent_id.to_string())
         .bind(&reason)
@@ -1726,8 +1737,7 @@ impl PgRepository {
         for trade in trades {
             inserted += insert_indexed_perp_trade(&mut tx, chain_id, trade).await?;
         }
-        upsert_indexer_cursor(&mut tx, chain_id, cursor_name, last_indexed_block, now_ms())
-            .await?;
+        upsert_indexer_cursor(&mut tx, chain_id, cursor_name, last_indexed_block, now_ms()).await?;
         tx.commit()
             .await
             .map_err(|error| BackendError::Persistence(error.to_string()))?;
@@ -5853,9 +5863,9 @@ impl ExecutionIntentRepository for PgRepository {
         intent_id: Uuid,
         last_send_at_ms: TimestampMs,
     ) -> crate::execution::RepositoryFuture<'_, u32> {
-        Box::pin(async move {
-            PgRepository::bump_send_attempt(self, intent_id, last_send_at_ms).await
-        })
+        Box::pin(
+            async move { PgRepository::bump_send_attempt(self, intent_id, last_send_at_ms).await },
+        )
     }
 
     fn get_prepared_broadcast(
@@ -9779,8 +9789,7 @@ fn prepared_broadcast_row_from_pg(row: PgRow) -> Result<PreparedBroadcastRow> {
         first_submission_at_ms,
         last_send_at_ms,
         send_attempts: u32::try_from(send_attempts_i32).unwrap_or(0),
-        receipt_block_number: receipt_block_number
-            .map(|v| u64::try_from(v).unwrap_or(0)),
+        receipt_block_number: receipt_block_number.map(|v| u64::try_from(v).unwrap_or(0)),
         receipt_status: receipt_status.map(|v| u64::try_from(v).unwrap_or(0)),
         confirmed_at_ms,
         failure_class,
