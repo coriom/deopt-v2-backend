@@ -165,6 +165,12 @@ pub struct AppState {
     /// closed-test guard on Perps mutations. Env:
     /// `PERPS_CLOSED_TEST_ALLOWLIST` (comma-separated hex).
     pub perps_closed_test_allowlist: Vec<AccountId>,
+    /// PERPS_BASE_SEPOLIA_BACKEND_RUNTIME_BOOT_INTEGRATION_V1 — public
+    /// readiness snapshot for the Perps closed-test broadcast
+    /// subsystem. Reflects the ACTUAL runtime lifecycle (preflight
+    /// OK, initial reconciliation OK, reconciler running), not just
+    /// config. Default: fresh handle with all flags false.
+    pub perps_broadcast_readiness: crate::execution::BroadcastReadiness,
     /// PERPS-FULLSTACK-RUNTIME-INTEGRATION-V1 Part D +
     /// PERPS-CLOSED-TEST-HARDENING-V1 Part A — nonce consumption
     /// ledger for signed `PerpOrderIntent` requests on
@@ -545,6 +551,7 @@ impl AppState {
             // mutation surface fail-closed for every wallet.
             perps_closed_test_enabled: false,
             perps_closed_test_allowlist: Vec::new(),
+            perps_broadcast_readiness: crate::execution::BroadcastReadiness::new(),
             // PERPS-FULLSTACK-RUNTIME-INTEGRATION-V1 Part D +
             // PERPS-CLOSED-TEST-HARDENING-V1 Part A — durable nonce
             // ledger backed by the PG repository when one is wired;

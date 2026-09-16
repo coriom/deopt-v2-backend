@@ -163,9 +163,7 @@ async fn main() -> deopt_v2_backend::Result<()> {
             state.perps_impact_mid_keeper_config = state
                 .perps_impact_mid_keeper_config
                 .clone()
-                .with_publisher(Arc::new(
-                    deopt_v2_backend::perps::NoOpPublisher::new(),
-                ));
+                .with_publisher(Arc::new(deopt_v2_backend::perps::NoOpPublisher::new()));
             info!(
                 worker = "perps_impact_mid_keeper",
                 publisher = "noop",
@@ -180,16 +178,16 @@ async fn main() -> deopt_v2_backend::Result<()> {
                     config.chain_id
                 )));
             }
-            let anvil_rpc_url = std::env::var("PERPS_IMPACT_MID_PUBLISHER_RPC_URL")
-                .map_err(|_| {
+            let anvil_rpc_url =
+                std::env::var("PERPS_IMPACT_MID_PUBLISHER_RPC_URL").map_err(|_| {
                     BackendError::Config(
                         "PERPS_IMPACT_MID_PUBLISHER_RPC_URL is required when \
                          PERPS_IMPACT_MID_PUBLISHER=local-anvil"
                             .to_string(),
                     )
                 })?;
-            let signer_hex = std::env::var("PERPS_IMPACT_MID_PUBLISHER_SIGNER_KEY")
-                .map_err(|_| {
+            let signer_hex =
+                std::env::var("PERPS_IMPACT_MID_PUBLISHER_SIGNER_KEY").map_err(|_| {
                     BackendError::Config(
                         "PERPS_IMPACT_MID_PUBLISHER_SIGNER_KEY is required when \
                          PERPS_IMPACT_MID_PUBLISHER=local-anvil"
@@ -197,8 +195,8 @@ async fn main() -> deopt_v2_backend::Result<()> {
                     )
                 })?;
             let signer_bytes = parse_signer_hex(&signer_hex)?;
-            let engine_addr = std::env::var("PERPS_IMPACT_MID_PUBLISHER_ENGINE_ADDRESS")
-                .map_err(|_| {
+            let engine_addr =
+                std::env::var("PERPS_IMPACT_MID_PUBLISHER_ENGINE_ADDRESS").map_err(|_| {
                     BackendError::Config(
                         "PERPS_IMPACT_MID_PUBLISHER_ENGINE_ADDRESS is required when \
                          PERPS_IMPACT_MID_PUBLISHER=local-anvil"
@@ -243,6 +241,66 @@ async fn main() -> deopt_v2_backend::Result<()> {
             );
         }
     }
+    // PERPS_BASE_SEPOLIA_BACKEND_RUNTIME_BOOT_INTEGRATION_V1 — real
+    // closed-test broadcast subsystem. Opt-in only; requires BOTH:
+    //   * EXECUTOR_REAL_BROADCAST_ENABLED=true
+    //   * PERPS_CLOSED_TEST_ENABLED=true
+    //   * PERSISTENCE_ENABLED=true (broadcast rows are durable)
+    // Default backend startup remains fully backward-compatible. Any
+    // preflight failure logs a warning and refuses to advertise the
+    // broadcast subsystem as ready — the backend continues serving
+    // non-Perps traffic. This matches the fail-closed convention used
+    // elsewhere (funding + liquidation workers).
+    let _perps_broadcast_runtime_shutdown = if config.execution.execution_enabled
+        && config.execution.real_broadcast_enabled
+        && !config.execution.dry_run
+        && config.perps_closed_test_enabled
+        && repository.is_some()
+    {
+        let repo_arc = std::sync::Arc::new(repository.clone().expect("checked above"));
+        let readiness = state.perps_broadcast_readiness.clone();
+        let reconciler_config = deopt_v2_backend::execution::ReconcilerConfig::from_env();
+        let executor_batch = config.execution.max_batch_size;
+        let executor_interval_ms = config.execution.poll_interval_ms;
+        match deopt_v2_backend::execution::build_broadcast_runtime(
+            config.execution.clone(),
+            repo_arc.clone(),
+            reconciler_config,
+            readiness,
+        )
+        .await
+        {
+            Ok(runtime) => {
+                info!("perps broadcast runtime: READY (real closed-test broadcast enabled)");
+                // Spawn the executor tick loop that actually calls
+                // BroadcastPolicy::broadcast_intent for eligible
+                // pending intents. Shares the reconciler's cancel
+                // token for coordinated shutdown.
+                let _exec_handle = deopt_v2_backend::execution::spawn_broadcast_executor(
+                    runtime.policy.clone(),
+                    repo_arc.clone(),
+                    executor_interval_ms,
+                    executor_batch,
+                    runtime.cancel.clone(),
+                );
+                Some(runtime.cancel)
+            }
+            Err(error) => {
+                deopt_v2_backend::execution::refuse_broadcast_runtime_disabled(&format!(
+                    "startup wiring failed: {error}"
+                ));
+                None
+            }
+        }
+    } else {
+        if config.execution.real_broadcast_enabled && !config.perps_closed_test_enabled {
+            deopt_v2_backend::execution::refuse_broadcast_runtime_disabled(
+                "EXECUTOR_REAL_BROADCAST_ENABLED=true requires PERPS_CLOSED_TEST_ENABLED=true \
+                 (closed-test gate composition)",
+            );
+        }
+        None
+    };
     if config.indexer.enabled {
         if let Some(repository) = repository.clone() {
             let indexer = Indexer::from_config_and_repository(config.indexer.clone(), repository)?;
@@ -272,8 +330,7 @@ async fn main() -> deopt_v2_backend::Result<()> {
     if state.perps_impact_mid_keeper_config.enabled {
         match state.perps_read_config.rpc_url.clone() {
             Some(rpc_url) => {
-                let provider =
-                    deopt_v2_backend::execution::rpc::HttpJsonRpcProvider::new(rpc_url);
+                let provider = deopt_v2_backend::execution::rpc::HttpJsonRpcProvider::new(rpc_url);
                 match deopt_v2_backend::perps::PerpOracleRouterRpcReader::new(
                     provider,
                     &state.perps_read_config,

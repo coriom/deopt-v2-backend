@@ -1,6 +1,7 @@
 pub mod abi;
 pub mod broadcast_policy;
 pub mod broadcast_reconciler;
+pub mod broadcast_runtime;
 pub mod config;
 pub mod executor;
 pub mod intent;
@@ -28,6 +29,10 @@ pub use broadcast_policy::{
 pub use broadcast_reconciler::{
     initial_reconciliation, spawn_broadcast_reconciler, startup_preflight,
     BroadcastReconcilerCancel, ReconcilerConfig,
+};
+pub use broadcast_runtime::{
+    build_broadcast_runtime, execute_pending_batch, refuse_broadcast_runtime_disabled,
+    spawn_broadcast_executor, wire_broadcast_runtime, BroadcastReadiness, BroadcastRuntime,
 };
 pub use config::{ExecutionConfig, ExecutionStatus, PrivateKeySecret};
 pub use executor::{
