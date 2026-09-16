@@ -552,10 +552,17 @@ where
                 // executed on a non-PME target could be mistaken for a
                 // confirmed fill.
                 if self.verify_pme_event {
+                    // Identity binding: derive the expected on-chain
+                    // intentId from the persisted intent_id (Uuid) and
+                    // require exact match against `topic[1]` of the
+                    // TradeExecuted event.
+                    let expected_identity = ExpectedExecutionIdentity::PreMatchedIntent {
+                        intent_id: expected_intent_hash_from_uuid(intent_id),
+                    };
                     if let Err(err) = verify_pme_event_in_receipt(
                         &receipt,
                         &self.config.perp_matching_engine_address,
-                        &self.expected_pme_topic0,
+                        &expected_identity,
                     ) {
                         let error = format!("semantic_event_verification: {err}");
                         repository
@@ -706,22 +713,54 @@ where
     }
 }
 
-/// Verify that a mined receipt contains at least one log emitted by
-/// the configured PerpMatchingEngine with `topic0` matching the
-/// canonical settlement event (or the intent-based variant). Returns
-/// Ok on success; error message names the specific predicate that
-/// failed for operator inspection.
+/// Expected canonical identity of the on-chain PME execution event
+/// to match against receipt logs. Distinct variants for the two PME
+/// settlement paths — their identity semantics differ and are NOT
+/// interchangeable.
 ///
-/// PERPS_BASE_SEPOLIA_BACKEND_BROADCAST_RUNTIME_WIRING_V1: closes the
-/// "receipt.status = 1 but wrong contract executed" attack surface.
-/// Even with a status=1 receipt whose `tx_hash` matches, the caller
-/// MAY have been tricked into signing a tx that landed on a different
-/// contract. This check refuses to mark Confirmed unless the log
-/// stream demonstrably includes a PME settlement event.
+/// * [`ExpectedExecutionIdentity::PreMatchedIntent`] — for the
+///   `executeTrade` path. Backend `intent_id: Uuid` maps to on-chain
+///   `bytes32 intentId` via `keccak256(intent_id.to_string().as_bytes())`.
+///   Verified as `topic1` of `TradeExecuted`.
+///
+/// * [`ExpectedExecutionIdentity::FromIntents`] — for the
+///   `executeTradeFromIntents` path. Both buyer + seller intent
+///   hashes (EIP-712 `PerpOrderIntent` digests) must match `topic1`
+///   and `topic2` of `TradeExecutedFromIntents`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExpectedExecutionIdentity {
+    /// `TradeExecuted(bytes32 indexed intentId, address indexed buyer,
+    /// address indexed seller, ...)`. `intent_id` is
+    /// `keccak256(uuid_string)`.
+    PreMatchedIntent { intent_id: [u8; 32] },
+    /// `TradeExecutedFromIntents(bytes32 indexed buyerIntentHash,
+    /// bytes32 indexed sellerIntentHash, ...)`.
+    FromIntents {
+        buyer_intent_hash: [u8; 32],
+        seller_intent_hash: [u8; 32],
+    },
+}
+
+/// Verify that a mined receipt contains at least one log emitted by
+/// the configured PerpMatchingEngine with:
+///   1. `topic0` matching the settlement event selector for the
+///      supplied identity variant, AND
+///   2. the identity topics decode to exactly the expected values.
+///
+/// A single tx may legitimately emit multiple PME events (batched
+/// settlement); the verifier searches all logs and requires at least
+/// one EXACT identity match. Merely matching emitter + topic0 with a
+/// DIFFERENT identity does NOT confirm the intent.
+///
+/// PERPS_BASE_SEPOLIA_BACKEND_RECEIPT_IDENTITY_BINDING_V1: closes the
+/// "correct emitter + correct topic0 but wrong execution identity"
+/// gap left open by the previous milestone. Confirmation now requires
+/// cryptographic proof that the PME emitted the event for exactly
+/// the persisted execution being finalized.
 pub fn verify_pme_event_in_receipt(
     receipt: &ConfirmationReceipt,
     expected_pme: &AccountId,
-    expected_topic0: &[u8; 32],
+    expected_identity: &ExpectedExecutionIdentity,
 ) -> Result<()> {
     if receipt.logs.is_empty() {
         return Err(BackendError::BroadcastRejected(
@@ -733,8 +772,18 @@ pub fn verify_pme_event_in_receipt(
         .trim()
         .trim_start_matches("0x")
         .to_ascii_lowercase();
-    let expected_topic_hex = format!("0x{}", hex_encode(expected_topic0));
-    let alt_topic_hex = format!("0x{}", hex_encode(&PME_TRADE_EXECUTED_FROM_INTENTS_TOPIC0));
+    let (expected_topic0, min_topics) = match expected_identity {
+        ExpectedExecutionIdentity::PreMatchedIntent { .. } => (PME_TRADE_EXECUTED_TOPIC0, 2),
+        ExpectedExecutionIdentity::FromIntents { .. } => {
+            (PME_TRADE_EXECUTED_FROM_INTENTS_TOPIC0, 3)
+        }
+    };
+    let expected_topic0_hex = format!("0x{}", hex_encode(&expected_topic0));
+
+    // Track predicate outcomes so the failure message can distinguish
+    // "no emitter/topic0 match" from "emitter+topic0 matched but
+    // identity mismatch".
+    let mut saw_emitter_topic0 = false;
     for log in &receipt.logs {
         let addr_lower = log
             .address
@@ -747,14 +796,89 @@ pub fn verify_pme_event_in_receipt(
         let Some(topic0) = log.topics.first() else {
             continue;
         };
-        let topic0_lower = topic0.trim().to_ascii_lowercase();
-        if topic0_lower == expected_topic_hex || topic0_lower == alt_topic_hex {
-            return Ok(());
+        if topic0.trim().to_ascii_lowercase() != expected_topic0_hex {
+            continue;
+        }
+        // Log has correct emitter + topic0. Check identity.
+        if log.topics.len() < min_topics {
+            // Malformed / short topic list — fail closed for this
+            // log; continue in case another log in the same tx has
+            // a well-formed match.
+            saw_emitter_topic0 = true;
+            continue;
+        }
+        match expected_identity {
+            ExpectedExecutionIdentity::PreMatchedIntent { intent_id } => {
+                if topic_matches_bytes32(&log.topics[1], intent_id) {
+                    return Ok(());
+                }
+                saw_emitter_topic0 = true;
+            }
+            ExpectedExecutionIdentity::FromIntents {
+                buyer_intent_hash,
+                seller_intent_hash,
+            } => {
+                if topic_matches_bytes32(&log.topics[1], buyer_intent_hash)
+                    && topic_matches_bytes32(&log.topics[2], seller_intent_hash)
+                {
+                    return Ok(());
+                }
+                saw_emitter_topic0 = true;
+            }
         }
     }
-    Err(BackendError::BroadcastRejected(format!(
-        "no matching PME event in receipt (expected emitter {expected_pme:?} + topic0 {expected_topic_hex})",
-    )))
+    if saw_emitter_topic0 {
+        Err(BackendError::BroadcastRejected(format!(
+            "PME event emitter+topic0 matched but identity mismatch (expected {expected_identity:?})"
+        )))
+    } else {
+        Err(BackendError::BroadcastRejected(format!(
+            "no matching PME event in receipt (expected emitter {} + topic0 {expected_topic0_hex})",
+            expected_pme.0
+        )))
+    }
+}
+
+/// Case-insensitive equality between a 0x-hex topic string and a
+/// 32-byte value. Never panics on malformed input — returns false.
+fn topic_matches_bytes32(topic_hex: &str, expected: &[u8; 32]) -> bool {
+    let stripped = topic_hex.trim().trim_start_matches("0x");
+    if stripped.len() != 64 {
+        return false;
+    }
+    let mut bytes = [0u8; 32];
+    let raw = stripped.as_bytes();
+    for i in 0..32 {
+        let hi = match hex_nibble(raw[2 * i]) {
+            Some(v) => v,
+            None => return false,
+        };
+        let lo = match hex_nibble(raw[2 * i + 1]) {
+            Some(v) => v,
+            None => return false,
+        };
+        bytes[i] = (hi << 4) | lo;
+    }
+    &bytes == expected
+}
+
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Compute the on-chain PME `intentId` (bytes32) for a backend
+/// canonical execution intent id (Uuid). Deterministic:
+/// `keccak256(intent_id.to_string().as_bytes())`. Mirrors
+/// [`crate::execution::perp_trade::intent_id_to_b256`] but returns
+/// the raw byte array for direct use with
+/// [`verify_pme_event_in_receipt`].
+pub fn expected_intent_hash_from_uuid(intent_id: Uuid) -> [u8; 32] {
+    crate::signing::eip712::keccak256(intent_id.to_string().as_bytes())
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -1388,10 +1512,24 @@ mod tests {
     /// Receipt with a valid PME TradeExecuted event log — for tests
     /// that toggle `verify_pme_event = true`.
     fn happy_receipt_with_pme_event(tx_hash: &str) -> ConfirmationReceipt {
+        happy_receipt_with_identity(tx_hash, make_intent().intent_id)
+    }
+
+    /// Build a happy receipt with a PME `TradeExecuted` log whose
+    /// `topic1` is the on-chain intent hash for `intent_uuid`.
+    fn happy_receipt_with_identity(tx_hash: &str, intent_uuid: Uuid) -> ConfirmationReceipt {
         let mut receipt = happy_receipt(tx_hash);
+        let intent_hash = expected_intent_hash_from_uuid(intent_uuid);
         receipt.logs.push(crate::confirmation::ReceiptLog {
             address: PME.to_ascii_lowercase(),
-            topics: vec![format!("0x{}", hex_encode(&PME_TRADE_EXECUTED_TOPIC0))],
+            topics: vec![
+                format!("0x{}", hex_encode(&PME_TRADE_EXECUTED_TOPIC0)),
+                format!("0x{}", hex_encode(&intent_hash)),
+                // topic[2] = buyer (indexed) — not checked by verifier
+                "0x0000000000000000000000000000000000000000000000000000000000000001".to_string(),
+                // topic[3] = seller (indexed) — not checked by verifier
+                "0x0000000000000000000000000000000000000000000000000000000000000002".to_string(),
+            ],
             data: "0x".to_string(),
         });
         receipt
@@ -2048,5 +2186,372 @@ mod tests {
         let c = AccountId::new("0xccc0000000000000000000000000000000000003".to_string());
         let err = validate_signer_triad(&a, &b, &c).unwrap_err();
         assert!(matches!(err, BackendError::Config(msg) if msg.contains("HV2_EXECUTOR_ADDRESS")));
+    }
+
+    // ================================================================
+    // IDENTITY-BINDING TEST MATRIX A-J (V1: RECEIPT_IDENTITY_BINDING)
+    // ================================================================
+
+    fn pme_addr() -> AccountId {
+        AccountId::new(PME.to_ascii_lowercase())
+    }
+
+    fn build_receipt_with_logs(logs: Vec<crate::confirmation::ReceiptLog>) -> ConfirmationReceipt {
+        ConfirmationReceipt {
+            tx_hash: "0x00".to_string(),
+            status: Some(1),
+            block_number: Some(42),
+            gas_used: None,
+            effective_gas_price: None,
+            cumulative_gas_used: None,
+            block_hash: None,
+            transaction_index: None,
+            logs,
+        }
+    }
+
+    fn pme_log(topics: Vec<String>) -> crate::confirmation::ReceiptLog {
+        crate::confirmation::ReceiptLog {
+            address: PME.to_ascii_lowercase(),
+            topics,
+            data: "0x".to_string(),
+        }
+    }
+
+    fn topic_hex(bytes: &[u8; 32]) -> String {
+        format!("0x{}", hex_encode(bytes))
+    }
+
+    // (A) status=1 + correct emitter + correct topic0 + correct intent_id → OK
+    #[test]
+    fn identity_a_correct_intent_id_confirms() {
+        let intent_id = Uuid::from_u128(0xABCD_1234);
+        let expected_hash = expected_intent_hash_from_uuid(intent_id);
+        let receipt = build_receipt_with_logs(vec![pme_log(vec![
+            topic_hex(&PME_TRADE_EXECUTED_TOPIC0),
+            topic_hex(&expected_hash),
+            topic_hex(&[1u8; 32]),
+            topic_hex(&[2u8; 32]),
+        ])]);
+        verify_pme_event_in_receipt(
+            &receipt,
+            &pme_addr(),
+            &ExpectedExecutionIdentity::PreMatchedIntent {
+                intent_id: expected_hash,
+            },
+        )
+        .expect("correct identity must confirm");
+    }
+
+    // (B) correct emitter + correct topic0 + WRONG intent_id → NOT Confirmed
+    #[test]
+    fn identity_b_wrong_intent_id_fails() {
+        let expected = expected_intent_hash_from_uuid(Uuid::from_u128(1));
+        let wrong = expected_intent_hash_from_uuid(Uuid::from_u128(2));
+        let receipt = build_receipt_with_logs(vec![pme_log(vec![
+            topic_hex(&PME_TRADE_EXECUTED_TOPIC0),
+            topic_hex(&wrong),
+            topic_hex(&[0u8; 32]),
+            topic_hex(&[0u8; 32]),
+        ])]);
+        let err = verify_pme_event_in_receipt(
+            &receipt,
+            &pme_addr(),
+            &ExpectedExecutionIdentity::PreMatchedIntent {
+                intent_id: expected,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, BackendError::BroadcastRejected(msg) if msg.contains("identity mismatch"))
+        );
+    }
+
+    // (C) correct intent_id + correct topic0 + WRONG emitter → NOT Confirmed
+    #[test]
+    fn identity_c_wrong_emitter_fails() {
+        let expected = expected_intent_hash_from_uuid(Uuid::from_u128(3));
+        let mut log = pme_log(vec![
+            topic_hex(&PME_TRADE_EXECUTED_TOPIC0),
+            topic_hex(&expected),
+            topic_hex(&[0u8; 32]),
+            topic_hex(&[0u8; 32]),
+        ]);
+        log.address = "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string();
+        let receipt = build_receipt_with_logs(vec![log]);
+        let err = verify_pme_event_in_receipt(
+            &receipt,
+            &pme_addr(),
+            &ExpectedExecutionIdentity::PreMatchedIntent {
+                intent_id: expected,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, BackendError::BroadcastRejected(msg) if msg.contains("no matching PME event"))
+        );
+    }
+
+    // (D) correct emitter + correct intent_id + WRONG topic0 → NOT Confirmed
+    #[test]
+    fn identity_d_wrong_topic0_fails() {
+        let expected = expected_intent_hash_from_uuid(Uuid::from_u128(4));
+        let receipt = build_receipt_with_logs(vec![pme_log(vec![
+            topic_hex(&[0xffu8; 32]),
+            topic_hex(&expected),
+            topic_hex(&[0u8; 32]),
+            topic_hex(&[0u8; 32]),
+        ])]);
+        let err = verify_pme_event_in_receipt(
+            &receipt,
+            &pme_addr(),
+            &ExpectedExecutionIdentity::PreMatchedIntent {
+                intent_id: expected,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, BackendError::BroadcastRejected(msg) if msg.contains("no matching PME event"))
+        );
+    }
+
+    // (E) multiple PME events; one is the exact expected identity → Confirmed
+    #[test]
+    fn identity_e_multi_event_one_match_confirms() {
+        let expected = expected_intent_hash_from_uuid(Uuid::from_u128(5));
+        let other = expected_intent_hash_from_uuid(Uuid::from_u128(6));
+        let receipt = build_receipt_with_logs(vec![
+            pme_log(vec![
+                topic_hex(&PME_TRADE_EXECUTED_TOPIC0),
+                topic_hex(&other), // wrong identity
+                topic_hex(&[0u8; 32]),
+                topic_hex(&[0u8; 32]),
+            ]),
+            pme_log(vec![
+                topic_hex(&PME_TRADE_EXECUTED_TOPIC0),
+                topic_hex(&expected), // correct identity
+                topic_hex(&[0u8; 32]),
+                topic_hex(&[0u8; 32]),
+            ]),
+        ]);
+        verify_pme_event_in_receipt(
+            &receipt,
+            &pme_addr(),
+            &ExpectedExecutionIdentity::PreMatchedIntent {
+                intent_id: expected,
+            },
+        )
+        .expect("one exact match must confirm");
+    }
+
+    // (F) multiple PME events, none match expected identity → NOT Confirmed
+    #[test]
+    fn identity_f_multi_event_none_match_fails() {
+        let expected = expected_intent_hash_from_uuid(Uuid::from_u128(7));
+        let a = expected_intent_hash_from_uuid(Uuid::from_u128(8));
+        let b = expected_intent_hash_from_uuid(Uuid::from_u128(9));
+        let receipt = build_receipt_with_logs(vec![
+            pme_log(vec![
+                topic_hex(&PME_TRADE_EXECUTED_TOPIC0),
+                topic_hex(&a),
+                topic_hex(&[0u8; 32]),
+                topic_hex(&[0u8; 32]),
+            ]),
+            pme_log(vec![
+                topic_hex(&PME_TRADE_EXECUTED_TOPIC0),
+                topic_hex(&b),
+                topic_hex(&[0u8; 32]),
+                topic_hex(&[0u8; 32]),
+            ]),
+        ]);
+        let err = verify_pme_event_in_receipt(
+            &receipt,
+            &pme_addr(),
+            &ExpectedExecutionIdentity::PreMatchedIntent {
+                intent_id: expected,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, BackendError::BroadcastRejected(msg) if msg.contains("identity mismatch"))
+        );
+    }
+
+    // (G) malformed / short topic list → fail closed, no panic
+    #[test]
+    fn identity_g_malformed_topics_fails_safely() {
+        let expected = expected_intent_hash_from_uuid(Uuid::from_u128(10));
+        // Log with only topic0 — no topic1. Verifier must not panic.
+        let receipt =
+            build_receipt_with_logs(vec![pme_log(vec![topic_hex(&PME_TRADE_EXECUTED_TOPIC0)])]);
+        let err = verify_pme_event_in_receipt(
+            &receipt,
+            &pme_addr(),
+            &ExpectedExecutionIdentity::PreMatchedIntent {
+                intent_id: expected,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, BackendError::BroadcastRejected(_)));
+
+        // Log with a topic1 that is not a well-formed 32-byte hex.
+        let receipt2 = build_receipt_with_logs(vec![pme_log(vec![
+            topic_hex(&PME_TRADE_EXECUTED_TOPIC0),
+            "0xNOT_HEX".to_string(),
+            topic_hex(&[0u8; 32]),
+            topic_hex(&[0u8; 32]),
+        ])]);
+        let err2 = verify_pme_event_in_receipt(
+            &receipt2,
+            &pme_addr(),
+            &ExpectedExecutionIdentity::PreMatchedIntent {
+                intent_id: expected,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err2, BackendError::BroadcastRejected(_)));
+    }
+
+    // (H) status=0 even with matching event → Failed at the receipt.status
+    //     stage (this test focuses on the isolated verifier which does
+    //     not inspect status; the finalize_receipt-level tests cover
+    //     the composite behavior — see reverted_receipt_marks_failed).
+    //     Kept here for scope-completeness: verifier is pure w.r.t.
+    //     status, so verify_pme_event_in_receipt returns Ok even for
+    //     status=0. The composite check in `finalize_receipt` runs the
+    //     status check BEFORE the semantic check.
+    #[test]
+    fn identity_h_status_zero_isolated_semantics() {
+        let expected = expected_intent_hash_from_uuid(Uuid::from_u128(11));
+        let mut receipt = build_receipt_with_logs(vec![pme_log(vec![
+            topic_hex(&PME_TRADE_EXECUTED_TOPIC0),
+            topic_hex(&expected),
+            topic_hex(&[0u8; 32]),
+            topic_hex(&[0u8; 32]),
+        ])]);
+        receipt.status = Some(0);
+        // Pure semantic verifier: matching log → Ok. finalize_receipt
+        // wraps this behind the status=1 gate.
+        verify_pme_event_in_receipt(
+            &receipt,
+            &pme_addr(),
+            &ExpectedExecutionIdentity::PreMatchedIntent {
+                intent_id: expected,
+            },
+        )
+        .expect("verifier is status-agnostic; composite check in finalize_receipt handles status");
+    }
+
+    // (I) tx_hash mismatch is handled in finalize_receipt BEFORE
+    //     verify_pme_event_in_receipt is invoked. Documented here.
+    //     No separate isolated test — see `i_reverted_receipt_marks_failed`
+    //     and existing finalize_receipt tests.
+    #[test]
+    fn identity_i_verifier_ignores_tx_hash() {
+        // Sanity: the verifier does not inspect tx_hash. Composite
+        // path validates receipt.tx_hash before invoking us.
+        let expected = expected_intent_hash_from_uuid(Uuid::from_u128(12));
+        let receipt = build_receipt_with_logs(vec![pme_log(vec![
+            topic_hex(&PME_TRADE_EXECUTED_TOPIC0),
+            topic_hex(&expected),
+            topic_hex(&[0u8; 32]),
+            topic_hex(&[0u8; 32]),
+        ])]);
+        verify_pme_event_in_receipt(
+            &receipt,
+            &pme_addr(),
+            &ExpectedExecutionIdentity::PreMatchedIntent {
+                intent_id: expected,
+            },
+        )
+        .expect("verifier ignores tx_hash — composite gate handles that");
+    }
+
+    // (J) reconciler observes the same receipt twice → deterministic verdict
+    #[test]
+    fn identity_j_verifier_deterministic() {
+        let expected = expected_intent_hash_from_uuid(Uuid::from_u128(13));
+        let receipt = build_receipt_with_logs(vec![pme_log(vec![
+            topic_hex(&PME_TRADE_EXECUTED_TOPIC0),
+            topic_hex(&expected),
+            topic_hex(&[0u8; 32]),
+            topic_hex(&[0u8; 32]),
+        ])]);
+        let a = verify_pme_event_in_receipt(
+            &receipt,
+            &pme_addr(),
+            &ExpectedExecutionIdentity::PreMatchedIntent {
+                intent_id: expected,
+            },
+        );
+        let b = verify_pme_event_in_receipt(
+            &receipt,
+            &pme_addr(),
+            &ExpectedExecutionIdentity::PreMatchedIntent {
+                intent_id: expected,
+            },
+        );
+        assert!(a.is_ok());
+        assert!(b.is_ok());
+    }
+
+    // (K bonus) FromIntents identity variant: matches topic1 + topic2
+    #[test]
+    fn identity_k_from_intents_requires_both_hashes() {
+        let buyer = [0x11u8; 32];
+        let seller = [0x22u8; 32];
+        // Correct: emitter + FromIntents topic0 + topic1=buyer + topic2=seller
+        let receipt_ok = build_receipt_with_logs(vec![pme_log(vec![
+            topic_hex(&PME_TRADE_EXECUTED_FROM_INTENTS_TOPIC0),
+            topic_hex(&buyer),
+            topic_hex(&seller),
+        ])]);
+        verify_pme_event_in_receipt(
+            &receipt_ok,
+            &pme_addr(),
+            &ExpectedExecutionIdentity::FromIntents {
+                buyer_intent_hash: buyer,
+                seller_intent_hash: seller,
+            },
+        )
+        .expect("both intent hashes match");
+        // Wrong seller hash → identity mismatch.
+        let receipt_wrong_seller = build_receipt_with_logs(vec![pme_log(vec![
+            topic_hex(&PME_TRADE_EXECUTED_FROM_INTENTS_TOPIC0),
+            topic_hex(&buyer),
+            topic_hex(&[0x33u8; 32]),
+        ])]);
+        let err = verify_pme_event_in_receipt(
+            &receipt_wrong_seller,
+            &pme_addr(),
+            &ExpectedExecutionIdentity::FromIntents {
+                buyer_intent_hash: buyer,
+                seller_intent_hash: seller,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, BackendError::BroadcastRejected(_)));
+    }
+
+    // (L bonus) topic_matches_bytes32 handles case-insensitive + odd
+    //     inputs safely.
+    #[test]
+    fn identity_l_topic_matches_bytes32_safety() {
+        let bytes = [0xdeu8; 32];
+        assert!(topic_matches_bytes32(
+            &format!("0x{}", hex_encode(&bytes)),
+            &bytes
+        ));
+        // Uppercase hex payload (keep the 0x prefix lowercased —
+        // real JSON-RPC always emits `0x` in lowercase).
+        let up = format!("0x{}", hex_encode(&bytes).to_ascii_uppercase());
+        assert!(topic_matches_bytes32(&up, &bytes));
+        // Wrong length.
+        assert!(!topic_matches_bytes32("0xdeadbeef", &bytes));
+        // Non-hex.
+        assert!(!topic_matches_bytes32(
+            "0xzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+            &bytes
+        ));
     }
 }
