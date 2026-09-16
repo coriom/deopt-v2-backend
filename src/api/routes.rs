@@ -361,6 +361,21 @@ pub fn router(state: AppState) -> Router {
         // on mainnet chain ids). Public trading MUST be off — this
         // endpoint is closed-test only for V1.
         .route("/perps/orders/signed", post(perps_submit_signed_order))
+        // PERPS_BASE_SEPOLIA_CLOSED_TEST_COSIGN_ROUTE_V1 —
+        // closed-test-only two-phase co-sign flow producing the exact
+        // 10-field `PerpTrade` accepted by the deployed Base Sepolia
+        // PME V1. Gated on `PERPS_CLOSED_TEST_ENABLED=true` + both
+        // parties in `PERPS_CLOSED_TEST_ALLOWLIST`. Preparation
+        // creates a `Pending` ExecutionIntent; broadcast requires the
+        // independent executor gates PLUS both signatures.
+        .route(
+            "/perps/closed-test/trades/prepare",
+            post(perps_closed_test_prepare_trade),
+        )
+        .route(
+            "/perps/closed-test/trades/:uuid/cosign",
+            post(perps_closed_test_cosign_trade),
+        )
         .route("/orderbook/:market_id", get(orderbook))
         .route(
             "/options/series",
@@ -3563,7 +3578,9 @@ async fn perps_submit_signed_order(
         .iter()
         .find(|m| (m.onchain_market_id as u128) == intent.market_id)
         .ok_or_else(|| {
-            ApiError::from(BackendError::PerpsMarketNotFound(intent.market_id.to_string()))
+            ApiError::from(BackendError::PerpsMarketNotFound(
+                intent.market_id.to_string(),
+            ))
         })?;
     let market_symbol = market_row.symbol.clone();
 
@@ -3629,8 +3646,7 @@ async fn perps_submit_signed_order(
     // The registration mirrors the on-chain `intentFilled[intentHash]`
     // mapping and shares the exact intent-hash key (`perp_order_intent_hash`
     // is the EIP-712 struct hash used on both sides).
-    let ledger =
-        crate::perps::PgIntentFillsLedger::new(repository.clone());
+    let ledger = crate::perps::PgIntentFillsLedger::new(repository.clone());
     let now_ms_i64 = crate::types::now_ms() as i64;
     ledger
         .record_intent(
@@ -8420,7 +8436,10 @@ async fn indexer_status(State(state): State<AppState>) -> Result<Json<IndexerSta
         // runtime's chain id.
         let chain_id = crate::chain_runtime::ChainRuntimeHandle::v1_default().chain_id();
         repository
-            .get_indexer_cursor(chain_id, crate::indexer::runner::PERP_MATCHING_ENGINE_CURSOR)
+            .get_indexer_cursor(
+                chain_id,
+                crate::indexer::runner::PERP_MATCHING_ENGINE_CURSOR,
+            )
             .await?
             .unwrap_or(state.indexer_config.start_block)
     } else {
@@ -15636,4 +15655,153 @@ impl IntoResponse for ApiError {
         )
             .into_response()
     }
+}
+
+// ================================================================
+// PERPS_BASE_SEPOLIA_CLOSED_TEST_COSIGN_ROUTE_V1 handlers
+// ================================================================
+
+/// POST /perps/closed-test/trades/prepare
+///
+/// Freezes a 10-field `PerpTrade` matched to the deployed V1 PME,
+/// persists an `ExecutionIntent` (status = `Pending`, no signatures
+/// yet), and returns the exact EIP-712 typed data both traders must
+/// co-sign.
+async fn perps_closed_test_prepare_trade(
+    State(state): State<AppState>,
+    Json(req): Json<crate::api::perps_cosign::PrepareTradeRequest>,
+) -> Result<Json<crate::api::perps_cosign::PrepareTradeResponse>, ApiError> {
+    let outcome = crate::api::perps_cosign::prepare_trade_core(&state, &req, None)?;
+    // Persistence: write the ExecutionIntent row so the cosign path
+    // can reload it by UUID. When repository is None (in-memory
+    // fallback), the closed-test flow is unsupported — fail closed.
+    let repository = state.repository.clone().ok_or_else(|| {
+        ApiError::from(BackendError::Persistence(
+            "closed-test cosign requires PERSISTENCE_ENABLED=true".to_string(),
+        ))
+    })?;
+    // Persist the frozen intent so the cosign path can reload it by
+    // UUID and reconstruct the EIP-712 digest server-side.
+    repository
+        .insert_execution_intent_row(&outcome.execution_intent)
+        .await?;
+    Ok(Json(crate::api::perps_cosign::PrepareTradeResponse {
+        uuid: outcome.uuid.to_string(),
+        intent_id_hex: outcome.intent_id_hex.clone(),
+        digest: outcome.digest_hex,
+        typed_data: outcome.typed_data,
+        trade: crate::api::perps_cosign::FrozenTradeEcho {
+            buyer: outcome.payload.buyer.0.clone(),
+            seller: outcome.payload.seller.0.clone(),
+            market_id: outcome.payload.market_id.to_string(),
+            size_delta_1e8: outcome.payload.size_delta_1e8.to_string(),
+            execution_price_1e8: outcome.payload.execution_price_1e8.to_string(),
+            buyer_is_maker: outcome.payload.buyer_is_maker,
+            buyer_nonce: outcome.payload.buyer_nonce.to_string(),
+            seller_nonce: outcome.payload.seller_nonce.to_string(),
+            deadline: outcome.payload.deadline.to_string(),
+        },
+    }))
+}
+
+/// POST /perps/closed-test/trades/{uuid}/cosign
+///
+/// Reloads the frozen `PerpTrade` by UUID, verifies both signatures
+/// server-side against the reconstructed EIP-712 digest, persists
+/// both signatures, and advances the intent to `CalldataReady`.
+async fn perps_closed_test_cosign_trade(
+    State(state): State<AppState>,
+    Path(uuid_str): Path<String>,
+    Json(req): Json<crate::api::perps_cosign::CosignTradeRequest>,
+) -> Result<Json<crate::api::perps_cosign::CosignTradeResponse>, ApiError> {
+    // Gate: closed-test only.
+    if !state.perps_closed_test_enabled {
+        state.perps_observability.record_perps_not_live_reject();
+        return Err(BackendError::PerpsNotLive.into());
+    }
+    if state.perps_public_trading_enabled {
+        state.perps_observability.record_perps_not_live_reject();
+        return Err(BackendError::PerpsNotLive.into());
+    }
+    let uuid = uuid::Uuid::parse_str(&uuid_str).map_err(|_| {
+        ApiError::from(BackendError::Config(format!(
+            "invalid uuid path segment: {uuid_str}"
+        )))
+    })?;
+    let repository = state.repository.clone().ok_or_else(|| {
+        ApiError::from(BackendError::Persistence(
+            "closed-test cosign requires PERSISTENCE_ENABLED=true".to_string(),
+        ))
+    })?;
+    let intent = repository
+        .get_execution_intent(uuid)
+        .await?
+        .ok_or_else(|| ApiError::from(BackendError::PerpOrderNotFound(uuid.to_string())))?;
+    // Reject if the intent isn't in a co-signable state.
+    if !matches!(
+        intent.status,
+        crate::execution::ExecutionIntentStatus::Pending
+            | crate::execution::ExecutionIntentStatus::CalldataReady
+    ) {
+        return Err(ApiError::from(BackendError::PerpInvalidOrderState(
+            format!("intent state {:?} not co-signable", intent.status),
+        )));
+    }
+    // Domain matches the deployed V1 PME identity used at prepare time.
+    let domain = crate::execution::PerpTradeDomain::new(
+        state.perps_read_config.chain_id,
+        state.execution_config.perp_matching_engine_address.clone(),
+    );
+    let prior_stored = repository.get_execution_intent_signatures(uuid).await?;
+    let prior_view = crate::api::perps_cosign::StoredTradeSignaturesView::from(&prior_stored);
+    let now_sec: u128 = (crate::types::now_ms() / 1000) as u128;
+    let verified = crate::api::perps_cosign::cosign_load_and_verify(
+        &intent,
+        &domain,
+        &req,
+        Some(&prior_view),
+        now_sec,
+    )?;
+    // Persist both signatures atomically.
+    let now_ms_val = crate::types::now_ms();
+    repository
+        .upsert_execution_intent_signatures(
+            uuid,
+            Some(hex_0x_bytes(&verified.bundle.buyer_sig)),
+            Some(hex_0x_bytes(&verified.bundle.seller_sig)),
+            now_ms_val,
+        )
+        .await?;
+    // Advance to CalldataReady if it was still Pending. Idempotent.
+    if intent.status == crate::execution::ExecutionIntentStatus::Pending {
+        repository
+            .update_execution_intent_status(
+                uuid,
+                crate::execution::ExecutionIntentStatus::CalldataReady,
+                now_ms_val,
+            )
+            .await?;
+    }
+    let intent_id_hex = crate::execution::intent_id_to_hex_bytes32(&uuid.to_string())?;
+    Ok(Json(crate::api::perps_cosign::CosignTradeResponse {
+        uuid: uuid.to_string(),
+        intent_id_hex,
+        buyer_signer: verified.buyer_signer.0.clone(),
+        seller_signer: verified.seller_signer.0.clone(),
+        calldata_ready: true,
+    }))
+}
+
+/// Local hex helper — the standalone `hex_0x` in
+/// `execution::transaction` is used by the broadcast path; this
+/// mirror keeps handler-side conversions dep-free.
+fn hex_0x_bytes(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(2 + bytes.len() * 2);
+    s.push_str("0x");
+    for b in bytes {
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    s
 }

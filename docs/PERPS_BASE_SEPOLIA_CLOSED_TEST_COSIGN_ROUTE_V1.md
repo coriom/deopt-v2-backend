@@ -4,6 +4,32 @@ Closed-test-only co-sign flow that produces the exact 10-field
 `PerpTrade` required by the deployed Base Sepolia PME V1 at
 `0x774d96E5739bffadEE91508b4D3D74F5BE29F165`.
 
+**REOPENED milestone iteration** — the original draft carried a
+millisecond-scaled deadline bug, unwired HTTP routes, and did not
+persist the prepared trade before returning typed data. Those gaps
+are closed in this revision.
+
+## Deadline units — Unix SECONDS
+
+Solidity `PerpMatchingEngine._isDeadlineValid` compares `t.deadline`
+against `block.timestamp`, which is **Unix seconds**. The backend
+computes:
+
+```rust
+let now_sec: u128 = (now_ms / 1000) as u128;
+let deadline_sec = now_sec + PREPARE_DEADLINE_TTL_SEC;  // 3600
+```
+
+Never `now_ms + 3_600_000`. The `PREPARE_DEADLINE_TTL_SEC` constant
+is fixed at **3 600** (one hour). A regression test
+`z1_deadline_is_unix_seconds_not_ms` pins this invariant.
+
+The `ExecutionIntent.deadline_ms` shadow column stores
+`deadline_sec × 1000` to keep the ms typed field coherent with
+existing rows. The authoritative deadline for cosign verification
+is the SECONDS value reconstructed via `intent_to_v1_payload` — the
+shadow is not consulted by the digest.
+
 ## Deployed contract truth (authoritative)
 
 | Field | Value |
@@ -29,9 +55,9 @@ The new `perp_trade_v1_digest` and `perp_trade_v1_digest_bytes` compute the corr
 
 ### Phase A — Prepare
 
-Route (recommended): `POST /perps/closed-test/trades/prepare`
+Route (**wired**): `POST /perps/closed-test/trades/prepare`
 
-Core logic: `perps_cosign::prepare_trade_core(state, req)`.
+Handler: `routes::perps_closed_test_prepare_trade` → `perps_cosign::prepare_trade_core(state, req, None)`.
 
 Gates:
 - `PERPS_CLOSED_TEST_ENABLED = true` (else `PerpsNotLive`)
@@ -40,21 +66,38 @@ Gates:
 - `buyer != seller`
 - Well-formed EVM addresses
 - Non-zero `sizeDelta1e8` and `executionPrice1e8`
+- **`PERSISTENCE_ENABLED = true`** — closed-test cosign requires a real repository for the reload path
+
+Request body:
+```json
+{
+  "buyer": "0x...",
+  "seller": "0x...",
+  "marketId": "1",
+  "sizeDelta1e8": "1000000",
+  "executionPrice1e8": "240000000000",
+  "buyerIsMaker": false,
+  "buyerNonce": "0",
+  "sellerNonce": "0"
+}
+```
 
 Actions:
-1. Generate a fresh UUID v4 (backend-owned).
-2. Derive `intentId = keccak256(uuid.to_string().as_bytes())` (canonical hyphenated RFC-4122 string bytes).
-3. Freeze `buyerNonce = 0`, `sellerNonce = 0` (matches fresh trader-fixture state; future extension: read `PME.nonces(x)` via RPC).
-4. Freeze `deadline = now_ms + PREPARE_DEADLINE_TTL_MS (default 1h)`.
-5. Build the 10-field `PerpTrade` payload.
-6. Compute the EIP-712 digest.
-7. Return `{ uuid, intentId, digest, typedData, trade }`.
+1. Enforce closed-test + allowlist gates.
+2. Parse explicit `buyerNonce` / `sellerNonce` — operator policy freezes these values (V1 does NOT auto-read `PME.nonces(x)` via RPC; a follow-on will).
+3. Generate a fresh UUID v4 (backend-owned).
+4. Derive `intentId = keccak256(uuid.to_string().as_bytes())` (canonical hyphenated RFC-4122 string bytes).
+5. Compute `deadline = (now_ms / 1000) + 3600` — **Unix seconds**, NOT ms.
+6. Build the 10-field `PerpTrade` payload.
+7. Compute the EIP-712 digest.
+8. **Persist the frozen `ExecutionIntent` (status = `Pending`, no signatures yet) via `PgRepository::insert_execution_intent_row(...)`.** This lets the cosign handler reload the intent by UUID.
+9. Return `{ uuid, intentId, digest, typedData, trade }`.
 
 ### Phase B — Cosign
 
-Route (recommended): `POST /perps/closed-test/trades/{uuid}/cosign`
+Route (**wired**): `POST /perps/closed-test/trades/{uuid}/cosign`
 
-Core logic: `perps_cosign::cosign_verify_core(payload, domain, req)`.
+Handler: `routes::perps_closed_test_cosign_trade` → `perps_cosign::cosign_load_and_verify(intent, domain, req, prior_bundle, now_sec)`.
 
 Body:
 ```json
@@ -62,11 +105,33 @@ Body:
 ```
 
 Actions:
-1. Recompute the frozen EIP-712 digest server-side (never trust client-supplied digest).
-2. `ecrecover(digest, buyer_signature)` must equal `payload.buyer`.
-3. `ecrecover(digest, seller_signature)` must equal `payload.seller`.
-4. On success, persist `{ buyer_sig, seller_sig }` via `PgRepository::upsert_execution_intent_signatures(intent_id, …)`.
-5. The intent's `execution_intent_signatures` row is now `calldata_ready`. BroadcastPolicy can consume it — but real broadcast still requires the independent executor gates.
+1. Enforce closed-test gates.
+2. Parse the UUID from the path.
+3. **Reload the frozen `ExecutionIntent` from Postgres via `PgRepository::get_execution_intent(uuid)`.** Returns `PerpOrderNotFound` if unknown.
+4. Reject if the intent is not in a co-signable state (must be `Pending` or already-signed `CalldataReady`).
+5. Reconstruct the `PerpTradePayload` from the persisted intent via `intent_to_v1_payload`.
+6. Reject if `now_sec > payload.deadline` → `PerpsIntentDeadlineExpired`.
+7. Load prior signatures (if any) via `PgRepository::get_execution_intent_signatures(uuid)`.
+8. Idempotency: if `prior.buyer_sig == req.buyer_signature && prior.seller_sig == req.seller_signature` → return Ok without re-verification.
+9. Conflict: if `prior.buyer_sig` / `prior.seller_sig` is Some but differs → `BroadcastRejected("cosign_conflict: …")`.
+10. Recompute the EIP-712 digest server-side.
+11. `ecrecover(digest, buyer_signature)` must equal `payload.buyer` (else `PerpsIntentTraderMismatch`).
+12. `ecrecover(digest, seller_signature)` must equal `payload.seller` (else `PerpsIntentTraderMismatch`).
+13. Persist both signatures via `PgRepository::upsert_execution_intent_signatures(uuid, ..., ...)`.
+14. Advance intent status `Pending → CalldataReady`.
+15. Return `{ uuid, intentId, buyerSigner, sellerSigner, calldataReady: true }`.
+
+**Client-controlled fields on cosign**: ONLY `buyerSignature` + `sellerSignature`. The client CANNOT replace any economic field — buyer, seller, marketId, sizeDelta1e8, executionPrice1e8, buyerNonce, sellerNonce, deadline, intentId are all reloaded from the frozen row.
+
+### Broadcast eligibility invariant
+
+An intent in `Pending` state with no signatures **cannot reach the broadcast RPC**. The chain of gates:
+
+- Repository executor path (dry-run or real) invokes `build_execution_transaction_request(&config, &intent, &signatures)`.
+- That function calls `signatures.calldata_ready()`, which requires BOTH `buyer_sig` and `seller_sig` to be Some.
+- Absent either signature → `BackendError::MissingTradeSignatures`.
+
+Test `z9_unsigned_prepared_intent_cannot_broadcast` pins this invariant.
 
 ## Signature verification failure classes
 

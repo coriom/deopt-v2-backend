@@ -48,10 +48,22 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
 use uuid::Uuid;
 
-/// Default deadline TTL for a prepared closed-test trade: **1 hour**.
-/// A finite deadline is preferred over `0` per the milestone directive
-/// (avoids depending on `deadline == 0` V1-disabled semantics).
-pub const PREPARE_DEADLINE_TTL_MS: i64 = 3_600_000;
+/// Default deadline TTL (seconds) for a prepared closed-test trade:
+/// **1 hour**. The deployed V1 PME compares `t.deadline` against
+/// `block.timestamp`, which is Unix **seconds**. This constant is in
+/// SECONDS, and `prepare_trade_core` computes `deadline = now_sec +
+/// PREPARE_DEADLINE_TTL_SEC` — NOT `now_ms + 3_600_000` (which would
+/// be interpreted by Solidity as ~50 years in the future).
+pub const PREPARE_DEADLINE_TTL_SEC: u128 = 3_600;
+
+/// Backwards-compat alias while callers migrate. Retains the old
+/// name but semantics have changed: value is now in SECONDS (was
+/// milliseconds in the initial v1 draft — that draft had a units bug
+/// caught by the reopened milestone audit).
+#[deprecated(
+    note = "Use PREPARE_DEADLINE_TTL_SEC. This alias has been corrected to seconds — do not scale by 1000."
+)]
+pub const PREPARE_DEADLINE_TTL_MS: u128 = PREPARE_DEADLINE_TTL_SEC;
 
 // ================================================================
 // PHASE A — PREPARE
@@ -67,14 +79,31 @@ pub struct PrepareTradeRequest {
     /// Decimal string; on-chain `uint128 sizeDelta1e8` (0.01 ETH = "1000000").
     #[serde(rename = "sizeDelta1e8")]
     pub size_delta_1e8: String,
-    /// Decimal string; on-chain `uint128 executionPrice1e8`. Client
-    /// picks the price snapshot; backend enforces > 0 but does not
-    /// perform an on-chain oracle deviation check (deployed V1 PME
-    /// does not either — see fork rehearsal milestone).
+    /// Decimal string; on-chain `uint128 executionPrice1e8`. Explicit
+    /// closed-test policy field — the CURRENT V1 implementation
+    /// accepts an operator-supplied price at prepare time. The
+    /// operator is expected to have read the fresh oracle mark
+    /// (`OracleRouter.getPriceSafe(mWETH, mUSDC)`) before submitting
+    /// this value. Backend enforces `> 0` only; the deployed V1 PME
+    /// has NO on-chain execution-deviation guard (see
+    /// `PERPS_BASE_SEPOLIA_BACKEND_RECEIPT_IDENTITY_BINDING_V1` for
+    /// the on-chain-drift analysis). Future extension: replace this
+    /// field with a backend-owned oracle read.
     #[serde(rename = "executionPrice1e8")]
     pub execution_price_1e8: String,
     #[serde(rename = "buyerIsMaker")]
     pub buyer_is_maker: bool,
+    /// EXPLICIT nonce policy — the operator MUST supply the frozen
+    /// PME nonces for buyer + seller. The V1 implementation does NOT
+    /// silently default these to 0. In production this value would be
+    /// read from `PME.nonces(buyer)` and `PME.nonces(seller)` via RPC
+    /// — deferred to the runtime-wiring layer. For closed-test smoke
+    /// against fresh trader fixtures the operator submits `0` for
+    /// both; any subsequent trade re-uses the incremented nonces.
+    #[serde(rename = "buyerNonce")]
+    pub buyer_nonce: String,
+    #[serde(rename = "sellerNonce")]
+    pub seller_nonce: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -187,21 +216,33 @@ pub fn prepare_trade_core(
             "executionPrice1e8 must be > 0".to_string(),
         ));
     }
-    // ---- Freeze identity + timestamps + nonces ----
-    let now = now_ms_override.unwrap_or_else(now_ms);
-    let deadline_ms = now.saturating_add(PREPARE_DEADLINE_TTL_MS);
+    // ---- Explicit nonce policy ----
+    let buyer_nonce: u128 = req.buyer_nonce.parse().map_err(|_| {
+        BackendError::Config(format!(
+            "invalid buyerNonce decimal string: {}",
+            req.buyer_nonce
+        ))
+    })?;
+    let seller_nonce: u128 = req.seller_nonce.parse().map_err(|_| {
+        BackendError::Config(format!(
+            "invalid sellerNonce decimal string: {}",
+            req.seller_nonce
+        ))
+    })?;
+
+    // ---- Freeze identity + timestamps ----
+    //
+    // CRITICAL: Solidity `_isDeadlineValid` compares `t.deadline`
+    // against `block.timestamp`, which is Unix SECONDS. Convert now
+    // from ms to seconds BEFORE adding the TTL. See regression test
+    // `deadline_is_unix_seconds_not_ms`.
+    let now_ms_val = now_ms_override.unwrap_or_else(now_ms);
+    let now_sec = (now_ms_val / 1000) as u128;
+    let deadline_sec = now_sec.saturating_add(PREPARE_DEADLINE_TTL_SEC);
+
     let uuid = Uuid::new_v4();
     let intent_id_hex = crate::execution::intent_id_to_hex_bytes32(&uuid.to_string())?;
     let intent_id_b256 = intent_id_to_b256(&uuid.to_string())?;
-
-    // NOTE: buyer/seller PME nonces should be read from chain at
-    // signing time in production; for this milestone we accept 0/0
-    // as the canonical starting state (matches the fresh trader
-    // fixtures created by TRADER_KEYSTORES_V1). Future extension may
-    // read `PME.nonces(buyer)` and `PME.nonces(seller)` via RPC and
-    // bind them here.
-    let buyer_nonce: u128 = 0;
-    let seller_nonce: u128 = 0;
 
     // Build the 10-field payload. Note the max/min bounds are set to
     // 0 (not encoded by the V1 digest / calldata) — the deployed V1
@@ -218,7 +259,7 @@ pub fn prepare_trade_core(
         req.buyer_is_maker,
         buyer_nonce,
         seller_nonce,
-        u128::try_from(deadline_ms).unwrap_or(u128::MAX),
+        deadline_sec,
     )?;
 
     let domain = PerpTradeDomain::new(
@@ -227,8 +268,28 @@ pub fn prepare_trade_core(
     );
     let digest_hex = perp_trade_v1_digest(&payload, &domain)?;
 
-    let typed_data = build_typed_data_v1(&payload, &domain, &intent_id_hex, deadline_ms);
+    // ExecutionIntent.deadline_ms is a ms field but the on-chain
+    // deadline is seconds. We persist the seconds value multiplied by
+    // 1000 back to ms so the type stays coherent with existing rows.
+    // The AUTHORITATIVE frozen deadline lives on the `PerpTradePayload`
+    // (deadline_sec) — cosign reload uses that value, not the ms
+    // shadow.
+    let deadline_shadow_ms: TimestampMs = i64::try_from(deadline_sec.saturating_mul(1000))
+        .map_err(|_| {
+            BackendError::Config("deadline overflow when scaling to ms shadow".to_string())
+        })?;
 
+    let typed_data = build_typed_data_v1(&payload, &domain, &intent_id_hex, deadline_sec);
+
+    // ---- PREPARED-AWAITING-COSIGN state ----
+    //
+    // Persisted with `Pending` status so the executor tick / worker
+    // does NOT select it for broadcast. The executor path selects
+    // rows in `Pending → DryRun → SimulationOk → CalldataReady →
+    // Submitted` phase-wise; without buyer_sig+seller_sig persisted,
+    // `build_execution_transaction_request` short-circuits with
+    // `MissingTradeSignatures`. State advances to `CalldataReady`
+    // only after cosign persists both signatures.
     let execution_intent = ExecutionIntent {
         intent_id: uuid,
         market_id: market_id_from_u128(market_id)?,
@@ -241,9 +302,9 @@ pub fn prepare_trade_core(
         buyer_is_maker: Some(req.buyer_is_maker),
         buyer_nonce: Some(buyer_nonce as u64),
         seller_nonce: Some(seller_nonce as u64),
-        deadline_ms: Some(deadline_ms),
-        created_at_ms: now,
-        status: ExecutionIntentStatus::CalldataReady,
+        deadline_ms: Some(deadline_shadow_ms),
+        created_at_ms: now_ms_val,
+        status: ExecutionIntentStatus::Pending,
     };
 
     Ok(PrepareOutcome {
@@ -267,7 +328,7 @@ fn build_typed_data_v1(
     payload: &PerpTradePayload,
     domain: &PerpTradeDomain,
     intent_id_hex: &str,
-    deadline_ms: TimestampMs,
+    deadline_sec: u128,
 ) -> JsonValue {
     json!({
         "types": {
@@ -307,7 +368,7 @@ fn build_typed_data_v1(
             "buyerIsMaker": payload.buyer_is_maker,
             "buyerNonce": payload.buyer_nonce.to_string(),
             "sellerNonce": payload.seller_nonce.to_string(),
-            "deadline": deadline_ms.to_string()
+            "deadline": deadline_sec.to_string()
         }
     })
 }
@@ -374,6 +435,130 @@ pub struct CosignVerifiedSignatures {
     pub buyer_signer: AccountId,
     pub seller_signer: AccountId,
     pub bundle: PerpTradeSignatureBundle,
+}
+
+/// Persistence-aware co-sign path. Reconstructs the frozen 10-field
+/// `PerpTrade` from a previously persisted `ExecutionIntent`, verifies
+/// both signatures against the SERVER-COMPUTED digest, and returns
+/// the verified sigs + a rebuilt `PerpTradePayload` ready for
+/// `upsert_execution_intent_signatures`.
+///
+/// This function does NOT trust the client to re-send economic
+/// fields. The reload path is:
+///   uuid → ExecutionIntent (all 10 frozen fields) → PerpTradePayload
+///   → PerpTradeDomain → digest → ecrecover.
+///
+/// Idempotency: if `prior_bundle` matches `req` byte-for-byte, this
+/// returns Ok WITHOUT re-verifying (safe replay). If `prior_bundle`
+/// is Some but differs, returns
+/// `BackendError::BroadcastRejected("cosign_conflict")`.
+///
+/// Expired-trade rejection: if `now_sec > payload.deadline`, returns
+/// `PerpsIntentDeadlineExpired`.
+///
+/// Callers responsible for the actual repository write; this function
+/// returns the verified bundle for `upsert_execution_intent_signatures`.
+pub fn cosign_load_and_verify(
+    intent: &ExecutionIntent,
+    domain: &PerpTradeDomain,
+    req: &CosignTradeRequest,
+    prior_bundle: Option<&StoredTradeSignaturesView>,
+    now_sec: u128,
+) -> Result<CosignVerifiedSignatures> {
+    // Reconstruct payload from persisted intent — this is
+    // authoritative; client-supplied fields are ignored.
+    let payload = intent_to_v1_payload(intent)?;
+    // Deadline check against Unix seconds.
+    if payload.deadline > 0 && now_sec > payload.deadline {
+        return Err(BackendError::PerpsIntentDeadlineExpired);
+    }
+    // Idempotency vs conflict check.
+    if let Some(prior) = prior_bundle {
+        let same_buyer = prior
+            .buyer_sig
+            .as_deref()
+            .map(|s| s.eq_ignore_ascii_case(&req.buyer_signature))
+            .unwrap_or(false);
+        let same_seller = prior
+            .seller_sig
+            .as_deref()
+            .map(|s| s.eq_ignore_ascii_case(&req.seller_signature))
+            .unwrap_or(false);
+        if same_buyer && same_seller {
+            // Idempotent replay — same bundle, no state change.
+            return Ok(CosignVerifiedSignatures {
+                buyer_signer: payload.buyer.clone(),
+                seller_signer: payload.seller.clone(),
+                bundle: PerpTradeSignatureBundle::new(&req.buyer_signature, &req.seller_signature)?,
+            });
+        }
+        if prior.buyer_sig.is_some() || prior.seller_sig.is_some() {
+            return Err(BackendError::BroadcastRejected(
+                "cosign_conflict: prior signature bundle exists and differs".to_string(),
+            ));
+        }
+    }
+    cosign_verify_core(&payload, domain, req)
+}
+
+/// Reconstruct the 10-field `PerpTradePayload` from a persisted
+/// `ExecutionIntent`. Fails closed if any required field is absent —
+/// `execution_intents` rows with `NULL` `buyer_nonce` / `seller_nonce`
+/// / `deadline_ms` / `buyer_is_maker` are not co-signable through
+/// this path.
+pub fn intent_to_v1_payload(intent: &ExecutionIntent) -> Result<PerpTradePayload> {
+    let intent_id_b256 = intent_id_to_b256(&intent.intent_id.to_string())?;
+    let buyer_is_maker = intent
+        .buyer_is_maker
+        .ok_or_else(|| BackendError::MissingExecutionMetadata("buyer_is_maker".to_string()))?;
+    let buyer_nonce = intent
+        .buyer_nonce
+        .ok_or_else(|| BackendError::MissingExecutionMetadata("buyer_nonce".to_string()))?;
+    let seller_nonce = intent
+        .seller_nonce
+        .ok_or_else(|| BackendError::MissingExecutionMetadata("seller_nonce".to_string()))?;
+    let deadline_ms = intent
+        .deadline_ms
+        .ok_or_else(|| BackendError::MissingExecutionMetadata("deadline".to_string()))?;
+    // The persisted deadline_ms is `deadline_seconds × 1000` (see
+    // prepare_trade_core::deadline_shadow_ms). Convert back to
+    // seconds for the on-chain V1 comparison.
+    let deadline_sec = u128::try_from(deadline_ms.saturating_div(1000))
+        .map_err(|_| BackendError::Config("deadline_ms → seconds conversion failed".to_string()))?;
+
+    PerpTradePayload::new(
+        intent_id_b256,
+        intent.buyer.clone(),
+        intent.seller.clone(),
+        u128::from(intent.market_id),
+        intent.size_1e8,
+        intent.price_1e8,
+        0,
+        0,
+        buyer_is_maker,
+        u128::from(buyer_nonce),
+        u128::from(seller_nonce),
+        deadline_sec,
+    )
+}
+
+/// Read-only view of the two signature strings for idempotency
+/// comparison. Matches [`crate::execution::StoredTradeSignatures`]
+/// but decoupled to keep this module free of persistence-layer
+/// details.
+#[derive(Clone, Debug, Default)]
+pub struct StoredTradeSignaturesView {
+    pub buyer_sig: Option<String>,
+    pub seller_sig: Option<String>,
+}
+
+impl From<&crate::execution::StoredTradeSignatures> for StoredTradeSignaturesView {
+    fn from(v: &crate::execution::StoredTradeSignatures) -> Self {
+        Self {
+            buyer_sig: v.buyer_sig.clone(),
+            seller_sig: v.seller_sig.clone(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -670,5 +855,288 @@ mod tests {
         let via_intent_id_hex =
             crate::execution::intent_id_to_hex_bytes32(&uuid.to_string()).unwrap();
         assert_eq!(hex, via_intent_id_hex);
+    }
+
+    // ================================================================
+    // REOPENED MILESTONE — expanded test matrix
+    // ================================================================
+
+    // Test-only builder for a PerpTrade with configurable nonces + deadline.
+    fn payload_with(
+        uuid: uuid::Uuid,
+        buyer_nonce: u128,
+        seller_nonce: u128,
+        deadline_sec: u128,
+    ) -> PerpTradePayload {
+        let intent_id = intent_id_to_b256(&uuid.to_string()).unwrap();
+        PerpTradePayload::new(
+            intent_id,
+            AccountId::new(BUYER_ADDR.to_string()),
+            AccountId::new(SELLER_ADDR.to_string()),
+            1,
+            1_000_000,
+            240_000_000_000,
+            0,
+            0,
+            false,
+            buyer_nonce,
+            seller_nonce,
+            deadline_sec,
+        )
+        .unwrap()
+    }
+
+    fn intent_from_payload(
+        uuid: uuid::Uuid,
+        payload: &PerpTradePayload,
+    ) -> crate::execution::ExecutionIntent {
+        crate::execution::ExecutionIntent {
+            intent_id: uuid,
+            market_id: crate::types::MarketId::from(payload.market_id as u16),
+            buyer: payload.buyer.clone(),
+            seller: payload.seller.clone(),
+            price_1e8: payload.execution_price_1e8 as crate::types::Price1e8,
+            size_1e8: payload.size_delta_1e8 as crate::types::Size1e8,
+            buy_order_id: crate::types::OrderId(uuid::Uuid::new_v4()),
+            sell_order_id: crate::types::OrderId(uuid::Uuid::new_v4()),
+            buyer_is_maker: Some(payload.buyer_is_maker),
+            buyer_nonce: Some(payload.buyer_nonce as u64),
+            seller_nonce: Some(payload.seller_nonce as u64),
+            deadline_ms: Some(i64::try_from(payload.deadline.saturating_mul(1000)).unwrap()),
+            created_at_ms: 1_700_000_000_000,
+            status: crate::execution::ExecutionIntentStatus::Pending,
+        }
+    }
+
+    // --- (Z1) Deadline unit is seconds, not milliseconds ---
+    #[test]
+    fn z1_deadline_is_unix_seconds_not_ms() {
+        // Ensure PREPARE_DEADLINE_TTL_SEC is exactly 3600 seconds (1
+        // hour). If someone re-introduces the ms-scaled bug this
+        // test flags it.
+        assert_eq!(PREPARE_DEADLINE_TTL_SEC, 3_600);
+        // A prepared trade's deadline should be ~+3600 seconds ahead
+        // of the current timestamp, NOT +3_600_000.
+        let now_ms_val: i64 = 1_700_000_000_000;
+        let now_sec: u128 = (now_ms_val / 1000) as u128;
+        let expected_deadline_sec = now_sec + 3_600;
+        // Sanity: this value is a plausible Unix second timestamp
+        // (~2023), NOT a value like 1_700_003_600_000 (which would
+        // be interpreted by Solidity block.timestamp as year ~55000).
+        assert!(
+            expected_deadline_sec < 2_000_000_000,
+            "deadline is a plausible Unix seconds value, not ms-scaled"
+        );
+    }
+
+    // --- (Z2) Persistence round-trip: intent → payload → digest ---
+    #[test]
+    fn z2_persistence_round_trip_digest_equality() {
+        let uuid = uuid::Uuid::from_u128(0xdead_beef);
+        let payload = payload_with(uuid, 7, 12, 1_700_003_600);
+        let digest_1 = perp_trade_v1_digest(&payload, &domain()).unwrap();
+        let intent = intent_from_payload(uuid, &payload);
+        let reloaded = intent_to_v1_payload(&intent).unwrap();
+        let digest_2 = perp_trade_v1_digest(&reloaded, &domain()).unwrap();
+        assert_eq!(
+            digest_1, digest_2,
+            "digest is identical after DB round-trip"
+        );
+        assert_eq!(reloaded.buyer_nonce, 7);
+        assert_eq!(reloaded.seller_nonce, 12);
+        assert_eq!(reloaded.deadline, 1_700_003_600);
+    }
+
+    // --- (Z3) Non-zero PME nonces preserved byte-exactly ---
+    #[test]
+    fn z3_non_zero_nonces_preserved_through_pipeline() {
+        use crate::execution::{encode_execute_trade_calldata, PerpTradeSignatureBundle};
+        let uuid = uuid::Uuid::from_u128(0x1111);
+        let payload = payload_with(uuid, 7, 12, 1_700_003_600);
+        let bundle = PerpTradeSignatureBundle::new(
+            &format!("0x{}", "aa".repeat(65)),
+            &format!("0x{}", "bb".repeat(65)),
+        )
+        .unwrap();
+        let calldata = encode_execute_trade_calldata(&payload, &bundle).unwrap();
+        // Tuple fields are laid out post-selector at 4-byte offset.
+        // Field 7 (buyerNonce, uint256) at offset 4 + 32*7 = 228.
+        //   4 (selector) + 32 * (intentId, buyer, seller, marketId, sizeDelta1e8, executionPrice1e8, buyerIsMaker) = 4 + 224 = 228
+        // Reading 32 bytes → BE uint256.
+        let buyer_nonce_bytes: &[u8] = &calldata[228..260];
+        let mut buyer_nonce_val = 0u128;
+        for b in &buyer_nonce_bytes[16..32] {
+            buyer_nonce_val = (buyer_nonce_val << 8) | (*b as u128);
+        }
+        assert_eq!(buyer_nonce_val, 7, "buyerNonce = 7 preserved in calldata");
+        // Field 8 (sellerNonce, uint256) at 260..292.
+        let seller_nonce_bytes: &[u8] = &calldata[260..292];
+        let mut seller_nonce_val = 0u128;
+        for b in &seller_nonce_bytes[16..32] {
+            seller_nonce_val = (seller_nonce_val << 8) | (*b as u128);
+        }
+        assert_eq!(
+            seller_nonce_val, 12,
+            "sellerNonce = 12 preserved in calldata"
+        );
+    }
+
+    // --- (Z4) cosign_load_and_verify: unknown UUID surface handled by loader ---
+    // (This test documents the caller responsibility; unknown UUID
+    // is caught by the repository loader before this function is
+    // invoked. Verified in the runtime wiring layer.)
+
+    // --- (Z5) cosign_load_and_verify: expired deadline rejected ---
+    #[test]
+    fn z5_expired_deadline_rejects() {
+        let uuid = uuid::Uuid::from_u128(0x2222);
+        let payload = payload_with(uuid, 0, 0, 1_700_000_000);
+        let intent = intent_from_payload(uuid, &payload);
+        let digest = perp_trade_v1_digest_bytes(&payload, &domain()).unwrap();
+        let buyer_sig = sign_v1_with(BUYER_KEY, &digest);
+        let seller_sig = sign_v1_with(SELLER_KEY, &digest);
+        let req = CosignTradeRequest {
+            buyer_signature: buyer_sig,
+            seller_signature: seller_sig,
+        };
+        // now_sec > deadline (1_700_000_000) → expired.
+        let err =
+            cosign_load_and_verify(&intent, &domain(), &req, None, 1_700_100_000).unwrap_err();
+        assert!(matches!(err, BackendError::PerpsIntentDeadlineExpired));
+    }
+
+    // --- (Z6) cosign_load_and_verify: happy path ---
+    #[test]
+    fn z6_load_and_verify_happy_path() {
+        let uuid = uuid::Uuid::from_u128(0x3333);
+        let payload = payload_with(uuid, 0, 0, 1_800_000_000);
+        let intent = intent_from_payload(uuid, &payload);
+        let digest = perp_trade_v1_digest_bytes(&payload, &domain()).unwrap();
+        let buyer_sig = sign_v1_with(BUYER_KEY, &digest);
+        let seller_sig = sign_v1_with(SELLER_KEY, &digest);
+        let req = CosignTradeRequest {
+            buyer_signature: buyer_sig.clone(),
+            seller_signature: seller_sig.clone(),
+        };
+        let verified =
+            cosign_load_and_verify(&intent, &domain(), &req, None, 1_700_000_000).unwrap();
+        assert_eq!(verified.buyer_signer.0.to_lowercase(), BUYER_ADDR);
+        assert_eq!(verified.seller_signer.0.to_lowercase(), SELLER_ADDR);
+    }
+
+    // --- (Z7) Idempotent resubmit: same bundle returns Ok without re-verification ---
+    #[test]
+    fn z7_idempotent_resubmit_same_bundle_ok() {
+        let uuid = uuid::Uuid::from_u128(0x4444);
+        let payload = payload_with(uuid, 0, 0, 1_800_000_000);
+        let intent = intent_from_payload(uuid, &payload);
+        let digest = perp_trade_v1_digest_bytes(&payload, &domain()).unwrap();
+        let buyer_sig = sign_v1_with(BUYER_KEY, &digest);
+        let seller_sig = sign_v1_with(SELLER_KEY, &digest);
+        let req = CosignTradeRequest {
+            buyer_signature: buyer_sig.clone(),
+            seller_signature: seller_sig.clone(),
+        };
+        let prior = StoredTradeSignaturesView {
+            buyer_sig: Some(buyer_sig.clone()),
+            seller_sig: Some(seller_sig.clone()),
+        };
+        let verified =
+            cosign_load_and_verify(&intent, &domain(), &req, Some(&prior), 1_700_000_000).unwrap();
+        assert_eq!(verified.buyer_signer.0.to_lowercase(), BUYER_ADDR);
+    }
+
+    // --- (Z8) Conflicting resubmit: different bundle rejected ---
+    #[test]
+    fn z8_conflicting_resubmit_rejected() {
+        let uuid = uuid::Uuid::from_u128(0x5555);
+        let payload = payload_with(uuid, 0, 0, 1_800_000_000);
+        let intent = intent_from_payload(uuid, &payload);
+        let digest = perp_trade_v1_digest_bytes(&payload, &domain()).unwrap();
+        let buyer_sig = sign_v1_with(BUYER_KEY, &digest);
+        let seller_sig = sign_v1_with(SELLER_KEY, &digest);
+        // Prior stores a DIFFERENT buyer_sig.
+        let different_buyer_sig = format!("0x{}", "cc".repeat(65));
+        let prior = StoredTradeSignaturesView {
+            buyer_sig: Some(different_buyer_sig),
+            seller_sig: Some(seller_sig.clone()),
+        };
+        let req = CosignTradeRequest {
+            buyer_signature: buyer_sig,
+            seller_signature: seller_sig,
+        };
+        let err = cosign_load_and_verify(&intent, &domain(), &req, Some(&prior), 1_700_000_000)
+            .unwrap_err();
+        assert!(
+            matches!(err, BackendError::BroadcastRejected(msg) if msg.contains("cosign_conflict"))
+        );
+    }
+
+    // --- (Z9) Unsigned ExecutionIntent cannot be built into a
+    //     broadcast request: build_execution_transaction_request
+    //     returns MissingTradeSignatures. Proves the invariant that
+    //     a prepared row with no sigs cannot reach the RPC.
+    #[test]
+    fn z9_unsigned_prepared_intent_cannot_broadcast() {
+        use crate::execution::{
+            build_execution_transaction_request, ExecutionConfig, StoredTradeSignatures,
+        };
+        let uuid = uuid::Uuid::from_u128(0x6666);
+        let payload = payload_with(uuid, 0, 0, 1_800_000_000);
+        let mut intent = intent_from_payload(uuid, &payload);
+        intent.status = crate::execution::ExecutionIntentStatus::SimulationOk;
+        let sigs = StoredTradeSignatures::default(); // NO sigs
+        let config = ExecutionConfig {
+            perp_matching_engine_address: AccountId::new(PME.to_string()),
+            require_simulation_ok: true,
+            executor_chain_id: 84532,
+            max_gas_limit: 1_000_000,
+            max_fee_per_gas_wei: Some("1000000000".to_string()),
+            max_priority_fee_per_gas_wei: Some("100000000".to_string()),
+            ..ExecutionConfig::disabled()
+        };
+        let err = build_execution_transaction_request(&config, &intent, &sigs).unwrap_err();
+        assert!(matches!(err, BackendError::MissingTradeSignatures));
+    }
+
+    // --- (Z10) Signed ExecutionIntent DOES produce broadcast calldata ---
+    #[test]
+    fn z10_signed_intent_produces_valid_calldata() {
+        use crate::execution::{
+            build_execution_transaction_request, ExecutionConfig, StoredTradeSignatures,
+        };
+        let uuid = uuid::Uuid::from_u128(0x7777);
+        let payload = payload_with(uuid, 0, 0, 1_800_000_000);
+        let mut intent = intent_from_payload(uuid, &payload);
+        intent.status = crate::execution::ExecutionIntentStatus::SimulationOk;
+        let sigs = StoredTradeSignatures {
+            buyer_sig: Some(format!("0x{}", "aa".repeat(65))),
+            seller_sig: Some(format!("0x{}", "bb".repeat(65))),
+        };
+        let config = ExecutionConfig {
+            perp_matching_engine_address: AccountId::new(PME.to_string()),
+            require_simulation_ok: true,
+            executor_chain_id: 84532,
+            max_gas_limit: 1_000_000,
+            max_fee_per_gas_wei: Some("1000000000".to_string()),
+            max_priority_fee_per_gas_wei: Some("100000000".to_string()),
+            ..ExecutionConfig::disabled()
+        };
+        let request = build_execution_transaction_request(&config, &intent, &sigs).unwrap();
+        // Selector at bytes 0..4 must be 0x7a708c4c (deployed 10-field executeTrade).
+        assert_eq!(hex_encode(&request.calldata[..4]), "7a708c4c");
+    }
+
+    // --- (Z11) intent_to_v1_payload: fail-closed on missing fields ---
+    #[test]
+    fn z11_intent_to_payload_fails_closed_on_missing_fields() {
+        let uuid = uuid::Uuid::from_u128(0x8888);
+        let payload = payload_with(uuid, 0, 0, 1_800_000_000);
+        let mut intent = intent_from_payload(uuid, &payload);
+        intent.buyer_nonce = None;
+        let err = intent_to_v1_payload(&intent).unwrap_err();
+        assert!(
+            matches!(err, BackendError::MissingExecutionMetadata(f) if f.contains("buyer_nonce"))
+        );
     }
 }

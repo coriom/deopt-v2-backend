@@ -1612,6 +1612,24 @@ impl PgRepository {
             .map_err(|error| BackendError::Persistence(error.to_string()))
     }
 
+    /// PERPS_BASE_SEPOLIA_CLOSED_TEST_COSIGN_ROUTE_V1 — insert a
+    /// freshly prepared `ExecutionIntent` from the closed-test
+    /// cosign prepare handler. Wraps [`insert_execution_intent`] in
+    /// a single-statement transaction. Fail-closed on any DB error.
+    ///
+    /// Distinct from the RFQ / order-book path which inserts intents
+    /// as part of a larger transactional workflow (`ExecutionIntentCreated`
+    /// engine event). This method exists specifically for the standalone
+    /// closed-test co-sign route.
+    pub async fn insert_execution_intent_row(&self, intent: &ExecutionIntent) -> Result<()> {
+        let mut tx = self.begin().await?;
+        let db_intent = DbExecutionIntent::try_from(intent)?;
+        insert_execution_intent(&mut tx, &db_intent).await?;
+        tx.commit()
+            .await
+            .map_err(|error| BackendError::Persistence(error.to_string()))
+    }
+
     pub async fn get_execution_intent(&self, intent_id: Uuid) -> Result<Option<ExecutionIntent>> {
         let row = sqlx::query(
             "SELECT intent_id, onchain_intent_id, market_id, buyer, seller, price_1e8, size_1e8, \
