@@ -136,7 +136,7 @@ mod tests {
             buyer_is_maker: Some(false),
             buyer_nonce: Some(11),
             seller_nonce: Some(12),
-            deadline_ms: Some(4_102_444_800),
+            deadline_ms: Some(4_102_444_800_000),
             created_at_ms: 123,
             status: ExecutionIntentStatus::Pending,
         };
@@ -169,6 +169,51 @@ mod tests {
         assert!(!call.is_broadcastable);
     }
 
+    /// PERPS_BASE_SEPOLIA_CLOSED_TEST_LIFECYCLE_DEADLINE_UNITS_FIX_V1
+    /// — the runtime calldata builder MUST encode deployed V1
+    /// `PerpTrade.deadline` in Unix SECONDS (i.e. `deadline_ms / 1000`),
+    /// not the raw application-layer millisecond value. Regression
+    /// against the exact real-trade incident that produced
+    /// `InvalidSignature (0x8baa579f)` on-chain.
+    #[test]
+    fn calldata_encodes_deadline_in_unix_seconds_not_milliseconds() {
+        // Intent uses `deadline_ms = 4_102_444_800_000` — the shadow
+        // for `deadline_sec = 4_102_444_800` (year 2100). If the
+        // legacy bug returned, the encoded tuple would carry
+        // `deadline = 4_102_444_800_000` and PME would reject the
+        // signatures with InvalidSignature.
+        let intent = intent();
+        let mut signatures = StoredTradeSignatures::default();
+        signatures
+            .upsert(Some(signature_hex(0xaa)), Some(signature_hex(0xbb)))
+            .unwrap();
+        let call = build_perp_execution_call_from_intent(&intent, &target(), &signatures).unwrap();
+        assert!(!call.calldata.is_empty());
+        assert_eq!(&call.calldata[..4], execute_trade_selector().as_slice());
+
+        // The tuple layout is:
+        //   [4 bytes selector]
+        //   [10 × 32-byte tuple fields]
+        //   [2 × 32-byte offsets to buyerSig/sellerSig]
+        //   [len + padded bytes for each sig]
+        //
+        // `deadline` is the 10th (last) tuple field. Its 32-byte word
+        // starts at offset 4 + 9*32 = 292 and ends at 324.
+        let deadline_word = &call.calldata[4 + 9 * 32..4 + 10 * 32];
+        // Solidity encodes uint256 as big-endian 32 bytes.
+        let mut buf = [0u8; 32];
+        buf.copy_from_slice(deadline_word);
+        let encoded_deadline_lo128 =
+            u128::from_be_bytes(buf[16..].try_into().expect("32-byte slice"));
+        assert_eq!(
+            encoded_deadline_lo128, 4_102_444_800,
+            "runtime calldata MUST encode deployed V1 deadline in Unix seconds \
+             (upper 128 bits must also be zero for canonical values)"
+        );
+        // Upper 128 bits must be zero.
+        assert_eq!(&buf[..16], &[0u8; 16]);
+    }
+
     fn intent() -> ExecutionIntent {
         ExecutionIntent {
             intent_id: Uuid::from_u128(1),
@@ -182,7 +227,7 @@ mod tests {
             buyer_is_maker: Some(false),
             buyer_nonce: Some(11),
             seller_nonce: Some(12),
-            deadline_ms: Some(4_102_444_800),
+            deadline_ms: Some(4_102_444_800_000),
             created_at_ms: 123,
             status: ExecutionIntentStatus::Pending,
         }

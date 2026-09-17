@@ -680,44 +680,20 @@ pub fn cosign_load_and_verify(
 }
 
 /// Reconstruct the 10-field `PerpTradePayload` from a persisted
-/// `ExecutionIntent`. Fails closed if any required field is absent —
-/// `execution_intents` rows with `NULL` `buyer_nonce` / `seller_nonce`
-/// / `deadline_ms` / `buyer_is_maker` are not co-signable through
-/// this path.
+/// `ExecutionIntent` for cosign signature verification.
+///
+/// PERPS_BASE_SEPOLIA_CLOSED_TEST_LIFECYCLE_DEADLINE_UNITS_FIX_V1
+/// — this function delegates to the single canonical primitive
+/// [`ExecutionIntent::perp_trade_payload`] so both the cosign
+/// verification path and the runtime transaction builder produce a
+/// byte-identical `PerpTradePayload` from the same persisted intent.
+/// Any divergence between the two paths (e.g. the earlier
+/// `deadline_ms` vs `deadline_sec` bug that caused an on-chain
+/// `InvalidSignature`) would surface as a digest mismatch during
+/// cosign OR simulation and be caught by the payload-equality unit
+/// invariants.
 pub fn intent_to_v1_payload(intent: &ExecutionIntent) -> Result<PerpTradePayload> {
-    let intent_id_b256 = intent_id_to_b256(&intent.intent_id.to_string())?;
-    let buyer_is_maker = intent
-        .buyer_is_maker
-        .ok_or_else(|| BackendError::MissingExecutionMetadata("buyer_is_maker".to_string()))?;
-    let buyer_nonce = intent
-        .buyer_nonce
-        .ok_or_else(|| BackendError::MissingExecutionMetadata("buyer_nonce".to_string()))?;
-    let seller_nonce = intent
-        .seller_nonce
-        .ok_or_else(|| BackendError::MissingExecutionMetadata("seller_nonce".to_string()))?;
-    let deadline_ms = intent
-        .deadline_ms
-        .ok_or_else(|| BackendError::MissingExecutionMetadata("deadline".to_string()))?;
-    // The persisted deadline_ms is `deadline_seconds × 1000` (see
-    // prepare_trade_core::deadline_shadow_ms). Convert back to
-    // seconds for the on-chain V1 comparison.
-    let deadline_sec = u128::try_from(deadline_ms.saturating_div(1000))
-        .map_err(|_| BackendError::Config("deadline_ms → seconds conversion failed".to_string()))?;
-
-    PerpTradePayload::new(
-        intent_id_b256,
-        intent.buyer.clone(),
-        intent.seller.clone(),
-        u128::from(intent.market_id),
-        intent.size_1e8,
-        intent.price_1e8,
-        0,
-        0,
-        buyer_is_maker,
-        u128::from(buyer_nonce),
-        u128::from(seller_nonce),
-        deadline_sec,
-    )
+    intent.perp_trade_payload()
 }
 
 /// Read-only view of the two signature strings for idempotency

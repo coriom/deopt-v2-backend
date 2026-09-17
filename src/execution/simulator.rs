@@ -281,7 +281,7 @@ mod tests {
             buyer_is_maker: Some(false),
             buyer_nonce: Some(11),
             seller_nonce: Some(12),
-            deadline_ms: Some(4_102_444_800),
+            deadline_ms: Some(4_102_444_800_000),
             created_at_ms: 123,
             status: ExecutionIntentStatus::CalldataReady,
         }
@@ -310,5 +310,30 @@ mod tests {
             encoded.push_str(&format!("{byte:02x}"));
         }
         encoded
+    }
+
+    /// PERPS_BASE_SEPOLIA_CLOSED_TEST_LIFECYCLE_DEADLINE_UNITS_FIX_V1
+    /// — end-to-end simulator regression proving the runtime calldata
+    /// builder can produce a valid eth_call against a mock RPC. Uses
+    /// an intent whose `deadline_ms` is a whole-second multiple
+    /// (matching the canonical shadow-ms convention); the fixed
+    /// builder converts to seconds before encoding, so simulation
+    /// succeeds. Under the legacy bug this exact path returned
+    /// `InvalidSignature`.
+    #[tokio::test]
+    async fn simulator_regression_valid_payload_reaches_simulation_ok() {
+        let intent = intent(); // deadline_ms = 4_102_444_800_000
+        let sigs = signatures();
+        let provider = MockProvider {
+            outcome: MockOutcome::Success,
+        };
+        let result = simulate_execution_intent(&provider, &config(), &intent, &sigs)
+            .await
+            .expect("simulator returns Result::Ok even on failure classes");
+        assert_eq!(
+            result.status,
+            ExecutionIntentStatus::SimulationOk,
+            "fixed builder must produce a payload that reaches SimulationOk against a mock RPC"
+        );
     }
 }

@@ -552,7 +552,7 @@ mod tests {
             buyer_is_maker: Some(false),
             buyer_nonce: Some(11),
             seller_nonce: Some(12),
-            deadline_ms: Some(4_102_444_800),
+            deadline_ms: Some(4_102_444_800_000),
             created_at_ms: 123,
             status: ExecutionIntentStatus::SimulationOk,
         }
