@@ -46,6 +46,7 @@
 //! settlement broadcast only — market/config governance stays with
 //! the ProtocolTimelock + OPS_MULTISIG governance path.
 
+use crate::api::perps_cosign::{decode_uint256_low128, PERP_ENGINE_GET_MARK_PRICE_SELECTOR};
 use crate::confirmation::ConfirmationReceipt;
 use crate::error::{BackendError, Result};
 use crate::execution::executor::{
@@ -365,6 +366,88 @@ where
             return Err(BackendError::BroadcastRejected(
                 "PME.paused() == true — refuse to broadcast".to_string(),
             ));
+        }
+
+        // PERPS_BASE_SEPOLIA_CLOSED_TEST_RUNTIME_ARMING_AND_ACCOUNTING_V1
+        // — pre-send deadline gate. `intent.deadline_ms` is the shadow
+        // (seconds × 1000) persisted by the cosign prepare path; the
+        // authoritative unit is Unix seconds. Fails closed if the
+        // remaining lifetime is below the configured minimum. Because
+        // the deployed PME will also reject an expired trade via
+        // `_isDeadlineValid`, this backend-side gate is defence in
+        // depth AND ensures we never burn an executor nonce on a
+        // trade that cannot land.
+        let now_sec_val = (now_ms() / 1000) as u64;
+        let deadline_sec = match intent.deadline_ms {
+            Some(ms) => u64::try_from((ms / 1_000).max(0)).map_err(|_| {
+                BackendError::BroadcastRejected("intent.deadline_ms out of range".to_string())
+            })?,
+            None => 0,
+        };
+        if deadline_sec == 0 {
+            return Err(BackendError::BroadcastRejected(
+                "intent has no deadline — refusing broadcast".to_string(),
+            ));
+        }
+        if now_sec_val >= deadline_sec {
+            return Err(BackendError::PerpsIntentDeadlineExpired);
+        }
+        let remaining_sec = deadline_sec.saturating_sub(now_sec_val);
+        if remaining_sec < self.config.perps_closed_test_min_deadline_remaining_sec {
+            return Err(BackendError::BroadcastRejected(format!(
+                "deadline remaining {remaining_sec}s < min {}s — refusing broadcast",
+                self.config.perps_closed_test_min_deadline_remaining_sec
+            )));
+        }
+
+        // PERPS_BASE_SEPOLIA_CLOSED_TEST_RUNTIME_ARMING_AND_ACCOUNTING_V1
+        // — pre-send price-drift gate. The deployed 10-field PME does
+        // NOT enforce an on-chain execution-price bound; the fork
+        // rehearsal trace showed no such guard. The backend therefore
+        // owns this safety property. Reads `PerpEngine.getMarkPrice`
+        // via the same RPC that will broadcast the trade. Fails
+        // closed on: RPC error, mark == 0, drift > configured cap.
+        let market_id_u128 = u128::from(intent.market_id);
+        let current_mark = {
+            let mut data = Vec::with_capacity(4 + 32);
+            data.extend_from_slice(&PERP_ENGINE_GET_MARK_PRICE_SELECTOR);
+            let mut market_word = [0u8; 32];
+            market_word[16..].copy_from_slice(&market_id_u128.to_be_bytes());
+            data.extend_from_slice(&market_word);
+            let out = self
+                .rpc
+                .eth_call(EthCallRequest {
+                    from: self.config.perp_engine_address.clone(),
+                    to: self.config.perp_engine_address.clone(),
+                    data,
+                    value: 0,
+                    gas_limit: None,
+                })
+                .await?;
+            decode_uint256_low128(&out.output, "getMarkPrice")?
+        };
+        if current_mark == 0 {
+            return Err(BackendError::PerpsProtocolReferencePriceUnavailable(
+                "pre-send mark price == 0".to_string(),
+            ));
+        }
+        let signed_price = u128::from(intent.price_1e8);
+        if signed_price == 0 {
+            return Err(BackendError::BroadcastRejected(
+                "intent.price_1e8 == 0".to_string(),
+            ));
+        }
+        let abs_diff = if current_mark >= signed_price {
+            current_mark - signed_price
+        } else {
+            signed_price - current_mark
+        };
+        let drift_bps = abs_diff.saturating_mul(10_000) / signed_price;
+        if drift_bps > u128::from(self.config.perps_closed_test_max_drift_bps) {
+            return Err(BackendError::BroadcastRejected(format!(
+                "pre-send drift {drift_bps} bps > cap {} bps (signed={signed_price} mark={current_mark})",
+                self.config.perps_closed_test_max_drift_bps
+            )));
         }
 
         // Build the canonical execution request. Validates simulation
@@ -1110,7 +1193,11 @@ mod tests {
             buyer_is_maker: Some(false),
             buyer_nonce: Some(11),
             seller_nonce: Some(12),
-            deadline_ms: Some(4_102_444_800),
+            // year 2100 in ms since epoch — 4_102_444_800_000 (~14400 seconds
+            // future in the fake test clock is enough; using year 2100
+            // keeps existing preflight tests deterministic while
+            // satisfying `MIN_DEADLINE_REMAINING_SEC`).
+            deadline_ms: Some(4_102_444_800_000),
             created_at_ms: 123,
             status: ExecutionIntentStatus::SimulationOk,
         }
@@ -1159,6 +1246,10 @@ mod tests {
             executor_allow_local_signer: true,
             backend_signer_provider: None,
             backend_signer_timeout_ms: 2500,
+            perps_closed_test_broadcast_armed: false,
+            perps_closed_test_broadcast_intent_id: None,
+            perps_closed_test_max_drift_bps: 100,
+            perps_closed_test_min_deadline_remaining_sec: 900,
         }
     }
 
@@ -1440,6 +1531,15 @@ mod tests {
                 bool_return(is_executor)
             } else if selector.as_slice() == PME_PAUSED_SELECTOR {
                 bool_return(paused)
+            } else if selector.as_slice() == PERP_ENGINE_GET_MARK_PRICE_SELECTOR {
+                // Return a mark price at price_1e8 from make_intent so
+                // the pre-send drift gate (default cap 100 bps) is
+                // satisfied for the happy-path tests. Value here
+                // matches make_intent().price_1e8 to give 0 bps drift.
+                let mut buf = vec![0u8; 32];
+                let price: u128 = 300_000_000_000;
+                buf[16..].copy_from_slice(&price.to_be_bytes());
+                buf
             } else {
                 vec![0u8; 32]
             };
@@ -2553,5 +2653,97 @@ mod tests {
             "0xzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
             &bytes
         ));
+    }
+
+    // ================================================================
+    // PERPS_BASE_SEPOLIA_CLOSED_TEST_RUNTIME_ARMING_AND_ACCOUNTING_V1
+    // ================================================================
+
+    use crate::execution::broadcast_runtime::execute_pending_batch;
+
+    fn armed_intent() -> ExecutionIntent {
+        let mut i = make_intent();
+        i.intent_id = Uuid::from_u128(0xa1);
+        i.status = ExecutionIntentStatus::Pending;
+        i
+    }
+
+    fn build_policy_with_config(cfg: ExecutionConfig) -> BroadcastPolicy<MockRpc, ExecutorSigner> {
+        BroadcastPolicy::new(cfg, MockRpc::default(), make_signer())
+    }
+
+    #[tokio::test]
+    async fn execute_pending_batch_disarmed_returns_zero_and_does_not_touch_repo() {
+        let mut cfg = make_config(TEST_KEY_ADDRESS, true, false);
+        cfg.perps_closed_test_broadcast_armed = false;
+        let policy = build_policy_with_config(cfg);
+        let intent = armed_intent();
+        let sigs = make_signatures();
+        let repo = MockRepo::with(intent, sigs);
+        let processed = execute_pending_batch(&policy, &repo, 10)
+            .await
+            .expect("disarmed must succeed with zero processed");
+        assert_eq!(processed, 0);
+        assert_eq!(
+            repo.status(Uuid::from_u128(0xa1)),
+            ExecutionIntentStatus::Pending,
+            "disarmed executor must not mutate intent status"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_pending_batch_armed_skips_non_matching_uuid() {
+        let mut cfg = make_config(TEST_KEY_ADDRESS, true, false);
+        cfg.perps_closed_test_broadcast_armed = true;
+        cfg.perps_closed_test_broadcast_intent_id = Some(Uuid::from_u128(0xdeadbeef));
+        let policy = build_policy_with_config(cfg);
+        let intent = armed_intent();
+        let sigs = make_signatures();
+        let repo = MockRepo::with(intent, sigs);
+        let processed = execute_pending_batch(&policy, &repo, 10)
+            .await
+            .expect("armed with wrong id must succeed with zero processed");
+        assert_eq!(processed, 0);
+        assert_eq!(
+            repo.status(Uuid::from_u128(0xa1)),
+            ExecutionIntentStatus::Pending,
+            "non-matching UUID must not be broadcast"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_pending_batch_armed_missing_intent_id_short_circuits() {
+        let mut cfg = make_config(TEST_KEY_ADDRESS, true, false);
+        cfg.perps_closed_test_broadcast_armed = true;
+        cfg.perps_closed_test_broadcast_intent_id = None; // startup should reject but be defensive
+        let policy = build_policy_with_config(cfg);
+        let intent = armed_intent();
+        let sigs = make_signatures();
+        let repo = MockRepo::with(intent, sigs);
+        let processed = execute_pending_batch(&policy, &repo, 10)
+            .await
+            .expect("armed with no intent id must short-circuit safely");
+        assert_eq!(processed, 0);
+        assert_eq!(
+            repo.status(Uuid::from_u128(0xa1)),
+            ExecutionIntentStatus::Pending
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_pending_batch_armed_but_unsigned_intent_still_skipped() {
+        let mut cfg = make_config(TEST_KEY_ADDRESS, true, false);
+        cfg.perps_closed_test_broadcast_armed = true;
+        let id = Uuid::from_u128(0xa1);
+        cfg.perps_closed_test_broadcast_intent_id = Some(id);
+        let policy = build_policy_with_config(cfg);
+        let intent = armed_intent();
+        // No signatures → calldata_ready() is false → skipped
+        let repo = MockRepo::with(intent, StoredTradeSignatures::default());
+        let processed = execute_pending_batch(&policy, &repo, 10)
+            .await
+            .expect("unsigned armed intent must be skipped without error");
+        assert_eq!(processed, 0);
+        assert_eq!(repo.status(id), ExecutionIntentStatus::Pending);
     }
 }

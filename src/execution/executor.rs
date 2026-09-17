@@ -416,6 +416,10 @@ mod tests {
             executor_allow_local_signer: false,
             backend_signer_provider: None,
             backend_signer_timeout_ms: 2500,
+            perps_closed_test_broadcast_armed: false,
+            perps_closed_test_broadcast_intent_id: None,
+            perps_closed_test_max_drift_bps: 100,
+            perps_closed_test_min_deadline_remaining_sec: 900,
         };
 
         let result = Executor::new(config, repository.clone())

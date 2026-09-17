@@ -94,6 +94,10 @@ fn make_config(from: &str, real_broadcast: bool, dry_run: bool) -> ExecutionConf
         executor_allow_local_signer: true,
         backend_signer_provider: None,
         backend_signer_timeout_ms: 2500,
+        perps_closed_test_broadcast_armed: false,
+        perps_closed_test_broadcast_intent_id: None,
+        perps_closed_test_max_drift_bps: 100,
+        perps_closed_test_min_deadline_remaining_sec: 900,
     }
 }
 
@@ -148,6 +152,16 @@ impl EthCallProvider for MockRpc {
             bool_return(is_exec)
         } else if selector.as_slice() == PME_PAUSED_SELECTOR {
             bool_return(paused)
+        } else if selector.as_slice()
+            == deopt_v2_backend::api::perps_cosign::PERP_ENGINE_GET_MARK_PRICE_SELECTOR
+        {
+            // Return a mark price matching the test intent's
+            // price_1e8 (see h_ test) so the pre-send drift gate is
+            // satisfied. price_1e8 = 300_000_000_000 in these fixtures.
+            let mut buf = vec![0u8; 32];
+            let price: u128 = 300_000_000_000;
+            buf[16..].copy_from_slice(&price.to_be_bytes());
+            buf
         } else {
             vec![0u8; 32]
         };
@@ -520,14 +534,18 @@ async fn h_eligible_execution_reaches_broadcast_policy() {
     // build_execution_transaction_request to succeed.
     sqlx::query(
         "UPDATE execution_intents SET buyer_is_maker = false, buyer_nonce = 11, \
-         seller_nonce = 12, deadline_ms = 4102444800 WHERE intent_id = $1",
+         seller_nonce = 12, deadline_ms = 4102444800000 WHERE intent_id = $1",
     )
     .bind(intent_id.to_string())
     .execute(pool)
     .await
     .unwrap();
 
-    let config = make_config(TEST_KEY_ADDRESS, true, false);
+    let mut config = make_config(TEST_KEY_ADDRESS, true, false);
+    // PERPS_BASE_SEPOLIA_CLOSED_TEST_RUNTIME_ARMING_AND_ACCOUNTING_V1 —
+    // the happy-path executor requires explicit arming.
+    config.perps_closed_test_broadcast_armed = true;
+    config.perps_closed_test_broadcast_intent_id = Some(intent_id);
     let signer = Arc::new(
         ExecutorSigner::from_private_key(&PrivateKeySecret::new(TEST_KEY.to_string())).unwrap(),
     );

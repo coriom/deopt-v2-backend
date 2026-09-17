@@ -82,6 +82,31 @@ pub struct ExecutionConfig {
     /// on timeout (re-sign risks duplicate intent submission with a
     /// different nonce).
     pub backend_signer_timeout_ms: u32,
+    /// PERPS_BASE_SEPOLIA_CLOSED_TEST_RUNTIME_ARMING_AND_ACCOUNTING_V1
+    /// — explicit closed-test one-intent arming gate. Default false.
+    /// When false, the broadcast worker MUST NOT initiate a NEW real
+    /// on-chain broadcast for any intent. When true, exactly one
+    /// intent (`perps_closed_test_broadcast_intent_id`) is eligible;
+    /// all others are refused. Independent of
+    /// `broadcast_ready()` — infrastructure may be ready while the
+    /// gate remains disarmed.
+    pub perps_closed_test_broadcast_armed: bool,
+    /// The exact UUID that is eligible when
+    /// `perps_closed_test_broadcast_armed=true`. Any other intent id
+    /// is rejected. `armed=true && intent_id=None` fails startup.
+    pub perps_closed_test_broadcast_intent_id: Option<uuid::Uuid>,
+    /// PERPS_BASE_SEPOLIA_CLOSED_TEST_RUNTIME_ARMING_AND_ACCOUNTING_V1
+    /// — pre-send drift cap in bps applied against
+    /// `PerpEngine.getMarkPrice(marketId)` immediately before signing
+    /// the executor transaction. Default 100 bps. Bounded [1, 500].
+    /// Fails closed on oracle error / mark==0 / drift > cap /
+    /// deadline expired.
+    pub perps_closed_test_max_drift_bps: u32,
+    /// PERPS_BASE_SEPOLIA_CLOSED_TEST_RUNTIME_ARMING_AND_ACCOUNTING_V1
+    /// — minimum remaining lifetime (seconds) between `now` and
+    /// `intent.deadline` at pre-send time. Default 900 s. Bounded
+    /// [60, 86_400].
+    pub perps_closed_test_min_deadline_remaining_sec: u64,
 }
 
 impl ExecutionConfig {
@@ -112,7 +137,20 @@ impl ExecutionConfig {
             executor_allow_local_signer: false,
             backend_signer_provider: None,
             backend_signer_timeout_ms: 2500,
+            perps_closed_test_broadcast_armed: false,
+            perps_closed_test_broadcast_intent_id: None,
+            perps_closed_test_max_drift_bps: 100,
+            perps_closed_test_min_deadline_remaining_sec: 900,
         }
+    }
+
+    /// Whether the closed-test one-intent gate accepts this UUID for a
+    /// NEW broadcast. False if the gate is disarmed, if no UUID is
+    /// configured, or if the id does not match. Case-sensitive Uuid
+    /// equality (canonical hyphenated form).
+    pub fn broadcast_armed_for(&self, intent_id: &uuid::Uuid) -> bool {
+        self.perps_closed_test_broadcast_armed
+            && self.perps_closed_test_broadcast_intent_id.as_ref() == Some(intent_id)
     }
 
     pub fn validate_startup(&self, persistence_enabled: bool) -> Result<()> {
@@ -120,6 +158,32 @@ impl ExecutionConfig {
             return Err(BackendError::Config(
                 "executor requires persistence enabled".to_string(),
             ));
+        }
+        // PERPS_BASE_SEPOLIA_CLOSED_TEST_RUNTIME_ARMING_AND_ACCOUNTING_V1
+        // Arming gate startup consistency: armed=true requires the
+        // exact one-intent UUID to be configured. armed=false with a
+        // configured UUID is allowed (operator staged the value ahead
+        // of the arming toggle).
+        if self.perps_closed_test_broadcast_armed
+            && self.perps_closed_test_broadcast_intent_id.is_none()
+        {
+            return Err(BackendError::Config(
+                "PERPS_CLOSED_TEST_BROADCAST_ARMED=true requires \
+                 PERPS_CLOSED_TEST_BROADCAST_INTENT_ID=<uuid>"
+                    .to_string(),
+            ));
+        }
+        if !(1..=500).contains(&self.perps_closed_test_max_drift_bps) {
+            return Err(BackendError::Config(format!(
+                "PERPS_CLOSED_TEST_MAX_DRIFT_BPS={} out of bounds [1..=500]",
+                self.perps_closed_test_max_drift_bps
+            )));
+        }
+        if !(60..=86_400).contains(&self.perps_closed_test_min_deadline_remaining_sec) {
+            return Err(BackendError::Config(format!(
+                "PERPS_CLOSED_TEST_MIN_DEADLINE_REMAINING_SEC={} out of bounds [60..=86400]",
+                self.perps_closed_test_min_deadline_remaining_sec
+            )));
         }
         if self.max_batch_size == 0 {
             return Err(BackendError::Config(
@@ -458,5 +522,115 @@ mod tests {
             Some(crate::execution::signer_adapters::SignerProviderKind::Mock);
         cfg.validate_startup(true)
             .expect("Sepolia + remote + mock allowed");
+    }
+
+    // ================================================================
+    // PERPS_BASE_SEPOLIA_CLOSED_TEST_RUNTIME_ARMING_AND_ACCOUNTING_V1
+    // ================================================================
+
+    fn armable_sepolia_base() -> ExecutionConfig {
+        let mut cfg = sepolia_local_base();
+        cfg.executor_allow_local_signer = true;
+        cfg
+    }
+
+    #[test]
+    fn arming_default_is_disarmed() {
+        let cfg = ExecutionConfig::disabled();
+        assert!(!cfg.perps_closed_test_broadcast_armed);
+        assert!(cfg.perps_closed_test_broadcast_intent_id.is_none());
+        assert!(!cfg.broadcast_armed_for(&uuid::Uuid::nil()));
+    }
+
+    #[test]
+    fn arming_armed_without_intent_id_refuses_startup() {
+        let mut cfg = armable_sepolia_base();
+        cfg.perps_closed_test_broadcast_armed = true;
+        cfg.perps_closed_test_broadcast_intent_id = None;
+        let err = cfg
+            .validate_startup(true)
+            .expect_err("armed without intent id must refuse");
+        assert!(err
+            .to_string()
+            .contains("PERPS_CLOSED_TEST_BROADCAST_ARMED=true requires"));
+    }
+
+    #[test]
+    fn arming_armed_with_intent_id_accepts() {
+        let mut cfg = armable_sepolia_base();
+        cfg.perps_closed_test_broadcast_armed = true;
+        let id = uuid::Uuid::from_u128(0xdead);
+        cfg.perps_closed_test_broadcast_intent_id = Some(id);
+        cfg.validate_startup(true)
+            .expect("armed + intent id must start");
+        assert!(cfg.broadcast_armed_for(&id));
+    }
+
+    #[test]
+    fn arming_disarmed_ignores_configured_intent_id() {
+        let mut cfg = armable_sepolia_base();
+        let id = uuid::Uuid::from_u128(0xbeef);
+        cfg.perps_closed_test_broadcast_intent_id = Some(id);
+        // armed=false, id present: must start; broadcast_armed_for=false
+        cfg.validate_startup(true)
+            .expect("disarmed with configured id must start");
+        assert!(!cfg.broadcast_armed_for(&id));
+    }
+
+    #[test]
+    fn arming_armed_but_wrong_uuid_returns_false() {
+        let mut cfg = armable_sepolia_base();
+        let a = uuid::Uuid::from_u128(1);
+        let b = uuid::Uuid::from_u128(2);
+        cfg.perps_closed_test_broadcast_armed = true;
+        cfg.perps_closed_test_broadcast_intent_id = Some(a);
+        assert!(cfg.broadcast_armed_for(&a));
+        assert!(!cfg.broadcast_armed_for(&b));
+    }
+
+    #[test]
+    fn drift_cap_out_of_bounds_refuses_startup() {
+        let mut cfg = armable_sepolia_base();
+        cfg.perps_closed_test_max_drift_bps = 0;
+        let err = cfg.validate_startup(true).expect_err("0 bps must refuse");
+        assert!(err.to_string().contains("PERPS_CLOSED_TEST_MAX_DRIFT_BPS"));
+        cfg.perps_closed_test_max_drift_bps = 501;
+        let err = cfg.validate_startup(true).expect_err("501 bps must refuse");
+        assert!(err.to_string().contains("PERPS_CLOSED_TEST_MAX_DRIFT_BPS"));
+    }
+
+    #[test]
+    fn drift_cap_valid_bounds_accept() {
+        let mut cfg = armable_sepolia_base();
+        for bps in [1u32, 50, 100, 500] {
+            cfg.perps_closed_test_max_drift_bps = bps;
+            cfg.validate_startup(true)
+                .unwrap_or_else(|e| panic!("bps={bps} rejected: {e}"));
+        }
+    }
+
+    #[test]
+    fn deadline_remaining_out_of_bounds_refuses_startup() {
+        let mut cfg = armable_sepolia_base();
+        cfg.perps_closed_test_min_deadline_remaining_sec = 59;
+        let err = cfg.validate_startup(true).expect_err("59s must refuse");
+        assert!(err
+            .to_string()
+            .contains("PERPS_CLOSED_TEST_MIN_DEADLINE_REMAINING_SEC"));
+        cfg.perps_closed_test_min_deadline_remaining_sec = 86_401;
+        let err = cfg.validate_startup(true).expect_err("86401s must refuse");
+        assert!(err
+            .to_string()
+            .contains("PERPS_CLOSED_TEST_MIN_DEADLINE_REMAINING_SEC"));
+    }
+
+    #[test]
+    fn deadline_remaining_valid_bounds_accept() {
+        let mut cfg = armable_sepolia_base();
+        for sec in [60u64, 900, 3600, 86_400] {
+            cfg.perps_closed_test_min_deadline_remaining_sec = sec;
+            cfg.validate_startup(true)
+                .unwrap_or_else(|e| panic!("sec={sec} rejected: {e}"));
+        }
     }
 }

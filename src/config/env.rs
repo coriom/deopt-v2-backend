@@ -229,6 +229,36 @@ impl AppConfig {
                 }
                 value
             },
+            // PERPS_BASE_SEPOLIA_CLOSED_TEST_RUNTIME_ARMING_AND_ACCOUNTING_V1
+            // — one-intent arming gate. Default disarmed. Intent id may
+            // be pre-staged before flipping the arm switch. Bounds on
+            // drift + deadline are enforced immediately before signing
+            // in `BroadcastPolicy::broadcast_intent`.
+            perps_closed_test_broadcast_armed: parse_env(
+                &mut lookup,
+                "PERPS_CLOSED_TEST_BROADCAST_ARMED",
+                "false",
+            )?,
+            perps_closed_test_broadcast_intent_id: lookup("PERPS_CLOSED_TEST_BROADCAST_INTENT_ID")
+                .filter(|value| !value.is_empty())
+                .map(|raw| {
+                    uuid::Uuid::parse_str(raw.trim()).map_err(|error| {
+                        crate::error::BackendError::Config(format!(
+                            "PERPS_CLOSED_TEST_BROADCAST_INTENT_ID must be a valid UUID: {error}"
+                        ))
+                    })
+                })
+                .transpose()?,
+            perps_closed_test_max_drift_bps: parse_env(
+                &mut lookup,
+                "PERPS_CLOSED_TEST_MAX_DRIFT_BPS",
+                "100",
+            )?,
+            perps_closed_test_min_deadline_remaining_sec: parse_env(
+                &mut lookup,
+                "PERPS_CLOSED_TEST_MIN_DEADLINE_REMAINING_SEC",
+                "900",
+            )?,
         };
         let indexer = IndexerConfig {
             enabled: parse_env(&mut lookup, "INDEXER_ENABLED", "false")?,

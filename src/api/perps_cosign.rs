@@ -165,7 +165,7 @@ where
     }
 }
 
-fn decode_uint256_low128(bytes: &[u8], name: &str) -> Result<u128> {
+pub fn decode_uint256_low128(bytes: &[u8], name: &str) -> Result<u128> {
     if bytes.len() != 32 {
         return Err(BackendError::Config(format!(
             "{name} return length {} != 32",

@@ -318,11 +318,32 @@ where
         + Sync,
     Repo: ExecutionIntentRepository,
 {
+    // PERPS_BASE_SEPOLIA_CLOSED_TEST_RUNTIME_ARMING_AND_ACCOUNTING_V1 —
+    // Arming gate. If disarmed, the worker MUST NOT initiate a NEW
+    // broadcast for any intent. Durable in-flight reconciliation of
+    // ALREADY-Prepared rows remains the reconciler's responsibility
+    // and is unaffected by this gate — this function only starts NEW
+    // broadcasts.
+    if !policy.config.perps_closed_test_broadcast_armed {
+        return Ok(0);
+    }
+    let armed_id = match policy.config.perps_closed_test_broadcast_intent_id {
+        Some(id) => id,
+        None => {
+            // Startup validation should have caught this; log and skip.
+            warn!("broadcast armed but no intent_id configured — refusing to broadcast");
+            return Ok(0);
+        }
+    };
     let intents = repository
         .list_pending_execution_intents(batch_size)
         .await?;
     let mut processed = 0usize;
     for intent in &intents {
+        // Only the exact armed UUID is eligible for a NEW broadcast.
+        if intent.intent_id != armed_id {
+            continue;
+        }
         let sigs = repository
             .get_execution_intent_signatures(intent.intent_id)
             .await?;
