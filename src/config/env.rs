@@ -80,6 +80,15 @@ pub struct AppConfig {
     /// with no allowlist is honest but useless. Env:
     /// `PERPS_CLOSED_TEST_ALLOWLIST` (default empty).
     pub perps_closed_test_allowlist: Vec<AccountId>,
+    /// PERPS_BASE_SEPOLIA_CLOSED_TEST_TRADE_TTL — deadline TTL (seconds)
+    /// used by `POST /perps/closed-test/trades/prepare` when freezing
+    /// `deadline = now_sec + ttl`. Affects ONLY the closed-test cosign
+    /// prepare route; Public Perps mutation semantics are unchanged.
+    /// Bounded to `[MIN_PERPS_CLOSED_TEST_TRADE_TTL_SEC ..= MAX_PERPS_CLOSED_TEST_TRADE_TTL_SEC]`
+    /// at parse time; out-of-range values fail startup. Default:
+    /// `DEFAULT_PERPS_CLOSED_TEST_TRADE_TTL_SEC` (3600). Env:
+    /// `PERPS_CLOSED_TEST_TRADE_TTL_SEC`.
+    pub perps_closed_test_trade_ttl_sec: u128,
     /// PERPS-FUNDING-LIQUIDATION-WORKERS-V1 — periodic funding worker
     /// configuration. Defaults `disabled()`. Env:
     ///
@@ -860,6 +869,27 @@ impl AppConfig {
             })
             .unwrap_or_default();
 
+        // PERPS_BASE_SEPOLIA_CLOSED_TEST_TRADE_TTL_AND_REPREPARE_V1 —
+        // configurable deadline TTL (seconds) for the closed-test
+        // PerpTrade prepare route. Default 3600, bounded [300, 86_400].
+        // Out-of-range values fail startup so a typo does not silently
+        // regress to the default. Public Perps semantics unchanged;
+        // consulted only by `prepare_trade_core`.
+        let perps_closed_test_trade_ttl_sec: u128 =
+            parse_env(&mut lookup, "PERPS_CLOSED_TEST_TRADE_TTL_SEC", "3600")?;
+        if perps_closed_test_trade_ttl_sec
+            < crate::api::perps_cosign::MIN_PERPS_CLOSED_TEST_TRADE_TTL_SEC
+            || perps_closed_test_trade_ttl_sec
+                > crate::api::perps_cosign::MAX_PERPS_CLOSED_TEST_TRADE_TTL_SEC
+        {
+            return Err(BackendError::Config(format!(
+                "PERPS_CLOSED_TEST_TRADE_TTL_SEC={perps_closed_test_trade_ttl_sec} out of bounds \
+                 [{min}..={max}] seconds",
+                min = crate::api::perps_cosign::MIN_PERPS_CLOSED_TEST_TRADE_TTL_SEC,
+                max = crate::api::perps_cosign::MAX_PERPS_CLOSED_TEST_TRADE_TTL_SEC,
+            )));
+        }
+
         // PERPS-FUNDING-LIQUIDATION-WORKERS-V1 — periodic funding
         // worker + kill-switch. All defaults safe (worker off, tick
         // off, 1h interval). Mainnet refusal enforced by
@@ -910,11 +940,8 @@ impl AppConfig {
         // market must be an explicit action.
         let impact_mid_enabled: bool =
             parse_env(&mut lookup, "PERPS_IMPACT_MID_KEEPER_ENABLED", "false")?;
-        let impact_mid_interval_ms: u64 = parse_env(
-            &mut lookup,
-            "PERPS_IMPACT_MID_KEEPER_INTERVAL_MS",
-            "5000",
-        )?;
+        let impact_mid_interval_ms: u64 =
+            parse_env(&mut lookup, "PERPS_IMPACT_MID_KEEPER_INTERVAL_MS", "5000")?;
         let impact_mid_markets = collect_impact_mid_markets(&mut lookup)?;
         let perps_impact_mid_keeper = crate::perps::PerpsImpactMidKeeperConfig {
             enabled: impact_mid_enabled,
@@ -968,6 +995,7 @@ impl AppConfig {
             perps_public_trading_enabled,
             perps_closed_test_enabled,
             perps_closed_test_allowlist,
+            perps_closed_test_trade_ttl_sec,
             perps_funding_worker,
             perps_liquidation_worker,
             perps_impact_mid_keeper,
@@ -1070,9 +1098,9 @@ fn collect_impact_mid_markets(
             Some(v) => v,
             None => continue,
         };
-        let notional: u128 = notional_raw.parse().map_err(|error| {
-            BackendError::Config(format!("invalid {notional_key}: {error}"))
-        })?;
+        let notional: u128 = notional_raw
+            .parse()
+            .map_err(|error| BackendError::Config(format!("invalid {notional_key}: {error}")))?;
         if notional == 0 {
             continue;
         }
@@ -1131,6 +1159,62 @@ mod tests {
 
         assert!(!config.persistence_enabled);
         assert_eq!(config.database_url, None);
+    }
+
+    // PERPS_BASE_SEPOLIA_CLOSED_TEST_TRADE_TTL_AND_REPREPARE_V1 tests
+
+    #[test]
+    fn perps_closed_test_trade_ttl_default_is_3600_seconds() {
+        let config = config_from_pairs([]).unwrap();
+        assert_eq!(config.perps_closed_test_trade_ttl_sec, 3_600);
+    }
+
+    #[test]
+    fn perps_closed_test_trade_ttl_accepts_configured_14400_seconds() {
+        let config = config_from_pairs([("PERPS_CLOSED_TEST_TRADE_TTL_SEC", "14400")]).unwrap();
+        assert_eq!(config.perps_closed_test_trade_ttl_sec, 14_400);
+    }
+
+    #[test]
+    fn perps_closed_test_trade_ttl_below_minimum_rejected_at_parse() {
+        let error = config_from_pairs([("PERPS_CLOSED_TEST_TRADE_TTL_SEC", "299")]).unwrap_err();
+        let msg = error.to_string();
+        assert!(
+            msg.contains("PERPS_CLOSED_TEST_TRADE_TTL_SEC=299"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("out of bounds"), "got: {msg}");
+    }
+
+    #[test]
+    fn perps_closed_test_trade_ttl_above_maximum_rejected_at_parse() {
+        let error = config_from_pairs([("PERPS_CLOSED_TEST_TRADE_TTL_SEC", "86401")]).unwrap_err();
+        let msg = error.to_string();
+        assert!(
+            msg.contains("PERPS_CLOSED_TEST_TRADE_TTL_SEC=86401"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("out of bounds"), "got: {msg}");
+    }
+
+    #[test]
+    fn perps_closed_test_trade_ttl_accepts_minimum_bound_300() {
+        let config = config_from_pairs([("PERPS_CLOSED_TEST_TRADE_TTL_SEC", "300")]).unwrap();
+        assert_eq!(config.perps_closed_test_trade_ttl_sec, 300);
+    }
+
+    #[test]
+    fn perps_closed_test_trade_ttl_accepts_maximum_bound_86400() {
+        let config = config_from_pairs([("PERPS_CLOSED_TEST_TRADE_TTL_SEC", "86400")]).unwrap();
+        assert_eq!(config.perps_closed_test_trade_ttl_sec, 86_400);
+    }
+
+    #[test]
+    fn perps_closed_test_trade_ttl_non_numeric_rejected_at_parse() {
+        let error = config_from_pairs([("PERPS_CLOSED_TEST_TRADE_TTL_SEC", "abc")]).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("invalid PERPS_CLOSED_TEST_TRADE_TTL_SEC"));
     }
 
     #[test]

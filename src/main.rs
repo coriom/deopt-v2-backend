@@ -135,6 +135,11 @@ async fn main() -> deopt_v2_backend::Result<()> {
     // remain fail-closed by default.
     state.perps_closed_test_enabled = config.perps_closed_test_enabled;
     state.perps_closed_test_allowlist = config.perps_closed_test_allowlist.clone();
+    // PERPS_BASE_SEPOLIA_CLOSED_TEST_TRADE_TTL_AND_REPREPARE_V1 —
+    // propagate the operator-configured closed-test PerpTrade TTL
+    // (seconds). Bounds validation happens in `Config::from_env`; here
+    // we just copy through so the prepare route reads it.
+    state.perps_closed_test_trade_ttl_sec = config.perps_closed_test_trade_ttl_sec;
     // PERPS-FUNDING-LIQUIDATION-WORKERS-V1 — periodic worker config.
     // Both configs default to `disabled()`; the spawn functions return
     // immediately unless `worker_enabled=true`, and the admin HTTP

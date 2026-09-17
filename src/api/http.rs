@@ -165,6 +165,16 @@ pub struct AppState {
     /// closed-test guard on Perps mutations. Env:
     /// `PERPS_CLOSED_TEST_ALLOWLIST` (comma-separated hex).
     pub perps_closed_test_allowlist: Vec<AccountId>,
+    /// PERPS_BASE_SEPOLIA_CLOSED_TEST_TRADE_TTL_AND_REPREPARE_V1 —
+    /// deadline TTL (seconds) applied by
+    /// `POST /perps/closed-test/trades/prepare`. Consulted ONLY inside
+    /// `prepare_trade_core`, which is gated by
+    /// `perps_closed_test_enabled`; Public Perps semantics never see
+    /// this field. Bounds enforced at env-parse time; the prepare path
+    /// clamps as a defence in depth so a hand-constructed test
+    /// AppState still produces a valid deadline. Default:
+    /// `DEFAULT_PERPS_CLOSED_TEST_TRADE_TTL_SEC` (3600).
+    pub perps_closed_test_trade_ttl_sec: u128,
     /// PERPS_BASE_SEPOLIA_BACKEND_RUNTIME_BOOT_INTEGRATION_V1 — public
     /// readiness snapshot for the Perps closed-test broadcast
     /// subsystem. Reflects the ACTUAL runtime lifecycle (preflight
@@ -551,6 +561,8 @@ impl AppState {
             // mutation surface fail-closed for every wallet.
             perps_closed_test_enabled: false,
             perps_closed_test_allowlist: Vec::new(),
+            perps_closed_test_trade_ttl_sec:
+                crate::api::perps_cosign::DEFAULT_PERPS_CLOSED_TEST_TRADE_TTL_SEC,
             perps_broadcast_readiness: crate::execution::BroadcastReadiness::new(),
             // PERPS-FULLSTACK-RUNTIME-INTEGRATION-V1 Part D +
             // PERPS-CLOSED-TEST-HARDENING-V1 Part A — durable nonce

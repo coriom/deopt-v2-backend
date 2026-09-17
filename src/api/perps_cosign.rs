@@ -186,22 +186,41 @@ fn decode_uint256_low128(bytes: &[u8], name: &str) -> Result<u128> {
     Ok(u128::from_be_bytes(u128_bytes))
 }
 
-/// Default deadline TTL (seconds) for a prepared closed-test trade:
-/// **1 hour**. The deployed V1 PME compares `t.deadline` against
-/// `block.timestamp`, which is Unix **seconds**. This constant is in
-/// SECONDS, and `prepare_trade_core` computes `deadline = now_sec +
-/// PREPARE_DEADLINE_TTL_SEC` — NOT `now_ms + 3_600_000` (which would
-/// be interpreted by Solidity as ~50 years in the future).
-pub const PREPARE_DEADLINE_TTL_SEC: u128 = 3_600;
+/// Default deadline TTL (seconds) for a prepared closed-test trade.
+/// The deployed V1 PME compares `t.deadline` against `block.timestamp`,
+/// which is Unix **seconds**. This constant is in SECONDS, and
+/// `prepare_trade_core` computes
+/// `deadline = now_sec + state.perps_closed_test_trade_ttl_sec` —
+/// NOT `now_ms + N_000` (which would be interpreted by Solidity as
+/// ~50 years in the future).
+pub const DEFAULT_PERPS_CLOSED_TEST_TRADE_TTL_SEC: u128 = 3_600;
+
+/// Lower bound for a configured closed-test PerpTrade TTL. Anything
+/// below 5 minutes leaves no meaningful window for operator review +
+/// dual-signing + cosign; enforced at config parse time.
+pub const MIN_PERPS_CLOSED_TEST_TRADE_TTL_SEC: u128 = 300;
+
+/// Upper bound for a configured closed-test PerpTrade TTL. 24 hours
+/// is the outer limit for a manual signing rehearsal. The deployed
+/// V1 PME's own deadline check is authoritative, but bounding here
+/// prevents accidental multi-day pending intents.
+pub const MAX_PERPS_CLOSED_TEST_TRADE_TTL_SEC: u128 = 86_400;
+
+/// Legacy const kept for tests + downstream callers that referenced
+/// the old name. Value is the default TTL (seconds). Runtime callers
+/// should read `state.perps_closed_test_trade_ttl_sec` instead — that
+/// value reflects the operator-configured override, this constant does
+/// not.
+pub const PREPARE_DEADLINE_TTL_SEC: u128 = DEFAULT_PERPS_CLOSED_TEST_TRADE_TTL_SEC;
 
 /// Backwards-compat alias while callers migrate. Retains the old
 /// name but semantics have changed: value is now in SECONDS (was
 /// milliseconds in the initial v1 draft — that draft had a units bug
 /// caught by the reopened milestone audit).
 #[deprecated(
-    note = "Use PREPARE_DEADLINE_TTL_SEC. This alias has been corrected to seconds — do not scale by 1000."
+    note = "Use DEFAULT_PERPS_CLOSED_TEST_TRADE_TTL_SEC or state.perps_closed_test_trade_ttl_sec."
 )]
-pub const PREPARE_DEADLINE_TTL_MS: u128 = PREPARE_DEADLINE_TTL_SEC;
+pub const PREPARE_DEADLINE_TTL_MS: u128 = DEFAULT_PERPS_CLOSED_TEST_TRADE_TTL_SEC;
 
 // ================================================================
 // PHASE A — PREPARE
@@ -382,7 +401,22 @@ where
     // `deadline_is_unix_seconds_not_ms`.
     let now_ms_val = now_ms_override.unwrap_or_else(now_ms);
     let now_sec = (now_ms_val / 1000) as u128;
-    let deadline_sec = now_sec.saturating_add(PREPARE_DEADLINE_TTL_SEC);
+    // Runtime-configurable TTL for closed-test prepared trades. Bounds
+    // are enforced at config-parse time (see `Config::from_env`); the
+    // clamp here is a belt-and-braces guard so an AppState constructed
+    // in a test that skipped env parsing still produces a signable
+    // deadline. Public Perps are unaffected — this value is consulted
+    // only inside `prepare_trade_core`, which is behind the
+    // `perps_closed_test_enabled` gate.
+    let configured_ttl = state.perps_closed_test_trade_ttl_sec;
+    let ttl_sec = if configured_ttl == 0 {
+        DEFAULT_PERPS_CLOSED_TEST_TRADE_TTL_SEC
+    } else {
+        configured_ttl
+            .max(MIN_PERPS_CLOSED_TEST_TRADE_TTL_SEC)
+            .min(MAX_PERPS_CLOSED_TEST_TRADE_TTL_SEC)
+    };
+    let deadline_sec = now_sec.saturating_add(ttl_sec);
 
     let uuid = Uuid::new_v4();
     let intent_id_hex = crate::execution::intent_id_to_hex_bytes32(&uuid.to_string())?;
@@ -1592,5 +1626,271 @@ mod tests {
             PERP_ENGINE_GET_MARK_PRICE_SELECTOR,
             [0x5a, 0xf3, 0xd0, 0x61]
         );
+    }
+
+    // ================================================================
+    // G-series: PERPS_BASE_SEPOLIA_CLOSED_TEST_TRADE_TTL_AND_REPREPARE_V1
+    // ================================================================
+
+    fn mk_readers_ok() -> (StaticNonceReader, StaticMarkPriceReader) {
+        (
+            StaticNonceReader {
+                buyer_addr: BUYER_ADDR.to_string(),
+                buyer: 0,
+                seller_addr: SELLER_ADDR.to_string(),
+                seller: 0,
+                fail: false,
+            },
+            StaticMarkPriceReader {
+                price: 240_000_000_000,
+                fail: false,
+            },
+        )
+    }
+
+    // (G1) Default AppState TTL is DEFAULT_PERPS_CLOSED_TEST_TRADE_TTL_SEC (3600).
+    #[tokio::test]
+    async fn g1_default_ttl_is_3600_seconds() {
+        let state = app_state_closed_test_allowed();
+        assert_eq!(
+            state.perps_closed_test_trade_ttl_sec,
+            DEFAULT_PERPS_CLOSED_TEST_TRADE_TTL_SEC
+        );
+        let req = mk_request();
+        let (nr, mr) = mk_readers_ok();
+        let outcome = prepare_trade_core(&state, &req, &nr, &mr, Some(1_700_000_000_000))
+            .await
+            .unwrap();
+        assert_eq!(outcome.payload.deadline, 1_700_000_000 + 3_600);
+    }
+
+    // (G2) Configured TTL 14_400 → deadline = now + 14_400 (seconds).
+    #[tokio::test]
+    async fn g2_configured_ttl_14400_flows_into_deadline() {
+        let mut state = app_state_closed_test_allowed();
+        state.perps_closed_test_trade_ttl_sec = 14_400;
+        let req = mk_request();
+        let (nr, mr) = mk_readers_ok();
+        let outcome = prepare_trade_core(&state, &req, &nr, &mr, Some(1_700_000_000_000))
+            .await
+            .unwrap();
+        assert_eq!(outcome.payload.deadline, 1_700_000_000 + 14_400);
+        // Persistence shadow ms mirrors the seconds value.
+        assert_eq!(
+            outcome.execution_intent.deadline_ms.unwrap(),
+            (1_700_000_000 + 14_400) * 1_000
+        );
+    }
+
+    // (G3) Deadline uses SECONDS not milliseconds. If the seconds
+    // value were interpreted as ms Solidity would see a deadline far in
+    // the past (or absurd future) and reject; the digest here is what
+    // Trader A/B will sign.
+    #[tokio::test]
+    async fn g3_deadline_is_seconds_not_ms_regardless_of_ttl() {
+        let mut state = app_state_closed_test_allowed();
+        state.perps_closed_test_trade_ttl_sec = 7_200;
+        let req = mk_request();
+        let (nr, mr) = mk_readers_ok();
+        let outcome = prepare_trade_core(&state, &req, &nr, &mr, Some(1_700_000_000_000))
+            .await
+            .unwrap();
+        // 1_700_000_000 sec + 7_200 sec = 1_700_007_200 sec — well below
+        // ms scale.
+        assert!(outcome.payload.deadline < 2_000_000_000u128);
+        assert_eq!(outcome.payload.deadline, 1_700_007_200);
+    }
+
+    // (G4) AppState value below MIN → clamped up (defence-in-depth;
+    // env parse rejects at the boundary but a hand-constructed state
+    // must still produce a signable deadline).
+    #[tokio::test]
+    async fn g4_appstate_below_min_is_clamped_up() {
+        let mut state = app_state_closed_test_allowed();
+        state.perps_closed_test_trade_ttl_sec = 60;
+        let req = mk_request();
+        let (nr, mr) = mk_readers_ok();
+        let outcome = prepare_trade_core(&state, &req, &nr, &mr, Some(1_700_000_000_000))
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.payload.deadline,
+            1_700_000_000 + MIN_PERPS_CLOSED_TEST_TRADE_TTL_SEC
+        );
+    }
+
+    // (G5) AppState value above MAX → clamped down.
+    #[tokio::test]
+    async fn g5_appstate_above_max_is_clamped_down() {
+        let mut state = app_state_closed_test_allowed();
+        state.perps_closed_test_trade_ttl_sec = 999_999_999;
+        let req = mk_request();
+        let (nr, mr) = mk_readers_ok();
+        let outcome = prepare_trade_core(&state, &req, &nr, &mr, Some(1_700_000_000_000))
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.payload.deadline,
+            1_700_000_000 + MAX_PERPS_CLOSED_TEST_TRADE_TTL_SEC
+        );
+    }
+
+    // (G6) AppState TTL = 0 (default-uninitialised) → falls back to
+    // DEFAULT, never produces a same-second-or-past deadline.
+    #[tokio::test]
+    async fn g6_zero_ttl_falls_back_to_default() {
+        let mut state = app_state_closed_test_allowed();
+        state.perps_closed_test_trade_ttl_sec = 0;
+        let req = mk_request();
+        let (nr, mr) = mk_readers_ok();
+        let outcome = prepare_trade_core(&state, &req, &nr, &mr, Some(1_700_000_000_000))
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.payload.deadline,
+            1_700_000_000 + DEFAULT_PERPS_CLOSED_TEST_TRADE_TTL_SEC
+        );
+    }
+
+    // (G7) An intent that has been prepared and then aged past its
+    // deadline CANNOT be cosigned. This is the primary lifecycle
+    // guarantee: expired prepared intents are permanently unbroadcastable.
+    #[tokio::test]
+    async fn g7_expired_prepared_intent_cannot_be_cosigned() {
+        let mut state = app_state_closed_test_allowed();
+        state.perps_closed_test_trade_ttl_sec = 300; // 5 min
+        let req = mk_request();
+        let (nr, mr) = mk_readers_ok();
+        let outcome = prepare_trade_core(&state, &req, &nr, &mr, Some(1_700_000_000_000))
+            .await
+            .unwrap();
+        // Simulate "now" 500 seconds later — past the 300s TTL.
+        let digest = perp_trade_v1_digest_bytes(&outcome.payload, &outcome.domain).unwrap();
+        let cosign_req = CosignTradeRequest {
+            buyer_signature: sign_v1_with(BUYER_KEY, &digest),
+            seller_signature: sign_v1_with(SELLER_KEY, &digest),
+        };
+        let err = cosign_load_and_verify(
+            &outcome.execution_intent,
+            &outcome.domain,
+            &cosign_req,
+            None,
+            /*now_sec*/ 1_700_000_000 + 500,
+        )
+        .unwrap_err();
+        assert!(matches!(err, BackendError::PerpsIntentDeadlineExpired));
+    }
+
+    // (G8) An expired prepared intent with NO signatures cannot produce
+    // a broadcast transaction request even if the executor tick had
+    // advanced its status past simulation. This is the same guarantee
+    // as z9 but exercised via the TTL-configured prepare path, proving
+    // that a small TTL does not accidentally short-circuit the
+    // executor's own fail-closed gate on missing signatures.
+    #[tokio::test]
+    async fn g8_expired_prepared_intent_cannot_produce_broadcast_calldata() {
+        let mut state = app_state_closed_test_allowed();
+        state.perps_closed_test_trade_ttl_sec = 300;
+        let req = mk_request();
+        let (nr, mr) = mk_readers_ok();
+        let mut outcome = prepare_trade_core(&state, &req, &nr, &mr, Some(1_700_000_000_000))
+            .await
+            .unwrap();
+        // Simulate an executor that has run simulation OK but signatures
+        // are still absent. build must refuse.
+        outcome.execution_intent.status = crate::execution::ExecutionIntentStatus::SimulationOk;
+        let empty_bundle = crate::execution::StoredTradeSignatures::default();
+        let config = crate::execution::ExecutionConfig {
+            perp_matching_engine_address: AccountId::new(PME.to_string()),
+            require_simulation_ok: true,
+            executor_chain_id: CHAIN_ID,
+            max_gas_limit: 1_000_000,
+            max_fee_per_gas_wei: Some("1000000000".to_string()),
+            max_priority_fee_per_gas_wei: Some("100000000".to_string()),
+            ..crate::execution::ExecutionConfig::disabled()
+        };
+        let err = crate::execution::build_execution_transaction_request(
+            &config,
+            &outcome.execution_intent,
+            &empty_bundle,
+        )
+        .unwrap_err();
+        assert!(matches!(err, BackendError::MissingTradeSignatures));
+    }
+
+    // (G9) TTL config does NOT affect public Perps: the field lives on
+    // AppState but is consulted only when
+    // `perps_closed_test_enabled=true` inside `prepare_trade_core`.
+    // Public trading semantics have their own routes; they never call
+    // this function.
+    #[tokio::test]
+    async fn g9_ttl_config_does_not_affect_public_perps() {
+        // Public-perps posture: closed-test disabled, public trading on,
+        // TTL configured to something exotic.
+        let mut state = app_state_closed_test_allowed();
+        state.perps_closed_test_enabled = false;
+        state.perps_public_trading_enabled = true;
+        state.perps_closed_test_trade_ttl_sec = 12_345;
+        let req = mk_request();
+        let (nr, mr) = mk_readers_ok();
+        let err = prepare_trade_core(&state, &req, &nr, &mr, Some(1_700_000_000_000))
+            .await
+            .unwrap_err();
+        // The prepare route STILL refuses to run — it belongs to the
+        // closed-test surface. Public Perps traders reach on-chain
+        // matching through a wholly different code path (POST
+        // /perps/orders*), which never touches
+        // `perps_closed_test_trade_ttl_sec`.
+        assert!(matches!(err, BackendError::PerpsNotLive));
+    }
+
+    // (G10) Old unsigned intent can NEVER become executable — even if
+    // signatures were somehow added POST-deadline, the cosign path
+    // rejects them; and without signatures the executor build path
+    // rejects them. Both are independent gates.
+    #[tokio::test]
+    async fn g10_old_unsigned_intent_cannot_become_executable() {
+        let state = app_state_closed_test_allowed();
+        let req = mk_request();
+        let (nr, mr) = mk_readers_ok();
+        let outcome = prepare_trade_core(&state, &req, &nr, &mr, Some(1_700_000_000_000))
+            .await
+            .unwrap();
+        // Gate 1: cosign after deadline is refused.
+        let digest = perp_trade_v1_digest_bytes(&outcome.payload, &outcome.domain).unwrap();
+        let sigs = CosignTradeRequest {
+            buyer_signature: sign_v1_with(BUYER_KEY, &digest),
+            seller_signature: sign_v1_with(SELLER_KEY, &digest),
+        };
+        let cosign_err = cosign_load_and_verify(
+            &outcome.execution_intent,
+            &outcome.domain,
+            &sigs,
+            None,
+            /*now_sec*/ 1_700_000_000 + DEFAULT_PERPS_CLOSED_TEST_TRADE_TTL_SEC + 1,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            cosign_err,
+            BackendError::PerpsIntentDeadlineExpired
+        ));
+        // Gate 2: even if the executor had simulated the intent, no
+        // signatures → build refuses to produce calldata.
+        let mut intent = outcome.execution_intent.clone();
+        intent.status = crate::execution::ExecutionIntentStatus::SimulationOk;
+        let empty_bundle = crate::execution::StoredTradeSignatures::default();
+        let config = crate::execution::ExecutionConfig {
+            perp_matching_engine_address: AccountId::new(PME.to_string()),
+            require_simulation_ok: true,
+            executor_chain_id: CHAIN_ID,
+            max_gas_limit: 1_000_000,
+            max_fee_per_gas_wei: Some("1000000000".to_string()),
+            max_priority_fee_per_gas_wei: Some("100000000".to_string()),
+            ..crate::execution::ExecutionConfig::disabled()
+        };
+        let build_err =
+            crate::execution::build_execution_transaction_request(&config, &intent, &empty_bundle)
+                .unwrap_err();
+        assert!(matches!(build_err, BackendError::MissingTradeSignatures));
     }
 }
