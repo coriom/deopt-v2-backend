@@ -48,6 +48,13 @@ pub enum SignerBackendKind {
     /// In-process k256 ECDSA signer (`ExecutorSigner::from_private_key`).
     /// Permitted only on testnet / anvil; refused on mainnet at startup.
     LocalDev,
+    /// PERPS_BASE_SEPOLIA_CLOSED_TEST_EXECUTION_LIFECYCLE_AND_LOCAL_KEYSTORE_V1
+    /// — decrypt a Web3 v3 keystore JSON at boot using a password read
+    /// from an ephemeral file (mode ≤ 0600). Same in-process
+    /// [`crate::execution::signer::ExecutorSigner`] downstream, but no
+    /// plaintext private key ever appears in the persistent `.env`.
+    /// Refused on mainnet — closed-test only.
+    LocalKeystore,
     /// HTTPS/mTLS client of an external signer microservice backed by a
     /// KMS / HSM / MPC provider.
     Remote,
@@ -57,6 +64,7 @@ impl SignerBackendKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::LocalDev => "local_dev",
+            Self::LocalKeystore => "local_keystore",
             Self::Remote => "remote",
         }
     }
@@ -64,9 +72,10 @@ impl SignerBackendKind {
     pub fn parse(value: &str) -> std::result::Result<Self, String> {
         match value {
             "local_dev" | "localdev" | "local-dev" => Ok(Self::LocalDev),
+            "local_keystore" | "localkeystore" | "local-keystore" => Ok(Self::LocalKeystore),
             "remote" => Ok(Self::Remote),
             other => Err(format!(
-                "invalid BACKEND_SIGNER_MODE: {other} (expected `local_dev` or `remote`)"
+                "invalid BACKEND_SIGNER_MODE: {other} (expected `local_dev`, `local_keystore`, or `remote`)"
             )),
         }
     }

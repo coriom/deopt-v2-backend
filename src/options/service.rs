@@ -2751,6 +2751,30 @@ pub fn build_signer_for_state(state: &AppState) -> Result<Arc<dyn RemoteSigner>>
             let inner = ExecutorSigner::from_private_key(private_key)?;
             Ok(Arc::new(LocalDevSigner::from_executor_signer(inner)))
         }
+        SignerBackendKind::LocalKeystore => {
+            let keystore_path = state
+                .execution_config
+                .executor_keystore_path
+                .as_ref()
+                .ok_or_else(|| {
+                    BackendError::Config(
+                        "EXECUTOR_KEYSTORE_PATH is required for BACKEND_SIGNER_MODE=local_keystore"
+                            .to_string(),
+                    )
+                })?;
+            let password_file = state
+                .execution_config
+                .executor_keystore_password_file
+                .as_ref()
+                .ok_or_else(|| {
+                    BackendError::Config(
+                        "EXECUTOR_KEYSTORE_PASSWORD_FILE is required for BACKEND_SIGNER_MODE=local_keystore"
+                            .to_string(),
+                    )
+                })?;
+            let inner = ExecutorSigner::from_v3_keystore(keystore_path, password_file)?;
+            Ok(Arc::new(LocalDevSigner::from_executor_signer(inner)))
+        }
         SignerBackendKind::Remote => {
             let endpoint = state
                 .execution_config

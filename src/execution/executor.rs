@@ -20,6 +20,28 @@ pub trait ExecutionIntentRepository: Clone + Send + Sync {
         limit: u32,
     ) -> RepositoryFuture<'_, Vec<ExecutionIntent>>;
 
+    /// PERPS_BASE_SEPOLIA_CLOSED_TEST_EXECUTION_LIFECYCLE_AND_LOCAL_KEYSTORE_V1
+    /// — return intents that are broadcast-workflow-eligible: those in
+    /// `Pending`, `CalldataReady`, or `SimulationOk`. Ordered by
+    /// `created_at_ms ASC` for stable FIFO selection.
+    ///
+    /// This is distinct from [`Self::list_pending_execution_intents`]:
+    /// the older selector is used by the dry-run preview tick and must
+    /// stay filtered to `Pending` so a cosigned/simulated intent does
+    /// not silently regress. The new selector is consumed only by the
+    /// real closed-test broadcast worker, which needs to advance
+    /// `CalldataReady → SimulationOk → broadcast` inline.
+    ///
+    /// Default implementation falls back to the old selector so
+    /// in-memory test doubles that predate this change keep working
+    /// (they exercise only Pending flows).
+    fn list_broadcastable_execution_intents(
+        &self,
+        limit: u32,
+    ) -> RepositoryFuture<'_, Vec<ExecutionIntent>> {
+        self.list_pending_execution_intents(limit)
+    }
+
     fn update_execution_intent_status(
         &self,
         intent_id: Uuid,
@@ -420,6 +442,8 @@ mod tests {
             perps_closed_test_broadcast_intent_id: None,
             perps_closed_test_max_drift_bps: 100,
             perps_closed_test_min_deadline_remaining_sec: 900,
+            executor_keystore_path: None,
+            executor_keystore_password_file: None,
         };
 
         let result = Executor::new(config, repository.clone())

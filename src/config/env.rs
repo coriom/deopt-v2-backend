@@ -259,6 +259,16 @@ impl AppConfig {
                 "PERPS_CLOSED_TEST_MIN_DEADLINE_REMAINING_SEC",
                 "900",
             )?,
+            // PERPS_BASE_SEPOLIA_CLOSED_TEST_EXECUTION_LIFECYCLE_AND_LOCAL_KEYSTORE_V1
+            // — LocalKeystore signer mode inputs. Both default None;
+            // required only when `BACKEND_SIGNER_MODE=local_keystore`,
+            // enforced by `ExecutionConfig::validate_startup`.
+            executor_keystore_path: lookup("EXECUTOR_KEYSTORE_PATH")
+                .filter(|value| !value.is_empty())
+                .map(std::path::PathBuf::from),
+            executor_keystore_password_file: lookup("EXECUTOR_KEYSTORE_PASSWORD_FILE")
+                .filter(|value| !value.is_empty())
+                .map(std::path::PathBuf::from),
         };
         let indexer = IndexerConfig {
             enabled: parse_env(&mut lookup, "INDEXER_ENABLED", "false")?,

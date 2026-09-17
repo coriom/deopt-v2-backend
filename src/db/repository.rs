@@ -1333,6 +1333,37 @@ impl PgRepository {
             .collect()
     }
 
+    /// PERPS_BASE_SEPOLIA_CLOSED_TEST_EXECUTION_LIFECYCLE_AND_LOCAL_KEYSTORE_V1
+    /// — intents that the real closed-test broadcast worker may
+    /// consider for a NEW send attempt. Selects `Pending`,
+    /// `CalldataReady`, and `SimulationOk` — the three positions on
+    /// the lifecycle the executor can legitimately drive forward.
+    /// `Prepared / Submitted` are owned by the reconciler (durable
+    /// rebroadcast) and terminal states are opaque.
+    pub async fn list_broadcastable_execution_intents(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<ExecutionIntent>> {
+        let rows = sqlx::query(
+            "SELECT intent_id, onchain_intent_id, market_id, buyer, seller, price_1e8, size_1e8, \
+             buy_order_id, sell_order_id, buyer_is_maker, buyer_nonce, seller_nonce, deadline_ms, \
+             status, created_at_ms, updated_at_ms \
+             FROM execution_intents \
+             WHERE status IN ('pending', 'calldata_ready', 'simulation_ok') \
+             ORDER BY created_at_ms ASC, intent_id ASC \
+             LIMIT $1",
+        )
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+
+        rows.into_iter()
+            .map(db_execution_intent_from_row)
+            .map(|result| result.and_then(ExecutionIntent::try_from))
+            .collect()
+    }
+
     pub async fn update_execution_intent_status(
         &self,
         intent_id: Uuid,
@@ -5846,6 +5877,15 @@ impl ExecutionIntentRepository for PgRepository {
         limit: u32,
     ) -> crate::execution::RepositoryFuture<'_, Vec<ExecutionIntent>> {
         Box::pin(async move { PgRepository::list_pending_execution_intents(self, limit).await })
+    }
+
+    fn list_broadcastable_execution_intents(
+        &self,
+        limit: u32,
+    ) -> crate::execution::RepositoryFuture<'_, Vec<ExecutionIntent>> {
+        Box::pin(
+            async move { PgRepository::list_broadcastable_execution_intents(self, limit).await },
+        )
     }
 
     fn update_execution_intent_status(

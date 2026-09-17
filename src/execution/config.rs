@@ -107,6 +107,18 @@ pub struct ExecutionConfig {
     /// `intent.deadline` at pre-send time. Default 900 s. Bounded
     /// [60, 86_400].
     pub perps_closed_test_min_deadline_remaining_sec: u64,
+    /// PERPS_BASE_SEPOLIA_CLOSED_TEST_EXECUTION_LIFECYCLE_AND_LOCAL_KEYSTORE_V1
+    /// — filesystem path to a Web3 v3 encrypted keystore consumed by
+    /// [`crate::execution::signer::ExecutorSigner::from_v3_keystore`]
+    /// when `backend_signer_mode == LocalKeystore`. Ignored otherwise.
+    /// Startup refuses `LocalKeystore` on mainnet chain ids.
+    pub executor_keystore_path: Option<std::path::PathBuf>,
+    /// PERPS_BASE_SEPOLIA_CLOSED_TEST_EXECUTION_LIFECYCLE_AND_LOCAL_KEYSTORE_V1
+    /// — filesystem path to an ephemeral password file (mode ≤ 0600)
+    /// used to decrypt `executor_keystore_path` at boot. Never stored
+    /// in the persistent `.env`; the operator must place it on tmpfs
+    /// and unlink after successful startup.
+    pub executor_keystore_password_file: Option<std::path::PathBuf>,
 }
 
 impl ExecutionConfig {
@@ -141,6 +153,8 @@ impl ExecutionConfig {
             perps_closed_test_broadcast_intent_id: None,
             perps_closed_test_max_drift_bps: 100,
             perps_closed_test_min_deadline_remaining_sec: 900,
+            executor_keystore_path: None,
+            executor_keystore_password_file: None,
         }
     }
 
@@ -237,6 +251,48 @@ impl ExecutionConfig {
                     };
                     ExecutorSigner::from_private_key(private_key)?;
                 }
+                SignerBackendKind::LocalKeystore => {
+                    // PERPS_BASE_SEPOLIA_CLOSED_TEST_EXECUTION_LIFECYCLE_AND_LOCAL_KEYSTORE_V1
+                    // — mainnet refusal is the same posture as
+                    // LocalDev: closed-test only. `validate_signer_backend`
+                    // has already refused mainnet for LocalKeystore.
+                    let Some(keystore_path) = self.executor_keystore_path.as_ref() else {
+                        return Err(BackendError::Config(
+                            "EXECUTOR_KEYSTORE_PATH is required when BACKEND_SIGNER_MODE=local_keystore"
+                                .to_string(),
+                        ));
+                    };
+                    let Some(password_file) = self.executor_keystore_password_file.as_ref() else {
+                        return Err(BackendError::Config(
+                            "EXECUTOR_KEYSTORE_PASSWORD_FILE is required when BACKEND_SIGNER_MODE=local_keystore"
+                                .to_string(),
+                        ));
+                    };
+                    let signer = ExecutorSigner::from_v3_keystore(keystore_path, password_file)?;
+                    // Bind the decrypted address to
+                    // `EXECUTOR_FROM_ADDRESS` at startup so a mistaken
+                    // keystore does not silently sign for a different
+                    // account.
+                    let derived = signer
+                        .address()
+                        .0
+                        .trim()
+                        .trim_start_matches("0x")
+                        .to_ascii_lowercase();
+                    let expected = self
+                        .executor_from_address
+                        .0
+                        .trim()
+                        .trim_start_matches("0x")
+                        .to_ascii_lowercase();
+                    if derived != expected {
+                        return Err(BackendError::Config(format!(
+                            "keystore address ({}) does not match EXECUTOR_FROM_ADDRESS ({})",
+                            signer.address().0,
+                            self.executor_from_address.0
+                        )));
+                    }
+                }
                 SignerBackendKind::Remote => {
                     if self
                         .backend_signer_endpoint
@@ -296,6 +352,26 @@ impl ExecutionConfig {
                     )));
                 }
                 let _ = BASE_SEPOLIA_CHAIN_ID; // referenced by docs; suppress unused warning
+            }
+            SignerBackendKind::LocalKeystore => {
+                if self.executor_chain_id == MAINNET_CHAIN_ID {
+                    return Err(BackendError::Config(
+                        "BACKEND_SIGNER_MODE=local_keystore is REFUSED on mainnet (chain_id=8453); use BACKEND_SIGNER_MODE=remote".to_string(),
+                    ));
+                }
+                // LocalKeystore is treated as a testnet closed-test
+                // convenience. It still requires
+                // `EXECUTOR_ALLOW_LOCAL_SIGNER=true` on non-anvil
+                // testnets so a stray production-shape env cannot
+                // accidentally activate it.
+                let testnet_allowed =
+                    self.executor_chain_id == ANVIL_CHAIN_ID || self.executor_allow_local_signer;
+                if !testnet_allowed {
+                    return Err(BackendError::Config(format!(
+                        "BACKEND_SIGNER_MODE=local_keystore on chain_id={} requires EXECUTOR_ALLOW_LOCAL_SIGNER=true (anvil chain_id={} is exempt)",
+                        self.executor_chain_id, ANVIL_CHAIN_ID
+                    )));
+                }
             }
             SignerBackendKind::Remote => {
                 if self

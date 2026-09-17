@@ -263,6 +263,8 @@ mod tests {
             perps_closed_test_broadcast_intent_id: None,
             perps_closed_test_max_drift_bps: 100,
             perps_closed_test_min_deadline_remaining_sec: 900,
+            executor_keystore_path: None,
+            executor_keystore_password_file: None,
         }
     }
 

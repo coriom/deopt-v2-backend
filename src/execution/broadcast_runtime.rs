@@ -259,15 +259,47 @@ where
         &hv2_executor,
     )?;
 
-    // Signer. LocalDev only in this V1 factory — Remote requires the
-    // `HybridV2KmsSignerBridge` factory which is deployment-side.
-    let private_key = config.executor_private_key.as_ref().ok_or_else(|| {
-        BackendError::Config(
-            "EXECUTOR_PRIVATE_KEY is required for LocalDev signer path in V1 boot integration"
-                .to_string(),
-        )
-    })?;
-    let signer = Arc::new(ExecutorSigner::from_private_key(private_key)?);
+    // Signer. LocalDev / LocalKeystore only in this V1 factory —
+    // Remote requires the `HybridV2KmsSignerBridge` factory which is
+    // deployment-side.
+    let signer = match config.backend_signer_mode {
+        crate::execution::SignerBackendKind::LocalDev => {
+            let private_key = config.executor_private_key.as_ref().ok_or_else(|| {
+                BackendError::Config(
+                    "EXECUTOR_PRIVATE_KEY is required for LocalDev signer path".to_string(),
+                )
+            })?;
+            Arc::new(ExecutorSigner::from_private_key(private_key)?)
+        }
+        crate::execution::SignerBackendKind::LocalKeystore => {
+            let keystore_path = config.executor_keystore_path.as_ref().ok_or_else(|| {
+                BackendError::Config(
+                    "EXECUTOR_KEYSTORE_PATH is required for LocalKeystore signer".to_string(),
+                )
+            })?;
+            let password_file =
+                config
+                    .executor_keystore_password_file
+                    .as_ref()
+                    .ok_or_else(|| {
+                        BackendError::Config(
+                            "EXECUTOR_KEYSTORE_PASSWORD_FILE is required for LocalKeystore signer"
+                                .to_string(),
+                        )
+                    })?;
+            Arc::new(ExecutorSigner::from_v3_keystore(
+                keystore_path,
+                password_file,
+            )?)
+        }
+        crate::execution::SignerBackendKind::Remote => {
+            return Err(BackendError::Config(
+                "BACKEND_SIGNER_MODE=remote requires the deployment-side HybridV2 signer bridge; \
+                 build_broadcast_runtime does not construct a remote signer directly"
+                    .to_string(),
+            ));
+        }
+    };
 
     // RPC.
     let rpc_url = config
@@ -335,8 +367,13 @@ where
             return Ok(0);
         }
     };
+    // PERPS_BASE_SEPOLIA_CLOSED_TEST_EXECUTION_LIFECYCLE_AND_LOCAL_KEYSTORE_V1
+    // — the broadcast-workflow selector returns intents in Pending,
+    // CalldataReady, or SimulationOk. This is the ONLY path that
+    // advances a closed-test intent through inline simulation on the
+    // way to a real send.
     let intents = repository
-        .list_pending_execution_intents(batch_size)
+        .list_broadcastable_execution_intents(batch_size)
         .await?;
     let mut processed = 0usize;
     for intent in &intents {
@@ -352,7 +389,49 @@ where
             // preview tick will pick it up.
             continue;
         }
-        match policy.broadcast_intent(repository, intent, &sigs).await {
+        // Inline lifecycle advancement:
+        //   Pending / CalldataReady  --simulate-->  SimulationOk (then broadcast)
+        //   SimulationOk             --------------->              broadcast
+        //   SimulationFailed / DryRun / Prepared / Submitted / Confirmed / Failed
+        //     → not selectable (SQL) or terminal-ish; skip defensively here too.
+        use crate::execution::ExecutionIntentStatus as St;
+        let ready_intent = match intent.status {
+            St::Pending | St::CalldataReady => {
+                let sim = crate::execution::simulate_execution_intent(
+                    &policy.rpc,
+                    &policy.config,
+                    intent,
+                    &sigs,
+                )
+                .await?;
+                let new_status = sim.status;
+                repository
+                    .update_execution_intent_status(
+                        intent.intent_id,
+                        new_status,
+                        crate::types::now_ms(),
+                    )
+                    .await?;
+                if new_status != St::SimulationOk {
+                    warn!(
+                        intent_id = %intent.intent_id,
+                        error = ?sim.error,
+                        "simulation did not reach SimulationOk; skipping broadcast"
+                    );
+                    processed += 1;
+                    continue;
+                }
+                let mut updated = intent.clone();
+                updated.status = St::SimulationOk;
+                updated
+            }
+            St::SimulationOk => intent.clone(),
+            _ => continue,
+        };
+        match policy
+            .broadcast_intent(repository, &ready_intent, &sigs)
+            .await
+        {
             Ok(outcome) => {
                 crate::monitoring::observe_broadcast_outcome(&outcome);
                 processed += 1;
