@@ -68,30 +68,54 @@ Gates:
 - Non-zero `sizeDelta1e8` and `executionPrice1e8`
 - **`PERSISTENCE_ENABLED = true`** — closed-test cosign requires a real repository for the reload path
 
-Request body:
+**FINAL request body — operator-owned fields only:**
 ```json
 {
   "buyer": "0x...",
   "seller": "0x...",
   "marketId": "1",
   "sizeDelta1e8": "1000000",
-  "executionPrice1e8": "240000000000",
-  "buyerIsMaker": false,
-  "buyerNonce": "0",
-  "sellerNonce": "0"
+  "buyerIsMaker": false
 }
 ```
 
+The caller CANNOT influence `uuid`, `intentId`, `executionPrice1e8`,
+`buyerNonce`, `sellerNonce`, or `deadline` — these are all frozen by
+the backend via authoritative chain reads at prepare time.
+
 Actions:
 1. Enforce closed-test + allowlist gates.
-2. Parse explicit `buyerNonce` / `sellerNonce` — operator policy freezes these values (V1 does NOT auto-read `PME.nonces(x)` via RPC; a follow-on will).
-3. Generate a fresh UUID v4 (backend-owned).
-4. Derive `intentId = keccak256(uuid.to_string().as_bytes())` (canonical hyphenated RFC-4122 string bytes).
-5. Compute `deadline = (now_ms / 1000) + 3600` — **Unix seconds**, NOT ms.
-6. Build the 10-field `PerpTrade` payload.
-7. Compute the EIP-712 digest.
-8. **Persist the frozen `ExecutionIntent` (status = `Pending`, no signatures yet) via `PgRepository::insert_execution_intent_row(...)`.** This lets the cosign handler reload the intent by UUID.
-9. Return `{ uuid, intentId, digest, typedData, trade }`.
+2. **Read `PerpEngine.getMarkPrice(marketId)`** via the injected
+   `MarkPriceReader` (production: `RpcMarkPriceReader` over
+   `HttpJsonRpcProvider`). Fail-closed on RPC error or zero return.
+3. **Read `PME.nonces(buyer)` + `PME.nonces(seller)`** via the
+   injected `NonceReader` (production: `RpcNonceReader`). Fail-closed
+   on RPC error — no silent 0 substitution.
+4. Generate a fresh UUID v4 (backend-owned).
+5. Derive `intentId = keccak256(uuid.to_string().as_bytes())`.
+6. Compute `deadline = (now_ms / 1000) + PREPARE_DEADLINE_TTL_SEC`
+   — **Unix seconds** (PREPARE_DEADLINE_TTL_SEC = 3600).
+7. Build the 10-field `PerpTrade` payload.
+8. Compute the EIP-712 digest.
+9. **Persist the frozen `ExecutionIntent` (status = `Pending`)** via
+   `PgRepository::insert_execution_intent_row(...)`.
+10. Return `{ uuid, intentId, digest, typedData, trade }`.
+
+**Ownership taxonomy:**
+
+| Field | Owner | Source |
+|---|---|---|
+| `uuid` | backend | `Uuid::new_v4()` |
+| `intentId` | backend | `keccak256(uuid.to_string().as_bytes())` |
+| `executionPrice1e8` | backend | `PerpEngine.getMarkPrice(marketId)` |
+| `buyerNonce` | backend | `PME.nonces(buyer)` |
+| `sellerNonce` | backend | `PME.nonces(seller)` |
+| `deadline` | backend | `now_sec + 3600` |
+| `buyer` | operator | request body |
+| `seller` | operator | request body |
+| `marketId` | operator | request body |
+| `sizeDelta1e8` | operator | request body |
+| `buyerIsMaker` | operator | request body |
 
 ### Phase B — Cosign
 

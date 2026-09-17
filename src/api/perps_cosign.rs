@@ -37,6 +37,7 @@
 
 use crate::api::AppState;
 use crate::error::{BackendError, Result};
+use crate::execution::rpc::{EthCallProvider, EthCallRequest};
 use crate::execution::{
     intent_id_to_b256, perp_trade_v1_digest, perp_trade_v1_digest_bytes, ExecutionIntent,
     ExecutionIntentStatus, PerpTradeDomain, PerpTradePayload, PerpTradeSignatureBundle,
@@ -46,7 +47,144 @@ use crate::signing::signature::recover_eip712_signer;
 use crate::types::{now_ms, AccountId, MarketId, OrderId, Price1e8, Size1e8, TimestampMs};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
+use std::future::Future;
+use std::pin::Pin;
 use uuid::Uuid;
+
+/// PME `nonces(address)` selector — first four bytes of
+/// `keccak256("nonces(address)")`. Used by
+/// [`RpcNonceReader`] to fetch the authoritative buyer/seller PME
+/// nonce at prepare time.
+pub const PME_NONCES_SELECTOR: [u8; 4] = [0x7e, 0xce, 0xbe, 0x00];
+
+/// PerpEngine `getMarkPrice(uint256)` selector — first four bytes of
+/// `keccak256("getMarkPrice(uint256)")`. Used by
+/// [`RpcMarkPriceReader`] to fetch the authoritative live mark for
+/// the prepare execution price.
+pub const PERP_ENGINE_GET_MARK_PRICE_SELECTOR: [u8; 4] = [0x5a, 0xf3, 0xd0, 0x61];
+
+pub type ReaderFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
+
+/// Read the authoritative PME nonce for a trader. Implementations:
+/// - [`RpcNonceReader`] uses `PerpMatchingEngine.nonces(address)`
+///   via `eth_call`.
+/// - Test doubles inject deterministic values.
+pub trait NonceReader: Send + Sync {
+    fn read_pme_nonce<'a>(&'a self, trader: &'a AccountId) -> ReaderFuture<'a, u128>;
+}
+
+/// Read the authoritative mark price for a market. Implementations:
+/// - [`RpcMarkPriceReader`] uses `PerpEngine.getMarkPrice(marketId)`
+///   which internally consults the OracleRouter.
+/// - Test doubles inject deterministic values.
+pub trait MarkPriceReader: Send + Sync {
+    fn read_mark_price<'a>(&'a self, market_id: u128) -> ReaderFuture<'a, u128>;
+}
+
+/// Live-chain [`NonceReader`] implementation backed by any
+/// [`EthCallProvider`] pointed at the PME contract.
+pub struct RpcNonceReader<R> {
+    pub rpc: R,
+    pub pme: AccountId,
+}
+
+impl<R> RpcNonceReader<R> {
+    pub fn new(rpc: R, pme: AccountId) -> Self {
+        Self { rpc, pme }
+    }
+}
+
+impl<R> NonceReader for RpcNonceReader<R>
+where
+    R: EthCallProvider + Send + Sync + 'static,
+{
+    fn read_pme_nonce<'a>(&'a self, trader: &'a AccountId) -> ReaderFuture<'a, u128> {
+        Box::pin(async move {
+            let trader_bytes = parse_evm_address(trader)?;
+            let mut data = Vec::with_capacity(4 + 32);
+            data.extend_from_slice(&PME_NONCES_SELECTOR);
+            data.extend_from_slice(&[0u8; 12]);
+            data.extend_from_slice(&trader_bytes);
+            let out = self
+                .rpc
+                .eth_call(EthCallRequest {
+                    from: trader.clone(),
+                    to: self.pme.clone(),
+                    data,
+                    value: 0,
+                    gas_limit: None,
+                })
+                .await?;
+            decode_uint256_low128(&out.output, "nonces")
+        })
+    }
+}
+
+/// Live-chain [`MarkPriceReader`] implementation backed by any
+/// [`EthCallProvider`] pointed at the PerpEngine contract.
+pub struct RpcMarkPriceReader<R> {
+    pub rpc: R,
+    pub perp_engine: AccountId,
+}
+
+impl<R> RpcMarkPriceReader<R> {
+    pub fn new(rpc: R, perp_engine: AccountId) -> Self {
+        Self { rpc, perp_engine }
+    }
+}
+
+impl<R> MarkPriceReader for RpcMarkPriceReader<R>
+where
+    R: EthCallProvider + Send + Sync + 'static,
+{
+    fn read_mark_price<'a>(&'a self, market_id: u128) -> ReaderFuture<'a, u128> {
+        Box::pin(async move {
+            let mut data = Vec::with_capacity(4 + 32);
+            data.extend_from_slice(&PERP_ENGINE_GET_MARK_PRICE_SELECTOR);
+            let mut market_word = [0u8; 32];
+            market_word[16..].copy_from_slice(&market_id.to_be_bytes());
+            data.extend_from_slice(&market_word);
+            let out = self
+                .rpc
+                .eth_call(EthCallRequest {
+                    from: self.perp_engine.clone(),
+                    to: self.perp_engine.clone(),
+                    data,
+                    value: 0,
+                    gas_limit: None,
+                })
+                .await?;
+            let price = decode_uint256_low128(&out.output, "getMarkPrice")?;
+            if price == 0 {
+                return Err(BackendError::PerpsProtocolReferencePriceUnavailable(
+                    "getMarkPrice returned 0 — oracle likely stale or unconfigured".to_string(),
+                ));
+            }
+            Ok(price)
+        })
+    }
+}
+
+fn decode_uint256_low128(bytes: &[u8], name: &str) -> Result<u128> {
+    if bytes.len() != 32 {
+        return Err(BackendError::Config(format!(
+            "{name} return length {} != 32",
+            bytes.len()
+        )));
+    }
+    // uint256 → we only support values that fit in the low 128 bits;
+    // nonces and 1e8 prices never exceed that for closed-test.
+    for byte in &bytes[..16] {
+        if *byte != 0 {
+            return Err(BackendError::Config(format!(
+                "{name} value overflows u128 (upper 128 bits non-zero)"
+            )));
+        }
+    }
+    let mut u128_bytes = [0u8; 16];
+    u128_bytes.copy_from_slice(&bytes[16..32]);
+    Ok(u128::from_be_bytes(u128_bytes))
+}
 
 /// Default deadline TTL (seconds) for a prepared closed-test trade:
 /// **1 hour**. The deployed V1 PME compares `t.deadline` against
@@ -69,6 +207,19 @@ pub const PREPARE_DEADLINE_TTL_MS: u128 = PREPARE_DEADLINE_TTL_SEC;
 // PHASE A — PREPARE
 // ================================================================
 
+/// FINAL closed-test prepare request. All backend-owned fields
+/// (`uuid`, `intentId`, `executionPrice1e8`, `buyerNonce`,
+/// `sellerNonce`, `deadline`) are frozen by the backend at prepare
+/// time — the caller CANNOT influence them.
+///
+/// Only the following fields are operator-owned:
+///
+/// * `buyer` — closed-test allowlisted address
+/// * `seller` — closed-test allowlisted address
+/// * `marketId` — market to trade against
+/// * `sizeDelta1e8` — trade size (1e8 scale)
+/// * `buyerIsMaker` — maker-side hint (economic classification only;
+///   the deployed V1 PME does not enforce a specific maker orientation)
 #[derive(Clone, Debug, Deserialize)]
 pub struct PrepareTradeRequest {
     pub buyer: String,
@@ -79,31 +230,8 @@ pub struct PrepareTradeRequest {
     /// Decimal string; on-chain `uint128 sizeDelta1e8` (0.01 ETH = "1000000").
     #[serde(rename = "sizeDelta1e8")]
     pub size_delta_1e8: String,
-    /// Decimal string; on-chain `uint128 executionPrice1e8`. Explicit
-    /// closed-test policy field — the CURRENT V1 implementation
-    /// accepts an operator-supplied price at prepare time. The
-    /// operator is expected to have read the fresh oracle mark
-    /// (`OracleRouter.getPriceSafe(mWETH, mUSDC)`) before submitting
-    /// this value. Backend enforces `> 0` only; the deployed V1 PME
-    /// has NO on-chain execution-deviation guard (see
-    /// `PERPS_BASE_SEPOLIA_BACKEND_RECEIPT_IDENTITY_BINDING_V1` for
-    /// the on-chain-drift analysis). Future extension: replace this
-    /// field with a backend-owned oracle read.
-    #[serde(rename = "executionPrice1e8")]
-    pub execution_price_1e8: String,
     #[serde(rename = "buyerIsMaker")]
     pub buyer_is_maker: bool,
-    /// EXPLICIT nonce policy — the operator MUST supply the frozen
-    /// PME nonces for buyer + seller. The V1 implementation does NOT
-    /// silently default these to 0. In production this value would be
-    /// read from `PME.nonces(buyer)` and `PME.nonces(seller)` via RPC
-    /// — deferred to the runtime-wiring layer. For closed-test smoke
-    /// against fresh trader fixtures the operator submits `0` for
-    /// both; any subsequent trade re-uses the incremented nonces.
-    #[serde(rename = "buyerNonce")]
-    pub buyer_nonce: String,
-    #[serde(rename = "sellerNonce")]
-    pub seller_nonce: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -161,11 +289,24 @@ pub struct PrepareOutcome {
 /// Core prepare logic — validates + freezes one 10-field PerpTrade.
 /// HTTP layer wraps this. Kept public within the crate so integration
 /// tests can call it directly.
-pub fn prepare_trade_core(
+///
+/// `nonce_reader` and `mark_price_reader` are injected so:
+/// - production wires the RPC-backed implementations
+///   ([`RpcNonceReader`], [`RpcMarkPriceReader`]),
+/// - integration tests inject deterministic doubles,
+/// - failure in either reader FAILS CLOSED (no silent zero
+///   substitution).
+pub async fn prepare_trade_core<NR, MR>(
     state: &AppState,
     req: &PrepareTradeRequest,
+    nonce_reader: &NR,
+    mark_price_reader: &MR,
     now_ms_override: Option<TimestampMs>,
-) -> Result<PrepareOutcome> {
+) -> Result<PrepareOutcome>
+where
+    NR: NonceReader + ?Sized,
+    MR: MarkPriceReader + ?Sized,
+{
     // ---- Gate 1: closed-test only ----
     if !state.perps_closed_test_enabled {
         return Err(BackendError::PerpsNotLive);
@@ -202,33 +343,36 @@ pub fn prepare_trade_core(
             req.size_delta_1e8
         ))
     })?;
-    let execution_price_1e8: u128 = req.execution_price_1e8.parse().map_err(|_| {
-        BackendError::Config(format!(
-            "invalid executionPrice1e8 decimal string: {}",
-            req.execution_price_1e8
-        ))
-    })?;
     if size_delta_1e8 == 0 {
         return Err(BackendError::PerpZeroSize);
     }
+
+    // ---- Backend-owned execution price ----
+    //
+    // Read the authoritative live mark from the injected
+    // `mark_price_reader`. Production wires
+    // [`RpcMarkPriceReader`] which invokes
+    // `PerpEngine.getMarkPrice(marketId)` (the same value the receipt
+    // identity verifier uses at settlement time). Any RPC failure or
+    // zero return FAILS CLOSED with
+    // `PerpsProtocolReferencePriceUnavailable`.
+    let execution_price_1e8 = mark_price_reader.read_mark_price(market_id).await?;
     if execution_price_1e8 == 0 {
         return Err(BackendError::PerpsProtocolReferencePriceUnavailable(
-            "executionPrice1e8 must be > 0".to_string(),
+            "mark price 0 — refuse to freeze zero execution price".to_string(),
         ));
     }
-    // ---- Explicit nonce policy ----
-    let buyer_nonce: u128 = req.buyer_nonce.parse().map_err(|_| {
-        BackendError::Config(format!(
-            "invalid buyerNonce decimal string: {}",
-            req.buyer_nonce
-        ))
-    })?;
-    let seller_nonce: u128 = req.seller_nonce.parse().map_err(|_| {
-        BackendError::Config(format!(
-            "invalid sellerNonce decimal string: {}",
-            req.seller_nonce
-        ))
-    })?;
+
+    // ---- Backend-owned PME nonces ----
+    //
+    // Read the authoritative nonces from
+    // `PerpMatchingEngine.nonces(buyer)` and
+    // `PerpMatchingEngine.nonces(seller)` via the injected reader.
+    // Any RPC failure FAILS CLOSED — no silent 0 substitution. This
+    // is the property the reopened milestone required (previous
+    // draft accepted client-supplied nonces).
+    let buyer_nonce = nonce_reader.read_pme_nonce(&buyer).await?;
+    let seller_nonce = nonce_reader.read_pme_nonce(&seller).await?;
 
     // ---- Freeze identity + timestamps ----
     //
@@ -1137,6 +1281,316 @@ mod tests {
         let err = intent_to_v1_payload(&intent).unwrap_err();
         assert!(
             matches!(err, BackendError::MissingExecutionMetadata(f) if f.contains("buyer_nonce"))
+        );
+    }
+
+    // ================================================================
+    // FINALIZATION — reader-injected prepare_trade_core tests
+    // ================================================================
+    use std::sync::Mutex;
+
+    struct StaticNonceReader {
+        buyer_addr: String,
+        buyer: u128,
+        seller_addr: String,
+        seller: u128,
+        fail: bool,
+    }
+    impl NonceReader for StaticNonceReader {
+        fn read_pme_nonce<'a>(&'a self, trader: &'a AccountId) -> ReaderFuture<'a, u128> {
+            let addr = trader.0.to_ascii_lowercase();
+            let buyer_addr = self.buyer_addr.clone();
+            let seller_addr = self.seller_addr.clone();
+            let (buyer_n, seller_n) = (self.buyer, self.seller);
+            let fail = self.fail;
+            Box::pin(async move {
+                if fail {
+                    return Err(BackendError::Config("mock RPC failure (nonce)".to_string()));
+                }
+                if addr == buyer_addr {
+                    Ok(buyer_n)
+                } else if addr == seller_addr {
+                    Ok(seller_n)
+                } else {
+                    Err(BackendError::Config(format!("unexpected trader {addr}")))
+                }
+            })
+        }
+    }
+
+    struct StaticMarkPriceReader {
+        price: u128,
+        fail: bool,
+    }
+    impl MarkPriceReader for StaticMarkPriceReader {
+        fn read_mark_price<'a>(&'a self, _market_id: u128) -> ReaderFuture<'a, u128> {
+            let price = self.price;
+            let fail = self.fail;
+            Box::pin(async move {
+                if fail {
+                    return Err(BackendError::PerpsProtocolReferencePriceUnavailable(
+                        "mock RPC failure (mark price)".to_string(),
+                    ));
+                }
+                Ok(price)
+            })
+        }
+    }
+
+    fn app_state_closed_test_allowed() -> AppState {
+        let mut state =
+            crate::api::http::AppState::new(crate::engine::EngineState::with_default_markets());
+        state.perps_closed_test_enabled = true;
+        state.perps_public_trading_enabled = false;
+        state.perps_closed_test_allowlist = vec![
+            AccountId::new(BUYER_ADDR.to_string()),
+            AccountId::new(SELLER_ADDR.to_string()),
+        ];
+        state.perps_read_config.chain_id = CHAIN_ID;
+        state.execution_config.perp_matching_engine_address = AccountId::new(PME.to_string());
+        state.execution_config.perp_engine_address =
+            AccountId::new("0xc6c592100723fe0c66343a16e95ec34cc0c2141c".to_string());
+        state
+    }
+
+    fn mk_request() -> PrepareTradeRequest {
+        PrepareTradeRequest {
+            buyer: BUYER_ADDR.to_string(),
+            seller: SELLER_ADDR.to_string(),
+            market_id: "1".to_string(),
+            size_delta_1e8: "1000000".to_string(),
+            buyer_is_maker: false,
+        }
+    }
+
+    // (F1) Backend-owned nonces + price: injected 7/12/240e11.
+    #[tokio::test]
+    async fn f1_backend_owned_nonces_and_price_flow_through_pipeline() {
+        let state = app_state_closed_test_allowed();
+        let req = mk_request();
+        let nonce_reader = StaticNonceReader {
+            buyer_addr: BUYER_ADDR.to_string(),
+            buyer: 7,
+            seller_addr: SELLER_ADDR.to_string(),
+            seller: 12,
+            fail: false,
+        };
+        let mark_reader = StaticMarkPriceReader {
+            price: 240_000_000_000,
+            fail: false,
+        };
+        let outcome = prepare_trade_core(
+            &state,
+            &req,
+            &nonce_reader,
+            &mark_reader,
+            Some(1_700_000_000_000),
+        )
+        .await
+        .expect("prepare must succeed with valid readers");
+        assert_eq!(outcome.payload.buyer_nonce, 7);
+        assert_eq!(outcome.payload.seller_nonce, 12);
+        assert_eq!(outcome.payload.execution_price_1e8, 240_000_000_000);
+        // Deadline = now_sec + 3600 (Unix seconds).
+        assert_eq!(outcome.payload.deadline, 1_700_000_000 + 3_600);
+        // Persistence shadow ms = seconds × 1000.
+        assert_eq!(
+            outcome.execution_intent.deadline_ms.unwrap(),
+            (1_700_000_000 + 3_600) * 1_000
+        );
+        // Status is Pending — unsigned prepared intent cannot broadcast.
+        assert_eq!(
+            outcome.execution_intent.status,
+            crate::execution::ExecutionIntentStatus::Pending
+        );
+    }
+
+    // (F2) Nonce RPC failure → FAIL CLOSED.
+    #[tokio::test]
+    async fn f2_nonce_rpc_failure_fails_closed() {
+        let state = app_state_closed_test_allowed();
+        let req = mk_request();
+        let nonce_reader = StaticNonceReader {
+            buyer_addr: BUYER_ADDR.to_string(),
+            buyer: 0,
+            seller_addr: SELLER_ADDR.to_string(),
+            seller: 0,
+            fail: true,
+        };
+        let mark_reader = StaticMarkPriceReader {
+            price: 240_000_000_000,
+            fail: false,
+        };
+        let err = prepare_trade_core(&state, &req, &nonce_reader, &mark_reader, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BackendError::Config(msg) if msg.contains("nonce")));
+    }
+
+    // (F3) Mark-price RPC failure → FAIL CLOSED.
+    #[tokio::test]
+    async fn f3_mark_price_rpc_failure_fails_closed() {
+        let state = app_state_closed_test_allowed();
+        let req = mk_request();
+        let nonce_reader = StaticNonceReader {
+            buyer_addr: BUYER_ADDR.to_string(),
+            buyer: 0,
+            seller_addr: SELLER_ADDR.to_string(),
+            seller: 0,
+            fail: false,
+        };
+        let mark_reader = StaticMarkPriceReader {
+            price: 0,
+            fail: true,
+        };
+        let err = prepare_trade_core(&state, &req, &nonce_reader, &mark_reader, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            BackendError::PerpsProtocolReferencePriceUnavailable(_)
+        ));
+    }
+
+    // (F4) Closed-test disabled → PerpsNotLive.
+    #[tokio::test]
+    async fn f4_closed_test_disabled_rejects() {
+        let mut state = app_state_closed_test_allowed();
+        state.perps_closed_test_enabled = false;
+        let req = mk_request();
+        let nonce_reader = StaticNonceReader {
+            buyer_addr: BUYER_ADDR.to_string(),
+            buyer: 0,
+            seller_addr: SELLER_ADDR.to_string(),
+            seller: 0,
+            fail: false,
+        };
+        let mark_reader = StaticMarkPriceReader {
+            price: 240_000_000_000,
+            fail: false,
+        };
+        let err = prepare_trade_core(&state, &req, &nonce_reader, &mark_reader, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BackendError::PerpsNotLive));
+    }
+
+    // (F5) Non-allowlisted buyer → PerpsNotLive.
+    #[tokio::test]
+    async fn f5_non_allowlisted_buyer_rejects() {
+        let mut state = app_state_closed_test_allowed();
+        state.perps_closed_test_allowlist = vec![AccountId::new(SELLER_ADDR.to_string())];
+        let req = mk_request();
+        let nonce_reader = StaticNonceReader {
+            buyer_addr: BUYER_ADDR.to_string(),
+            buyer: 0,
+            seller_addr: SELLER_ADDR.to_string(),
+            seller: 0,
+            fail: false,
+        };
+        let mark_reader = StaticMarkPriceReader {
+            price: 240_000_000_000,
+            fail: false,
+        };
+        let err = prepare_trade_core(&state, &req, &nonce_reader, &mark_reader, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BackendError::PerpsNotLive));
+    }
+
+    // (F6) buyer == seller → rejected.
+    #[tokio::test]
+    async fn f6_buyer_equals_seller_rejects() {
+        let mut state = app_state_closed_test_allowed();
+        // allowlist contains buyer twice
+        state.perps_closed_test_allowlist = vec![AccountId::new(BUYER_ADDR.to_string())];
+        let mut req = mk_request();
+        req.seller = BUYER_ADDR.to_string();
+        let nonce_reader = StaticNonceReader {
+            buyer_addr: BUYER_ADDR.to_string(),
+            buyer: 0,
+            seller_addr: BUYER_ADDR.to_string(),
+            seller: 0,
+            fail: false,
+        };
+        let mark_reader = StaticMarkPriceReader {
+            price: 240_000_000_000,
+            fail: false,
+        };
+        let err = prepare_trade_core(&state, &req, &nonce_reader, &mark_reader, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            BackendError::PerpsIntentSideBoundInconsistent(msg) if msg.contains("buyer == seller")
+        ));
+    }
+
+    // (F7) End-to-end: prepare → cosign → both sigs recover.
+    #[tokio::test]
+    async fn f7_prepare_and_cosign_end_to_end_with_readers() {
+        let state = app_state_closed_test_allowed();
+        let req = mk_request();
+        let nonce_reader = StaticNonceReader {
+            buyer_addr: BUYER_ADDR.to_string(),
+            buyer: 7,
+            seller_addr: SELLER_ADDR.to_string(),
+            seller: 12,
+            fail: false,
+        };
+        let mark_reader = StaticMarkPriceReader {
+            price: 240_000_000_000,
+            fail: false,
+        };
+        let outcome = prepare_trade_core(
+            &state,
+            &req,
+            &nonce_reader,
+            &mark_reader,
+            Some(1_700_000_000_000),
+        )
+        .await
+        .unwrap();
+        let digest = perp_trade_v1_digest_bytes(&outcome.payload, &outcome.domain).unwrap();
+        let buyer_sig = sign_v1_with(BUYER_KEY, &digest);
+        let seller_sig = sign_v1_with(SELLER_KEY, &digest);
+        let cosign_req = CosignTradeRequest {
+            buyer_signature: buyer_sig,
+            seller_signature: seller_sig,
+        };
+        let verified = cosign_load_and_verify(
+            &outcome.execution_intent,
+            &outcome.domain,
+            &cosign_req,
+            None,
+            /*now_sec*/ 1_700_000_100,
+        )
+        .unwrap();
+        assert_eq!(verified.buyer_signer.0.to_lowercase(), BUYER_ADDR);
+        assert_eq!(verified.seller_signer.0.to_lowercase(), SELLER_ADDR);
+    }
+
+    // (F8) Byte-decode of uint256 low-128 helper.
+    #[test]
+    fn f8_decode_uint256_low128() {
+        // Value 42 encoded as 32-byte BE.
+        let mut bytes = [0u8; 32];
+        bytes[31] = 42;
+        let val = super::decode_uint256_low128(&bytes, "x").unwrap();
+        assert_eq!(val, 42);
+        // Upper 128 bits nonzero → overflow error.
+        bytes[0] = 1;
+        let err = super::decode_uint256_low128(&bytes, "x").unwrap_err();
+        assert!(matches!(err, BackendError::Config(msg) if msg.contains("overflows")));
+    }
+
+    // (F9) Selector regression check.
+    #[test]
+    fn f9_reader_selectors_match_deployed() {
+        assert_eq!(PME_NONCES_SELECTOR, [0x7e, 0xce, 0xbe, 0x00]);
+        assert_eq!(
+            PERP_ENGINE_GET_MARK_PRICE_SELECTOR,
+            [0x5a, 0xf3, 0xd0, 0x61]
         );
     }
 }

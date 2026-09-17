@@ -15671,7 +15671,35 @@ async fn perps_closed_test_prepare_trade(
     State(state): State<AppState>,
     Json(req): Json<crate::api::perps_cosign::PrepareTradeRequest>,
 ) -> Result<Json<crate::api::perps_cosign::PrepareTradeResponse>, ApiError> {
-    let outcome = crate::api::perps_cosign::prepare_trade_core(&state, &req, None)?;
+    // FINAL: backend owns nonces + execution price. Construct the
+    // RPC-backed readers from AppState. Absent RPC config → fail closed.
+    let rpc_url = state
+        .execution_config
+        .rpc_url
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| {
+            ApiError::from(BackendError::Config(
+                "closed-test cosign requires RPC_URL configured (backend must read PME.nonces + getMarkPrice)".to_string(),
+            ))
+        })?;
+    let rpc = crate::execution::rpc::HttpJsonRpcProvider::new(rpc_url);
+    let nonce_reader = crate::api::perps_cosign::RpcNonceReader::new(
+        rpc.clone(),
+        state.execution_config.perp_matching_engine_address.clone(),
+    );
+    let mark_price_reader = crate::api::perps_cosign::RpcMarkPriceReader::new(
+        rpc,
+        state.execution_config.perp_engine_address.clone(),
+    );
+    let outcome = crate::api::perps_cosign::prepare_trade_core(
+        &state,
+        &req,
+        &nonce_reader,
+        &mark_price_reader,
+        None,
+    )
+    .await?;
     // Persistence: write the ExecutionIntent row so the cosign path
     // can reload it by UUID. When repository is None (in-memory
     // fallback), the closed-test flow is unsupported — fail closed.
