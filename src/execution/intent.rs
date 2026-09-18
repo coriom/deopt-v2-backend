@@ -24,6 +24,35 @@ pub enum ExecutionIntentStatus {
     Submitted,
     Confirmed,
     Failed,
+    /// PERPS_CLOSE_PNL_BUG_RETIRED_AND_V2_ACCOUNTING_DESIGN — operator-
+    /// authored administrative retirement of an intent that must never
+    /// be signed / cosigned / simulated / armed / broadcast. Terminal.
+    /// The row remains for audit; the executor's broadcastable filter
+    /// (`WHERE status IN ('pending','calldata_ready','simulation_ok')`)
+    /// naturally excludes it. Distinct from `Failed` (post-broadcast
+    /// on-chain revert) and `SimulationFailed` (simulate-time revert):
+    /// `Abandoned` denotes an intent that was withdrawn BEFORE the
+    /// runtime touched it.
+    Abandoned,
+}
+
+impl ExecutionIntentStatus {
+    /// Whether the intent may still transition into an executable
+    /// lifecycle state. `Abandoned`, `Confirmed`, and `Failed` are
+    /// terminal for the executor; `Prepared` and `Submitted` are
+    /// in-flight and MUST NOT be overwritten by an administrative
+    /// retire (the reconciler is authoritative). Only administratively-
+    /// retire-safe states return `true`.
+    pub fn is_retire_eligible(self) -> bool {
+        matches!(
+            self,
+            ExecutionIntentStatus::Pending
+                | ExecutionIntentStatus::DryRun
+                | ExecutionIntentStatus::CalldataReady
+                | ExecutionIntentStatus::SimulationOk
+                | ExecutionIntentStatus::SimulationFailed
+        )
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -199,6 +228,46 @@ mod tests {
         let d_runtime = perp_trade_v1_digest_bytes(&runtime_payload, &domain).unwrap();
         let d_cosign = perp_trade_v1_digest_bytes(&cosign_payload, &domain).unwrap();
         assert_eq!(d_runtime, d_cosign);
+    }
+
+    // PERPS_CLOSE_PNL_BUG_RETIRED_AND_V2_ACCOUNTING_DESIGN
+    #[test]
+    fn abandoned_is_terminal_and_not_retire_eligible() {
+        // The `Abandoned` variant itself is a terminal state; a second
+        // retire attempt must be refused (idempotency handled at the
+        // repository transaction boundary; here we only care about the
+        // enum-level property that `Abandoned.is_retire_eligible()` is
+        // false).
+        assert!(!ExecutionIntentStatus::Abandoned.is_retire_eligible());
+    }
+
+    #[test]
+    fn retire_eligible_covers_administratively_safe_states_only() {
+        // Administratively safe: nothing broadcast yet.
+        assert!(ExecutionIntentStatus::Pending.is_retire_eligible());
+        assert!(ExecutionIntentStatus::DryRun.is_retire_eligible());
+        assert!(ExecutionIntentStatus::CalldataReady.is_retire_eligible());
+        assert!(ExecutionIntentStatus::SimulationOk.is_retire_eligible());
+        assert!(ExecutionIntentStatus::SimulationFailed.is_retire_eligible());
+        // Post-broadcast or terminal: MUST NOT be overwritten.
+        // Prepared / Submitted are in-flight — the reconciler owns them.
+        assert!(!ExecutionIntentStatus::Prepared.is_retire_eligible());
+        assert!(!ExecutionIntentStatus::Submitted.is_retire_eligible());
+        assert!(!ExecutionIntentStatus::Confirmed.is_retire_eligible());
+        assert!(!ExecutionIntentStatus::Failed.is_retire_eligible());
+        assert!(!ExecutionIntentStatus::Abandoned.is_retire_eligible());
+    }
+
+    #[test]
+    fn abandoned_status_roundtrips_through_string_form() {
+        // Repository writes go via db::models::execution_status_to_str;
+        // reads go via execution_status_from_str_public. Both must know
+        // about `Abandoned` or a persisted retired intent cannot be
+        // deserialized by the reconciler / audit paths.
+        let s = crate::db::models::execution_status_to_str(ExecutionIntentStatus::Abandoned);
+        assert_eq!(s, "abandoned");
+        let back = crate::db::models::execution_status_from_str_public("abandoned").unwrap();
+        assert_eq!(back, ExecutionIntentStatus::Abandoned);
     }
 
     #[test]

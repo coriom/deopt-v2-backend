@@ -2192,6 +2192,7 @@ fn execution_status_key(status: ExecutionIntentStatus) -> &'static str {
         ExecutionIntentStatus::Submitted => "submitted",
         ExecutionIntentStatus::Confirmed => "confirmed",
         ExecutionIntentStatus::Failed => "failed",
+        ExecutionIntentStatus::Abandoned => "abandoned",
     }
 }
 

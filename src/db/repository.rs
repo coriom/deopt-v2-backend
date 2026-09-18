@@ -1,6 +1,7 @@
 use super::models::{
-    execution_status_to_str, order_status_to_str, timestamp_to_i64, u32_to_i32, u64_to_i64,
-    DbExecutionIntent, DbExecutionSimulation, DbOrder, DbTrade,
+    execution_status_from_str_public, execution_status_to_str, order_status_to_str,
+    timestamp_to_i64, u32_to_i32, u64_to_i64, DbExecutionIntent, DbExecutionSimulation, DbOrder,
+    DbTrade,
 };
 use super::pool;
 use crate::confirmation::{ConfirmationDecision, ConfirmationStatus};
@@ -1382,6 +1383,69 @@ impl PgRepository {
         .await
         .map_err(|error| BackendError::Persistence(error.to_string()))?;
         Ok(())
+    }
+
+    /// PERPS_CLOSE_PNL_BUG_RETIRED_AND_V2_ACCOUNTING_DESIGN — atomic
+    /// administrative retire of an execution intent that must never
+    /// broadcast (e.g. a design defect made the trade unsafe to
+    /// execute). Enforces terminal-status guards inside a single
+    /// transaction, then transitions to `Abandoned`.
+    ///
+    /// Retire is refused if the current status is `Prepared` or
+    /// `Submitted` (a durable raw envelope may still land on-chain;
+    /// the reconciler is authoritative there), `Confirmed` (already
+    /// settled on-chain), `Failed` (already terminal), or `Abandoned`
+    /// (idempotent no-op is a legitimate ask but the caller MUST see
+    /// it, so we error). The `Abandoned` row is preserved for audit.
+    pub async fn retire_execution_intent(
+        &self,
+        intent_id: Uuid,
+        updated_at_ms: TimestampMs,
+    ) -> Result<ExecutionIntentStatus> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|error| BackendError::Persistence(error.to_string()))?;
+
+        let row = sqlx::query("SELECT status FROM execution_intents WHERE intent_id = $1 FOR UPDATE")
+            .bind(intent_id.to_string())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|error| BackendError::Persistence(error.to_string()))?;
+
+        let Some(row) = row else {
+            return Err(BackendError::Persistence(format!(
+                "execution_intents row not found: intent_id={intent_id}"
+            )));
+        };
+        let current_status_str: String = row_get(&row, "status")?;
+        let current = execution_status_from_str_public(&current_status_str)?;
+
+        if !current.is_retire_eligible() {
+            return Err(BackendError::Persistence(format!(
+                "retire refused: intent {intent_id} is in status {current_status_str} \
+                 (must be pending / dry_run / calldata_ready / simulation_ok / simulation_failed)"
+            )));
+        }
+
+        sqlx::query(
+            "UPDATE execution_intents
+             SET status = $2, updated_at_ms = $3
+             WHERE intent_id = $1",
+        )
+        .bind(intent_id.to_string())
+        .bind(execution_status_to_str(ExecutionIntentStatus::Abandoned))
+        .bind(timestamp_to_i64(updated_at_ms))
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+
+        tx.commit()
+            .await
+            .map_err(|error| BackendError::Persistence(error.to_string()))?;
+
+        Ok(current)
     }
 
     /// PERPS_BASE_SEPOLIA_BACKEND_BROADCAST_DURABILITY_PG_V1 —

@@ -261,6 +261,7 @@ pub fn execution_status_to_str(status: ExecutionIntentStatus) -> &'static str {
         ExecutionIntentStatus::Submitted => "submitted",
         ExecutionIntentStatus::Confirmed => "confirmed",
         ExecutionIntentStatus::Failed => "failed",
+        ExecutionIntentStatus::Abandoned => "abandoned",
     }
 }
 
@@ -279,6 +280,7 @@ fn execution_status_from_str(value: &str) -> Result<ExecutionIntentStatus> {
         "submitted" => Ok(ExecutionIntentStatus::Submitted),
         "confirmed" => Ok(ExecutionIntentStatus::Confirmed),
         "failed" => Ok(ExecutionIntentStatus::Failed),
+        "abandoned" => Ok(ExecutionIntentStatus::Abandoned),
         other => Err(BackendError::Persistence(format!(
             "invalid execution intent status: {other}"
         ))),

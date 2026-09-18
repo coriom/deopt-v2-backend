@@ -1292,6 +1292,7 @@ fn execution_status_key(status: crate::execution::ExecutionIntentStatus) -> &'st
         crate::execution::ExecutionIntentStatus::Submitted => "submitted",
         crate::execution::ExecutionIntentStatus::Confirmed => "confirmed",
         crate::execution::ExecutionIntentStatus::Failed => "failed",
+        crate::execution::ExecutionIntentStatus::Abandoned => "abandoned",
     }
 }
 
