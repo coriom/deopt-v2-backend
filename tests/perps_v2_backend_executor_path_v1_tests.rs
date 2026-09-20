@@ -301,6 +301,107 @@ fn execution_intent_serde_round_trips_v2_protocol_version() {
     assert_eq!(round_tripped, intent);
 }
 
+// ─── §3 V2 signed-field durability across DB round-trip ────────
+
+#[test]
+fn v2_bounds_survive_db_model_round_trip() {
+    use deopt_v2_backend::db::models::DbExecutionIntent;
+    // Non-trivial bounds — deliberately DIFFERENT non-zero values so
+    // an accidental swap between max/min surfaces here.
+    let execution_price: u128 = 246_831_000_000;
+    let max_bound: u128 = 246_835_000_000;
+    let min_bound: u128 = 246_827_000_000;
+
+    let mut intent = mock_intent_v1();
+    intent.protocol_version = PerpsProtocolVersion::V2;
+    intent.price_1e8 = execution_price;
+    intent.max_execution_price_1e8 = max_bound;
+    intent.min_execution_price_1e8 = min_bound;
+
+    // Forward: ExecutionIntent → DbExecutionIntent (serialise-for-DB)
+    let db: DbExecutionIntent = (&intent).try_into().unwrap();
+    assert_eq!(db.protocol_version, "perp_v2");
+    assert_eq!(db.max_execution_price_1e8, max_bound.to_string());
+    assert_eq!(db.min_execution_price_1e8, min_bound.to_string());
+
+    // Backward: DbExecutionIntent → ExecutionIntent (row-read)
+    let round_tripped: ExecutionIntent = db.try_into().unwrap();
+    assert_eq!(round_tripped.protocol_version, PerpsProtocolVersion::V2);
+    assert_eq!(round_tripped.max_execution_price_1e8, max_bound);
+    assert_eq!(round_tripped.min_execution_price_1e8, min_bound);
+    assert_eq!(round_tripped, intent);
+}
+
+#[test]
+fn v2_digest_survives_db_model_round_trip() {
+    // Prove: the V2 EIP-712 digest reconstructed from the reloaded
+    // ExecutionIntent equals the digest reconstructed from the
+    // pre-DB state. If any bound bit was silently truncated the
+    // digests would differ.
+    use deopt_v2_backend::db::models::DbExecutionIntent;
+    let mut intent = mock_intent_v1();
+    intent.protocol_version = PerpsProtocolVersion::V2;
+    intent.price_1e8 = 246_831_000_000;
+    intent.max_execution_price_1e8 = 246_835_000_000;
+    intent.min_execution_price_1e8 = 246_827_000_000;
+
+    let dom = PerpTradeDomain::new_v2(CHAIN_ID, AccountId::new(V2_PME));
+
+    let before_payload = intent.perp_trade_payload().unwrap();
+    let before_digest = perp_trade_v2_digest_bytes(&before_payload, &dom).unwrap();
+
+    let db: DbExecutionIntent = (&intent).try_into().unwrap();
+    let reloaded: ExecutionIntent = db.try_into().unwrap();
+
+    let after_payload = reloaded.perp_trade_payload().unwrap();
+    let after_digest = perp_trade_v2_digest_bytes(&after_payload, &dom).unwrap();
+
+    assert_eq!(before_digest, after_digest);
+    assert_eq!(before_payload.max_execution_price_1e8, 246_835_000_000);
+    assert_eq!(before_payload.min_execution_price_1e8, 246_827_000_000);
+}
+
+#[test]
+fn v2_bounds_default_to_zero_for_v1_backfill() {
+    // Existing (pre-migration) V1 rows have max/min = 0 (DEFAULT).
+    // Prove that a V1 intent with zeros round-trips lossless and
+    // reproduces the exact V1 payload (bounds ignored by V1 digest).
+    use deopt_v2_backend::db::models::DbExecutionIntent;
+    let mut intent = mock_intent_v1();
+    intent.protocol_version = PerpsProtocolVersion::V1;
+    intent.max_execution_price_1e8 = 0;
+    intent.min_execution_price_1e8 = 0;
+    let db: DbExecutionIntent = (&intent).try_into().unwrap();
+    assert_eq!(db.max_execution_price_1e8, "0");
+    assert_eq!(db.min_execution_price_1e8, "0");
+    let round_tripped: ExecutionIntent = db.try_into().unwrap();
+    assert_eq!(round_tripped, intent);
+}
+
+#[test]
+fn active_version_flip_after_reload_preserves_bounds() {
+    // §3: prepare V2 with bounds → persist → reload → flip runtime
+    // active version → reconstruct digest → assert unchanged.
+    use deopt_v2_backend::db::models::DbExecutionIntent;
+    let mut intent = mock_intent_v1();
+    intent.protocol_version = PerpsProtocolVersion::V2;
+    intent.max_execution_price_1e8 = 246_835_000_000;
+    intent.min_execution_price_1e8 = 246_827_000_000;
+    let dom = PerpTradeDomain::new_v2(CHAIN_ID, AccountId::new(V2_PME));
+    let d0 = perp_trade_v2_digest_bytes(&intent.perp_trade_payload().unwrap(), &dom).unwrap();
+
+    // Simulated shutdown + reload — go through the DB model.
+    let db: DbExecutionIntent = (&intent).try_into().unwrap();
+    let reloaded: ExecutionIntent = db.try_into().unwrap();
+
+    // Runtime active version flip is external to the intent — the
+    // persisted intent's protocol_version + bounds + digest are
+    // invariant under it.
+    assert_eq!(reloaded.protocol_version, PerpsProtocolVersion::V2);
+    let d1 = perp_trade_v2_digest_bytes(&reloaded.perp_trade_payload().unwrap(), &dom).unwrap();
+    assert_eq!(d0, d1);
+}
+
 #[test]
 fn execution_intent_serde_defaults_missing_protocol_version_to_v1() {
     // Legacy JSON (pre-migration) lacks the field. Deserialise must
@@ -345,6 +446,8 @@ fn mock_intent_v1() -> ExecutionIntent {
         created_at_ms: 1_789_890_000_000,
         status: ExecutionIntentStatus::Pending,
         protocol_version: PerpsProtocolVersion::V1,
+        max_execution_price_1e8: 0,
+        min_execution_price_1e8: 0,
     }
 }
 

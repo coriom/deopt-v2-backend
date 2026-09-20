@@ -523,6 +523,15 @@ where
         // EIP-712 domain + typehash + verifying contract the trader
         // signed. A subsequent runtime flip MUST NOT retarget it.
         protocol_version: state.execution_config.perps_active_engine_version,
+        // PERPS_V2_BACKEND_RPC_SIMULATION_INTEGRATION_V1 — persist
+        // the V2 signed price bounds. The payload built above at
+        // `PerpTradePayload::new(...)` carries these; we mirror the
+        // exact values onto the intent row so cosign reload and the
+        // runtime tx builder byte-reproduce the same signed shape
+        // from persisted state alone. Zero for V1 intents (payload
+        // bounds are zero for V1 → strict-price semantics).
+        max_execution_price_1e8: payload.max_execution_price_1e8,
+        min_execution_price_1e8: payload.min_execution_price_1e8,
     };
 
     Ok(PrepareOutcome {
@@ -1193,6 +1202,8 @@ mod tests {
             created_at_ms: 1_700_000_000_000,
             status: crate::execution::ExecutionIntentStatus::Pending,
             protocol_version: crate::execution::perp_trade::PerpsProtocolVersion::V1,
+            max_execution_price_1e8: 0,
+            min_execution_price_1e8: 0,
         }
     }
 

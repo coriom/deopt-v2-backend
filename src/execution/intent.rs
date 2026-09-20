@@ -84,6 +84,22 @@ pub struct ExecutionIntent {
     /// active-version MUST NOT retarget an already-signed intent.
     #[serde(default)]
     pub protocol_version: PerpsProtocolVersion,
+    /// PERPS_V2_BACKEND_RPC_SIMULATION_INTEGRATION_V1 — V2
+    /// trader-signed upper price bound (1e8 scale). `0` reproduces
+    /// V1 strict-price semantics (no upper bound). Persisted in
+    /// `execution_intents.max_execution_price_1e8` (migration
+    /// `0065_execution_intents_v2_price_bounds.sql`). Participates
+    /// in the V2 EIP-712 digest via
+    /// [`PerpTradePayload::max_execution_price_1e8`]; any loss
+    /// between prepare and cosign produces an on-chain signature
+    /// verification failure. Immutable post-cosign.
+    #[serde(default)]
+    pub max_execution_price_1e8: u128,
+    /// PERPS_V2_BACKEND_RPC_SIMULATION_INTEGRATION_V1 — V2
+    /// trader-signed lower price bound (1e8 scale). See
+    /// [`max_execution_price_1e8`] for lifecycle notes.
+    #[serde(default)]
+    pub min_execution_price_1e8: u128,
 }
 
 impl ExecutionIntent {
@@ -139,10 +155,12 @@ impl ExecutionIntent {
             .map_err(|_| BackendError::MissingExecutionMetadata("deadline".to_string()))?;
         let deadline_sec = deadline_ms_u128 / 1_000;
 
-        // PERPS-PRICING-AND-EXECUTION-SAFETY-CORE-V1 — legacy intent shape has no
-        // user bounds. Pass `0, 0` (strict): validate_shape() reproduces V1 exact-
-        // price behaviour when both bounds are zero. Once the higher intent model
-        // carries user-signed bounds, thread them through instead of hard-coding 0.
+        // PERPS_V2_BACKEND_RPC_SIMULATION_INTEGRATION_V1 — thread the
+        // persisted V2 bounds through. V1 intents persist `0, 0` (via
+        // the DEFAULT in migration 0065) which reproduces the legacy
+        // strict-price behaviour byte-for-byte. V2 intents persist the
+        // trader-signed bounds so the reconstructed payload byte-matches
+        // what the trader hashed.
         PerpTradePayload::new(
             intent_id_to_b256(&self.intent_id.to_string())?,
             self.buyer.clone(),
@@ -150,8 +168,8 @@ impl ExecutionIntent {
             u128::from(self.market_id),
             self.size_1e8,
             self.price_1e8,
-            0,
-            0,
+            self.max_execution_price_1e8,
+            self.min_execution_price_1e8,
             buyer_is_maker,
             u128::from(buyer_nonce),
             u128::from(seller_nonce),
@@ -182,6 +200,8 @@ mod tests {
             created_at_ms: 1_789_000_000_000,
             status: ExecutionIntentStatus::CalldataReady,
             protocol_version: crate::execution::perp_trade::PerpsProtocolVersion::V1,
+            max_execution_price_1e8: 0,
+            min_execution_price_1e8: 0,
         }
     }
 

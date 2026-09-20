@@ -299,6 +299,13 @@ pub async fn accept_quote(
         // creates a new execution intent at the runtime active
         // version. Post-persistence this field is immutable.
         protocol_version: state.execution_config.perps_active_engine_version,
+        // PERPS_V2_BACKEND_RPC_SIMULATION_INTEGRATION_V1 — RFQ
+        // acceptance does not carry V2 price bounds yet; zero
+        // reproduces V1 strict-price semantics. Threading
+        // trader-signed bounds through the RFQ pipeline is a
+        // follow-up milestone.
+        max_execution_price_1e8: 0,
+        min_execution_price_1e8: 0,
     };
     let onchain_intent_id = intent_id_to_hex_bytes32(&intent.intent_id.to_string())?;
 

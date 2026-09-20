@@ -140,6 +140,8 @@ mod tests {
             created_at_ms: 123,
             status: ExecutionIntentStatus::Pending,
             protocol_version: crate::execution::perp_trade::PerpsProtocolVersion::V1,
+            max_execution_price_1e8: 0,
+            min_execution_price_1e8: 0,
         };
 
         let call = preview_perp_execution_call_from_intent(&intent, &target()).unwrap();
@@ -232,6 +234,8 @@ mod tests {
             created_at_ms: 123,
             status: ExecutionIntentStatus::Pending,
             protocol_version: crate::execution::perp_trade::PerpsProtocolVersion::V1,
+            max_execution_price_1e8: 0,
+            min_execution_price_1e8: 0,
         }
     }
 

@@ -118,6 +118,15 @@ pub struct DbExecutionIntent {
     /// rows back-fill to `perp_v1`. See migration
     /// `0064_execution_intents_protocol_version.sql`.
     pub protocol_version: String,
+    /// PERPS_V2_BACKEND_RPC_SIMULATION_INTEGRATION_V1 —
+    /// V2 trader-signed upper price bound. Stored as TEXT (matches
+    /// `price_1e8`/`size_1e8` convention for u128-wide unsigned
+    /// integers). Default `'0'` for V1 intents. See migration
+    /// `0065_execution_intents_v2_price_bounds.sql`.
+    pub max_execution_price_1e8: String,
+    /// PERPS_V2_BACKEND_RPC_SIMULATION_INTEGRATION_V1 —
+    /// V2 trader-signed lower price bound.
+    pub min_execution_price_1e8: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -187,6 +196,8 @@ impl TryFrom<&ExecutionIntent> for DbExecutionIntent {
             created_at_ms: intent.created_at_ms,
             updated_at_ms: intent.created_at_ms,
             protocol_version: intent.protocol_version.as_persisted_str().to_string(),
+            max_execution_price_1e8: intent.max_execution_price_1e8.to_string(),
+            min_execution_price_1e8: intent.min_execution_price_1e8.to_string(),
         })
     }
 }
@@ -225,6 +236,16 @@ impl TryFrom<DbExecutionIntent> for ExecutionIntent {
             created_at_ms: value.created_at_ms,
             status: execution_status_from_str(&value.status)?,
             protocol_version: PerpsProtocolVersion::parse(&value.protocol_version)?,
+            max_execution_price_1e8: value.max_execution_price_1e8.parse().map_err(|error| {
+                BackendError::Persistence(format!(
+                    "invalid max_execution_price_1e8: {error}"
+                ))
+            })?,
+            min_execution_price_1e8: value.min_execution_price_1e8.parse().map_err(|error| {
+                BackendError::Persistence(format!(
+                    "invalid min_execution_price_1e8: {error}"
+                ))
+            })?,
         })
     }
 }

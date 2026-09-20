@@ -209,5 +209,10 @@ fn intent_from_trade(trade: &TradeMatch) -> ExecutionIntent {
         // matching engine itself remains V1-bound until an explicit
         // V2 wiring milestone.
         protocol_version: crate::execution::perp_trade::PerpsProtocolVersion::V1,
+        // PERPS_V2_BACKEND_RPC_SIMULATION_INTEGRATION_V1 — engine
+        // matched trades are V1; strict-price bounds are the
+        // canonical V1 shape.
+        max_execution_price_1e8: 0,
+        min_execution_price_1e8: 0,
     }
 }

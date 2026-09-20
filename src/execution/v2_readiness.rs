@@ -55,10 +55,44 @@
 use crate::error::{BackendError, Result};
 use crate::execution::config::ExecutionConfig;
 use crate::execution::perp_trade::PerpsProtocolVersion;
+use crate::execution::rpc::{EthCallProvider, EthCallRequest};
+use crate::signing::eip712::parse_evm_address;
 use crate::types::AccountId;
+use alloy_sol_types::{sol, SolCall};
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::pin::Pin;
+
+// PERPS_V2_BACKEND_RPC_SIMULATION_INTEGRATION_V1 (§5) — canonical
+// ABI declarations for the V2 read surface. The `sol!` macro
+// computes each function's 4-byte selector at compile time from
+// its exact Solidity signature; a signature drift here produces a
+// selector mismatch on the deployed contract and the read reverts
+// with `execution reverted` at the JSON-RPC layer.
+//
+// Wrapped in a nested module so identifiers do not collide with the
+// V2 `executeTrade` codec in `abi.rs`.
+pub mod v2_abi {
+    use alloy_sol_types::sol;
+
+    sol! {
+        // PerpEngineV2 reads.
+        function migrationState() external view returns (uint8);
+        function migrationSnapshotHash() external view returns (bytes32);
+        function clearingAccount() external view returns (address);
+
+        // PerpMatchingEngineV2 reads.
+        function isExecutor(address) external view returns (bool);
+        function nonces(address) external view returns (uint256);
+        function perpEngine() external view returns (address);
+        function paused() external view returns (bool);
+
+        // CollateralVault reads. `balances` is a public mapping so
+        // Solidity auto-generates `balances(address user, address
+        // token) returns (uint256)`.
+        function balances(address, address) external view returns (uint256);
+    }
+}
 
 /// PERPS_V2_BACKEND_EXECUTOR_PATH_V1 — canonical mirror of
 /// `PerpEngineV2`'s `MigrationState` enum. Wire order matches
@@ -465,6 +499,303 @@ pub async fn v2_preflight_check(
 
     report.outcome = V2PreflightOutcome::Ready;
     report
+}
+
+// ────────────────────────────────────────────────────────────────
+// PERPS_V2_BACKEND_RPC_SIMULATION_INTEGRATION_V1 (§5)
+// Real live-chain RPC-backed implementations of the reader traits.
+// ────────────────────────────────────────────────────────────────
+
+fn decode_word32(bytes: &[u8], name: &str) -> Result<[u8; 32]> {
+    if bytes.len() != 32 {
+        return Err(BackendError::Config(format!(
+            "{name} return length {} != 32",
+            bytes.len()
+        )));
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(bytes);
+    Ok(out)
+}
+
+fn decode_address(bytes: &[u8], name: &str) -> Result<AccountId> {
+    let word = decode_word32(bytes, name)?;
+    // Solidity encodes address in a 32-byte word, right-padded — the
+    // 12 high bytes MUST be zero for a valid address encoding.
+    for byte in &word[..12] {
+        if *byte != 0 {
+            return Err(BackendError::Config(format!(
+                "{name} address-word upper 12 bytes non-zero"
+            )));
+        }
+    }
+    let mut out = String::from("0x");
+    for byte in &word[12..] {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    Ok(AccountId::new(out))
+}
+
+fn decode_bool(bytes: &[u8], name: &str) -> Result<bool> {
+    let word = decode_word32(bytes, name)?;
+    // Solidity `bool` encodes as a 32-byte word with value 0 or 1.
+    match word[31] {
+        0 => {
+            for byte in &word[..31] {
+                if *byte != 0 {
+                    return Err(BackendError::Config(format!(
+                        "{name} bool-word non-canonical (upper bytes non-zero)"
+                    )));
+                }
+            }
+            Ok(false)
+        }
+        1 => {
+            for byte in &word[..31] {
+                if *byte != 0 {
+                    return Err(BackendError::Config(format!(
+                        "{name} bool-word non-canonical (upper bytes non-zero)"
+                    )));
+                }
+            }
+            Ok(true)
+        }
+        other => Err(BackendError::Config(format!(
+            "{name} bool-word LSB = {other} (expected 0 or 1)"
+        ))),
+    }
+}
+
+fn decode_uint8(bytes: &[u8], name: &str) -> Result<u8> {
+    let word = decode_word32(bytes, name)?;
+    for byte in &word[..31] {
+        if *byte != 0 {
+            return Err(BackendError::Config(format!(
+                "{name} uint8-word overflows (upper bytes non-zero)"
+            )));
+        }
+    }
+    Ok(word[31])
+}
+
+fn encode_address_arg(address: &[u8; 20]) -> [u8; 32] {
+    let mut word = [0u8; 32];
+    word[12..].copy_from_slice(address);
+    word
+}
+
+/// PERPS_V2_BACKEND_RPC_SIMULATION_INTEGRATION_V1 — live-chain
+/// [`V2EngineReader`] backed by any [`EthCallProvider`]. Selectors
+/// are compiled from the exact Solidity signatures via `sol!`, so
+/// any Solidity drift produces a compile-time change to the
+/// selector constant.
+pub struct RpcV2EngineReader<R> {
+    pub rpc: R,
+    pub engine: AccountId,
+}
+
+impl<R> RpcV2EngineReader<R> {
+    pub fn new(rpc: R, engine: AccountId) -> Self {
+        Self { rpc, engine }
+    }
+}
+
+impl<R> V2EngineReader for RpcV2EngineReader<R>
+where
+    R: EthCallProvider + Send + Sync + 'static,
+{
+    fn read_migration_state<'a>(&'a self) -> ReaderFuture<'a, MigrationState> {
+        Box::pin(async move {
+            let data = v2_abi::migrationStateCall::SELECTOR.to_vec();
+            let out = self
+                .rpc
+                .eth_call(EthCallRequest {
+                    from: self.engine.clone(),
+                    to: self.engine.clone(),
+                    data,
+                    value: 0,
+                    gas_limit: None,
+                })
+                .await?;
+            let byte = decode_uint8(&out.output, "migrationState")?;
+            MigrationState::parse_u8(byte)
+        })
+    }
+
+    fn read_migration_snapshot_hash<'a>(&'a self) -> ReaderFuture<'a, [u8; 32]> {
+        Box::pin(async move {
+            let data = v2_abi::migrationSnapshotHashCall::SELECTOR.to_vec();
+            let out = self
+                .rpc
+                .eth_call(EthCallRequest {
+                    from: self.engine.clone(),
+                    to: self.engine.clone(),
+                    data,
+                    value: 0,
+                    gas_limit: None,
+                })
+                .await?;
+            decode_word32(&out.output, "migrationSnapshotHash")
+        })
+    }
+
+    fn read_clearing_account<'a>(&'a self) -> ReaderFuture<'a, AccountId> {
+        Box::pin(async move {
+            let data = v2_abi::clearingAccountCall::SELECTOR.to_vec();
+            let out = self
+                .rpc
+                .eth_call(EthCallRequest {
+                    from: self.engine.clone(),
+                    to: self.engine.clone(),
+                    data,
+                    value: 0,
+                    gas_limit: None,
+                })
+                .await?;
+            decode_address(&out.output, "clearingAccount")
+        })
+    }
+}
+
+/// PERPS_V2_BACKEND_RPC_SIMULATION_INTEGRATION_V1 — live-chain
+/// [`V2MatchingEngineReader`] backed by any [`EthCallProvider`].
+pub struct RpcV2MatchingEngineReader<R> {
+    pub rpc: R,
+    pub pme: AccountId,
+}
+
+impl<R> RpcV2MatchingEngineReader<R> {
+    pub fn new(rpc: R, pme: AccountId) -> Self {
+        Self { rpc, pme }
+    }
+}
+
+impl<R> V2MatchingEngineReader for RpcV2MatchingEngineReader<R>
+where
+    R: EthCallProvider + Send + Sync + 'static,
+{
+    fn read_is_executor<'a>(&'a self, runtime: &'a AccountId) -> ReaderFuture<'a, bool> {
+        Box::pin(async move {
+            let runtime_bytes = parse_evm_address(runtime)?;
+            let mut data = Vec::with_capacity(4 + 32);
+            data.extend_from_slice(&v2_abi::isExecutorCall::SELECTOR);
+            data.extend_from_slice(&encode_address_arg(&runtime_bytes));
+            let out = self
+                .rpc
+                .eth_call(EthCallRequest {
+                    from: self.pme.clone(),
+                    to: self.pme.clone(),
+                    data,
+                    value: 0,
+                    gas_limit: None,
+                })
+                .await?;
+            decode_bool(&out.output, "isExecutor")
+        })
+    }
+
+    fn read_v2_nonce<'a>(&'a self, trader: &'a AccountId) -> ReaderFuture<'a, u128> {
+        Box::pin(async move {
+            let trader_bytes = parse_evm_address(trader)?;
+            let mut data = Vec::with_capacity(4 + 32);
+            data.extend_from_slice(&v2_abi::noncesCall::SELECTOR);
+            data.extend_from_slice(&encode_address_arg(&trader_bytes));
+            let out = self
+                .rpc
+                .eth_call(EthCallRequest {
+                    from: self.pme.clone(),
+                    to: self.pme.clone(),
+                    data,
+                    value: 0,
+                    gas_limit: None,
+                })
+                .await?;
+            crate::api::perps_cosign::decode_uint256_low128(&out.output, "nonces")
+        })
+    }
+
+    fn read_configured_engine<'a>(&'a self) -> ReaderFuture<'a, AccountId> {
+        Box::pin(async move {
+            let data = v2_abi::perpEngineCall::SELECTOR.to_vec();
+            let out = self
+                .rpc
+                .eth_call(EthCallRequest {
+                    from: self.pme.clone(),
+                    to: self.pme.clone(),
+                    data,
+                    value: 0,
+                    gas_limit: None,
+                })
+                .await?;
+            decode_address(&out.output, "perpEngine")
+        })
+    }
+
+    fn read_paused<'a>(&'a self) -> ReaderFuture<'a, bool> {
+        Box::pin(async move {
+            let data = v2_abi::pausedCall::SELECTOR.to_vec();
+            let out = self
+                .rpc
+                .eth_call(EthCallRequest {
+                    from: self.pme.clone(),
+                    to: self.pme.clone(),
+                    data,
+                    value: 0,
+                    gas_limit: None,
+                })
+                .await?;
+            decode_bool(&out.output, "paused")
+        })
+    }
+}
+
+/// PERPS_V2_BACKEND_RPC_SIMULATION_INTEGRATION_V1 — live-chain
+/// [`V2VaultReader`] backed by any [`EthCallProvider`]. Reads
+/// `CollateralVault.balances(user, token)` — the public mapping
+/// getter that returns the user's deposited settlement-asset
+/// balance held by the vault. For the V2 clearing preflight
+/// `user` is the `PerpClearingAccountV2` address (the clearing
+/// account's own deposit).
+pub struct RpcV2VaultReader<R> {
+    pub rpc: R,
+    pub vault: AccountId,
+}
+
+impl<R> RpcV2VaultReader<R> {
+    pub fn new(rpc: R, vault: AccountId) -> Self {
+        Self { rpc, vault }
+    }
+}
+
+impl<R> V2VaultReader for RpcV2VaultReader<R>
+where
+    R: EthCallProvider + Send + Sync + 'static,
+{
+    fn read_clearing_settlement_balance<'a>(
+        &'a self,
+        clearing_account: &'a AccountId,
+        settlement_asset: &'a AccountId,
+    ) -> ReaderFuture<'a, u128> {
+        Box::pin(async move {
+            let clearing_bytes = parse_evm_address(clearing_account)?;
+            let asset_bytes = parse_evm_address(settlement_asset)?;
+            let mut data = Vec::with_capacity(4 + 64);
+            data.extend_from_slice(&v2_abi::balancesCall::SELECTOR);
+            data.extend_from_slice(&encode_address_arg(&clearing_bytes));
+            data.extend_from_slice(&encode_address_arg(&asset_bytes));
+            let out = self
+                .rpc
+                .eth_call(EthCallRequest {
+                    from: self.vault.clone(),
+                    to: self.vault.clone(),
+                    data,
+                    value: 0,
+                    gas_limit: None,
+                })
+                .await?;
+            crate::api::perps_cosign::decode_uint256_low128(&out.output, "balances")
+        })
+    }
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -894,5 +1225,255 @@ mod tests {
         assert_eq!(MigrationState::parse_u8(1).unwrap(), MigrationState::Sealed);
         assert!(MigrationState::parse_u8(2).is_err());
         assert!(MigrationState::parse_u8(255).is_err());
+    }
+
+    // ── PERPS_V2_BACKEND_RPC_SIMULATION_INTEGRATION_V1 (§5) —
+    // real-RPC reader unit tests. The mock provider records the
+    // outbound eth_call parameters (target contract, calldata) and
+    // returns programmed bytes; assertions cover both the outbound
+    // selector/argument encoding and the inbound decoding.
+
+    use crate::execution::rpc::{EthCallProvider, EthCallRequest, EthCallSuccess};
+    use crate::execution::rpc::RpcFuture;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct MockRpc {
+        // (target, calldata) captured for assertions.
+        pub captured: Arc<Mutex<Vec<(AccountId, Vec<u8>)>>>,
+        // Programmed responses in insertion order.
+        pub queued: Arc<Mutex<Vec<Vec<u8>>>>,
+    }
+    impl MockRpc {
+        fn queue(&self, response: Vec<u8>) {
+            self.queued.lock().unwrap().push(response);
+        }
+        fn captured_len(&self) -> usize {
+            self.captured.lock().unwrap().len()
+        }
+    }
+    impl EthCallProvider for MockRpc {
+        fn eth_call(&self, request: EthCallRequest) -> RpcFuture<'_, EthCallSuccess> {
+            let target = request.to.clone();
+            let data = request.data.clone();
+            let queued = self.queued.clone();
+            let captured = self.captured.clone();
+            Box::pin(async move {
+                captured.lock().unwrap().push((target, data));
+                let mut q = queued.lock().unwrap();
+                if q.is_empty() {
+                    return Err(BackendError::Config("mock rpc: no queued response".into()));
+                }
+                let output = q.remove(0);
+                Ok(EthCallSuccess {
+                    block_number: Some(1),
+                    output,
+                })
+            })
+        }
+    }
+
+    // Encoding helpers for tests
+    fn u256_word(low128: u128) -> Vec<u8> {
+        let mut w = [0u8; 32];
+        w[16..].copy_from_slice(&low128.to_be_bytes());
+        w.to_vec()
+    }
+    fn addr_word(addr: &str) -> Vec<u8> {
+        let stripped = addr.strip_prefix("0x").unwrap();
+        let mut w = [0u8; 32];
+        for (i, chunk) in stripped.as_bytes().chunks(2).enumerate() {
+            let s = std::str::from_utf8(chunk).unwrap();
+            w[12 + i] = u8::from_str_radix(s, 16).unwrap();
+        }
+        w.to_vec()
+    }
+    fn bool_word(b: bool) -> Vec<u8> {
+        let mut w = [0u8; 32];
+        w[31] = if b { 1 } else { 0 };
+        w.to_vec()
+    }
+
+    const ENGINE_ADDR: &str = "0x0000000000000000000000000000000000000E01";
+    const PME_ADDR: &str = "0x0000000000000000000000000000000000000E02";
+    const CLEARING_ADDR: &str = "0x0000000000000000000000000000000000000E03";
+    const VAULT_ADDR: &str = "0x0000000000000000000000000000000000000E04";
+    const ASSET_ADDR: &str = "0x0000000000000000000000000000000000000E05";
+    const RUNTIME_ADDR: &str = "0x0000000000000000000000000000000000000E99";
+    const TRADER_ADDR: &str = "0xff287410852B9328437eaC353720e5476bC5F837";
+
+    #[tokio::test]
+    async fn rpc_engine_reader_migration_state_sealed() {
+        let rpc = MockRpc::default();
+        let mut sealed = [0u8; 32];
+        sealed[31] = 1;
+        rpc.queue(sealed.to_vec());
+        let reader = RpcV2EngineReader::new(rpc.clone(), AccountId::new(ENGINE_ADDR));
+        let state = reader.read_migration_state().await.unwrap();
+        assert_eq!(state, MigrationState::Sealed);
+        let captured = rpc.captured.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].0.0, ENGINE_ADDR);
+        assert_eq!(&captured[0].1[..4], &v2_abi::migrationStateCall::SELECTOR);
+    }
+
+    #[tokio::test]
+    async fn rpc_engine_reader_migration_state_open_and_invalid() {
+        let rpc = MockRpc::default();
+        rpc.queue([0u8; 32].to_vec()); // Open
+        let reader = RpcV2EngineReader::new(rpc.clone(), AccountId::new(ENGINE_ADDR));
+        assert_eq!(reader.read_migration_state().await.unwrap(), MigrationState::Open);
+
+        let mut bad = [0u8; 32];
+        bad[31] = 2; // invalid enum value
+        rpc.queue(bad.to_vec());
+        assert!(reader.read_migration_state().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn rpc_engine_reader_snapshot_hash_and_clearing_account() {
+        let rpc = MockRpc::default();
+        let mut hash = [0u8; 32];
+        hash[31] = 0x42;
+        rpc.queue(hash.to_vec());
+        rpc.queue(addr_word(CLEARING_ADDR));
+        let reader = RpcV2EngineReader::new(rpc.clone(), AccountId::new(ENGINE_ADDR));
+
+        let h = reader.read_migration_snapshot_hash().await.unwrap();
+        assert_eq!(h, hash);
+
+        let ca = reader.read_clearing_account().await.unwrap();
+        assert!(ca.0.eq_ignore_ascii_case(CLEARING_ADDR));
+
+        let captured = rpc.captured.lock().unwrap();
+        assert_eq!(&captured[0].1[..4], &v2_abi::migrationSnapshotHashCall::SELECTOR);
+        assert_eq!(&captured[1].1[..4], &v2_abi::clearingAccountCall::SELECTOR);
+    }
+
+    #[tokio::test]
+    async fn rpc_pme_reader_is_executor_and_nonces_and_engine_and_paused() {
+        let rpc = MockRpc::default();
+        rpc.queue(bool_word(true));
+        rpc.queue(u256_word(42));
+        rpc.queue(addr_word(ENGINE_ADDR));
+        rpc.queue(bool_word(false));
+
+        let reader = RpcV2MatchingEngineReader::new(rpc.clone(), AccountId::new(PME_ADDR));
+        assert!(reader
+            .read_is_executor(&AccountId::new(RUNTIME_ADDR))
+            .await
+            .unwrap());
+        assert_eq!(
+            reader.read_v2_nonce(&AccountId::new(TRADER_ADDR)).await.unwrap(),
+            42
+        );
+        assert!(reader
+            .read_configured_engine()
+            .await
+            .unwrap()
+            .0
+            .eq_ignore_ascii_case(ENGINE_ADDR));
+        assert!(!reader.read_paused().await.unwrap());
+
+        let captured = rpc.captured.lock().unwrap();
+        assert_eq!(captured.len(), 4);
+        assert_eq!(&captured[0].1[..4], &v2_abi::isExecutorCall::SELECTOR);
+        // isExecutor calldata = selector || 32-byte runtime address
+        assert_eq!(captured[0].1.len(), 36);
+        assert_eq!(&captured[1].1[..4], &v2_abi::noncesCall::SELECTOR);
+        assert_eq!(&captured[2].1[..4], &v2_abi::perpEngineCall::SELECTOR);
+        assert_eq!(&captured[3].1[..4], &v2_abi::pausedCall::SELECTOR);
+    }
+
+    #[tokio::test]
+    async fn rpc_vault_reader_balances() {
+        let rpc = MockRpc::default();
+        rpc.queue(u256_word(500_000_000));
+        let reader = RpcV2VaultReader::new(rpc.clone(), AccountId::new(VAULT_ADDR));
+        let balance = reader
+            .read_clearing_settlement_balance(
+                &AccountId::new(CLEARING_ADDR),
+                &AccountId::new(ASSET_ADDR),
+            )
+            .await
+            .unwrap();
+        assert_eq!(balance, 500_000_000);
+        let captured = rpc.captured.lock().unwrap();
+        assert_eq!(&captured[0].1[..4], &v2_abi::balancesCall::SELECTOR);
+        // balances calldata = selector || 32-byte user || 32-byte token
+        assert_eq!(captured[0].1.len(), 4 + 64);
+    }
+
+    #[tokio::test]
+    async fn rpc_readers_reject_non_canonical_encodings() {
+        // Non-canonical bool: upper bytes nonzero.
+        let rpc = MockRpc::default();
+        let mut bad_bool = [0xffu8; 32];
+        bad_bool[31] = 1;
+        rpc.queue(bad_bool.to_vec());
+        let reader = RpcV2MatchingEngineReader::new(rpc.clone(), AccountId::new(PME_ADDR));
+        assert!(reader
+            .read_is_executor(&AccountId::new(RUNTIME_ADDR))
+            .await
+            .is_err());
+
+        // Address with non-zero upper bytes.
+        let rpc2 = MockRpc::default();
+        let mut bad_addr = addr_word(ENGINE_ADDR);
+        bad_addr[0] = 0xaa; // corrupt the high-byte
+        rpc2.queue(bad_addr);
+        let reader2 = RpcV2EngineReader::new(rpc2.clone(), AccountId::new(ENGINE_ADDR));
+        assert!(reader2.read_clearing_account().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn rpc_end_to_end_preflight_against_mock() {
+        // Compose the real readers with the mock provider and run the
+        // full preflight aggregator. Proves the RpcV2* impls satisfy
+        // the trait interfaces exactly as the mocks did.
+        let rpc = MockRpc::default();
+        // Order matches the preflight's call sequence:
+        //  1. read_migration_state
+        //  2. read_migration_snapshot_hash
+        //  3. read_clearing_account
+        //  4. read_configured_engine (PME)
+        //  5. read_is_executor
+        //  6. read_paused
+        //  7. read_clearing_settlement_balance
+        let mut sealed = [0u8; 32];
+        sealed[31] = 1;
+        rpc.queue(sealed.to_vec()); // migrationState -> Sealed
+        let mut hash = [0u8; 32];
+        hash[31] = 0x42;
+        rpc.queue(hash.to_vec()); // migrationSnapshotHash -> non-zero
+        rpc.queue(addr_word(CLEARING_ADDR)); // clearingAccount
+        rpc.queue(addr_word(ENGINE_ADDR)); // pme.perpEngine
+        rpc.queue(bool_word(true)); // isExecutor -> true
+        rpc.queue(bool_word(false)); // paused -> false
+        rpc.queue(u256_word(50_000_000)); // vault balance >= floor
+
+        let engine_reader = RpcV2EngineReader::new(rpc.clone(), AccountId::new(ENGINE_ADDR));
+        let pme_reader = RpcV2MatchingEngineReader::new(rpc.clone(), AccountId::new(PME_ADDR));
+        let vault_reader = RpcV2VaultReader::new(rpc.clone(), AccountId::new(VAULT_ADDR));
+
+        let mut config = ExecutionConfig::disabled();
+        config.perps_active_engine_version = PerpsProtocolVersion::V2;
+        config.perp_engine_v2_address = Some(AccountId::new(ENGINE_ADDR));
+        config.perp_matching_engine_v2_address = Some(AccountId::new(PME_ADDR));
+        config.perp_clearing_account_v2_address = Some(AccountId::new(CLEARING_ADDR));
+        config.perps_v2_clearing_min_balance_raw = 10_000_000;
+
+        let report = v2_preflight_check(
+            &config,
+            PerpsProtocolVersion::V2,
+            &AccountId::new(RUNTIME_ADDR),
+            &AccountId::new(ASSET_ADDR),
+            &engine_reader,
+            &pme_reader,
+            &vault_reader,
+        )
+        .await;
+        assert_eq!(report.outcome, V2PreflightOutcome::Ready);
+        assert_eq!(rpc.captured_len(), 7);
     }
 }
