@@ -103,6 +103,39 @@ pub struct ExecutionIntent {
 }
 
 impl ExecutionIntent {
+    /// PERPS_V2_BACKEND_ANVIL_LIVE_E2E_V1 (§0) — cross-version
+    /// safety invariant. Because the backend uses a single 12-field
+    /// [`PerpTradePayload`] for both V1 and V2, a V1 intent MUST
+    /// carry `max_execution_price_1e8 == 0` AND
+    /// `min_execution_price_1e8 == 0`. Any other combination
+    /// implies the persisted row is malformed (or the row was
+    /// tampered with) and MUST fail closed rather than being
+    /// silently reinterpreted.
+    ///
+    /// V2 intents may carry any valid combination (including 0/0 —
+    /// strict-price mode).
+    ///
+    /// Called by:
+    ///   - [`ExecutionIntent::perp_trade_payload`] (every reload path)
+    ///   - [`api::perps_cosign::prepare_trade_core`] (after payload
+    ///     construction, before insert)
+    ///
+    /// The invariant is enforced at both prepare time and every
+    /// reload so a mid-database mutation cannot bypass it.
+    pub fn validate_version_invariants(&self) -> Result<()> {
+        if self.protocol_version == PerpsProtocolVersion::V1
+            && (self.max_execution_price_1e8 != 0 || self.min_execution_price_1e8 != 0)
+        {
+            return Err(BackendError::Config(format!(
+                "V1 intent {} has non-zero V2 price bounds (max={}, min={}); \
+                 V1 signatures do not commit to bounds — this row is malformed \
+                 and cannot be reconstructed safely",
+                self.intent_id, self.max_execution_price_1e8, self.min_execution_price_1e8
+            )));
+        }
+        Ok(())
+    }
+
     /// Canonical reconstruction of the deployed-V1 10-field
     /// `PerpTradePayload` from a persisted `ExecutionIntent`.
     ///
@@ -129,6 +162,12 @@ impl ExecutionIntent {
     /// invariant is asserted by unit tests
     /// `payload_equality_cosign_and_runtime_paths_match_*`.
     pub fn perp_trade_payload(&self) -> Result<PerpTradePayload> {
+        // PERPS_V2_BACKEND_ANVIL_LIVE_E2E_V1 (§0) — enforce the V1
+        // bounds invariant on EVERY payload reconstruction. Cheaper
+        // than repeating the check at every call site and prevents
+        // any bypass path via a malformed row surviving through the
+        // DB layer.
+        self.validate_version_invariants()?;
         let buyer_is_maker = self
             .buyer_is_maker
             .ok_or_else(|| BackendError::MissingExecutionMetadata("buyer_is_maker".to_string()))?;
@@ -313,5 +352,61 @@ mod tests {
             matches!(err, BackendError::MissingExecutionMetadata(ref m) if m.contains("deadline")),
             "got: {err:?}"
         );
+    }
+
+    // ── PERPS_V2_BACKEND_ANVIL_LIVE_E2E_V1 §0 V1 bounds invariant ──
+
+    #[test]
+    fn v1_with_zero_bounds_is_valid() {
+        let intent = intent_with_deadline_ms(1_789_656_028_000);
+        assert_eq!(
+            intent.protocol_version,
+            crate::execution::perp_trade::PerpsProtocolVersion::V1
+        );
+        assert!(intent.validate_version_invariants().is_ok());
+        assert!(intent.perp_trade_payload().is_ok());
+    }
+
+    #[test]
+    fn v1_with_nonzero_max_bound_is_refused() {
+        let mut intent = intent_with_deadline_ms(1_789_656_028_000);
+        intent.max_execution_price_1e8 = 1;
+        let err = intent.validate_version_invariants().unwrap_err();
+        assert!(
+            format!("{err}").contains("V1 intent")
+                && format!("{err}").contains("non-zero V2 price bounds"),
+            "got: {err}"
+        );
+        // Reload path also fails closed.
+        assert!(intent.perp_trade_payload().is_err());
+    }
+
+    #[test]
+    fn v1_with_nonzero_min_bound_is_refused() {
+        let mut intent = intent_with_deadline_ms(1_789_656_028_000);
+        intent.min_execution_price_1e8 = 1;
+        assert!(intent.validate_version_invariants().is_err());
+        assert!(intent.perp_trade_payload().is_err());
+    }
+
+    #[test]
+    fn v2_with_nonzero_bounds_is_valid() {
+        let mut intent = intent_with_deadline_ms(1_789_656_028_000);
+        intent.protocol_version = crate::execution::perp_trade::PerpsProtocolVersion::V2;
+        intent.max_execution_price_1e8 = 300_500_000_000;
+        intent.min_execution_price_1e8 = 299_500_000_000;
+        assert!(intent.validate_version_invariants().is_ok());
+        let payload = intent.perp_trade_payload().unwrap();
+        assert_eq!(payload.max_execution_price_1e8, 300_500_000_000);
+        assert_eq!(payload.min_execution_price_1e8, 299_500_000_000);
+    }
+
+    #[test]
+    fn v2_with_zero_bounds_is_valid() {
+        // Strict-price V2 case: bounds = 0, 0 explicitly permitted.
+        let mut intent = intent_with_deadline_ms(1_789_656_028_000);
+        intent.protocol_version = crate::execution::perp_trade::PerpsProtocolVersion::V2;
+        assert!(intent.validate_version_invariants().is_ok());
+        assert!(intent.perp_trade_payload().is_ok());
     }
 }
