@@ -15685,14 +15685,25 @@ async fn perps_closed_test_prepare_trade(
             ))
         })?;
     let rpc = crate::execution::rpc::HttpJsonRpcProvider::new(rpc_url);
-    let nonce_reader = crate::api::perps_cosign::RpcNonceReader::new(
-        rpc.clone(),
-        state.execution_config.perp_matching_engine_address.clone(),
-    );
-    let mark_price_reader = crate::api::perps_cosign::RpcMarkPriceReader::new(
-        rpc,
-        state.execution_config.perp_engine_address.clone(),
-    );
+    // PERPS_V2_BACKEND_EXECUTOR_PATH_V1 — version-aware reader
+    // targets. Under `PERPS_ACTIVE_ENGINE_VERSION=v1` these resolve
+    // to the deployed V1 addresses (backwards-compatible with every
+    // caller). Under `=v2` they resolve to the configured V2
+    // addresses; startup already refused an active=v2 config with
+    // unpopulated V2 addresses (see `ExecutionConfig::validate_startup`).
+    let active_pme = state
+        .execution_config
+        .active_perp_matching_engine_address()
+        .map_err(ApiError::from)?
+        .clone();
+    let active_engine = state
+        .execution_config
+        .active_perp_engine_address()
+        .map_err(ApiError::from)?
+        .clone();
+    let nonce_reader = crate::api::perps_cosign::RpcNonceReader::new(rpc.clone(), active_pme);
+    let mark_price_reader =
+        crate::api::perps_cosign::RpcMarkPriceReader::new(rpc, active_engine);
     let outcome = crate::api::perps_cosign::prepare_trade_core(
         &state,
         &req,
@@ -15776,10 +15787,21 @@ async fn perps_closed_test_cosign_trade(
             format!("intent state {:?} not co-signable", intent.status),
         )));
     }
-    // Domain matches the deployed V1 PME identity used at prepare time.
-    let domain = crate::execution::PerpTradeDomain::new(
+    // PERPS_V2_BACKEND_EXECUTOR_PATH_V1 — domain rebuilt from the
+    // intent's PERSISTED protocol_version (NEVER from the current
+    // runtime active version), so a runtime cutover cannot retarget
+    // an already-persisted intent's signing digest. The
+    // verifyingContract for that version comes from
+    // `perp_matching_engine_address_for(intent.protocol_version)`.
+    let verifying_contract = state
+        .execution_config
+        .perp_matching_engine_address_for(intent.protocol_version)
+        .map_err(ApiError::from)?
+        .clone();
+    let domain = crate::execution::PerpTradeDomain::for_version(
+        intent.protocol_version,
         state.perps_read_config.chain_id,
-        state.execution_config.perp_matching_engine_address.clone(),
+        verifying_contract,
     );
     let prior_stored = repository.get_execution_intent_signatures(uuid).await?;
     let prior_view = crate::api::perps_cosign::StoredTradeSignaturesView::from(&prior_stored);

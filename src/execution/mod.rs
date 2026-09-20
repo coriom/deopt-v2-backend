@@ -17,8 +17,14 @@ pub mod signer_adapters;
 pub mod simulator;
 pub mod transaction;
 pub mod tx_builder;
+pub mod v2_readiness;
 
-pub use abi::{encode_execute_trade_calldata, execute_trade_selector};
+pub use abi::{
+    decode_execute_trade_v2_calldata, encode_execute_trade_calldata,
+    encode_execute_trade_calldata_for_version, encode_execute_trade_v2_calldata,
+    execute_trade_selector, execute_trade_selector_for, execute_trade_v2_selector,
+    EXECUTE_TRADE_SIGNATURE, EXECUTE_TRADE_V2_SIGNATURE,
+};
 pub use broadcast_policy::{
     classify_send_error, expected_intent_hash_from_uuid, preflight_intent_filled,
     preflight_pme_state, validate_signer_triad, verify_pme_event_in_receipt, BroadcastOutcome,
@@ -69,6 +75,10 @@ pub use rpc::{
 pub use runner::spawn_executor;
 pub use signer::ExecutorSigner;
 pub use simulator::{simulate_execution_intent, SimulationResult};
+pub use v2_readiness::{
+    v2_preflight_check, MigrationState, V2EngineReader, V2MatchingEngineReader,
+    V2PreflightDenial, V2PreflightOutcome, V2PreflightReport, V2VaultReader,
+};
 pub use transaction::{
     assemble_eip1559_signed_transaction, build_execution_transaction_request,
     derive_signed_transaction_hash, eip1559_transaction_prehash, ensure_no_submitted_transaction,

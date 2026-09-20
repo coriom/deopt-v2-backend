@@ -440,11 +440,33 @@ where
         deadline_sec,
     )?;
 
-    let domain = PerpTradeDomain::new(
+    // PERPS_V2_BACKEND_EXECUTOR_PATH_V1 — version-dispatched domain
+    // + digest. The runtime active version controls which
+    // verifyingContract is baked into the domain separator and which
+    // typehash (10-field V1 vs 12-field V2) is hashed into the trade
+    // struct. Persistence records the version on the intent row
+    // (`protocol_version`); cosign later reconstructs the same domain
+    // from that persisted value, NOT the runtime active version — so
+    // a later runtime flip cannot retarget an already-cosigned intent
+    // (proved by `active_version_flip_preserves_existing_intent_shape`).
+    let active_version = state.execution_config.perps_active_engine_version;
+    let verifying_contract = state
+        .execution_config
+        .active_perp_matching_engine_address()?
+        .clone();
+    let domain = PerpTradeDomain::for_version(
+        active_version,
         state.perps_read_config.chain_id,
-        state.execution_config.perp_matching_engine_address.clone(),
+        verifying_contract,
     );
-    let digest_hex = perp_trade_v1_digest(&payload, &domain)?;
+    let digest_hex = match active_version {
+        crate::execution::perp_trade::PerpsProtocolVersion::V1 => {
+            perp_trade_v1_digest(&payload, &domain)?
+        }
+        crate::execution::perp_trade::PerpsProtocolVersion::V2 => {
+            crate::execution::perp_trade_v2_digest(&payload, &domain)?
+        }
+    };
 
     // ExecutionIntent.deadline_ms is a ms field but the on-chain
     // deadline is seconds. We persist the seconds value multiplied by
@@ -457,7 +479,19 @@ where
             BackendError::Config("deadline overflow when scaling to ms shadow".to_string())
         })?;
 
-    let typed_data = build_typed_data_v1(&payload, &domain, &intent_id_hex, deadline_sec);
+    // PERPS_V2_BACKEND_EXECUTOR_PATH_V1 — dispatch typed data on
+    // active version. HTTP typedData response must match the
+    // digest (byte-for-byte) that the trader signs; that in turn
+    // must match the digest cosign reconstructs at verification
+    // time (from persisted intent.protocol_version).
+    let typed_data = match active_version {
+        crate::execution::perp_trade::PerpsProtocolVersion::V1 => {
+            build_typed_data_v1(&payload, &domain, &intent_id_hex, deadline_sec)
+        }
+        crate::execution::perp_trade::PerpsProtocolVersion::V2 => {
+            build_typed_data_v2(&payload, &domain, &intent_id_hex, deadline_sec)
+        }
+    };
 
     // ---- PREPARED-AWAITING-COSIGN state ----
     //
@@ -557,6 +591,64 @@ fn build_typed_data_v1(
     })
 }
 
+/// PERPS_V2_BACKEND_EXECUTOR_PATH_V1 — canonical V2 typed data.
+/// 12-field `PerpTrade` matches `PerpMatchingEngineV2.PerpTrade` at
+/// sol HEAD `2e9ad6f` byte-for-byte. Field order MUST match the
+/// Solidity struct exactly (see also
+/// `PERP_TRADE_TYPE` in `execution/perp_trade.rs`).
+fn build_typed_data_v2(
+    payload: &PerpTradePayload,
+    domain: &PerpTradeDomain,
+    intent_id_hex: &str,
+    deadline_sec: u128,
+) -> JsonValue {
+    json!({
+        "types": {
+            "EIP712Domain": [
+                {"name": "name", "type": "string"},
+                {"name": "version", "type": "string"},
+                {"name": "chainId", "type": "uint256"},
+                {"name": "verifyingContract", "type": "address"}
+            ],
+            "PerpTrade": [
+                {"name": "intentId", "type": "bytes32"},
+                {"name": "buyer", "type": "address"},
+                {"name": "seller", "type": "address"},
+                {"name": "marketId", "type": "uint256"},
+                {"name": "sizeDelta1e8", "type": "uint128"},
+                {"name": "executionPrice1e8", "type": "uint128"},
+                {"name": "maxExecutionPrice1e8", "type": "uint128"},
+                {"name": "minExecutionPrice1e8", "type": "uint128"},
+                {"name": "buyerIsMaker", "type": "bool"},
+                {"name": "buyerNonce", "type": "uint256"},
+                {"name": "sellerNonce", "type": "uint256"},
+                {"name": "deadline", "type": "uint256"}
+            ]
+        },
+        "primaryType": "PerpTrade",
+        "domain": {
+            "name": domain.name,
+            "version": domain.version,
+            "chainId": domain.chain_id,
+            "verifyingContract": domain.verifying_contract.0
+        },
+        "message": {
+            "intentId": intent_id_hex,
+            "buyer": payload.buyer.0,
+            "seller": payload.seller.0,
+            "marketId": payload.market_id.to_string(),
+            "sizeDelta1e8": payload.size_delta_1e8.to_string(),
+            "executionPrice1e8": payload.execution_price_1e8.to_string(),
+            "maxExecutionPrice1e8": payload.max_execution_price_1e8.to_string(),
+            "minExecutionPrice1e8": payload.min_execution_price_1e8.to_string(),
+            "buyerIsMaker": payload.buyer_is_maker,
+            "buyerNonce": payload.buyer_nonce.to_string(),
+            "sellerNonce": payload.seller_nonce.to_string(),
+            "deadline": deadline_sec.to_string()
+        }
+    })
+}
+
 // ================================================================
 // PHASE B — COSIGN
 // ================================================================
@@ -591,12 +683,40 @@ pub struct CosignTradeResponse {
 /// HTTP handler / integration test are responsible for persisting the
 /// signatures (via `PgRepository::upsert_execution_intent_signatures`
 /// or an in-memory equivalent).
+///
+/// PERPS_V2_BACKEND_EXECUTOR_PATH_V1 — legacy V1 shape. For a V2
+/// intent use [`cosign_verify_core_for_version`], which routes to
+/// the V2 digest based on the intent's persisted protocol version.
 pub fn cosign_verify_core(
     payload: &PerpTradePayload,
     domain: &PerpTradeDomain,
     req: &CosignTradeRequest,
 ) -> Result<CosignVerifiedSignatures> {
-    let digest = perp_trade_v1_digest_bytes(payload, domain)?;
+    cosign_verify_core_for_version(
+        payload,
+        domain,
+        req,
+        crate::execution::perp_trade::PerpsProtocolVersion::V1,
+    )
+}
+
+/// PERPS_V2_BACKEND_EXECUTOR_PATH_V1 — version-aware cosign.
+/// `version` MUST come from the intent's PERSISTED
+/// `protocol_version` field, never from the runtime
+/// `PERPS_ACTIVE_ENGINE_VERSION`. A subsequent runtime flip cannot
+/// retarget the digest that the trader already signed.
+///
+/// The domain MUST have `version` matching `version`; if it does
+/// not, the underlying digest helper (`perp_trade_v1_digest` /
+/// `perp_trade_v2_digest`) fails closed with a
+/// `BackendError::Config`.
+pub fn cosign_verify_core_for_version(
+    payload: &PerpTradePayload,
+    domain: &PerpTradeDomain,
+    req: &CosignTradeRequest,
+    version: crate::execution::perp_trade::PerpsProtocolVersion,
+) -> Result<CosignVerifiedSignatures> {
+    let digest = crate::execution::perp_trade_digest_bytes_for_version(payload, domain, version)?;
     let buyer_recovered = recover_eip712_signer(&digest, &req.buyer_signature)
         .map_err(|_| BackendError::PerpsIntentSignatureInvalid)?;
     if buyer_recovered.0.to_lowercase() != payload.buyer.0.to_lowercase() {
@@ -649,8 +769,15 @@ pub fn cosign_load_and_verify(
     prior_bundle: Option<&StoredTradeSignaturesView>,
     now_sec: u128,
 ) -> Result<CosignVerifiedSignatures> {
-    // Reconstruct payload from persisted intent — this is
-    // authoritative; client-supplied fields are ignored.
+    // PERPS_V2_BACKEND_EXECUTOR_PATH_V1 — cosign dispatches on the
+    // intent's PERSISTED protocol_version, NEVER on the runtime
+    // active version. A runtime flip after cosign cannot retarget
+    // the digest that the trader signed.
+    //
+    // The passed-in `domain` MUST have `version` matching
+    // `intent.protocol_version`; a mismatch surfaces at
+    // `perp_trade_digest_bytes_for_version` inside
+    // `cosign_verify_core_for_version`.
     let payload = intent_to_v1_payload(intent)?;
     // Deadline check against Unix seconds.
     if payload.deadline > 0 && now_sec > payload.deadline {
@@ -682,7 +809,7 @@ pub fn cosign_load_and_verify(
             ));
         }
     }
-    cosign_verify_core(&payload, domain, req)
+    cosign_verify_core_for_version(&payload, domain, req, intent.protocol_version)
 }
 
 /// Reconstruct the 10-field `PerpTradePayload` from a persisted
