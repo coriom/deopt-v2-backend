@@ -1,4 +1,5 @@
 use crate::error::{BackendError, Result};
+use crate::execution::perp_trade::PerpsProtocolVersion;
 use crate::execution::remote_signer::{
     SignerBackendKind, ANVIL_CHAIN_ID, BASE_SEPOLIA_CHAIN_ID, MAINNET_CHAIN_ID,
 };
@@ -51,6 +52,55 @@ pub struct ExecutionConfig {
     /// broadcast traffic. `None` means "OLD address not configured" and
     /// any unmatched consumer is bucketed as `"unknown"`.
     pub old_perp_engine_address: Option<AccountId>,
+    /// PERPS_V2_BACKEND_COMPAT_FOUNDATION_V1 — future
+    /// `PerpEngineV2` deployment. `None` until the V2 stack is
+    /// deployed (Base Sepolia / mainnet); when set, MUST be distinct
+    /// from `perp_engine_address` (the V1 legacy address). Only ever
+    /// used by the V2 execution path — V1 legacy trading routes NEVER
+    /// read this. Startup refuses `perps_active_engine_version = V2`
+    /// unless this address is populated with a non-zero value.
+    pub perp_engine_v2_address: Option<AccountId>,
+    /// PERPS_V2_BACKEND_COMPAT_FOUNDATION_V1 — future
+    /// `PerpMatchingEngineV2` deployment. `None` until deployed.
+    /// Distinct verifying contract from V1; drives the V2 EIP-712
+    /// domain (`PerpTradeDomain::new_v2`) so V1 trader signatures
+    /// cannot cryptographically replay onto V2. Startup refuses
+    /// `perps_active_engine_version = V2` unless populated.
+    pub perp_matching_engine_v2_address: Option<AccountId>,
+    /// PERPS_V2_BACKEND_COMPAT_FOUNDATION_V1 — future
+    /// `PerpClearingAccountV2` deployment. `None` until deployed.
+    /// This is the deposit-only clearing custody contract funded by
+    /// the operator through the canonical
+    /// `PerpClearingAccountV2.fundClearing` path; NEVER conflated with
+    /// the insurance fund. The V2 executor preflight refuses to
+    /// broadcast unless the on-chain `PerpEngineV2.clearingAccount()`
+    /// read matches this configured address exactly.
+    pub perp_clearing_account_v2_address: Option<AccountId>,
+    /// PERPS_V2_BACKEND_COMPAT_FOUNDATION_V1 — runtime active
+    /// settlement protocol version. Selects which contract addresses
+    /// / EIP-712 domain / trade typehash the *new* intent path emits.
+    /// Historical / audit reads of V1-persisted intents remain
+    /// version-bound to the value stored on each intent row and are
+    /// unaffected by this switch (see
+    /// `execution_intents.protocol_version` migration
+    /// `0064_execution_intents_protocol_version.sql`).
+    ///
+    /// Defaults to [`PerpsProtocolVersion::V1`] for backward
+    /// compatibility with all existing deployments. Flipping to V2
+    /// requires the three V2 contract addresses above to be
+    /// populated — enforced at
+    /// [`ExecutionConfig::validate_startup`].
+    pub perps_active_engine_version: PerpsProtocolVersion,
+    /// PERPS_V2_BACKEND_COMPAT_FOUNDATION_V1 — operator-configurable
+    /// floor for the V2 clearing-account settlement-asset balance,
+    /// expressed in raw base-unit integer form (e.g. mUSDC has 6
+    /// decimals; `10_000_000` == 10 mUSDC). The V2 executor
+    /// preflight fails closed if the on-chain balance drops below
+    /// this threshold at pre-send time. `0` means "no floor
+    /// enforced" (operator-authored explicit opt-out). This is an
+    /// operational safety net — the exact per-trade requirement is
+    /// derived from the trade payload at simulation time.
+    pub perps_v2_clearing_min_balance_raw: u128,
     /// Selected signer backend. `LocalDev` wraps the in-process
     /// `ExecutorSigner::from_private_key`; `Remote` routes through the
     /// signer microservice mTLS client. Mainnet (`chain_id == 8453`)
@@ -144,6 +194,11 @@ impl ExecutionConfig {
             ),
             perp_engine_address: AccountId::new("0x0000000000000000000000000000000000000000"),
             old_perp_engine_address: None,
+            perp_engine_v2_address: None,
+            perp_matching_engine_v2_address: None,
+            perp_clearing_account_v2_address: None,
+            perps_active_engine_version: PerpsProtocolVersion::V1,
+            perps_v2_clearing_min_balance_raw: 0,
             backend_signer_mode: SignerBackendKind::LocalDev,
             backend_signer_endpoint: None,
             executor_allow_local_signer: false,
@@ -165,6 +220,125 @@ impl ExecutionConfig {
     pub fn broadcast_armed_for(&self, intent_id: &uuid::Uuid) -> bool {
         self.perps_closed_test_broadcast_armed
             && self.perps_closed_test_broadcast_intent_id.as_ref() == Some(intent_id)
+    }
+
+    /// PERPS_V2_BACKEND_COMPAT_FOUNDATION_V1 — treat an optional
+    /// address as "configured" only when present AND non-zero.
+    /// Prevents the well-known
+    /// `Some("0x0000…")` foot-gun that silently defaults through
+    /// `.parse()` chains and only surfaces at first RPC call.
+    fn address_is_configured(candidate: Option<&AccountId>) -> bool {
+        match candidate {
+            Some(address) => !address
+                .0.as_str()
+                .eq_ignore_ascii_case("0x0000000000000000000000000000000000000000"),
+            None => false,
+        }
+    }
+
+    /// PERPS_V2_BACKEND_COMPAT_FOUNDATION_V1 — resolve the
+    /// `PerpEngine` address that a *new* intent (created under the
+    /// current runtime configuration) MUST target. Returns V1 legacy
+    /// when active version is V1; returns V2 when active version is
+    /// V2 (or a `BackendError::Config` if V2 is active but its
+    /// address is unconfigured — but this state should be blocked
+    /// upstream by `validate_startup`).
+    pub fn active_perp_engine_address(&self) -> Result<&AccountId> {
+        match self.perps_active_engine_version {
+            PerpsProtocolVersion::V1 => Ok(&self.perp_engine_address),
+            PerpsProtocolVersion::V2 => self
+                .perp_engine_v2_address
+                .as_ref()
+                .filter(|addr| {
+                    !addr.0.as_str()
+                        .eq_ignore_ascii_case("0x0000000000000000000000000000000000000000")
+                })
+                .ok_or_else(|| {
+                    BackendError::Config(
+                        "PERPS_ACTIVE_ENGINE_VERSION=v2 requested but \
+                         PERP_ENGINE_V2_ADDRESS is unconfigured or zero"
+                            .to_string(),
+                    )
+                }),
+        }
+    }
+
+    /// PERPS_V2_BACKEND_COMPAT_FOUNDATION_V1 — resolve the
+    /// `PerpMatchingEngine` (EIP-712 `verifyingContract`) address for
+    /// *new* intents under the current runtime configuration. See
+    /// [`ExecutionConfig::active_perp_engine_address`].
+    pub fn active_perp_matching_engine_address(&self) -> Result<&AccountId> {
+        match self.perps_active_engine_version {
+            PerpsProtocolVersion::V1 => Ok(&self.perp_matching_engine_address),
+            PerpsProtocolVersion::V2 => self
+                .perp_matching_engine_v2_address
+                .as_ref()
+                .filter(|addr| {
+                    !addr.0.as_str()
+                        .eq_ignore_ascii_case("0x0000000000000000000000000000000000000000")
+                })
+                .ok_or_else(|| {
+                    BackendError::Config(
+                        "PERPS_ACTIVE_ENGINE_VERSION=v2 requested but \
+                         PERP_MATCHING_ENGINE_V2_ADDRESS is unconfigured or zero"
+                            .to_string(),
+                    )
+                }),
+        }
+    }
+
+    /// PERPS_V2_BACKEND_COMPAT_FOUNDATION_V1 — version-aware
+    /// address resolver used by historical / reconciliation reads
+    /// where the intent's persisted `protocol_version` is
+    /// authoritative (NOT the runtime active version). This is the
+    /// invariant that prevents a runtime flip from retargeting an
+    /// already-signed intent.
+    pub fn perp_engine_address_for(&self, version: PerpsProtocolVersion) -> Result<&AccountId> {
+        match version {
+            PerpsProtocolVersion::V1 => Ok(&self.perp_engine_address),
+            PerpsProtocolVersion::V2 => self
+                .perp_engine_v2_address
+                .as_ref()
+                .filter(|addr| {
+                    !addr.0.as_str()
+                        .eq_ignore_ascii_case("0x0000000000000000000000000000000000000000")
+                })
+                .ok_or_else(|| {
+                    BackendError::Config(
+                        "perp_engine_address_for(V2): \
+                         PERP_ENGINE_V2_ADDRESS is unconfigured or zero"
+                            .to_string(),
+                    )
+                }),
+        }
+    }
+
+    /// PERPS_V2_BACKEND_COMPAT_FOUNDATION_V1 — version-aware
+    /// verifying-contract resolver. Mirrors
+    /// [`ExecutionConfig::perp_engine_address_for`]; both are needed
+    /// so the intent's persisted version is authoritative even when
+    /// the runtime has flipped.
+    pub fn perp_matching_engine_address_for(
+        &self,
+        version: PerpsProtocolVersion,
+    ) -> Result<&AccountId> {
+        match version {
+            PerpsProtocolVersion::V1 => Ok(&self.perp_matching_engine_address),
+            PerpsProtocolVersion::V2 => self
+                .perp_matching_engine_v2_address
+                .as_ref()
+                .filter(|addr| {
+                    !addr.0.as_str()
+                        .eq_ignore_ascii_case("0x0000000000000000000000000000000000000000")
+                })
+                .ok_or_else(|| {
+                    BackendError::Config(
+                        "perp_matching_engine_address_for(V2): \
+                         PERP_MATCHING_ENGINE_V2_ADDRESS is unconfigured or zero"
+                            .to_string(),
+                    )
+                }),
+        }
     }
 
     pub fn validate_startup(&self, persistence_enabled: bool) -> Result<()> {
@@ -213,6 +387,66 @@ impl ExecutionConfig {
             return Err(BackendError::Config(
                 "EXECUTOR_CHAIN_ID must be greater than zero".to_string(),
             ));
+        }
+        // PERPS_V2_BACKEND_COMPAT_FOUNDATION_V1 — cross-version
+        // wiring guardrails. Flipping the runtime to V2 without the
+        // V2 contracts populated would let the executor emit
+        // signatures against `verifyingContract = 0x000…000` and
+        // eth_call a non-existent target; both fail closed at
+        // preflight, but startup should refuse the state up front so
+        // the operator can fix the env before any request lands.
+        if self.perps_active_engine_version == PerpsProtocolVersion::V2 {
+            if !Self::address_is_configured(self.perp_engine_v2_address.as_ref()) {
+                return Err(BackendError::Config(
+                    "PERPS_ACTIVE_ENGINE_VERSION=v2 requires \
+                     PERP_ENGINE_V2_ADDRESS=<non-zero>"
+                        .to_string(),
+                ));
+            }
+            if !Self::address_is_configured(self.perp_matching_engine_v2_address.as_ref()) {
+                return Err(BackendError::Config(
+                    "PERPS_ACTIVE_ENGINE_VERSION=v2 requires \
+                     PERP_MATCHING_ENGINE_V2_ADDRESS=<non-zero>"
+                        .to_string(),
+                ));
+            }
+            if !Self::address_is_configured(self.perp_clearing_account_v2_address.as_ref()) {
+                return Err(BackendError::Config(
+                    "PERPS_ACTIVE_ENGINE_VERSION=v2 requires \
+                     PERP_CLEARING_ACCOUNT_V2_ADDRESS=<non-zero>"
+                        .to_string(),
+                ));
+            }
+        }
+        // V1↔V2 addresses MUST be distinct. Silent collision would let
+        // a V2 intent target a V1 emitter (or vice versa) with
+        // matching domain separators — catastrophic replay surface.
+        if let Some(v2_engine) = self.perp_engine_v2_address.as_ref() {
+            if !v2_engine.0.as_str().eq_ignore_ascii_case("0x0000000000000000000000000000000000000000")
+                && v2_engine
+                    .0.as_str()
+                    .eq_ignore_ascii_case(self.perp_engine_address.0.as_str())
+            {
+                return Err(BackendError::Config(
+                    "PERP_ENGINE_V2_ADDRESS must not equal PERP_ENGINE_ADDRESS (V1); \
+                     collision would allow cross-version replay"
+                        .to_string(),
+                ));
+            }
+        }
+        if let Some(v2_pme) = self.perp_matching_engine_v2_address.as_ref() {
+            if !v2_pme.0.as_str().eq_ignore_ascii_case("0x0000000000000000000000000000000000000000")
+                && v2_pme
+                    .0.as_str()
+                    .eq_ignore_ascii_case(self.perp_matching_engine_address.0.as_str())
+            {
+                return Err(BackendError::Config(
+                    "PERP_MATCHING_ENGINE_V2_ADDRESS must not equal \
+                     PERP_MATCHING_ENGINE_ADDRESS (V1); collision would allow \
+                     cross-version replay"
+                        .to_string(),
+                ));
+            }
         }
         if self.simulation_enabled && self.rpc_url.is_none() {
             return Err(BackendError::Config(

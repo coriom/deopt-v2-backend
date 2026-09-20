@@ -139,6 +139,7 @@ mod tests {
             deadline_ms: Some(4_102_444_800_000),
             created_at_ms: 123,
             status: ExecutionIntentStatus::Pending,
+            protocol_version: crate::execution::perp_trade::PerpsProtocolVersion::V1,
         };
 
         let call = preview_perp_execution_call_from_intent(&intent, &target()).unwrap();
@@ -230,6 +231,7 @@ mod tests {
             deadline_ms: Some(4_102_444_800_000),
             created_at_ms: 123,
             status: ExecutionIntentStatus::Pending,
+            protocol_version: crate::execution::perp_trade::PerpsProtocolVersion::V1,
         }
     }
 

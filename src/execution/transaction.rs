@@ -525,6 +525,11 @@ mod tests {
             ),
             perp_engine_address: AccountId::new("0x0000000000000000000000000000000000000000"),
             old_perp_engine_address: None,
+        perp_engine_v2_address: None,
+        perp_matching_engine_v2_address: None,
+        perp_clearing_account_v2_address: None,
+        perps_active_engine_version: crate::execution::perp_trade::PerpsProtocolVersion::V1,
+        perps_v2_clearing_min_balance_raw: 0,
             backend_signer_mode: crate::execution::SignerBackendKind::LocalDev,
             backend_signer_endpoint: None,
             executor_allow_local_signer: false,
@@ -555,6 +560,7 @@ mod tests {
             deadline_ms: Some(4_102_444_800_000),
             created_at_ms: 123,
             status: ExecutionIntentStatus::SimulationOk,
+            protocol_version: crate::execution::perp_trade::PerpsProtocolVersion::V1,
         }
     }
 

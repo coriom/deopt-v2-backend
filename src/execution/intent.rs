@@ -1,4 +1,5 @@
 use crate::error::{BackendError, Result};
+use crate::execution::perp_trade::PerpsProtocolVersion;
 use crate::execution::{intent_id_to_b256, PerpTradePayload};
 use crate::types::{AccountId, MarketId, OrderId, Price1e8, Size1e8, TimestampMs};
 use serde::{Deserialize, Serialize};
@@ -71,6 +72,18 @@ pub struct ExecutionIntent {
     pub deadline_ms: Option<TimestampMs>,
     pub created_at_ms: TimestampMs,
     pub status: ExecutionIntentStatus,
+    /// PERPS_V2_BACKEND_COMPAT_FOUNDATION_V1 — settlement protocol
+    /// version this intent belongs to. Persisted as `TEXT` on
+    /// `execution_intents.protocol_version` (migration
+    /// `0064_execution_intents_protocol_version.sql`). All rows
+    /// created BEFORE the migration back-fill to
+    /// [`PerpsProtocolVersion::V1`] deterministically, matching the
+    /// live Base Sepolia V1 deployment. Post-cosign this field is
+    /// IMMUTABLE: it fixes the exact EIP-712 domain / typehash /
+    /// verifying contract the trader signed, and flipping the runtime
+    /// active-version MUST NOT retarget an already-signed intent.
+    #[serde(default)]
+    pub protocol_version: PerpsProtocolVersion,
 }
 
 impl ExecutionIntent {
@@ -168,6 +181,7 @@ mod tests {
             deadline_ms: Some(deadline_ms),
             created_at_ms: 1_789_000_000_000,
             status: ExecutionIntentStatus::CalldataReady,
+            protocol_version: crate::execution::perp_trade::PerpsProtocolVersion::V1,
         }
     }
 

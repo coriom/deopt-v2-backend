@@ -483,6 +483,12 @@ where
         deadline_ms: Some(deadline_shadow_ms),
         created_at_ms: now_ms_val,
         status: ExecutionIntentStatus::Pending,
+        // PERPS_V2_BACKEND_COMPAT_FOUNDATION_V1 — pin the intent to
+        // the runtime active version at prepare time. Once persisted
+        // this value is IMMUTABLE post-cosign: it fixes the exact
+        // EIP-712 domain + typehash + verifying contract the trader
+        // signed. A subsequent runtime flip MUST NOT retarget it.
+        protocol_version: state.execution_config.perps_active_engine_version,
     };
 
     Ok(PrepareOutcome {
@@ -1059,6 +1065,7 @@ mod tests {
             deadline_ms: Some(i64::try_from(payload.deadline.saturating_mul(1000)).unwrap()),
             created_at_ms: 1_700_000_000_000,
             status: crate::execution::ExecutionIntentStatus::Pending,
+            protocol_version: crate::execution::perp_trade::PerpsProtocolVersion::V1,
         }
     }
 

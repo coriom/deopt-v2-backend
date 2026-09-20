@@ -195,6 +195,48 @@ impl AppConfig {
             old_perp_engine_address: optional_env(&mut lookup, "OLD_PERP_ENGINE_ADDRESS")
                 .filter(|value| !value.is_empty())
                 .map(AccountId::new),
+            // PERPS_V2_BACKEND_COMPAT_FOUNDATION_V1 — versioned V2
+            // contract addresses. All three default `None`; startup
+            // refuses `PERPS_ACTIVE_ENGINE_VERSION=v2` unless all
+            // three are populated + distinct from their V1
+            // counterparts.
+            perp_engine_v2_address: optional_env(&mut lookup, "PERP_ENGINE_V2_ADDRESS")
+                .filter(|value| !value.is_empty())
+                .map(AccountId::new),
+            perp_matching_engine_v2_address: optional_env(
+                &mut lookup,
+                "PERP_MATCHING_ENGINE_V2_ADDRESS",
+            )
+            .filter(|value| !value.is_empty())
+            .map(AccountId::new),
+            perp_clearing_account_v2_address: optional_env(
+                &mut lookup,
+                "PERP_CLEARING_ACCOUNT_V2_ADDRESS",
+            )
+            .filter(|value| !value.is_empty())
+            .map(AccountId::new),
+            // Default V1 for backward compatibility with every existing
+            // deployment. Operator MUST set `v2` explicitly at cutover.
+            perps_active_engine_version: match optional_env(
+                &mut lookup,
+                "PERPS_ACTIVE_ENGINE_VERSION",
+            )
+            .filter(|value| !value.is_empty())
+            {
+                Some(raw) => crate::execution::perp_trade::PerpsProtocolVersion::parse(&raw)?,
+                None => crate::execution::perp_trade::PerpsProtocolVersion::V1,
+            },
+            perps_v2_clearing_min_balance_raw: {
+                let raw = optional_env(&mut lookup, "PERPS_V2_CLEARING_MIN_BALANCE_RAW")
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| "0".to_string());
+                raw.trim().parse::<u128>().map_err(|error| {
+                    crate::error::BackendError::Config(format!(
+                        "PERPS_V2_CLEARING_MIN_BALANCE_RAW must be a non-negative \
+                         integer (raw units): {error}"
+                    ))
+                })?
+            },
             backend_signer_mode: {
                 let endpoint = lookup("BACKEND_SIGNER_ENDPOINT").filter(|value| !value.is_empty());
                 match lookup("BACKEND_SIGNER_MODE").filter(|value| !value.is_empty()) {

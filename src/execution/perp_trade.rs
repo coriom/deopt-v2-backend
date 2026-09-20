@@ -2,7 +2,8 @@ use crate::error::{BackendError, Result};
 use crate::signing::eip712::{keccak256, parse_evm_address, EIP712_DOMAIN_TYPE};
 use crate::types::AccountId;
 use alloy_primitives::B256;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::fmt;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PerpTradePayload {
@@ -206,13 +207,133 @@ pub struct PerpTradeDomain {
 }
 
 impl PerpTradeDomain {
+    /// Legacy backward-compat constructor. Returns a V1 domain
+    /// (version = "1"). Callsites that predate the versioned config
+    /// still use this; new code SHOULD prefer
+    /// [`PerpTradeDomain::new_v1`] / [`PerpTradeDomain::new_v2`] /
+    /// [`PerpTradeDomain::for_version`] for grep-ability.
     pub fn new(chain_id: u64, verifying_contract: AccountId) -> Self {
+        Self::new_v1(chain_id, verifying_contract)
+    }
+
+    /// PERPS_V2_BACKEND_COMPAT_FOUNDATION_V1 — canonical V1 domain.
+    /// `verifying_contract` MUST be the V1 PerpMatchingEngine address.
+    /// Pairs with [`perp_trade_v1_digest`] / the 10-field
+    /// [`PERP_TRADE_V1_TYPE`].
+    pub fn new_v1(chain_id: u64, verifying_contract: AccountId) -> Self {
         Self {
             name: "DeOptV2-PerpMatchingEngine".to_string(),
             version: "1".to_string(),
             chain_id,
             verifying_contract,
         }
+    }
+
+    /// PERPS_V2_BACKEND_COMPAT_FOUNDATION_V1 — canonical V2 domain.
+    /// `verifying_contract` MUST be the V2 PerpMatchingEngineV2
+    /// address (distinct from V1). Pairs with [`perp_trade_v2_digest`]
+    /// / the 12-field [`PERP_TRADE_TYPE`]. The name/version pair
+    /// matches
+    /// `PerpMatchingEngineV2` `EIP712("DeOptV2-PerpMatchingEngine", "2")`
+    /// exactly; any drift means backend-generated V2 signatures will
+    /// NOT verify on the deployed V2 PME.
+    pub fn new_v2(chain_id: u64, verifying_contract: AccountId) -> Self {
+        Self {
+            name: "DeOptV2-PerpMatchingEngine".to_string(),
+            version: "2".to_string(),
+            chain_id,
+            verifying_contract,
+        }
+    }
+
+    /// PERPS_V2_BACKEND_COMPAT_FOUNDATION_V1 — version-aware
+    /// dispatcher. Callers holding a
+    /// [`PerpsProtocolVersion`] (typically read from a persisted
+    /// [`crate::execution::intent::ExecutionIntent::protocol_version`]
+    /// or the runtime active-version config) use this so digest
+    /// reconstruction cannot silently cross versions.
+    pub fn for_version(
+        version: PerpsProtocolVersion,
+        chain_id: u64,
+        verifying_contract: AccountId,
+    ) -> Self {
+        match version {
+            PerpsProtocolVersion::V1 => Self::new_v1(chain_id, verifying_contract),
+            PerpsProtocolVersion::V2 => Self::new_v2(chain_id, verifying_contract),
+        }
+    }
+}
+
+/// PERPS_V2_BACKEND_COMPAT_FOUNDATION_V1 — canonical Perps
+/// settlement protocol version tag. Persisted as `TEXT` on
+/// `execution_intents.protocol_version` with the exact wire strings
+/// [`PerpsProtocolVersion::as_persisted_str`]. Also drives EIP-712
+/// domain selection ([`PerpTradeDomain::for_version`]) and trade
+/// typehash selection ([`perp_trade_digest_for_version`]).
+///
+/// A persisted intent's version is IMMUTABLE post-cosign: it fixes
+/// the exact digest the trader signed. Changing the runtime
+/// `PERPS_ACTIVE_ENGINE_VERSION` MUST NOT retarget an already-signed
+/// intent — that would silently invalidate the trader's consent.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PerpsProtocolVersion {
+    V1,
+    V2,
+}
+
+impl PerpsProtocolVersion {
+    /// Persisted wire form. NEVER change — this is a DB-durable
+    /// value. Any rename breaks reconciliation of pre-existing
+    /// intents.
+    pub const fn as_persisted_str(self) -> &'static str {
+        match self {
+            Self::V1 => "perp_v1",
+            Self::V2 => "perp_v2",
+        }
+    }
+
+    /// EIP-712 domain `version` string as it appears in the domain
+    /// separator preimage. Deployed V1 PME uses `"1"`, V2 PME uses
+    /// `"2"`. Verified against the Solidity source of truth at
+    /// `PerpMatchingEngine.sol` / `PerpMatchingEngineV2.sol`
+    /// `constructor(...)` `EIP712(...)` call.
+    pub const fn domain_version_str(self) -> &'static str {
+        match self {
+            Self::V1 => "1",
+            Self::V2 => "2",
+        }
+    }
+
+    /// Parse from persisted string or operator env-var. Accepts the
+    /// canonical persisted form (`perp_v1` / `perp_v2`) plus short
+    /// aliases (`v1` / `v2`, `1` / `2`) for operator ergonomics.
+    /// Any other value fails closed with a
+    /// [`BackendError::Config`].
+    pub fn parse(raw: &str) -> Result<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "perp_v1" | "v1" | "1" => Ok(Self::V1),
+            "perp_v2" | "v2" | "2" => Ok(Self::V2),
+            other => Err(BackendError::Config(format!(
+                "unknown Perps protocol version: {other} \
+                 (expected one of: perp_v1, perp_v2)"
+            ))),
+        }
+    }
+}
+
+impl Default for PerpsProtocolVersion {
+    /// Historical default. Every persisted intent that predates the
+    /// `execution_intents.protocol_version` column back-fills to V1
+    /// (see migration `0064_execution_intents_protocol_version.sql`).
+    fn default() -> Self {
+        Self::V1
+    }
+}
+
+impl fmt::Display for PerpsProtocolVersion {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_persisted_str())
     }
 }
 
@@ -247,6 +368,91 @@ pub fn perp_trade_digest(payload: &PerpTradePayload, domain: &PerpTradeDomain) -
     encoded.extend_from_slice(&domain_separator);
     encoded.extend_from_slice(&trade_hash);
     Ok(hex_0x(&keccak256(&encoded)))
+}
+
+/// PERPS_V2_BACKEND_COMPAT_FOUNDATION_V1 — raw 32-byte digest for
+/// the V2 12-field PerpTrade. `domain` MUST be constructed via
+/// [`PerpTradeDomain::new_v2`] (version = "2"); a V1-versioned
+/// domain is refused with a [`BackendError::Config`] to prevent
+/// silent cross-version replay.
+pub fn perp_trade_v2_digest_bytes(
+    payload: &PerpTradePayload,
+    domain: &PerpTradeDomain,
+) -> Result<[u8; 32]> {
+    if domain.version != PerpsProtocolVersion::V2.domain_version_str() {
+        return Err(BackendError::Config(format!(
+            "perp_trade_v2_digest_bytes requires PerpTradeDomain::new_v2 \
+             (domain.version = \"2\"); got version = \"{}\"",
+            domain.version
+        )));
+    }
+    let domain_separator = domain_separator(domain)?;
+    let trade_hash = perp_trade_hash(payload)?;
+    let mut encoded = Vec::with_capacity(66);
+    encoded.extend_from_slice(b"\x19\x01");
+    encoded.extend_from_slice(&domain_separator);
+    encoded.extend_from_slice(&trade_hash);
+    Ok(keccak256(&encoded))
+}
+
+/// PERPS_V2_BACKEND_COMPAT_FOUNDATION_V1 — hex form of
+/// [`perp_trade_v2_digest_bytes`]. Same wire-lock guardrail applies.
+pub fn perp_trade_v2_digest(
+    payload: &PerpTradePayload,
+    domain: &PerpTradeDomain,
+) -> Result<String> {
+    Ok(hex_0x(&perp_trade_v2_digest_bytes(payload, domain)?))
+}
+
+/// PERPS_V2_BACKEND_COMPAT_FOUNDATION_V1 — version-aware digest
+/// dispatcher. Callers holding a persisted
+/// [`PerpsProtocolVersion`] (from an
+/// [`crate::execution::intent::ExecutionIntent`]) use this so the
+/// digest reconstruction path cannot silently cross versions.
+///
+/// The `domain` MUST have the matching version string; a mismatch
+/// (`version = V1 && domain.version = "2"`, or vice versa) fails
+/// closed with a [`BackendError::Config`].
+pub fn perp_trade_digest_for_version(
+    payload: &PerpTradePayload,
+    domain: &PerpTradeDomain,
+    version: PerpsProtocolVersion,
+) -> Result<String> {
+    if domain.version != version.domain_version_str() {
+        return Err(BackendError::Config(format!(
+            "perp_trade_digest_for_version({}) requires domain.version = \"{}\"; \
+             got version = \"{}\"",
+            version.as_persisted_str(),
+            version.domain_version_str(),
+            domain.version
+        )));
+    }
+    match version {
+        PerpsProtocolVersion::V1 => perp_trade_v1_digest(payload, domain),
+        PerpsProtocolVersion::V2 => perp_trade_v2_digest(payload, domain),
+    }
+}
+
+/// PERPS_V2_BACKEND_COMPAT_FOUNDATION_V1 — raw 32-byte version-aware
+/// digest dispatcher. See [`perp_trade_digest_for_version`].
+pub fn perp_trade_digest_bytes_for_version(
+    payload: &PerpTradePayload,
+    domain: &PerpTradeDomain,
+    version: PerpsProtocolVersion,
+) -> Result<[u8; 32]> {
+    if domain.version != version.domain_version_str() {
+        return Err(BackendError::Config(format!(
+            "perp_trade_digest_bytes_for_version({}) requires domain.version = \"{}\"; \
+             got version = \"{}\"",
+            version.as_persisted_str(),
+            version.domain_version_str(),
+            domain.version
+        )));
+    }
+    match version {
+        PerpsProtocolVersion::V1 => perp_trade_v1_digest_bytes(payload, domain),
+        PerpsProtocolVersion::V2 => perp_trade_v2_digest_bytes(payload, domain),
+    }
 }
 
 // ================================================================

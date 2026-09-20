@@ -295,6 +295,10 @@ pub async fn accept_quote(
         deadline_ms: Some(rfq.expires_at_ms.min(quote.expires_at_ms)),
         created_at_ms: now,
         status: ExecutionIntentStatus::Pending,
+        // PERPS_V2_BACKEND_COMPAT_FOUNDATION_V1 — RFQ acceptance
+        // creates a new execution intent at the runtime active
+        // version. Post-persistence this field is immutable.
+        protocol_version: state.execution_config.perps_active_engine_version,
     };
     let onchain_intent_id = intent_id_to_hex_bytes32(&intent.intent_id.to_string())?;
 

@@ -1300,7 +1300,7 @@ impl PgRepository {
         let rows = sqlx::query(
             "SELECT intent_id, onchain_intent_id, market_id, buyer, seller, price_1e8, size_1e8, \
              buy_order_id, sell_order_id, buyer_is_maker, buyer_nonce, seller_nonce, deadline_ms, \
-             status, created_at_ms, updated_at_ms \
+             status, created_at_ms, updated_at_ms, protocol_version \
              FROM execution_intents ORDER BY created_at_ms ASC, intent_id ASC",
         )
         .fetch_all(&self.pool)
@@ -1317,7 +1317,7 @@ impl PgRepository {
         let rows = sqlx::query(
             "SELECT intent_id, onchain_intent_id, market_id, buyer, seller, price_1e8, size_1e8, \
              buy_order_id, sell_order_id, buyer_is_maker, buyer_nonce, seller_nonce, deadline_ms, \
-             status, created_at_ms, updated_at_ms \
+             status, created_at_ms, updated_at_ms, protocol_version \
              FROM execution_intents \
              WHERE status = 'pending' \
              ORDER BY created_at_ms ASC, intent_id ASC \
@@ -1348,7 +1348,7 @@ impl PgRepository {
         let rows = sqlx::query(
             "SELECT intent_id, onchain_intent_id, market_id, buyer, seller, price_1e8, size_1e8, \
              buy_order_id, sell_order_id, buyer_is_maker, buyer_nonce, seller_nonce, deadline_ms, \
-             status, created_at_ms, updated_at_ms \
+             status, created_at_ms, updated_at_ms, protocol_version \
              FROM execution_intents \
              WHERE status IN ('pending', 'calldata_ready', 'simulation_ok') \
              ORDER BY created_at_ms ASC, intent_id ASC \
@@ -1565,7 +1565,7 @@ impl PgRepository {
             "SELECT ei.intent_id, ei.onchain_intent_id, ei.market_id, ei.buyer, ei.seller, \
              ei.price_1e8, ei.size_1e8, ei.buy_order_id, ei.sell_order_id, ei.buyer_is_maker, \
              ei.buyer_nonce, ei.seller_nonce, ei.deadline_ms, ei.status, ei.created_at_ms, \
-             ei.updated_at_ms \
+             ei.updated_at_ms, ei.protocol_version \
              FROM execution_intents ei \
              INNER JOIN execution_intent_broadcasts eib ON eib.intent_id = ei.intent_id \
              WHERE eib.status IN ('prepared', 'submitted') \
@@ -1729,7 +1729,7 @@ impl PgRepository {
         let row = sqlx::query(
             "SELECT intent_id, onchain_intent_id, market_id, buyer, seller, price_1e8, size_1e8, \
              buy_order_id, sell_order_id, buyer_is_maker, buyer_nonce, seller_nonce, deadline_ms, \
-             status, created_at_ms, updated_at_ms \
+             status, created_at_ms, updated_at_ms, protocol_version \
              FROM execution_intents WHERE intent_id = $1",
         )
         .bind(intent_id.to_string())
@@ -2297,7 +2297,7 @@ impl PgRepository {
         let rows = sqlx::query(
             "SELECT intent_id, onchain_intent_id, market_id, buyer, seller, price_1e8, size_1e8,
                     buy_order_id, sell_order_id, buyer_is_maker, buyer_nonce, seller_nonce,
-                    deadline_ms, status, created_at_ms, updated_at_ms
+                    deadline_ms, status, created_at_ms, updated_at_ms, protocol_version
              FROM execution_intents
              WHERE onchain_intent_id = $1
              ORDER BY created_at_ms ASC, intent_id ASC",
@@ -6321,8 +6321,8 @@ async fn insert_execution_intent(
         "INSERT INTO execution_intents (
             intent_id, onchain_intent_id, market_id, buyer, seller, price_1e8, size_1e8,
             buy_order_id, sell_order_id, buyer_is_maker, buyer_nonce, seller_nonce, deadline_ms,
-            status, created_at_ms, updated_at_ms
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
+            status, created_at_ms, updated_at_ms, protocol_version
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)",
     )
     .bind(&intent.intent_id)
     .bind(&intent.onchain_intent_id)
@@ -6340,6 +6340,7 @@ async fn insert_execution_intent(
     .bind(&intent.status)
     .bind(intent.created_at_ms)
     .bind(intent.updated_at_ms)
+    .bind(&intent.protocol_version)
     .execute(&mut **tx)
     .await
     .map_err(|error| BackendError::Persistence(error.to_string()))?;
@@ -6463,6 +6464,12 @@ fn db_execution_intent_from_row(row: PgRow) -> Result<DbExecutionIntent> {
         status: row_get(&row, "status")?,
         created_at_ms: row_get(&row, "created_at_ms")?,
         updated_at_ms: row_get(&row, "updated_at_ms")?,
+        // PERPS_V2_BACKEND_COMPAT_FOUNDATION_V1 —
+        // `execution_intents.protocol_version` (migration
+        // `0064_execution_intents_protocol_version.sql`). NOT NULL
+        // with DB-side default `perp_v1`; pre-migration rows
+        // back-fill to `perp_v1` deterministically.
+        protocol_version: row_get(&row, "protocol_version")?,
     })
 }
 

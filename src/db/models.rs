@@ -1,4 +1,5 @@
 use crate::error::{BackendError, Result};
+use crate::execution::perp_trade::PerpsProtocolVersion;
 use crate::execution::{
     intent_id_to_hex_bytes32, ExecutionIntent, ExecutionIntentStatus, SimulationResult,
 };
@@ -109,6 +110,14 @@ pub struct DbExecutionIntent {
     pub status: String,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+    /// PERPS_V2_BACKEND_COMPAT_FOUNDATION_V1 —
+    /// `execution_intents.protocol_version` column. Persisted as the
+    /// exact wire string returned by
+    /// [`PerpsProtocolVersion::as_persisted_str`] (`perp_v1` /
+    /// `perp_v2`). Non-null with default `perp_v1`; pre-migration
+    /// rows back-fill to `perp_v1`. See migration
+    /// `0064_execution_intents_protocol_version.sql`.
+    pub protocol_version: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -177,6 +186,7 @@ impl TryFrom<&ExecutionIntent> for DbExecutionIntent {
             status: execution_status_to_str(intent.status).to_string(),
             created_at_ms: intent.created_at_ms,
             updated_at_ms: intent.created_at_ms,
+            protocol_version: intent.protocol_version.as_persisted_str().to_string(),
         })
     }
 }
@@ -214,6 +224,7 @@ impl TryFrom<DbExecutionIntent> for ExecutionIntent {
             deadline_ms: value.deadline_ms,
             created_at_ms: value.created_at_ms,
             status: execution_status_from_str(&value.status)?,
+            protocol_version: PerpsProtocolVersion::parse(&value.protocol_version)?,
         })
     }
 }

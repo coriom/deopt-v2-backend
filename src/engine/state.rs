@@ -202,5 +202,12 @@ fn intent_from_trade(trade: &TradeMatch) -> ExecutionIntent {
         deadline_ms,
         created_at_ms: trade.created_at_ms,
         status: ExecutionIntentStatus::Pending,
+        // PERPS_V2_BACKEND_COMPAT_FOUNDATION_V1 — engine-created
+        // matched-trade intents default to V1. Runtime cutover uses
+        // the API prepare path (which reads
+        // `state.execution_config.perps_active_engine_version`); the
+        // matching engine itself remains V1-bound until an explicit
+        // V2 wiring milestone.
+        protocol_version: crate::execution::perp_trade::PerpsProtocolVersion::V1,
     }
 }
