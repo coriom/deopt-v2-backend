@@ -15702,8 +15702,7 @@ async fn perps_closed_test_prepare_trade(
         .map_err(ApiError::from)?
         .clone();
     let nonce_reader = crate::api::perps_cosign::RpcNonceReader::new(rpc.clone(), active_pme);
-    let mark_price_reader =
-        crate::api::perps_cosign::RpcMarkPriceReader::new(rpc, active_engine);
+    let mark_price_reader = crate::api::perps_cosign::RpcMarkPriceReader::new(rpc, active_engine);
     let outcome = crate::api::perps_cosign::prepare_trade_core(
         &state,
         &req,
@@ -15736,6 +15735,8 @@ async fn perps_closed_test_prepare_trade(
             market_id: outcome.payload.market_id.to_string(),
             size_delta_1e8: outcome.payload.size_delta_1e8.to_string(),
             execution_price_1e8: outcome.payload.execution_price_1e8.to_string(),
+            max_execution_price_1e8: outcome.payload.max_execution_price_1e8.to_string(),
+            min_execution_price_1e8: outcome.payload.min_execution_price_1e8.to_string(),
             buyer_is_maker: outcome.payload.buyer_is_maker,
             buyer_nonce: outcome.payload.buyer_nonce.to_string(),
             seller_nonce: outcome.payload.seller_nonce.to_string(),

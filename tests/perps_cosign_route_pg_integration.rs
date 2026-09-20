@@ -107,6 +107,8 @@ fn mk_request() -> PrepareTradeRequest {
         market_id: "1".to_string(),
         size_delta_1e8: "1000000".to_string(),
         buyer_is_maker: false,
+        max_execution_price_1e8: None,
+        min_execution_price_1e8: None,
     }
 }
 

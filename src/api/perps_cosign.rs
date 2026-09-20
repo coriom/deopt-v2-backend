@@ -239,7 +239,12 @@ pub const PREPARE_DEADLINE_TTL_MS: u128 = DEFAULT_PERPS_CLOSED_TEST_TRADE_TTL_SE
 /// * `sizeDelta1e8` — trade size (1e8 scale)
 /// * `buyerIsMaker` — maker-side hint (economic classification only;
 ///   the deployed V1 PME does not enforce a specific maker orientation)
-#[derive(Clone, Debug, Deserialize)]
+/// * `maxExecutionPrice1e8` / `minExecutionPrice1e8` — V2-only signed
+///   price bounds (optional). Omitted or `"0"` reproduces V1
+///   strict-price semantics. Under `PERPS_ACTIVE_ENGINE_VERSION=v1`
+///   both MUST be absent or `"0"`; a non-zero V1 request fails closed
+///   because the deployed V1 PME does not commit to the bounds.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct PrepareTradeRequest {
     pub buyer: String,
     pub seller: String,
@@ -251,9 +256,23 @@ pub struct PrepareTradeRequest {
     pub size_delta_1e8: String,
     #[serde(rename = "buyerIsMaker")]
     pub buyer_is_maker: bool,
+    /// Optional V2 upper price bound (decimal string, 1e8 scale). See struct docs.
+    #[serde(
+        rename = "maxExecutionPrice1e8",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_execution_price_1e8: Option<String>,
+    /// Optional V2 lower price bound (decimal string, 1e8 scale). See struct docs.
+    #[serde(
+        rename = "minExecutionPrice1e8",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub min_execution_price_1e8: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PrepareTradeResponse {
     /// UUID v4 assigned by the backend for this prepared trade. Both
     /// signatures MUST be submitted against this exact UUID.
@@ -273,7 +292,7 @@ pub struct PrepareTradeResponse {
     pub trade: FrozenTradeEcho,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FrozenTradeEcho {
     pub buyer: String,
     pub seller: String,
@@ -283,6 +302,12 @@ pub struct FrozenTradeEcho {
     pub size_delta_1e8: String,
     #[serde(rename = "executionPrice1e8")]
     pub execution_price_1e8: String,
+    /// V2 upper bound (1e8 scale). `"0"` for V1 or unbounded V2.
+    #[serde(rename = "maxExecutionPrice1e8")]
+    pub max_execution_price_1e8: String,
+    /// V2 lower bound (1e8 scale). `"0"` for V1 or unbounded V2.
+    #[serde(rename = "minExecutionPrice1e8")]
+    pub min_execution_price_1e8: String,
     #[serde(rename = "buyerIsMaker")]
     pub buyer_is_maker: bool,
     #[serde(rename = "buyerNonce")]
@@ -382,6 +407,42 @@ where
         ));
     }
 
+    // ---- V2 optional price bounds (min/max) ----
+    //
+    // Parse optional caller-supplied bounds. Under
+    // `PERPS_ACTIVE_ENGINE_VERSION=v1` any non-zero bound fails
+    // closed: the deployed V1 PME does not commit to the bounds in
+    // its EIP-712 typehash, so persisting a non-zero V1 row would
+    // create a malformed intent that
+    // `ExecutionIntent::validate_version_invariants` refuses to
+    // reload. Under V2 the bounds are trader-signed and passed
+    // through unchanged; `min == 0` disables the lower bound,
+    // `max == 0` disables the upper bound (matches
+    // `PerpTradePayload::validate` semantics).
+    let parse_bound = |raw: &Option<String>, field: &str| -> Result<u128> {
+        match raw.as_deref() {
+            None => Ok(0),
+            Some(s) => s
+                .trim()
+                .parse::<u128>()
+                .map_err(|_| BackendError::Config(format!("invalid {field} decimal string: {s}"))),
+        }
+    };
+    let max_execution_price_1e8 =
+        parse_bound(&req.max_execution_price_1e8, "maxExecutionPrice1e8")?;
+    let min_execution_price_1e8 =
+        parse_bound(&req.min_execution_price_1e8, "minExecutionPrice1e8")?;
+    if state.execution_config.perps_active_engine_version
+        == crate::execution::perp_trade::PerpsProtocolVersion::V1
+        && (max_execution_price_1e8 != 0 || min_execution_price_1e8 != 0)
+    {
+        return Err(BackendError::Config(
+            "V1 prepare must not carry non-zero maxExecutionPrice1e8 / minExecutionPrice1e8; \
+             deployed V1 PME does not commit to these fields"
+                .to_string(),
+        ));
+    }
+
     // ---- Backend-owned PME nonces ----
     //
     // Read the authoritative nonces from
@@ -422,9 +483,11 @@ where
     let intent_id_hex = crate::execution::intent_id_to_hex_bytes32(&uuid.to_string())?;
     let intent_id_b256 = intent_id_to_b256(&uuid.to_string())?;
 
-    // Build the 10-field payload. Note the max/min bounds are set to
-    // 0 (not encoded by the V1 digest / calldata) — the deployed V1
-    // PerpTrade has no such fields.
+    // Build the 12-field payload. `max_execution_price_1e8` and
+    // `min_execution_price_1e8` are 0 for V1 (invariant enforced
+    // above); for V2 they carry the trader-signed bounds. The V2
+    // digest / calldata encoder consume the bounds; the V1 encoder
+    // ignores them (see `perp_trade_v1_digest`).
     let payload = PerpTradePayload::new(
         intent_id_b256,
         buyer.clone(),
@@ -432,8 +495,8 @@ where
         market_id,
         size_delta_1e8,
         execution_price_1e8,
-        0,
-        0,
+        max_execution_price_1e8,
+        min_execution_price_1e8,
         req.buyer_is_maker,
         buyer_nonce,
         seller_nonce,
@@ -662,7 +725,7 @@ fn build_typed_data_v2(
 // PHASE B — COSIGN
 // ================================================================
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CosignTradeRequest {
     #[serde(rename = "buyerSignature")]
     pub buyer_signature: String,
@@ -670,7 +733,7 @@ pub struct CosignTradeRequest {
     pub seller_signature: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CosignTradeResponse {
     pub uuid: String,
     #[serde(rename = "intentId")]
@@ -1515,6 +1578,8 @@ mod tests {
             market_id: "1".to_string(),
             size_delta_1e8: "1000000".to_string(),
             buyer_is_maker: false,
+            max_execution_price_1e8: None,
+            min_execution_price_1e8: None,
         }
     }
 
