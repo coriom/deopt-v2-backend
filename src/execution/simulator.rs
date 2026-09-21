@@ -37,11 +37,13 @@ pub async fn simulate_execution_intent<P>(
 where
     P: EthCallProvider,
 {
-    let call = build_perp_execution_call_from_intent(
-        intent,
-        &config.perp_matching_engine_address,
-        signatures,
-    )?;
+    // PERPS_V2_BACKEND_ANVIL_BROADCAST_E2E_V1 §1 — dispatch the
+    // simulation target from the intent's persisted
+    // `protocol_version`, NEVER the runtime active version. A V1
+    // simulation must hit the V1 PME; a V2 simulation must hit the
+    // V2 PME. This is the same invariant as the broadcast target.
+    let target = config.perp_matching_engine_address_for(intent.protocol_version)?;
+    let call = build_perp_execution_call_from_intent(intent, target, signatures)?;
     simulate_prepared_call(provider, &config.executor_from_address, call).await
 }
 

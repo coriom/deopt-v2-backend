@@ -207,11 +207,17 @@ where
             policy.config.executor_chain_id
         )));
     }
-    // PME state
+    // PERPS_V2_BACKEND_ANVIL_BROADCAST_E2E_V1 §1 — preflight the
+    // ACTIVE version's PME (the one new intents will target). If
+    // `PERPS_ACTIVE_ENGINE_VERSION=v2`, preflight the V2 PME
+    // executor authorization/pause; if V1, preflight V1. Never
+    // hardcode the V1 field here, or a V2 boot would silently
+    // validate the wrong engine and mask a mis-authorized executor.
+    let active_pme = policy.config.active_perp_matching_engine_address()?;
     let pme_state = crate::execution::broadcast_policy::preflight_pme_state(
         &policy.rpc,
         &policy.config.executor_from_address,
-        &policy.config.perp_matching_engine_address,
+        active_pme,
     )
     .await?;
     if !pme_state.is_executor {
@@ -228,7 +234,8 @@ where
     info!(
         chain_id = rpc_chain_id,
         executor = %policy.config.executor_from_address.0,
-        pme = %policy.config.perp_matching_engine_address.0,
+        active_version = %policy.config.perps_active_engine_version.as_persisted_str(),
+        pme = %active_pme.0,
         "startup preflight OK"
     );
     Ok(())

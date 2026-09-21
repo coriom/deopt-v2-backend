@@ -417,6 +417,17 @@ where
         // owns this safety property. Reads `PerpEngine.getMarkPrice`
         // via the same RPC that will broadcast the trade. Fails
         // closed on: RPC error, mark == 0, drift > configured cap.
+        //
+        // PERPS_V2_BACKEND_ANVIL_BROADCAST_E2E_V1 §1 — dispatch the
+        // engine `to` address from the intent's persisted
+        // `protocol_version`, NEVER the V1-only `perp_engine_address`
+        // field. Otherwise a V2 intent would drift-check against the
+        // wrong engine (V1 EOA placeholder / stale contract) and
+        // either revert or silently pass the wrong oracle read.
+        let engine_for_intent = self
+            .config
+            .perp_engine_address_for(intent.protocol_version)?
+            .clone();
         let market_id_u128 = u128::from(intent.market_id);
         let current_mark = {
             let mut data = Vec::with_capacity(4 + 32);
@@ -427,8 +438,8 @@ where
             let out = self
                 .rpc
                 .eth_call(EthCallRequest {
-                    from: self.config.perp_engine_address.clone(),
-                    to: self.config.perp_engine_address.clone(),
+                    from: engine_for_intent.clone(),
+                    to: engine_for_intent.clone(),
                     data,
                     value: 0,
                     gas_limit: None,
