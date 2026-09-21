@@ -1,3 +1,4 @@
+use crate::execution::perp_trade::PerpsProtocolVersion;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
@@ -42,4 +43,20 @@ pub struct IndexedPerpTrade {
     pub seller_nonce: String,
     #[serde(rename = "createdAtMs")]
     pub created_at_ms: i64,
+    /// PERPS_V2_BACKEND_RECONCILIATION_V1 §12–14 — settlement
+    /// generation this indexed trade belongs to. Derived from the
+    /// log's `address` (emitter), NEVER from a runtime config
+    /// value. V1 and V2 emit BYTE-IDENTICAL `TradeExecuted`
+    /// signatures, so the emitter address is the sole disambiguator
+    /// and must be stamped onto every persisted row so mixed
+    /// replays cannot cross-attribute a fill.
+    #[serde(rename = "protocolVersion", default)]
+    pub protocol_version: PerpsProtocolVersion,
+    /// PERPS_V2_BACKEND_RECONCILIATION_V1 §12–14 — the exact
+    /// emitter contract this log came from (lower-case hex).
+    /// Persisted alongside `protocol_version` so audit can
+    /// reconstruct which PME deployment produced the fill even
+    /// if the address book later changes.
+    #[serde(rename = "emitterAddress", default)]
+    pub emitter_address: String,
 }

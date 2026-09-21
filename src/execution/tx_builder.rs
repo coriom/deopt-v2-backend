@@ -1,5 +1,6 @@
 use crate::error::Result;
-use crate::execution::abi::encode_execute_trade_calldata;
+use crate::execution::abi::{encode_execute_trade_calldata, encode_execute_trade_calldata_for_version};
+use crate::execution::perp_trade::PerpsProtocolVersion;
 use crate::execution::{
     ExecutionIntent, PerpTradePayload, PerpTradeSignatureBundle, StoredTradeSignatures,
 };
@@ -21,6 +22,12 @@ pub struct PreparedExecutionCall {
     pub calldata: Vec<u8>,
     pub is_broadcastable: bool,
     pub missing_signatures: bool,
+    /// PERPS_V2_BACKEND_RECONCILIATION_V1 §3 — settlement
+    /// generation this prepared call was built for. Consumers
+    /// that persist the call (broadcast policy) MUST propagate
+    /// this into `PreparedTransactionRecord.protocol_version`
+    /// unchanged.
+    pub protocol_version: PerpsProtocolVersion,
 }
 
 pub fn build_perp_execution_call(
@@ -29,11 +36,47 @@ pub fn build_perp_execution_call(
     payload: &PerpTradePayload,
     signatures: Option<&PerpTradeSignatureBundle>,
 ) -> Result<PreparedExecutionCall> {
+    // Legacy V1-only entry point retained for existing tests and
+    // callers that hand-build a `PerpTradePayload`. New code
+    // MUST use [`build_perp_execution_call_for_version`] so the
+    // calldata encoder is dispatched from the intent's persisted
+    // protocol_version, not the runtime active version.
+    build_perp_execution_call_for_version(
+        target,
+        intent_id,
+        payload,
+        signatures,
+        PerpsProtocolVersion::V1,
+    )
+}
+
+/// PERPS_V2_BACKEND_RECONCILIATION_V1 §3 — version-dispatched
+/// call builder. Selects the executeTrade / executeTradeV2
+/// selector + tuple layout from the caller-provided version. The
+/// caller (broadcast policy) MUST pass the intent's *persisted*
+/// `protocol_version`, NEVER the runtime active version.
+pub fn build_perp_execution_call_for_version(
+    target: &AccountId,
+    intent_id: Uuid,
+    payload: &PerpTradePayload,
+    signatures: Option<&PerpTradeSignatureBundle>,
+    protocol_version: PerpsProtocolVersion,
+) -> Result<PreparedExecutionCall> {
     parse_evm_address(target)?;
     payload.validate()?;
 
     let (calldata, missing_signatures) = match signatures {
-        Some(signatures) => (encode_execute_trade_calldata(payload, signatures)?, false),
+        Some(signatures) => (
+            match protocol_version {
+                PerpsProtocolVersion::V1 => encode_execute_trade_calldata(payload, signatures)?,
+                PerpsProtocolVersion::V2 => encode_execute_trade_calldata_for_version(
+                    payload,
+                    signatures,
+                    PerpsProtocolVersion::V2,
+                )?,
+            },
+            false,
+        ),
         None => (Vec::new(), true),
     };
 
@@ -48,6 +91,7 @@ pub fn build_perp_execution_call(
         calldata,
         is_broadcastable: false,
         missing_signatures,
+        protocol_version,
     })
 }
 
@@ -70,9 +114,16 @@ pub fn preview_perp_execution_call_from_intent(
         calldata: Vec::new(),
         is_broadcastable: false,
         missing_signatures: true,
+        protocol_version: intent.protocol_version,
     })
 }
 
+/// PERPS_V2_BACKEND_RECONCILIATION_V1 §3 — dispatch the calldata
+/// encoder from `intent.protocol_version` (persisted), NEVER
+/// from the runtime active version. The caller MUST also pass
+/// `target = ExecutionConfig::perp_matching_engine_address_for(
+/// intent.protocol_version)` so the intent's persisted generation
+/// selects both the tuple layout AND the on-chain `to`.
 pub fn build_perp_execution_call_from_intent(
     intent: &ExecutionIntent,
     target: &AccountId,
@@ -82,7 +133,13 @@ pub fn build_perp_execution_call_from_intent(
         return preview_perp_execution_call_from_intent(intent, target);
     };
     let payload = intent.perp_trade_payload()?;
-    build_perp_execution_call(target, intent.intent_id, &payload, Some(&bundle))
+    build_perp_execution_call_for_version(
+        target,
+        intent.intent_id,
+        &payload,
+        Some(&bundle),
+        intent.protocol_version,
+    )
 }
 
 #[cfg(test)]

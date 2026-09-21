@@ -180,6 +180,14 @@ pub trait ExecutionIntentRepository: Clone + Send + Sync {
 
 /// Durable broadcast record persisted by
 /// [`ExecutionIntentRepository::record_prepared_transaction`].
+///
+/// PERPS_V2_BACKEND_RECONCILIATION_V1 §2, §5 — `protocol_version`
+/// and `expected_emitter` freeze the settlement generation identity
+/// at prepare time. Every downstream correlation (receipt
+/// verification, indexer classification, rebroadcast) MUST read
+/// from these persisted fields rather than the runtime
+/// `PERPS_ACTIVE_ENGINE_VERSION`; otherwise a runtime cutover
+/// could retarget an already-prepared row.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PreparedTransactionRecord {
     pub intent_id: Uuid,
@@ -190,12 +198,28 @@ pub struct PreparedTransactionRecord {
     pub nonce: u64,
     pub raw_tx_hex: String,
     pub prepared_at_ms: TimestampMs,
+    /// PERPS_V2_BACKEND_RECONCILIATION_V1 §2 — the settlement
+    /// generation (`perp_v1` | `perp_v2`) this row was prepared
+    /// against. Immutable post-insert.
+    pub protocol_version: crate::execution::perp_trade::PerpsProtocolVersion,
+    /// PERPS_V2_BACKEND_RECONCILIATION_V1 §5 — the exact PME
+    /// address the reconciler expects to see in receipt logs.
+    /// Persisted separately from `target_address` so a future
+    /// `to != emitter` topology can be represented; today they
+    /// are equal for PerpMatchingEngine calls.
+    pub expected_emitter: crate::types::AccountId,
 }
 
 /// Row shape returned by
 /// [`ExecutionIntentRepository::get_prepared_broadcast`]. Provides the
 /// exact byte-identical raw envelope so reconciliation can rebroadcast
 /// without allocating a new nonce or building a different transaction.
+///
+/// PERPS_V2_BACKEND_RECONCILIATION_V1 §2, §5 — `protocol_version`
+/// and `expected_emitter` are the persisted generation identity.
+/// The reconciler MUST correlate receipts against `expected_emitter`
+/// (not runtime config) so a runtime `PERPS_ACTIVE_ENGINE_VERSION`
+/// flip cannot retarget an already-prepared row.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PreparedBroadcastRow {
     pub intent_id: Uuid,
@@ -216,6 +240,12 @@ pub struct PreparedBroadcastRow {
     pub failure_class: Option<String>,
     pub failure_reason: Option<String>,
     pub failed_at_ms: Option<TimestampMs>,
+    /// PERPS_V2_BACKEND_RECONCILIATION_V1 §2 — persisted settlement
+    /// generation. Authoritative for downstream dispatch.
+    pub protocol_version: crate::execution::perp_trade::PerpsProtocolVersion,
+    /// PERPS_V2_BACKEND_RECONCILIATION_V1 §5 — persisted expected
+    /// receipt emitter. Authoritative for receipt correlation.
+    pub expected_emitter: crate::types::AccountId,
 }
 
 #[derive(Clone)]
@@ -263,17 +293,21 @@ where
                 .repository
                 .get_execution_intent_signatures(intent.intent_id)
                 .await?;
+            // PERPS_V2_BACKEND_RECONCILIATION_V1 §3 — even the
+            // dry-run preview must resolve its target from the
+            // intent's PERSISTED `protocol_version` so a V2 intent
+            // previewed against a V1-active runtime shows the V2
+            // PME (not silently V1). Falls back to the V1 address
+            // if the intent is V1 (which is the historical
+            // behaviour byte-for-byte).
+            let target = self
+                .config
+                .perp_matching_engine_address_for(intent.protocol_version)?
+                .clone();
             let prepared_call = (if signatures.calldata_ready() {
-                build_perp_execution_call_from_intent(
-                    intent,
-                    &self.config.perp_matching_engine_address,
-                    &signatures,
-                )
+                build_perp_execution_call_from_intent(intent, &target, &signatures)
             } else {
-                preview_perp_execution_call_from_intent(
-                    intent,
-                    &self.config.perp_matching_engine_address,
-                )
+                preview_perp_execution_call_from_intent(intent, &target)
             })?;
             info!(
                 intent_id = %intent.intent_id,

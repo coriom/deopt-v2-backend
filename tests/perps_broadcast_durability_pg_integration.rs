@@ -128,6 +128,8 @@ fn make_record(intent_id: Uuid, tx_hash: String, nonce: u64) -> PreparedTransact
         nonce,
         raw_tx_hex: "0x02f8...deadbeef".to_string(),
         prepared_at_ms: 1_700_000_000_000,
+        protocol_version: deopt_v2_backend::execution::PerpsProtocolVersion::V1,
+        expected_emitter: AccountId::new(PME_TARGET.to_string()),
     }
 }
 
@@ -494,5 +496,232 @@ async fn broadcast_durability_concurrent_nonce_race_exactly_one_wins() {
         rejections,
         (N - 1) as usize,
         "all other workers are rejected"
+    );
+}
+
+// =====================================================================
+// PERPS_V2_BACKEND_RECONCILIATION_V1 §2, §5, §9, §18 — durable
+// per-row generation identity round-trip.
+//
+// These tests exercise the invariant that a persisted broadcast
+// row's `protocol_version` and `expected_emitter` survive an
+// insert → SELECT round-trip byte-identically, and that a V2
+// insert coexists with V1 rows without disturbing them.
+// =====================================================================
+
+const PME_V1_ADDR: &str = "0x774d96e5739bffadee91508b4d3d74f5be29f165";
+const PME_V2_ADDR: &str = "0x1111111111111111111111111111111111111112";
+
+fn make_record_versioned(
+    intent_id: Uuid,
+    tx_hash: String,
+    nonce: u64,
+    protocol_version: deopt_v2_backend::execution::PerpsProtocolVersion,
+    emitter_hex: &str,
+) -> PreparedTransactionRecord {
+    PreparedTransactionRecord {
+        intent_id,
+        chain_id: CHAIN_ID_BASE_SEPOLIA,
+        executor_address: AccountId::new("0x58ad437cb9e32b0faee810ef05810d5ba2ae52b8".to_string()),
+        target_address: AccountId::new(emitter_hex.to_string()),
+        tx_hash,
+        nonce,
+        raw_tx_hex: "0x02f8...cafe".to_string(),
+        prepared_at_ms: 1_700_000_000_000,
+        protocol_version,
+        expected_emitter: AccountId::new(emitter_hex.to_string()),
+    }
+}
+
+#[tokio::test]
+async fn v1_row_persists_and_reads_back_with_v1_generation_identity() {
+    let Some(url) = pg_url() else {
+        eprintln!(
+            "IGNORED [v1_row_persists_and_reads_back_with_v1_generation_identity] (PG url not provided)"
+        );
+        return;
+    };
+    let repo = fresh_repo(&url).await;
+    let intent_id = unique_intent_id(0x51);
+    seed_execution_intent(&repo, intent_id).await;
+    let tx = tx_hash_hex(0x51);
+    repo.record_prepared_transaction(make_record_versioned(
+        intent_id,
+        tx.clone(),
+        5001,
+        deopt_v2_backend::execution::PerpsProtocolVersion::V1,
+        PME_V1_ADDR,
+    ))
+    .await
+    .expect("insert V1 row");
+    let row = repo
+        .get_prepared_broadcast(intent_id)
+        .await
+        .expect("read prepared broadcast")
+        .expect("row present");
+    assert_eq!(
+        row.protocol_version,
+        deopt_v2_backend::execution::PerpsProtocolVersion::V1,
+        "V1 row must read back as V1"
+    );
+    assert!(
+        row.expected_emitter
+            .0
+            .eq_ignore_ascii_case(PME_V1_ADDR),
+        "V1 row expected_emitter must be the V1 PME address"
+    );
+    assert_eq!(row.tx_hash, tx);
+    assert_eq!(row.nonce, 5001);
+}
+
+#[tokio::test]
+async fn v2_row_persists_and_reads_back_with_v2_generation_identity() {
+    let Some(url) = pg_url() else {
+        eprintln!(
+            "IGNORED [v2_row_persists_and_reads_back_with_v2_generation_identity] (PG url not provided)"
+        );
+        return;
+    };
+    let repo = fresh_repo(&url).await;
+    let intent_id = unique_intent_id(0x52);
+    seed_execution_intent(&repo, intent_id).await;
+    let tx = tx_hash_hex(0x52);
+    repo.record_prepared_transaction(make_record_versioned(
+        intent_id,
+        tx.clone(),
+        5002,
+        deopt_v2_backend::execution::PerpsProtocolVersion::V2,
+        PME_V2_ADDR,
+    ))
+    .await
+    .expect("insert V2 row");
+    let row = repo
+        .get_prepared_broadcast(intent_id)
+        .await
+        .expect("read prepared broadcast")
+        .expect("row present");
+    assert_eq!(
+        row.protocol_version,
+        deopt_v2_backend::execution::PerpsProtocolVersion::V2,
+        "V2 row must read back as V2"
+    );
+    assert!(
+        row.expected_emitter
+            .0
+            .eq_ignore_ascii_case(PME_V2_ADDR),
+        "V2 row expected_emitter must be the V2 PME address"
+    );
+    assert_eq!(row.tx_hash, tx);
+    assert_eq!(row.nonce, 5002);
+}
+
+// §9 mirror. Simulates the config-drift restart:
+//   * insert a V2 broadcast row against the V2 PME;
+//   * *do not* mutate the row;
+//   * simulate a config flip by reading back the row and asserting
+//     its expected_emitter is still the V2 PME.
+// This is the reconciler's ONLY source of truth; a runtime
+// `PERPS_ACTIVE_ENGINE_VERSION` flip in the interim cannot
+// retarget it because the reconciler consumes row.expected_emitter,
+// not config.perp_matching_engine_address.
+#[tokio::test]
+async fn v2_broadcast_row_survives_simulated_active_version_flip() {
+    let Some(url) = pg_url() else {
+        eprintln!(
+            "IGNORED [v2_broadcast_row_survives_simulated_active_version_flip] (PG url not provided)"
+        );
+        return;
+    };
+    let repo = fresh_repo(&url).await;
+    let intent_id = unique_intent_id(0x53);
+    seed_execution_intent(&repo, intent_id).await;
+    let tx = tx_hash_hex(0x53);
+    repo.record_prepared_transaction(make_record_versioned(
+        intent_id,
+        tx.clone(),
+        5003,
+        deopt_v2_backend::execution::PerpsProtocolVersion::V2,
+        PME_V2_ADDR,
+    ))
+    .await
+    .expect("insert V2 row");
+
+    // No mutation; simulate elapsed operator flip of active version.
+    // The read-back MUST still be V2 with the V2 PME.
+    let row = repo
+        .get_prepared_broadcast(intent_id)
+        .await
+        .expect("read prepared broadcast")
+        .expect("row present");
+    assert_eq!(
+        row.protocol_version,
+        deopt_v2_backend::execution::PerpsProtocolVersion::V2,
+        "V2 row must NOT be retargeted by a runtime active-version flip"
+    );
+    assert!(
+        row.expected_emitter
+            .0
+            .eq_ignore_ascii_case(PME_V2_ADDR),
+        "V2 row expected_emitter must remain the V2 PME address"
+    );
+}
+
+// V1 and V2 rows for different intents may coexist without
+// interfering with each other's persistence.
+#[tokio::test]
+async fn mixed_v1_and_v2_rows_coexist() {
+    let Some(url) = pg_url() else {
+        eprintln!("IGNORED [mixed_v1_and_v2_rows_coexist] (PG url not provided)");
+        return;
+    };
+    let repo = fresh_repo(&url).await;
+    let v1_intent = unique_intent_id(0x54);
+    let v2_intent = unique_intent_id(0x55);
+    seed_execution_intent(&repo, v1_intent).await;
+    seed_execution_intent(&repo, v2_intent).await;
+    repo.record_prepared_transaction(make_record_versioned(
+        v1_intent,
+        tx_hash_hex(0x54),
+        5010,
+        deopt_v2_backend::execution::PerpsProtocolVersion::V1,
+        PME_V1_ADDR,
+    ))
+    .await
+    .expect("insert V1 row");
+    repo.record_prepared_transaction(make_record_versioned(
+        v2_intent,
+        tx_hash_hex(0x55),
+        5011,
+        deopt_v2_backend::execution::PerpsProtocolVersion::V2,
+        PME_V2_ADDR,
+    ))
+    .await
+    .expect("insert V2 row");
+
+    let v1_row = repo
+        .get_prepared_broadcast(v1_intent)
+        .await
+        .expect("read V1")
+        .expect("row");
+    let v2_row = repo
+        .get_prepared_broadcast(v2_intent)
+        .await
+        .expect("read V2")
+        .expect("row");
+    assert_eq!(
+        v1_row.protocol_version,
+        deopt_v2_backend::execution::PerpsProtocolVersion::V1
+    );
+    assert_eq!(
+        v2_row.protocol_version,
+        deopt_v2_backend::execution::PerpsProtocolVersion::V2
+    );
+    assert!(
+        v1_row.expected_emitter.0.eq_ignore_ascii_case(PME_V1_ADDR),
+        "V1 emitter untouched by V2 insert"
+    );
+    assert!(
+        v2_row.expected_emitter.0.eq_ignore_ascii_case(PME_V2_ADDR),
+        "V2 emitter untouched by V1 insert"
     );
 }

@@ -320,6 +320,15 @@ impl AppConfig {
             require_persistence: parse_env(&mut lookup, "INDEXER_REQUIRE_PERSISTENCE", "true")?,
             rpc_url: execution.rpc_url.clone(),
             perp_matching_engine_address: execution.perp_matching_engine_address.clone(),
+            // PERPS_V2_BACKEND_RECONCILIATION_V1 §12–14 — thread the
+            // executor's V2 PME address (when configured) into the
+            // indexer so a mixed V1/V2 event stream can be ingested
+            // in one pass. Left `None` in single-emitter deployments;
+            // the indexer's multi-address filter downgrades to a
+            // single-address filter transparently.
+            perp_matching_engine_v2_address: execution
+                .perp_matching_engine_v2_address
+                .clone(),
         };
         let reconciliation = ReconciliationConfig {
             enabled: parse_env(&mut lookup, "RECONCILIATION_ENABLED", "false")?,

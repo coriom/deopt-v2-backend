@@ -86,6 +86,7 @@ pub use transaction::{
     ExecutionTransactionStatus,
 };
 pub use tx_builder::{
-    build_perp_execution_call, build_perp_execution_call_from_intent,
-    preview_perp_execution_call_from_intent, PreparedExecutionCall,
+    build_perp_execution_call, build_perp_execution_call_for_version,
+    build_perp_execution_call_from_intent, preview_perp_execution_call_from_intent,
+    PreparedExecutionCall,
 };

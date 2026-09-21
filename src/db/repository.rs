@@ -1491,8 +1491,9 @@ impl PgRepository {
             "INSERT INTO execution_intent_broadcasts (
                 intent_id, chain_id, executor_address, target_address,
                 tx_hash, nonce, raw_tx_hex, status,
-                prepared_at_ms, send_attempts, updated_at_ms
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'prepared', $8, 0, $8)",
+                prepared_at_ms, send_attempts, updated_at_ms,
+                protocol_version, expected_emitter
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'prepared', $8, 0, $8, $9, $10)",
         )
         .bind(record.intent_id.to_string())
         .bind(chain_id_i64)
@@ -1502,6 +1503,8 @@ impl PgRepository {
         .bind(nonce_i64)
         .bind(&record.raw_tx_hex)
         .bind(timestamp_to_i64(record.prepared_at_ms))
+        .bind(record.protocol_version.as_persisted_str())
+        .bind(&record.expected_emitter.0)
         .execute(&mut *tx)
         .await;
 
@@ -1553,7 +1556,8 @@ impl PgRepository {
             "SELECT intent_id, chain_id, executor_address, target_address, tx_hash, nonce, \
              raw_tx_hex, status, prepared_at_ms, first_submission_at_ms, last_send_at_ms, \
              send_attempts, receipt_block_number, receipt_status, confirmed_at_ms, \
-             failure_class, failure_reason, failed_at_ms \
+             failure_class, failure_reason, failed_at_ms, \
+             protocol_version, expected_emitter \
              FROM execution_intent_broadcasts WHERE intent_id = $1",
         )
         .bind(intent_id.to_string())
@@ -1866,7 +1870,8 @@ impl PgRepository {
         let rows = sqlx::query(
             "SELECT event_id, tx_hash, log_index, block_number, block_hash, buyer, seller,
                     onchain_intent_id, market_id, size_delta_1e8, execution_price_1e8,
-                    buyer_is_maker, buyer_nonce, seller_nonce, created_at_ms
+                    buyer_is_maker, buyer_nonce, seller_nonce, created_at_ms,
+                    protocol_version, emitter_address
              FROM indexed_perp_trades
              ORDER BY block_number DESC, log_index DESC
              LIMIT $1",
@@ -1886,7 +1891,8 @@ impl PgRepository {
         let rows = sqlx::query(
             "SELECT event_id, tx_hash, log_index, block_number, block_hash, buyer, seller,
                     onchain_intent_id, market_id, size_delta_1e8, execution_price_1e8,
-                    buyer_is_maker, buyer_nonce, seller_nonce, created_at_ms
+                    buyer_is_maker, buyer_nonce, seller_nonce, created_at_ms,
+                    protocol_version, emitter_address
              FROM indexed_perp_trades indexed
              WHERE indexed.onchain_intent_id IS NOT NULL
                AND NOT EXISTS (
@@ -2329,7 +2335,8 @@ impl PgRepository {
         let rows = sqlx::query(
             "SELECT event_id, tx_hash, log_index, block_number, block_hash, buyer, seller,
                     onchain_intent_id, market_id, size_delta_1e8, execution_price_1e8,
-                    buyer_is_maker, buyer_nonce, seller_nonce, created_at_ms
+                    buyer_is_maker, buyer_nonce, seller_nonce, created_at_ms,
+                    protocol_version, emitter_address
              FROM indexed_perp_trades
              WHERE onchain_intent_id = $1
              ORDER BY block_number ASC, log_index ASC",
@@ -2634,7 +2641,7 @@ impl PgRepository {
             "SELECT t.event_id, t.tx_hash, t.log_index, t.block_number, t.block_hash,
                     t.buyer, t.seller, t.onchain_intent_id, t.market_id, t.size_delta_1e8,
                     t.execution_price_1e8, t.buyer_is_maker, t.buyer_nonce, t.seller_nonce,
-                    t.created_at_ms
+                    t.created_at_ms, t.protocol_version, t.emitter_address
              FROM execution_reconciliations r
              JOIN indexed_perp_trades t ON t.event_id = r.indexed_event_id
              WHERE r.intent_id = $1
@@ -6169,12 +6176,19 @@ async fn insert_indexed_perp_trade(
     // chain-scoped composite so cross-chain (tx_hash, log_index)
     // reuse is legitimately deduplicated per chain instead of blocked
     // globally.
+    // PERPS_V2_BACKEND_RECONCILIATION_V1 §12–14 — persist the
+    // per-row generation identity alongside the trade. `protocol_version`
+    // and `emitter_address` are authoritative for all downstream
+    // reads; the DB CHECK on `protocol_version` fails a corrupt
+    // value closed.
     let result = sqlx::query(
         "INSERT INTO indexed_perp_trades (
             event_id, tx_hash, log_index, block_number, block_hash, buyer, seller,
             onchain_intent_id, market_id, size_delta_1e8, execution_price_1e8, buyer_is_maker,
-            buyer_nonce, seller_nonce, created_at_ms, chain_id
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+            buyer_nonce, seller_nonce, created_at_ms, chain_id,
+            protocol_version, emitter_address
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
+                  $17, $18)
         ON CONFLICT (chain_id, tx_hash, log_index) DO NOTHING",
     )
     .bind(&trade.event_id)
@@ -6193,6 +6207,8 @@ async fn insert_indexed_perp_trade(
     .bind(&trade.seller_nonce)
     .bind(timestamp_to_i64(trade.created_at_ms))
     .bind(u64_to_i64("chain_id", chain_id)?)
+    .bind(trade.protocol_version.as_persisted_str())
+    .bind(&trade.emitter_address)
     .execute(&mut **tx)
     .await
     .map_err(|error| BackendError::Persistence(error.to_string()))?;
@@ -6493,6 +6509,22 @@ fn indexed_perp_trade_from_row(row: PgRow) -> Result<IndexedPerpTrade> {
     let log_index: i64 = row_get(&row, "log_index")?;
     let block_number: i64 = row_get(&row, "block_number")?;
     let onchain_intent_id: Option<String> = row_get(&row, "onchain_intent_id")?;
+    // PERPS_V2_BACKEND_RECONCILIATION_V1 §12–14, §19 — the
+    // per-row generation columns added by migration 0067. Fail
+    // closed on any unknown persisted value (DB CHECK already
+    // enforces the domain; a parse error here means schema drift
+    // or a manual mutation).
+    let protocol_version_str: String = row_get(&row, "protocol_version")?;
+    let protocol_version = crate::execution::perp_trade::PerpsProtocolVersion::parse(
+        &protocol_version_str,
+    )
+    .map_err(|error| {
+        BackendError::Persistence(format!(
+            "indexed_perp_trades.protocol_version {protocol_version_str:?} \
+             is not a known settlement generation — refusing to reinterpret ({error})"
+        ))
+    })?;
+    let emitter_address: String = row_get(&row, "emitter_address")?;
     Ok(IndexedPerpTrade {
         event_id: row_get(&row, "event_id")?,
         tx_hash: row_get(&row, "tx_hash")?,
@@ -6511,6 +6543,8 @@ fn indexed_perp_trade_from_row(row: PgRow) -> Result<IndexedPerpTrade> {
         buyer_nonce: row_get(&row, "buyer_nonce")?,
         seller_nonce: row_get(&row, "seller_nonce")?,
         created_at_ms: row_get(&row, "created_at_ms")?,
+        protocol_version,
+        emitter_address,
     })
 }
 
@@ -9918,6 +9952,24 @@ fn prepared_broadcast_row_from_pg(row: PgRow) -> Result<PreparedBroadcastRow> {
     let failure_class: Option<String> = row_get(&row, "failure_class")?;
     let failure_reason: Option<String> = row_get(&row, "failure_reason")?;
     let failed_at_ms: Option<i64> = row_get(&row, "failed_at_ms")?;
+    let protocol_version_str: String = row_get(&row, "protocol_version")?;
+    let expected_emitter: String = row_get(&row, "expected_emitter")?;
+
+    // PERPS_V2_BACKEND_RECONCILIATION_V1 §19 — fail closed on
+    // any unknown persisted protocol_version. The DB CHECK
+    // constraint already prevents inserts of other values, so a
+    // parse error here means either a schema drift or a manual
+    // mutation; either way this row must NOT be silently
+    // reinterpreted as V1.
+    let protocol_version = crate::execution::perp_trade::PerpsProtocolVersion::parse(
+        &protocol_version_str,
+    )
+    .map_err(|error| {
+        BackendError::Persistence(format!(
+            "execution_intent_broadcasts.protocol_version {protocol_version_str:?} \
+             is not a known settlement generation — refusing to reinterpret ({error})"
+        ))
+    })?;
 
     Ok(PreparedBroadcastRow {
         intent_id,
@@ -9940,5 +9992,7 @@ fn prepared_broadcast_row_from_pg(row: PgRow) -> Result<PreparedBroadcastRow> {
         failure_class,
         failure_reason,
         failed_at_ms,
+        protocol_version,
+        expected_emitter: crate::types::AccountId::new(expected_emitter),
     })
 }

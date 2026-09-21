@@ -1,9 +1,21 @@
 use super::events::{EthLog, IndexedPerpTrade};
 use crate::error::{BackendError, Result};
+use crate::execution::perp_trade::PerpsProtocolVersion;
 use crate::signing::eip712::keccak256;
 use crate::types::now_ms;
 use alloy_primitives::U256;
 
+/// PERPS_V2_BACKEND_RECONCILIATION_V1 §6, §23 — V1 and V2 emit
+/// BYTE-IDENTICAL `TradeExecuted` signatures. Both PerpMatchingEngine
+/// contracts declare an event with the same 9-parameter shape, so
+/// their `topic0` (keccak256 of the signature) is identical. See:
+///   - `deopt-v2-sol/src/matching/PerpMatchingEngine.sol:39`
+///   - `deopt-v2-sol/src/matching/PerpMatchingEngineV2.sol:50`
+/// Because topic0 alone cannot distinguish V1 from V2, the
+/// **emitter address is the sole generation boundary**. Every
+/// indexed row MUST carry the derived `protocol_version` — a
+/// downstream consumer that reads only topic0 would silently
+/// cross-attribute a V2 fill to V1 (and vice versa).
 pub const TRADE_EXECUTED_SIGNATURE: &str =
     "TradeExecuted(bytes32,address,address,uint256,uint128,uint128,bool,uint256,uint256)";
 
@@ -11,7 +23,35 @@ pub fn trade_executed_topic0() -> String {
     hex_0x(&keccak256(TRADE_EXECUTED_SIGNATURE.as_bytes()))
 }
 
+/// Legacy V1-only decode entry point. Retained for pre-existing
+/// tests / callers that do not (yet) have a way to classify the
+/// emitter. New code MUST use
+/// [`decode_trade_executed_log_for_emitter`] so `protocol_version`
+/// is derived from the log's emitter address and NOT silently
+/// defaulted to V1.
 pub fn decode_trade_executed_log(log: &EthLog) -> Result<IndexedPerpTrade> {
+    decode_trade_executed_log_with_version(log, PerpsProtocolVersion::V1)
+}
+
+/// PERPS_V2_BACKEND_RECONCILIATION_V1 §12–14 — the caller
+/// (typically the indexer runner) classifies the log's emitter
+/// against the (V1, V2) address pair from `IndexerConfig` and
+/// passes the resolved `PerpsProtocolVersion` here so it can be
+/// stamped onto the persisted row. An emitter that matches
+/// neither the V1 nor the V2 address must never reach this
+/// function — the runner is responsible for filtering `eth_getLogs`
+/// to the configured address set before calling in.
+pub fn decode_trade_executed_log_for_emitter(
+    log: &EthLog,
+    protocol_version: PerpsProtocolVersion,
+) -> Result<IndexedPerpTrade> {
+    decode_trade_executed_log_with_version(log, protocol_version)
+}
+
+fn decode_trade_executed_log_with_version(
+    log: &EthLog,
+    protocol_version: PerpsProtocolVersion,
+) -> Result<IndexedPerpTrade> {
     if log.topics.len() != 4 {
         return Err(BackendError::Indexer(
             "TradeExecuted log must have four topics".to_string(),
@@ -51,7 +91,32 @@ pub fn decode_trade_executed_log(log: &EthLog) -> Result<IndexedPerpTrade> {
         buyer_nonce: decode_data_u256(&data, 4)?.to_string(),
         seller_nonce: decode_data_u256(&data, 5)?.to_string(),
         created_at_ms: now_ms(),
+        protocol_version,
+        emitter_address: log.address.to_ascii_lowercase(),
     })
+}
+
+/// PERPS_V2_BACKEND_RECONCILIATION_V1 §12–14 — resolve a
+/// `PerpsProtocolVersion` from a log emitter address by matching
+/// against the configured V1 / V2 PME addresses. Comparison is
+/// case-insensitive (EIP-55 mixed-case is tolerated). Returns
+/// `None` if the emitter matches neither — the caller MUST fail
+/// closed rather than defaulting.
+pub fn classify_emitter(
+    emitter_hex: &str,
+    v1_pme: &str,
+    v2_pme: Option<&str>,
+) -> Option<PerpsProtocolVersion> {
+    let emitter_lower = emitter_hex.trim().to_ascii_lowercase();
+    if emitter_lower == v1_pme.trim().to_ascii_lowercase() {
+        return Some(PerpsProtocolVersion::V1);
+    }
+    if let Some(v2) = v2_pme {
+        if emitter_lower == v2.trim().to_ascii_lowercase() {
+            return Some(PerpsProtocolVersion::V2);
+        }
+    }
+    None
 }
 
 fn required_field<'a>(value: Option<&'a String>, field: &str) -> Result<&'a String> {
@@ -156,6 +221,86 @@ mod tests {
             trade_executed_topic0(),
             "0x5018a0a73d56c00e01815636cf5e029fd7ed9440d42b3eea0e75404dfedb3f80"
         );
+    }
+
+    // PERPS_V2_BACKEND_RECONCILIATION_V1 §12–14 — classify_emitter
+    // is the sole disambiguator between V1 and V2 logs (topic0 is
+    // identical, see §6/§23). These tests pin the case-insensitive
+    // matching semantics and the fail-closed None return.
+    #[test]
+    fn classify_emitter_matches_v1() {
+        let v = classify_emitter(
+            "0xAAAABBBBAAAABBBBAAAABBBBAAAABBBBAAAABBBB",
+            "0xaaaabbbbaaaabbbbaaaabbbbaaaabbbbaaaabbbb",
+            Some("0x1111111111111111111111111111111111111111"),
+        );
+        assert_eq!(v, Some(PerpsProtocolVersion::V1));
+    }
+
+    #[test]
+    fn classify_emitter_matches_v2() {
+        let v = classify_emitter(
+            "0x1111111111111111111111111111111111111111",
+            "0xaaaabbbbaaaabbbbaaaabbbbaaaabbbbaaaabbbb",
+            Some("0x1111111111111111111111111111111111111111"),
+        );
+        assert_eq!(v, Some(PerpsProtocolVersion::V2));
+    }
+
+    #[test]
+    fn classify_emitter_fails_closed_on_unknown() {
+        // Emitter matches neither V1 nor V2: must return None so
+        // the caller fails closed (skips the row) rather than
+        // defaulting to V1.
+        let v = classify_emitter(
+            "0x9999999999999999999999999999999999999999",
+            "0xaaaabbbbaaaabbbbaaaabbbbaaaabbbbaaaabbbb",
+            Some("0x1111111111111111111111111111111111111111"),
+        );
+        assert_eq!(v, None);
+    }
+
+    #[test]
+    fn classify_emitter_returns_none_when_v2_unconfigured_and_emitter_differs() {
+        let v = classify_emitter(
+            "0x1111111111111111111111111111111111111111",
+            "0xaaaabbbbaaaabbbbaaaabbbbaaaabbbbaaaabbbb",
+            None,
+        );
+        assert_eq!(v, None);
+    }
+
+    // Decoder tags the persisted row with the caller-supplied
+    // protocol_version + normalized emitter (lower-case hex).
+    #[test]
+    fn decoder_stamps_persisted_generation_and_emitter() {
+        let emitter_mixed = "0xAaAaBbBbAaAaBbBbAaAaBbBbAaAaBbBbAaAaBbBb";
+        let log = EthLog {
+            address: emitter_mixed.to_string(),
+            topics: vec![
+                trade_executed_topic0(),
+                word(1),
+                topic_address("0000000000000000000000000000000000000001"),
+                topic_address("0000000000000000000000000000000000000002"),
+            ],
+            data: format!(
+                "0x{}{}{}{}{}{}",
+                word_no_prefix(1),
+                word_no_prefix(1),
+                word_no_prefix(1),
+                word_no_prefix(0),
+                word_no_prefix(0),
+                word_no_prefix(0),
+            ),
+            block_number: Some("0x1".to_string()),
+            block_hash: None,
+            transaction_hash: Some("0xa".to_string()),
+            log_index: Some("0x0".to_string()),
+        };
+        let trade = decode_trade_executed_log_for_emitter(&log, PerpsProtocolVersion::V2)
+            .expect("decode ok");
+        assert_eq!(trade.protocol_version, PerpsProtocolVersion::V2);
+        assert_eq!(trade.emitter_address, emitter_mixed.to_ascii_lowercase());
     }
 
     #[test]

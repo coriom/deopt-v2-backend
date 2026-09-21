@@ -349,11 +349,21 @@ where
             )));
         }
 
+        // PERPS_V2_BACKEND_RECONCILIATION_V1 §3, §5 — resolve the
+        // PME address from the intent's PERSISTED protocol_version,
+        // NEVER from the runtime active version. Both preflight
+        // reads and the target-address the request will encode
+        // now branch off the same intent-authoritative source.
+        let pme_for_intent = self
+            .config
+            .perp_matching_engine_address_for(intent.protocol_version)?
+            .clone();
+
         // PME on-chain state guard.
         let pme_state = preflight_pme_state(
             &self.rpc,
             &self.config.executor_from_address,
-            &self.config.perp_matching_engine_address,
+            &pme_for_intent,
         )
         .await?;
         if !pme_state.is_executor {
@@ -469,16 +479,26 @@ where
         // safe — the reconciler recovers by rebroadcasting the
         // byte-identical raw_hex (same nonce, same tx_hash) or
         // observing a receipt already produced by an earlier attempt.
+        // PERPS_V2_BACKEND_RECONCILIATION_V1 §2, §5 — freeze the
+        // settlement generation identity onto the durable row.
+        // `target_address` and `expected_emitter` are equal here
+        // (the executor's `to` is the PME that emits the
+        // settlement event), but persisting them as distinct
+        // columns keeps the receipt-correlation contract explicit
+        // and keeps the door open for a future `to != emitter`
+        // topology (e.g. a router).
         repository
             .record_prepared_transaction(PreparedTransactionRecord {
                 intent_id: intent.intent_id,
                 chain_id: self.config.executor_chain_id,
                 executor_address: self.config.executor_from_address.clone(),
-                target_address: self.config.perp_matching_engine_address.clone(),
+                target_address: pme_for_intent.clone(),
                 tx_hash: tx_hash.clone(),
                 nonce,
                 raw_tx_hex: raw_hex.clone(),
                 prepared_at_ms: now_ms(),
+                protocol_version: intent.protocol_version,
+                expected_emitter: pme_for_intent.clone(),
             })
             .await?;
         repository
@@ -574,8 +594,15 @@ where
         let receipt = self.poll_receipt(&tx_hash).await?;
         match receipt {
             Some(receipt) => {
-                self.finalize_receipt(repository, intent.intent_id, &tx_hash, nonce, receipt)
-                    .await
+                self.finalize_receipt(
+                    repository,
+                    intent.intent_id,
+                    &tx_hash,
+                    nonce,
+                    &pme_for_intent,
+                    receipt,
+                )
+                .await
             }
             None => Ok(BroadcastOutcome {
                 intent_id: intent.intent_id,
@@ -604,6 +631,7 @@ where
         intent_id: Uuid,
         expected_tx_hash: &str,
         nonce: u64,
+        expected_emitter: &AccountId,
         receipt: ConfirmationReceipt,
     ) -> Result<BroadcastOutcome>
     where
@@ -630,10 +658,12 @@ where
             Some(1) => {
                 // Semantic PME event verification. `receipt.status = 1`
                 // alone is NOT sufficient — the tx must have emitted an
-                // expected PME settlement event from the configured PME
-                // address. Without this check a status=1 tx that
-                // executed on a non-PME target could be mistaken for a
-                // confirmed fill.
+                // expected PME settlement event from the persisted
+                // per-row emitter (§5). Without this check a status=1
+                // tx that executed on a non-PME target could be
+                // mistaken for a confirmed fill, and a runtime
+                // active-version flip could not re-target the
+                // correlation surface.
                 if self.verify_pme_event {
                     // Identity binding: derive the expected on-chain
                     // intentId from the persisted intent_id (Uuid) and
@@ -644,7 +674,7 @@ where
                     };
                     if let Err(err) = verify_pme_event_in_receipt(
                         &receipt,
-                        &self.config.perp_matching_engine_address,
+                        expected_emitter,
                         &expected_identity,
                     ) {
                         let error = format!("semantic_event_verification: {err}");
@@ -738,6 +768,13 @@ where
             // Receipt-first: even a `Prepared` row may have been mined
             // by a prior lifecycle — we always check the chain before
             // rebroadcasting.
+            //
+            // PERPS_V2_BACKEND_RECONCILIATION_V1 §5, §8 — the
+            // expected receipt emitter comes from the PERSISTED row
+            // (`row.expected_emitter`), never from runtime config.
+            // This makes the reconciler generation-safe: a runtime
+            // `PERPS_ACTIVE_ENGINE_VERSION` flip between prepare and
+            // reconcile cannot retarget an already-broadcast row.
             match self.rpc.transaction_receipt(row.tx_hash.clone()).await? {
                 Some(receipt) => {
                     let outcome = self
@@ -746,6 +783,7 @@ where
                             intent.intent_id,
                             &row.tx_hash,
                             row.nonce,
+                            &row.expected_emitter,
                             receipt,
                         )
                         .await?;
@@ -1337,6 +1375,9 @@ mod tests {
                 failure_class: None,
                 failure_reason: None,
                 failed_at_ms: None,
+                protocol_version:
+                    crate::execution::perp_trade::PerpsProtocolVersion::V1,
+                expected_emitter: AccountId::new(String::from(PME)),
             };
             self.submitted_tx.lock().unwrap().insert(intent_id, row);
         }
@@ -1427,6 +1468,8 @@ mod tests {
                 failure_class: None,
                 failure_reason: None,
                 failed_at_ms: None,
+                protocol_version: record.protocol_version,
+                expected_emitter: record.expected_emitter,
             };
             self.submitted_tx
                 .lock()
@@ -2932,6 +2975,266 @@ mod tests {
         assert_eq!(
             sent_final, 1,
             "subsequent ticks must not create a second NEW raw transaction"
+        );
+    }
+
+    // ================================================================
+    // PERPS_V2_BACKEND_RECONCILIATION_V1 — generation-safety tests
+    //
+    // These tests exercise the invariant that a persisted broadcast
+    // row is IMMUTABLY bound to the settlement generation it was
+    // prepared against. A runtime `PERPS_ACTIVE_ENGINE_VERSION` flip
+    // between prepare and reconcile cannot retarget the row.
+    //
+    // Test index (numbered against §21):
+    //   T3.  V1 receipt with V1 emitter → accepted
+    //   T4.  V2 receipt with V2 emitter → accepted (via emitter binding)
+    //   T7/T8. V2 intent with V1 emitter log → rejected (topic0 IDENTICAL
+    //         between V1 and V2, so emitter is the sole generation
+    //         boundary — see §6/§23)
+    //   T9.  V1 intent with V2 emitter log → rejected
+    //   T10. Correct emitter but wrong intentId → rejected
+    //   T11. Correct emitter but wrong topic0 → rejected
+    //   T12. Correct emitter but receipt.status=0 → failed (rejected)
+    // ================================================================
+
+    const PME_V2: &str = "0x1111111111111111111111111111111111111112";
+
+    fn hex_encode_local(bytes: &[u8]) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut out = String::with_capacity(bytes.len() * 2);
+        for b in bytes {
+            out.push(HEX[(b >> 4) as usize] as char);
+            out.push(HEX[(b & 0x0f) as usize] as char);
+        }
+        out
+    }
+
+    fn topic_hex_local(bytes: &[u8; 32]) -> String {
+        format!("0x{}", hex_encode_local(bytes))
+    }
+
+    fn topic_from_intent(intent_id: Uuid) -> String {
+        topic_hex_local(&expected_intent_hash_from_uuid(intent_id))
+    }
+
+    fn pad_address(addr: &str) -> String {
+        let stripped = addr.trim_start_matches("0x");
+        format!("0x{}{}", "0".repeat(64 - stripped.len()), stripped)
+    }
+
+    fn well_formed_pme_log(
+        emitter: &str,
+        topic0: &[u8; 32],
+        intent_id: Uuid,
+    ) -> crate::confirmation::ReceiptLog {
+        crate::confirmation::ReceiptLog {
+            address: emitter.to_ascii_lowercase(),
+            topics: vec![
+                topic_hex_local(topic0),
+                topic_from_intent(intent_id),
+                pad_address("0x0000000000000000000000000000000000000001"),
+                pad_address("0x0000000000000000000000000000000000000002"),
+            ],
+            data: format!("0x{}", "0".repeat(64 * 6)),
+        }
+    }
+
+    fn make_receipt_with_log(
+        tx_hash: &str,
+        status: Option<u64>,
+        log: crate::confirmation::ReceiptLog,
+    ) -> ConfirmationReceipt {
+        ConfirmationReceipt {
+            tx_hash: tx_hash.to_string(),
+            status,
+            block_number: Some(999),
+            gas_used: None,
+            effective_gas_price: None,
+            cumulative_gas_used: None,
+            block_hash: Some("0xblock".to_string()),
+            transaction_index: None,
+            logs: vec![log],
+        }
+    }
+
+    // T3. V1 identity + V1 emitter + correct topic0 + correct intentId → OK.
+    #[test]
+    fn v1_receipt_accepts_v1_emitter_with_correct_identity() {
+        let intent_id = Uuid::from_u128(0xa1);
+        let identity = ExpectedExecutionIdentity::PreMatchedIntent {
+            intent_id: expected_intent_hash_from_uuid(intent_id),
+        };
+        let log = well_formed_pme_log(PME, &PME_TRADE_EXECUTED_TOPIC0, intent_id);
+        let receipt = make_receipt_with_log("0xtx", Some(1), log);
+        verify_pme_event_in_receipt(&receipt, &AccountId::new(PME.to_string()), &identity)
+            .expect("V1 emitter + V1 identity must be accepted");
+    }
+
+    // T4. V2 identity + V2 emitter + correct topic0 + correct intentId → OK.
+    // Because V1 and V2 TradeExecuted signatures are IDENTICAL (see
+    // §6/§23), the emitter address is the sole generation boundary.
+    #[test]
+    fn v2_receipt_accepts_v2_emitter_with_correct_identity() {
+        let intent_id = Uuid::from_u128(0xa2);
+        let identity = ExpectedExecutionIdentity::PreMatchedIntent {
+            intent_id: expected_intent_hash_from_uuid(intent_id),
+        };
+        let log = well_formed_pme_log(PME_V2, &PME_TRADE_EXECUTED_TOPIC0, intent_id);
+        let receipt = make_receipt_with_log("0xtx", Some(1), log);
+        verify_pme_event_in_receipt(&receipt, &AccountId::new(PME_V2.to_string()), &identity)
+            .expect("V2 emitter + V2 identity must be accepted");
+    }
+
+    // T7/T8. V2 expected emitter, log from V1 emitter → rejected. This
+    // is the CORE invariant of §5. Because V1/V2 topic0 is identical,
+    // omitting the emitter check would silently confirm the wrong
+    // generation.
+    #[test]
+    fn v2_receipt_rejects_v1_emitter_with_otherwise_correct_log() {
+        let intent_id = Uuid::from_u128(0xb2);
+        let identity = ExpectedExecutionIdentity::PreMatchedIntent {
+            intent_id: expected_intent_hash_from_uuid(intent_id),
+        };
+        // Log emits from V1 PME with matching topic0 + matching intentId.
+        let log = well_formed_pme_log(PME, &PME_TRADE_EXECUTED_TOPIC0, intent_id);
+        let receipt = make_receipt_with_log("0xtx", Some(1), log);
+        let err = verify_pme_event_in_receipt(
+            &receipt,
+            &AccountId::new(PME_V2.to_string()),
+            &identity,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, BackendError::BroadcastRejected(ref reason) if reason.contains("no matching PME event")),
+            "V2 expected emitter must refuse a V1-emitted log (got: {err:?})"
+        );
+    }
+
+    // T9. V1 expected emitter, log from V2 emitter → rejected.
+    #[test]
+    fn v1_receipt_rejects_v2_emitter_with_otherwise_correct_log() {
+        let intent_id = Uuid::from_u128(0xb1);
+        let identity = ExpectedExecutionIdentity::PreMatchedIntent {
+            intent_id: expected_intent_hash_from_uuid(intent_id),
+        };
+        let log = well_formed_pme_log(PME_V2, &PME_TRADE_EXECUTED_TOPIC0, intent_id);
+        let receipt = make_receipt_with_log("0xtx", Some(1), log);
+        let err = verify_pme_event_in_receipt(
+            &receipt,
+            &AccountId::new(PME.to_string()),
+            &identity,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, BackendError::BroadcastRejected(ref reason) if reason.contains("no matching PME event")),
+            "V1 expected emitter must refuse a V2-emitted log (got: {err:?})"
+        );
+    }
+
+    // T10. Correct emitter + correct topic0, but the log's intentId
+    // topic disagrees with the expected identity → rejected.
+    #[test]
+    fn correct_emitter_wrong_intent_id_rejected() {
+        let expected_intent = Uuid::from_u128(0xcc);
+        let unrelated_intent = Uuid::from_u128(0xdd);
+        let identity = ExpectedExecutionIdentity::PreMatchedIntent {
+            intent_id: expected_intent_hash_from_uuid(expected_intent),
+        };
+        let log = well_formed_pme_log(PME_V2, &PME_TRADE_EXECUTED_TOPIC0, unrelated_intent);
+        let receipt = make_receipt_with_log("0xtx", Some(1), log);
+        let err = verify_pme_event_in_receipt(
+            &receipt,
+            &AccountId::new(PME_V2.to_string()),
+            &identity,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, BackendError::BroadcastRejected(ref reason) if reason.contains("identity mismatch")),
+            "emitter+topic0 match but wrong intentId must fail with identity_mismatch (got: {err:?})"
+        );
+    }
+
+    // T11. Correct emitter, correct intentId, but topic0 disagrees →
+    // rejected. Exercised with a synthetic distinct topic0.
+    #[test]
+    fn correct_emitter_wrong_topic0_rejected() {
+        let intent_id = Uuid::from_u128(0xee);
+        let identity = ExpectedExecutionIdentity::PreMatchedIntent {
+            intent_id: expected_intent_hash_from_uuid(intent_id),
+        };
+        let mut wrong_topic0 = PME_TRADE_EXECUTED_TOPIC0;
+        wrong_topic0[0] ^= 0xff; // definitely distinct.
+        let log = well_formed_pme_log(PME_V2, &wrong_topic0, intent_id);
+        let receipt = make_receipt_with_log("0xtx", Some(1), log);
+        let err = verify_pme_event_in_receipt(
+            &receipt,
+            &AccountId::new(PME_V2.to_string()),
+            &identity,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, BackendError::BroadcastRejected(ref reason) if reason.contains("no matching PME event")),
+            "wrong topic0 must be refused even if emitter+identity are correct (got: {err:?})"
+        );
+    }
+
+    // §4 — V2-persisted intent survives runtime flip to V1: the
+    // broadcast pipeline resolves the target from the intent's
+    // `protocol_version` (persisted), not from
+    // `config.perps_active_engine_version` (runtime).
+    #[test]
+    fn v2_persisted_intent_survives_active_version_flip_to_v1() {
+        // Configure a V1-runtime-active config that ALSO has V2
+        // populated (both PME addresses set). Any V2-persisted intent
+        // must route to the V2 PME regardless of runtime active
+        // version.
+        let mut cfg = make_config(TEST_KEY_ADDRESS, false, true);
+        cfg.perp_matching_engine_v2_address = Some(AccountId::new(PME_V2.to_string()));
+        cfg.perp_engine_v2_address =
+            Some(AccountId::new("0x0000000000000000000000000000000000000010".to_string()));
+        cfg.perp_clearing_account_v2_address =
+            Some(AccountId::new("0x0000000000000000000000000000000000000011".to_string()));
+        cfg.perps_active_engine_version =
+            crate::execution::perp_trade::PerpsProtocolVersion::V1;
+
+        let mut intent = make_intent();
+        intent.protocol_version = crate::execution::perp_trade::PerpsProtocolVersion::V2;
+        // V2 intents may carry any valid bounds combination; keep 0,0
+        // (strict-price V2 reproduction) so the payload validator is
+        // happy.
+        let target = cfg
+            .perp_matching_engine_address_for(intent.protocol_version)
+            .expect("V2 PME must resolve even when runtime active is V1")
+            .clone();
+        assert!(
+            target.0.eq_ignore_ascii_case(PME_V2),
+            "V2 persisted intent must target the V2 PME (got {})",
+            target.0
+        );
+    }
+
+    // §4 mirror — V1-persisted intent survives runtime flip to V2.
+    #[test]
+    fn v1_persisted_intent_survives_active_version_flip_to_v2() {
+        let mut cfg = make_config(TEST_KEY_ADDRESS, false, true);
+        cfg.perp_matching_engine_v2_address = Some(AccountId::new(PME_V2.to_string()));
+        cfg.perp_engine_v2_address =
+            Some(AccountId::new("0x0000000000000000000000000000000000000010".to_string()));
+        cfg.perp_clearing_account_v2_address =
+            Some(AccountId::new("0x0000000000000000000000000000000000000011".to_string()));
+        cfg.perps_active_engine_version =
+            crate::execution::perp_trade::PerpsProtocolVersion::V2;
+
+        let intent = make_intent(); // default V1
+        let target = cfg
+            .perp_matching_engine_address_for(intent.protocol_version)
+            .expect("V1 PME must resolve even when runtime active is V2")
+            .clone();
+        assert!(
+            target.0.eq_ignore_ascii_case(PME),
+            "V1 persisted intent must target the V1 PME (got {})",
+            target.0
         );
     }
 

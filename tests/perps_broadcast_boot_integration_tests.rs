@@ -428,6 +428,8 @@ async fn f_initial_reconciliation_failure_blocks_readiness() {
         nonce: 999_999,
         raw_tx_hex: "0x02".to_string(),
         prepared_at_ms: 1_700_000_000_000,
+        protocol_version: deopt_v2_backend::execution::PerpsProtocolVersion::V1,
+        expected_emitter: AccountId::new(PME_TARGET.to_string()),
     })
     .await
     .unwrap();

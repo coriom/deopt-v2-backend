@@ -203,12 +203,24 @@ pub fn sign_eip1559_transaction(
     )
 }
 
+/// PERPS_V2_BACKEND_RECONCILIATION_V1 §3 — build a broadcast
+/// request whose `to` address, calldata layout, and expected
+/// receipt emitter are ALL dispatched from
+/// `intent.protocol_version` (persisted), NEVER from the runtime
+/// active version. A runtime `PERPS_ACTIVE_ENGINE_VERSION` flip
+/// after prepare cannot retarget the returned request.
 pub fn build_execution_transaction_request(
     config: &ExecutionConfig,
     intent: &ExecutionIntent,
     signatures: &StoredTradeSignatures,
 ) -> Result<ExecutionTransactionRequest> {
-    validate_broadcast_target(&config.perp_matching_engine_address)?;
+    // Version-aware target selection. `perp_matching_engine_address_for`
+    // returns the persisted-version address; for V2 it also enforces
+    // that the operator has actually configured a V2 PME address.
+    let target = config
+        .perp_matching_engine_address_for(intent.protocol_version)?
+        .clone();
+    validate_broadcast_target(&target)?;
     if config.require_simulation_ok && intent.status != ExecutionIntentStatus::SimulationOk {
         return Err(BackendError::BroadcastRejected(
             "simulation_ok status is required before broadcast".to_string(),
@@ -217,11 +229,7 @@ pub fn build_execution_transaction_request(
     if !signatures.calldata_ready() {
         return Err(BackendError::MissingTradeSignatures);
     }
-    let call = build_perp_execution_call_from_intent(
-        intent,
-        &config.perp_matching_engine_address,
-        signatures,
-    )?;
+    let call = build_perp_execution_call_from_intent(intent, &target, signatures)?;
     if call.calldata.is_empty() || call.missing_signatures {
         return Err(BackendError::BroadcastRejected(
             "executeTrade calldata is required before broadcast".to_string(),
