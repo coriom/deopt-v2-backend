@@ -5,7 +5,7 @@
 //! standing up a real RPC endpoint. The concrete
 //! `PerpMarketRegistryRpcReader` uses the existing
 //! `EthCallProvider`/`HttpJsonRpcProvider` and hand-declares only the
-//! `isMarketActive(uint256) view returns (bool)` ABI stub — the rich
+//! `marketExists(uint256)` and `isMarketActive(uint256)` ABI stubs — the rich
 //! `getMarket` struct decode is deferred to
 //! `PERPS-ISOLATED-MARGIN-POSITION-ENGINE-V1` when the full market
 //! shape is actually needed on the backend.
@@ -20,22 +20,21 @@ use alloy_sol_types::{sol, SolCall};
 use async_trait::async_trait;
 
 sol! {
-    /// PerpMarketRegistry (0xb4fcf45e57b93274441def8f0f68bd30f6d677ec on
-    /// Base Sepolia). We only bind the read function the V1 backend
-    /// actually needs — a boolean liveness check per market. Richer
+    /// PerpMarketRegistry read ABI. The concrete address is supplied
+    /// by PERPS_MARKET_REGISTRY_ADDRESS at startup. Richer
     /// reads (risk config, funding config, launch caps) land in later
     /// milestones alongside the code paths that would consume them.
     function isMarketActive(uint256 marketId) external view returns (bool);
+    function marketExists(uint256 marketId) external view returns (bool);
 }
 
 /// Read a single market's on-chain liveness flag.
 #[async_trait]
 pub trait PerpMarketRegistryReader: Send + Sync {
     /// Return `Ok(status)` mapped to `ReadOnly` (active) or `Paused`
-    /// (inactive). Returns `Err(BackendError::PerpsMarketNotFound)` if
-    /// the read succeeds but the market row is empty (which should not
-    /// happen for the seeded ETH-PERP / BTC-PERP; kept explicit so a
-    /// future misconfigured market id doesn't return a bogus status).
+    /// (inactive). Returns `PerpsMarketNotFound` when the market has not
+    /// yet been created, and `PerpsRegistryUnavailable` when the chain
+    /// read cannot establish existence or status.
     async fn read_status(&self, market: &PerpsReadMarket) -> Result<PerpMarketStatus>;
 }
 
@@ -71,6 +70,32 @@ impl<P: EthCallProvider> PerpMarketRegistryRpcReader<P> {
 #[async_trait]
 impl<P: EthCallProvider + 'static> PerpMarketRegistryReader for PerpMarketRegistryRpcReader<P> {
     async fn read_status(&self, market: &PerpsReadMarket) -> Result<PerpMarketStatus> {
+        // isMarketActive reverts for an absent market. Check existence
+        // explicitly so a configured future market is not advertised as
+        // an existing paused market, and so transport errors are not
+        // mistaken for a genuine 404.
+        let exists = self
+            .provider
+            .eth_call(EthCallRequest {
+                from: self.caller.clone(),
+                to: self.registry_address.clone(),
+                data: marketExistsCall {
+                    marketId: U256::from(market.onchain_market_id),
+                }
+                .abi_encode(),
+                value: 0,
+                gas_limit: None,
+            })
+            .await
+            .map_err(|_| {
+                BackendError::PerpsRegistryUnavailable("market existence read failed".into())
+            })?;
+        let exists = marketExistsCall::abi_decode_returns(&exists.output, true).map_err(|_| {
+            BackendError::PerpsRegistryUnavailable("invalid market existence response".into())
+        })?;
+        if !exists._0 {
+            return Err(BackendError::PerpsMarketNotFound(market.symbol.clone()));
+        }
         let call = isMarketActiveCall {
             marketId: U256::from(market.onchain_market_id),
         };
@@ -81,16 +106,16 @@ impl<P: EthCallProvider + 'static> PerpMarketRegistryReader for PerpMarketRegist
             value: 0,
             gas_limit: None,
         };
-        let success = self.provider.eth_call(request).await.map_err(|err| {
-            BackendError::PerpsMarketNotFound(format!(
-                "PerpMarketRegistry.isMarketActive({}) failed: {err}",
+        let success = self.provider.eth_call(request).await.map_err(|_| {
+            BackendError::PerpsRegistryUnavailable(format!(
+                "market status read failed for id {}",
                 market.onchain_market_id
             ))
         })?;
         let decoded =
-            isMarketActiveCall::abi_decode_returns(&success.output, true).map_err(|err| {
-                BackendError::PerpsMarketNotFound(format!(
-                    "failed to decode isMarketActive({}) return: {err}",
+            isMarketActiveCall::abi_decode_returns(&success.output, true).map_err(|_| {
+                BackendError::PerpsRegistryUnavailable(format!(
+                    "invalid market status response for id {}",
                     market.onchain_market_id
                 ))
             })?;
@@ -148,6 +173,35 @@ impl PerpMarketRegistryReader for InMemoryPerpMarketRegistryReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::execution::rpc::{EthCallSuccess, RpcFuture};
+
+    #[derive(Clone)]
+    struct RegistryRpc {
+        exists: Option<bool>,
+        active: Option<bool>,
+    }
+
+    impl EthCallProvider for RegistryRpc {
+        fn eth_call(&self, request: EthCallRequest) -> RpcFuture<'_, EthCallSuccess> {
+            let value = if request.data.starts_with(&marketExistsCall::SELECTOR) {
+                self.exists
+            } else if request.data.starts_with(&isMarketActiveCall::SELECTOR) {
+                self.active
+            } else {
+                None
+            };
+            Box::pin(async move {
+                let value =
+                    value.ok_or_else(|| BackendError::Simulation("rpc unavailable".into()))?;
+                let mut output = vec![0; 32];
+                output[31] = u8::from(value);
+                Ok(EthCallSuccess {
+                    block_number: Some(1),
+                    output,
+                })
+            })
+        }
+    }
 
     fn eth_market() -> PerpsReadMarket {
         PerpsReadMarket {
@@ -187,5 +241,73 @@ mod tests {
             InMemoryPerpMarketRegistryReader::new().with_forced_error("simulated rpc down");
         let err = reader.read_status(&eth_market()).await.unwrap_err();
         assert!(matches!(err, BackendError::PerpsMarketNotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn absent_onchain_market_is_not_a_paused_market() {
+        let cfg = PerpsReadConfig::enabled_in_memory_for_tests();
+        let reader = PerpMarketRegistryRpcReader::new(
+            RegistryRpc {
+                exists: Some(false),
+                active: Some(true),
+            },
+            &cfg,
+        )
+        .unwrap();
+        assert!(matches!(
+            reader.read_status(&eth_market()).await,
+            Err(BackendError::PerpsMarketNotFound(_))
+        ));
+        assert!(crate::perps::service::list_perp_markets(&cfg, &reader)
+            .await
+            .unwrap()
+            .markets
+            .is_empty());
+        assert!(matches!(
+            crate::perps::service::get_perp_market(&cfg, &reader, "ETH-PERP").await,
+            Err(BackendError::PerpsMarketNotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn registry_outage_is_distinct_from_absent_market() {
+        let cfg = PerpsReadConfig::enabled_in_memory_for_tests();
+        let reader = PerpMarketRegistryRpcReader::new(
+            RegistryRpc {
+                exists: None,
+                active: None,
+            },
+            &cfg,
+        )
+        .unwrap();
+        assert!(matches!(
+            reader.read_status(&eth_market()).await,
+            Err(BackendError::PerpsRegistryUnavailable(_))
+        ));
+        let listing = crate::perps::service::list_perp_markets(&cfg, &reader)
+            .await
+            .unwrap();
+        assert_eq!(listing.markets.len(), 2);
+        assert!(listing
+            .markets
+            .iter()
+            .all(|m| m.status == PerpMarketStatus::Unknown && !m.trading_enabled));
+    }
+
+    #[tokio::test]
+    async fn existing_inactive_market_is_paused() {
+        let cfg = PerpsReadConfig::enabled_in_memory_for_tests();
+        let reader = PerpMarketRegistryRpcReader::new(
+            RegistryRpc {
+                exists: Some(true),
+                active: Some(false),
+            },
+            &cfg,
+        )
+        .unwrap();
+        assert_eq!(
+            reader.read_status(&eth_market()).await.unwrap(),
+            PerpMarketStatus::Paused
+        );
     }
 }

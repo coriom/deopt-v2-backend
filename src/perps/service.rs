@@ -81,10 +81,11 @@ pub async fn list_perp_markets<R: PerpMarketRegistryReader + ?Sized>(
         // still show that the market exists in the registry, with a
         // clearly non-tradeable status. Fabricating "ReadOnly" would
         // violate the "no fake data" rule.
-        let status = reader
-            .read_status(row)
-            .await
-            .unwrap_or(PerpMarketStatus::Unknown);
+        let status = match reader.read_status(row).await {
+            Ok(status) => status,
+            Err(BackendError::PerpsMarketNotFound(_)) => continue,
+            Err(_) => PerpMarketStatus::Unknown,
+        };
         markets.push(mint_perp_market(cfg, row, status, None));
     }
     Ok(PerpMarketListing {
@@ -111,10 +112,11 @@ pub async fn list_perp_markets_with_risk<
     let now = now_ms();
     let mut markets = Vec::with_capacity(cfg.markets.len());
     for row in &cfg.markets {
-        let onchain_status = reader
-            .read_status(row)
-            .await
-            .unwrap_or(PerpMarketStatus::Unknown);
+        let onchain_status = match reader.read_status(row).await {
+            Ok(status) => status,
+            Err(BackendError::PerpsMarketNotFound(_)) => continue,
+            Err(_) => PerpMarketStatus::Unknown,
+        };
         let oracle = fetch_oracle_snapshot(cfg, price_reader, row, now).await;
         // V1 has no per-market admin override wired; a future admin
         // pause/resume endpoint fills this in.
@@ -141,10 +143,11 @@ pub async fn get_perp_market<R: PerpMarketRegistryReader + ?Sized>(
     let row = cfg
         .market_by_symbol(symbol)
         .ok_or_else(|| BackendError::PerpsMarketNotFound(symbol.to_string()))?;
-    let status = reader
-        .read_status(row)
-        .await
-        .unwrap_or(PerpMarketStatus::Unknown);
+    let status = match reader.read_status(row).await {
+        Ok(status) => status,
+        Err(err @ BackendError::PerpsMarketNotFound(_)) => return Err(err),
+        Err(_) => PerpMarketStatus::Unknown,
+    };
     Ok(mint_perp_market(cfg, row, status, None))
 }
 
@@ -163,10 +166,11 @@ pub async fn get_perp_market_with_risk<
     let row = cfg
         .market_by_symbol(symbol)
         .ok_or_else(|| BackendError::PerpsMarketNotFound(symbol.to_string()))?;
-    let onchain_status = reader
-        .read_status(row)
-        .await
-        .unwrap_or(PerpMarketStatus::Unknown);
+    let onchain_status = match reader.read_status(row).await {
+        Ok(status) => status,
+        Err(err @ BackendError::PerpsMarketNotFound(_)) => return Err(err),
+        Err(_) => PerpMarketStatus::Unknown,
+    };
     let now = now_ms();
     let oracle = fetch_oracle_snapshot(cfg, price_reader, row, now).await;
     let admin = PerpsMarketAdminOverride::default();

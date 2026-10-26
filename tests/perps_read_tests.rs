@@ -12,8 +12,8 @@
 //!     future change to /perps/markets can't accidentally re-open the
 //!     `/markets` leak).
 //!   * When the reader config is enabled but the RPC endpoint is
-//!     unreachable, the endpoint surfaces `PerpsPriceUnavailable`
-//!     (503) — it does NOT fabricate a price.
+//!     unreachable, the endpoints return 503 — they do not fabricate
+//!     a price, chain identity or market existence.
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -22,6 +22,34 @@ use deopt_v2_backend::engine::EngineState;
 use deopt_v2_backend::perps::PerpsReadConfig;
 use deopt_v2_backend::types::AccountId;
 use tower::ServiceExt;
+
+async fn absent_market_rpc(chain_id: u64) -> String {
+    use axum::{routing::post, Json, Router};
+    let app = Router::new().route(
+        "/",
+        post(move |Json(request): Json<serde_json::Value>| async move {
+            let result = match request["method"].as_str() {
+                Some("eth_chainId") => format!("0x{chain_id:x}"),
+                Some("eth_blockNumber") => "0x1".to_string(),
+                Some("eth_call") => format!("0x{}", "00".repeat(32)),
+                other => panic!("unexpected read-only RPC method: {other:?}"),
+            };
+            Json(serde_json::json!({"jsonrpc":"2.0","id":1,"result":result}))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://{address}")
+}
+
+async fn state_with_absent_market_rpc(chain_id: u64) -> AppState {
+    let mut state = AppState::new(EngineState::with_default_markets());
+    let mut cfg = PerpsReadConfig::enabled_in_memory_for_tests();
+    cfg.rpc_url = Some(absent_market_rpc(chain_id).await);
+    state.perps_read_config = cfg;
+    state
+}
 
 fn state_with_perps_read_disabled() -> AppState {
     AppState::new(EngineState::with_default_markets())
@@ -159,9 +187,8 @@ async fn markets_still_filters_out_perps_even_when_read_layer_is_configured() {
 }
 
 // =====================================================================
-// D. Enabled + dead RPC — never fabricates. Price returns 503.
-//    Market list returns rows with `unknown` status (per-row resilience;
-//    the row still exists, but its liveness flag is honestly unknown).
+// D. Enabled + dead RPC — never fabricates. Read routes return 503
+//    because the actual RPC chain cannot be verified.
 // =====================================================================
 
 #[tokio::test]
@@ -187,30 +214,14 @@ async fn perps_market_price_returns_503_when_rpc_unreachable() {
 }
 
 #[tokio::test]
-async fn perps_markets_survives_reader_failure_without_fabricating_status() {
-    // With a dead RPC, every per-row reader call errors — the service
-    // layer must fall back to `PerpMarketStatus::Unknown`, NEVER to
-    // `read_only` (which would imply a live check succeeded).
+async fn perps_markets_rejects_unverifiable_rpc_chain_without_fabricating_rows() {
+    // With a dead RPC, the route cannot establish chain identity.
+    // It fails closed before claiming any market exists.
     let app = router(state_with_perps_read_enabled_but_dead_rpc());
     let response = app.oneshot(get("/perps/markets")).await.unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     let body = body_json(response).await;
-    let markets = body["markets"].as_array().expect("markets array");
-    assert_eq!(markets.len(), 2, "expected ETH-PERP + BTC-PERP");
-    for market in markets {
-        assert_eq!(
-            market["status"].as_str().unwrap_or(""),
-            "unknown",
-            "reader failure MUST NOT surface as `read_only`: {market}"
-        );
-        assert_eq!(
-            market["trading_enabled"].as_bool(),
-            Some(false),
-            "trading_enabled must always be false in V1: {market}"
-        );
-    }
-    assert_eq!(body["trading_enabled"].as_bool(), Some(false));
-    assert_eq!(body["chain_id"].as_u64(), Some(84532));
+    assert!(body.get("markets").is_none());
 }
 
 // =====================================================================
@@ -232,6 +243,40 @@ async fn perps_market_price_unknown_symbol_returns_404() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn configured_but_uncreated_market_is_absent_on_every_read_route() {
+    let app = router(state_with_absent_market_rpc(84532).await);
+    let listing = app.clone().oneshot(get("/perps/markets")).await.unwrap();
+    assert_eq!(listing.status(), StatusCode::OK);
+    let listing = body_json(listing).await;
+    assert_eq!(listing["markets"].as_array().unwrap().len(), 0);
+
+    let market = app
+        .clone()
+        .oneshot(get("/perps/markets/ETH-PERP"))
+        .await
+        .unwrap();
+    assert_eq!(market.status(), StatusCode::NOT_FOUND);
+
+    let price = app
+        .oneshot(get("/perps/markets/ETH-PERP/price"))
+        .await
+        .unwrap();
+    assert_eq!(price.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn perps_reads_reject_rpc_on_wrong_chain() {
+    let app = router(state_with_absent_market_rpc(8453).await);
+    let response = app.oneshot(get("/perps/markets")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(response).await;
+    assert!(body["error"]
+        .as_str()
+        .unwrap_or("")
+        .contains("chain id mismatch"));
 }
 
 // =====================================================================

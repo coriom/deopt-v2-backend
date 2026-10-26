@@ -2365,6 +2365,22 @@ fn build_perp_market_registry_reader(
     )?)
 }
 
+async fn ensure_perps_read_rpc_chain(state: &AppState) -> Result<(), ApiError> {
+    let rpc_url = state
+        .perps_read_config
+        .rpc_url
+        .clone()
+        .ok_or_else(|| ApiError::from(BackendError::PerpsReadDisabled))?;
+    let provider = crate::execution::rpc::HttpJsonRpcProvider::new(rpc_url);
+    let actual = provider.chain_id().await.map_err(|_| {
+        ApiError::from(BackendError::PerpsRegistryUnavailable(
+            "chain identity read failed".into(),
+        ))
+    })?;
+    crate::perps::service::ensure_chain_id_matches(&state.perps_read_config, actual)?;
+    Ok(())
+}
+
 fn build_perp_oracle_price_reader(
     state: &AppState,
 ) -> Result<
@@ -2387,6 +2403,7 @@ async fn perps_markets(
     State(state): State<AppState>,
 ) -> Result<Json<crate::perps::PerpMarketListing>, ApiError> {
     crate::perps::service::ensure_read_enabled(&state.perps_read_config)?;
+    ensure_perps_read_rpc_chain(&state).await?;
     let registry_reader = build_perp_market_registry_reader(&state)?;
     // PERPS-MARKET-STATUS-DTO-WS-V1 — populate the per-market risk
     // status view. When the RPC layer is disabled the price reader
@@ -2415,6 +2432,11 @@ async fn perps_market(
     Path(market_id): Path<String>,
 ) -> Result<Json<crate::perps::PerpMarket>, ApiError> {
     crate::perps::service::ensure_read_enabled(&state.perps_read_config)?;
+    state
+        .perps_read_config
+        .market_by_symbol(&market_id)
+        .ok_or_else(|| ApiError::from(BackendError::PerpsMarketNotFound(market_id.clone())))?;
+    ensure_perps_read_rpc_chain(&state).await?;
     let registry_reader = build_perp_market_registry_reader(&state)?;
     match build_perp_oracle_price_reader(&state) {
         Ok(price_reader) => {
@@ -2443,7 +2465,17 @@ async fn perps_market_price(
     State(state): State<AppState>,
     Path(market_id): Path<String>,
 ) -> Result<Json<crate::perps::PerpMarketPriceResponse>, ApiError> {
+    use crate::perps::PerpMarketRegistryReader;
     crate::perps::service::ensure_read_enabled(&state.perps_read_config)?;
+    let market = state
+        .perps_read_config
+        .market_by_symbol(&market_id)
+        .ok_or_else(|| ApiError::from(BackendError::PerpsMarketNotFound(market_id.clone())))?;
+    ensure_perps_read_rpc_chain(&state).await?;
+    let registry = build_perp_market_registry_reader(&state)?;
+    // A feed may exist before its corresponding market is created.
+    // Never serve that feed as a price for a live market.
+    registry.read_status(market).await?;
     let reader = build_perp_oracle_price_reader(&state)?;
     let resp =
         crate::perps::get_perp_market_price(&state.perps_read_config, &reader, &market_id).await?;
@@ -15549,6 +15581,7 @@ impl From<BackendError> for ApiError {
             BackendError::PerpsReadDisabled => StatusCode::SERVICE_UNAVAILABLE,
             BackendError::PerpsChainIdMismatch { .. } => StatusCode::BAD_REQUEST,
             BackendError::PerpsMarketNotFound(_) => StatusCode::NOT_FOUND,
+            BackendError::PerpsRegistryUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             BackendError::PerpsPriceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             // PERPS-ISOLATED-MARGIN-POSITION-ENGINE-V1
             BackendError::PerpsPositionsDisabled => StatusCode::SERVICE_UNAVAILABLE,

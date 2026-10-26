@@ -167,6 +167,8 @@ pub enum BackendError {
     PerpsChainIdMismatch { expected: u64, got: u64 },
     #[error("perps market not found: {0}")]
     PerpsMarketNotFound(String),
+    #[error("perps registry unavailable: {0}")]
+    PerpsRegistryUnavailable(String),
     #[error("perps oracle price unavailable: {0}")]
     PerpsPriceUnavailable(String),
     // PERPS-ISOLATED-MARGIN-POSITION-ENGINE-V1

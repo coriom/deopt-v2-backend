@@ -24,13 +24,12 @@
 #   GET /health   always 200 when the HTTP server is up
 #   GET /ready    200 when ready, 503 SERVICE_UNAVAILABLE otherwise
 #
-# Build stage uses rust:1.83-bookworm (matches rust-version =
-# "1.75" minimum + recent stable features). The final stage is
+# Build stage uses the locally validated Rust 1.95 toolchain. The final stage is
 # debian:bookworm-slim — small but ships glibc so sqlx/openssl link
 # cleanly without statically-linked-musl gotchas.
 
 # ---- builder ------------------------------------------------------
-FROM rust:1.83-bookworm AS builder
+FROM rust:1.95-bookworm AS builder
 WORKDIR /build
 
 # System deps: pkg-config + openssl headers for sqlx-postgres +
@@ -45,6 +44,7 @@ RUN apt-get update \
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY migrations ./migrations
+COPY resources ./resources
 
 # Build the release binary. SQLX_OFFLINE=true so sqlx macros use
 # the committed query metadata rather than a live DB; if your
@@ -58,7 +58,7 @@ FROM debian:bookworm-slim AS runtime
 WORKDIR /app
 
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates libssl3 \
+ && apt-get install -y --no-install-recommends ca-certificates libssl3 curl \
  && rm -rf /var/lib/apt/lists/* \
  && useradd --system --uid 1001 --home-dir /app deopt
 
@@ -78,6 +78,6 @@ EXPOSE 8080
 # Health check uses /health (no DB dependency); use /ready in
 # PaaS-level readiness probes instead.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD wget -qO- "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1 || exit 1
+    CMD curl --fail --silent --show-error "http://127.0.0.1:${PORT}/health" >/dev/null || exit 1
 
 ENTRYPOINT ["/usr/local/bin/deopt-v2-backend"]
