@@ -674,6 +674,12 @@ pub async fn submit_perp_order_via_state<P: PerpOraclePriceReader + ?Sized>(
     // `PerpOrderRejected` on a classified error. Mirrors the PG-path
     // behaviour so both branches surface the same lifecycle contract.
     let rejection_snapshot = crate::perps::execution_pg::RejectionSnapshot::from_input(&input);
+    let oracle_read = crate::perps::execution::prepare_submit_oracle(
+        &state.perps_read_config,
+        price_reader,
+        &input,
+    )
+    .await;
     let mut order_store = state
         .perp_order_store
         .lock()
@@ -682,16 +688,20 @@ pub async fn submit_perp_order_via_state<P: PerpOraclePriceReader + ?Sized>(
         .perp_positions_store
         .lock()
         .map_err(|_| BackendError::Config("perp_positions_store lock poisoned".to_string()))?;
-    match crate::perps::submit_perp_order_internal(
+    // Keep the two ledgers atomic even if a later fill rejects. Oracle I/O
+    // has already completed, so neither mutex is held across an await.
+    let mut next_orders = order_store.clone();
+    let mut next_positions = positions_store.clone();
+    match crate::perps::execution::submit_perp_order_internal_with_oracle(
         &state.perps_read_config,
-        &mut order_store,
-        &mut positions_store,
-        price_reader,
+        &mut next_orders,
+        &mut next_positions,
+        oracle_read,
         input,
-    )
-    .await
-    {
+    ) {
         Ok(outcome) => {
+            *order_store = next_orders;
+            *positions_store = next_positions;
             // In-memory path: emit the same lifecycle bundle the PG
             // path emits AFTER commit.
             crate::perps::emit_lifecycle_for_submit_outcome(

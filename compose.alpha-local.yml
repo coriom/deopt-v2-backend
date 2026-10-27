@@ -1,0 +1,47 @@
+# Disposable local backend + PostgreSQL rehearsal. Never use for public trading.
+# Supply DEOPT_ALPHA_DB_PASSWORD in the shell; no credential is committed.
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: deopt_alpha
+      POSTGRES_PASSWORD: ${DEOPT_ALPHA_DB_PASSWORD:?set a local disposable password}
+      POSTGRES_DB: deopt_alpha
+    volumes:
+      - alpha_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U deopt_alpha -d deopt_alpha"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: "no"
+
+  backend:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      HOST: 0.0.0.0
+      PORT: "8080"
+      CHAIN_ID: "84532"
+      PERSISTENCE_ENABLED: "true"
+      DATABASE_URL: postgres://deopt_alpha:${DEOPT_ALPHA_DB_PASSWORD}@postgres:5432/deopt_alpha
+      EXECUTION_ENABLED: "false"
+      EXECUTOR_REAL_BROADCAST_ENABLED: "false"
+      HV2_BROADCAST_ENABLED: "false"
+      PERPS_PUBLIC_TRADING_ENABLED: "false"
+      PERPS_CLOSED_TEST_ENABLED: "false"
+      PERPS_READ_ENABLED: "false"
+      OPTIONS_ENABLED: "false"
+    ports:
+      - "127.0.0.1:18080:8080"
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+    restart: "no"
+
+volumes:
+  alpha_pg_data:

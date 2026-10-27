@@ -23,6 +23,7 @@ pub fn active_asks_sorted(store: &PerpOrderStore, market_id: &str) -> Vec<PerpOr
         a.price_1e8
             .cmp(&b.price_1e8)
             .then_with(|| a.created_at_ms.cmp(&b.created_at_ms))
+            .then_with(|| a.id.cmp(&b.id))
     });
     asks
 }
@@ -37,6 +38,7 @@ pub fn active_bids_sorted(store: &PerpOrderStore, market_id: &str) -> Vec<PerpOr
         b.price_1e8
             .cmp(&a.price_1e8)
             .then_with(|| a.created_at_ms.cmp(&b.created_at_ms))
+            .then_with(|| a.id.cmp(&b.id))
     });
     bids
 }

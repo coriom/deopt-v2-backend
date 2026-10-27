@@ -214,6 +214,44 @@ async fn pg_tick_settles_long_with_positive_delta() {
     assert_eq!(post.status, PerpPositionStatus::Open);
 }
 
+#[tokio::test]
+async fn pg_funding_persists_distinct_subaccount_events() {
+    let Some(url) = pg_test_url() else {
+        return;
+    };
+    let state = pg_state(&url).await;
+    let repo = state.repository.clone().unwrap();
+    let account = per_test_account("pg-fund-subaccount-v1", "aa58");
+    for subaccount_id in [1, 2] {
+        let position = deopt_v2_backend::perps::positions::new_position_skeleton(
+            account.clone(),
+            subaccount_id,
+            "ETH-PERP".to_string(),
+            deopt_v2_backend::perps::PerpSide::Long,
+            ONE,
+            300 * ONE,
+            300 * ONE,
+        );
+        repo.insert_perp_position(&position).await.unwrap();
+    }
+    run_perp_funding_tick_via_repository(
+        &state.perps_read_config,
+        &repo,
+        &indices_eth(ONE_1E18 / 100, true),
+        &state.lifecycle_events,
+        now_ms(),
+    )
+    .await
+    .unwrap();
+    let events = repo
+        .list_perp_funding_events_for_account(&account)
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 2);
+    assert!(events.iter().any(|event| event.subaccount_id == 1));
+    assert!(events.iter().any(|event| event.subaccount_id == 2));
+}
+
 // =====================================================================
 // 2. PG tick credits SHORT with positive delta
 // =====================================================================

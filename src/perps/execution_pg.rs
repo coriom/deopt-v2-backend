@@ -152,18 +152,27 @@ async fn submit_perp_order_via_repository_inner<P: PerpOraclePriceReader + ?Size
         .ok_or_else(|| BackendError::PerpsMarketNotFound(input.market_id.clone()))?
         .clone();
 
-    // Mark-price staleness gate for opens/increases. We compute it
-    // outside the transaction to keep the RPC call off the DB
-    // connection.
-    let position_side_after = input.side.position_side();
-    // We can't know `is_reduce` before opening the tx (need the
-    // pre-fill position), so re-check inside. For the staleness gate
-    // we conservatively probe here when NOT explicitly reduce-only.
-    if !input.reduce_only {
-        ensure_mark_fresh(cfg, price_reader, &market).await?;
-    }
+    // Fetch outside the transaction. A validated explicit reduce-only
+    // order may proceed when the oracle is unavailable; ordinary orders
+    // recheck quote freshness after the serialized position snapshot.
+    let mark = price_reader.read_price(&market).await;
 
-    // Snapshot values needed inside the transaction.
+    let mut tx = repository.begin().await?;
+    repo::lock_perp_order_ledger_tx(&mut tx).await?;
+    let mut positions = crate::perps::positions::PerpPositionsStore::new();
+    for position in repo::list_open_perp_positions_tx(&mut tx).await? {
+        positions.insert_open(position)?;
+    }
+    // An ordinary opposite-side order can rest and later become an
+    // increase after the account's position changes. Only a validated
+    // reduce-only order may bypass opening-risk/oracle checks.
+    let is_reduce = input.reduce_only;
+    if !is_reduce {
+        let read = mark.map_err(|err| BackendError::PerpMarkPriceUnavailable(err.to_string()))?;
+        ensure_mark_fresh(cfg, &read, &market)?;
+        crate::perps::execution::enforce_pre_submit_risk_caps(&market, &positions, &input)?;
+    }
+    // Time priority is assigned only after the transaction is serialized.
     let now = now_ms();
     let taker_seed = PerpOrder::new(
         input.account.clone(),
@@ -179,9 +188,6 @@ async fn submit_perp_order_via_repository_inner<P: PerpOraclePriceReader + ?Size
         input.client_order_id.clone(),
         now,
     );
-
-    // ---- Transaction opens here ----------------------------------
-    let mut tx = repository.begin().await?;
 
     // 1. Insert taker order (status=Open). This claims the client
     //    order id via the unique index; a violation bubbles as
@@ -212,9 +218,10 @@ async fn submit_perp_order_via_repository_inner<P: PerpOraclePriceReader + ?Size
         enforce_reduce_only_pg(
             &mut tx,
             &taker_seed.account,
+            taker_seed.subaccount_id,
             &taker_seed.market_id,
-            position_side_after.opposite(),
-            planned_total,
+            taker_seed.side.position_side().opposite(),
+            taker_seed.size_1e8,
         )
         .await?;
     }
@@ -402,6 +409,7 @@ pub async fn cancel_perp_order_via_repository(
     caller: &AccountId,
 ) -> Result<PerpOrder> {
     let mut tx = repository.begin().await?;
+    repo::lock_perp_order_ledger_tx(&mut tx).await?;
     let existing = repo::get_perp_order_tx(&mut tx, order_id)
         .await?
         .ok_or_else(|| BackendError::PerpOrderNotFound(order_id.to_string()))?;
@@ -515,15 +523,11 @@ fn validate_tif_combinations(input: &SubmitPerpOrderInput) -> Result<()> {
     Ok(())
 }
 
-async fn ensure_mark_fresh<P: PerpOraclePriceReader + ?Sized>(
+fn ensure_mark_fresh(
     cfg: &PerpsReadConfig,
-    price_reader: &P,
+    read: &crate::perps::price_reader::RawPriceRead,
     market: &crate::perps::config::PerpsReadMarket,
 ) -> Result<()> {
-    let read = price_reader
-        .read_price(market)
-        .await
-        .map_err(|err| BackendError::PerpMarkPriceUnavailable(err.to_string()))?;
     if !read.ok || read.price_1e8 == 0 {
         return Err(BackendError::PerpMarkPriceUnavailable(format!(
             "oracle reported ok=false or zero price for {}",
@@ -556,6 +560,7 @@ fn filter_counterparties(orders: Vec<PerpOrder>, taker_side: PerpOrderSide) -> V
             b.price_1e8
                 .cmp(&a.price_1e8)
                 .then_with(|| a.created_at_ms.cmp(&b.created_at_ms))
+                .then_with(|| a.id.cmp(&b.id))
         }),
     }
     filtered
@@ -589,17 +594,18 @@ fn plan_fills_pure(taker: &PerpOrder, counterparties: &[PerpOrder]) -> Vec<Plann
 async fn enforce_reduce_only_pg(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     account: &AccountId,
+    subaccount_id: u32,
     market_id: &str,
     required_side: crate::perps::PerpSide,
-    planned_total: u128,
+    order_size: u128,
 ) -> Result<()> {
-    let existing = repo::get_active_perp_position_tx(tx, account, market_id)
+    let existing = repo::get_active_perp_position_tx(tx, account, subaccount_id, market_id)
         .await?
         .ok_or(BackendError::PerpReduceOnlyViolation)?;
     if existing.side != required_side {
         return Err(BackendError::PerpReduceOnlyViolation);
     }
-    if planned_total > existing.size_1e8 {
+    if order_size > existing.size_1e8 {
         return Err(BackendError::PerpReduceOnlyViolation);
     }
     Ok(())
@@ -633,7 +639,9 @@ async fn apply_perp_fill_pg(
             market.symbol, fill.market_id
         )));
     }
-    let existing = repo::get_active_perp_position_tx(tx, &fill.account, &fill.market_id).await?;
+    let existing =
+        repo::get_active_perp_position_tx(tx, &fill.account, fill.subaccount_id, &fill.market_id)
+            .await?;
     match existing {
         None => {
             if fill.margin_1e8 == 0 {
@@ -722,6 +730,7 @@ async fn apply_perp_fill_pg(
                 let mut closed = repo::close_active_perp_position_tx(
                     tx,
                     &existing_pos.account,
+                    existing_pos.subaccount_id,
                     &existing_pos.market_id,
                     now,
                 )

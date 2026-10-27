@@ -10,6 +10,10 @@ use std::collections::{BTreeMap, BTreeSet};
 pub struct ReadinessResponse {
     pub ready: bool,
     pub service: &'static str,
+    /// `/ready` checks process/config/database serviceability. It does not
+    /// assert that a public market exists or that trading is authorized.
+    pub perps_market_data_status: &'static str,
+    pub perps_trading_status: &'static str,
     pub checks: Vec<ReadinessCheck>,
     /// PERPS-FUNDING-LIQUIDATION-WORKERS-V1 — operator visibility for
     /// the two periodic Perps workers + their kill-switches +
@@ -137,6 +141,16 @@ pub async fn readiness(state: &AppState) -> ReadinessResponse {
     ReadinessResponse {
         ready: checks.iter().all(|check| check.ok),
         service: "deopt-v2-backend",
+        perps_market_data_status: if state.perps_read_config.enabled {
+            "configured_live_market_read_required"
+        } else {
+            "disabled"
+        },
+        perps_trading_status: if state.perps_public_trading_enabled {
+            "flagged_economic_preflight_required"
+        } else {
+            "disabled"
+        },
         checks,
         perps_workers,
     }

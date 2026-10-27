@@ -532,6 +532,86 @@ async fn pg_liquidation_cancels_open_orders_for_account_market_only() {
     assert_eq!(bob_orders[0].status, PerpOrderStatus::Open);
 }
 
+#[tokio::test]
+async fn pg_liquidation_is_scoped_to_one_subaccount() {
+    let Some(url) = pg_test_url() else {
+        return;
+    };
+    let state = pg_state(&url).await;
+    let repo = state.repository.clone().unwrap();
+    let account = per_test_account("pg-liq-subaccount-v1", "aa58");
+    let mut safe = deopt_v2_backend::perps::positions::new_position_skeleton(
+        account.clone(),
+        1,
+        "ETH-PERP".to_string(),
+        deopt_v2_backend::perps::PerpSide::Long,
+        ONE,
+        PRICE_ETH_3000,
+        1_000 * ONE,
+    );
+    safe.updated_at_ms = now_ms();
+    repo.insert_perp_position(&safe).await.unwrap();
+    let mut unsafe_position = safe.clone();
+    unsafe_position.id = uuid::Uuid::new_v4();
+    unsafe_position.subaccount_id = 2;
+    unsafe_position.margin_1e8 = MARGIN_10X_ETH;
+    repo.insert_perp_position(&unsafe_position).await.unwrap();
+
+    let mut orders = Vec::new();
+    for subaccount_id in [1, 2] {
+        let order = deopt_v2_backend::perps::PerpOrder::new(
+            account.clone(),
+            subaccount_id,
+            "ETH-PERP".to_string(),
+            PerpOrderSide::Buy,
+            PRICE_ETH_3000 - ONE,
+            ONE,
+            PerpTimeInForce::Gtc,
+            false,
+            false,
+            MARGIN_10X_ETH,
+            Some(format!("pg-liq-subaccount-v1-{subaccount_id}")),
+            now_ms(),
+        );
+        repo.insert_perp_order(&order).await.unwrap();
+        orders.push(order);
+    }
+    let reader = fresh_reader_for(PRICE_ETH_2700);
+    let now = now_ms();
+    let marks = prefetch_mark_prices(&state.perps_read_config, &reader, now).await;
+    run_perp_liquidation_tick_via_repository(
+        &state.perps_read_config,
+        &repo,
+        &marks,
+        &state.lifecycle_events,
+        now,
+    )
+    .await
+    .unwrap();
+
+    let safe_after = repo
+        .get_active_perp_position_for_subaccount(&account, 1, "ETH-PERP")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(safe_after.status, PerpPositionStatus::Open);
+    assert!(repo
+        .get_active_perp_position_for_subaccount(&account, 2, "ETH-PERP")
+        .await
+        .unwrap()
+        .is_none());
+    let first = repo.get_perp_order(orders[0].id).await.unwrap().unwrap();
+    let second = repo.get_perp_order(orders[1].id).await.unwrap().unwrap();
+    assert_eq!(first.status, PerpOrderStatus::Open);
+    assert_eq!(second.status, PerpOrderStatus::Cancelled);
+    let events = repo
+        .list_perp_liquidation_events_for_account(&account)
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].subaccount_id, 2);
+}
+
 // =====================================================================
 // 6. PG tick is idempotent — repeated ticks produce no dup events
 // =====================================================================

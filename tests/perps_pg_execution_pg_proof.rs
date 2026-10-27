@@ -48,10 +48,22 @@ const ENV_VAR: &str = "PERPS_PG_TEST_DATABASE_URL";
 const ONE: u128 = 100_000_000;
 const PRICE_ETH_3000: u128 = 3000 * ONE;
 const PRICE_ETH_3100: u128 = 3100 * ONE;
-const MARGIN_10X_ETH: u128 = 300 * ONE;
 
-fn pg_test_url() -> Option<String> {
-    std::env::var(ENV_VAR).ok().filter(|v| !v.is_empty())
+async fn pg_test_url() -> Option<String> {
+    let base = std::env::var(ENV_VAR).ok().filter(|v| !v.is_empty())?;
+    // Every proof gets its own schema. A shared orderbook makes a FOK or
+    // fill test depend on whichever other test inserted resting liquidity.
+    let schema = format!("perps_proof_{}", uuid::Uuid::new_v4().simple());
+    let pool = sqlx::PgPool::connect(&base)
+        .await
+        .expect("connect to disposable PG proof database");
+    sqlx::query(&format!("CREATE SCHEMA {schema}"))
+        .execute(&pool)
+        .await
+        .expect("create isolated proof schema");
+    pool.close().await;
+    let separator = if base.contains('?') { '&' } else { '?' };
+    Some(format!("{base}{separator}options=-csearch_path%3D{schema}"))
 }
 
 /// Deterministic per-test address so re-runs against the same
@@ -72,17 +84,12 @@ fn per_test_account(tag: &str, prefix: &str) -> AccountId {
 }
 
 async fn ensure_migrated(url: &str) {
-    static MIGRATED: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
-    MIGRATED
-        .get_or_init(|| async {
-            let repo = PgRepository::connect(url)
-                .await
-                .expect("connect for shared migration");
-            repo.run_migrations()
-                .await
-                .expect("run migrations once against disposable PG database");
-        })
-        .await;
+    let repo = PgRepository::connect(url)
+        .await
+        .expect("connect for isolated migration");
+    repo.run_migrations()
+        .await
+        .expect("run migrations against isolated proof schema");
 }
 
 async fn fresh_repo(url: &str) -> PgRepository {
@@ -136,7 +143,9 @@ fn base_input(
         time_in_force: PerpTimeInForce::Gtc,
         post_only: false,
         reduce_only: false,
-        isolated_margin_1e8: MARGIN_10X_ETH,
+        // Fund at the submitted limit, including 3,100-price buys and
+        // partial fills. The old fixed 300 fixture underfunded them.
+        isolated_margin_1e8: size.saturating_mul(price).div_ceil(ONE * 10),
         client_order_id: Some(format!("cli-{tag}")),
         max_execution_price_1e8: 0,
         min_execution_price_1e8: 0,
@@ -160,7 +169,7 @@ fn drain(rx: &mut tokio::sync::broadcast::Receiver<LifecycleEvent>) -> Vec<Lifec
 
 #[tokio::test]
 async fn pg_resting_gtc_order_persists() {
-    let Some(url) = pg_test_url() else {
+    let Some(url) = pg_test_url().await else {
         return;
     };
     let state = pg_state(&url).await;
@@ -195,7 +204,7 @@ async fn pg_resting_gtc_order_persists() {
 
 #[tokio::test]
 async fn pg_crossing_trade_persists_orders_fills_and_positions() {
-    let Some(url) = pg_test_url() else {
+    let Some(url) = pg_test_url().await else {
         return;
     };
     let state = pg_state(&url).await;
@@ -273,13 +282,253 @@ async fn pg_crossing_trade_persists_orders_fills_and_positions() {
     assert_eq!(alice_pos.size_1e8, ONE);
 }
 
+/// Two backend instances must not both consume the same maker quantity.
+/// The advisory transaction lock serializes the book read and fill commit.
+#[tokio::test]
+async fn pg_concurrent_takers_cannot_double_fill_one_maker() {
+    let Some(url) = pg_test_url().await else {
+        return;
+    };
+    let first = pg_state(&url).await;
+    let second = pg_state(&url).await;
+    let reader = fresh_price_reader();
+    let maker = per_test_account("race-pg-v1", "aab1");
+    let buyer_a = per_test_account("race-pg-v1", "aab2");
+    let buyer_b = per_test_account("race-pg-v1", "aab3");
+    let maker_outcome = submit_perp_order_via_state(
+        &first,
+        &reader,
+        base_input(
+            maker.clone(),
+            deopt_v2_backend::perps::PerpOrderSide::Sell,
+            PRICE_ETH_3000,
+            ONE,
+            "race-pg-maker-v1",
+        ),
+    )
+    .await
+    .unwrap();
+    let (a, b) = tokio::join!(
+        submit_perp_order_via_state(
+            &first,
+            &reader,
+            base_input(
+                buyer_a,
+                deopt_v2_backend::perps::PerpOrderSide::Buy,
+                PRICE_ETH_3100,
+                ONE,
+                "race-pg-taker-a-v1"
+            )
+        ),
+        submit_perp_order_via_state(
+            &second,
+            &reader,
+            base_input(
+                buyer_b,
+                deopt_v2_backend::perps::PerpOrderSide::Buy,
+                PRICE_ETH_3100,
+                ONE,
+                "race-pg-taker-b-v1"
+            )
+        ),
+    );
+    let total_filled = a.unwrap().fills.len() + b.unwrap().fills.len();
+    assert_eq!(total_filled, 1);
+    let repo = first.repository.as_ref().unwrap();
+    let fills = repo.list_perp_fills_for_account(&maker).await.unwrap();
+    assert_eq!(fills.len(), 1);
+    let maker_row = repo
+        .get_perp_order(maker_outcome.order.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(maker_row.filled_size_1e8, ONE);
+    assert_eq!(maker_row.remaining_size_1e8, 0);
+}
+
+#[tokio::test]
+async fn pg_subaccounts_keep_positions_fills_and_client_ids_separate() {
+    let Some(url) = pg_test_url().await else {
+        return;
+    };
+    let state = pg_state(&url).await;
+    let reader = fresh_price_reader();
+    let buyer = per_test_account("subacct-pg-v1", "aac1");
+    for subaccount_id in [1, 2] {
+        let seller = per_test_account(
+            "subacct-pg-v1",
+            if subaccount_id == 1 { "aac2" } else { "aac3" },
+        );
+        submit_perp_order_via_state(
+            &state,
+            &reader,
+            base_input(
+                seller,
+                deopt_v2_backend::perps::PerpOrderSide::Sell,
+                PRICE_ETH_3000,
+                ONE,
+                &format!("subacct-maker-{subaccount_id}"),
+            ),
+        )
+        .await
+        .unwrap();
+        let mut taker = base_input(
+            buyer.clone(),
+            deopt_v2_backend::perps::PerpOrderSide::Buy,
+            PRICE_ETH_3000,
+            ONE,
+            "same-client-id-different-subaccount-v1",
+        );
+        taker.subaccount_id = subaccount_id;
+        assert_eq!(
+            submit_perp_order_via_state(&state, &reader, taker)
+                .await
+                .unwrap()
+                .fills
+                .len(),
+            1
+        );
+    }
+    let repo = state.repository.as_ref().unwrap();
+    for subaccount_id in [1, 2] {
+        let position = repo
+            .get_active_perp_position_for_subaccount(&buyer, subaccount_id, "ETH-PERP")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(position.subaccount_id, subaccount_id);
+        assert_eq!(position.size_1e8, ONE);
+    }
+    let fills = repo.list_perp_fills_for_account(&buyer).await.unwrap();
+    assert_eq!(fills.len(), 2);
+    assert!(fills.iter().any(|f| f.taker_subaccount_id == 1));
+    assert!(fills.iter().any(|f| f.taker_subaccount_id == 2));
+
+    // Closing subaccount 2 must leave the same wallet's subaccount 1
+    // untouched. This exercises the SQL UPDATE predicate, not just the
+    // subaccount-aware SELECT above.
+    let closing_maker = per_test_account("subacct-pg-v1", "aac4");
+    submit_perp_order_via_state(
+        &state,
+        &reader,
+        base_input(
+            closing_maker,
+            deopt_v2_backend::perps::PerpOrderSide::Buy,
+            PRICE_ETH_3000,
+            ONE,
+            "subacct-close-maker",
+        ),
+    )
+    .await
+    .unwrap();
+    let mut close = base_input(
+        buyer.clone(),
+        deopt_v2_backend::perps::PerpOrderSide::Sell,
+        PRICE_ETH_3000,
+        ONE,
+        "subacct-close-taker",
+    );
+    close.subaccount_id = 2;
+    close.reduce_only = true;
+    assert_eq!(
+        submit_perp_order_via_state(&state, &reader, close)
+            .await
+            .unwrap()
+            .fills
+            .len(),
+        1
+    );
+    assert!(repo
+        .get_active_perp_position_for_subaccount(&buyer, 2, "ETH-PERP")
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        repo.get_active_perp_position_for_subaccount(&buyer, 1, "ETH-PERP")
+            .await
+            .unwrap()
+            .unwrap()
+            .size_1e8,
+        ONE
+    );
+    let stale = InMemoryPerpOraclePriceReader::new().with_price(
+        "ETH-PERP",
+        RawPriceRead {
+            price_1e8: PRICE_ETH_3000,
+            updated_at_sec: 1,
+            ok: true,
+        },
+    );
+    let err = submit_perp_order_via_state(
+        &state,
+        &stale,
+        base_input(
+            buyer.clone(),
+            deopt_v2_backend::perps::PerpOrderSide::Sell,
+            PRICE_ETH_3000,
+            ONE,
+            "ordinary-opposite-needs-oracle",
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("stale"));
+    let mut oversized_reduce = base_input(
+        buyer,
+        deopt_v2_backend::perps::PerpOrderSide::Sell,
+        PRICE_ETH_3000,
+        2 * ONE,
+        "oversized-reduce-pg",
+    );
+    oversized_reduce.reduce_only = true;
+    assert!(
+        submit_perp_order_via_state(&state, &reader, oversized_reduce)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn pg_risk_cap_rejects_before_persisting_order() {
+    let Some(url) = pg_test_url().await else {
+        return;
+    };
+    let mut state = pg_state(&url).await;
+    state.perps_read_config.markets[0].max_order_size_1e8 = Some(ONE / 2);
+    let buyer = per_test_account("cap-pg-v1", "aad1");
+    let result = submit_perp_order_via_state(
+        &state,
+        &fresh_price_reader(),
+        base_input(
+            buyer.clone(),
+            deopt_v2_backend::perps::PerpOrderSide::Buy,
+            PRICE_ETH_3000,
+            ONE,
+            "cap-pg-v1",
+        ),
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Err(deopt_v2_backend::error::BackendError::PerpOrderSizeCap(_))
+    ));
+    assert!(state
+        .repository
+        .as_ref()
+        .unwrap()
+        .list_perp_orders_for_account(&buyer)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
 // =====================================================================
 // 3. Cancel persists terminal status in PG
 // =====================================================================
 
 #[tokio::test]
 async fn pg_cancel_persists_terminal_status() {
-    let Some(url) = pg_test_url() else {
+    let Some(url) = pg_test_url().await else {
         return;
     };
     let state = pg_state(&url).await;
@@ -323,7 +572,7 @@ async fn pg_cancel_persists_terminal_status() {
 
 #[tokio::test]
 async fn pg_post_only_would_match_leaves_no_mutation() {
-    let Some(url) = pg_test_url() else {
+    let Some(url) = pg_test_url().await else {
         return;
     };
     let state = pg_state(&url).await;
@@ -388,7 +637,7 @@ async fn pg_post_only_would_match_leaves_no_mutation() {
 
 #[tokio::test]
 async fn pg_fok_not_fillable_leaves_no_mutation() {
-    let Some(url) = pg_test_url() else {
+    let Some(url) = pg_test_url().await else {
         return;
     };
     let state = pg_state(&url).await;
@@ -450,7 +699,7 @@ async fn pg_fok_not_fillable_leaves_no_mutation() {
 
 #[tokio::test]
 async fn pg_duplicate_client_order_id_rejects() {
-    let Some(url) = pg_test_url() else {
+    let Some(url) = pg_test_url().await else {
         return;
     };
     let state = pg_state(&url).await;
@@ -514,7 +763,7 @@ async fn pg_duplicate_client_order_id_rejects() {
 
 #[tokio::test]
 async fn pg_successful_crossing_emits_lifecycle_after_commit() {
-    let Some(url) = pg_test_url() else {
+    let Some(url) = pg_test_url().await else {
         return;
     };
     let state = pg_state(&url).await;
@@ -573,7 +822,7 @@ async fn pg_successful_crossing_emits_lifecycle_after_commit() {
 
 #[tokio::test]
 async fn pg_failed_submit_emits_perp_order_rejected_and_nothing_else() {
-    let Some(url) = pg_test_url() else {
+    let Some(url) = pg_test_url().await else {
         return;
     };
     let state = pg_state(&url).await;

@@ -22,6 +22,7 @@ use deopt_v2_backend::options::{
 use deopt_v2_backend::perps::{
     spawn_perps_funding_worker, spawn_perps_impact_mid_keeper, spawn_perps_liquidation_worker,
 };
+use std::future::IntoFuture;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{watch, RwLock};
@@ -681,19 +682,43 @@ async fn main() -> deopt_v2_backend::Result<()> {
         .await
         .map_err(|error| deopt_v2_backend::error::BackendError::Config(error.to_string()))?;
     // BACKEND-HYBRID-V2-BROADCAST-LIVE-WIRING-CLOSURE-V1 (Part H):
-    // graceful shutdown that broadcasts to the confirmation worker.
-    // On Ctrl+C (or serve error) we flip both the WorkerCancel and
-    // the shutdown watch channel, then await the JoinHandle with a
-    // bounded timeout so a stuck poll cannot block process exit.
-    let serve_fut = axum::serve(listener, app);
-    let shutdown = async {
+    // Docker and service managers send SIGTERM, while local terminals send
+    // Ctrl+C. Give active HTTP requests a bounded drain period before
+    // cancelling the broadcast worker. Dropped DB requests roll back.
+    #[cfg(unix)]
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .map_err(|e| BackendError::Config(format!("SIGTERM listener: {e}")))?;
+    let (shutdown_started_tx, mut shutdown_started_rx) = watch::channel(false);
+    let shutdown = async move {
+        #[cfg(unix)]
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                if let Err(e) = result { warn!("ctrl_c signal listener failed: {e}"); }
+            }
+            _ = sigterm.recv() => {}
+        }
+        #[cfg(not(unix))]
         if let Err(e) = tokio::signal::ctrl_c().await {
             warn!("ctrl_c signal listener failed: {e}");
         }
+        let _ = shutdown_started_tx.send(true);
     };
+    let mut serve_fut = Box::pin(
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown)
+            .into_future(),
+    );
     let serve_result = tokio::select! {
-        r = serve_fut => r,
-        _ = shutdown => Ok(()),
+        result = &mut serve_fut => result,
+        _ = shutdown_started_rx.changed() => {
+            match tokio::time::timeout(Duration::from_secs(5), &mut serve_fut).await {
+                Ok(result) => result,
+                Err(_) => {
+                    warn!("HTTP drain timeout after 5s; abandoning active connections");
+                    Ok(())
+                }
+            }
+        }
     };
     if let Some(tx) = broadcast_worker_shutdown_tx.take() {
         let _ = tx.send(true);

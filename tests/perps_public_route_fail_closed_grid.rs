@@ -204,4 +204,6 @@ async fn readiness_json_reports_perps_public_routes_fail_closed_by_default() {
         body.contains("fail_closed"),
         "readiness JSON must report `fail_closed` for the default flag: {body}"
     );
+    assert!(body.contains("\"perps_market_data_status\":\"disabled\""));
+    assert!(body.contains("\"perps_trading_status\":\"disabled\""));
 }

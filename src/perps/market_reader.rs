@@ -160,7 +160,7 @@ impl InMemoryPerpMarketRegistryReader {
 impl PerpMarketRegistryReader for InMemoryPerpMarketRegistryReader {
     async fn read_status(&self, market: &PerpsReadMarket) -> Result<PerpMarketStatus> {
         if let Some(err) = &self.force_error {
-            return Err(BackendError::PerpsMarketNotFound(err.clone()));
+            return Err(BackendError::PerpsRegistryUnavailable(err.clone()));
         }
         Ok(self
             .by_id
@@ -240,7 +240,7 @@ mod tests {
         let reader =
             InMemoryPerpMarketRegistryReader::new().with_forced_error("simulated rpc down");
         let err = reader.read_status(&eth_market()).await.unwrap_err();
-        assert!(matches!(err, BackendError::PerpsMarketNotFound(_)));
+        assert!(matches!(err, BackendError::PerpsRegistryUnavailable(_)));
     }
 
     #[tokio::test]

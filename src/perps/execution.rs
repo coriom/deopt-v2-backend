@@ -31,7 +31,7 @@ use crate::perps::orders::{
     reason, PerpFill, PerpOrder, PerpOrderSide, PerpOrderStatus, PerpTimeInForce,
 };
 use crate::perps::positions::PerpPositionsStore;
-use crate::perps::price_reader::PerpOraclePriceReader;
+use crate::perps::price_reader::{PerpOraclePriceReader, RawPriceRead};
 use crate::types::{now_ms, AccountId, TimestampMs};
 use uuid::Uuid;
 
@@ -108,29 +108,55 @@ pub async fn submit_perp_order_internal<P: PerpOraclePriceReader + ?Sized>(
     price_reader: &P,
     input: SubmitPerpOrderInput,
 ) -> Result<SubmitPerpOrderOutcome> {
+    let oracle_read = prepare_submit_oracle(cfg, price_reader, &input).await;
+    submit_perp_order_internal_with_oracle(cfg, order_store, positions_store, oracle_read, input)
+}
+
+/// Fetch outside shared-state locks. A failed read is retained so reductions
+/// can still proceed, while a position that changed to an opening order
+/// during the read is rejected at the commit boundary.
+pub(crate) async fn prepare_submit_oracle<P: PerpOraclePriceReader + ?Sized>(
+    cfg: &PerpsReadConfig,
+    price_reader: &P,
+    input: &SubmitPerpOrderInput,
+) -> Result<RawPriceRead> {
+    validate_input_basics(input)?;
+    validate_tif_combinations(input)?;
+    let market = cfg
+        .market_by_symbol(&input.market_id)
+        .ok_or_else(|| BackendError::PerpsMarketNotFound(input.market_id.clone()))?;
+    price_reader.read_price(market).await
+}
+
+/// Entire orderbook and position mutation is synchronous. Callers holding
+/// both store locks re-evaluate reduction, risk caps, and quote age here.
+pub(crate) fn submit_perp_order_internal_with_oracle(
+    cfg: &PerpsReadConfig,
+    order_store: &mut PerpOrderStore,
+    positions_store: &mut PerpPositionsStore,
+    oracle_read: Result<RawPriceRead>,
+    input: SubmitPerpOrderInput,
+) -> Result<SubmitPerpOrderOutcome> {
     validate_input_basics(&input)?;
     validate_tif_combinations(&input)?;
     let market = cfg
         .market_by_symbol(&input.market_id)
         .ok_or_else(|| BackendError::PerpsMarketNotFound(input.market_id.clone()))?;
 
-    // Pre-fill risk gate: opens/increases require a fresh mark price.
-    // Reduces don't (they only decrease exposure, so we don't need
-    // the mark for margin math). This matches the milestone brief.
-    let position_side_after = input.side.position_side();
-    let is_reduce = input.reduce_only
-        || positions_store
-            .get_active(&input.account, input.subaccount_id, &input.market_id)
-            .filter(|p| p.side != position_side_after)
-            .is_some();
+    // Only an explicitly reduce-only order can skip the opening-risk gate.
+    // An ordinary opposite-side GTC order may rest and later increase a
+    // changed position, even when its immediate fill would reduce one.
+    let is_reduce = input.reduce_only;
     if !is_reduce {
         // PERPS-MARGIN-ORACLE-RISK-V1 — layered pre-submit gate:
         //   * fresh oracle mark (existing guard, unchanged);
         //   * deviation guard between index + mark;
         //   * per-market risk caps (order size / notional / subaccount
         //     notional / open interest).
-        ensure_mark_fresh(cfg, price_reader, market).await?;
-        ensure_mark_within_deviation(cfg, price_reader, market).await?;
+        let read =
+            oracle_read.map_err(|err| BackendError::PerpMarkPriceUnavailable(err.to_string()))?;
+        ensure_mark_fresh(cfg, &read, market)?;
+        ensure_mark_within_deviation(cfg, &read, market)?;
         enforce_pre_submit_risk_caps(market, positions_store, &input)?;
     }
 
@@ -167,6 +193,22 @@ pub async fn submit_perp_order_internal<P: PerpOraclePriceReader + ?Sized>(
     // read-only over the store — nothing mutates until we commit.
     let planned = plan_fills(order_store, &order)?;
 
+    // Reject before touching any maker or position. A self maker may
+    // appear after another price level, so checking inside the fill
+    // loop would otherwise leave an earlier partial fill behind.
+    if planned.iter().any(|f| f.maker_account == order.account) {
+        mark_order_terminal(
+            order_store,
+            order_id,
+            PerpOrderStatus::Rejected,
+            reason::SELF_TRADE,
+            "self-trade rejected",
+            reason::SOURCE_MATCHING_POLICY,
+            now,
+        )?;
+        return Err(BackendError::PerpSelfTrade);
+    }
+
     // Post-only: no fill allowed.
     if order.post_only && !planned.is_empty() {
         mark_order_terminal(
@@ -199,7 +241,7 @@ pub async fn submit_perp_order_internal<P: PerpOraclePriceReader + ?Sized>(
     // Reduce-only pre-check: fills must not exceed the existing
     // opposite-side position and must not switch net direction.
     if order.reduce_only {
-        enforce_reduce_only(positions_store, &order, planned_total)?;
+        enforce_reduce_only(positions_store, &order)?;
     }
 
     // Commit: apply each planned fill to both accounts. Every fill
@@ -212,21 +254,6 @@ pub async fn submit_perp_order_internal<P: PerpOraclePriceReader + ?Sized>(
     let mut taker_remaining = order.size_1e8;
     for plan in &planned {
         let taker_side = order.side;
-        // Self-trade rejection: the account is proving both sides
-        // of the fill. In V1 we reject rather than crossing the
-        // book internally.
-        if plan.maker_account == order.account {
-            mark_order_terminal(
-                order_store,
-                order_id,
-                PerpOrderStatus::Rejected,
-                reason::SELF_TRADE,
-                "self-trade rejected",
-                reason::SOURCE_MATCHING_POLICY,
-                now,
-            )?;
-            return Err(BackendError::PerpSelfTrade);
-        }
         // Update the maker's row first: reduce their remaining and
         // bump their filled/status.
         order_store.update(plan.maker_order_id, now, |maker| {
@@ -508,15 +535,11 @@ fn validate_tif_combinations(input: &SubmitPerpOrderInput) -> Result<()> {
     Ok(())
 }
 
-async fn ensure_mark_fresh<P: PerpOraclePriceReader + ?Sized>(
+fn ensure_mark_fresh(
     cfg: &PerpsReadConfig,
-    price_reader: &P,
+    read: &RawPriceRead,
     market: &PerpsReadMarket,
 ) -> Result<()> {
-    let read = price_reader
-        .read_price(market)
-        .await
-        .map_err(|err| BackendError::PerpMarkPriceUnavailable(err.to_string()))?;
     if !read.ok || read.price_1e8 == 0 {
         return Err(BackendError::PerpMarkPriceUnavailable(format!(
             "oracle reported ok=false or zero price for {}",
@@ -546,15 +569,11 @@ async fn ensure_mark_fresh<P: PerpOraclePriceReader + ?Sized>(
 /// V1 they're the same field on `PerpPriceRead`, so the observed
 /// deviation is always 0 bps → pass. Kept as a first-class function
 /// so tests can freeze the shape.
-async fn ensure_mark_within_deviation<P: PerpOraclePriceReader + ?Sized>(
+fn ensure_mark_within_deviation(
     cfg: &PerpsReadConfig,
-    price_reader: &P,
+    read: &RawPriceRead,
     market: &PerpsReadMarket,
 ) -> Result<()> {
-    let read = price_reader
-        .read_price(market)
-        .await
-        .map_err(|err| BackendError::PerpMarkPriceUnavailable(err.to_string()))?;
     let index = read.price_1e8;
     let mark = read.price_1e8; // V1: mark == index at OracleRouter.
     let observed_bps = deviation_bps(index, mark);
@@ -700,11 +719,7 @@ fn plan_fills(store: &PerpOrderStore, taker: &PerpOrder) -> Result<Vec<PlannedFi
     Ok(plan)
 }
 
-fn enforce_reduce_only(
-    positions_store: &PerpPositionsStore,
-    order: &PerpOrder,
-    planned_total: u128,
-) -> Result<()> {
+fn enforce_reduce_only(positions_store: &PerpPositionsStore, order: &PerpOrder) -> Result<()> {
     let opposite = order.side.position_side().opposite();
     let existing = positions_store
         .get_active(&order.account, order.subaccount_id, &order.market_id)
@@ -712,7 +727,7 @@ fn enforce_reduce_only(
     if existing.side != opposite {
         return Err(BackendError::PerpReduceOnlyViolation);
     }
-    if planned_total > existing.size_1e8 {
+    if order.size_1e8 > existing.size_1e8 {
         return Err(BackendError::PerpReduceOnlyViolation);
     }
     Ok(())

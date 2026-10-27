@@ -13,8 +13,8 @@ use uuid::Uuid;
 pub struct PerpOrderStore {
     orders: HashMap<Uuid, PerpOrder>,
     fills: Vec<PerpFill>,
-    /// (lower(account), client_order_id) → order id, for idempotency.
-    by_client_order_id: HashMap<(String, String), Uuid>,
+    /// (lower(account), subaccount_id, client_order_id) → order id.
+    by_client_order_id: HashMap<(String, u32, String), Uuid>,
 }
 
 impl PerpOrderStore {
@@ -26,7 +26,11 @@ impl PerpOrderStore {
     /// order id from the same account.
     pub fn insert_order(&mut self, order: PerpOrder) -> Result<PerpOrder> {
         if let Some(client_id) = &order.client_order_id {
-            let key = (order.account.0.to_lowercase(), client_id.clone());
+            let key = (
+                order.account.0.to_lowercase(),
+                order.subaccount_id,
+                client_id.clone(),
+            );
             if self.by_client_order_id.contains_key(&key) {
                 return Err(BackendError::PerpDuplicateClientOrderId(client_id.clone()));
             }

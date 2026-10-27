@@ -4,15 +4,8 @@ target/
 node_modules/
 **/node_modules/
 
-# Real env files MUST NOT enter the image. Only .env.example
-# variants ship.
-.env
-.env.local
-.env.local.*
-.env.production
-.env.production.local
-.env.base-sepolia
-.env.base-sepolia.private
+# No environment files enter the build context, including examples.
+.env*
 
 # Build artefacts + editor noise
 .vscode/

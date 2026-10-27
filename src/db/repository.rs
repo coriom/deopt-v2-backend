@@ -1923,8 +1923,8 @@ impl PgRepository {
                 id, account, market_id, side,
                 size_1e8, entry_price_1e8, margin_1e8, realized_pnl_1e8,
                 status, opened_at_ms, updated_at_ms, closed_at_ms, version,
-                last_funding_index_1e18, cumulative_funding_payment_1e8
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
+                last_funding_index_1e18, cumulative_funding_payment_1e8, subaccount_id
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
         )
         .bind(position.id)
         .bind(&position.account.0)
@@ -1941,6 +1941,7 @@ impl PgRepository {
         .bind(position.version as i64)
         .bind(position.last_funding_index_1e18.to_string())
         .bind(position.cumulative_funding_payment_1e8.to_string())
+        .bind(u32_to_i32("subaccount_id", position.subaccount_id)?)
         .execute(&self.pool)
         .await;
         match res {
@@ -1993,7 +1994,9 @@ impl PgRepository {
         // `ON CONFLICT (partial-index)` shortcut, so we branch on the
         // existence of an active row first.
         let existing = self
-            .get_active_perp_position(&position.account, &position.market_id)
+            .get_active_perp_position_for_subaccount(
+                &position.account, position.subaccount_id, &position.market_id,
+            )
             .await?;
         if existing.is_some() {
             self.update_perp_position(position).await
@@ -2008,13 +2011,24 @@ impl PgRepository {
         account: &AccountId,
         market_id: &str,
     ) -> Result<Option<crate::perps::PerpPosition>> {
+        self.get_active_perp_position_for_subaccount(account, 1, market_id).await
+    }
+
+    pub async fn get_active_perp_position_for_subaccount(
+        &self,
+        account: &AccountId,
+        subaccount_id: u32,
+        market_id: &str,
+    ) -> Result<Option<crate::perps::PerpPosition>> {
         let row = sqlx::query(&format!(
             "{PERP_POSITION_SELECT_ALL}
-             WHERE lower(account) = lower($1) AND market_id = $2 AND status = 'open'
+             WHERE lower(account) = lower($1) AND market_id = $2
+               AND subaccount_id = $3 AND status = 'open'
              LIMIT 1",
         ))
         .bind(&account.0)
         .bind(market_id)
+        .bind(u32_to_i32("subaccount_id", subaccount_id)?)
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| BackendError::Persistence(e.to_string()))?;
@@ -2035,7 +2049,8 @@ impl PgRepository {
                  closed_at_ms = $3,
                  updated_at_ms = $3,
                  version = version + 1
-             WHERE lower(account) = lower($1) AND market_id = $2 AND status = 'open'
+             WHERE lower(account) = lower($1) AND market_id = $2
+               AND subaccount_id = 1 AND status = 'open'
              RETURNING {PERP_POSITION_COLUMNS}",
         ))
         .bind(&account.0)
@@ -2079,9 +2094,9 @@ impl PgRepository {
                 time_in_force, post_only, reduce_only, isolated_margin_1e8,
                 status, client_order_id,
                 terminal_reason_code, terminal_reason_message, terminal_reason_source,
-                created_at_ms, updated_at_ms
+                created_at_ms, updated_at_ms, subaccount_id
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-                      $14, $15, $16, $17, $18, $19, $20)",
+                      $14, $15, $16, $17, $18, $19, $20, $21)",
         )
         .bind(order.id)
         .bind(&order.account.0)
@@ -2103,6 +2118,7 @@ impl PgRepository {
         .bind(&order.terminal_reason_source)
         .bind(timestamp_to_i64(order.created_at_ms))
         .bind(timestamp_to_i64(order.updated_at_ms))
+        .bind(u32_to_i32("subaccount_id", order.subaccount_id)?)
         .execute(&self.pool)
         .await;
         match res {
@@ -2207,8 +2223,9 @@ impl PgRepository {
             "INSERT INTO perp_fills (
                 id, market_id, taker_order_id, maker_order_id,
                 taker_account, maker_account, taker_side,
-                price_1e8, size_1e8, created_at_ms
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+                price_1e8, size_1e8, created_at_ms,
+                taker_subaccount_id, maker_subaccount_id
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
         )
         .bind(fill.id)
         .bind(&fill.market_id)
@@ -2220,6 +2237,8 @@ impl PgRepository {
         .bind(fill.price_1e8.to_string())
         .bind(fill.size_1e8.to_string())
         .bind(timestamp_to_i64(fill.created_at_ms))
+        .bind(u32_to_i32("taker_subaccount_id", fill.taker_subaccount_id)?)
+        .bind(u32_to_i32("maker_subaccount_id", fill.maker_subaccount_id)?)
         .execute(&self.pool)
         .await
         .map(|_| ())
@@ -2287,7 +2306,8 @@ impl PgRepository {
     ) -> Result<Option<crate::perps::PerpOrder>> {
         let row = sqlx::query(&format!(
             "{PERP_ORDER_SELECT_ALL}
-             WHERE lower(account) = lower($1) AND client_order_id = $2
+             WHERE lower(account) = lower($1) AND subaccount_id = 1
+               AND client_order_id = $2
              LIMIT 1",
         ))
         .bind(&account.0)
@@ -6552,12 +6572,12 @@ fn indexed_perp_trade_from_row(row: PgRow) -> Result<IndexedPerpTrade> {
 // PERPS-PG-WRITE-PATH-V1 — SELECT column lists + row decoders.
 // =====================================================================
 
-const PERP_POSITION_COLUMNS: &str = "id, account, market_id, side,
+const PERP_POSITION_COLUMNS: &str = "id, account, subaccount_id, market_id, side,
     size_1e8, entry_price_1e8, margin_1e8, realized_pnl_1e8,
     status, opened_at_ms, updated_at_ms, closed_at_ms, version,
     last_funding_index_1e18, cumulative_funding_payment_1e8";
 
-const PERP_POSITION_SELECT_ALL: &str = "SELECT id, account, market_id, side,
+const PERP_POSITION_SELECT_ALL: &str = "SELECT id, account, subaccount_id, market_id, side,
             size_1e8, entry_price_1e8, margin_1e8, realized_pnl_1e8,
             status, opened_at_ms, updated_at_ms, closed_at_ms, version,
             last_funding_index_1e18, cumulative_funding_payment_1e8
@@ -6576,19 +6596,19 @@ const PERP_POSITION_SELECT_BY_ID_UPDATE: &str = "UPDATE perp_positions
         cumulative_funding_payment_1e8 = $12,
         version = version + 1
     WHERE id = $1 AND version = $10
-    RETURNING id, account, market_id, side,
+    RETURNING id, account, subaccount_id, market_id, side,
               size_1e8, entry_price_1e8, margin_1e8, realized_pnl_1e8,
               status, opened_at_ms, updated_at_ms, closed_at_ms, version,
               last_funding_index_1e18, cumulative_funding_payment_1e8";
 
-const PERP_ORDER_COLUMNS: &str = "id, account, market_id, side, order_type,
+const PERP_ORDER_COLUMNS: &str = "id, account, subaccount_id, market_id, side, order_type,
     price_1e8, size_1e8, remaining_size_1e8, filled_size_1e8,
     time_in_force, post_only, reduce_only, isolated_margin_1e8,
     status, client_order_id,
     terminal_reason_code, terminal_reason_message, terminal_reason_source,
     created_at_ms, updated_at_ms";
 
-const PERP_ORDER_SELECT_ALL: &str = "SELECT id, account, market_id, side, order_type,
+const PERP_ORDER_SELECT_ALL: &str = "SELECT id, account, subaccount_id, market_id, side, order_type,
             price_1e8, size_1e8, remaining_size_1e8, filled_size_1e8,
             time_in_force, post_only, reduce_only, isolated_margin_1e8,
             status, client_order_id,
@@ -6598,7 +6618,7 @@ const PERP_ORDER_SELECT_ALL: &str = "SELECT id, account, market_id, side, order_
 
 const PERP_FILL_SELECT_ALL: &str = "SELECT id, market_id,
             taker_order_id, maker_order_id,
-            taker_account, maker_account, taker_side,
+            taker_account, maker_account, taker_subaccount_id, maker_subaccount_id, taker_side,
             price_1e8, size_1e8, created_at_ms
      FROM perp_fills";
 
@@ -6757,9 +6777,9 @@ pub(crate) async fn insert_perp_order_tx(
             time_in_force, post_only, reduce_only, isolated_margin_1e8,
             status, client_order_id,
             terminal_reason_code, terminal_reason_message, terminal_reason_source,
-            created_at_ms, updated_at_ms
+            created_at_ms, updated_at_ms, subaccount_id
         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-                  $14, $15, $16, $17, $18, $19, $20)",
+                  $14, $15, $16, $17, $18, $19, $20, $21)",
     )
     .bind(order.id)
     .bind(&order.account.0)
@@ -6781,6 +6801,7 @@ pub(crate) async fn insert_perp_order_tx(
     .bind(&order.terminal_reason_source)
     .bind(timestamp_to_i64(order.created_at_ms))
     .bind(timestamp_to_i64(order.updated_at_ms))
+    .bind(u32_to_i32("subaccount_id", order.subaccount_id)?)
     .execute(&mut **tx)
     .await;
     match res {
@@ -6855,6 +6876,20 @@ pub(crate) async fn list_open_perp_orders_tx(
     rows.into_iter().map(perp_order_from_row).collect()
 }
 
+/// Serialize PG-backed perps submit/cancel transactions across backend
+/// processes. A single ledger key is intentionally conservative for the
+/// local alpha: price/time priority and maker remaining size must be read
+/// only after any prior fill or cancellation commits.
+pub(crate) async fn lock_perp_order_ledger_tx(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
+    const PERP_LEDGER_LOCK: i64 = 0x4445_4f50_5045_5250;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(PERP_LEDGER_LOCK)
+        .execute(&mut **tx)
+        .await
+        .map(|_| ())
+        .map_err(|e| BackendError::Persistence(e.to_string()))
+}
+
 pub(crate) async fn insert_perp_fill_tx(
     tx: &mut Transaction<'_, Postgres>,
     fill: &crate::perps::PerpFill,
@@ -6863,8 +6898,9 @@ pub(crate) async fn insert_perp_fill_tx(
         "INSERT INTO perp_fills (
             id, market_id, taker_order_id, maker_order_id,
             taker_account, maker_account, taker_side,
-            price_1e8, size_1e8, created_at_ms
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+            price_1e8, size_1e8, created_at_ms,
+            taker_subaccount_id, maker_subaccount_id
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
     )
     .bind(fill.id)
     .bind(&fill.market_id)
@@ -6876,6 +6912,8 @@ pub(crate) async fn insert_perp_fill_tx(
     .bind(fill.price_1e8.to_string())
     .bind(fill.size_1e8.to_string())
     .bind(timestamp_to_i64(fill.created_at_ms))
+    .bind(u32_to_i32("taker_subaccount_id", fill.taker_subaccount_id)?)
+    .bind(u32_to_i32("maker_subaccount_id", fill.maker_subaccount_id)?)
     .execute(&mut **tx)
     .await
     .map(|_| ())
@@ -6885,15 +6923,18 @@ pub(crate) async fn insert_perp_fill_tx(
 pub(crate) async fn get_active_perp_position_tx(
     tx: &mut Transaction<'_, Postgres>,
     account: &AccountId,
+    subaccount_id: u32,
     market_id: &str,
 ) -> Result<Option<crate::perps::PerpPosition>> {
     let row = sqlx::query(&format!(
         "{PERP_POSITION_SELECT_ALL}
-         WHERE lower(account) = lower($1) AND market_id = $2 AND status = 'open'
+         WHERE lower(account) = lower($1) AND subaccount_id = $3
+           AND market_id = $2 AND status = 'open'
          LIMIT 1",
     ))
     .bind(&account.0)
     .bind(market_id)
+    .bind(u32_to_i32("subaccount_id", subaccount_id)?)
     .fetch_optional(&mut **tx)
     .await
     .map_err(|e| BackendError::Persistence(e.to_string()))?;
@@ -6909,8 +6950,8 @@ pub(crate) async fn insert_perp_position_tx(
             id, account, market_id, side,
             size_1e8, entry_price_1e8, margin_1e8, realized_pnl_1e8,
             status, opened_at_ms, updated_at_ms, closed_at_ms, version,
-            last_funding_index_1e18, cumulative_funding_payment_1e8
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
+            last_funding_index_1e18, cumulative_funding_payment_1e8, subaccount_id
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
     )
     .bind(position.id)
     .bind(&position.account.0)
@@ -6927,6 +6968,7 @@ pub(crate) async fn insert_perp_position_tx(
     .bind(position.version as i64)
     .bind(position.last_funding_index_1e18.to_string())
     .bind(position.cumulative_funding_payment_1e8.to_string())
+    .bind(u32_to_i32("subaccount_id", position.subaccount_id)?)
     .execute(&mut **tx)
     .await;
     match res {
@@ -6970,6 +7012,7 @@ pub(crate) async fn update_perp_position_tx(
 pub(crate) async fn close_active_perp_position_tx(
     tx: &mut Transaction<'_, Postgres>,
     account: &AccountId,
+    subaccount_id: u32,
     market_id: &str,
     now_ms: TimestampMs,
 ) -> Result<crate::perps::PerpPosition> {
@@ -6979,12 +7022,14 @@ pub(crate) async fn close_active_perp_position_tx(
              closed_at_ms = $3,
              updated_at_ms = $3,
              version = version + 1
-         WHERE lower(account) = lower($1) AND market_id = $2 AND status = 'open'
+         WHERE lower(account) = lower($1) AND market_id = $2
+           AND subaccount_id = $4 AND status = 'open'
          RETURNING {PERP_POSITION_COLUMNS}",
     ))
     .bind(&account.0)
     .bind(market_id)
     .bind(timestamp_to_i64(now_ms))
+    .bind(u32_to_i32("subaccount_id", subaccount_id)?)
     .fetch_optional(&mut **tx)
     .await
     .map_err(|e| BackendError::Persistence(e.to_string()))?;
@@ -7003,7 +7048,7 @@ pub(crate) async fn close_active_perp_position_tx(
 // commit. Lifecycle frames fire only AFTER `tx.commit().await?` in the
 // tick orchestrator (see `crate::perps::liquidation_pg`).
 
-const PERP_LIQUIDATION_SELECT_ALL: &str = "SELECT id, account, market_id, position_id, side,
+const PERP_LIQUIDATION_SELECT_ALL: &str = "SELECT id, account, subaccount_id, market_id, position_id, side,
             size_1e8, entry_price_1e8, mark_price_1e8, margin_1e8,
             unrealized_pnl_1e8, equity_1e8, maintenance_margin_requirement_1e8,
             margin_ratio_bps, realized_pnl_1e8, bad_debt_1e8, liquidation_fee_1e8,
@@ -7094,8 +7139,8 @@ pub(crate) async fn insert_perp_liquidation_event_tx(
             size_1e8, entry_price_1e8, mark_price_1e8, margin_1e8,
             unrealized_pnl_1e8, equity_1e8, maintenance_margin_requirement_1e8,
             margin_ratio_bps, realized_pnl_1e8, bad_debt_1e8, liquidation_fee_1e8,
-            status, reason_code, created_at_ms
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)",
+            status, reason_code, created_at_ms, subaccount_id
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)",
     )
     .bind(event.id)
     .bind(&event.account.0)
@@ -7116,6 +7161,7 @@ pub(crate) async fn insert_perp_liquidation_event_tx(
     .bind(event.status.as_str())
     .bind(&event.reason_code)
     .bind(timestamp_to_i64(event.created_at_ms))
+    .bind(u32_to_i32("subaccount_id", event.subaccount_id)?)
     .execute(&mut **tx)
     .await
     .map(|_| ())
@@ -7166,6 +7212,7 @@ pub(crate) async fn list_open_perp_positions_tx(
 pub(crate) async fn liquidate_active_perp_position_tx(
     tx: &mut Transaction<'_, Postgres>,
     account: &AccountId,
+    subaccount_id: u32,
     market_id: &str,
     realized_pnl_delta_1e8: i128,
     now_ms: TimestampMs,
@@ -7177,13 +7224,15 @@ pub(crate) async fn liquidate_active_perp_position_tx(
              closed_at_ms = $4,
              updated_at_ms = $4,
              version = version + 1
-         WHERE lower(account) = lower($1) AND market_id = $2 AND status = 'open'
+         WHERE lower(account) = lower($1) AND subaccount_id = $5
+           AND market_id = $2 AND status = 'open'
          RETURNING {PERP_POSITION_COLUMNS}",
     ))
     .bind(&account.0)
     .bind(market_id)
     .bind(realized_pnl_delta_1e8.to_string())
     .bind(timestamp_to_i64(now_ms))
+    .bind(u32_to_i32("subaccount_id", subaccount_id)?)
     .fetch_optional(&mut **tx)
     .await
     .map_err(|e| BackendError::Persistence(e.to_string()))?;
@@ -7204,6 +7253,7 @@ pub(crate) async fn liquidate_active_perp_position_tx(
 pub(crate) async fn cancel_open_perp_orders_for_account_market_tx(
     tx: &mut Transaction<'_, Postgres>,
     account: &AccountId,
+    subaccount_id: u32,
     market_id: &str,
     reason_code: &str,
     reason_source: &str,
@@ -7216,6 +7266,7 @@ pub(crate) async fn cancel_open_perp_orders_for_account_market_tx(
              terminal_reason_source = $4,
              updated_at_ms = $5
          WHERE lower(account) = lower($1)
+           AND subaccount_id = $6
            AND market_id = $2
            AND status IN ('open', 'partially_filled')
          RETURNING {PERP_ORDER_COLUMNS}",
@@ -7225,6 +7276,7 @@ pub(crate) async fn cancel_open_perp_orders_for_account_market_tx(
     .bind(reason_code)
     .bind(reason_source)
     .bind(timestamp_to_i64(now_ms))
+    .bind(u32_to_i32("subaccount_id", subaccount_id)?)
     .fetch_all(&mut **tx)
     .await
     .map_err(|e| BackendError::Persistence(e.to_string()))?;
@@ -7235,7 +7287,7 @@ pub(crate) async fn cancel_open_perp_orders_for_account_market_tx(
 // PERPS-FUNDING-V1 — durable funding-event write + read helpers.
 // =====================================================================
 
-const PERP_FUNDING_SELECT_ALL: &str = "SELECT id, account, market_id, position_id, side,
+const PERP_FUNDING_SELECT_ALL: &str = "SELECT id, account, subaccount_id, market_id, position_id, side,
             position_size_1e8, funding_index_before_1e18, funding_index_after_1e18,
             funding_delta_1e18, payment_1e8,
             margin_before_1e8, margin_after_1e8, bad_debt_1e8,
@@ -7303,8 +7355,8 @@ pub(crate) async fn insert_perp_funding_event_tx(
             position_size_1e8, funding_index_before_1e18, funding_index_after_1e18,
             funding_delta_1e18, payment_1e8,
             margin_before_1e8, margin_after_1e8, bad_debt_1e8,
-            reason_code, created_at_ms
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
+            reason_code, created_at_ms, subaccount_id
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
     )
     .bind(event.id)
     .bind(&event.account.0)
@@ -7321,6 +7373,7 @@ pub(crate) async fn insert_perp_funding_event_tx(
     .bind(event.bad_debt_1e8.to_string())
     .bind(&event.reason_code)
     .bind(timestamp_to_i64(event.created_at_ms))
+    .bind(u32_to_i32("subaccount_id", event.subaccount_id)?)
     .execute(&mut **tx)
     .await
     .map(|_| ())

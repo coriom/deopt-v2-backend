@@ -103,12 +103,17 @@ async fn settle_perp_position_via_repository(
     now: TimestampMs,
 ) -> Result<Option<PerpFundingEvent>> {
     let mut tx = repository.begin().await?;
+    repo::lock_perp_order_ledger_tx(&mut tx).await?;
 
     // Re-load position inside tx. Concurrent close/liquidate skips
     // gracefully.
-    let Some(current) =
-        repo::get_active_perp_position_tx(&mut tx, &candidate.account, &candidate.market_id)
-            .await?
+    let Some(current) = repo::get_active_perp_position_tx(
+        &mut tx,
+        &candidate.account,
+        candidate.subaccount_id,
+        &candidate.market_id,
+    )
+    .await?
     else {
         drop(tx);
         return Ok(None);

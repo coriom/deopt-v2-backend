@@ -132,12 +132,17 @@ async fn liquidate_perp_position_via_repository(
     now: TimestampMs,
 ) -> Result<Option<PerpLiquidationEvent>> {
     let mut tx = repository.begin().await?;
+    repo::lock_perp_order_ledger_tx(&mut tx).await?;
 
     // Re-load the position inside the tx. A concurrent close would have
     // flipped status by now; we honor that and skip.
-    let Some(current) =
-        repo::get_active_perp_position_tx(&mut tx, &candidate.account, &candidate.market_id)
-            .await?
+    let Some(current) = repo::get_active_perp_position_tx(
+        &mut tx,
+        &candidate.account,
+        candidate.subaccount_id,
+        &candidate.market_id,
+    )
+    .await?
     else {
         return Ok(None);
     };
@@ -209,6 +214,7 @@ async fn apply_pg_liquidation(
     repo::cancel_open_perp_orders_for_account_market_tx(
         tx,
         &position.account,
+        position.subaccount_id,
         &position.market_id,
         order_reason::LIQUIDATED,
         order_reason::SOURCE_LIQUIDATION_TICK,
@@ -221,6 +227,7 @@ async fn apply_pg_liquidation(
     repo::liquidate_active_perp_position_tx(
         tx,
         &position.account,
+        position.subaccount_id,
         &position.market_id,
         realized,
         now,

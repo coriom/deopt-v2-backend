@@ -51,7 +51,11 @@ COPY resources ./resources
 # build uses an inline migration helper that needs DATABASE_URL,
 # adjust here.
 ENV SQLX_OFFLINE=true
-RUN cargo build --release --bin deopt-v2-backend
+ENV CARGO_BUILD_JOBS=1
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/build/target \
+    cargo build --release --bin deopt-v2-backend \
+ && cp target/release/deopt-v2-backend /build/deopt-v2-backend
 
 # ---- runtime -----------------------------------------------------
 FROM debian:bookworm-slim AS runtime
@@ -65,7 +69,7 @@ RUN apt-get update \
 # Bring the binary + migrations dir (sqlx::migrate!() embeds them
 # at compile time, but copying the directory keeps the artefact
 # self-describing for operators inspecting the image).
-COPY --from=builder /build/target/release/deopt-v2-backend /usr/local/bin/deopt-v2-backend
+COPY --from=builder /build/deopt-v2-backend /usr/local/bin/deopt-v2-backend
 COPY --from=builder /build/migrations /app/migrations
 
 USER deopt

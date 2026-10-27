@@ -1,0 +1,89 @@
+{
+  "milestone": "DEOPT_BACKEND_PERPS_ALPHA_CONCURRENCY_RECOVERY_AND_E2E_V1",
+  "scope": "local-only; no public transaction or remote backend deployment",
+  "starting_commit": "3b67f87b2c929030da640b3047eaa32ed3cef874",
+  "chain_id_for_local_profile": 84532,
+  "concurrency_invariant": "Oracle I/O precedes in-memory ledger locks; both ledgers commit together after revalidation. PG submit, cancel, funding and liquidation serialize through one transaction-scoped advisory lock.",
+  "tests": {
+    "focused_unique_passed": 80,
+    "focused_failed_after_repair": 0,
+    "library_passed": 1861,
+    "library_failed_after_repair": 0,
+    "local_anvil_lifecycle_passed": 6,
+    "pg_execution_proof_passed": 11,
+    "pg_funding_passed": 10,
+    "pg_liquidation_passed": 13,
+    "in_memory_concurrency_passed": 7,
+    "signed_intent_passed": 18,
+    "margin_oracle_risk_passed": 34,
+    "distinct_final_rust_tests_passed": 1993,
+    "local_process_sigterm_regression_passed": 1
+  },
+  "postgres_recovery": {
+    "disposable_only": true,
+    "fault": "SIGKILL local PostgreSQL container with synthetic update uncommitted",
+    "committed_orders_after_restart": 4,
+    "committed_fills_after_restart": 2,
+    "committed_positions_after_restart": 4,
+    "digest_before_and_after": "c80a296a6915d75a1e34b2c4323ce221",
+    "uncommitted_probe_rows_after_restart": 0,
+    "verdict": "PASS_BOUNDED"
+  },
+  "local_api": {
+    "health_http": 200,
+    "ready_http": 200,
+    "market_data_status": "disabled",
+    "trading_status": "disabled",
+    "market_read_http": 503
+  },
+  "frontend_browser": {
+    "isolated_production_build": "PASS",
+    "routes_loaded_and_reloaded": ["/", "/options", "/perps", "/custom"],
+    "uncaught_page_errors": 0,
+    "perps_local_backend_http": 503,
+    "trading_submit_tested": false,
+    "frontend_repository_modified": false
+  },
+  "fee_policy_sync": {
+    "status": "BLOCKED_UNEXECUTED_D2",
+    "approved_testnet_perp_policy_bps": {"maker": 0, "taker": 2, "rebate": 0},
+    "existing_backend_tier0_bps": {"maker": 0.5, "taker": 3},
+    "source": "src/fees/schedule.rs; on-chain D2 S2 postflights are not established in this milestone"
+  },
+  "quality": {
+    "docker_compose_config": "PASS",
+    "host_binary_build": "PASS",
+    "git_diff_check": "PASS",
+    "clippy_all_targets_all_features_deny_warnings": "FAIL_196_LIBRARY_DIAGNOSTICS",
+    "clippy_lock_across_await_finding_observed": false,
+    "whole_repository_format_check": "FAIL_PREEXISTING_DIFF",
+    "docker_image_build": "PASS",
+    "docker_image_id": "sha256:463cd67c4ab262fddc3deaccacbd6fa889b954882d0101fb82dc331ed61c738d",
+    "docker_runtime": "PASS_BOUNDED_LOCAL",
+    "docker_health": "healthy",
+    "docker_nonroot_user": "deopt",
+    "docker_readonly_rootfs": true,
+    "docker_capabilities_dropped": "ALL",
+    "docker_memory_limit_bytes": 1073741824,
+    "docker_sigterm_initial": "FAIL_FORCE_KILL_EXIT_137_AFTER_15S_NOT_OOM",
+    "docker_sigterm_after_fix": "PASS_EXIT_0_WITHIN_3S",
+    "local_services_stopped_after_test": true
+  },
+  "verdict": {
+    "local_perps_alpha": "PARTIAL",
+    "backend_hosting_readiness": "PARTIAL",
+    "remaining_blockers": [
+      "D2 PERP fee profiles are not canonically executed or synchronized with backend fee accounting",
+      "Public C02 market creation and maintenance-release gates remain separately unauthorized",
+      "Durable indexer reorg/replay and PostgreSQL backup restore have not been accepted",
+      "No remote service, monitoring or RPC failover has been validated"
+    ],
+    "next_implementation_milestone": "Fail-closed live D2 fee-source synchronization after independent D2 S2 postflights"
+  },
+  "public_broadcast_enabled": false,
+  "remote_backend_deployed_by_this_milestone": false,
+  "existing_remote_backend_status": "NOT_VERIFIED",
+  "public_blockchain_transactions_by_agent": 0,
+  "c02_execution_authorized": false,
+  "public_trading_authorized": false
+}
