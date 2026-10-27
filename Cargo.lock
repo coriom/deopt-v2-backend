@@ -1224,6 +1224,7 @@ dependencies = [
  "dotenvy",
  "eth-keystore",
  "futures",
+ "hex",
  "k256",
  "once_cell",
  "quinn",

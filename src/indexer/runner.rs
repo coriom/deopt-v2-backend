@@ -19,7 +19,9 @@ pub const PERP_MATCHING_ENGINE_CURSOR: &str = "perp_matching_engine";
 pub type RpcFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
 
 pub trait IndexerRpcProvider: Clone + Send + Sync {
+    fn chain_id(&self) -> RpcFuture<'_, u64>;
     fn block_number(&self) -> RpcFuture<'_, u64>;
+    fn block_hash(&self, block_number: u64) -> RpcFuture<'_, String>;
     fn get_logs(&self, filter: EthGetLogsFilter) -> RpcFuture<'_, Vec<EthLog>>;
 }
 
@@ -39,11 +41,45 @@ impl HttpIndexerRpcProvider {
 }
 
 impl IndexerRpcProvider for HttpIndexerRpcProvider {
+    fn chain_id(&self) -> RpcFuture<'_, u64> {
+        Box::pin(async move {
+            let response: JsonRpcResponse<String> = self.client.post(&self.rpc_url)
+                .timeout(Duration::from_secs(8))
+                .json(&JsonRpcRequest {
+                    jsonrpc: "2.0", id: 1, method: "eth_chainId",
+                    params: Vec::<serde_json::Value>::new(),
+                })
+                .send().await.map_err(|e| BackendError::Indexer(e.to_string()))?
+                .json().await.map_err(|e| BackendError::Indexer(e.to_string()))?;
+            if let Some(error) = response.error { return Err(BackendError::Indexer(error.message)); }
+            parse_hex_quantity(&response.result.ok_or_else(|| BackendError::Indexer("chain ID absent".into()))?)
+        })
+    }
+
+    fn block_hash(&self, block_number: u64) -> RpcFuture<'_, String> {
+        Box::pin(async move {
+            let response: JsonRpcResponse<serde_json::Value> = self.client.post(&self.rpc_url)
+                .timeout(Duration::from_secs(8))
+                .json(&JsonRpcRequest {
+                    jsonrpc: "2.0", id: 1, method: "eth_getBlockByNumber",
+                    params: (hex_quantity(block_number), false),
+                })
+                .send().await.map_err(|e| BackendError::Indexer(e.to_string()))?
+                .json().await.map_err(|e| BackendError::Indexer(e.to_string()))?;
+            if let Some(error) = response.error { return Err(BackendError::Indexer(error.message)); }
+            let value = response.result.ok_or_else(|| BackendError::Indexer("block absent".into()))?;
+            let hash = value.get("hash").and_then(serde_json::Value::as_str)
+                .ok_or_else(|| BackendError::Indexer("block hash absent".into()))?;
+            canonical_hash(hash)
+        })
+    }
+
     fn block_number(&self) -> RpcFuture<'_, u64> {
         Box::pin(async move {
             let response: JsonRpcResponse<String> = self
                 .client
                 .post(&self.rpc_url)
+                .timeout(Duration::from_secs(8))
                 .json(&JsonRpcRequest {
                     jsonrpc: "2.0",
                     id: 1,
@@ -71,6 +107,7 @@ impl IndexerRpcProvider for HttpIndexerRpcProvider {
             let response: JsonRpcResponse<Vec<EthLog>> = self
                 .client
                 .post(&self.rpc_url)
+                .timeout(Duration::from_secs(8))
                 .json(&JsonRpcRequest {
                     jsonrpc: "2.0",
                     id: 1,
@@ -192,11 +229,25 @@ where
         // now `(chain_id, name)`-scoped. V1 has exactly one chain
         // runtime (Base Sepolia via `v1_default`).
         let chain_id = ChainRuntimeHandle::v1_default().chain_id();
+        if self.provider.chain_id().await? != chain_id {
+            return Err(BackendError::Indexer("indexer RPC chain ID mismatch".into()));
+        }
         let last_indexed_block = self
             .repository
             .get_indexer_cursor(chain_id, PERP_MATCHING_ENGINE_CURSOR)
             .await?
             .unwrap_or(self.config.start_block);
+        // A legacy cursor without a durable block hash cannot be trusted to
+        // resume after an RPC switch or reorg. Require explicit reconciliation.
+        let stored_hash = self.repository
+            .get_indexer_cursor_hash(chain_id, PERP_MATCHING_ENGINE_CURSOR).await?;
+        if let Some(stored_hash) = stored_hash.as_ref() {
+            if canonical_hash(stored_hash)? != self.provider.block_hash(last_indexed_block).await? {
+                return Err(BackendError::Indexer("indexed cursor diverged from canonical chain; reconciliation required".into()));
+            }
+        } else if self.repository.get_indexer_cursor(chain_id, PERP_MATCHING_ENGINE_CURSOR).await?.is_some() {
+            return Err(BackendError::Indexer("legacy indexer cursor has no canonical block hash; reconciliation required".into()));
+        }
         let from_block = last_indexed_block.saturating_add(1);
         if from_block > current_block {
             return Ok(IndexerTickResult {
@@ -211,6 +262,7 @@ where
             .saturating_add(self.config.max_block_range)
             .saturating_sub(1);
         let to_block = current_block.min(range_end);
+        let to_hash_before = self.provider.block_hash(to_block).await?;
 
         // PERPS_V2_BACKEND_RECONCILIATION_V1 §12 — filter by BOTH
         // the V1 PME emitter and the optional V2 PME emitter in a
@@ -238,7 +290,19 @@ where
             .await?;
         let logs_found = logs.len();
         let mut trades = Vec::with_capacity(logs.len());
+        let mut checked_hashes: std::collections::HashMap<u64, String> =
+            std::collections::HashMap::new();
         for log in &logs {
+            let number = parse_hex_quantity(log.block_number.as_deref().ok_or_else(||
+                BackendError::Indexer("log missing block number".into()))?)?;
+            if number < from_block || number > to_block {
+                return Err(BackendError::Indexer("RPC returned out-of-range log".into()));
+            }
+            let log_hash = canonical_hash(log.block_hash.as_deref().ok_or_else(||
+                BackendError::Indexer("log missing block hash".into()))?)?;
+            let canonical = if let Some(hash) = checked_hashes.get(&number) { hash.clone() }
+                else { let hash = self.provider.block_hash(number).await?; checked_hashes.insert(number, hash.clone()); hash };
+            if log_hash != canonical { return Err(BackendError::Indexer("RPC returned orphaned log".into())); }
             let Some(version) =
                 classify_emitter(&log.address, &v1_pme, v2_pme_opt.as_deref())
             else {
@@ -257,13 +321,17 @@ where
             };
             trades.push(decode_trade_executed_log_for_emitter(log, version)?);
         }
+        if self.provider.block_hash(to_block).await? != to_hash_before {
+            return Err(BackendError::Indexer("indexer range reorganized during RPC read".into()));
+        }
         let events_indexed = self
             .repository
             .persist_indexed_perp_trades_and_cursor(
                 chain_id,
                 PERP_MATCHING_ENGINE_CURSOR,
                 &trades,
-                to_block,
+                stored_hash.as_deref().map(|hash| (last_indexed_block, hash)),
+                (to_block, &to_hash_before),
             )
             .await?;
 
@@ -280,6 +348,13 @@ where
             cursor_updated: true,
         })
     }
+}
+
+fn canonical_hash(value: &str) -> Result<String> {
+    if value.len() != 66 || !value.starts_with("0x") || !value[2..].bytes().all(|c| c.is_ascii_hexdigit()) {
+        return Err(BackendError::Indexer("invalid block hash".into()));
+    }
+    Ok(value.to_ascii_lowercase())
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]

@@ -1,0 +1,58 @@
+{
+  "milestone": "DEOPT_BACKEND_FEE_SOURCE_INDEXER_RECOVERY_AND_RELEASE_HARDENING_V1",
+  "startHead": "7d6615219c1f25b5b28f0c436b1e0acc549c622e",
+  "chainId": 84532,
+  "publicTransactionsSent": 0,
+  "remoteBackendDeployed": false,
+  "publicBroadcastEnabled": false,
+  "tradingEnabled": false,
+  "d2FeeSource": {
+    "canonicalAddress": "0x9947f42cc29a32992bbf2030ee49e35c839eded5",
+    "sourceRuntimeHash": "0x732101d67fb112f6d3159f32852071bbf995f8bd1995335cf9a2b0f167d08726",
+    "humanPolicy": {"makerBps": 0, "takerBps": 2, "rebatesBps": 0},
+    "onchainUnits": {"makerPpm": 0, "takerPpm": 200, "denominator": 1000000},
+    "tiers": [0, 1, 2, 3, 4],
+    "readbackAndReceiptVerifierImplemented": true,
+    "liveReceiptReadbackVerified": false,
+    "replacementFeeAccrualUsesLegacySchedule": false,
+    "runtimeFeeActivation": "BLOCKED_PENDING_CANONICAL_S2_POSTFLIGHTS_AND_INTEGRATION"
+  },
+  "indexer": {
+    "hybridV2PostgresReorgTests": {"passed": 9, "failed": 0},
+    "legacyCursorPostgresTests": {"passed": 1, "failed": 0},
+    "legacyCursorHashBound": true,
+    "legacyDivergenceBehavior": "FAIL_CLOSED_MANUAL_RECONCILIATION_REQUIRED",
+    "automaticLegacyFeeLedgerRewind": false
+  },
+  "postgresRestore": {
+    "isolatedSourceDatabase": "deopt_indexer_test",
+    "isolatedTargetDatabase": "deopt_restore_test",
+    "backupFormat": "pg_dump_custom",
+    "restoreTool": "pg_restore_exit_on_error",
+    "logicalStateDigestMd5": "65733b7d9fe096f67b240e92d6c2aca1",
+    "sourceTargetDigestEqual": true,
+    "restoredCounts": {"orders": 1, "perpOrders": 2, "perpFills": 1, "perpPositions": 1, "indexedTrades": 1, "indexerCursors": 1, "feeEvents": 0},
+    "duplicateReplayChangedState": false,
+    "backendRestartAgainstRestore": {"status": "PASS", "recordCountsUnchanged": true, "serviceReady": true, "perpsTradingStatus": "disabled"}
+  },
+  "quality": {
+    "strictClippyBefore": {"reportedDiagnostics": 196, "scope": "prior milestone, not rerun at start"},
+    "feeTests": {"passed": 112, "failed": 0, "scope": "prior to final D2 freshness guard"},
+    "d2ReaderTestsAfterFreshnessGuard": {"passed": 3, "failed": 0},
+    "strictClippyAfter": {"status": "FAIL", "diagnostics": 197, "command": "cargo clippy --lib -- -D warnings", "newReaderOrIndexerDiagnostics": 0},
+    "repositoryFmtCheck": "FAIL_PREEXISTING_DRIFT",
+    "newFileRustfmtCheck": "PASS",
+    "dockerBuild": {"status": "PASS", "localImage": "deopt-alpha-backend:recovery-v1", "imageId": "sha256:f59ab82aebdf9c6b4142cb7a8d699ef88b935db7c027497c6a42cbd716e13403"},
+    "dockerRuntime": {"status": "PASS", "nonRoot": true, "readOnlyFilesystem": true, "healthHttp": 200, "readyHttp": 200, "perpsMarketsHttp": 503, "publicTradingEnabled": false},
+    "isolatedAnvil": "PRIOR_MILESTONE_REUSED_NOT_RERUN",
+    "frontendBrowser": "PRIOR_MILESTONE_REUSED_NOT_RERUN"
+  },
+  "localPerpsAlpha": "PARTIAL",
+  "backendHostingReadiness": "PARTIAL",
+  "remainingBlockers": [
+    "D2 and D3 S2 canonical public postflights are not yet verified",
+    "Replacement V2 fee accrual still needs a reviewed integration with pinned D2 account tiers and quotes",
+    "Legacy indexer orphaned downstream fee events require manual reconciliation on reorg",
+    "Public trading requires separate governance and runtime authorization"
+  ]
+}

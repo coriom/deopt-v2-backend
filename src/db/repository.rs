@@ -1845,6 +1845,19 @@ impl PgRepository {
         .transpose()
     }
 
+    pub async fn get_indexer_cursor_hash(&self, chain_id: u64, name: &str) -> Result<Option<String>> {
+        let hash: Option<String> = sqlx::query_scalar(
+            "SELECT last_indexed_block_hash FROM indexer_cursors WHERE chain_id = $1 AND name = $2",
+        )
+        .bind(u64_to_i64("chain_id", chain_id)?)
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?
+        .flatten();
+        Ok(hash)
+    }
+
     /// Persist a batch of indexed Perp trades + advance the indexer
     /// cursor for `(chain_id, cursor_name)` in a single transaction.
     pub async fn persist_indexed_perp_trades_and_cursor(
@@ -1852,14 +1865,42 @@ impl PgRepository {
         chain_id: u64,
         cursor_name: &str,
         trades: &[IndexedPerpTrade],
-        last_indexed_block: u64,
+        expected_cursor: Option<(u64, &str)>,
+        next_cursor: (u64, &str),
     ) -> Result<u64> {
         let mut tx = self.begin().await?;
+        // Serialize ticks from competing workers. The cursor CAS and trade
+        // inserts must share the same transaction so a failed tick leaves
+        // neither half committed.
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(u64_to_i64("chain_id", chain_id)?)
+            .execute(&mut *tx).await
+            .map_err(|e| BackendError::Persistence(e.to_string()))?;
+        let prior = sqlx::query(
+            "SELECT last_indexed_block, last_indexed_block_hash FROM indexer_cursors
+             WHERE chain_id = $1 AND name = $2 FOR UPDATE",
+        )
+        .bind(u64_to_i64("chain_id", chain_id)?)
+        .bind(cursor_name)
+        .fetch_optional(&mut *tx).await
+        .map_err(|e| BackendError::Persistence(e.to_string()))?;
+        match (prior, expected_cursor) {
+            (Some(row), Some((expected_block, expected_hash))) => {
+                let block: i64 = row_get(&row, "last_indexed_block")?;
+                let hash: Option<String> = row_get(&row, "last_indexed_block_hash")?;
+                if i64_to_u64_persistence("last_indexed_block", block)? != expected_block
+                    || hash.as_deref() != Some(expected_hash) {
+                    return Err(BackendError::Indexer("indexer cursor changed during tick".into()));
+                }
+            }
+            (None, None) => {}
+            _ => return Err(BackendError::Indexer("indexer cursor changed during tick".into())),
+        }
         let mut inserted = 0u64;
         for trade in trades {
             inserted += insert_indexed_perp_trade(&mut tx, chain_id, trade).await?;
         }
-        upsert_indexer_cursor(&mut tx, chain_id, cursor_name, last_indexed_block, now_ms()).await?;
+        upsert_indexer_cursor(&mut tx, chain_id, cursor_name, next_cursor.0, next_cursor.1, now_ms()).await?;
         tx.commit()
             .await
             .map_err(|error| BackendError::Persistence(error.to_string()))?;
@@ -6240,18 +6281,21 @@ async fn upsert_indexer_cursor(
     chain_id: u64,
     name: &str,
     last_indexed_block: u64,
+    last_indexed_block_hash: &str,
     updated_at_ms: i64,
 ) -> Result<()> {
     sqlx::query(
-        "INSERT INTO indexer_cursors (chain_id, name, last_indexed_block, updated_at_ms)
-         VALUES ($1, $2, $3, $4)
+        "INSERT INTO indexer_cursors (chain_id, name, last_indexed_block, last_indexed_block_hash, updated_at_ms)
+         VALUES ($1, $2, $3, $4, $5)
          ON CONFLICT (chain_id, name) DO UPDATE
          SET last_indexed_block = EXCLUDED.last_indexed_block,
+             last_indexed_block_hash = EXCLUDED.last_indexed_block_hash,
              updated_at_ms = EXCLUDED.updated_at_ms",
     )
     .bind(u64_to_i64("chain_id", chain_id)?)
     .bind(name)
     .bind(u64_to_i64("last_indexed_block", last_indexed_block)?)
+    .bind(last_indexed_block_hash)
     .bind(timestamp_to_i64(updated_at_ms))
     .execute(&mut **tx)
     .await

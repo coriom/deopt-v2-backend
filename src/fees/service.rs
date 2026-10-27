@@ -306,6 +306,17 @@ pub async fn record_indexed_perp_trade_fees(
     trade: &IndexedPerpTrade,
     flow_type: FeeFlowType,
 ) -> Result<()> {
+    // This ledger uses the legacy local launch schedule. A replacement V2
+    // fill must not accrue those rates as though the five approved D2 PERP
+    // updates had already executed. Keep V2 accounting closed until the
+    // pinned D2 reader and canonical S2 postflights are wired into a
+    // separately reviewed runtime activation path.
+    if trade.protocol_version == crate::execution::perp_trade::PerpsProtocolVersion::V2 {
+        return Err(BackendError::Config(
+            "V2 PERP fee accrual requires canonical D2 execution and on-chain profile verification"
+                .to_string(),
+        ));
+    }
     let market_id = parse_u64_field(&trade.market_id, "indexed perp trade market_id")?;
     let size_1e8 = parse_u128_field(&trade.size_delta_1e8, "indexed perp trade size_delta_1e8")?;
     let execution_price_1e8 = parse_u128_field(
@@ -1156,6 +1167,33 @@ mod tests {
         assert_eq!(taker_volume.market_type, FeeMarketType::Perp);
         assert_eq!(taker_volume.maker_volume_1e8, 0);
         assert_eq!(taker_volume.taker_volume_1e8, 6_000 * ONE_1E8);
+    }
+
+    #[tokio::test]
+    async fn replacement_trade_never_uses_legacy_local_fee_schedule() {
+        let state = fee_state(false);
+        let trade = IndexedPerpTrade {
+            event_id: "synthetic-v2:0".into(),
+            tx_hash: "synthetic-v2".into(),
+            log_index: 0,
+            block_number: 1,
+            block_hash: None,
+            onchain_intent_id: None,
+            buyer: account_one().0,
+            seller: account_two().0,
+            market_id: "1".into(),
+            size_delta_1e8: "100000000".into(),
+            execution_price_1e8: "100000000".into(),
+            buyer_is_maker: true,
+            buyer_nonce: "1".into(),
+            seller_nonce: "2".into(),
+            created_at_ms: CREATED_AT_MS,
+            protocol_version: crate::execution::perp_trade::PerpsProtocolVersion::V2,
+            emitter_address: "synthetic-emitter".into(),
+        };
+        assert!(record_indexed_perp_trade_fees(&state, &trade, FeeFlowType::Orderbook)
+            .await.is_err());
+        assert!(state.fees_store.lock().unwrap().list_fee_events(10).is_empty());
     }
 
     #[tokio::test]

@@ -1,4 +1,5 @@
 pub mod onchain_summary;
+pub mod d2_onchain;
 pub mod option_consumer;
 pub mod perp_consumer;
 pub mod schedule;
