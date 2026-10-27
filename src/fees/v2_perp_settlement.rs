@@ -11,6 +11,7 @@ use crate::fees::d2_onchain::{
 use crate::indexer::decoder::{decode_trade_executed_log_for_emitter, trade_executed_topic0};
 use crate::indexer::{EthLog, IndexedPerpTrade};
 use alloy_primitives::keccak256;
+use serde::Serialize;
 use serde_json::{json, Value};
 use std::time::Duration;
 
@@ -36,6 +37,32 @@ pub struct CanonicalV2PerpFee {
     pub taker_tier: u8,
     pub basis_native: u128,
     pub amount_native: u128,
+}
+
+/// A settled wallet-level fact. D6's `TradeExecuted` event carries wallets,
+/// but no subaccount identifier. In particular, the local default account
+/// is never evidence of canonical subaccount ownership.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct CanonicalV2PerpHistoryRow {
+    pub chain_id: u64,
+    pub tx_hash: String,
+    pub trade_log_index: u64,
+    pub fee_log_index: Option<u64>,
+    pub block_number: u64,
+    pub block_hash: String,
+    pub market_id: String,
+    pub wallet: String,
+    pub counterparty: String,
+    pub role: &'static str,
+    pub side: &'static str,
+    pub size_delta_1e8: String,
+    pub execution_price_1e8: String,
+    pub fee_native: String,
+    pub fee_payer: String,
+    pub fee_recipient: String,
+    pub subaccount_id: Option<u32>,
+    pub attribution: &'static str,
+    pub settlement: &'static str,
 }
 
 /// The five hashes are public execution receipts, supplied only after their
@@ -230,6 +257,25 @@ pub fn validate_receipt(
         .and_then(Value::as_array)
         .ok_or_else(|| fee_error("V2 receipt logs missing".into()))?;
     let mut trade_matches = 0;
+    let mut prior_trade_log_index: Option<u64> = None;
+    for log in logs {
+        let emitter = log.get("address").and_then(Value::as_str).unwrap_or("");
+        let topic0 = log
+            .get("topics")
+            .and_then(Value::as_array)
+            .and_then(|topics| topics.first())
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if emitter.eq_ignore_ascii_case(D6_MATCHER)
+            && topic0.eq_ignore_ascii_case(&trade_executed_topic0())
+        {
+            let index = quantity(log.get("logIndex"))?;
+            if index < trade.log_index {
+                prior_trade_log_index =
+                    Some(prior_trade_log_index.map_or(index, |old| old.max(index)));
+            }
+        }
+    }
     let mut fee_log: Option<(u64, u128, u128)> = None;
     let charge_topic = topic(
         "FeeChargedV2(address,address,address,address,uint8,uint8,bool,int32,uint256,uint256)",
@@ -251,6 +297,13 @@ pub fn validate_receipt(
         if emitter.eq_ignore_ascii_case(D6_MATCHER)
             && topic0.eq_ignore_ascii_case(&trade_executed_topic0())
         {
+            let index = quantity(log.get("logIndex"))?;
+            if index < trade.log_index {
+                continue;
+            }
+            if index > trade.log_index {
+                continue;
+            }
             let parsed: EthLog = serde_json::from_value(log.clone())
                 .map_err(|_| fee_error("malformed D6 TradeExecuted log".into()))?;
             let parsed = decode_trade_executed_log_for_emitter(&parsed, PerpsProtocolVersion::V2)?;
@@ -282,6 +335,15 @@ pub fn validate_receipt(
             return Err(fee_error("unexpected D2 rebate in V2 PERP receipt".into()));
         }
         if emitter.eq_ignore_ascii_case(D2_ADDRESS) && topic0.eq_ignore_ascii_case(&charge_topic) {
+            let index = quantity(log.get("logIndex"))?;
+            if index >= trade.log_index {
+                continue;
+            }
+            // A batch can contain several D6 fills and D2 charges. Bind
+            // only the charge since the preceding D6 TradeExecuted log.
+            if prior_trade_log_index.is_some_and(|previous| index <= previous) {
+                continue;
+            }
             if fee_log.is_some() {
                 return Err(fee_error(
                     "multiple D2 charges in one V2 trade receipt".into(),
@@ -301,7 +363,7 @@ pub fn validate_receipt(
                             .is_some_and(|expected| hash.eq_ignore_ascii_case(expected))
                     })
                 || quantity(log.get("blockNumber"))? != trade.block_number
-                || quantity(log.get("logIndex"))? >= trade.log_index
+                || index >= trade.log_index
             {
                 return Err(fee_error(
                     "D2 charge log identity or ordering mismatch".into(),
@@ -327,11 +389,7 @@ pub fn validate_receipt(
             {
                 return Err(fee_error("D2 charge asset, flow or rate mismatch".into()));
             }
-            fee_log = Some((
-                quantity(log.get("logIndex"))?,
-                word_u128(&data[5])?,
-                word_u128(&data[6])?,
-            ));
+            fee_log = Some((index, word_u128(&data[5])?, word_u128(&data[6])?));
         }
     }
     if trade_matches != 1 {
@@ -566,6 +624,8 @@ mod tests {
     fn receipt(trade: &IndexedPerpTrade) -> Value {
         let size = trade.size_delta_1e8.parse::<u128>().unwrap();
         let price = trade.execution_price_1e8.parse::<u128>().unwrap();
+        let buyer_nonce = trade.buyer_nonce.parse::<u128>().unwrap();
+        let seller_nonce = trade.seller_nonce.parse::<u128>().unwrap();
         let basis = (size * price / 100_000_000) * 1_000_000 / 100_000_000;
         let amount = approved_taker_fee(basis).unwrap();
         json!({
@@ -584,7 +644,7 @@ mod tests {
                     format!("0x{}", address_word(BUYER)),
                     format!("0x{}", address_word(SELLER))],
                  "data": format!("0x{}{}{}{}{}{}", word(1), word(size),
-                    word(price), word(1), word(1), word(2)),
+                    word(price), word(1), word(buyer_nonce), word(seller_nonce)),
                  "logIndex": "0x3", "transactionHash": trade.tx_hash,
                  "blockNumber": "0x64", "blockHash": trade.block_hash}
             ]
@@ -704,6 +764,47 @@ mod tests {
         .is_err());
     }
 
+    #[test]
+    fn batched_receipt_binds_each_charge_to_its_own_trade() {
+        let first = trade();
+        let mut second = first.clone();
+        second.log_index = 6;
+        second.event_id = format!("{}:6", second.tx_hash);
+        second.onchain_intent_id = Some(hash("de"));
+        second.buyer_nonce = "3".into();
+        second.seller_nonce = "4".into();
+        let mut batch = receipt(&first);
+        let mut other = receipt(&second);
+        other["logs"][0]["logIndex"] = json!("0x5");
+        other["logs"][1]["logIndex"] = json!("0x6");
+        batch["logs"]
+            .as_array_mut()
+            .unwrap()
+            .extend(other["logs"].as_array().unwrap().clone());
+        let first_fee = validate_receipt(&first, &batch, &policy(), 0, 0, 1010).unwrap();
+        let second_fee = validate_receipt(&second, &batch, &policy(), 0, 0, 1010).unwrap();
+        assert_eq!(first_fee.fee_log_index, Some(2));
+        assert_eq!(second_fee.fee_log_index, Some(5));
+        let mut duplicate = batch.clone();
+        duplicate["logs"]
+            .as_array_mut()
+            .unwrap()
+            .insert(2, batch["logs"][0].clone());
+        assert!(validate_receipt(&first, &duplicate, &policy(), 0, 0, 1010).is_err());
+    }
+
+    #[test]
+    fn intent_hash_event_alone_never_becomes_wallet_or_subaccount_fee_history() {
+        let trade = trade();
+        let mut intent_only = receipt(&trade);
+        intent_only["logs"][1]["topics"] = json!([
+            topic("TradeExecutedFromIntents(bytes32,bytes32,uint256,uint128,uint128,uint256)"),
+            hash("cd"),
+            hash("ef")
+        ]);
+        assert!(validate_receipt(&trade, &intent_only, &policy(), 0, 0, 1010).is_err());
+    }
+
     #[tokio::test]
     async fn postgres_atomic_retry_reorg_and_divergence() {
         let Ok(url) = std::env::var("D2_ATOMIC_PG_TEST_URL") else {
@@ -743,6 +844,71 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 1);
+        let buyer_history = repository
+            .list_canonical_v2_perp_history(BUYER, 10)
+            .await
+            .unwrap();
+        let seller_history = repository
+            .list_canonical_v2_perp_history(SELLER, 10)
+            .await
+            .unwrap();
+        assert_eq!(buyer_history.len(), 1);
+        assert_eq!(seller_history.len(), 1);
+        assert_eq!(buyer_history[0].role, "maker");
+        assert_eq!(buyer_history[0].fee_native, "0");
+        assert_eq!(seller_history[0].role, "taker");
+        assert_eq!(seller_history[0].fee_native, "20000");
+        assert_eq!(seller_history[0].subaccount_id, None);
+        assert_eq!(
+            seller_history[0].attribution,
+            "wallet_only_unresolved_subaccount"
+        );
+        for id in [1_i32, 2_i32] {
+            sqlx::query("INSERT INTO subaccounts (owner_address, subaccount_id, created_at_ms, updated_at_ms) VALUES ($1,$2,0,0)")
+                .bind(BUYER)
+                .bind(id)
+                .execute(repository.pool())
+                .await
+                .unwrap();
+        }
+        let after_local_accounts = repository
+            .list_canonical_v2_perp_history(BUYER, 10)
+            .await
+            .unwrap();
+        assert_eq!(after_local_accounts.len(), 1);
+        assert_eq!(after_local_accounts[0].subaccount_id, None);
+        use tower::ServiceExt;
+        let mut state =
+            crate::api::AppState::new(crate::engine::EngineState::with_default_markets());
+        state.repository = Some(repository.clone());
+        let response = crate::api::router(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/accounts/{BUYER}/perps/canonical-fees"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1_000_000)
+            .await
+            .unwrap();
+        let api: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(api["identity_scope"], "wallet");
+        assert_eq!(api["subaccount_attribution"], "unresolved");
+        assert_eq!(api["fees"].as_array().unwrap().len(), 1);
+        assert!(api["fees"][0]["subaccount_id"].is_null());
+        assert_eq!(api["fees"][0]["fee_native"], "0");
+        assert!(repository
+            .list_canonical_v2_perp_history("not-a-wallet", 10)
+            .await
+            .is_err());
+        assert!(repository
+            .list_canonical_v2_perp_history("0x3333333333333333333333333333333333333333", 10)
+            .await
+            .unwrap()
+            .is_empty());
         let legacy: i64 = sqlx::query_scalar("SELECT count(*) FROM fee_events")
             .fetch_one(repository.pool())
             .await
@@ -800,5 +966,37 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(orphan, 0);
+        let mut second_in_same_tx = trade.clone();
+        second_in_same_tx.log_index = 6;
+        second_in_same_tx.event_id = format!("{}:6", second_in_same_tx.tx_hash);
+        second_in_same_tx.onchain_intent_id = Some(hash("de"));
+        second_in_same_tx.buyer_nonce = "3".into();
+        second_in_same_tx.seller_nonce = "4".into();
+        let mut batch = receipt(&trade);
+        let mut second_receipt = receipt(&second_in_same_tx);
+        second_receipt["logs"][0]["logIndex"] = json!("0x5");
+        second_receipt["logs"][1]["logIndex"] = json!("0x6");
+        batch["logs"]
+            .as_array_mut()
+            .unwrap()
+            .extend(second_receipt["logs"].as_array().unwrap().clone());
+        let second_fee =
+            validate_receipt(&second_in_same_tx, &batch, &policy(), 0, 0, 1010).unwrap();
+        assert_eq!(second_fee.fee_log_index, Some(5));
+        assert!(repository
+            .persist_canonical_v2_perp_fee(&second_in_same_tx, &second_fee)
+            .await
+            .unwrap());
+        assert!(!repository
+            .persist_canonical_v2_perp_fee(&second_in_same_tx, &second_fee)
+            .await
+            .unwrap());
+        let same_tx_count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM canonical_v2_perp_fees WHERE tx_hash=$1")
+                .bind(&trade.tx_hash)
+                .fetch_one(repository.pool())
+                .await
+                .unwrap();
+        assert_eq!(same_tx_count, 2);
     }
 }

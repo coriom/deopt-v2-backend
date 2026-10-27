@@ -123,7 +123,7 @@ use crate::rfq::{
 };
 use crate::types::TimeInForce;
 use crate::types::{now_ms, AccountId, MarketId, OrderId, Side, TimestampMs};
-use axum::extract::{Path, Query, State};
+use axum::extract::{OriginalUri, Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -328,6 +328,7 @@ pub fn router(state: AppState) -> Router {
         // the internal execution service.
         .route("/accounts/:address/perps/orders", get(perps_account_orders))
         .route("/accounts/:address/perps/fills", get(perps_account_fills))
+        .route("/accounts/:address/perps/canonical-fees", get(perps_canonical_fees))
         // PERPS-LIQUIDATION-AND-RISK-V1
         .route(
             "/accounts/:address/perps/liquidations",
@@ -2681,6 +2682,56 @@ async fn perps_account_fills(
             .retain(|v| v.taker_subaccount_id == sub || v.maker_subaccount_id == sub);
     }
     Ok(Json(response))
+}
+
+#[derive(Serialize)]
+struct CanonicalPerpFeeHistoryResponse {
+    chain_id: u64,
+    identity_scope: &'static str,
+    subaccount_attribution: &'static str,
+    current_chain_canonicality: &'static str,
+    fees: Vec<crate::fees::v2_perp_settlement::CanonicalV2PerpHistoryRow>,
+    trading_enabled: bool,
+}
+
+/// Only confirmed D6/D2 wallet-level facts. Local matching fills and their
+/// off-chain subaccount labels are intentionally excluded.
+async fn perps_canonical_fees(
+    State(state): State<AppState>,
+    Path(address): Path<String>,
+    OriginalUri(uri): OriginalUri,
+) -> Result<Json<CanonicalPerpFeeHistoryResponse>, ApiError> {
+    if uri.query().is_some() {
+        return Err(ApiError {
+            status: StatusCode::BAD_REQUEST,
+            message: "canonical fee history has wallet scope; subaccount filters are unsupported"
+                .into(),
+        });
+    }
+    if state.chain_id != crate::fees::d2_onchain::BASE_SEPOLIA_CHAIN_ID {
+        return Err(ApiError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: "canonical V2 fees require Base Sepolia".into(),
+        });
+    }
+    let wallet = crate::subaccounts::normalize_owner_address(&address).map_err(|_| ApiError {
+        status: StatusCode::BAD_REQUEST,
+        message: "invalid wallet address".into(),
+    })?;
+    let repository = state.repository.as_ref().ok_or_else(|| ApiError {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        message: "canonical fee history requires persistent storage".into(),
+    })?;
+    Ok(Json(CanonicalPerpFeeHistoryResponse {
+        chain_id: 84532,
+        identity_scope: "wallet",
+        subaccount_attribution: "unresolved",
+        current_chain_canonicality: "requires_fresh_chain_recheck",
+        fees: repository
+            .list_canonical_v2_perp_history(&wallet, 100)
+            .await?,
+        trading_enabled: false,
+    }))
 }
 
 // PERPS-LIQUIDATION-AND-RISK-V1 — read-only account liquidations.
@@ -8955,6 +9006,46 @@ mod tests {
     use axum::http::Request;
     use tokio::sync::mpsc;
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn canonical_fee_history_fails_closed_without_wallet_or_ledger() {
+        let app = router(AppState::new(EngineState::with_default_markets()));
+        let invalid = app
+            .clone()
+            .oneshot(get_request(
+                "/accounts/not-a-wallet/perps/canonical-fees",
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        let unavailable = app
+            .oneshot(get_request(
+                "/accounts/0x1111111111111111111111111111111111111111/perps/canonical-fees",
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let mut wrong_chain = AppState::new(EngineState::with_default_markets());
+        wrong_chain.chain_id = 8453;
+        let wrong = router(wrong_chain)
+            .oneshot(get_request(
+                "/accounts/0x1111111111111111111111111111111111111111/perps/canonical-fees",
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(wrong.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let filtered = router(AppState::new(EngineState::with_default_markets()))
+            .oneshot(get_request(
+                "/accounts/0x1111111111111111111111111111111111111111/perps/canonical-fees?subaccount_id=2",
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(filtered.status(), StatusCode::BAD_REQUEST);
+    }
 
     #[test]
     fn simulation_response_keeps_submitted_and_confirmed_false() {

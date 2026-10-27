@@ -12,11 +12,13 @@ use crate::execution::{
     ExecutionTransactionStatus, PreparedBroadcastRow, PreparedTransactionRecord, SimulationResult,
     StoredTradeSignatures,
 };
+use crate::fees::d2_onchain::{approved_taker_fee, TIMELOCK_ADDRESS};
+use crate::fees::v2_perp_settlement::{
+    CanonicalV2PerpFee, CanonicalV2PerpHistoryRow, D6_MATCHER, MUSDC,
+};
 use crate::fees::{
     FeeEvent, FeeFlowType, FeeMarketType, FeeSourceType, FeeStatus, RebateAccrual, VolumeBucket,
 };
-use crate::fees::d2_onchain::{approved_taker_fee, TIMELOCK_ADDRESS};
-use crate::fees::v2_perp_settlement::{CanonicalV2PerpFee, D6_MATCHER, MUSDC};
 use crate::indexer::IndexedPerpTrade;
 use crate::mm::{MmAccountPermissions, MmProductPermission};
 use crate::monitoring::FeeEventLabels;
@@ -1413,11 +1415,12 @@ impl PgRepository {
             .await
             .map_err(|error| BackendError::Persistence(error.to_string()))?;
 
-        let row = sqlx::query("SELECT status FROM execution_intents WHERE intent_id = $1 FOR UPDATE")
-            .bind(intent_id.to_string())
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        let row =
+            sqlx::query("SELECT status FROM execution_intents WHERE intent_id = $1 FOR UPDATE")
+                .bind(intent_id.to_string())
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|error| BackendError::Persistence(error.to_string()))?;
 
         let Some(row) = row else {
             return Err(BackendError::Persistence(format!(
@@ -1847,7 +1850,11 @@ impl PgRepository {
         .transpose()
     }
 
-    pub async fn get_indexer_cursor_hash(&self, chain_id: u64, name: &str) -> Result<Option<String>> {
+    pub async fn get_indexer_cursor_hash(
+        &self,
+        chain_id: u64,
+        name: &str,
+    ) -> Result<Option<String>> {
         let hash: Option<String> = sqlx::query_scalar(
             "SELECT last_indexed_block_hash FROM indexer_cursors WHERE chain_id = $1 AND name = $2",
         )
@@ -1876,7 +1883,8 @@ impl PgRepository {
         // neither half committed.
         sqlx::query("SELECT pg_advisory_xact_lock($1)")
             .bind(u64_to_i64("chain_id", chain_id)?)
-            .execute(&mut *tx).await
+            .execute(&mut *tx)
+            .await
             .map_err(|e| BackendError::Persistence(e.to_string()))?;
         let prior = sqlx::query(
             "SELECT last_indexed_block, last_indexed_block_hash FROM indexer_cursors
@@ -1884,25 +1892,41 @@ impl PgRepository {
         )
         .bind(u64_to_i64("chain_id", chain_id)?)
         .bind(cursor_name)
-        .fetch_optional(&mut *tx).await
+        .fetch_optional(&mut *tx)
+        .await
         .map_err(|e| BackendError::Persistence(e.to_string()))?;
         match (prior, expected_cursor) {
             (Some(row), Some((expected_block, expected_hash))) => {
                 let block: i64 = row_get(&row, "last_indexed_block")?;
                 let hash: Option<String> = row_get(&row, "last_indexed_block_hash")?;
                 if i64_to_u64_persistence("last_indexed_block", block)? != expected_block
-                    || hash.as_deref() != Some(expected_hash) {
-                    return Err(BackendError::Indexer("indexer cursor changed during tick".into()));
+                    || hash.as_deref() != Some(expected_hash)
+                {
+                    return Err(BackendError::Indexer(
+                        "indexer cursor changed during tick".into(),
+                    ));
                 }
             }
             (None, None) => {}
-            _ => return Err(BackendError::Indexer("indexer cursor changed during tick".into())),
+            _ => {
+                return Err(BackendError::Indexer(
+                    "indexer cursor changed during tick".into(),
+                ))
+            }
         }
         let mut inserted = 0u64;
         for trade in trades {
             inserted += insert_indexed_perp_trade(&mut tx, chain_id, trade).await?;
         }
-        upsert_indexer_cursor(&mut tx, chain_id, cursor_name, next_cursor.0, next_cursor.1, now_ms()).await?;
+        upsert_indexer_cursor(
+            &mut tx,
+            chain_id,
+            cursor_name,
+            next_cursor.0,
+            next_cursor.1,
+            now_ms(),
+        )
+        .await?;
         tx.commit()
             .await
             .map_err(|error| BackendError::Persistence(error.to_string()))?;
@@ -1918,23 +1942,33 @@ impl PgRepository {
         trade: &IndexedPerpTrade,
         fee: &CanonicalV2PerpFee,
     ) -> Result<bool> {
-        let taker = if trade.buyer_is_maker { &trade.seller } else { &trade.buyer };
+        let taker = if trade.buyer_is_maker {
+            &trade.seller
+        } else {
+            &trade.buyer
+        };
         if fee.chain_id != 84532
             || trade.protocol_version != crate::execution::perp_trade::PerpsProtocolVersion::V2
             || !trade.emitter_address.eq_ignore_ascii_case(D6_MATCHER)
             || !trade.tx_hash.eq_ignore_ascii_case(&fee.tx_hash)
             || trade.log_index != fee.trade_log_index
             || trade.block_number != fee.block_number
-            || !trade.block_hash.as_deref().is_some_and(|hash| hash.eq_ignore_ascii_case(&fee.block_hash))
+            || !trade
+                .block_hash
+                .as_deref()
+                .is_some_and(|hash| hash.eq_ignore_ascii_case(&fee.block_hash))
             || trade.market_id != fee.market_id
             || !fee.payer.eq_ignore_ascii_case(taker)
             || !fee.recipient.eq_ignore_ascii_case(TIMELOCK_ADDRESS)
             || !fee.settlement_asset.eq_ignore_ascii_case(MUSDC)
-            || fee.maker_tier >= 5 || fee.taker_tier >= 5
+            || fee.maker_tier >= 5
+            || fee.taker_tier >= 5
             || approved_taker_fee(fee.basis_native) != Some(fee.amount_native)
             || fee.fee_log_index.is_some() != (fee.amount_native > 0)
         {
-            return Err(BackendError::Persistence("canonical V2 trade/fee identity mismatch".into()));
+            return Err(BackendError::Persistence(
+                "canonical V2 trade/fee identity mismatch".into(),
+            ));
         }
         let mut normalized = trade.clone();
         normalized.tx_hash = fee.tx_hash.clone();
@@ -1944,7 +1978,8 @@ impl PgRepository {
         let mut tx = self.begin().await?;
         sqlx::query("SELECT pg_advisory_xact_lock($1)")
             .bind(u64_to_i64("chain_id", fee.chain_id)?)
-            .execute(&mut *tx).await
+            .execute(&mut *tx)
+            .await
             .map_err(|e| BackendError::Persistence(e.to_string()))?;
         insert_indexed_perp_trade(&mut tx, fee.chain_id, &normalized).await?;
         let stored = sqlx::query(
@@ -1956,16 +1991,23 @@ impl PgRepository {
         .bind(u64_to_i64("chain_id", fee.chain_id)?)
         .bind(&fee.tx_hash)
         .bind(u64_to_i64("trade_log_index", fee.trade_log_index)?)
-        .fetch_one(&mut *tx).await
+        .fetch_one(&mut *tx)
+        .await
         .map_err(|e| BackendError::Persistence(e.to_string()))?;
         let stored_hash: Option<String> = row_get(&stored, "block_hash")?;
-        if i64_to_u64_persistence("block_number", row_get::<i64>(&stored, "block_number")?)? != fee.block_number
-            || !stored_hash.as_deref().is_some_and(|hash| hash.eq_ignore_ascii_case(&fee.block_hash))
+        if i64_to_u64_persistence("block_number", row_get::<i64>(&stored, "block_number")?)?
+            != fee.block_number
+            || !stored_hash
+                .as_deref()
+                .is_some_and(|hash| hash.eq_ignore_ascii_case(&fee.block_hash))
             || row_get::<String>(&stored, "market_id")? != trade.market_id
             || !row_get::<String>(&stored, "buyer")?.eq_ignore_ascii_case(&trade.buyer)
             || !row_get::<String>(&stored, "seller")?.eq_ignore_ascii_case(&trade.seller)
             || row_get::<Option<String>>(&stored, "onchain_intent_id")?
-                != trade.onchain_intent_id.as_deref().and_then(normalize_onchain_intent_id)
+                != trade
+                    .onchain_intent_id
+                    .as_deref()
+                    .and_then(normalize_onchain_intent_id)
             || row_get::<String>(&stored, "size_delta_1e8")? != trade.size_delta_1e8
             || row_get::<String>(&stored, "execution_price_1e8")? != trade.execution_price_1e8
             || row_get::<bool>(&stored, "buyer_is_maker")? != trade.buyer_is_maker
@@ -1975,7 +2017,9 @@ impl PgRepository {
                 != crate::execution::perp_trade::PerpsProtocolVersion::V2.as_persisted_str()
             || !row_get::<String>(&stored, "emitter_address")?.eq_ignore_ascii_case(D6_MATCHER)
         {
-            return Err(BackendError::Persistence("stored V2 trade diverged from canonical receipt".into()));
+            return Err(BackendError::Persistence(
+                "stored V2 trade diverged from canonical receipt".into(),
+            ));
         }
         let inserted = sqlx::query(
             "INSERT INTO canonical_v2_perp_fees (
@@ -1988,7 +2032,11 @@ impl PgRepository {
         .bind(u64_to_i64("chain_id", fee.chain_id)?)
         .bind(&fee.tx_hash)
         .bind(u64_to_i64("trade_log_index", fee.trade_log_index)?)
-        .bind(fee.fee_log_index.map(|value| u64_to_i64("fee_log_index", value)).transpose()?)
+        .bind(
+            fee.fee_log_index
+                .map(|value| u64_to_i64("fee_log_index", value))
+                .transpose()?,
+        )
         .bind(u64_to_i64("block_number", fee.block_number)?)
         .bind(&fee.block_hash)
         .bind(&fee.market_id)
@@ -2001,9 +2049,11 @@ impl PgRepository {
         .bind(200i32)
         .bind(fee.amount_native.to_string())
         .bind(timestamp_to_i64(now_ms()))
-        .execute(&mut *tx).await
+        .execute(&mut *tx)
+        .await
         .map_err(|e| BackendError::Persistence(e.to_string()))?
-        .rows_affected() == 1;
+        .rows_affected()
+            == 1;
         let row = sqlx::query(
             "SELECT fee_log_index, block_number, block_hash, market_id, payer, recipient,
                     settlement_asset, maker_tier, taker_tier, basis_native, fee_ppm, amount_native
@@ -2012,27 +2062,109 @@ impl PgRepository {
         .bind(u64_to_i64("chain_id", fee.chain_id)?)
         .bind(&fee.tx_hash)
         .bind(u64_to_i64("trade_log_index", fee.trade_log_index)?)
-        .fetch_optional(&mut *tx).await
+        .fetch_optional(&mut *tx)
+        .await
         .map_err(|e| BackendError::Persistence(e.to_string()))?
         .ok_or_else(|| BackendError::Persistence("D2 fee log uniqueness conflict".into()))?;
         if row_get::<Option<i64>>(&row, "fee_log_index")?
-                != fee.fee_log_index.map(|value| u64_to_i64("fee_log_index", value)).transpose()?
-            || i64_to_u64_persistence("block_number", row_get::<i64>(&row, "block_number")?)? != fee.block_number
+            != fee
+                .fee_log_index
+                .map(|value| u64_to_i64("fee_log_index", value))
+                .transpose()?
+            || i64_to_u64_persistence("block_number", row_get::<i64>(&row, "block_number")?)?
+                != fee.block_number
             || !row_get::<String>(&row, "block_hash")?.eq_ignore_ascii_case(&fee.block_hash)
             || row_get::<String>(&row, "market_id")? != fee.market_id
             || !row_get::<String>(&row, "payer")?.eq_ignore_ascii_case(&fee.payer)
             || !row_get::<String>(&row, "recipient")?.eq_ignore_ascii_case(&fee.recipient)
-            || !row_get::<String>(&row, "settlement_asset")?.eq_ignore_ascii_case(&fee.settlement_asset)
+            || !row_get::<String>(&row, "settlement_asset")?
+                .eq_ignore_ascii_case(&fee.settlement_asset)
             || row_get::<i16>(&row, "maker_tier")? != i16::from(fee.maker_tier)
             || row_get::<i16>(&row, "taker_tier")? != i16::from(fee.taker_tier)
             || row_get::<String>(&row, "basis_native")? != fee.basis_native.to_string()
             || row_get::<i32>(&row, "fee_ppm")? != 200
             || row_get::<String>(&row, "amount_native")? != fee.amount_native.to_string()
         {
-            return Err(BackendError::Persistence("stored D2 fee diverged from canonical receipt".into()));
+            return Err(BackendError::Persistence(
+                "stored D2 fee diverged from canonical receipt".into(),
+            ));
         }
-        tx.commit().await.map_err(|e| BackendError::Persistence(e.to_string()))?;
+        tx.commit()
+            .await
+            .map_err(|e| BackendError::Persistence(e.to_string()))?;
         Ok(inserted)
+    }
+
+    /// Canonically settled V2 history for a wallet. This is deliberately
+    /// separate from `perp_fills`: those are local matching projections with
+    /// local subaccount IDs. No on-chain subaccount is inferred here.
+    pub async fn list_canonical_v2_perp_history(
+        &self,
+        wallet: &str,
+        limit: u32,
+    ) -> Result<Vec<CanonicalV2PerpHistoryRow>> {
+        let wallet = crate::subaccounts::normalize_owner_address(wallet)
+            .map_err(|_| BackendError::Config("invalid wallet address".into()))?;
+        let rows = sqlx::query(
+            "SELECT f.chain_id, f.tx_hash, f.trade_log_index, f.fee_log_index,
+                    f.block_number, f.block_hash, f.market_id, f.payer, f.recipient,
+                    f.amount_native, t.buyer, t.seller, t.buyer_is_maker,
+                    t.size_delta_1e8, t.execution_price_1e8
+             FROM canonical_v2_perp_fees f
+             JOIN indexed_perp_trades t
+               ON t.chain_id=f.chain_id AND t.tx_hash=f.tx_hash
+              AND t.log_index=f.trade_log_index
+             WHERE f.chain_id=84532 AND t.protocol_version='perp_v2'
+               AND t.emitter_address=$1
+               AND (lower(t.buyer)=$2 OR lower(t.seller)=$2)
+             ORDER BY f.block_number DESC, f.trade_log_index DESC
+             LIMIT $3",
+        )
+        .bind(D6_MATCHER)
+        .bind(&wallet)
+        .bind(i64::from(limit.min(100)))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| BackendError::Persistence(e.to_string()))?;
+        rows.into_iter()
+            .map(|row| {
+                let buyer: String = row_get(&row, "buyer")?;
+                let seller: String = row_get(&row, "seller")?;
+                let is_buyer = buyer.eq_ignore_ascii_case(&wallet);
+                let buyer_is_maker: bool = row_get(&row, "buyer_is_maker")?;
+                let is_maker = is_buyer == buyer_is_maker;
+                let amount: String = row_get(&row, "amount_native")?;
+                Ok(CanonicalV2PerpHistoryRow {
+                    chain_id: i64_to_u64_persistence("chain_id", row_get(&row, "chain_id")?)?,
+                    tx_hash: row_get(&row, "tx_hash")?,
+                    trade_log_index: i64_to_u64_persistence(
+                        "trade_log_index",
+                        row_get(&row, "trade_log_index")?,
+                    )?,
+                    fee_log_index: row_get::<Option<i64>>(&row, "fee_log_index")?
+                        .map(|n| i64_to_u64_persistence("fee_log_index", n))
+                        .transpose()?,
+                    block_number: i64_to_u64_persistence(
+                        "block_number",
+                        row_get(&row, "block_number")?,
+                    )?,
+                    block_hash: row_get(&row, "block_hash")?,
+                    market_id: row_get(&row, "market_id")?,
+                    wallet: wallet.clone(),
+                    counterparty: if is_buyer { seller } else { buyer },
+                    role: if is_maker { "maker" } else { "taker" },
+                    side: if is_buyer { "buy" } else { "sell" },
+                    size_delta_1e8: row_get(&row, "size_delta_1e8")?,
+                    execution_price_1e8: row_get(&row, "execution_price_1e8")?,
+                    fee_native: if is_maker { "0".into() } else { amount },
+                    fee_payer: row_get(&row, "payer")?,
+                    fee_recipient: row_get(&row, "recipient")?,
+                    subaccount_id: None,
+                    attribution: "wallet_only_unresolved_subaccount",
+                    settlement: "receipt_verified_at_ingestion",
+                })
+            })
+            .collect()
     }
 
     pub async fn list_indexed_perp_trades(&self, limit: u32) -> Result<Vec<IndexedPerpTrade>> {
@@ -2164,7 +2296,9 @@ impl PgRepository {
         // existence of an active row first.
         let existing = self
             .get_active_perp_position_for_subaccount(
-                &position.account, position.subaccount_id, &position.market_id,
+                &position.account,
+                position.subaccount_id,
+                &position.market_id,
             )
             .await?;
         if existing.is_some() {
@@ -2180,7 +2314,8 @@ impl PgRepository {
         account: &AccountId,
         market_id: &str,
     ) -> Result<Option<crate::perps::PerpPosition>> {
-        self.get_active_perp_position_for_subaccount(account, 1, market_id).await
+        self.get_active_perp_position_for_subaccount(account, 1, market_id)
+            .await
     }
 
     pub async fn get_active_perp_position_for_subaccount(
@@ -6780,7 +6915,8 @@ const PERP_ORDER_COLUMNS: &str = "id, account, subaccount_id, market_id, side, o
     terminal_reason_code, terminal_reason_message, terminal_reason_source,
     created_at_ms, updated_at_ms";
 
-const PERP_ORDER_SELECT_ALL: &str = "SELECT id, account, subaccount_id, market_id, side, order_type,
+const PERP_ORDER_SELECT_ALL: &str =
+    "SELECT id, account, subaccount_id, market_id, side, order_type,
             price_1e8, size_1e8, remaining_size_1e8, filled_size_1e8,
             time_in_force, post_only, reduce_only, isolated_margin_1e8,
             status, client_order_id,
@@ -7220,7 +7356,8 @@ pub(crate) async fn close_active_perp_position_tx(
 // commit. Lifecycle frames fire only AFTER `tx.commit().await?` in the
 // tick orchestrator (see `crate::perps::liquidation_pg`).
 
-const PERP_LIQUIDATION_SELECT_ALL: &str = "SELECT id, account, subaccount_id, market_id, position_id, side,
+const PERP_LIQUIDATION_SELECT_ALL: &str =
+    "SELECT id, account, subaccount_id, market_id, position_id, side,
             size_1e8, entry_price_1e8, mark_price_1e8, margin_1e8,
             unrealized_pnl_1e8, equity_1e8, maintenance_margin_requirement_1e8,
             margin_ratio_bps, realized_pnl_1e8, bad_debt_1e8, liquidation_fee_1e8,
@@ -7459,7 +7596,8 @@ pub(crate) async fn cancel_open_perp_orders_for_account_market_tx(
 // PERPS-FUNDING-V1 — durable funding-event write + read helpers.
 // =====================================================================
 
-const PERP_FUNDING_SELECT_ALL: &str = "SELECT id, account, subaccount_id, market_id, position_id, side,
+const PERP_FUNDING_SELECT_ALL: &str =
+    "SELECT id, account, subaccount_id, market_id, position_id, side,
             position_size_1e8, funding_index_before_1e18, funding_index_after_1e18,
             funding_delta_1e18, payment_1e8,
             margin_before_1e8, margin_after_1e8, bad_debt_1e8,

@@ -1,0 +1,64 @@
+{
+  "milestone": "DEOPT_BACKEND_V2_RECEIPT_SUBACCOUNT_AND_ALPHA_ACCEPTANCE_V1",
+  "startHead": "626b95d3ca8d2ddedee582ad8515ef9145f3e957",
+  "chainId": 84532,
+  "publicChainTransactions": 0,
+  "remoteBackendDeployed": false,
+  "publicBroadcastEnabled": false,
+  "publicTradingEnabled": false,
+  "sourceFacts": {
+    "d6TradeExecuted": "wallet identities, market, size, price, maker side, nonces and intent ID; no subaccount ID",
+    "d6TradeExecutedFromIntents": "signed intent hashes, market, size, price and timestamp; subaccount IDs exist only in signed calldata",
+    "d4EconomicPositionKey": "wallet and market ID",
+    "d2FeeUnits": "200 ppm taker, 0 ppm maker, six-decimal mUSDC native fee accounting"
+  },
+  "implementation": {
+    "api": "GET /accounts/{wallet}/perps/canonical-fees",
+    "identityScope": "wallet",
+    "subaccountAttribution": "unresolved, null in every canonical history row",
+    "canonicalityClaim": "receipt verified at ingestion; current chain canonicality requires fresh recheck",
+    "wrongChain": "503",
+    "subaccountOrOtherQuery": "400",
+    "missingLedger": "503",
+    "malformedWallet": "400",
+    "localProjectedFillsMerged": false,
+    "legacyFeeLedgerMerged": false,
+    "batchReceiptBinding": "each D2 charge is bound to the following D6 TradeExecuted in its segment",
+    "duplicateOrDivergentFee": "rejected or no-op on exact replay",
+    "reorg": "divergent block hash rejected; operator reconciliation required"
+  },
+  "governanceReadiness": {
+    "feePolicyReady": "POLICY_APPROVED_ONLY",
+    "onchainFeeStateVerified": false,
+    "accountAttributionReady": "WALLET_ONLY",
+    "marketReady": "NOT_VERIFIED; C02 was historically queued",
+    "protocolTradingAuthorized": false,
+    "backendBroadcastEnabled": false
+  },
+  "freshValidation": {
+    "libraryTests": {"passed": 1874, "failed": 0, "postgresEnabled": true, "scope": "before final query rejection guard; that guard passed its own focused final-source test"},
+    "finalFocusedFeeTests": {"passed": 7, "failed": 0, "postgresEnabled": true},
+    "finalFocusedRouteTests": {"passed": 1, "failed": 0, "scope": "wrong chain, malformed wallet, absent database, unsupported subaccount query"},
+    "isolatedAnvilExistingLifecycle": {"passed": 1, "failed": 0, "scope": "synthetic local transaction and PostgreSQL; does not prove the new D2 fee-history lifecycle"},
+    "touchedFilesRustfmt": "PASS",
+    "repositoryCargoFmt": "FAIL_PREEXISTING_DRIFT",
+    "strictClippyBefore": "196 diagnostics in previous accepted milestone",
+    "strictClippyAfter": "196 diagnostics; zero in newly added receipt/history path",
+    "cargoBuild": "PASS",
+    "dockerImageBuild": {"status": "PASS", "image": "deopt-alpha-backend:receipt-history-v1", "imageId": "sha256:32b8a5a18be812b238f6a73fb8425960975a3fcbd5a77e012eb7b9e814262304"},
+    "dockerRuntime": {"status": "PASS_BOUNDED", "nonRoot": true, "readOnlyFilesystem": true, "healthHttp": 200, "readyHttp": 200, "tradingStatus": "disabled", "marketDataStatus": "disabled", "canonicalHistoryHttp": 200, "unsupportedSubaccountQueryHttp": 400, "syntheticMakerRows": 3, "syntheticTakerRows": 3, "syntheticTakerFeeNativeEach": "20000", "walletAttributionUnresolved": true},
+    "connectedFrontendBrowser": "NOT_RUN_NEW_API_NOT_YET_CONSUMED"
+  },
+  "acceptance": {
+    "localPerpsAlpha": "PARTIAL",
+    "backendHostingReadiness": "PARTIAL",
+    "blockers": [
+      "No fresh canonical proof of five public D2 S2 executions or deployed D2 readbacks",
+      "Intent-based D6 event needs signed calldata proof before wallet/subaccount attribution and fee reconciliation",
+      "Current-chain canonicality is not rechecked by the new history read route",
+      "Frontend does not yet consume the separate canonical wallet fee history API",
+      "Repository-wide strict Clippy and cargo fmt gates remain failing",
+      "C02, migration, maintenance release, market and broadcaster activation are separate unapproved gates"
+    ]
+  }
+}
