@@ -23,29 +23,78 @@ pub const D2_OPERATION_IDS: [&str; 5] = [
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FeeActivationState {
-    PolicyApproved,
+    Unconfigured,
     TimelockQueued,
-    CanonicallyExecuted,
-    OnchainReadbackVerified,
-    TradingEligible,
+    PartiallyExecuted,
+    ExecutedUnverified,
+    OnchainVerified,
+    DriftedOrStale,
+}
+
+/// Diagnostic labels never grant trading permission. Counts must come from
+/// canonical receipts/queue reads; only `VerifiedD2FeePolicy` may attest the
+/// `OnchainVerified` state used by a fee-dependent runtime path.
+pub fn classify_fee_readiness(
+    configured: bool,
+    queued_tiers: usize,
+    executed_tiers: usize,
+    readback_verified: bool,
+    drifted_or_stale: bool,
+) -> FeeActivationState {
+    if drifted_or_stale
+        || queued_tiers.saturating_add(executed_tiers) > 5
+        || (readback_verified && executed_tiers != 5)
+    {
+        return FeeActivationState::DriftedOrStale;
+    }
+    if !configured {
+        return FeeActivationState::Unconfigured;
+    }
+    if executed_tiers == 5 && readback_verified {
+        return FeeActivationState::OnchainVerified;
+    }
+    if executed_tiers == 5 {
+        return FeeActivationState::ExecutedUnverified;
+    }
+    if executed_tiers > 0 {
+        return FeeActivationState::PartiallyExecuted;
+    }
+    if queued_tiers == 5 {
+        return FeeActivationState::TimelockQueued;
+    }
+    FeeActivationState::Unconfigured
 }
 
 /// Constructible only after live canonical receipts and a fresh pinned D2
 /// readback agree. This is a fee-source proof, not trading authorization.
 pub struct VerifiedD2FeePolicy {
     snapshot: D2Snapshot,
+    latest_execution_block: u64,
 }
 
 impl VerifiedD2FeePolicy {
     pub fn snapshot(&self) -> &D2Snapshot {
         &self.snapshot
     }
+    pub fn latest_execution_block(&self) -> u64 {
+        self.latest_execution_block
+    }
     pub fn activation_state(&self) -> FeeActivationState {
-        FeeActivationState::OnchainReadbackVerified
+        FeeActivationState::OnchainVerified
     }
     pub fn taker_fee(&self, basis: u128, now: u64, max_age_seconds: u64) -> Result<u128, String> {
         self.snapshot.validate(now, max_age_seconds)?;
         approved_taker_fee(basis).ok_or_else(|| "D2 fee arithmetic overflow".into())
+    }
+}
+
+#[cfg(test)]
+impl VerifiedD2FeePolicy {
+    pub(crate) fn synthetic_for_tests(snapshot: D2Snapshot) -> Self {
+        Self {
+            snapshot,
+            latest_execution_block: 50,
+        }
     }
 }
 
@@ -57,8 +106,12 @@ pub async fn verify_d2_fee_policy(
 ) -> Result<VerifiedD2FeePolicy, String> {
     let snapshot = read_pinned_d2(rpc_url).await?;
     snapshot.validate(now, max_age_seconds)?;
-    verify_d2_execution_receipts(rpc_url, &snapshot, execution_tx_hashes).await?;
-    Ok(VerifiedD2FeePolicy { snapshot })
+    let latest_execution_block =
+        verify_d2_execution_receipts(rpc_url, &snapshot, execution_tx_hashes).await?;
+    Ok(VerifiedD2FeePolicy {
+        snapshot,
+        latest_execution_block,
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -131,6 +184,26 @@ pub async fn read_pinned_account_tier(
     max_age_seconds: u64,
 ) -> Result<u8, String> {
     snapshot.validate(now, max_age_seconds)?;
+    read_account_tier_at_block(
+        rpc_url,
+        snapshot.block_number,
+        &snapshot.block_hash,
+        account,
+    )
+    .await
+}
+
+/// Resolve the D2 tier at the fill's own canonical block, not at a later
+/// readback where a tier claim could have changed or expired.
+pub async fn read_account_tier_at_block(
+    rpc_url: &str,
+    block_number: u64,
+    block_hash: &str,
+    account: &str,
+) -> Result<u8, String> {
+    if !is_hash(block_hash) {
+        return Err("tier block hash malformed".into());
+    }
     let account_bytes = hex::decode(account.strip_prefix("0x").ok_or("account not hex")?)
         .map_err(|e| e.to_string())?;
     if account_bytes.len() != 20 {
@@ -143,12 +216,15 @@ pub async fn read_pinned_account_tier(
         .timeout(Duration::from_secs(8))
         .build()
         .map_err(|e| e.to_string())?;
+    if quantity(&rpc(&client, rpc_url, "eth_chainId", json!([])).await?)? != BASE_SEPOLIA_CHAIN_ID {
+        return Err("wrong RPC chain for tier read".into());
+    }
     let result = rpc(
         &client,
         rpc_url,
         "eth_call",
         json!([{"to": D2_ADDRESS, "data": format!("0x{}", hex::encode(data))},
-            {"blockHash": snapshot.block_hash}]),
+            {"blockHash": block_hash}]),
     )
     .await?;
     let bytes = hex::decode(
@@ -166,14 +242,14 @@ pub async fn read_pinned_account_tier(
         &client,
         rpc_url,
         "eth_getBlockByNumber",
-        json!([format!("0x{:x}", snapshot.block_number), false]),
+        json!([format!("0x{block_number:x}"), false]),
     )
     .await?;
     if canonical
         .get("hash")
         .and_then(Value::as_str)
         .map(str::to_ascii_lowercase)
-        != Some(snapshot.block_hash.clone())
+        != Some(block_hash.to_ascii_lowercase())
     {
         return Err("D2 account-tier block reorganized".into());
     }
@@ -302,7 +378,7 @@ pub async fn verify_d2_execution_receipts(
     rpc_url: &str,
     snapshot: &D2Snapshot,
     tx_hashes: &[String; 5],
-) -> Result<(), String> {
+) -> Result<u64, String> {
     if snapshot.chain_id != BASE_SEPOLIA_CHAIN_ID || snapshot.contract != D2_ADDRESS {
         return Err("wrong D2 snapshot identity".into());
     }
@@ -320,6 +396,7 @@ pub async fn verify_d2_execution_receipts(
         ))
     );
     let mut distinct = std::collections::HashSet::new();
+    let mut latest_execution_block = 0;
     for (tier, tx_hash) in tx_hashes.iter().enumerate() {
         if !is_hash(tx_hash) || !distinct.insert(tx_hash.to_ascii_lowercase()) {
             return Err("missing or duplicate D2 S2 transaction hash".into());
@@ -342,6 +419,7 @@ pub async fn verify_d2_execution_receipts(
             return Err(format!("D2 tier {tier} receipt failed"));
         }
         let number = quantity(receipt.get("blockNumber").ok_or("receipt block missing")?)?;
+        latest_execution_block = latest_execution_block.max(number);
         if number > snapshot.block_number {
             return Err("D2 receipt newer than readback".into());
         }
@@ -416,7 +494,7 @@ pub async fn verify_d2_execution_receipts(
     {
         return Err("D2 readback block reorganized".into());
     }
-    Ok(())
+    Ok(latest_execution_block)
 }
 
 fn execution_log_matches(log: &Value, event_topic: &str, operation_id: &str) -> bool {
@@ -564,6 +642,33 @@ mod tests {
         y.rfq_discounts[1] = (1, 0);
         assert!(y.validate(1020, 60).is_err());
         assert!(x.validate(1100, 60).is_err());
+    }
+    #[test]
+    fn governance_readiness_never_implies_trading() {
+        assert_eq!(
+            classify_fee_readiness(false, 0, 0, false, false),
+            FeeActivationState::Unconfigured
+        );
+        assert_eq!(
+            classify_fee_readiness(true, 5, 0, false, false),
+            FeeActivationState::TimelockQueued
+        );
+        assert_eq!(
+            classify_fee_readiness(true, 4, 1, false, false),
+            FeeActivationState::PartiallyExecuted
+        );
+        assert_eq!(
+            classify_fee_readiness(true, 0, 5, false, false),
+            FeeActivationState::ExecutedUnverified
+        );
+        assert_eq!(
+            classify_fee_readiness(true, 0, 5, true, false),
+            FeeActivationState::OnchainVerified
+        );
+        assert_eq!(
+            classify_fee_readiness(true, 0, 5, true, true),
+            FeeActivationState::DriftedOrStale
+        );
     }
     #[test]
     fn d2_ppm_rounds_positive_fees_up() {

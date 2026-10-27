@@ -12,6 +12,7 @@ pub mod tier_merkle;
 pub mod tier_snapshot;
 pub mod types;
 pub mod v2_observability;
+pub mod v2_perp_settlement;
 pub mod vault_observability;
 
 pub use schedule::{

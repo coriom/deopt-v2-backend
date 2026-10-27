@@ -15,6 +15,8 @@ use crate::execution::{
 use crate::fees::{
     FeeEvent, FeeFlowType, FeeMarketType, FeeSourceType, FeeStatus, RebateAccrual, VolumeBucket,
 };
+use crate::fees::d2_onchain::{approved_taker_fee, TIMELOCK_ADDRESS};
+use crate::fees::v2_perp_settlement::{CanonicalV2PerpFee, D6_MATCHER, MUSDC};
 use crate::indexer::IndexedPerpTrade;
 use crate::mm::{MmAccountPermissions, MmProductPermission};
 use crate::monitoring::FeeEventLabels;
@@ -1904,6 +1906,132 @@ impl PgRepository {
         tx.commit()
             .await
             .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        Ok(inserted)
+    }
+
+    /// Atomically bind a canonical D6 trade to the exact D2 fee charged in
+    /// the same receipt. This is separate from the legacy `fee_events` ledger
+    /// and never transfers value. Duplicate delivery returns false only if
+    /// every economically relevant stored field still agrees.
+    pub async fn persist_canonical_v2_perp_fee(
+        &self,
+        trade: &IndexedPerpTrade,
+        fee: &CanonicalV2PerpFee,
+    ) -> Result<bool> {
+        let taker = if trade.buyer_is_maker { &trade.seller } else { &trade.buyer };
+        if fee.chain_id != 84532
+            || trade.protocol_version != crate::execution::perp_trade::PerpsProtocolVersion::V2
+            || !trade.emitter_address.eq_ignore_ascii_case(D6_MATCHER)
+            || !trade.tx_hash.eq_ignore_ascii_case(&fee.tx_hash)
+            || trade.log_index != fee.trade_log_index
+            || trade.block_number != fee.block_number
+            || !trade.block_hash.as_deref().is_some_and(|hash| hash.eq_ignore_ascii_case(&fee.block_hash))
+            || trade.market_id != fee.market_id
+            || !fee.payer.eq_ignore_ascii_case(taker)
+            || !fee.recipient.eq_ignore_ascii_case(TIMELOCK_ADDRESS)
+            || !fee.settlement_asset.eq_ignore_ascii_case(MUSDC)
+            || fee.maker_tier >= 5 || fee.taker_tier >= 5
+            || approved_taker_fee(fee.basis_native) != Some(fee.amount_native)
+            || fee.fee_log_index.is_some() != (fee.amount_native > 0)
+        {
+            return Err(BackendError::Persistence("canonical V2 trade/fee identity mismatch".into()));
+        }
+        let mut normalized = trade.clone();
+        normalized.tx_hash = fee.tx_hash.clone();
+        normalized.block_hash = Some(fee.block_hash.clone());
+        normalized.event_id = format!("{}:{}", fee.tx_hash, fee.trade_log_index);
+        normalized.emitter_address = D6_MATCHER.into();
+        let mut tx = self.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(u64_to_i64("chain_id", fee.chain_id)?)
+            .execute(&mut *tx).await
+            .map_err(|e| BackendError::Persistence(e.to_string()))?;
+        insert_indexed_perp_trade(&mut tx, fee.chain_id, &normalized).await?;
+        let stored = sqlx::query(
+            "SELECT block_number, block_hash, market_id, buyer, seller, onchain_intent_id,
+                    size_delta_1e8, execution_price_1e8, buyer_is_maker, buyer_nonce,
+                    seller_nonce, protocol_version, emitter_address
+             FROM indexed_perp_trades WHERE chain_id=$1 AND tx_hash=$2 AND log_index=$3 FOR UPDATE",
+        )
+        .bind(u64_to_i64("chain_id", fee.chain_id)?)
+        .bind(&fee.tx_hash)
+        .bind(u64_to_i64("trade_log_index", fee.trade_log_index)?)
+        .fetch_one(&mut *tx).await
+        .map_err(|e| BackendError::Persistence(e.to_string()))?;
+        let stored_hash: Option<String> = row_get(&stored, "block_hash")?;
+        if i64_to_u64_persistence("block_number", row_get::<i64>(&stored, "block_number")?)? != fee.block_number
+            || !stored_hash.as_deref().is_some_and(|hash| hash.eq_ignore_ascii_case(&fee.block_hash))
+            || row_get::<String>(&stored, "market_id")? != trade.market_id
+            || !row_get::<String>(&stored, "buyer")?.eq_ignore_ascii_case(&trade.buyer)
+            || !row_get::<String>(&stored, "seller")?.eq_ignore_ascii_case(&trade.seller)
+            || row_get::<Option<String>>(&stored, "onchain_intent_id")?
+                != trade.onchain_intent_id.as_deref().and_then(normalize_onchain_intent_id)
+            || row_get::<String>(&stored, "size_delta_1e8")? != trade.size_delta_1e8
+            || row_get::<String>(&stored, "execution_price_1e8")? != trade.execution_price_1e8
+            || row_get::<bool>(&stored, "buyer_is_maker")? != trade.buyer_is_maker
+            || row_get::<String>(&stored, "buyer_nonce")? != trade.buyer_nonce
+            || row_get::<String>(&stored, "seller_nonce")? != trade.seller_nonce
+            || row_get::<String>(&stored, "protocol_version")?
+                != crate::execution::perp_trade::PerpsProtocolVersion::V2.as_persisted_str()
+            || !row_get::<String>(&stored, "emitter_address")?.eq_ignore_ascii_case(D6_MATCHER)
+        {
+            return Err(BackendError::Persistence("stored V2 trade diverged from canonical receipt".into()));
+        }
+        let inserted = sqlx::query(
+            "INSERT INTO canonical_v2_perp_fees (
+                chain_id, tx_hash, trade_log_index, fee_log_index, block_number, block_hash,
+                market_id, payer, recipient, settlement_asset, maker_tier, taker_tier,
+                basis_native, fee_ppm, amount_native, created_at_ms
+             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(u64_to_i64("chain_id", fee.chain_id)?)
+        .bind(&fee.tx_hash)
+        .bind(u64_to_i64("trade_log_index", fee.trade_log_index)?)
+        .bind(fee.fee_log_index.map(|value| u64_to_i64("fee_log_index", value)).transpose()?)
+        .bind(u64_to_i64("block_number", fee.block_number)?)
+        .bind(&fee.block_hash)
+        .bind(&fee.market_id)
+        .bind(&fee.payer)
+        .bind(&fee.recipient)
+        .bind(&fee.settlement_asset)
+        .bind(i16::from(fee.maker_tier))
+        .bind(i16::from(fee.taker_tier))
+        .bind(fee.basis_native.to_string())
+        .bind(200i32)
+        .bind(fee.amount_native.to_string())
+        .bind(timestamp_to_i64(now_ms()))
+        .execute(&mut *tx).await
+        .map_err(|e| BackendError::Persistence(e.to_string()))?
+        .rows_affected() == 1;
+        let row = sqlx::query(
+            "SELECT fee_log_index, block_number, block_hash, market_id, payer, recipient,
+                    settlement_asset, maker_tier, taker_tier, basis_native, fee_ppm, amount_native
+             FROM canonical_v2_perp_fees WHERE chain_id=$1 AND tx_hash=$2 AND trade_log_index=$3",
+        )
+        .bind(u64_to_i64("chain_id", fee.chain_id)?)
+        .bind(&fee.tx_hash)
+        .bind(u64_to_i64("trade_log_index", fee.trade_log_index)?)
+        .fetch_optional(&mut *tx).await
+        .map_err(|e| BackendError::Persistence(e.to_string()))?
+        .ok_or_else(|| BackendError::Persistence("D2 fee log uniqueness conflict".into()))?;
+        if row_get::<Option<i64>>(&row, "fee_log_index")?
+                != fee.fee_log_index.map(|value| u64_to_i64("fee_log_index", value)).transpose()?
+            || i64_to_u64_persistence("block_number", row_get::<i64>(&row, "block_number")?)? != fee.block_number
+            || !row_get::<String>(&row, "block_hash")?.eq_ignore_ascii_case(&fee.block_hash)
+            || row_get::<String>(&row, "market_id")? != fee.market_id
+            || !row_get::<String>(&row, "payer")?.eq_ignore_ascii_case(&fee.payer)
+            || !row_get::<String>(&row, "recipient")?.eq_ignore_ascii_case(&fee.recipient)
+            || !row_get::<String>(&row, "settlement_asset")?.eq_ignore_ascii_case(&fee.settlement_asset)
+            || row_get::<i16>(&row, "maker_tier")? != i16::from(fee.maker_tier)
+            || row_get::<i16>(&row, "taker_tier")? != i16::from(fee.taker_tier)
+            || row_get::<String>(&row, "basis_native")? != fee.basis_native.to_string()
+            || row_get::<i32>(&row, "fee_ppm")? != 200
+            || row_get::<String>(&row, "amount_native")? != fee.amount_native.to_string()
+        {
+            return Err(BackendError::Persistence("stored D2 fee diverged from canonical receipt".into()));
+        }
+        tx.commit().await.map_err(|e| BackendError::Persistence(e.to_string()))?;
         Ok(inserted)
     }
 

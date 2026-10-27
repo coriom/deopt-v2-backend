@@ -8392,7 +8392,7 @@ async fn confirm_transaction(
         reconciliation_matched,
         require_reconciliation: state.confirmation_config.require_reconciliation,
     });
-    if decision.confirmed && state.fees_config.enabled {
+    if decision.confirmed {
         let indexed_trade = repository
             .find_matched_indexed_trade_for_confirmation(
                 transaction.intent_id,
@@ -8405,10 +8405,30 @@ async fn confirm_transaction(
                     "matched indexed perp trade not found for confirmed transaction".to_string(),
                 )
             })?;
-        let flow_type = repository
-            .perp_fee_flow_for_intent(transaction.intent_id)
+        if indexed_trade.protocol_version == crate::execution::perp_trade::PerpsProtocolVersion::V2
+        {
+            let rpc_url = state
+                .confirmation_config
+                .rpc_url
+                .as_deref()
+                .ok_or_else(|| {
+                    BackendError::Config("V2 fee reconciliation requires a read-only RPC".into())
+                })?;
+            let hashes = crate::fees::v2_perp_settlement::execution_hashes_from_env()?;
+            crate::fees::v2_perp_settlement::reconcile_confirmed_v2_trade(
+                repository,
+                rpc_url,
+                &hashes,
+                &indexed_trade,
+                (now_ms() as u64) / 1000,
+            )
             .await?;
-        record_indexed_perp_trade_fees(state, &indexed_trade, flow_type).await?;
+        } else if state.fees_config.enabled {
+            let flow_type = repository
+                .perp_fee_flow_for_intent(transaction.intent_id)
+                .await?;
+            record_indexed_perp_trade_fees(state, &indexed_trade, flow_type).await?;
+        }
     }
     repository
         .apply_confirmation_decision(
