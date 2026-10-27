@@ -1,7 +1,7 @@
 use crate::execution::perp_trade::PerpsProtocolVersion;
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EthLog {
     pub address: String,

@@ -13,6 +13,7 @@ pub mod tier_snapshot;
 pub mod types;
 pub mod v2_observability;
 pub mod v2_perp_settlement;
+pub mod v2_intent_receipt;
 pub mod vault_observability;
 
 pub use schedule::{

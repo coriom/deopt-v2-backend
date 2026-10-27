@@ -61,6 +61,8 @@ pub struct CanonicalV2PerpHistoryRow {
     pub fee_payer: String,
     pub fee_recipient: String,
     pub subaccount_id: Option<u32>,
+    /// EIP-712 signed order-origin label. It is not a canonical D4 account.
+    pub signed_subaccount_id: Option<u32>,
     pub attribution: &'static str,
     pub settlement: &'static str,
 }
@@ -140,6 +142,60 @@ pub async fn reconcile_confirmed_v2_trade(
     repository.persist_canonical_v2_perp_fee(trade, &fee).await
 }
 
+/// Read-only RPC reconciliation for a direct D6 intent transaction. This is
+/// deliberately separate from legacy `TradeExecuted` confirmation: an event
+/// hash alone does not reveal the wallets, signatures or signed subaccount IDs.
+pub async fn reconcile_confirmed_v2_intent_tx(
+    repository: &PgRepository,
+    rpc_url: &str,
+    execution_hashes: &[String; 5],
+    tx_hash: &str,
+    now_seconds: u64,
+) -> Result<bool> {
+    if !is_hash(tx_hash) {
+        return Err(fee_error("invalid intent transaction hash".into()));
+    }
+    let policy = verify_d2_fee_policy(rpc_url, now_seconds, 300, execution_hashes)
+        .await.map_err(fee_error)?;
+    let tx = rpc(rpc_url, "eth_getTransactionByHash", json!([tx_hash])).await?;
+    let receipt = rpc(rpc_url, "eth_getTransactionReceipt", json!([tx_hash])).await?;
+    let block_number = quantity(receipt.get("blockNumber"))?;
+    let block = rpc(rpc_url, "eth_getBlockByNumber", json!([format!("0x{block_number:x}"), false])).await?;
+    let block_hash = block.get("hash").and_then(Value::as_str)
+        .ok_or_else(|| fee_error("canonical block hash missing".into()))?;
+    if !receipt.get("blockHash").and_then(Value::as_str)
+        .is_some_and(|hash| hash.eq_ignore_ascii_case(block_hash)) {
+        return Err(fee_error("intent receipt block is noncanonical".into()));
+    }
+    let timestamp = quantity(block.get("timestamp"))?;
+    let logs = receipt.get("logs").and_then(Value::as_array)
+        .ok_or_else(|| fee_error("intent receipt logs missing".into()))?;
+    let intent_topic = topic(crate::fees::v2_intent_receipt::INTENT_EVENT_SIGNATURE);
+    let candidates: Vec<_> = logs.iter().filter(|log| {
+        log.get("address").and_then(Value::as_str).is_some_and(|v| v.eq_ignore_ascii_case(D6_MATCHER))
+            && log.get("topics").and_then(Value::as_array).and_then(|v| v.first()).and_then(Value::as_str)
+                .is_some_and(|v| v.eq_ignore_ascii_case(&intent_topic))
+    }).collect();
+    if candidates.len() != 1 {
+        return Err(fee_error("direct intent transaction must emit exactly one D6 intent fill".into()));
+    }
+    let event: EthLog = serde_json::from_value(candidates[0].clone())
+        .map_err(|_| fee_error("malformed intent event".into()))?;
+    let proof = crate::fees::v2_intent_receipt::prove_direct_intent_fill(&tx, &receipt, &event, timestamp)?;
+    verify_market_and_decimals_at_trade(rpc_url, &proof.trade).await?;
+    let (maker, taker) = roles(&proof.trade)?;
+    let maker_tier = read_account_tier_at_block(rpc_url, block_number, block_hash, maker).await.map_err(fee_error)?;
+    let taker_tier = read_account_tier_at_block(rpc_url, block_number, block_hash, taker).await.map_err(fee_error)?;
+    let fee = validate_intent_receipt(&proof, &receipt, &policy, maker_tier, taker_tier, now_seconds)?;
+    let canonical_again = rpc(rpc_url, "eth_getBlockByNumber",
+        json!([format!("0x{block_number:x}"), false])).await?;
+    if !canonical_again.get("hash").and_then(Value::as_str)
+        .is_some_and(|hash| hash.eq_ignore_ascii_case(block_hash)) {
+        return Err(fee_error("intent receipt reorg detected before persistence".into()));
+    }
+    repository.persist_canonical_v2_intent_fee(&proof, &fee).await
+}
+
 async fn verify_market_and_decimals_at_trade(
     rpc_url: &str,
     trade: &IndexedPerpTrade,
@@ -216,6 +272,32 @@ pub fn validate_receipt(
     taker_tier: u8,
     now_seconds: u64,
 ) -> Result<CanonicalV2PerpFee> {
+    validate_receipt_mode(trade, receipt, policy, maker_tier, taker_tier, now_seconds, None)
+}
+
+/// Use only after `prove_direct_intent_fill` has verified the transaction
+/// input, both signatures and the exact D6 event. Never synthesize a legacy
+/// `TradeExecuted` event to enter the canonical fee ledger.
+pub fn validate_intent_receipt(
+    proof: &crate::fees::v2_intent_receipt::VerifiedIntentFill,
+    receipt: &Value,
+    policy: &VerifiedD2FeePolicy,
+    maker_tier: u8,
+    taker_tier: u8,
+    now_seconds: u64,
+) -> Result<CanonicalV2PerpFee> {
+    validate_receipt_mode(&proof.trade, receipt, policy, maker_tier, taker_tier, now_seconds, Some(proof))
+}
+
+fn validate_receipt_mode(
+    trade: &IndexedPerpTrade,
+    receipt: &Value,
+    policy: &VerifiedD2FeePolicy,
+    maker_tier: u8,
+    taker_tier: u8,
+    now_seconds: u64,
+    intent_proof: Option<&crate::fees::v2_intent_receipt::VerifiedIntentFill>,
+) -> Result<CanonicalV2PerpFee> {
     policy
         .snapshot()
         .validate(now_seconds, 300)
@@ -257,6 +339,9 @@ pub fn validate_receipt(
         .and_then(Value::as_array)
         .ok_or_else(|| fee_error("V2 receipt logs missing".into()))?;
     let mut trade_matches = 0;
+    let expected_topic = intent_proof.map_or_else(trade_executed_topic0, |_| {
+        topic(crate::fees::v2_intent_receipt::INTENT_EVENT_SIGNATURE)
+    });
     let mut prior_trade_log_index: Option<u64> = None;
     for log in logs {
         let emitter = log.get("address").and_then(Value::as_str).unwrap_or("");
@@ -267,7 +352,7 @@ pub fn validate_receipt(
             .and_then(Value::as_str)
             .unwrap_or("");
         if emitter.eq_ignore_ascii_case(D6_MATCHER)
-            && topic0.eq_ignore_ascii_case(&trade_executed_topic0())
+            && topic0.eq_ignore_ascii_case(&expected_topic)
         {
             let index = quantity(log.get("logIndex"))?;
             if index < trade.log_index {
@@ -295,7 +380,7 @@ pub fn validate_receipt(
             .and_then(Value::as_str)
             .unwrap_or("");
         if emitter.eq_ignore_ascii_case(D6_MATCHER)
-            && topic0.eq_ignore_ascii_case(&trade_executed_topic0())
+            && topic0.eq_ignore_ascii_case(&expected_topic)
         {
             let index = quantity(log.get("logIndex"))?;
             if index < trade.log_index {
@@ -305,26 +390,34 @@ pub fn validate_receipt(
                 continue;
             }
             let parsed: EthLog = serde_json::from_value(log.clone())
-                .map_err(|_| fee_error("malformed D6 TradeExecuted log".into()))?;
-            let parsed = decode_trade_executed_log_for_emitter(&parsed, PerpsProtocolVersion::V2)?;
-            if parsed.tx_hash.eq_ignore_ascii_case(&trade.tx_hash)
-                && parsed.log_index == trade.log_index
-                && parsed.block_number == trade.block_number
+                .map_err(|_| fee_error("malformed D6 trade log".into()))?;
+            let valid_event = if let Some(proof) = intent_proof {
+                parsed.topics.len() == 3
+                    && parsed.topics[1].eq_ignore_ascii_case(&proof.buyer_intent_hash)
+                    && parsed.topics[2].eq_ignore_ascii_case(&proof.seller_intent_hash)
+                    && parsed.data.eq_ignore_ascii_case(&proof.event_data)
+            } else {
+                let decoded = decode_trade_executed_log_for_emitter(&parsed, PerpsProtocolVersion::V2)?;
+                decoded.onchain_intent_id == trade.onchain_intent_id
+                    && decoded.market_id == trade.market_id
+                    && decoded.size_delta_1e8 == trade.size_delta_1e8
+                    && decoded.execution_price_1e8 == trade.execution_price_1e8
+                    && decoded.buyer_is_maker == trade.buyer_is_maker
+                    && decoded.buyer_nonce == trade.buyer_nonce
+                    && decoded.seller_nonce == trade.seller_nonce
+                    && decoded.buyer.eq_ignore_ascii_case(&trade.buyer)
+                    && decoded.seller.eq_ignore_ascii_case(&trade.seller)
+            };
+            if parsed.transaction_hash.as_deref().is_some_and(|hash| hash.eq_ignore_ascii_case(&trade.tx_hash))
+                && parsed.log_index.as_deref().and_then(|value| crate::indexer::decoder::parse_hex_quantity(value).ok()) == Some(trade.log_index)
+                && parsed.block_number.as_deref().and_then(|value| crate::indexer::decoder::parse_hex_quantity(value).ok()) == Some(trade.block_number)
                 && parsed.block_hash.as_deref().is_some_and(|hash| {
                     trade
                         .block_hash
                         .as_deref()
                         .is_some_and(|stored| hash.eq_ignore_ascii_case(stored))
                 })
-                && parsed.onchain_intent_id == trade.onchain_intent_id
-                && parsed.market_id == trade.market_id
-                && parsed.size_delta_1e8 == trade.size_delta_1e8
-                && parsed.execution_price_1e8 == trade.execution_price_1e8
-                && parsed.buyer_is_maker == trade.buyer_is_maker
-                && parsed.buyer_nonce == trade.buyer_nonce
-                && parsed.seller_nonce == trade.seller_nonce
-                && parsed.buyer.eq_ignore_ascii_case(&trade.buyer)
-                && parsed.seller.eq_ignore_ascii_case(&trade.seller)
+                && valid_event
             {
                 trade_matches += 1;
             } else {

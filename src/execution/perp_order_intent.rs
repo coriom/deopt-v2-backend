@@ -7,9 +7,9 @@
 //! NOT verify on-chain — the wire-lock test `perp_order_intent_typehash_matches_locked_value`
 //! is the earliest place the drift surfaces.
 //!
-//! Domain: reuses the same `PerpTradeDomain` (`DeOptV2-PerpMatchingEngine`,
-//! version `"1"`) as the pre-existing `PerpTrade` type — both structs
-//! are consumed by the same on-chain engine under the same domain.
+//! Domain: the struct hash is shared, but a D6 V2 receipt MUST use
+//! `PerpTradeDomain::new_v2` (`DeOptV2-PerpMatchingEngine`, version `"2"`).
+//! The historical V1 engine uses version `"1"`; the two digests differ.
 //!
 //! Scope:
 //! * `PerpOrderIntent` — the Rust twin of the Solidity struct (fields in

@@ -329,6 +329,7 @@ pub fn router(state: AppState) -> Router {
         .route("/accounts/:address/perps/orders", get(perps_account_orders))
         .route("/accounts/:address/perps/fills", get(perps_account_fills))
         .route("/accounts/:address/perps/canonical-fees", get(perps_canonical_fees))
+        .route("/admin/perps/v2/intent-transactions/:tx_hash/reconcile", post(reconcile_v2_intent_transaction))
         // PERPS-LIQUIDATION-AND-RISK-V1
         .route(
             "/accounts/:address/perps/liquidations",
@@ -2732,6 +2733,30 @@ async fn perps_canonical_fees(
             .await?,
         trading_enabled: false,
     }))
+}
+
+/// Explicit operator reconciliation. No chain writes, no transaction
+/// submission, and no activation side effect. The D2 governance proof is
+/// required even for local canonical-history ingestion.
+async fn reconcile_v2_intent_transaction(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(tx_hash): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    ensure_admin_access(&state, &headers)?;
+    if state.chain_id != crate::fees::d2_onchain::BASE_SEPOLIA_CHAIN_ID {
+        return Err(BackendError::Config("V2 intent reconciliation requires Base Sepolia".into()).into());
+    }
+    let repository = state.repository.as_ref().ok_or_else(||
+        BackendError::Config("V2 intent reconciliation requires PostgreSQL".into()))?;
+    let rpc_url = state.confirmation_config.rpc_url.as_deref().ok_or_else(||
+        BackendError::Config("V2 intent reconciliation requires read-only RPC".into()))?;
+    let hashes = crate::fees::v2_perp_settlement::execution_hashes_from_env()?;
+    let inserted = crate::fees::v2_perp_settlement::reconcile_confirmed_v2_intent_tx(
+        repository, rpc_url, &hashes, &tx_hash, (now_ms() as u64) / 1000,
+    ).await?;
+    Ok(Json(serde_json::json!({"chainId":84532,"txHash":tx_hash,
+        "canonicalIntentFeeInserted":inserted,"tradingEnabled":false})))
 }
 
 // PERPS-LIQUIDATION-AND-RISK-V1 — read-only account liquidations.

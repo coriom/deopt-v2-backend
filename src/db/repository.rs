@@ -16,6 +16,7 @@ use crate::fees::d2_onchain::{approved_taker_fee, TIMELOCK_ADDRESS};
 use crate::fees::v2_perp_settlement::{
     CanonicalV2PerpFee, CanonicalV2PerpHistoryRow, D6_MATCHER, MUSDC,
 };
+use crate::fees::v2_intent_receipt::VerifiedIntentFill;
 use crate::fees::{
     FeeEvent, FeeFlowType, FeeMarketType, FeeSourceType, FeeStatus, RebateAccrual, VolumeBucket,
 };
@@ -1942,6 +1943,23 @@ impl PgRepository {
         trade: &IndexedPerpTrade,
         fee: &CanonicalV2PerpFee,
     ) -> Result<bool> {
+        self.persist_canonical_v2_perp_fee_inner(trade, fee, None).await
+    }
+
+    pub async fn persist_canonical_v2_intent_fee(
+        &self,
+        proof: &VerifiedIntentFill,
+        fee: &CanonicalV2PerpFee,
+    ) -> Result<bool> {
+        self.persist_canonical_v2_perp_fee_inner(&proof.trade, fee, Some(proof)).await
+    }
+
+    async fn persist_canonical_v2_perp_fee_inner(
+        &self,
+        trade: &IndexedPerpTrade,
+        fee: &CanonicalV2PerpFee,
+        intent_proof: Option<&VerifiedIntentFill>,
+    ) -> Result<bool> {
         let taker = if trade.buyer_is_maker {
             &trade.seller
         } else {
@@ -2089,6 +2107,48 @@ impl PgRepository {
                 "stored D2 fee diverged from canonical receipt".into(),
             ));
         }
+        if let Some(proof) = intent_proof {
+            if proof.trade != *trade || !proof.buyer_intent_hash.starts_with("0x")
+                || !proof.seller_intent_hash.starts_with("0x")
+                || proof.buyer_intent_hash.len() != 66 || proof.seller_intent_hash.len() != 66 {
+                return Err(BackendError::Persistence("intent proof differs from canonical fill".into()));
+            }
+            sqlx::query(
+                "INSERT INTO canonical_v2_intent_proofs (
+                    chain_id, tx_hash, trade_log_index, block_hash,
+                    buyer_intent_hash, seller_intent_hash,
+                    buyer_signed_subaccount_id, seller_signed_subaccount_id
+                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+                 ON CONFLICT DO NOTHING",
+            )
+            .bind(u64_to_i64("chain_id", fee.chain_id)?)
+            .bind(&fee.tx_hash)
+            .bind(u64_to_i64("trade_log_index", fee.trade_log_index)?)
+            .bind(&fee.block_hash)
+            .bind(&proof.buyer_intent_hash)
+            .bind(&proof.seller_intent_hash)
+            .bind(i64::from(proof.buyer_signed_subaccount_id))
+            .bind(i64::from(proof.seller_signed_subaccount_id))
+            .execute(&mut *tx).await.map_err(|e| BackendError::Persistence(e.to_string()))?;
+            let stored = sqlx::query(
+                "SELECT block_hash, buyer_intent_hash, seller_intent_hash,
+                        buyer_signed_subaccount_id, seller_signed_subaccount_id
+                 FROM canonical_v2_intent_proofs
+                 WHERE chain_id=$1 AND tx_hash=$2 AND trade_log_index=$3 FOR UPDATE",
+            )
+            .bind(u64_to_i64("chain_id", fee.chain_id)?)
+            .bind(&fee.tx_hash)
+            .bind(u64_to_i64("trade_log_index", fee.trade_log_index)?)
+            .fetch_one(&mut *tx).await.map_err(|e| BackendError::Persistence(e.to_string()))?;
+            if !row_get::<String>(&stored, "block_hash")?.eq_ignore_ascii_case(&fee.block_hash)
+                || !row_get::<String>(&stored, "buyer_intent_hash")?.eq_ignore_ascii_case(&proof.buyer_intent_hash)
+                || !row_get::<String>(&stored, "seller_intent_hash")?.eq_ignore_ascii_case(&proof.seller_intent_hash)
+                || row_get::<i64>(&stored, "buyer_signed_subaccount_id")? != i64::from(proof.buyer_signed_subaccount_id)
+                || row_get::<i64>(&stored, "seller_signed_subaccount_id")? != i64::from(proof.seller_signed_subaccount_id)
+            {
+                return Err(BackendError::Persistence("stored signed-intent proof diverged".into()));
+            }
+        }
         tx.commit()
             .await
             .map_err(|e| BackendError::Persistence(e.to_string()))?;
@@ -2109,11 +2169,15 @@ impl PgRepository {
             "SELECT f.chain_id, f.tx_hash, f.trade_log_index, f.fee_log_index,
                     f.block_number, f.block_hash, f.market_id, f.payer, f.recipient,
                     f.amount_native, t.buyer, t.seller, t.buyer_is_maker,
-                    t.size_delta_1e8, t.execution_price_1e8
+                    t.size_delta_1e8, t.execution_price_1e8,
+                    p.buyer_signed_subaccount_id, p.seller_signed_subaccount_id
              FROM canonical_v2_perp_fees f
              JOIN indexed_perp_trades t
                ON t.chain_id=f.chain_id AND t.tx_hash=f.tx_hash
               AND t.log_index=f.trade_log_index
+             LEFT JOIN canonical_v2_intent_proofs p
+               ON p.chain_id=f.chain_id AND p.tx_hash=f.tx_hash
+              AND p.trade_log_index=f.trade_log_index
              WHERE f.chain_id=84532 AND t.protocol_version='perp_v2'
                AND t.emitter_address=$1
                AND (lower(t.buyer)=$2 OR lower(t.seller)=$2)
@@ -2160,7 +2224,15 @@ impl PgRepository {
                     fee_payer: row_get(&row, "payer")?,
                     fee_recipient: row_get(&row, "recipient")?,
                     subaccount_id: None,
-                    attribution: "wallet_only_unresolved_subaccount",
+                    signed_subaccount_id: row_get::<Option<i64>>(
+                        &row,
+                        if is_buyer { "buyer_signed_subaccount_id" } else { "seller_signed_subaccount_id" },
+                    )?.map(|value| u32::try_from(value).map_err(|_| BackendError::Persistence("signed subaccount ID out of range".into()))).transpose()?,
+                    attribution: if row_get::<Option<i64>>(&row, "buyer_signed_subaccount_id")?.is_some() {
+                        "signed_intent_origin_wallet_settlement"
+                    } else {
+                        "wallet_only_unresolved_subaccount"
+                    },
                     settlement: "receipt_verified_at_ingestion",
                 })
             })

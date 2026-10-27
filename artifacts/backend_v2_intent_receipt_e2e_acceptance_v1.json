@@ -1,0 +1,99 @@
+{
+  "milestone": "DEOPT_BACKEND_V2_INTENT_RECEIPT_E2E_ACCEPTANCE_V1",
+  "source_start_head": "c6b8e595799584eb5259f3cd49aed663df013b80",
+  "network": "Base Sepolia 84532",
+  "contract_evidence": {
+    "d6_source": "../deopt-v2-sol/src/matching/PerpMatchingEngineV2.sol",
+    "d6_abi": "../deopt-v2-sol/out/PerpMatchingEngineV2.sol/PerpMatchingEngineV2.json",
+    "execute_trade_from_intents_selector": "0xb69459b0",
+    "event": "TradeExecutedFromIntents(bytes32,bytes32,uint256,uint128,uint128,uint256)",
+    "identity_scope": "D6 signed intent carries wallet and subaccountId; D4 settles by wallet and market, not by subaccountId"
+  },
+  "implementation": [
+    "Canonical direct-call ABI decode and exact calldata re-encoding",
+    "Both EIP-712 V2 signatures, bounds, nonce fields, deadline and event digest comparison",
+    "Dedicated D2 receipt fee validation without fabricating TradeExecuted",
+    "Atomic PostgreSQL trade, canonical fee and signed-origin proof storage",
+    "Wallet-scoped API history with signed_subaccount_id metadata and null canonical subaccount_id",
+    "Admin-gated read-only-chain reconciliation endpoint; public broadcasting remains disabled"
+  ],
+  "statuses": {
+    "INTENT_PATH_PROOF": "PARTIAL",
+    "WALLET_IDENTITY_PROOF": "PASS",
+    "SUBACCOUNT_ATTRIBUTION_PROOF": "PARTIAL",
+    "MULTIFILL_D2_RECONCILIATION": "FAIL",
+    "POSTGRESQL_E2E": "PASS",
+    "API_E2E": "PARTIAL",
+    "FRONTEND_BROWSER_E2E": "FAIL",
+    "CURRENT_CHAIN_D2_VERIFICATION": "FAIL",
+    "ONCHAIN_D2_STATE_VERIFIED": "NO",
+    "LOCAL_PERPS_ALPHA": "PARTIAL",
+    "BACKEND_HOSTING_READINESS": "PARTIAL"
+  },
+  "current_chain_reads": {
+    "primary_rpc": "https://sepolia.base.org",
+    "safe_block_number": 50887065,
+    "safe_block_hash": "0x299b98a1ccd7b597beed986d11b822e89a1c9f7622f4a9c8da1d81f437429eca",
+    "safe_block_hash_confirmed_by_secondary_rpc": true,
+    "safe_block_timestamp_utc": "2026-10-27T11:08:01Z",
+    "d2_perp_profiles_ppm_tiers_0_to_4": [[50, 300], [0, 250], [-50, 200], [-75, 175], [-100, 150]],
+    "five_d2_s1_operations_queued": true,
+    "secondary_rpc": "https://base-sepolia-rpc.publicnode.com",
+    "secondary_safe_block_number": 50888378,
+    "secondary_safe_block_hash": "0x5cab0c144438bcc14a6e3738f77a5657731bb071ee4a7918c4e17b4b6fab8178",
+    "secondary_safe_block_timestamp_utc": "2026-10-27T11:12:24Z",
+    "secondary_tier_0_ppm": [50, 300],
+    "secondary_tier_4_ppm": [-100, 150],
+    "final_safe_block_number": 50900713,
+    "final_safe_block_hash": "0x5322436116aa72374ff906cdc109cd5cee66f051af41f9fefd1f6840aab9abc2",
+    "final_safe_block_timestamp_utc": "2026-10-27T11:53:31Z",
+    "final_safe_block_hash_confirmed_by_secondary_rpc": true,
+    "final_tier_0_ppm": [50, 300],
+    "final_tier_4_ppm": [-100, 150],
+    "conclusion": "Approved 0/200 ppm policy is not active; five S2 execution receipts are not present in this evidence. Trading fee gate remains closed."
+  },
+  "fresh_tests": {
+    "rust_lib": "1879 passed, 0 failed with local listener permission; sandbox-only run had two EPERM listener failures",
+    "postgresql_disposable": "1 passed; migration, atomic insert, idempotent retry, wallet isolation, signed origin, divergent block rejection",
+    "http_local": "health 200; ready 200 with trading disabled; synthetic canonical-fees 200; unauthenticated admin reconcile 403",
+    "browser_local": "3 passed, 4 failed in existing frontend spec; failures expect a Perps activity strip removed in current frontend; no canonical fee UI is mounted",
+    "anvil": "1 existing isolated V2 lifecycle test passed with disposable PostgreSQL; new executeTradeFromIntents receipt path NOT_VERIFIED on Anvil",
+    "docker": "PASS: exact final-source release image built; localhost /health and /ready 200; non-root user, read-only root filesystem, healthy container, trading and workers disabled",
+    "build": "PASS",
+    "clippy_strict_library": "FAIL: 196 compiler diagnostics, plus one final compilation summary; baseline 196; no new diagnostic located in v2_intent_receipt.rs",
+    "format": "new intent module rustfmt --check PASS; repository cargo fmt --check FAIL on pre-existing unrelated formatting"
+  },
+  "commands": [
+    "cargo test -j 1 --lib -- --test-threads=2 (with local listener permission)",
+    "D2_INTENT_PG_TEST_URL=<disposable localhost PostgreSQL URL> cargo test -j 1 --lib v2_intent_receipt -- --test-threads=1",
+    "cargo build -j 1",
+    "cargo clippy -j 1 --lib -- -D warnings",
+    "cast call D2 getFeeProfile(uint8,uint8) tiers 0 and 4 at safe block 50900713; independent second RPC block hash and tier 0",
+    "PERPS_CLOSED_TEST_E2E_PG_URL=<disposable localhost PostgreSQL URL> cargo test -j 1 --test perps_v2_backend_anvil_live_e2e_pg_integration v2_backend_anvil_live_positive_lifecycle -- --nocapture",
+    "rustfmt --edition 2021 --check src/fees/v2_intent_receipt.rs",
+    "curl http://127.0.0.1:18080/health",
+    "curl http://127.0.0.1:18080/ready",
+    "curl http://127.0.0.1:18080/accounts/<synthetic-wallet>/perps/canonical-fees",
+    "E2E_BASE_URL=http://127.0.0.1:13000 npx playwright test tests/e2e/perps-subaccounts-frontend-routing-v1.spec.ts --project=chromium",
+    "docker build --progress=plain -t deopt-intent-backend-local:final .",
+    "docker run --rm --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges with disabled trading and broadcaster flags; curl loopback /health and /ready"
+  ],
+  "limitations": [
+    "Direct D6 call only. A wrapper transaction with multiple intent fills requires independently authenticated nested-call traces and deterministic per-event binding; it is rejected now.",
+    "Signed subaccountId proves an order-origin label but not a separate D4 economic account or historical membership of a local SQL subaccount row.",
+    "The canonical fee API is wallet-scoped. The current frontend does not call this endpoint or display its signed-origin metadata.",
+    "Only synthetic local receipts were tested. No public D6 intent settlement receipt is available in this evidence.",
+    "Indexer does not automatically ingest TradeExecutedFromIntents; operator-triggered admin reconciliation is required after D2 S2 proof.",
+    "The synthetic PostgreSQL test covers two signed wallet parties and wallet-scoped history; multiple economically separate local subaccounts are intentionally not attributed.",
+    "U256 intent fields exceeding backend u128 bounds are rejected, even if D6 could accept them."
+  ],
+  "security": {
+    "public_chain_transactions": "NONE",
+    "remote_deployment": "NONE",
+    "public_broadcaster": "DISABLED",
+    "public_trading": "DISABLED",
+    "c02_execution_authorized": false,
+    "private_keys_or_secrets_committed": false
+  },
+  "next_action": "Implement authenticated nested-call trace binding for multi-fill receipts and mount the wallet-scoped canonical fee view in a separately reviewed local frontend change; recheck D2 only after five independent S2 postflights."
+}
