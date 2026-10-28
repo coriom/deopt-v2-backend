@@ -1,0 +1,92 @@
+{
+  "milestone": "DEOPT_BACKEND_REAL_ANVIL_MULTIFILL_AND_ALPHA_CLOSURE_V1",
+  "observed_utc": "2026-10-28",
+  "backend_start_commit": "5b79cc26cae3665888afbffe127beb1b8cdcc885",
+  "chain_scope": "isolated Anvil fork of Base Sepolia, chain ID 84532; no public transaction",
+  "local_transaction": {
+    "status": "PASS_LOCAL_AT_EXECUTION_TIME",
+    "hash": "0x6384c5fe43fbae6d3d12065199dc1edda82325328b69d225b83a1a068fb19fa3",
+    "block_hash": "0xb64dd58c311afb38ec0044b94140278286469ae4c1c1c9bd9dee31a48cc91228",
+    "receipt_status": 1,
+    "receipt_log_count": 20,
+    "d6_intent_events": 2,
+    "d2_fee_events": 2,
+    "nested_d6_calls": 2,
+    "nested_d4_to_d2_calls_per_fill": 2,
+    "same_signed_maker_intent_partial_sizes_1e8": [100000000, 200000000],
+    "final_intent_filled_1e8": 300000000,
+    "maker_fee_native_musdc": 0,
+    "taker_fees_native_musdc": [474660, 949320],
+    "taker_fee_ppm": 200,
+    "testnet_fixture_oracle": "two fresh local MockPriceSource contracts; no public oracle change",
+    "after_reorg_rehearsal": "local transaction removed by evm_revert; hash is historical local test evidence only"
+  },
+  "trace_proof": {
+    "status": "PASS_LOCAL",
+    "checks": [
+      "callTracer queried for exact local transaction and matched the canonical local receipt/block",
+      "two nested D6 calldata payloads matched the wrapper call hashes",
+      "both nested EIP-712 signatures and intent digests verified against their respective D6 event",
+      "the shared buyer intent and distinct seller intents were confirmed",
+      "wallet-level D4/D6 event pair remains the production persistence identity"
+    ],
+    "production_trace_persistence": "NOT_IMPLEMENTED; wrapped receipt rows remain wallet-level only"
+  },
+  "postgresql_and_api": {
+    "status": "PASS_LOCAL",
+    "fresh_atomic_insert": true,
+    "fill_rows": 2,
+    "maker_wallet_rows": 2,
+    "taker_wallet_rows_each": 1,
+    "second_ingest_inserted": false,
+    "post_restart_replay_inserted": false,
+    "http_wallet_fee_history_pagination": "PASS",
+    "canonical_subaccount_attribution": "NONE; wallet-only",
+    "local_reorg": "PASS_FAIL_CLOSED; disappeared receipt rejected, committed rows retained for manual reconciliation"
+  },
+  "frontend_browser": {
+    "status": "PASS_LOCAL",
+    "source_commit": "a32c5cc1b6dee30a0676b4adc156718687a0a727",
+    "source_changes": "NONE",
+    "scenario": "unchanged frontend on 127.0.0.1:3001 against local backend 127.0.0.1:4010 and actual PostgreSQL rows",
+    "buyer_rows": 2,
+    "taker_rows_each": 1,
+    "reload": "PASS",
+    "wallet_only_disclosure": "PASS",
+    "uncaught_client_exceptions": 0,
+    "production_verification": "NOT_RUN; no frontend deployment"
+  },
+  "focused_validation": {
+    "fresh_anvil_fork_setup": "PASS; C02 executed on fork only and reviewed Builder SHA-256 verified",
+    "forge_wrapper_compile": "PASS",
+    "rust_anvil_postgres_api_tests": "2 PASS (sequential ingestion then destructive local reorg)",
+    "rust_library_tests": "1881 PASS, 0 FAIL",
+    "cargo_build": "PASS",
+    "docker_runtime": "PASS; existing image, non-root/read-only, health 200, ready 200, broadcast off",
+    "fresh_docker_image_build": "NOT_RUN; runtime image reused because production source was unchanged",
+    "connected_chromium": "1 PASS, 0 uncaught client exceptions",
+    "frontend_fee_history_playwright": "2 PASS (wallet display/reload and wrong-wallet/unavailable-backend rejection)",
+    "targeted_rustfmt": "PASS",
+    "repository_wide_cargo_fmt_check": "FAIL; pre-existing unrelated formatting drift",
+    "strict_clippy_library": "FAIL; 196 existing diagnostics (prior baseline about 196)"
+  },
+  "governance_and_operational_bounds": {
+    "onchain_c02_execution_authorized": false,
+    "onchain_market_creation_by_agent": false,
+    "public_transaction_sent": false,
+    "public_broadcaster_enabled": false,
+    "remote_backend_deployed_by_this_milestone": false,
+    "current_remote_execution_services": "UNKNOWN; no current provider inventory authenticated",
+    "railway_reference": "HISTORICAL_UNVERIFIED failed deployment reference",
+    "c02_handoff": "timestamped inventory or attestation of all active backend/worker hosts, chain/contract targets, and non-secret execution flags required"
+  },
+  "local_perps_alpha": "PARTIAL",
+  "backend_hosting_readiness": "PARTIAL",
+  "remaining_blockers": [
+    "wrapped fills are durably wallet-level; trace-derived signed origin is not persisted by the production reconciliation path",
+    "on-chain independent subaccount economic identity is absent",
+    "repository-wide strict Clippy and format gates fail on pre-existing debt",
+    "remote backend/relayer/keeper state is not verified",
+    "public market creation, maintenance release, migration and trading require separate governance"
+  ]
+}
