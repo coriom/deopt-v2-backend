@@ -1,0 +1,78 @@
+{
+  "milestone": "DEOPT_BACKEND_SIGNED_ORIGIN_PERSISTENCE_AND_LOCAL_ALPHA_RELEASE_V1",
+  "source_head": "2c10f1c1ca9d8c38d9c92fd7b5e500ad862f525c",
+  "network": { "chain_id": 84532, "public_writes": false, "fork_only_writes": true },
+  "implementation": {
+    "signed_origin_provenance_persisted": "PASS",
+    "wrapper_trace_authentication": "PASS_BOUNDED_CALLTRACER",
+    "atomic_fee_and_proof_commit": "PASS",
+    "duplicate_receipt_idempotency": "PASS",
+    "wallet_level_settlement": "PASS",
+    "independent_onchain_subaccounts": "UNSUPPORTED",
+    "legacy_record_backfill": "NONE",
+    "raw_signatures_or_traces_stored": false,
+    "api_provenance_and_reconciliation_status": "PASS"
+  },
+  "fresh_local_evidence": {
+    "anvil_multifill_tx": "0xa264eae61ab27853c792d84e0e007a93757a655077ea51cc864450e164446082",
+    "anvil_original_block_hash": "0x9a224863bbd02ecea1f4418440c4c99a6419575aa0e0c2680e0c5fd039434326",
+    "anvil_tx_currently_canonical": false,
+    "anvil_tx_invalidated_by_intentional_reorg_test": true,
+    "partial_fill_count": 2,
+    "signed_origin_records_before_reorg": 2,
+    "d2_fee_events": 2,
+    "maker_fee_native": "0",
+    "taker_fees_native": ["474660", "949320"],
+    "settlement_decimals": 6,
+    "post_reorg_provenance": "reorg_divergent",
+    "post_reorg_api_canonicality": "reconciliation_required",
+    "post_reorg_signed_subaccount_labels": null,
+    "pg_dump_restore": "PASS",
+    "restore_row_counts": { "fees": 2, "intent_proofs": 2, "provenance": 2 },
+    "source_and_restored_provenance_digest": "31cfb1dc35959024f5562d072236d3c0",
+    "postgres_restart": "PASS",
+    "api_after_restart": "HTTP_200_TWO_SIGNED_ORIGIN_ROWS"
+  },
+  "fresh_tests": {
+    "rust_lib": { "command": "cargo test --lib -j 1 -- --test-threads=1 --quiet", "passed": 1881, "failed": 0 },
+    "real_anvil_postgres_api": "PASS",
+    "missing_trace_wallet_only": "PASS",
+    "malformed_trace_batch_rejected": "PASS",
+    "conflicting_stored_origin_rejected": "PASS",
+    "reorg_divergence_after_rpc_fix": "PASS",
+    "connected_chromium": "PASS_ONE_SCRIPT_THREE_WALLETS_NO_CLIENT_EXCEPTIONS",
+    "frontend_playwright": { "command": "E2E_BASE_URL=http://127.0.0.1:3001 npx playwright test tests/e2e/perps-canonical-fees.spec.ts --project=chromium", "passed": 2, "failed": 0 },
+    "cargo_build": "PASS",
+    "targeted_rustfmt_and_node_syntax": "PASS",
+    "repository_cargo_fmt_check": "FAIL_EXISTING_FORMATTING_DEBT",
+    "strict_clippy": { "command": "cargo clippy --lib -- -D warnings", "status": "FAIL", "diagnostics": 196, "new_diagnostics_in_touched_fee_modules": 0 },
+    "docker_build": "PASS_LOCAL_IMAGE",
+    "docker_runtime": "PASS_NON_ROOT_READ_ONLY_HEALTH_READY_200_REORG_SAFE_API"
+  },
+  "resolved_failed_attempts": [
+    "Docker-published PostgreSQL loopback port unavailable; replaced with a disposable local PostgreSQL instance.",
+    "A disappeared Anvil receipt initially escaped divergence marking because the generic RPC helper rejected null; nullable receipt handling was fixed and reorg test passed.",
+    "Chromium fixture clicked before React hydration; test waits for client wallet state and passed.",
+    "A final sandboxed parallel Rust run had two loopback-bind EPERM failures and one shared-environment race; a loopback-permitted serial run passed all 1881 tests."
+  ],
+  "release_gates": {
+    "local_functional_alpha_readiness": "PASS",
+    "local_alpha_scope": "WALLET_LEVEL_ISOLATED_FORK_ONLY",
+    "public_onchain_protocol_readiness": "PARTIAL",
+    "public_protocol_blockers": ["C02_NOT_AUTHORIZED", "D4_D6_MAINTENANCE"],
+    "backend_hosting_readiness": "PARTIAL",
+    "hosting_blockers": ["TRACE_CAPABLE_PROVIDER_UNVERIFIED", "HOSTED_CONTROLS_UNVERIFIED"],
+    "public_trading_readiness": "BLOCKED",
+    "public_broadcaster_enabled": false,
+    "remote_backend_deployed_this_milestone": false,
+    "c02_execution_authorized": false
+  },
+  "hosting_prerequisites": [
+    "Trusted Base Sepolia RPC with debug_traceTransaction callTracer for authenticated wrapped-fill provenance; method-not-found permits wallet-level history only.",
+    "Persistent PostgreSQL with monitored backups and restoration drills.",
+    "Non-root Docker runtime, health and readiness monitoring, bounded restart policy and secret management.",
+    "Independent operational inventory of any existing remote Rust backend, relayer or keeper before C02 review.",
+    "Separate explicit governance and broadcaster activation gates."
+  ],
+  "private_fixture_policy": "Raw signed local fixture, trace, and PostgreSQL dump remain under /tmp and are not committed."
+}

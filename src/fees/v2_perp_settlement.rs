@@ -39,6 +39,21 @@ pub struct CanonicalV2PerpFee {
     pub amount_native: u128,
 }
 
+/// Minimal durable classification. Signed hashes live in VerifiedIntentFill;
+/// a trace digest commits to nested calldata without retaining signatures.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FillProvenance {
+    pub status: &'static str,
+    pub trace_call_hash: Option<String>,
+}
+
+impl FillProvenance {
+    pub fn signed_direct() -> Self { Self { status: "signed_direct_verified", trace_call_hash: None } }
+    pub fn signed_trace(hash: String) -> Self { Self { status: "signed_trace_verified", trace_call_hash: Some(hash) } }
+    pub fn trace_unavailable() -> Self { Self { status: "wallet_only_trace_unavailable", trace_call_hash: None } }
+    pub fn no_intent() -> Self { Self { status: "wallet_only_no_intent", trace_call_hash: None } }
+}
+
 /// A settled wallet-level fact. D6's `TradeExecuted` event carries wallets,
 /// but no subaccount identifier. In particular, the local default account
 /// is never evidence of canonical subaccount ownership.
@@ -65,6 +80,10 @@ pub struct CanonicalV2PerpHistoryRow {
     pub signed_subaccount_id: Option<u32>,
     pub attribution: &'static str,
     pub settlement: &'static str,
+    /// Authentication performed at ingestion. This is not a claim that the
+    /// historical block is still canonical at the moment of this API read.
+    pub signed_origin_provenance: String,
+    pub canonicality_status: &'static str,
 }
 
 /// The five hashes are public execution receipts, supplied only after their
@@ -143,9 +162,9 @@ pub async fn reconcile_confirmed_v2_trade(
 }
 
 /// Read-only RPC reconciliation for a direct or wrapped D6 intent transaction.
-/// A direct call proves signatures and signed order origin; a wrapper proves
-/// wallet settlement from the adjacent D4/D6 logs only. Neither supplies a
-/// canonical economic subaccount.
+/// A wrapper is signed-origin verified only with a matching callTracer proof;
+/// explicit method-not-found retains a wallet fee with unverified signed
+/// origin. Neither path supplies a canonical economic subaccount.
 pub async fn reconcile_confirmed_v2_intent_tx(
     repository: &PgRepository,
     rpc_url: &str,
@@ -156,18 +175,24 @@ pub async fn reconcile_confirmed_v2_intent_tx(
     if !is_hash(tx_hash) {
         return Err(fee_error("invalid intent transaction hash".into()));
     }
-    let policy = verify_d2_fee_policy(rpc_url, now_seconds, 300, execution_hashes)
-        .await.map_err(fee_error)?;
-    let tx = rpc(rpc_url, "eth_getTransactionByHash", json!([tx_hash])).await?;
-    let receipt = rpc(rpc_url, "eth_getTransactionReceipt", json!([tx_hash])).await?;
+    let tx = rpc_nullable(rpc_url, "eth_getTransactionByHash", json!([tx_hash])).await?;
+    let receipt = rpc_nullable(rpc_url, "eth_getTransactionReceipt", json!([tx_hash])).await?;
+    if tx.is_null() || receipt.is_null() {
+        repository.mark_canonical_v2_provenance_divergent(tx_hash).await?;
+        return Err(fee_error("intent receipt missing; persisted provenance requires reconciliation".into()));
+    }
     let block_number = quantity(receipt.get("blockNumber"))?;
     let block = rpc(rpc_url, "eth_getBlockByNumber", json!([format!("0x{block_number:x}"), false])).await?;
     let block_hash = block.get("hash").and_then(Value::as_str)
         .ok_or_else(|| fee_error("canonical block hash missing".into()))?;
     if !receipt.get("blockHash").and_then(Value::as_str)
         .is_some_and(|hash| hash.eq_ignore_ascii_case(block_hash)) {
+        repository.mark_canonical_v2_provenance_divergent(tx_hash).await?;
         return Err(fee_error("intent receipt block is noncanonical".into()));
     }
+    repository.ensure_canonical_v2_provenance_block(tx_hash, block_hash).await?;
+    let policy = verify_d2_fee_policy(rpc_url, now_seconds, 300, execution_hashes)
+        .await.map_err(fee_error)?;
     let timestamp = quantity(block.get("timestamp"))?;
     let logs = receipt.get("logs").and_then(Value::as_array)
         .ok_or_else(|| fee_error("intent receipt logs missing".into()))?;
@@ -185,20 +210,38 @@ pub async fn reconcile_confirmed_v2_intent_tx(
     if direct && candidates.len() != 1 {
         return Err(fee_error("direct D6 call emitted multiple intent fills".into()));
     }
-    // A direct call proves both signatures and signed order-origin labels.
-    // A wrapper has no authenticated nested calldata on a receipt-only RPC;
-    // use only the D4/D6 event pair for wallet-level accounting.
+    let trace_proofs = if direct { None } else {
+        match optional_transaction_trace(rpc_url, tx_hash).await? {
+            Some(trace) => {
+                let events: Vec<EthLog> = candidates.iter().map(|candidate|
+                    serde_json::from_value((*candidate).clone())
+                        .map_err(|_| fee_error("malformed intent event".into()))
+                ).collect::<Result<_>>()?;
+                Some(crate::fees::v2_intent_receipt::prove_traced_wrapper_intent_fills(
+                    &tx, &receipt, &trace, &events, timestamp)?)
+            }
+            None => None,
+        }
+    };
     let mut verified = Vec::with_capacity(candidates.len());
-    for candidate in candidates {
-        let event: EthLog = serde_json::from_value(candidate.clone())
+    for (index, candidate) in candidates.iter().enumerate() {
+        let event: EthLog = serde_json::from_value((*candidate).clone())
             .map_err(|_| fee_error("malformed intent event".into()))?;
-        let (trade, fee, signed) = if direct {
+        let (trade, fee, signed, provenance) = if direct {
             let proof = crate::fees::v2_intent_receipt::prove_direct_intent_fill(&tx, &receipt, &event, timestamp)?;
             let (maker, taker) = roles(&proof.trade)?;
             let maker_tier = read_account_tier_at_block(rpc_url, block_number, block_hash, maker).await.map_err(fee_error)?;
             let taker_tier = read_account_tier_at_block(rpc_url, block_number, block_hash, taker).await.map_err(fee_error)?;
             let fee = validate_intent_receipt(&proof, &receipt, &policy, maker_tier, taker_tier, now_seconds)?;
-            (proof.trade.clone(), fee, Some(proof))
+            (proof.trade.clone(), fee, Some(proof), FillProvenance::signed_direct())
+        } else if let Some(ref trace_proofs) = trace_proofs {
+            let (proof, call_hash) = &trace_proofs[index];
+            verify_d4_matcher_at_block(rpc_url, block_hash).await?;
+            let (maker, taker) = roles(&proof.trade)?;
+            let maker_tier = read_account_tier_at_block(rpc_url, block_number, block_hash, maker).await.map_err(fee_error)?;
+            let taker_tier = read_account_tier_at_block(rpc_url, block_number, block_hash, taker).await.map_err(fee_error)?;
+            let fee = validate_intent_receipt(proof, &receipt, &policy, maker_tier, taker_tier, now_seconds)?;
+            (proof.trade.clone(), fee, Some(proof.clone()), FillProvenance::signed_trace(call_hash.clone()))
         } else {
             let proof = crate::fees::v2_intent_receipt::prove_wallet_intent_fill(&tx, &receipt, &event, timestamp)?;
             verify_d4_matcher_at_block(rpc_url, block_hash).await?;
@@ -206,20 +249,56 @@ pub async fn reconcile_confirmed_v2_intent_tx(
             let maker_tier = read_account_tier_at_block(rpc_url, block_number, block_hash, maker).await.map_err(fee_error)?;
             let taker_tier = read_account_tier_at_block(rpc_url, block_number, block_hash, taker).await.map_err(fee_error)?;
             let fee = validate_wallet_intent_receipt(&proof, &receipt, &policy, maker_tier, taker_tier, now_seconds)?;
-            (proof.trade, fee, None)
+            (proof.trade, fee, None, FillProvenance::trace_unavailable())
         };
         verify_market_and_decimals_at_trade(rpc_url, &trade).await?;
-        verified.push((trade, fee, signed));
+        verified.push((trade, fee, signed, provenance));
     }
     let canonical_again = rpc(rpc_url, "eth_getBlockByNumber",
         json!([format!("0x{block_number:x}"), false])).await?;
     if !canonical_again.get("hash").and_then(Value::as_str)
         .is_some_and(|hash| hash.eq_ignore_ascii_case(block_hash)) {
+        repository.mark_canonical_v2_provenance_divergent(tx_hash).await?;
         return Err(fee_error("intent receipt reorg detected before persistence".into()));
     }
     // One receipt, one SQL transaction. A later fill's failure rolls back
     // all earlier fills and fees from this receipt.
-    repository.persist_canonical_v2_intent_batch(&verified).await
+    match repository.persist_canonical_v2_intent_batch_with_provenance(&verified).await {
+        Err(error) => {
+            if let BackendError::Persistence(message) = &error {
+                if message.contains("stored fill provenance conflicts")
+                    || message.contains("stored signed-intent proof diverged")
+                    || message.contains("stored V2 trade diverged")
+                    || message.contains("stored D2 fee diverged") {
+                    repository.mark_canonical_v2_provenance_conflicting(tx_hash).await?;
+                }
+            }
+            Err(error)
+        }
+        result => result,
+    }
+}
+
+/// The only accepted downgrade is explicit JSON-RPC method-not-found. A
+/// malformed, mismatched or failed trace is a hard error, not wallet proof.
+async fn optional_transaction_trace(rpc_url: &str, tx_hash: &str) -> Result<Option<Value>> {
+    let response: Value = reqwest::Client::builder()
+        .timeout(Duration::from_secs(8)).build()
+        .map_err(|_| fee_error("trace RPC client unavailable".into()))?
+        .post(rpc_url)
+        .json(&json!({"jsonrpc":"2.0","id":1,"method":"debug_traceTransaction",
+            "params":[tx_hash,{"tracer":"callTracer"}]}))
+        .send().await.map_err(|_| fee_error("trace RPC request failed".into()))?
+        .error_for_status().map_err(|_| fee_error("trace RPC HTTP failure".into()))?
+        .json().await.map_err(|_| fee_error("trace RPC response malformed".into()))?;
+    if response.get("error").and_then(|error| error.get("code"))
+        .and_then(Value::as_i64) == Some(-32601) {
+        return Ok(None);
+    }
+    if response.get("error").is_some() || response.get("result").map_or(true, Value::is_null) {
+        return Err(fee_error("trace RPC result unavailable or inconsistent".into()));
+    }
+    Ok(Some(response["result"].clone()))
 }
 
 async fn verify_d4_matcher_at_block(rpc_url: &str, block_hash: &str) -> Result<()> {
@@ -688,6 +767,16 @@ fn word_i32(word: &[u8; 32]) -> Result<i32> {
     Ok(value)
 }
 async fn rpc(url: &str, method: &str, params: Value) -> Result<Value> {
+    let result = rpc_nullable(url, method, params).await?;
+    if result.is_null() {
+        return Err(fee_error(format!("{method} result absent")));
+    }
+    Ok(result)
+}
+
+/// A disappeared receipt is a valid RPC response during a reorg. The caller
+/// must see null so it can invalidate persisted provenance before returning.
+async fn rpc_nullable(url: &str, method: &str, params: Value) -> Result<Value> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(8))
         .build()
@@ -706,10 +795,7 @@ async fn rpc(url: &str, method: &str, params: Value) -> Result<Value> {
     if response.get("error").is_some() {
         return Err(fee_error(format!("{method} RPC error")));
     }
-    response
-        .get("result")
-        .filter(|value| !value.is_null())
-        .cloned()
+    response.get("result").cloned()
         .ok_or_else(|| fee_error(format!("{method} result absent")))
 }
 

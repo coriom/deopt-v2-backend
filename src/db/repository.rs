@@ -14,7 +14,7 @@ use crate::execution::{
 };
 use crate::fees::d2_onchain::{approved_taker_fee, TIMELOCK_ADDRESS};
 use crate::fees::v2_perp_settlement::{
-    CanonicalV2PerpFee, CanonicalV2PerpHistoryRow, D6_MATCHER, MUSDC,
+    CanonicalV2PerpFee, CanonicalV2PerpHistoryRow, FillProvenance, D6_MATCHER, MUSDC,
 };
 use crate::fees::v2_intent_receipt::VerifiedIntentFill;
 use crate::fees::{
@@ -60,6 +60,11 @@ use sqlx::query::Query;
 use sqlx::{Postgres, Row, Transaction};
 use std::collections::{BTreeMap, HashMap};
 use uuid::Uuid;
+
+fn valid_hex_32(value: &str) -> bool {
+    value.len() == 66 && value.starts_with("0x")
+        && value[2..].bytes().all(|byte| byte.is_ascii_hexdigit())
+}
 
 #[derive(Clone)]
 pub struct PgRepository {
@@ -1943,7 +1948,7 @@ impl PgRepository {
         trade: &IndexedPerpTrade,
         fee: &CanonicalV2PerpFee,
     ) -> Result<bool> {
-        self.persist_canonical_v2_perp_fee_inner(trade, fee, None).await
+        self.persist_canonical_v2_perp_fee_inner(trade, fee, None, &FillProvenance::no_intent()).await
     }
 
     pub async fn persist_canonical_v2_intent_fee(
@@ -1951,7 +1956,7 @@ impl PgRepository {
         proof: &VerifiedIntentFill,
         fee: &CanonicalV2PerpFee,
     ) -> Result<bool> {
-        self.persist_canonical_v2_perp_fee_inner(&proof.trade, fee, Some(proof)).await
+        self.persist_canonical_v2_perp_fee_inner(&proof.trade, fee, Some(proof), &FillProvenance::signed_direct()).await
     }
 
     async fn persist_canonical_v2_perp_fee_inner(
@@ -1959,9 +1964,10 @@ impl PgRepository {
         trade: &IndexedPerpTrade,
         fee: &CanonicalV2PerpFee,
         intent_proof: Option<&VerifiedIntentFill>,
+        provenance: &FillProvenance,
     ) -> Result<bool> {
         let mut tx = self.begin().await?;
-        let inserted = Self::persist_canonical_v2_perp_fee_in_tx(&mut tx, trade, fee, intent_proof).await?;
+        let inserted = Self::persist_canonical_v2_perp_fee_in_tx(&mut tx, trade, fee, intent_proof, provenance).await?;
         tx.commit().await.map_err(|e| BackendError::Persistence(e.to_string()))?;
         Ok(inserted)
     }
@@ -1972,18 +1978,29 @@ impl PgRepository {
         &self,
         fills: &[(IndexedPerpTrade, CanonicalV2PerpFee, Option<VerifiedIntentFill>)],
     ) -> Result<bool> {
+        let with_provenance: Vec<_> = fills.iter().map(|(trade, fee, proof)| (
+            trade.clone(), fee.clone(), proof.clone(),
+            if proof.is_some() { FillProvenance::signed_direct() } else { FillProvenance::trace_unavailable() }
+        )).collect();
+        self.persist_canonical_v2_intent_batch_with_provenance(&with_provenance).await
+    }
+
+    pub async fn persist_canonical_v2_intent_batch_with_provenance(
+        &self,
+        fills: &[(IndexedPerpTrade, CanonicalV2PerpFee, Option<VerifiedIntentFill>, FillProvenance)],
+    ) -> Result<bool> {
         if fills.is_empty() || fills.len() > 64 {
             return Err(BackendError::Persistence("invalid canonical V2 receipt batch size".into()));
         }
         let first = &fills[0].1;
-        if fills.iter().any(|(_, fee, _)| fee.chain_id != first.chain_id
+        if fills.iter().any(|(_, fee, _, _)| fee.chain_id != first.chain_id
             || fee.tx_hash != first.tx_hash || fee.block_hash != first.block_hash) {
             return Err(BackendError::Persistence("mixed canonical V2 receipt batch".into()));
         }
         let mut tx = self.begin().await?;
         let mut inserted = false;
-        for (trade, fee, proof) in fills {
-            inserted |= Self::persist_canonical_v2_perp_fee_in_tx(&mut tx, trade, fee, proof.as_ref()).await?;
+        for (trade, fee, proof, provenance) in fills {
+            inserted |= Self::persist_canonical_v2_perp_fee_in_tx(&mut tx, trade, fee, proof.as_ref(), provenance).await?;
         }
         tx.commit().await.map_err(|e| BackendError::Persistence(e.to_string()))?;
         Ok(inserted)
@@ -1994,7 +2011,16 @@ impl PgRepository {
         trade: &IndexedPerpTrade,
         fee: &CanonicalV2PerpFee,
         intent_proof: Option<&VerifiedIntentFill>,
+        provenance: &FillProvenance,
     ) -> Result<bool> {
+        if !matches!(provenance.status, "signed_direct_verified" | "signed_trace_verified"
+            | "wallet_only_trace_unavailable" | "wallet_only_no_intent")
+            || intent_proof.is_some() != provenance.status.starts_with("signed_")
+            || provenance.trace_call_hash.is_some() != (provenance.status == "signed_trace_verified")
+            || provenance.trace_call_hash.as_deref().is_some_and(|hash| !valid_hex_32(hash))
+        {
+            return Err(BackendError::Persistence("invalid signed-origin provenance classification".into()));
+        }
         let taker = if trade.buyer_is_maker {
             &trade.seller
         } else {
@@ -2142,9 +2168,8 @@ impl PgRepository {
             ));
         }
         if let Some(proof) = intent_proof {
-            if proof.trade != *trade || !proof.buyer_intent_hash.starts_with("0x")
-                || !proof.seller_intent_hash.starts_with("0x")
-                || proof.buyer_intent_hash.len() != 66 || proof.seller_intent_hash.len() != 66 {
+            if proof.trade != *trade || !valid_hex_32(&proof.buyer_intent_hash)
+                || !valid_hex_32(&proof.seller_intent_hash) {
                 return Err(BackendError::Persistence("intent proof differs from canonical fill".into()));
             }
             sqlx::query(
@@ -2183,8 +2208,118 @@ impl PgRepository {
                 return Err(BackendError::Persistence("stored signed-intent proof diverged".into()));
             }
         }
+        let buyer_hash = intent_proof.map(|proof| proof.buyer_intent_hash.as_str());
+        let seller_hash = intent_proof.map(|proof| proof.seller_intent_hash.as_str());
+        sqlx::query(
+            "INSERT INTO canonical_v2_fill_provenance (
+                chain_id, tx_hash, trade_log_index, block_number, block_hash,
+                emitter_address, buyer_wallet, seller_wallet, fee_log_index,
+                buyer_intent_hash, seller_intent_hash, trace_call_hash, status, created_at_ms
+             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(u64_to_i64("chain_id", fee.chain_id)?)
+        .bind(&fee.tx_hash)
+        .bind(u64_to_i64("trade_log_index", fee.trade_log_index)?)
+        .bind(u64_to_i64("block_number", fee.block_number)?)
+        .bind(&fee.block_hash)
+        .bind(D6_MATCHER)
+        .bind(&trade.buyer)
+        .bind(&trade.seller)
+        .bind(fee.fee_log_index.map(|value| u64_to_i64("fee_log_index", value)).transpose()?)
+        .bind(buyer_hash)
+        .bind(seller_hash)
+        .bind(provenance.trace_call_hash.as_deref())
+        .bind(provenance.status)
+        .bind(timestamp_to_i64(now_ms()))
+        .execute(&mut **tx).await.map_err(|e| BackendError::Persistence(e.to_string()))?;
+        let stored = sqlx::query(
+            "SELECT block_number, block_hash, emitter_address, buyer_wallet, seller_wallet,
+                    fee_log_index, buyer_intent_hash, seller_intent_hash, trace_call_hash, status
+             FROM canonical_v2_fill_provenance
+             WHERE chain_id=$1 AND tx_hash=$2 AND trade_log_index=$3 FOR UPDATE",
+        )
+        .bind(u64_to_i64("chain_id", fee.chain_id)?)
+        .bind(&fee.tx_hash)
+        .bind(u64_to_i64("trade_log_index", fee.trade_log_index)?)
+        .fetch_one(&mut **tx).await.map_err(|e| BackendError::Persistence(e.to_string()))?;
+        if row_get::<i64>(&stored, "block_number")? != u64_to_i64("block_number", fee.block_number)?
+            || !row_get::<String>(&stored, "block_hash")?.eq_ignore_ascii_case(&fee.block_hash)
+            || !row_get::<String>(&stored, "emitter_address")?.eq_ignore_ascii_case(D6_MATCHER)
+            || !row_get::<String>(&stored, "buyer_wallet")?.eq_ignore_ascii_case(&trade.buyer)
+            || !row_get::<String>(&stored, "seller_wallet")?.eq_ignore_ascii_case(&trade.seller)
+            || row_get::<Option<i64>>(&stored, "fee_log_index")?
+                != fee.fee_log_index.map(|value| u64_to_i64("fee_log_index", value)).transpose()?
+            || row_get::<Option<String>>(&stored, "buyer_intent_hash")?.as_deref() != buyer_hash
+            || row_get::<Option<String>>(&stored, "seller_intent_hash")?.as_deref() != seller_hash
+            || row_get::<Option<String>>(&stored, "trace_call_hash")?.as_deref() != provenance.trace_call_hash.as_deref()
+            || row_get::<String>(&stored, "status")? != provenance.status
+        {
+            return Err(BackendError::Persistence("stored fill provenance conflicts with canonical evidence".into()));
+        }
         Ok(inserted)
     }
+
+    /// Audit a local reorg without erasing economic records or their prior
+    /// signed-origin evidence. A later replay may not silently re-promote it.
+    pub async fn mark_canonical_v2_provenance_divergent(&self, tx_hash: &str) -> Result<u64> {
+        let result = sqlx::query(
+            "UPDATE canonical_v2_fill_provenance
+             SET previous_status=status, status='reorg_divergent', invalidated_observed_ms=$2
+             WHERE chain_id=84532 AND tx_hash=$1 AND status NOT IN ('reorg_divergent', 'evidence_conflict')",
+        )
+        .bind(tx_hash.to_ascii_lowercase())
+        .bind(timestamp_to_i64(now_ms()))
+        .execute(&self.pool).await.map_err(|e| BackendError::Persistence(e.to_string()))?;
+        Ok(result.rows_affected())
+    }
+
+    /// A transaction can be re-mined after a reorg with the same hash but a
+    /// different block hash. Keep the original economic record for review.
+    pub async fn ensure_canonical_v2_provenance_block(
+        &self,
+        tx_hash: &str,
+        current_block_hash: &str,
+    ) -> Result<()> {
+        let rows = sqlx::query(
+            "SELECT block_hash, status FROM canonical_v2_fill_provenance
+             WHERE chain_id=84532 AND tx_hash=$1",
+        )
+        .bind(tx_hash.to_ascii_lowercase())
+        .fetch_all(&self.pool).await
+        .map_err(|e| BackendError::Persistence(e.to_string()))?;
+        if rows.iter().any(|row| {
+            row.try_get::<String, _>("block_hash")
+                .map_or(true, |hash| !hash.eq_ignore_ascii_case(current_block_hash))
+        }) {
+            self.mark_canonical_v2_provenance_divergent(tx_hash).await?;
+            return Err(BackendError::Persistence(
+                "previously persisted signed origin moved to another canonical block; manual reconciliation required".into(),
+            ));
+        }
+        if rows.iter().any(|row| {
+            row.try_get::<String, _>("status")
+                .map_or(true, |status| matches!(status.as_str(), "reorg_divergent" | "evidence_conflict"))
+        }) {
+            return Err(BackendError::Persistence(
+                "previously persisted signed origin requires manual reconciliation".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub async fn mark_canonical_v2_provenance_conflicting(&self, tx_hash: &str) -> Result<u64> {
+        let result = sqlx::query(
+            "UPDATE canonical_v2_fill_provenance
+             SET previous_status=status, status='evidence_conflict', invalidated_observed_ms=$2
+             WHERE chain_id=84532 AND tx_hash=$1 AND status NOT IN ('reorg_divergent', 'evidence_conflict')",
+        )
+        .bind(tx_hash.to_ascii_lowercase())
+        .bind(timestamp_to_i64(now_ms()))
+        .execute(&self.pool).await.map_err(|e| BackendError::Persistence(e.to_string()))?;
+        Ok(result.rows_affected())
+    }
+
 
     /// Canonically settled V2 history for a wallet. This is deliberately
     /// separate from `perp_fills`: those are local matching projections with
@@ -2212,7 +2347,8 @@ impl PgRepository {
                     f.block_number, f.block_hash, f.market_id, f.payer, f.recipient,
                     f.amount_native, t.buyer, t.seller, t.buyer_is_maker,
                     t.size_delta_1e8, t.execution_price_1e8,
-                    p.buyer_signed_subaccount_id, p.seller_signed_subaccount_id
+                    p.buyer_signed_subaccount_id, p.seller_signed_subaccount_id,
+                    v.status AS provenance_status
              FROM canonical_v2_perp_fees f
              JOIN indexed_perp_trades t
                ON t.chain_id=f.chain_id AND t.tx_hash=f.tx_hash
@@ -2220,6 +2356,9 @@ impl PgRepository {
              LEFT JOIN canonical_v2_intent_proofs p
                ON p.chain_id=f.chain_id AND p.tx_hash=f.tx_hash
               AND p.trade_log_index=f.trade_log_index
+             LEFT JOIN canonical_v2_fill_provenance v
+               ON v.chain_id=f.chain_id AND v.tx_hash=f.tx_hash
+              AND v.trade_log_index=f.trade_log_index
              WHERE f.chain_id=84532 AND t.protocol_version='perp_v2'
                AND t.emitter_address=$1
                AND (lower(t.buyer)=$2 OR lower(t.seller)=$2)
@@ -2243,6 +2382,11 @@ impl PgRepository {
                 let buyer_is_maker: bool = row_get(&row, "buyer_is_maker")?;
                 let is_maker = is_buyer == buyer_is_maker;
                 let amount: String = row_get(&row, "amount_native")?;
+                let provenance_status = row_get::<Option<String>>(&row, "provenance_status")?
+                    .unwrap_or_else(|| "legacy_unverified".into());
+                let signed_origin = matches!(provenance_status.as_str(),
+                    "signed_direct_verified" | "signed_trace_verified");
+                let divergent = matches!(provenance_status.as_str(), "reorg_divergent" | "evidence_conflict");
                 Ok(CanonicalV2PerpHistoryRow {
                     chain_id: i64_to_u64_persistence("chain_id", row_get(&row, "chain_id")?)?,
                     tx_hash: row_get(&row, "tx_hash")?,
@@ -2269,16 +2413,17 @@ impl PgRepository {
                     fee_payer: row_get(&row, "payer")?,
                     fee_recipient: row_get(&row, "recipient")?,
                     subaccount_id: None,
-                    signed_subaccount_id: row_get::<Option<i64>>(
-                        &row,
-                        if is_buyer { "buyer_signed_subaccount_id" } else { "seller_signed_subaccount_id" },
-                    )?.map(|value| u32::try_from(value).map_err(|_| BackendError::Persistence("signed subaccount ID out of range".into()))).transpose()?,
-                    attribution: if row_get::<Option<i64>>(&row, "buyer_signed_subaccount_id")?.is_some() {
+                    signed_subaccount_id: if signed_origin { row_get::<Option<i64>>(
+                        &row, if is_buyer { "buyer_signed_subaccount_id" } else { "seller_signed_subaccount_id" },
+                    )?.map(|value| u32::try_from(value).map_err(|_| BackendError::Persistence("signed subaccount ID out of range".into()))).transpose()? } else { None },
+                    attribution: if signed_origin {
                         "signed_intent_origin_wallet_settlement"
                     } else {
                         "wallet_only_unresolved_subaccount"
                     },
-                    settlement: "receipt_verified_at_ingestion",
+                    settlement: if divergent { "requires_operator_reconciliation" } else { "receipt_verified_at_ingestion" },
+                    signed_origin_provenance: provenance_status,
+                    canonicality_status: if divergent { "reconciliation_required" } else { "requires_fresh_chain_recheck" },
                 })
             })
             .collect()

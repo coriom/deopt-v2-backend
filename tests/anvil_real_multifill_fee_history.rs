@@ -2,12 +2,15 @@
 //! It never constructs synthetic receipt logs or submits a public transaction.
 use alloy_primitives::keccak256;
 use deopt_v2_backend::db::PgRepository;
-use deopt_v2_backend::fees::v2_intent_receipt::{prove_direct_intent_fill, INTENT_EVENT_SIGNATURE};
+use deopt_v2_backend::fees::v2_intent_receipt::{
+    prove_direct_intent_fill, prove_traced_wrapper_intent_fills, INTENT_EVENT_SIGNATURE,
+};
 use deopt_v2_backend::fees::v2_perp_settlement::reconcile_confirmed_v2_intent_tx;
 use deopt_v2_backend::indexer::EthLog;
 use serde_json::{json, Value};
 
 const RPC: &str = "http://127.0.0.1:18545";
+const TRACE_PROXY: &str = "http://127.0.0.1:18546";
 const EXECUTIONS: [&str; 5] = [
     "0xb8bcb5359598046cd5ea9110e32cb303674b7ba5825e215e823e1941602c3c87",
     "0xc5c7ae3f6cd81253da5090aec01eb235952bf204ed2ec322d8e78c948616c955",
@@ -174,6 +177,67 @@ async fn real_anvil_multifill_receipt_to_postgres_and_api() {
         })
         .collect();
     assert_eq!(intent_events.len(), nested.len());
+    let events: Vec<EthLog> = intent_events
+        .iter()
+        .map(|event| serde_json::from_value((*event).clone()).unwrap())
+        .collect();
+    let authenticated = prove_traced_wrapper_intent_fills(
+        &transaction,
+        &original,
+        &trace,
+        &events,
+        trade_timestamp,
+    )
+    .unwrap();
+    assert_eq!(authenticated.len(), 2);
+    assert_eq!(
+        authenticated[0].0.buyer_intent_hash,
+        authenticated[1].0.buyer_intent_hash
+    );
+    assert_ne!(
+        authenticated[0].0.seller_intent_hash,
+        authenticated[1].0.seller_intent_hash
+    );
+    let mut wrong_order = trace.clone();
+    wrong_order["calls"].as_array_mut().unwrap().swap(0, 1);
+    assert!(prove_traced_wrapper_intent_fills(
+        &transaction,
+        &original,
+        &wrong_order,
+        &events,
+        trade_timestamp
+    )
+    .is_err());
+    let mut incomplete = trace.clone();
+    incomplete["calls"].as_array_mut().unwrap().pop();
+    assert!(prove_traced_wrapper_intent_fills(
+        &transaction,
+        &original,
+        &incomplete,
+        &events,
+        trade_timestamp
+    )
+    .is_err());
+    let mut wrong_target = trace.clone();
+    wrong_target["calls"][0]["to"] = json!("0x0000000000000000000000000000000000000001");
+    assert!(prove_traced_wrapper_intent_fills(
+        &transaction,
+        &original,
+        &wrong_target,
+        &events,
+        trade_timestamp
+    )
+    .is_err());
+    let mut wrong_chain = transaction.clone();
+    wrong_chain["chainId"] = json!("0x1");
+    assert!(prove_traced_wrapper_intent_fills(
+        &wrong_chain,
+        &original,
+        &trace,
+        &events,
+        trade_timestamp
+    )
+    .is_err());
     let mut signed_hashes = Vec::new();
     for (nested_call, event_json) in nested.iter().zip(intent_events.iter()) {
         // callTracer is queried for this exact canonical local transaction;
@@ -302,6 +366,29 @@ async fn real_anvil_multifill_receipt_to_postgres_and_api() {
         (buyer_rows.len(), seller_a_rows.len(), seller_b_rows.len()),
         (2, 1, 1)
     );
+    assert!(buyer_rows.iter().all(
+        |row| row.signed_origin_provenance == "signed_trace_verified"
+            && row.canonicality_status == "requires_fresh_chain_recheck"
+            && row.signed_subaccount_id == Some(0)
+            && row.subaccount_id.is_none()
+    ));
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+    let stored_proofs: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM canonical_v2_fill_provenance WHERE tx_hash=$1
+         AND status='signed_trace_verified' AND trace_call_hash IS NOT NULL",
+    )
+    .bind(tx_hash)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(stored_proofs, 2);
+    let signed_origin_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM canonical_v2_intent_proofs WHERE tx_hash=$1")
+            .bind(tx_hash)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(signed_origin_rows, 2);
     assert!(buyer_rows
         .iter()
         .all(|row| row.fee_native == "0" && row.role == "maker" && row.subaccount_id.is_none()));
@@ -355,6 +442,10 @@ async fn real_anvil_multifill_receipt_to_postgres_and_api() {
         .unwrap();
     let page: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(page["identity_scope"], "wallet");
+    assert_eq!(
+        page["fees"][0]["signed_origin_provenance"],
+        "signed_trace_verified"
+    );
     assert_eq!(page["fees"].as_array().unwrap().len(), 1);
     assert_eq!(page["fees"][0]["subaccount_id"], Value::Null);
     assert!(page["next_cursor"].is_object());
@@ -413,7 +504,14 @@ async fn real_anvil_reorg_fails_closed_without_erasing_committed_accounting() {
     );
     let tx_hash = fixture["receipt"]["transactionHash"].as_str().unwrap();
     let snapshot = fixture["fixture"]["preTradeSnapshot"].as_str().unwrap();
-    assert_eq!(rpc("evm_revert", json!([snapshot])).await, true);
+    // A retry after a test interruption may find the disposable fork already
+    // reverted. In either case the real receipt must now be absent.
+    if !rpc("eth_getTransactionReceipt", json!([tx_hash]))
+        .await
+        .is_null()
+    {
+        assert_eq!(rpc("evm_revert", json!([snapshot])).await, true);
+    }
     assert!(rpc("eth_getTransactionReceipt", json!([tx_hash]))
         .await
         .is_null());
@@ -441,5 +539,143 @@ async fn real_anvil_reorg_fails_closed_without_erasing_committed_accounting() {
         2,
         "persisted settled rows require operator reconciliation, not silent rollback"
     );
+    assert!(repo
+        .list_canonical_v2_perp_history(buyer, 10)
+        .await
+        .unwrap()
+        .iter()
+        .all(|row| row.signed_origin_provenance == "reorg_divergent"
+            && row.canonicality_status == "reconciliation_required"
+            && row.signed_subaccount_id.is_none()));
     println!("REAL_ANVIL_REORG_DETECTED tx={tx_hash} persisted_rows=2 manual_reconciliation_required=true");
+}
+
+#[tokio::test]
+#[ignore = "requires local Anvil, missing-trace proxy and a separate disposable PostgreSQL DB"]
+async fn trace_method_missing_keeps_wallet_fee_without_signed_proof() {
+    let url = "postgres://postgres@127.0.0.1:15439/deopt_anvil_untraced";
+    let fixture: Value =
+        serde_json::from_slice(&std::fs::read("/tmp/deopt_anvil_multifill_actual.json").unwrap())
+            .unwrap();
+    let tx_hash = fixture["receipt"]["transactionHash"].as_str().unwrap();
+    let latest = rpc("eth_getBlockByNumber", json!(["latest", false])).await;
+    let now = u64::from_str_radix(
+        latest["timestamp"]
+            .as_str()
+            .unwrap()
+            .trim_start_matches("0x"),
+        16,
+    )
+    .unwrap();
+    let repo = PgRepository::connect(url).await.unwrap();
+    repo.run_migrations().await.unwrap();
+    let executions = EXECUTIONS.map(str::to_owned);
+    assert!(
+        reconcile_confirmed_v2_intent_tx(&repo, TRACE_PROXY, &executions, tx_hash, now)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !reconcile_confirmed_v2_intent_tx(&repo, TRACE_PROXY, &executions, tx_hash, now)
+            .await
+            .unwrap()
+    );
+    let buyer = fixture["fixture"]["buyers"][0].as_str().unwrap();
+    let rows = repo
+        .list_canonical_v2_perp_history(buyer, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(
+        |row| row.signed_origin_provenance == "wallet_only_trace_unavailable"
+            && row.signed_subaccount_id.is_none()
+            && row.subaccount_id.is_none()
+    ));
+    let pool = sqlx::PgPool::connect(url).await.unwrap();
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM canonical_v2_intent_proofs WHERE tx_hash=$1")
+            .bind(tx_hash)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[tokio::test]
+#[ignore = "requires local Anvil, malformed-trace proxy and a separate disposable PostgreSQL DB"]
+async fn malformed_trace_rejects_entire_receipt_batch() {
+    let url = "postgres://postgres@127.0.0.1:15439/deopt_anvil_badtrace";
+    let fixture: Value =
+        serde_json::from_slice(&std::fs::read("/tmp/deopt_anvil_multifill_actual.json").unwrap())
+            .unwrap();
+    let tx_hash = fixture["receipt"]["transactionHash"].as_str().unwrap();
+    let latest = rpc("eth_getBlockByNumber", json!(["latest", false])).await;
+    let now = u64::from_str_radix(
+        latest["timestamp"]
+            .as_str()
+            .unwrap()
+            .trim_start_matches("0x"),
+        16,
+    )
+    .unwrap();
+    let repo = PgRepository::connect(url).await.unwrap();
+    repo.run_migrations().await.unwrap();
+    let executions = EXECUTIONS.map(str::to_owned);
+    assert!(
+        reconcile_confirmed_v2_intent_tx(&repo, TRACE_PROXY, &executions, tx_hash, now)
+            .await
+            .is_err()
+    );
+    let buyer = fixture["fixture"]["buyers"][0].as_str().unwrap();
+    assert!(repo
+        .list_canonical_v2_perp_history(buyer, 10)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+#[ignore = "requires local Anvil real receipt and a separate disposable PostgreSQL DB"]
+async fn conflicting_persisted_origin_requires_reconciliation() {
+    let url = "postgres://postgres@127.0.0.1:15439/deopt_anvil_conflict";
+    let fixture: Value =
+        serde_json::from_slice(&std::fs::read("/tmp/deopt_anvil_multifill_actual.json").unwrap())
+            .unwrap();
+    let tx_hash = fixture["receipt"]["transactionHash"].as_str().unwrap();
+    let latest = rpc("eth_getBlockByNumber", json!(["latest", false])).await;
+    let now = u64::from_str_radix(
+        latest["timestamp"]
+            .as_str()
+            .unwrap()
+            .trim_start_matches("0x"),
+        16,
+    )
+    .unwrap();
+    let repo = PgRepository::connect(url).await.unwrap();
+    repo.run_migrations().await.unwrap();
+    let executions = EXECUTIONS.map(str::to_owned);
+    assert!(
+        reconcile_confirmed_v2_intent_tx(&repo, RPC, &executions, tx_hash, now)
+            .await
+            .unwrap()
+    );
+    let pool = sqlx::PgPool::connect(url).await.unwrap();
+    sqlx::query("UPDATE canonical_v2_fill_provenance SET buyer_intent_hash=$1 WHERE tx_hash=$2 AND trade_log_index=(SELECT min(trade_log_index) FROM canonical_v2_fill_provenance WHERE tx_hash=$2)")
+        .bind(format!("0x{}", "ff".repeat(32))).bind(tx_hash).execute(&pool).await.unwrap();
+    assert!(
+        reconcile_confirmed_v2_intent_tx(&repo, RPC, &executions, tx_hash, now)
+            .await
+            .is_err()
+    );
+    let buyer = fixture["fixture"]["buyers"][0].as_str().unwrap();
+    let rows = repo
+        .list_canonical_v2_perp_history(buyer, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows
+        .iter()
+        .all(|row| row.signed_origin_provenance == "evidence_conflict"
+            && row.canonicality_status == "reconciliation_required"
+            && row.signed_subaccount_id.is_none()));
 }

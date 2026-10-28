@@ -74,6 +74,96 @@ pub struct VerifiedWalletIntentFill {
     pub event_data: String,
 }
 
+/// Authenticate a narrow wrapper pattern: the canonical outer transaction
+/// makes one successful direct D6 intent call per D6 intent event. EVM call
+/// and log order, plus D6's exactly-one-event-per-call implementation, bind
+/// each nested signed payload to its event. Other trace shapes fail closed.
+/// The digest is of calldata; raw signatures are never returned for storage.
+pub fn prove_traced_wrapper_intent_fills(
+    transaction: &Value,
+    receipt: &Value,
+    trace: &Value,
+    events: &[EthLog],
+    block_timestamp: u64,
+) -> Result<Vec<(VerifiedIntentFill, String)>> {
+    if events.is_empty() || events.len() > 64
+        || required(trace, "type")? != "CALL"
+        || trace.get("error").is_some()
+        || !required(trace, "from")?.eq_ignore_ascii_case(required(transaction, "from")?)
+        || !required(trace, "to")?.eq_ignore_ascii_case(required(transaction, "to")?)
+        || !required(trace, "input")?.eq_ignore_ascii_case(required(transaction, "input")?)
+        || parse_hex_quantity(required(trace, "value")?)? != 0
+        || parse_hex_quantity(required(transaction, "value")?)? != 0
+        || !required(transaction, "hash")?.eq_ignore_ascii_case(required(receipt, "transactionHash")?)
+        || !required(transaction, "blockHash")?.eq_ignore_ascii_case(required(receipt, "blockHash")?)
+    {
+        return Err(invalid("wrapper trace does not match canonical transaction"));
+    }
+    let calls = trace.get("calls").and_then(Value::as_array)
+        .ok_or_else(|| invalid("wrapper trace calls absent"))?;
+    if calls.len() != events.len() {
+        return Err(invalid("wrapper trace call and event counts differ"));
+    }
+    let topic0 = digest_hex(keccak256(INTENT_EVENT_SIGNATURE.as_bytes()));
+    let mut proven = Vec::with_capacity(events.len());
+    let mut prior_log_index = None;
+    for (call, event) in calls.iter().zip(events) {
+        let index = parse_hex_quantity(event.log_index.as_deref().ok_or_else(|| invalid("event log index absent"))?)?;
+        if prior_log_index.is_some_and(|previous| index <= previous)
+            || required(call, "type")? != "CALL"
+            || call.get("error").is_some()
+            || !required(call, "from")?.eq_ignore_ascii_case(required(trace, "to")?)
+            || !required(call, "to")?.eq_ignore_ascii_case(D6_MATCHER)
+            || parse_hex_quantity(required(call, "value")?)? != 0
+            || !event.address.eq_ignore_ascii_case(D6_MATCHER)
+            || !event.topics.first().is_some_and(|topic| topic.eq_ignore_ascii_case(&topic0))
+        {
+            return Err(invalid("nested D6 call or event identity mismatch"));
+        }
+        let nested = call.get("calls").and_then(Value::as_array)
+            .ok_or_else(|| invalid("nested D4 call absent"))?;
+        if nested.iter().filter(|child| {
+            child.get("type").and_then(Value::as_str) == Some("CALL")
+                && child.get("to").and_then(Value::as_str)
+                    .is_some_and(|to| to.eq_ignore_ascii_case(D4_ENGINE))
+                && child.get("error").is_none()
+        }).count() != 1 {
+            return Err(invalid("nested D4 trade call absent or ambiguous"));
+        }
+        let input = required(call, "input")?;
+        let input_bytes = hex::decode(input.strip_prefix("0x").ok_or_else(|| invalid("nested calldata hex"))?)
+            .map_err(|_| invalid("nested calldata hex"))?;
+        let mut inner_tx = transaction.clone();
+        inner_tx["to"] = Value::String(D6_MATCHER.into());
+        inner_tx["input"] = Value::String(input.into());
+        let mut single_event_receipt = receipt.clone();
+        single_event_receipt["logs"] = Value::Array(receipt.get("logs").and_then(Value::as_array)
+            .ok_or_else(|| invalid("receipt logs absent"))?.iter().filter(|log| {
+                !log.get("address").and_then(Value::as_str)
+                    .is_some_and(|address| address.eq_ignore_ascii_case(D6_MATCHER))
+                || !log.get("topics").and_then(Value::as_array)
+                    .and_then(|topics| topics.first()).and_then(Value::as_str)
+                    .is_some_and(|topic| topic.eq_ignore_ascii_case(&topic0))
+                || log.get("logIndex").and_then(Value::as_str)
+                    == event.log_index.as_deref()
+            }).cloned().collect());
+        let signed = prove_direct_intent_fill(&inner_tx, &single_event_receipt, event, block_timestamp)?;
+        let wallet = prove_wallet_intent_fill(transaction, receipt, event, block_timestamp)?;
+        if signed.trade.buyer != wallet.trade.buyer
+            || signed.trade.seller != wallet.trade.seller
+            || signed.trade.market_id != wallet.trade.market_id
+            || signed.trade.size_delta_1e8 != wallet.trade.size_delta_1e8
+            || signed.trade.execution_price_1e8 != wallet.trade.execution_price_1e8
+            || signed.trade.buyer_is_maker != wallet.trade.buyer_is_maker
+        {
+            return Err(invalid("signed trace disagrees with D4 wallet settlement"));
+        }
+        proven.push((signed, digest_hex(keccak256(&input_bytes))));
+        prior_log_index = Some(index);
+    }
+    Ok(proven)
+}
+
 const ENGINE_TRADE_EVENT: &str = "TradeExecuted(address,address,uint256,uint128,uint128,bool)";
 
 /// One D6 invocation emits D4's `TradeExecuted` after fee consumption and

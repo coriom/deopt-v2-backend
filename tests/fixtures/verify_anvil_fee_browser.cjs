@@ -31,16 +31,20 @@ async function main() {
   }, {account: buyer});
   const base = 'http://127.0.0.1:3001';
   try {
-    await page.goto(`${base}/perps`);
+    await page.goto(`${base}/perps`, {waitUntil:'domcontentloaded'});
+    await page.locator('[data-testid="wallet-connect-button"][data-wallet-state="disconnected"]').waitFor();
     await page.getByTestId('wallet-connect-button').click();
+    await page.locator('[data-testid="wallet-connect-button"][data-wallet-state="connected"]').waitFor();
     await page.getByTestId('widget-perps-book-feed-tab-fees').click();
     await page.getByTestId('perps-fee-row').first().waitFor();
     if (await page.getByTestId('perps-fee-row').count() !== 2) throw new Error('buyer must have exactly two real receipt rows');
     const buyerText = await page.getByTestId('perps-fees-history').innerText();
     if (!buyerText.includes('0.000000 mUSDC') || !buyerText.includes('Subaccount settlement attribution is unverified')) throw new Error('buyer fee display mismatch');
-    await page.reload();
+    await page.reload({waitUntil:'domcontentloaded'});
     await page.getByTestId('perps-fees-disconnected').waitFor();
+    await page.locator('[data-testid="wallet-connect-button"][data-wallet-state="disconnected"]').waitFor();
     await page.getByTestId('wallet-connect-button').click();
+    await page.locator('[data-testid="wallet-connect-button"][data-wallet-state="connected"]').waitFor();
     await page.getByTestId('perps-fee-row').first().waitFor();
     if (await page.getByTestId('perps-fee-row').count() !== 2) throw new Error('reload lost genuine rows');
     // The browser can only request wallet-scoped public chain records.
@@ -55,8 +59,10 @@ async function main() {
         },configurable:true});
       }, {address:seller});
       sellerPage.on('pageerror', error => errors.push(error.message));
-      await sellerPage.goto(`${base}/perps`);
+      await sellerPage.goto(`${base}/perps`, {waitUntil:'domcontentloaded'});
+      await sellerPage.locator('[data-testid="wallet-connect-button"][data-wallet-state="disconnected"]').waitFor();
       await sellerPage.getByTestId('wallet-connect-button').click();
+      await sellerPage.locator('[data-testid="wallet-connect-button"][data-wallet-state="connected"]').waitFor();
       await sellerPage.getByTestId('widget-perps-book-feed-tab-fees').click();
       await sellerPage.getByTestId('perps-fee-row').first().waitFor();
       if (await sellerPage.getByTestId('perps-fee-row').count() !== 1) throw new Error('seller wallet row count mismatch');
@@ -67,6 +73,9 @@ async function main() {
     if (errors.length) throw new Error(`frontend client exceptions: ${JSON.stringify(errors)}`);
     if (!feeRequests.length || feeRequests.some(item => item.status !== 200 || !item.url.startsWith('http://127.0.0.1:4010/'))) throw new Error(`fee requests did not reach local backend: ${JSON.stringify(feeRequests)}`);
     process.stdout.write(`CONNECTED_BROWSER_PASS buyer_rows=2 seller_rows=1+1 backend_requests=${feeRequests.length} client_exceptions=0\n`);
+  } catch (error) {
+    process.stderr.write(`BROWSER_DIAGNOSTIC ${JSON.stringify({url:page.url(), fees:feeRequests, errors, body:(await page.locator('body').innerText().catch(()=>'' )).slice(0,1000)})}\n`);
+    throw error;
   } finally {
     await browser.close();
   }

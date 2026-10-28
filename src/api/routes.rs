@@ -2746,6 +2746,7 @@ async fn perps_canonical_fees(
         .await?;
     let has_more = fees.len() > limit as usize;
     fees.truncate(limit as usize);
+    let has_divergent = fees.iter().any(|fee| fee.canonicality_status == "reconciliation_required");
     let next_cursor = if has_more {
         fees.last().map(|row| CanonicalFeeCursor {
             before_block: row.block_number,
@@ -2756,7 +2757,7 @@ async fn perps_canonical_fees(
         chain_id: 84532,
         identity_scope: "wallet",
         subaccount_attribution: "unresolved",
-        current_chain_canonicality: "requires_fresh_chain_recheck",
+        current_chain_canonicality: if has_divergent { "reconciliation_required" } else { "requires_fresh_chain_recheck" },
         fees,
         next_cursor,
         trading_enabled: false,
