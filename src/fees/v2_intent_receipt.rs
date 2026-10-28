@@ -1,4 +1,4 @@
-//! Proof for a direct D6 `executeTradeFromIntents` transaction.
+//! Proof for direct or wrapped D6 `executeTradeFromIntents` receipts.
 //!
 //! The D6 event contains intent digests, not wallets or subaccounts. Those
 //! identities are recovered from the transaction input only after both EIP-712
@@ -10,7 +10,7 @@ use crate::execution::perp_order_intent::{
     perp_order_intent_digest, validate_shape, verify_perp_order_intent, PerpOrderIntent,
 };
 use crate::execution::perp_trade::{PerpTradeDomain, PerpsProtocolVersion};
-use crate::fees::v2_perp_settlement::D6_MATCHER;
+use crate::fees::v2_perp_settlement::{D4_ENGINE, D6_MATCHER};
 use crate::indexer::decoder::parse_hex_quantity;
 use crate::indexer::{EthLog, IndexedPerpTrade};
 use crate::signing::eip712::keccak256;
@@ -64,6 +64,137 @@ pub struct VerifiedIntentFill {
     pub seller_signed_subaccount_id: u32,
 }
 
+/// Wallet identity proved by the D4 trade event emitted by the D6 call.
+/// No signed subaccount or nonce is inferred from a wrapper transaction.
+#[derive(Clone, Debug)]
+pub struct VerifiedWalletIntentFill {
+    pub trade: IndexedPerpTrade,
+    pub buyer_intent_hash: String,
+    pub seller_intent_hash: String,
+    pub event_data: String,
+}
+
+const ENGINE_TRADE_EVENT: &str = "TradeExecuted(address,address,uint256,uint128,uint128,bool)";
+
+/// One D6 invocation emits D4's `TradeExecuted` after fee consumption and
+/// then D6's `TradeExecutedFromIntents` after `applyTrade` returns. D4's
+/// post-trade risk calls are static, so the two logs must be adjacent. This
+/// verifies a wallet-level fill in a wrapper with multiple D6 calls without
+/// claiming access to the nested signed calldata or local subaccount.
+pub fn prove_wallet_intent_fill(
+    transaction: &Value,
+    receipt: &Value,
+    event: &EthLog,
+    block_timestamp: u64,
+) -> Result<VerifiedWalletIntentFill> {
+    if parse_hex_quantity(required(transaction, "chainId")?)? != 84532
+        || !required(transaction, "hash")?.eq_ignore_ascii_case(required(receipt, "transactionHash")?)
+        || !required(transaction, "blockHash")?.eq_ignore_ascii_case(required(receipt, "blockHash")?)
+        || parse_hex_quantity(required(transaction, "blockNumber")?)?
+            != parse_hex_quantity(required(receipt, "blockNumber")?)?
+        || parse_hex_quantity(required(receipt, "status")?)? != 1
+        || !event.address.eq_ignore_ascii_case(D6_MATCHER)
+        || !event.transaction_hash.as_deref().is_some_and(|value| value.eq_ignore_ascii_case(required(transaction, "hash").unwrap_or("")))
+        || !event.block_hash.as_deref().is_some_and(|value| value.eq_ignore_ascii_case(required(receipt, "blockHash").unwrap_or("")))
+        || parse_hex_quantity(event.block_number.as_deref().ok_or_else(|| invalid("event blockNumber"))?)?
+            != parse_hex_quantity(required(receipt, "blockNumber")?)?
+    {
+        return Err(invalid("wrapper receipt or chain identity mismatch"));
+    }
+    let topic0 = digest_hex(keccak256(INTENT_EVENT_SIGNATURE.as_bytes()));
+    if event.topics.len() != 3 || !event.topics[0].eq_ignore_ascii_case(&topic0)
+        || event.topics[1].len() != 66 || event.topics[2].len() != 66
+        || event.topics[1] == event.topics[2]
+    {
+        return Err(invalid("invalid intent event topics"));
+    }
+    let event_data = hex::decode(event.data.strip_prefix("0x").ok_or_else(|| invalid("intent event data"))?)
+        .map_err(|_| invalid("intent event data"))?;
+    if event_data.len() != 128 || word(&event_data, 3)? != U256::from(block_timestamp) {
+        return Err(invalid("intent event data or timestamp mismatch"));
+    }
+    let event_index = parse_hex_quantity(event.log_index.as_deref().ok_or_else(|| invalid("event logIndex"))?)?;
+    let logs = receipt.get("logs").and_then(Value::as_array).ok_or_else(|| invalid("receipt logs"))?;
+    let mut indexed = Vec::with_capacity(logs.len());
+    for log in logs {
+        let index = parse_hex_quantity(required(log, "logIndex")?)?;
+        if log.get("removed").and_then(Value::as_bool) == Some(true)
+            || !required(log, "transactionHash")?.eq_ignore_ascii_case(required(transaction, "hash")?)
+            || !required(log, "blockHash")?.eq_ignore_ascii_case(required(receipt, "blockHash")?)
+            || parse_hex_quantity(required(log, "blockNumber")?)?
+                != parse_hex_quantity(required(receipt, "blockNumber")?)?
+            || indexed.last().is_some_and(|(last, _)| index <= *last)
+        {
+            return Err(invalid("receipt log provenance or order mismatch"));
+        }
+        indexed.push((index, log));
+    }
+    let matches: Vec<_> = indexed.iter().enumerate().filter(|(_, (index, log))| {
+        *index == event_index && log.get("address").and_then(Value::as_str)
+            .is_some_and(|v| v.eq_ignore_ascii_case(D6_MATCHER))
+            && log.get("topics").and_then(Value::as_array).is_some_and(|topics| {
+                topics.len() == 3 && topics.iter().zip(&event.topics).all(|(a,b)|
+                    a.as_str().is_some_and(|v| v.eq_ignore_ascii_case(b)))
+            }) && log.get("data").and_then(Value::as_str)
+                .is_some_and(|v| v.eq_ignore_ascii_case(&event.data))
+    }).collect();
+    if matches.len() != 1 || matches[0].0 == 0 {
+        return Err(invalid("missing or ambiguous D6 intent event"));
+    }
+    let (_, engine) = indexed[matches[0].0 - 1];
+    if !required(engine, "address")?.eq_ignore_ascii_case(D4_ENGINE)
+        || engine.get("topics").and_then(Value::as_array).map_or(true, |v| v.len() != 4)
+        || !engine["topics"][0].as_str().is_some_and(|v| v.eq_ignore_ascii_case(&digest_hex(keccak256(ENGINE_TRADE_EVENT.as_bytes()))))
+    {
+        return Err(invalid("adjacent D4 trade event absent"));
+    }
+    let topics = engine["topics"].as_array().ok_or_else(|| invalid("D4 topics"))?;
+    let address = |topic: &Value| -> Result<String> {
+        let bytes = hex::decode(topic.as_str().ok_or_else(|| invalid("D4 address topic"))?.strip_prefix("0x").ok_or_else(|| invalid("D4 address topic"))?)
+            .map_err(|_| invalid("D4 address topic"))?;
+        if bytes.len() != 32 || bytes[..12].iter().any(|b| *b != 0) { return Err(invalid("D4 address topic")); }
+        Ok(format!("0x{}", hex::encode(&bytes[12..])))
+    };
+    let buyer = address(&topics[1])?;
+    let seller = address(&topics[2])?;
+    if buyer == seller || buyer == "0x0000000000000000000000000000000000000000" || seller == "0x0000000000000000000000000000000000000000" {
+        return Err(invalid("invalid D4 trade parties"));
+    }
+    let engine_market = hex::decode(topics[3].as_str().ok_or_else(|| invalid("D4 market topic"))?.strip_prefix("0x").ok_or_else(|| invalid("D4 market topic"))?)
+        .map_err(|_| invalid("D4 market topic"))?;
+    if engine_market.len() != 32 || U256::from_be_slice(&engine_market) != word(&event_data, 0)? {
+        return Err(invalid("D4/D6 market mismatch"));
+    }
+    let engine_data = hex::decode(required(engine, "data")?.strip_prefix("0x").ok_or_else(|| invalid("D4 data"))?)
+        .map_err(|_| invalid("D4 data"))?;
+    if engine_data.len() != 96 || word(&engine_data, 0)? != word(&event_data, 1)?
+        || word(&engine_data, 1)? != word(&event_data, 2)?
+        || word(&engine_data, 2)? > U256::from(1)
+        || word(&event_data, 1)? == U256::ZERO || word(&event_data, 2)? == U256::ZERO {
+        return Err(invalid("D4/D6 fill mismatch"));
+    }
+    let tx_hash = required(transaction, "hash")?.to_ascii_lowercase();
+    Ok(VerifiedWalletIntentFill {
+        trade: IndexedPerpTrade {
+            event_id: format!("{tx_hash}:{event_index}"), tx_hash,
+            log_index: event_index,
+            block_number: parse_hex_quantity(required(receipt, "blockNumber")?)?,
+            block_hash: Some(required(receipt, "blockHash")?.to_ascii_lowercase()),
+            onchain_intent_id: None, buyer, seller,
+            market_id: word(&event_data, 0)?.to_string(),
+            size_delta_1e8: word(&event_data, 1)?.to_string(),
+            execution_price_1e8: word(&event_data, 2)?.to_string(),
+            buyer_is_maker: word(&engine_data, 2)? == U256::from(1),
+            buyer_nonce: String::new(), seller_nonce: String::new(),
+            created_at_ms: now_ms(), protocol_version: PerpsProtocolVersion::V2,
+            emitter_address: D6_MATCHER.into(),
+        },
+        buyer_intent_hash: event.topics[1].to_ascii_lowercase(),
+        seller_intent_hash: event.topics[2].to_ascii_lowercase(),
+        event_data: event.data.to_ascii_lowercase(),
+    })
+}
+
 fn invalid(reason: &str) -> BackendError {
     BackendError::Indexer(format!("D6 signed-intent receipt: {reason}"))
 }
@@ -108,9 +239,9 @@ fn digest_hex(digest: [u8; 32]) -> String {
     format!("0x{}", hex::encode(digest))
 }
 
-/// Verify a *direct* D6 call and one exact event. A wrapper or a receipt with
-/// multiple intent events requires independently authenticated call traces;
-/// no event is attributed by order or by matching a convenient first log.
+/// Verify a *direct* D6 call and one exact event, including both signatures.
+/// Wrapped calls use `prove_wallet_intent_fill` for wallet-only settlement;
+/// nested signatures and local subaccount origin remain unverified.
 pub fn prove_direct_intent_fill(
     transaction: &Value,
     receipt: &Value,
@@ -435,6 +566,122 @@ mod tests {
         (tx, receipt, event)
     }
 
+    fn engine_log(tx: &Value, buyer: &str, seller: &str, index: u64) -> Value {
+        let address_topic = |value: &str| format!("0x{}{}", "00".repeat(12), &value[2..]);
+        let mut data = Vec::new();
+        for value in [50_000_000u128, 300_000_000_000, 1] {
+            data.extend_from_slice(&U256::from(value).to_be_bytes::<32>());
+        }
+        json!({"address":D4_ENGINE,
+            "topics":[digest_hex(keccak256(ENGINE_TRADE_EVENT.as_bytes())),
+                address_topic(buyer), address_topic(seller), format!("0x{:064x}",1)],
+            "data":format!("0x{}",hex::encode(data)),
+            "logIndex":format!("0x{index:x}"),
+            "transactionHash":tx["hash"],"blockHash":tx["blockHash"],
+            "blockNumber":tx["blockNumber"]})
+    }
+
+    fn charge_log(tx: &Value, taker: &str, index: u64) -> Value {
+        use crate::fees::d2_onchain::{D2_ADDRESS, TIMELOCK_ADDRESS};
+        let address_topic = |value: &str| format!("0x{}{}", "00".repeat(12), &value[2..]);
+        let mut data = Vec::new();
+        data.extend_from_slice(&hex::decode(address_topic(crate::fees::v2_perp_settlement::MUSDC).trim_start_matches("0x")).unwrap());
+        for value in [1u128, 0, 0, 200, 1_500_000_000, 300_000] {
+            data.extend_from_slice(&U256::from(value).to_be_bytes::<32>());
+        }
+        json!({"address":D2_ADDRESS,"topics":[
+            digest_hex(keccak256("FeeChargedV2(address,address,address,address,uint8,uint8,bool,int32,uint256,uint256)".as_bytes())),
+            address_topic(D4_ENGINE), address_topic(taker), address_topic(TIMELOCK_ADDRESS)],
+            "data":format!("0x{}",hex::encode(data)),"logIndex":format!("0x{index:x}"),
+            "transactionHash":tx["hash"],"blockHash":tx["blockHash"],"blockNumber":tx["blockNumber"]})
+    }
+
+    fn fee_policy() -> crate::fees::d2_onchain::VerifiedD2FeePolicy {
+        use crate::fees::d2_onchain::{D2Snapshot, VerifiedD2FeePolicy, D2_ADDRESS, TIMELOCK_ADDRESS};
+        VerifiedD2FeePolicy::synthetic_for_tests(D2Snapshot {
+            chain_id: 84532, block_number: 200,
+            block_hash: format!("0x{}", "dd".repeat(32)), block_timestamp: 1000,
+            contract: D2_ADDRESS.into(), owner: TIMELOCK_ADDRESS.into(),
+            recipient: TIMELOCK_ADDRESS.into(),
+            rebate_funding_account: "0x0000000000000000000000000000000000000000".into(),
+            protocol_fee_vault: "0x0000000000000000000000000000000000000000".into(),
+            profiles: [(0, 200); 5], rfq_discounts: [(0, 0); 5],
+        })
+    }
+
+    #[test]
+    fn wrapper_multifill_wallet_identity_is_proved_without_subaccount_guess() {
+        let (mut tx, mut receipt, event) = fixture();
+        let direct = prove_direct_intent_fill(&tx, &receipt, &event, 1000).unwrap();
+        tx["to"] = json!("0x3333333333333333333333333333333333333333");
+        tx["input"] = json!("0x12345678");
+        let engine = engine_log(&tx, &direct.trade.buyer, &direct.trade.seller, 1);
+        receipt["logs"].as_array_mut().unwrap().insert(0, engine);
+        let proved = prove_wallet_intent_fill(&tx, &receipt, &event, 1000).unwrap();
+        assert_eq!(proved.trade.buyer, direct.trade.buyer);
+        assert_eq!(proved.trade.seller, direct.trade.seller);
+        assert!(proved.trade.buyer_nonce.is_empty());
+        assert_eq!(proved.trade.log_index, 2);
+
+        let mut second = event.clone();
+        second.log_index = Some("0x5".into());
+        second.topics[1] = digest_hex([3u8; 32]);
+        second.topics[2] = digest_hex([4u8; 32]);
+        let second_engine = engine_log(&tx, &direct.trade.seller, &direct.trade.buyer, 4);
+        receipt["logs"].as_array_mut().unwrap().extend([second_engine, serde_json::to_value(&second).unwrap()]);
+        let second_proof = prove_wallet_intent_fill(&tx, &receipt, &second, 1000).unwrap();
+        assert_eq!(second_proof.trade.buyer, direct.trade.seller);
+        assert_eq!(second_proof.trade.log_index, 5);
+        assert_ne!(proved.trade.event_id, second_proof.trade.event_id);
+
+        let mut wrong = receipt.clone();
+        wrong["logs"][2]["topics"][3] = json!(format!("0x{:064x}", 2));
+        assert!(prove_wallet_intent_fill(&tx, &wrong, &second, 1000).is_err());
+        let mut wrong = receipt.clone();
+        wrong["logs"][2]["logIndex"] = json!("0x2");
+        assert!(prove_wallet_intent_fill(&tx, &wrong, &second, 1000).is_err());
+        let mut wrong = receipt.clone();
+        wrong["logs"].as_array_mut().unwrap().swap(2,3);
+        assert!(prove_wallet_intent_fill(&tx, &wrong, &second, 1000).is_err());
+        let mut wrong = tx.clone();
+        wrong["chainId"] = json!("0x1");
+        assert!(prove_wallet_intent_fill(&wrong, &receipt, &event, 1000).is_err());
+    }
+
+    #[test]
+    fn wrapper_two_fills_bind_distinct_d2_charges_and_tiers() {
+        let (mut tx, mut receipt, first) = fixture();
+        let signed = prove_direct_intent_fill(&tx, &receipt, &first, 1000).unwrap();
+        tx["to"] = json!("0x3333333333333333333333333333333333333333");
+        tx["input"] = json!("0x12345678");
+        let mut second = first.clone();
+        second.log_index = Some("0x5".into());
+        second.topics[1] = digest_hex([3u8;32]);
+        second.topics[2] = digest_hex([4u8;32]);
+        receipt["logs"] = json!([
+            charge_log(&tx, &signed.trade.seller, 0),
+            engine_log(&tx, &signed.trade.buyer, &signed.trade.seller, 1),
+            first,
+            charge_log(&tx, &signed.trade.buyer, 3),
+            engine_log(&tx, &signed.trade.seller, &signed.trade.buyer, 4),
+            second,
+        ]);
+        let first_event: EthLog = serde_json::from_value(receipt["logs"][2].clone()).unwrap();
+        let second_event: EthLog = serde_json::from_value(receipt["logs"][5].clone()).unwrap();
+        let a = prove_wallet_intent_fill(&tx, &receipt, &first_event, 1000).unwrap();
+        let b = prove_wallet_intent_fill(&tx, &receipt, &second_event, 1000).unwrap();
+        for tier in 0..5 {
+            let fee_a = crate::fees::v2_perp_settlement::validate_wallet_intent_receipt(&a,&receipt,&fee_policy(),tier,tier,1010).unwrap();
+            let fee_b = crate::fees::v2_perp_settlement::validate_wallet_intent_receipt(&b,&receipt,&fee_policy(),tier,tier,1010).unwrap();
+            assert_eq!((fee_a.fee_log_index,fee_b.fee_log_index),(Some(0),Some(3)));
+            assert_eq!((fee_a.amount_native,fee_b.amount_native),(300_000,300_000));
+            assert_ne!(fee_a.payer,fee_b.payer);
+        }
+        let mut tampered=receipt.clone();
+        tampered["logs"][3]["data"] = json!("0x00");
+        assert!(crate::fees::v2_perp_settlement::validate_wallet_intent_receipt(&b,&tampered,&fee_policy(),0,0,1010).is_err());
+    }
+
     #[test]
     fn frozen_d6_abi_selector_and_event_topic_match() {
         // Selector independently derived from the frozen Solidity ABI.
@@ -616,5 +863,68 @@ mod tests {
             .persist_canonical_v2_intent_fee(&reorg, &reorg_fee)
             .await
             .is_err());
+
+        // One transaction can contain several fills. Failure of the second
+        // insert must roll back the first, including its indexed trade row.
+        let mut partial = proof.trade.clone();
+        partial.log_index = 6;
+        partial.event_id = format!("{}:6", partial.tx_hash);
+        let mut partial_fee = fee.clone();
+        partial_fee.trade_log_index = 6;
+        partial_fee.fee_log_index = Some(5);
+        let mut other = proof.trade.clone();
+        other.log_index = 9;
+        other.event_id = format!("{}:9", other.tx_hash);
+        let mut invalid_fee = fee.clone();
+        invalid_fee.trade_log_index = 9;
+        invalid_fee.fee_log_index = Some(8);
+        invalid_fee.payer = proof.trade.buyer.clone();
+        assert!(repository.persist_canonical_v2_intent_batch(&[
+            (partial.clone(), partial_fee.clone(), None),
+            (other, invalid_fee, None),
+        ]).await.is_err());
+        let after_rollback: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM canonical_v2_perp_fees WHERE tx_hash=$1"
+        ).bind(&fee.tx_hash).fetch_one(repository.pool()).await.unwrap();
+        assert_eq!(after_rollback, 1);
+        assert!(repository.persist_canonical_v2_intent_batch(&[
+            (proof.trade.clone(), fee.clone(), Some(proof.clone())),
+            (partial.clone(), partial_fee.clone(), None),
+        ]).await.unwrap());
+        assert!(!repository.persist_canonical_v2_intent_batch(&[
+            (proof.trade.clone(), fee.clone(), Some(proof.clone())),
+            (partial, partial_fee, None),
+        ]).await.unwrap());
+        let newest = repository.list_canonical_v2_perp_history_page(&proof.trade.seller, 1, None)
+            .await.unwrap();
+        assert_eq!(newest.len(), 1);
+        assert_eq!(newest[0].trade_log_index, 6);
+        let older = repository.list_canonical_v2_perp_history_page(&proof.trade.seller, 1,
+            Some((newest[0].block_number, newest[0].trade_log_index))).await.unwrap();
+        assert_eq!(older.len(), 1);
+        assert_eq!(older[0].trade_log_index, proof.trade.log_index);
+
+        // Exercise the actual HTTP route over the persisted wallet ledger.
+        use tower::ServiceExt;
+        let mut state = crate::api::AppState::new(
+            crate::engine::EngineState::with_default_markets());
+        state.chain_id = 84532;
+        state.repository = Some(repository.clone());
+        let route = format!(
+            "/accounts/{}/perps/canonical-fees?limit=1",
+            proof.trade.seller,
+        );
+        let response = crate::api::router(state).oneshot(
+            axum::http::Request::builder().uri(route).body(axum::body::Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let page: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(page["identity_scope"], "wallet");
+        assert_eq!(page["subaccount_attribution"], "unresolved");
+        assert_eq!(page["trading_enabled"], false);
+        assert_eq!(page["fees"][0]["trade_log_index"], 6);
+        assert_eq!(page["fees"][0]["subaccount_id"], serde_json::Value::Null);
+        assert_eq!(page["next_cursor"]["before_log_index"], 6);
     }
 }

@@ -142,9 +142,10 @@ pub async fn reconcile_confirmed_v2_trade(
     repository.persist_canonical_v2_perp_fee(trade, &fee).await
 }
 
-/// Read-only RPC reconciliation for a direct D6 intent transaction. This is
-/// deliberately separate from legacy `TradeExecuted` confirmation: an event
-/// hash alone does not reveal the wallets, signatures or signed subaccount IDs.
+/// Read-only RPC reconciliation for a direct or wrapped D6 intent transaction.
+/// A direct call proves signatures and signed order origin; a wrapper proves
+/// wallet settlement from the adjacent D4/D6 logs only. Neither supplies a
+/// canonical economic subaccount.
 pub async fn reconcile_confirmed_v2_intent_tx(
     repository: &PgRepository,
     rpc_url: &str,
@@ -176,24 +177,61 @@ pub async fn reconcile_confirmed_v2_intent_tx(
             && log.get("topics").and_then(Value::as_array).and_then(|v| v.first()).and_then(Value::as_str)
                 .is_some_and(|v| v.eq_ignore_ascii_case(&intent_topic))
     }).collect();
-    if candidates.len() != 1 {
-        return Err(fee_error("direct intent transaction must emit exactly one D6 intent fill".into()));
+    if candidates.is_empty() || candidates.len() > 64 {
+        return Err(fee_error("intent receipt fill count missing or exceeds bound".into()));
     }
-    let event: EthLog = serde_json::from_value(candidates[0].clone())
-        .map_err(|_| fee_error("malformed intent event".into()))?;
-    let proof = crate::fees::v2_intent_receipt::prove_direct_intent_fill(&tx, &receipt, &event, timestamp)?;
-    verify_market_and_decimals_at_trade(rpc_url, &proof.trade).await?;
-    let (maker, taker) = roles(&proof.trade)?;
-    let maker_tier = read_account_tier_at_block(rpc_url, block_number, block_hash, maker).await.map_err(fee_error)?;
-    let taker_tier = read_account_tier_at_block(rpc_url, block_number, block_hash, taker).await.map_err(fee_error)?;
-    let fee = validate_intent_receipt(&proof, &receipt, &policy, maker_tier, taker_tier, now_seconds)?;
+    let direct = tx.get("to").and_then(Value::as_str)
+        .is_some_and(|to| to.eq_ignore_ascii_case(D6_MATCHER));
+    if direct && candidates.len() != 1 {
+        return Err(fee_error("direct D6 call emitted multiple intent fills".into()));
+    }
+    // A direct call proves both signatures and signed order-origin labels.
+    // A wrapper has no authenticated nested calldata on a receipt-only RPC;
+    // use only the D4/D6 event pair for wallet-level accounting.
+    let mut verified = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        let event: EthLog = serde_json::from_value(candidate.clone())
+            .map_err(|_| fee_error("malformed intent event".into()))?;
+        let (trade, fee, signed) = if direct {
+            let proof = crate::fees::v2_intent_receipt::prove_direct_intent_fill(&tx, &receipt, &event, timestamp)?;
+            let (maker, taker) = roles(&proof.trade)?;
+            let maker_tier = read_account_tier_at_block(rpc_url, block_number, block_hash, maker).await.map_err(fee_error)?;
+            let taker_tier = read_account_tier_at_block(rpc_url, block_number, block_hash, taker).await.map_err(fee_error)?;
+            let fee = validate_intent_receipt(&proof, &receipt, &policy, maker_tier, taker_tier, now_seconds)?;
+            (proof.trade.clone(), fee, Some(proof))
+        } else {
+            let proof = crate::fees::v2_intent_receipt::prove_wallet_intent_fill(&tx, &receipt, &event, timestamp)?;
+            verify_d4_matcher_at_block(rpc_url, block_hash).await?;
+            let (maker, taker) = roles(&proof.trade)?;
+            let maker_tier = read_account_tier_at_block(rpc_url, block_number, block_hash, maker).await.map_err(fee_error)?;
+            let taker_tier = read_account_tier_at_block(rpc_url, block_number, block_hash, taker).await.map_err(fee_error)?;
+            let fee = validate_wallet_intent_receipt(&proof, &receipt, &policy, maker_tier, taker_tier, now_seconds)?;
+            (proof.trade, fee, None)
+        };
+        verify_market_and_decimals_at_trade(rpc_url, &trade).await?;
+        verified.push((trade, fee, signed));
+    }
     let canonical_again = rpc(rpc_url, "eth_getBlockByNumber",
         json!([format!("0x{block_number:x}"), false])).await?;
     if !canonical_again.get("hash").and_then(Value::as_str)
         .is_some_and(|hash| hash.eq_ignore_ascii_case(block_hash)) {
         return Err(fee_error("intent receipt reorg detected before persistence".into()));
     }
-    repository.persist_canonical_v2_intent_fee(&proof, &fee).await
+    // One receipt, one SQL transaction. A later fill's failure rolls back
+    // all earlier fills and fees from this receipt.
+    repository.persist_canonical_v2_intent_batch(&verified).await
+}
+
+async fn verify_d4_matcher_at_block(rpc_url: &str, block_hash: &str) -> Result<()> {
+    let result = rpc(rpc_url, "eth_call", json!([
+        {"to": D4_ENGINE, "data": format!("0x{}", hex::encode(&keccak256("matchingEngine()".as_bytes())[..4]))},
+        {"blockHash": block_hash}
+    ])).await?;
+    let words = abi_result_words(&result, 1)?;
+    if !word_address(&words[0])?.eq_ignore_ascii_case(D6_MATCHER) {
+        return Err(fee_error("D4 matching engine was not canonical D6 at fill block".into()));
+    }
+    Ok(())
 }
 
 async fn verify_market_and_decimals_at_trade(
@@ -286,7 +324,20 @@ pub fn validate_intent_receipt(
     taker_tier: u8,
     now_seconds: u64,
 ) -> Result<CanonicalV2PerpFee> {
-    validate_receipt_mode(&proof.trade, receipt, policy, maker_tier, taker_tier, now_seconds, Some(proof))
+    validate_receipt_mode(&proof.trade, receipt, policy, maker_tier, taker_tier, now_seconds,
+        Some((&proof.buyer_intent_hash, &proof.seller_intent_hash, &proof.event_data)))
+}
+
+pub fn validate_wallet_intent_receipt(
+    proof: &crate::fees::v2_intent_receipt::VerifiedWalletIntentFill,
+    receipt: &Value,
+    policy: &VerifiedD2FeePolicy,
+    maker_tier: u8,
+    taker_tier: u8,
+    now_seconds: u64,
+) -> Result<CanonicalV2PerpFee> {
+    validate_receipt_mode(&proof.trade, receipt, policy, maker_tier, taker_tier, now_seconds,
+        Some((&proof.buyer_intent_hash, &proof.seller_intent_hash, &proof.event_data)))
 }
 
 fn validate_receipt_mode(
@@ -296,7 +347,7 @@ fn validate_receipt_mode(
     maker_tier: u8,
     taker_tier: u8,
     now_seconds: u64,
-    intent_proof: Option<&crate::fees::v2_intent_receipt::VerifiedIntentFill>,
+    intent_proof: Option<(&str, &str, &str)>,
 ) -> Result<CanonicalV2PerpFee> {
     policy
         .snapshot()
@@ -352,7 +403,8 @@ fn validate_receipt_mode(
             .and_then(Value::as_str)
             .unwrap_or("");
         if emitter.eq_ignore_ascii_case(D6_MATCHER)
-            && topic0.eq_ignore_ascii_case(&expected_topic)
+            && (topic0.eq_ignore_ascii_case(&expected_topic)
+                || topic0.eq_ignore_ascii_case(&trade_executed_topic0()))
         {
             let index = quantity(log.get("logIndex"))?;
             if index < trade.log_index {
@@ -391,11 +443,11 @@ fn validate_receipt_mode(
             }
             let parsed: EthLog = serde_json::from_value(log.clone())
                 .map_err(|_| fee_error("malformed D6 trade log".into()))?;
-            let valid_event = if let Some(proof) = intent_proof {
+            let valid_event = if let Some((buyer_hash, seller_hash, event_data)) = intent_proof {
                 parsed.topics.len() == 3
-                    && parsed.topics[1].eq_ignore_ascii_case(&proof.buyer_intent_hash)
-                    && parsed.topics[2].eq_ignore_ascii_case(&proof.seller_intent_hash)
-                    && parsed.data.eq_ignore_ascii_case(&proof.event_data)
+                    && parsed.topics[1].eq_ignore_ascii_case(buyer_hash)
+                    && parsed.topics[2].eq_ignore_ascii_case(seller_hash)
+                    && parsed.data.eq_ignore_ascii_case(event_data)
             } else {
                 let decoded = decode_trade_executed_log_for_emitter(&parsed, PerpsProtocolVersion::V2)?;
                 decoded.onchain_intent_id == trade.onchain_intent_id

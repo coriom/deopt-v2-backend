@@ -1,0 +1,173 @@
+{
+  "milestone": "DEOPT_BACKEND_D2_LIVE_FEE_AND_FRONTEND_ACCEPTANCE_V1",
+  "backend_start_commit": "a7e38b2447221e2ce4d712e588a03ec1356ccd04",
+  "protocol_evidence_commit": "f225bceb53dc8c6bcb51e0f71131c8f25e90a7f4",
+  "chain_id": 84532,
+  "rpc_provider": "https://sepolia.base.org",
+  "pinned_snapshot": {
+    "block_number": 51161751,
+    "block_hash": "0x7fbd66c00e211d5fed3fb68a013d05da8d708209e33d4a3ba8a28c97db62aec0"
+  },
+  "six_executions": [
+    {
+      "name": "D3_TOKEN",
+      "txHash": "0x80735123b23b5d20773c8c79f8b70385edbda8113959d706ced2a0747199ec51",
+      "block": 50914805,
+      "blockHash": "0x56699c1519a388ce73a60bb5c3682e6be6994cf3ec363a24d3e527233e40b27b",
+      "safeSuccess": true,
+      "timelockExecuted": true,
+      "safeTxHash": "0x263f797d378aba0478288588b548efff7efc3d1546fe885c232de7d1bff4e73c",
+      "operationId": "0x6678a5eefb1b1a1b7a9ff4aa5795e1ba7d09fba63ee59917d454e07fe2208c0d"
+    },
+    {
+      "name": "D2_PERP_TIER_0",
+      "txHash": "0xb8bcb5359598046cd5ea9110e32cb303674b7ba5825e215e823e1941602c3c87",
+      "block": 50954332,
+      "blockHash": "0xd22af61863375e539c21d55e0fd56f783838699b1a544995a1696b443d04be53",
+      "safeSuccess": true,
+      "timelockExecuted": true,
+      "safeTxHash": "0x361020aba95982f0187725e31716183edfe3b24b428737721d0fa5caafbbdcc7",
+      "operationId": "0x1976519a08a3a7e65cbe1a2f77fcf0f5fa0f783ccb6c7ef0e6c87b7481caf45b"
+    },
+    {
+      "name": "D2_PERP_TIER_1",
+      "txHash": "0xc5c7ae3f6cd81253da5090aec01eb235952bf204ed2ec322d8e78c948616c955",
+      "block": 50960011,
+      "blockHash": "0x2154e61c62dda3da971b108b50586d7dfed9e0d099696cce5f880e45a79a3d35",
+      "safeSuccess": true,
+      "timelockExecuted": true,
+      "safeTxHash": "0x736f2f64d358f40e72d243024c5a5b65843eaae35cdb7a5a2a64db87ee265e49",
+      "operationId": "0xb79986810ad3e08b5495a8edeaed0654da513ef6acfa15e8ff1d496ff2ef4a11"
+    },
+    {
+      "name": "D2_PERP_TIER_2",
+      "txHash": "0x4fcbade6e314e9a1c12f779cfa48ff869ba7481448dae6d168c55d2beab7807e",
+      "block": 50965557,
+      "blockHash": "0x34857c306244de0e4b5a5ea4f92aefbc387422cb8b3901d1ab5625da4a6ad836",
+      "safeSuccess": true,
+      "timelockExecuted": true,
+      "safeTxHash": "0xdfbcbbf2c808b55e3e5ba7a42ebf7e110ee4e79235e0c2b1c686570d5318949d",
+      "operationId": "0x48b66ca38c21064a6605af4038a657a191a56f327784dc1e0d0bffdc21075a62"
+    },
+    {
+      "name": "D2_PERP_TIER_3",
+      "txHash": "0xecd3ba1221fa073937ec366a584f5e9006bc725e877e237415c52128d1da32b0",
+      "block": 50970367,
+      "blockHash": "0xd2cf508938474ea59419b085bc38262b89a5016d7000377156c14dbff6056c62",
+      "safeSuccess": true,
+      "timelockExecuted": true,
+      "safeTxHash": "0x0cfa836f6f396bdd049908af487f40cd5da07648cee3b660e01a9303260bc7f1",
+      "operationId": "0xaaf8ae230522b4a6b08a365be6e87f2544392e729b559db44968912b3a177f76"
+    },
+    {
+      "name": "D2_PERP_TIER_4",
+      "txHash": "0xc6ef082b121947377426437087da5bec0172173aa65240a14d4d7a0f1cf34940",
+      "block": 50976587,
+      "blockHash": "0xf12cd3a2a91b026d1d61e2a701426ecae6437482ade0920143367faca4846d2c",
+      "safeSuccess": true,
+      "timelockExecuted": true,
+      "safeTxHash": "0x4f365bce909032d8b0e0d31a85c1b5af3b55b3753082bf274e8a09cd8955b81a",
+      "operationId": "0x9ec2e37332d4dbb27791ae7f4de7e852147b344f58210e61adb7b2f95a8d5b49"
+    }
+  ],
+  "onchain_readbacks": {
+    "d3_musdc_config": [
+      5,
+      true,
+      true
+    ],
+    "d3_runtime_code_hash": "0x6d199e027af598ee903513a1ab41e27e2937115c79b8ec85e386d739615befcb",
+    "d2_perp_profiles_ppm": [
+      [
+        0,
+        200
+      ],
+      [
+        0,
+        200
+      ],
+      [
+        0,
+        200
+      ],
+      [
+        0,
+        200
+      ],
+      [
+        0,
+        200
+      ]
+    ],
+    "d2_recipient": "0xa67f8E8E673ce4bb2Fb563B0e6E9FA8F70E3b588",
+    "d4_four_flags": [
+      true,
+      true,
+      true,
+      true
+    ],
+    "d6_paused": true,
+    "d1_market_count": 0,
+    "c02_queued": true,
+    "all_six_consumed": true,
+    "d3_collateral_risk_pointer": "0xc0f019005a25524a34f2ee8839dcdcc50715dd7b",
+    "d2_rebate_budget_musdc_native_at_snapshot": 0,
+    "d2_rebate_budget_read_method": "rebateBudget(address) at pinned block 51161751"
+  },
+  "backend_fee_reader": {
+    "status": "PASS",
+    "review_block": 51158299,
+    "review_block_hash": "0x2929d3d2340cf423916c4a6ddec7256f2d55d88a04bb78115fa9ecb9a642867a",
+    "latest_execution_block": 50976587,
+    "command": "BASE_SEPOLIA_RPC_URL=<read-only RPC> D2_PERP_TIER_S2_TX_HASHES=<five reviewed hashes> cargo run --bin verify_d2_live"
+  },
+  "implementation": {
+    "wrapper_multifill": "adjacent D4 wallet trade and D6 intent log, canonical receipt identity and per-segment D2 fee",
+    "direct_intent": "existing EIP-712 signature and calldata proof",
+    "subaccount_attribution": "unresolved; canonical wallet only",
+    "database": "single SQL transaction for all fills in a receipt",
+    "api": "GET /accounts/{wallet}/perps/canonical-fees with bounded keyset pagination",
+    "frontend": "read-only My Fees tab; mUSDC six decimals; fail-closed unavailable states"
+  },
+  "fresh_tests": {
+    "rust_lib": "1881 passed, 0 failed with local loopback access",
+    "postgres_intent_atomic_http": "1 passed, rollback/idempotency/pagination/router assertions",
+    "postgres_fee_reorg": "1 passed, idempotency and divergence",
+    "frontend_node": "323 passed, 0 failed",
+    "frontend_chromium_local": "13 targeted plus 24 production-build tests passed; overlapping cases",
+    "frontend_production_smoke": "Home, Options, Perps, Workspace HTTP 200 and visible; fee disconnected; trade submit disabled; reload stable; no uncaught app errors",
+    "frontend_typecheck": "PASS",
+    "frontend_build": "PASS",
+    "frontend_lint": "PASS with one unrelated existing warning",
+    "backend_build": "PASS",
+    "backend_docker_image": "PASS, deopt-alpha-backend:d2-live-multifill-v1 built from current source",
+    "backend_docker_runtime": "PASS, non-root read-only container, /health=200, /ready=200, loopback only, persistent fixture PostgreSQL",
+    "actual_http_api": "PASS, GET wallet fee history 200 with next cursor; invalid limit and subaccount filter 400",
+    "frontend_local_connected_browser": "PASS, local frontend -> backend Docker -> disposable PostgreSQL, 2 synthetic receipt fee rows, mock disconnected wallet and no pageerrors",
+    "frontend_vercel_production": "PASS bounded smoke, deployment dpl_4Ah6VNmKyFVzVdAUH1mbeptz93XS, commit a32c5cc1b6dee30a0676b4adc156718687a0a727, Home/Options/Perps/Workspace 200 and visible",
+    "cargo_fmt_check": "FAIL, repository-wide pre-existing formatting drift; no bulk formatting applied",
+    "cargo_clippy_strict": "NOT_VERIFIED_COMPLETE, >10 minute bounded run interrupted after pre-existing unused-import errors; strict gate remains FAIL"
+  },
+  "statuses": {
+    "D2_ONCHAIN_POLICY_VERIFIED": "YES",
+    "D3_CONFIGURATION_VERIFIED": "YES",
+    "SIX_GOVERNANCE_EXECUTIONS_AUTHENTICATED": "YES",
+    "MULTIFILL_RECEIPT_RECONCILIATION": "PARTIAL_SYNTHETIC",
+    "WALLET_SUBACCOUNT_ATTRIBUTION": "WALLET_ONLY",
+    "LOCAL_CONNECTED_BROWSER": "PASS_SYNTHETIC_FIXTURE",
+    "PUBLIC_TRADING_AUTHORIZED": "NO",
+    "PUBLIC_BROADCASTER_ENABLED": "NO",
+    "PUBLIC_BLOCKCHAIN_TRANSACTIONS_BY_AGENT": "NONE",
+    "BACKEND_HOSTING_READINESS": "PARTIAL",
+    "BACKEND_LOCAL_ALPHA": "PARTIAL"
+  },
+  "limitations": [
+    "No real D6 fill exists on Base Sepolia while market 1 is absent and D6 paused.",
+    "Wrapper calldata signatures and independent subaccount settlement are not recovered from logs.",
+    "Current chain canonicality of historical fee rows requires fresh recheck before economic decisions.",
+    "Production frontend has no backend API configured; fee history is safely unavailable.",
+    "Actual local Anvil wrapper multi-fill remains unverified; connected browser used synthetic PostgreSQL receipts.",
+    "Repository-wide strict Clippy and cargo fmt gates are not passing; existing lint/format debt was kept outside this economic correctness patch."
+  ],
+  "next_action": "Implement and test one isolated Anvil wrapper transaction with multiple real D6 intent fills, then reconcile through disposable PostgreSQL and the read-only API without asserting canonical subaccount ownership."
+}

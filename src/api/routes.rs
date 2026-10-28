@@ -123,7 +123,7 @@ use crate::rfq::{
 };
 use crate::types::TimeInForce;
 use crate::types::{now_ms, AccountId, MarketId, OrderId, Side, TimestampMs};
-use axum::extract::{OriginalUri, Path, Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -2692,7 +2692,22 @@ struct CanonicalPerpFeeHistoryResponse {
     subaccount_attribution: &'static str,
     current_chain_canonicality: &'static str,
     fees: Vec<crate::fees::v2_perp_settlement::CanonicalV2PerpHistoryRow>,
+    next_cursor: Option<CanonicalFeeCursor>,
     trading_enabled: bool,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct CanonicalFeeHistoryQuery {
+    limit: Option<u32>,
+    before_block: Option<u64>,
+    before_log_index: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct CanonicalFeeCursor {
+    before_block: u64,
+    before_log_index: u64,
 }
 
 /// Only confirmed D6/D2 wallet-level facts. Local matching fills and their
@@ -2700,13 +2715,15 @@ struct CanonicalPerpFeeHistoryResponse {
 async fn perps_canonical_fees(
     State(state): State<AppState>,
     Path(address): Path<String>,
-    OriginalUri(uri): OriginalUri,
+    Query(query): Query<CanonicalFeeHistoryQuery>,
 ) -> Result<Json<CanonicalPerpFeeHistoryResponse>, ApiError> {
-    if uri.query().is_some() {
+    let limit = query.limit.unwrap_or(25);
+    if !(1..=100).contains(&limit)
+        || query.before_block.is_some() != query.before_log_index.is_some()
+    {
         return Err(ApiError {
             status: StatusCode::BAD_REQUEST,
-            message: "canonical fee history has wallet scope; subaccount filters are unsupported"
-                .into(),
+            message: "invalid canonical fee pagination".into(),
         });
     }
     if state.chain_id != crate::fees::d2_onchain::BASE_SEPOLIA_CHAIN_ID {
@@ -2723,14 +2740,25 @@ async fn perps_canonical_fees(
         status: StatusCode::SERVICE_UNAVAILABLE,
         message: "canonical fee history requires persistent storage".into(),
     })?;
+    let mut fees = repository
+        .list_canonical_v2_perp_history_page(&wallet, limit + 1,
+            query.before_block.zip(query.before_log_index))
+        .await?;
+    let has_more = fees.len() > limit as usize;
+    fees.truncate(limit as usize);
+    let next_cursor = if has_more {
+        fees.last().map(|row| CanonicalFeeCursor {
+            before_block: row.block_number,
+            before_log_index: row.trade_log_index,
+        })
+    } else { None };
     Ok(Json(CanonicalPerpFeeHistoryResponse {
         chain_id: 84532,
         identity_scope: "wallet",
         subaccount_attribution: "unresolved",
         current_chain_canonicality: "requires_fresh_chain_recheck",
-        fees: repository
-            .list_canonical_v2_perp_history(&wallet, 100)
-            .await?,
+        fees,
+        next_cursor,
         trading_enabled: false,
     }))
 }
@@ -9070,6 +9098,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(filtered.status(), StatusCode::BAD_REQUEST);
+        for query in ["limit=0", "limit=101", "before_block=10", "before_log_index=3"] {
+            let response = router(AppState::new(EngineState::with_default_markets()))
+                .oneshot(get_request(
+                    &format!("/accounts/0x1111111111111111111111111111111111111111/perps/canonical-fees?{query}"),
+                    None,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
     }
 
     #[test]
