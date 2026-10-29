@@ -1,0 +1,10 @@
+{$DEOPT_DOMAIN} {
+    encode zstd gzip
+    @mutating not method GET HEAD OPTIONS
+    respond @mutating "read-only release" 405
+    reverse_proxy backend:8080
+    header {
+        X-Content-Type-Options nosniff
+        Referrer-Policy no-referrer
+    }
+}

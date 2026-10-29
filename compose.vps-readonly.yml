@@ -1,0 +1,103 @@
+# Operator-only VPS profile. No cloud action occurs by committing this file.
+# All three images must be supplied as immutable registry digests.
+services:
+  postgres:
+    image: ${DEOPT_POSTGRES_IMAGE:?pin postgres 16 image digest}
+    environment:
+      POSTGRES_USER: deopt_readonly
+      POSTGRES_DB: deopt_readonly
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets: [postgres_password]
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks: [db]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U deopt_readonly -d deopt_readonly"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    mem_limit: 1536m
+    cpus: 1.5
+    pids_limit: 128
+    restart: unless-stopped
+    stop_grace_period: 30s
+    logging: &logs
+      driver: json-file
+      options: {max-size: "10m", max-file: "5"}
+
+  backend:
+    image: ${DEOPT_BACKEND_IMAGE:?pin reviewed backend image digest}
+    depends_on:
+      postgres: {condition: service_healthy}
+    entrypoint: ["/usr/local/bin/deopt-readonly-entrypoint"]
+    environment:
+      HOST: 0.0.0.0
+      PORT: "8080"
+      CHAIN_ID: "84532"
+      NETWORK_NAME: base-sepolia
+      DEOPT_READ_ONLY_RELEASE: "true"
+      PERSISTENCE_ENABLED: "true"
+      PERPS_READ_ENABLED: "false"
+      EXECUTION_ENABLED: "false"
+      EXECUTOR_DRY_RUN: "true"
+      EXECUTOR_REAL_BROADCAST_ENABLED: "false"
+      HV2_BROADCAST_ENABLED: "false"
+      PERPS_PUBLIC_TRADING_ENABLED: "false"
+      PERPS_CLOSED_TEST_ENABLED: "false"
+      OPTIONS_ENABLED: "false"
+      INDEXER_ENABLED: "false"
+      PUBLIC_WS_ENABLED: "false"
+      METRICS_ENABLED: "false"
+      MM_GATEWAY_ENABLED: "false"
+      CORS_ALLOWED_ORIGINS: ${DEOPT_CORS_ORIGIN:?set reviewed HTTPS frontend origin}
+    secrets: [postgres_password]
+    networks: [db, web]
+    user: "1001:1001"
+    read_only: true
+    tmpfs: [/tmp]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    mem_limit: 2048m
+    cpus: 2.0
+    pids_limit: 128
+    init: true
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:8080/ready"]
+      interval: 10s
+      timeout: 3s
+      start_period: 30s
+      retries: 5
+    restart: unless-stopped
+    stop_grace_period: 30s
+    logging: *logs
+
+  caddy:
+    image: ${DEOPT_CADDY_IMAGE:?pin caddy image digest}
+    environment:
+      DEOPT_DOMAIN: ${DEOPT_DOMAIN:?set operator-approved domain}
+    ports: ["80:80", "443:443"]
+    volumes:
+      - ./deploy/vps/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks: [web]
+    depends_on: [backend]
+    mem_limit: 256m
+    cpus: 0.5
+    pids_limit: 64
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+    logging: *logs
+
+networks:
+  db: {internal: true}
+  web: {}
+
+secrets:
+  postgres_password:
+    file: ${DEOPT_POSTGRES_PASSWORD_FILE:?set absolute path to host-only password file}
+
+volumes:
+  postgres_data: {}
+  caddy_data: {}
+  caddy_config: {}

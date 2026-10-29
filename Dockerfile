@@ -71,6 +71,7 @@ RUN apt-get update \
 # self-describing for operators inspecting the image).
 COPY --from=builder /build/deopt-v2-backend /usr/local/bin/deopt-v2-backend
 COPY --from=builder /build/migrations /app/migrations
+COPY --chmod=0555 deploy/vps/backend-entrypoint.sh /usr/local/bin/deopt-readonly-entrypoint
 
 USER deopt
 ENV HOST=0.0.0.0 \

@@ -32,6 +32,9 @@ use tracing_subscriber::EnvFilter;
 #[tokio::main]
 async fn main() -> deopt_v2_backend::Result<()> {
     let config = AppConfig::from_env()?;
+    // AppConfig loads .env first; validate the effective environment, not
+    // only the parent process variables.
+    let read_only_release = deopt_v2_backend::read_only_release::validate_from_env()?;
     config
         .execution
         .validate_startup(config.persistence_enabled)?;
@@ -646,7 +649,13 @@ async fn main() -> deopt_v2_backend::Result<()> {
     }
     // Build the router AFTER hybrid_v2 wiring so mounted operator
     // admin routes see the projection-store handle attached above.
-    let app = router(state.clone());
+    let app = if read_only_release {
+        router(state.clone()).layer(axum::middleware::from_fn(
+            deopt_v2_backend::read_only_release::reject_http_writes,
+        ))
+    } else {
+        router(state.clone())
+    };
     spawn_webtransport_gateway(config.mm_gateway.clone(), state).await?;
 
     info!(

@@ -22,6 +22,7 @@ pub mod orders;
 pub mod perps;
 pub mod reconciliation;
 pub mod rfq;
+pub mod read_only_release;
 pub mod risk;
 pub mod signing;
 pub mod subaccounts;
