@@ -1,0 +1,151 @@
+{
+  "backup": {
+    "destination_selected": false,
+    "encrypted_local_restore": "PREVIOUS_MILESTONE_PASS",
+    "key_recovery_approved": false,
+    "offserver_upload_restore": "NOT_VERIFIED",
+    "private_compose_dump_restore": "PASS",
+    "restored_sum": 600,
+    "restored_synthetic_rows": 2
+  },
+  "c02_action": false,
+  "capacity": {
+    "aggregate_fee_native_musdc_units": 5695920,
+    "canonical_fee_rows": 8,
+    "chain": "isolated Anvil fork 84532",
+    "concurrent_history_reads": {
+      "after_restart": {
+        "backend_cpu_seconds": 1.75,
+        "backend_rss_high_water_mib": 67.15,
+        "p50_ms": 118.96,
+        "p95_ms": 685.9,
+        "requests": 64,
+        "requests_per_second": 41.4,
+        "seconds": 1.546
+      },
+      "cross_wallet_leaks": 0,
+      "first": {
+        "backend_cpu_seconds": 7.2,
+        "backend_rss_high_water_mib": 51.24,
+        "p50_ms": 119.32,
+        "p95_ms": 157.54,
+        "requests": 256,
+        "requests_per_second": 61.38,
+        "seconds": 4.171,
+        "workers": 8
+      },
+      "profile": "loopback development only; release wallet-history route remains HTTP 403"
+    },
+    "database_bytes_after": 13679639,
+    "database_bytes_pristine": 7699479,
+    "database_growth_bytes_including_schema": 5980160,
+    "distinct_transaction_hashes": 4,
+    "genuine_local_transactions": 4,
+    "indexed_trade_rows": 8,
+    "intent_proof_rows": 8,
+    "postgres_restarts": 2,
+    "provenance_rows": 8,
+    "signed_partial_fills": 8,
+    "status": "PASS_BOUNDED_LOCAL",
+    "vps_8gib_verdict": "PROVISIONAL; hosted load and restart acceptance required",
+    "wsl_host": {
+      "cpus": 12,
+      "ram_mib": 9944,
+      "swap_mib": 3072
+    }
+  },
+  "checksums_sha256": {
+    "Dockerfile": "ca965710c7ba0fde4846826de86426e9b605ce623b9c8b4ed9f7bec8c6e003c2",
+    "compose.vps-readonly.yml": "6adb904cc727f7b77b0aa36712e8cea77f447c65cf7e3646b5b51a5a73b56c29",
+    "deploy/vps/Caddyfile": "545c864700b4b3e23004891edc1528c7f95ab48c91880c0a8df4b3f3833e52a2",
+    "deploy/vps/backend-entrypoint.sh": "cf216039a1137dbbff5c42adb0e61364ff6701bf4d540fc0f0728c4fae0ea2ee",
+    "migrations_sorted_sha256_manifest": "d82d628987f988935f05f13010c020e5b170e1e55e2873f8db7b1d2086c44005"
+  },
+  "matrix": [
+    {
+      "blocks": "host_setup",
+      "evidence_required": "approved exact VPS/domain, independently verified SSH host key, second key-based session",
+      "item": "host access",
+      "status": "NOT_VERIFIED"
+    },
+    {
+      "blocks": "private_deployment_acceptance",
+      "evidence_required": "repeat bounded and longer workload on actual 8 GiB VPS under Compose limits",
+      "item": "capacity",
+      "status": "PASS_BOUNDED_LOCAL"
+    },
+    {
+      "blocks": "private_deployment",
+      "evidence_required": "approved private registry and immutable pushed manifest digest with source attestation",
+      "item": "registry",
+      "status": "NOT_VERIFIED"
+    },
+    {
+      "blocks": "private_deployment_acceptance",
+      "evidence_required": "approved destination and recovery key, encrypted upload, retention/failure alerting, independent restore",
+      "item": "backup",
+      "status": "NOT_VERIFIED_OFFSERVER"
+    },
+    {
+      "blocks": "public_api",
+      "evidence_required": "caller ownership authentication and authorization tests",
+      "item": "wallet_history",
+      "status": "BLOCKED"
+    }
+  ],
+  "milestone": "DEOPT_VPS_READONLY_PREREQUISITES_CLOSURE_V1",
+  "mkt1_action": false,
+  "observed_utc": "2026-10-30T03:56:47Z",
+  "preexisting_remote_backend_status": "UNKNOWN; local preparation does not attest remote inventory",
+  "public_blockchain_transactions": 0,
+  "quality_limitations": {
+    "encrypted_local_restore": "REUSED_PREVIOUS_MILESTONE",
+    "global_strict_rust_clippy": "INHERITED_FAIL_NOT_RERUN",
+    "production_docker_image_build": "REUSED_PREVIOUS_MILESTONE",
+    "repository_wide_format": "NOT_RERUN"
+  },
+  "release_gates": {
+    "broadcaster_disabled": true,
+    "chain_id": 84532,
+    "market_reads_disabled": true,
+    "postgres_host_port_published": false,
+    "public_backend_port_published": false,
+    "trading_disabled": true,
+    "wallet_history_release_http_status": 403,
+    "workers_disabled": true
+  },
+  "release_image": {
+    "local_image_id": "sha256:e8eaebfa226ccc389a971f3ef529f225b9d1cb8386aa935e5b8f5e7d783848be",
+    "oci_revision_label_verified": false,
+    "platform": "linux/amd64",
+    "private_registry_manifest_digest": null,
+    "publication_authorized": false,
+    "size_bytes": 176035224,
+    "source_commit_claim": "ff9c6cc353a02a8f6142b393756766f475ded512",
+    "status": "LOCAL_ONLY",
+    "tag": "deopt-vps-readonly:local"
+  },
+  "remote_deployment_by_this_milestone": false,
+  "rpc": {
+    "callTracer_calls": 22,
+    "chain_id": 84532,
+    "credential_or_url_recorded": false,
+    "receipt_block_transaction_hashes_match": true,
+    "receipt_success": true,
+    "status": "PASS_BOUNDED_PROVIDER_SAMPLE",
+    "trace_target_and_input_match_transaction": true,
+    "wrapped_fill_hosted_trace_verified": false
+  },
+  "scope": "local preparation only; no remote deployment or public-chain write",
+  "source_start_commit": "ff9c6cc353a02a8f6142b393756766f475ded512",
+  "tests": {
+    "bash_syntax": "PASS",
+    "genuine_receipt_ingestion_invocations": 4,
+    "git_diff_check": "PASS",
+    "history_http_reads": 320,
+    "private_compose_dump_restore": 1,
+    "python_compile": "PASS",
+    "release_profile_unittest": 7,
+    "rpc_proxy_unittest": 2
+  }
+}
