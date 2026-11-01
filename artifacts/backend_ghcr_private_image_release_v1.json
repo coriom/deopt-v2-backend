@@ -8,6 +8,16 @@
   "package_visibility": "NOT_VERIFIED",
   "publication": "BLOCKED_BEFORE_WORKFLOW_DISPATCH",
   "registry_digest": null,
+  "local_source_commit": "0572870e8114f49fd1a57bd0d3e7e6cd02a84aed",
+  "dockerfile_sha256": "0b051d09fa4b1e3ec60e710aa78bb8ae096cd56e4d38a6c7d9ab700420fb029f",
+  "local_image_id_not_registry_digest": "sha256:693d9953d74b74fd097c3f4a240a904cf692193fe7918adc3c8d12fef0bd4835",
+  "tests": {
+    "targeted_unit_tests": "35_PASS",
+    "workflow_yaml_and_shell": "PASS",
+    "local_amd64_build": "PASS",
+    "isolated_runtime_files": "PASS",
+    "github_workflow_run": "NOT_RUN"
+  },
   "workflow": ".github/workflows/publish-private-ghcr.yml",
   "workflow_trigger": "MANUAL_ONLY",
   "workflow_permissions": ["contents:read", "packages:write"],
