@@ -58,16 +58,18 @@
     "trading_broadcast_workers": "DISABLED_SOURCE_POLICY"
   },
   "image": {
-    "source_commit": "483af31ee3a40f75eeef78fd961e3455a0a78d8b",
-    "dockerfile_sha256": "ca965710c7ba0fde4846826de86426e9b605ce623b9c8b4ed9f7bec8c6e003c2",
+    "source_commit": "acb8c02960928910dfcfa579c93dadac30bb9f61",
+    "dockerfile_sha256": "0b051d09fa4b1e3ec60e710aa78bb8ae096cd56e4d38a6c7d9ab700420fb029f",
     "platform": "linux/amd64",
-    "local_image_id": "sha256:c1fa0700446b1b7752f9d3040727b34c8beaeef1a3947e9f25a6817ea7cb59d3",
+    "local_image_id": "sha256:cbf6ff52b1248d66488175b59577a8cb97b62f947b4d4bf6fab5dc968a328d6b",
     "source_revision_label": "PASS",
     "local_nonroot_file_probe": "PASS_UID_1001_NO_NETWORK",
+    "base_images": "PINNED_BY_DIGEST",
+    "apt_packages": "UNPINNED_REBUILD_NOT_BITWISE_REPRODUCIBLE",
     "registry_manifest_digest": "NOT_AVAILABLE_UNPUBLISHED"
   },
   "tests": {
-    "targeted_unittests": "27_PASS",
+    "targeted_unittests": "28_PASS",
     "normalized_compose": "PASS",
     "adversarial_compose_mutations": "PASS",
     "local_amd64_image_build": "PASS",
