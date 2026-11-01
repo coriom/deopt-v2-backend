@@ -11,13 +11,13 @@ SCRIPT = ROOT / "deploy/vps/ghcr-private-preflight.sh"
 
 
 class GhcrPrivatePreflightTests(unittest.TestCase):
-    def test_workflow_is_manual_and_uses_minimum_package_permissions(self):
+    def test_workflow_is_manual_and_has_no_package_permission(self):
         workflow = (ROOT / ".github/workflows/publish-private-ghcr.yml").read_text()
         self.assertIn("  workflow_dispatch:", workflow)
         self.assertNotIn("\n  push:", workflow)
         self.assertNotIn("\n  schedule:", workflow)
         self.assertIn("  contents: read", workflow)
-        self.assertIn("  packages: write", workflow)
+        self.assertNotIn("  packages: write", workflow)
         self.assertIn("ghcr-private-preflight.sh pre", workflow)
         self.assertIn("ghcr-private-preflight.sh post", workflow)
         self.assertIn("github.event.repository.private == true", workflow)

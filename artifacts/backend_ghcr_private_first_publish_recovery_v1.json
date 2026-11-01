@@ -10,6 +10,16 @@
   "operator_script": "deploy/vps/ghcr-private-first-publish.sh",
   "public_repository_actions_access": "BLOCKED_NOT_CONFIGURED",
   "registry_digest": null,
+  "local_candidate_source_commit": "724d0408b946f1d544db93b5328135a3e2c99b57",
+  "local_image_id_not_registry_digest": "sha256:b99908e18b7a75489776dbd1547150408054c1a04f70e1422c2e42bbb9695d71",
+  "local_candidate_source_label": "ABSENT",
+  "tests": {
+    "targeted_tests": "42_PASS",
+    "interactive_mock_workflow": "PASS",
+    "workflow_and_shell_syntax": "PASS",
+    "local_amd64_build": "PASS",
+    "local_nonroot_runtime": "PASS"
+  },
   "anonymous_pull": "NOT_VERIFIED",
   "authenticated_pull": "NOT_VERIFIED",
   "deployment": "NOT_PERFORMED",

@@ -20,7 +20,7 @@ Le workflow Actions du dépôt public est désormais bloqué à la fois par sa c
 
 ## Validation et limites
 
-Les tests hors ligne couvrent l'inventaire absent, privé, public, accès refusé et états contradictoires. La syntaxe Bash et le build Docker local `--provenance=false` ont été vérifiés ; l'image construite ne contient pas de label `source`. Aucun PAT réel n'a été reçu par Codex, aucun push GHCR ni pull distant n'a été exécuté. La vérification de confidentialité effective, le digest de registre et le refus anonyme restent **NOT_VERIFIED** jusqu'à l'exécution opérateur.
+Les 42 tests ciblés passent, dont un parcours interactif complet avec faux PAT et faux registre : inventaire, confirmation, push, vérifications et suppression du `DOCKER_CONFIG` temporaire. La syntaxe Bash et YAML passe. Le build Docker local `--provenance=false` du commit `724d0408b946f1d544db93b5328135a3e2c99b57` passe en `linux/amd64` ; l'image locale `sha256:b99908e18b7a75489776dbd1547150408054c1a04f70e1422c2e42bbb9695d71` porte la révision attendue et aucun label `source`. Son conteneur jetable sans réseau confirme UID 1001, binaire et migrations. Cet ID local n'est **pas** un digest GHCR. Aucun PAT réel n'a été reçu par Codex, aucun push GHCR ni pull distant n'a été exécuté. La confidentialité effective, le digest de registre et le refus anonyme restent **NOT_VERIFIED** jusqu'à l'exécution opérateur.
 
 La publication d'image n'autorise aucun déploiement. Coolify, Netcup, Vercel, les ports, le protocole et les états de trading ne changent pas. Les portes VPS antérieures (sauvegarde/restauration DeOpt, secret PostgreSQL, Compose généré, isolation réseau, autorisation de release) restent ouvertes.
 

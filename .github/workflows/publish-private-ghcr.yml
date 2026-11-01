@@ -5,7 +5,7 @@ on:
 
 permissions:
   contents: read
-  packages: write
+  # No packages permission while this source repository is public.
 
 concurrency:
   group: private-ghcr-${{ github.ref }}
