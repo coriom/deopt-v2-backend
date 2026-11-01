@@ -1,0 +1,87 @@
+{
+  "milestone": "DEOPT_VPS_PRIVATE_ALPHA_READINESS_V1",
+  "observed_utc": "2026-11-01T14:36:46Z",
+  "target": "deopt-vps",
+  "private_deployment": "BLOCKED",
+  "ssh": {
+    "strict_key_login": "PASS",
+    "service_active": true,
+    "deoptops_docker_socket_access": "DENIED",
+    "root_password_policy": "OPERATOR_REPORTED_DISABLED_NOT_REREAD_THIS_MILESTONE"
+  },
+  "host": {
+    "docker_engine": "29.9.2_ACTIVE",
+    "docker_compose": "5.6.1",
+    "memory_total_mib": 7947,
+    "memory_available_mib": 6571,
+    "root_total_gib": 157,
+    "root_available_gib": 146,
+    "resource_sample": "IDLE_ONLY"
+  },
+  "network": {
+    "coolify_admin_ipv4_loopback_ports": [8000, 6001, 6002],
+    "coolify_admin_ipv6_listeners": [],
+    "public_listeners_ipv4_ipv6": [22, 80, 443, 8080],
+    "external_http_8000_6001_6002": "UNREACHABLE_IN_BOUNDED_TEST",
+    "port_8080_owner": "COOLIFY_PROXY_OPERATOR_DOCKER_PS",
+    "port_8080_external_ipv4_probe": "CONNECTION_FAILED_HTTP_AND_HTTPS_FROM_WSL",
+    "port_8080_local_probe": "HTTP_RESET_HTTPS_BROKEN_PIPE",
+    "port_8080_traefik_flags": "API_INSECURE_FALSE_API_DASHBOARD_TRUE_ENTRYPOINT_8080_FALSE_OPERATOR_FILTERED_INSPECT",
+    "port_8080_assessment": "LIKELY_UNUSED_MAPPING_REVIEW_BEFORE_SEPARATE_CHANGE",
+    "other_application_conflicts": "NO_OTHER_CONTAINERS_IN_OPERATOR_INVENTORY_AS_OF_OBSERVATION"
+  },
+  "coolify": {
+    "version": "4.5.3_OPERATOR_REPORTED",
+    "localhost_server": "READY_OPERATOR_REPORTED",
+    "owner_2fa": "ENABLED_OPERATOR_REPORTED",
+    "local_dashboard_http": 302,
+    "deopt_project_staging": "NOT_CREATED_BY_CODEX"
+  },
+  "backup": {
+    "first_coolify_dump": "SUCCESS_DOWNLOADED_TO_WINDOWS_OPERATOR_REPORTED",
+    "app_key": "SAVED_SEPARATELY_OPERATOR_REPORTED",
+    "daily_schedule": "ENABLED_0_0_*_*_*_UTC_OPERATOR_DASHBOARD",
+    "backup_before_update": "ENABLED_OPERATOR_DASHBOARD",
+    "last_execution": "SUCCESS_2026-11-01T14:12:58Z_LOCAL_382.14KB_OPERATOR_DASHBOARD",
+    "second_automatic_execution": "NOT_VERIFIED",
+    "coolify_restore": "NOT_TESTED",
+    "coolify_technical_ssh_keys_offsite": "NOT_VERIFIED",
+    "deopt_postgres_offsite_restore": "NOT_CONFIGURED"
+  },
+  "deopt_profile": {
+    "source_compose_sha256": "524bd14b0cb6d23672eabb7c793c2c649f2c760651370d33592c1a6622745f82",
+    "normalized_source_compose": "PASS_PRIVATE_CHECKER_WITH_PLACEHOLDER_DIGESTS",
+    "coolify_generated_compose": "NOT_AVAILABLE_NO_RESOURCE",
+    "postgres_network": "INTERNAL_SOURCE_ONLY",
+    "wallet_history": "BLOCKED_SOURCE_POLICY",
+    "chain_id": 84532,
+    "trading_broadcast_workers": "DISABLED_SOURCE_POLICY"
+  },
+  "image": {
+    "source_commit": "483af31ee3a40f75eeef78fd961e3455a0a78d8b",
+    "dockerfile_sha256": "ca965710c7ba0fde4846826de86426e9b605ce623b9c8b4ed9f7bec8c6e003c2",
+    "platform": "linux/amd64",
+    "local_image_id": "sha256:c1fa0700446b1b7752f9d3040727b34c8beaeef1a3947e9f25a6817ea7cb59d3",
+    "source_revision_label": "PASS",
+    "local_nonroot_file_probe": "PASS_UID_1001_NO_NETWORK",
+    "registry_manifest_digest": "NOT_AVAILABLE_UNPUBLISHED"
+  },
+  "tests": {
+    "targeted_unittests": "27_PASS",
+    "normalized_compose": "PASS",
+    "adversarial_compose_mutations": "PASS",
+    "local_amd64_image_build": "PASS",
+    "vps_backend_runtime": "NOT_DEPLOYED"
+  },
+  "blockers": [
+    "VERIFY_COOLIFY_TECHNICAL_KEY_RECOVERY",
+    "APPROVE_PRIVATE_IMAGE_DISTRIBUTION_AND_VERIFY_REGISTRY_DIGEST",
+    "PREPARE_HOST_ONLY_DB_SECRET_AND_OFFSITE_DB_RESTORE",
+    "REVIEW_ACTUAL_COOLIFY_GENERATED_COMPOSE_WITH_NO_DOMAIN",
+    "SEPARATE_PRIVATE_RELEASE_AUTHORIZATION"
+  ],
+  "remote_backend_deployed": false,
+  "frontend_modified": false,
+  "public_blockchain_transactions": 0,
+  "trading_enabled": false
+}

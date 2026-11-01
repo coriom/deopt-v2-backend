@@ -94,6 +94,11 @@ class CoolifyPrivateComposeTests(unittest.TestCase):
         self.assertIn("--load --pull=false --platform linux/amd64", contents)
         self.assertNotIn("docker push", contents)
 
+    def test_builder_and_runtime_bases_are_digest_pinned(self):
+        dockerfile = (ROOT / "Dockerfile").read_text()
+        self.assertIn("FROM rust:1.95-bookworm@sha256:", dockerfile)
+        self.assertIn("FROM debian:bookworm-slim@sha256:", dockerfile)
+
 
 if __name__ == "__main__":
     unittest.main()

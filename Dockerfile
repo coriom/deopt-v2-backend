@@ -29,7 +29,7 @@
 # cleanly without statically-linked-musl gotchas.
 
 # ---- builder ------------------------------------------------------
-FROM rust:1.95-bookworm AS builder
+FROM rust:1.95-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1 AS builder
 WORKDIR /build
 
 # System deps: pkg-config + openssl headers for sqlx-postgres +
@@ -58,7 +58,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
  && cp target/release/deopt-v2-backend /build/deopt-v2-backend
 
 # ---- runtime -----------------------------------------------------
-FROM debian:bookworm-slim AS runtime
+FROM debian:bookworm-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8 AS runtime
 WORKDIR /app
 
 RUN apt-get update \
