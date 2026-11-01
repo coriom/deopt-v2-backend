@@ -19,6 +19,9 @@ repository_visibility=$(gh api "repos/$GITHUB_REPOSITORY" --jq .visibility 2>/de
 [[ "$repository_visibility" == private || "$repository_visibility" == public ]] || {
   echo 'GHCR_REPOSITORY_VISIBILITY_UNKNOWN' >&2; exit 2;
 }
+[[ "$repository_visibility" == private ]] || {
+  echo 'GHCR_PUBLIC_SOURCE_WORKFLOW_BLOCKED' >&2; exit 2;
+}
 
 endpoint='users/coriom/packages/container/deopt-v2-backend'
 response=$(mktemp)
@@ -44,7 +47,7 @@ case "$http_status" in
     echo 'GHCR_EXISTING_PACKAGE_PRIVATE'
     ;;
   404)
-    [[ "$mode" == pre && "$repository_visibility" == private ]] || {
+    [[ "$mode" == pre ]] || {
       echo 'GHCR_FIRST_PUBLICATION_PRIVACY_UNPROVEN' >&2; exit 2;
     }
     echo 'GHCR_FIRST_PUBLICATION_FROM_PRIVATE_REPOSITORY'

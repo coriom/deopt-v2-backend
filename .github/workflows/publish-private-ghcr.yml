@@ -13,7 +13,7 @@ concurrency:
 
 jobs:
   publish:
-    if: github.repository == 'coriom/deopt-v2-backend' && github.ref == 'refs/heads/main'
+    if: github.repository == 'coriom/deopt-v2-backend' && github.ref == 'refs/heads/main' && github.event.repository.private == true
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:

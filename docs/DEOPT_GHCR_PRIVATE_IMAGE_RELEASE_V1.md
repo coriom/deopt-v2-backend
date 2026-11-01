@@ -6,12 +6,12 @@
 
 La connexion GitHub en lecture seule confirme que `coriom/deopt-v2-backend` est **public** et que le compte connecté possède les droits administrateur sur ce dépôt. La CLI `gh` locale signale un jeton invalide ; l'existence et la visibilité d'un éventuel package GHCR privé préexistant ne sont donc pas vérifiées. Ne pas interpréter une absence dans une recherche anonyme comme une preuve d'absence du package.
 
-[GitHub indique](https://docs.github.com/en/packages/managing-github-packages-using-github-actions-workflows/publishing-and-installing-a-package-with-github-actions) qu'un package créé par un workflow avec `GITHUB_TOKEN` hérite par défaut de la visibilité et des permissions du dépôt. Une première publication depuis le dépôt **public** ne répond pas à l'exigence « package privé garanti ». Le nouveau workflow manuel échoue avant la connexion GHCR si le package n'est pas déjà prouvé privé ou si le dépôt n'est pas privé. Il vérifie de nouveau après publication la visibilité privée et l'association au dépôt. Aucun lancement n'a eu lieu.
+[GitHub indique](https://docs.github.com/en/packages/managing-github-packages-using-github-actions-workflows/publishing-and-installing-a-package-with-github-actions) qu'un package créé par un workflow avec `GITHUB_TOKEN` hérite par défaut de la visibilité et des permissions du dépôt. Une première publication depuis le dépôt **public** ne répond pas à l'exigence « package privé garanti ». Le workflow manuel reste désormais bloqué tant que ce dépôt est public, même si un package privé existe, afin d'éviter l'accès potentiel des forks. Aucun lancement n'a eu lieu.
 
 Deux chemins possibles pour lever ce blocage, chacun à approuver séparément :
 
 1. Rendre le dépôt source privé, puis revérifier sa visibilité avant une première exécution du workflow ; ou
-2. Précréer le package GHCR en privé via un mécanisme contrôlé, donner au dépôt l'accès Actions nécessaire, puis faire vérifier sa visibilité privée par le workflow avant toute nouvelle version.
+2. Précréer le package GHCR en privé via un mécanisme contrôlé ; préparer les futures publications Actions depuis un dépôt privé distinct avec droits explicitement revus.
 
 Ne pas changer la visibilité du dépôt ni créer un package au moyen d'un token transmis dans le chat. Vérifier aussi le budget GitHub Actions applicable au compte avant le premier run ; la [facturation GHCR actuelle](https://docs.github.com/en/billing/concepts/product-billing/github-packages) ne remplace pas ce contrôle des minutes Actions.
 

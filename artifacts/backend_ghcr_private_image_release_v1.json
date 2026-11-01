@@ -21,7 +21,7 @@
   "workflow": ".github/workflows/publish-private-ghcr.yml",
   "workflow_trigger": "MANUAL_ONLY",
   "workflow_permissions": ["contents:read", "packages:write"],
-  "privacy_gate": "EXISTING_PRIVATE_PACKAGE_OR_PRIVATE_REPOSITORY_REQUIRED",
+  "privacy_gate": "PRIVATE_WORKFLOW_REPOSITORY_REQUIRED; PUBLIC_SOURCE_ACTIONS_BLOCKED",
   "coolify_pull": "DOCUMENTED_NOT_CONFIGURED",
   "deployment": "NOT_PERFORMED",
   "frontend_modified": false,

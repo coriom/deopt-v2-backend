@@ -1,0 +1,18 @@
+{
+  "milestone": "DEOPT_GHCR_PRIVATE_FIRST_PUBLISH_RECOVERY_V1",
+  "repository": "coriom/deopt-v2-backend",
+  "repository_visibility": "PUBLIC_VERIFIED",
+  "operator_package_dashboard": "GET_STARTED_NO_PACKAGE_VISIBLE",
+  "authenticated_package_inventory": "NOT_VERIFIED_LOCAL_GH_AUTH_INVALID",
+  "package_exists": "UNKNOWN_UNTIL_OPERATOR_API_CHECK",
+  "package_visibility": "NOT_VERIFIED",
+  "publish_method": "OPERATOR_WSL_INTERACTIVE_CLASSIC_PAT_DOCKER_PUSH_IF_ABSENT",
+  "operator_script": "deploy/vps/ghcr-private-first-publish.sh",
+  "public_repository_actions_access": "BLOCKED_NOT_CONFIGURED",
+  "registry_digest": null,
+  "anonymous_pull": "NOT_VERIFIED",
+  "authenticated_pull": "NOT_VERIFIED",
+  "deployment": "NOT_PERFORMED",
+  "public_blockchain_transactions": 0,
+  "trading_enabled": false
+}

@@ -20,6 +20,7 @@ class GhcrPrivatePreflightTests(unittest.TestCase):
         self.assertIn("  packages: write", workflow)
         self.assertIn("ghcr-private-preflight.sh pre", workflow)
         self.assertIn("ghcr-private-preflight.sh post", workflow)
+        self.assertIn("github.event.repository.private == true", workflow)
         self.assertNotIn(":latest", workflow)
 
     def run_gate(self, repo_visibility, package_status, package_visibility="", mode="pre",
@@ -62,8 +63,9 @@ class GhcrPrivatePreflightTests(unittest.TestCase):
     def test_private_repo_can_create_package(self):
         self.assertEqual(self.run_gate("private", 404).returncode, 0)
 
-    def test_existing_private_package_can_be_published(self):
-        self.assertEqual(self.run_gate("public", 200, "private").returncode, 0)
+    def test_public_repo_cannot_access_private_package_via_workflow(self):
+        self.assertNotEqual(self.run_gate("public", 200, "private").returncode, 0)
+        self.assertEqual(self.run_gate("private", 200, "private").returncode, 0)
 
     def test_existing_public_package_is_rejected(self):
         self.assertNotEqual(self.run_gate("private", 200, "public").returncode, 0)
@@ -74,8 +76,8 @@ class GhcrPrivatePreflightTests(unittest.TestCase):
 
     def test_post_publish_requires_private_package(self):
         self.assertNotEqual(self.run_gate("private", 404, mode="post").returncode, 0)
-        self.assertEqual(self.run_gate("public", 200, "private", mode="post").returncode, 0)
-        self.assertNotEqual(self.run_gate("public", 200, "private", mode="post",
+        self.assertEqual(self.run_gate("private", 200, "private", mode="post").returncode, 0)
+        self.assertNotEqual(self.run_gate("private", 200, "private", mode="post",
                                          linked_repository="another/repo").returncode, 0)
 
 
