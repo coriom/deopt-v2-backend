@@ -51,7 +51,7 @@ def secret_names(service: dict) -> set[str]:
             for item in service.get("secrets", [])}
 
 
-def check(rendered: dict) -> None:
+def check(rendered: dict, release: dict | None = None) -> None:
     services = rendered.get("services", {})
     require(set(services) == {"postgres", "backend"}, "SERVICES")
     require(isinstance(rendered.get("networks"), dict), "NETWORKS")
@@ -106,6 +106,7 @@ def check(rendered: dict) -> None:
     required = {
         "CHAIN_ID": "84532", "NETWORK_NAME": "base-sepolia", "DEOPT_READ_ONLY_RELEASE": "true",
         "PERSISTENCE_ENABLED": "true", "EXECUTION_ENABLED": "false",
+        "EXECUTOR_DRY_RUN": "true",
         "EXECUTOR_REAL_BROADCAST_ENABLED": "false", "HV2_BROADCAST_ENABLED": "false",
         "PERPS_PUBLIC_TRADING_ENABLED": "false", "PERPS_CLOSED_TEST_ENABLED": "false",
         "INDEXER_ENABLED": "false", "PERPS_READ_ENABLED": "false", "OPTIONS_ENABLED": "false",
@@ -128,15 +129,28 @@ def check(rendered: dict) -> None:
     require("/ready" in str(backend.get("healthcheck", {}).get("test", "")), "BACKEND_READINESS_CHECK")
     require(backend.get("entrypoint") == ["/usr/local/bin/deopt-readonly-entrypoint"],
             "BACKEND_ENTRYPOINT")
+    if release is not None:
+        require(backend["image"] == release["backend_image"], "BACKEND_RELEASE_DIGEST")
+        require(postgres["image"] == release["postgres_image"], "POSTGRES_RELEASE_DIGEST")
+        require(env.get("CORS_ALLOWED_ORIGINS") == release["cors_origin"], "BACKEND_CORS_ORIGIN")
+        require(secret["file"] == release["postgres_password_file"], "POSTGRES_RELEASE_SECRET_PATH")
 
 
 def main() -> int:
-    if len(sys.argv) != 2:
-        print("usage: check_coolify_private_compose.py rendered-compose.json", file=sys.stderr)
+    if len(sys.argv) == 2:
+        release_path = None
+        rendered_path = sys.argv[1]
+    elif len(sys.argv) == 4 and sys.argv[1] == "--release-manifest":
+        release_path = sys.argv[2]
+        rendered_path = sys.argv[3]
+    else:
+        print("usage: check_coolify_private_compose.py [--release-manifest manifest.json] rendered-compose.json",
+              file=sys.stderr)
         return 2
     try:
-        rendered = json.loads(Path(sys.argv[1]).read_text())
-        check(rendered)
+        rendered = json.loads(Path(rendered_path).read_text())
+        release = json.loads(Path(release_path).read_text()) if release_path else None
+        check(rendered, release)
     except (OSError, ValueError, KeyError, TypeError) as error:
         code = str(error) if isinstance(error, PrivateComposeError) else "INVALID_RENDERED_COMPOSE"
         print(f"PRIVATE_COMPOSE=FAIL {code}", file=sys.stderr)

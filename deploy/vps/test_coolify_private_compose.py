@@ -43,6 +43,39 @@ class CoolifyPrivateComposeTests(unittest.TestCase):
     def test_exact_source_profile_passes_without_authorizing_deployment(self):
         check(self.fixture)
 
+    def test_exact_release_manifest_accepts_only_reviewed_images_and_secret_path(self):
+        release = json.loads((ROOT / "deploy/vps/coolify-staging-release-v1.json").read_text())
+        env = dict(os.environ)
+        env.update({
+            "DEOPT_BACKEND_IMAGE": release["backend_image"],
+            "DEOPT_POSTGRES_IMAGE": release["postgres_image"],
+            "DEOPT_CORS_ORIGIN": release["cors_origin"],
+            "DEOPT_POSTGRES_PASSWORD_FILE": release["postgres_password_file"],
+        })
+        result = subprocess.run(
+            ["docker", "compose", "-f", str(ROOT / "compose.coolify-readonly.yml"),
+             "config", "--format", "json"],
+            env=env, capture_output=True, text=True, check=True,
+        )
+        rendered = json.loads(result.stdout)
+        check(rendered, release)
+        for service, key, value, code in (
+            ("backend", "image", "ghcr.io/coriom/other@sha256:" + "a" * 64, "BACKEND_RELEASE_DIGEST"),
+            ("postgres", "image", "postgres:16@sha256:" + "b" * 64, "POSTGRES_RELEASE_DIGEST"),
+        ):
+            candidate = copy.deepcopy(rendered)
+            candidate["services"][service][key] = value
+            with self.assertRaisesRegex(PrivateComposeError, code):
+                check(candidate, release)
+        candidate = copy.deepcopy(rendered)
+        candidate["services"]["backend"]["environment"]["CORS_ALLOWED_ORIGINS"] = "*"
+        with self.assertRaisesRegex(PrivateComposeError, "BACKEND_CORS_ORIGIN"):
+            check(candidate, release)
+        candidate = copy.deepcopy(rendered)
+        candidate["secrets"]["postgres_password"]["file"] = "/tmp/other"
+        with self.assertRaisesRegex(PrivateComposeError, "POSTGRES_RELEASE_SECRET_PATH"):
+            check(candidate, release)
+
     def test_rejects_published_port_and_proxy_route(self):
         self.reject(lambda x: x["services"]["backend"].update(ports=[{"published": 8080, "target": 8080}]),
                     "BACKEND_PUBLISHED_PORT")
@@ -69,6 +102,8 @@ class CoolifyPrivateComposeTests(unittest.TestCase):
 
     def test_rejects_trading_signing_or_wrong_chain(self):
         self.reject(lambda x: x["services"]["backend"]["environment"].update(EXECUTION_ENABLED="true"),
+                    "BACKEND_READ_ONLY_FLAGS")
+        self.reject(lambda x: x["services"]["backend"]["environment"].update(EXECUTOR_DRY_RUN="false"),
                     "BACKEND_READ_ONLY_FLAGS")
         self.reject(lambda x: x["services"]["backend"]["environment"].update(EXECUTOR_PRIVATE_KEY="dummy"),
                     "BACKEND_SIGNER_VARIABLE")
