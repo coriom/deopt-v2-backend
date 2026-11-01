@@ -2,8 +2,10 @@
 
 import json
 import hashlib
+import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import subprocess
 from tempfile import TemporaryDirectory
@@ -137,35 +139,59 @@ class NetcupCoolifyTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("Run the reviewed root-owned copy", result.stderr)
 
-    def test_root_ssh_password_check_accepts_only_key_only_values(self):
+    def run_root_ssh_policy_fixture(self, address, output, sshd_exit=0, large=False):
         script = (ROOT / "deploy/vps/netcup-docker-coolify-bootstrap.sh").read_text()
         self.assertIn("set -euo pipefail", script)
         self.assertIn("/usr/sbin/sshd -t", script)
-        match = re.search(
-            r"/usr/sbin/sshd -T -C \"user=root,host=localhost,addr=\$client_addr\" \|\s*"
-            r"(grep -Eqx '[^']+') \|\|",
-            script,
-        )
+        self.assertIn('if [[ "$ssh_dropin_created" == true ]]; then\n  systemctl reload ssh', script)
+        self.assertIn("for client_addr in 203.0.113.5 2001:db8::5; do", script)
+        match = re.search(r"(?ms)^verify_root_ssh_policy\(\) \{\n.*?^\}", script)
         self.assertIsNotNone(match, "effective sshd check missing")
-        command = match.group(1)
-        for value, expected in (
-            ("permitrootlogin prohibit-password\n", 0),
-            ("permitrootlogin without-password\n", 0),
-            ("permitrootlogin yes\n", 1),
-            ("", 1),
-        ):
-            with self.subTest(value=value):
-                result = subprocess.run(
-                    ["bash", "-o", "pipefail", "-c", f"printf '%s' \"$1\" | {command}", "test", value],
-                    capture_output=True, text=True, check=False,
-                )
-                self.assertEqual(result.returncode, expected)
-        failed_sshd = subprocess.run(
-            ["bash", "-o", "pipefail", "-c",
-             f"{{ printf 'permitrootlogin prohibit-password\\n'; exit 7; }} | {command}"],
-            capture_output=True, text=True, check=False,
-        )
-        self.assertNotEqual(failed_sshd.returncode, 0)
+        function = match.group()
+        self.assertIn('effective=$(/usr/sbin/sshd -T -C', function)
+        self.assertNotIn("| grep", function)
+        with TemporaryDirectory() as directory:
+            fake_sshd = Path(directory) / "sshd"
+            fake_sshd.write_text(
+                '#!/usr/bin/env bash\n'
+                'set -e\n'
+                '[[ "$*" == *"addr=$FAKE_EXPECT_ADDR" ]] || exit 77\n'
+                'printf "%s" "$FAKE_SSH_OUTPUT"\n'
+                'if [[ "$FAKE_LARGE" == 1 ]]; then\n'
+                '  for ((i=0;i<8000;i++)); do printf "otherconfig %s\\n" "$i"; done\n'
+                'fi\n'
+                'exit "$FAKE_SSH_EXIT"\n'
+            )
+            fake_sshd.chmod(0o700)
+            function = function.replace("/usr/sbin/sshd -T", shlex.quote(str(fake_sshd)) + " -T")
+            env = dict(os.environ, FAKE_EXPECT_ADDR=address, FAKE_SSH_OUTPUT=output,
+                       FAKE_SSH_EXIT=str(sshd_exit), FAKE_LARGE="1" if large else "0")
+            return subprocess.run(
+                ["bash", "-e", "-u", "-o", "pipefail", "-c",
+                 function + '\nverify_root_ssh_policy "$1"', "test", address],
+                env=env, capture_output=True, text=True, check=False,
+            )
+
+    def test_root_ssh_password_check_both_ip_families(self):
+        for address in ("203.0.113.5", "2001:db8::5"):
+            for policy in ("prohibit-password", "without-password"):
+                with self.subTest(address=address, policy=policy):
+                    result = self.run_root_ssh_policy_fixture(
+                        address, f"permitrootlogin {policy}\notherconfig value\n")
+                    self.assertEqual(result.returncode, 0, result.stderr)
+            for output in ("permitrootlogin yes\n", "", "permitrootlogin forced-commands-only\n",
+                           "permitrootlogin without-password\npermitrootlogin prohibit-password\n"):
+                with self.subTest(address=address, output=output):
+                    self.assertNotEqual(self.run_root_ssh_policy_fixture(address, output).returncode, 0)
+            with self.subTest(address=address, sshd_exit=7):
+                self.assertNotEqual(self.run_root_ssh_policy_fixture(
+                    address, "permitrootlogin without-password\n", sshd_exit=7).returncode, 0)
+
+    def test_root_ssh_check_avoids_pipefail_sigpipe_on_full_output(self):
+        for address in ("203.0.113.5", "2001:db8::5"):
+            result = self.run_root_ssh_policy_fixture(
+                address, "permitrootlogin without-password\n", large=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
 
 
 if __name__ == "__main__":

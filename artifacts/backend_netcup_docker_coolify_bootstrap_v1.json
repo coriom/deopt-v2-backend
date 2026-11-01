@@ -45,7 +45,8 @@
     "bash_syntax": "PASS",
     "deopt_profile_equivalence": "PASS",
     "reviewed_compose_override_render": "PASS",
-    "targeted_unittests": 10,
+    "targeted_unittests": 11,
+    "root_ssh_effective_full_output_ipv4_ipv6": "PASS_FIXTURED; LIVE_IPV6_NEEDS_OPERATOR_SUDO",
     "root_ssh_password_rendering_compatibility": "PASS_2_ACCEPTED_3_REJECTED",
     "curl_live_seven_pinned_inputs": "PASS_AUTHORIZED_LOCAL_NETWORK",
     "curl_sandbox_without_network": "BLOCKED_DNS_CURL_6",
@@ -57,10 +58,21 @@
   "prepared_files_sha256": {
     "compose.coolify-readonly.yml": "524bd14b0cb6d23672eabb7c793c2c649f2c760651370d33592c1a6622745f82",
     "deploy/vps/coolify-loopback.override.yml": "0df01f752a0959b095738f741bf9f632d7334f0dac914b0ed850ea315cbe9856",
-    "deploy/vps/netcup-docker-coolify-bootstrap.sh": "68848fed094e8da65b1214c59bd3c9970aa780ef3f78e58245ba19f3b7c82d2b",
+    "deploy/vps/netcup-docker-coolify-bootstrap.sh": "4061a4dd4c89c56fdb8d61542a4d6d26963b2ccc5d8b68125d24b7f2ed2f5ffb",
     "deploy/vps/prepare_coolify_vendor.py": "160e174c8b4c337b94819377ea6a2cb9b0099705b646bb8b5e0d4c5d3ebe0b95"
   },
   "public_blockchain_transactions": 0,
+  "ssh_effective_policy_recovery": {
+    "observed_utc": "2026-11-01T13:30:16Z",
+    "operator_reported_ipv4_root": "without-password",
+    "live_ipv6_root": "NOT_VERIFIED_DROPIN_MODE_0600_REQUIRES_OPERATOR_SUDO",
+    "live_sshd_root_status": "NOT_VERIFIED_DROPIN_MODE_0600_REQUIRES_OPERATOR_SUDO",
+    "old_pipeline_sigpipe": "PLAUSIBLE_NOT_PROVEN_ON_HOST",
+    "corrected_method": "CAPTURE_FULL_SSHD_OUTPUT_AND_STATUS_THEN_VALIDATE_EXACT_SINGLE_POLICY_LINE",
+    "ssh_reload_on_existing_dropin": false,
+    "docker_reinstall": false,
+    "coolify_installed": false
+  },
   "http403_recovery": {
     "observed_utc": "2026-11-01T12:54:11Z",
     "blocked_url": "https://cdn.coollabs.io/coolify/upgrade-postgres.sh",

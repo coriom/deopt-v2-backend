@@ -64,6 +64,7 @@ if grep -Eiq '^[[:space:]]*Match[[:space:]]' /etc/ssh/sshd_config /etc/ssh/sshd_
   echo 'SSH Match rules need manual review' >&2; exit 2
 fi
 ssh_dropin=/etc/ssh/sshd_config.d/01-deopt-root-login.conf
+ssh_dropin_created=false
 install -d -m 0755 /etc/ssh/sshd_config.d
 if [[ -e "$ssh_dropin" ]]; then
   [[ "$(cat "$ssh_dropin")" == 'PermitRootLogin prohibit-password' ]] || {
@@ -72,13 +73,28 @@ if [[ -e "$ssh_dropin" ]]; then
 else
   printf '%s\n' 'PermitRootLogin prohibit-password' > "$ssh_dropin"
   chmod 0600 "$ssh_dropin"
+  ssh_dropin_created=true
 fi
+verify_root_ssh_policy() {
+  local client_addr=$1 effective line policy_count=0
+  effective=$(/usr/sbin/sshd -T -C "user=root,host=localhost,addr=$client_addr") || return 1
+  while IFS= read -r line; do
+    case "$line" in
+      'permitrootlogin prohibit-password'|'permitrootlogin without-password') ((policy_count+=1));;
+      permitrootlogin*) return 1;;
+    esac
+  done <<< "$effective"
+  [[ $policy_count -eq 1 ]]
+}
 /usr/sbin/sshd -t
 for client_addr in 203.0.113.5 2001:db8::5; do
-  /usr/sbin/sshd -T -C "user=root,host=localhost,addr=$client_addr" |
-    grep -Eqx 'permitrootlogin (prohibit-password|without-password)' || { echo 'Root password SSH still permitted' >&2; exit 2; }
+  verify_root_ssh_policy "$client_addr" || {
+    echo "Root password SSH still permitted or sshd -T failed for $client_addr" >&2; exit 2;
+  }
 done
-systemctl reload ssh
+if [[ "$ssh_dropin_created" == true ]]; then
+  systemctl reload ssh
+fi
 echo 'SSH_ROOT_PASSWORD_LOGIN=DISABLED; DEOPTOPS_PASSWORD_SETTING_UNCHANGED'
 printf '%s' 'Verify a NEW independent key-based SSH session and Netcup console recovery, then type VERIFIED: '
 read -r ssh_recovery_ack
