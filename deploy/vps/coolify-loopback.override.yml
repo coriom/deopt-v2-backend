@@ -1,0 +1,7 @@
+# Applied before first Coolify start; replaces all default public admin binds.
+services:
+  coolify:
+    ports: !override
+      - "127.0.0.1:8000:8080"
+      - "127.0.0.1:6001:6001"
+      - "127.0.0.1:6002:6002"

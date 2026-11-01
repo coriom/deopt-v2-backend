@@ -1,0 +1,113 @@
+{
+  "backup": {
+    "app_key_independent_recovery": "PENDING_OPERATOR",
+    "coolify_config": "PREPARED_PLAN_ONLY",
+    "coolify_database_offsite": "PENDING_DESTINATION",
+    "deopt_postgres_backup": "SEPARATE_FUTURE_GATE",
+    "restore_test": "NOT_VERIFIED"
+  },
+  "coolify_admin_exposure": {
+    "access_method": "SSH_TUNNEL_PLANNED",
+    "admin_account": "PENDING_OPERATOR",
+    "compose_override_merge": "PASS_LOCAL",
+    "first_start_port_guard": "PREPARED_NOT_REMOTE_EXECUTED",
+    "ipv6_public_admin_binding_planned": false,
+    "planned_bindings": [
+      "127.0.0.1:8000",
+      "127.0.0.1:6001",
+      "127.0.0.1:6002"
+    ],
+    "two_factor": "PENDING_OPERATOR"
+  },
+  "coolify_installed_by_codex": false,
+  "deopt_backend_deployed": false,
+  "deopt_coolify_profile": {
+    "backend_nonroot": true,
+    "backend_read_only_rootfs": true,
+    "broadcaster_disabled": true,
+    "caddy_removed": true,
+    "chain_id": 84532,
+    "database_network_internal": true,
+    "market_reads_disabled": true,
+    "published_ports": [],
+    "services": [
+      "postgres",
+      "backend"
+    ],
+    "status": "PREPARED_LOCAL_NOT_DEPLOYED",
+    "trading_disabled": true,
+    "wallet_history_blocked": true,
+    "workers_disabled": true
+  },
+  "docker_installed_by_codex": false,
+  "local_start_commit": "045ebc5b7d714c81c5e4e3afb10c3b16faece593",
+  "local_tests": {
+    "bash_syntax": "PASS",
+    "deopt_profile_equivalence": "PASS",
+    "reviewed_compose_override_render": "PASS",
+    "targeted_unittests": 4,
+    "vendor_snapshot_offline_patch": "PASS"
+  },
+  "milestone": "DEOPT_NETCUP_DOCKER_COOLIFY_BOOTSTRAP_V1",
+  "next_operator_checkpoint": "Verify staged/root-owned file SHA-256, then run one interactive sudo bootstrap while keeping Netcup console and a second independent SSH session available.",
+  "observed_utc": "2026-11-01T08:08:49Z",
+  "prepared_files_sha256": {
+    "compose.coolify-readonly.yml": "524bd14b0cb6d23672eabb7c793c2c649f2c760651370d33592c1a6622745f82",
+    "deploy/vps/coolify-loopback.override.yml": "0df01f752a0959b095738f741bf9f632d7334f0dac914b0ed850ea315cbe9856",
+    "deploy/vps/netcup-docker-coolify-bootstrap.sh": "4c6b1e4a3d2a0d3bb3c42de4b1ea89d840ed51a5d675dad5cc38b6772ecf2c23",
+    "deploy/vps/prepare_coolify_vendor.py": "48eb61ed1ab3d561e0e9554beb599af7947e238bd362cff7a4e85a1a11ae6af3"
+  },
+  "public_blockchain_transactions": 0,
+  "remote_system_changes_by_codex": false,
+  "remote_target": {
+    "architecture": "amd64",
+    "cpu_count": 4,
+    "hostname": "v2202611448349549977",
+    "ipv4": "94.16.113.122",
+    "os": "Debian 13",
+    "provider": "Netcup",
+    "ram_available_gib_observed": 7.4,
+    "ram_gib_reported": 7.8,
+    "root_available_gib_observed": 149,
+    "root_filesystem": "/dev/vda4",
+    "root_total_gib_reported": 157,
+    "ssh_user": "deoptops"
+  },
+  "remote_user_owned_staging": {
+    "directory_mode": "0700",
+    "owner": "deoptops",
+    "path": "/home/deoptops/deopt-bootstrap.stage",
+    "system_privilege_used": false,
+    "three_file_sha256_match": true
+  },
+  "software": {
+    "compose_live": "ABSENT",
+    "coolify_live": "ABSENT",
+    "docker_live": "ABSENT",
+    "patched_installer_sha256_offline_test": "adf9ef5d41c3f9d7526b5e46a518c01228c69f7add4c802bd8226df53f1c217c",
+    "reviewed_coolify_version": "4.5.3",
+    "reviewed_helper_version": "1.0.19",
+    "reviewed_official_installer_sha256": "7ef7ff6e5ee4738025d5003cacfca4fcc36df0a8844cc324f6ebb4a20b2dff04",
+    "vendor_hash_drift_policy": "STOP_BEFORE_START"
+  },
+  "ssh": {
+    "agent_forwarding": false,
+    "existing_agent_usable": true,
+    "expected_key_fingerprint": "SHA256:4+ZAflWevkavw030+70CA8xDzkSSNqK7gfoAhEIN6KA",
+    "host_key_pinned": true,
+    "independent_console_host_key_verification": "PENDING_OPERATOR",
+    "independent_second_connection": "PASS",
+    "observed_public_listeners": [
+      "0.0.0.0:22",
+      "[::]:22"
+    ],
+    "observed_root_login_config": "yes; effective post-change pending",
+    "pinned_ed25519_host_fingerprint": "SHA256:cLC+iqPLwsu2CMkzZnFfaIefkljcr9mct2VR0M1mGhQ",
+    "privileged_execution": "PENDING_OPERATOR_INTERACTIVE_SUDO",
+    "ssh_service": "active",
+    "strict_first_connection": "PASS",
+    "sudo_noninteractive": false
+  },
+  "trading_enabled": false,
+  "vercel_modified": false
+}
