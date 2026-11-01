@@ -67,6 +67,8 @@
     "urllib_status": 403,
     "curl_status": 200,
     "curl_redirects": 0,
+    "remote_staged_helper_full_fetch": "PASS_7_PINNED_FILES_UNPRIVILEGED_TEMPORARY",
+    "remote_staging_three_sha256_match": true,
     "pinned_sha256_match": true,
     "download_method": "curl_https_bounded_pinned_sha256",
     "docker_engine": "29.9.2_ACTIVE",

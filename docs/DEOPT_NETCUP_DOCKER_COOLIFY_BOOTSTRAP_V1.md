@@ -88,6 +88,8 @@ Le script de préparation utilise maintenant `curl` avec HTTPS et TLS obligatoir
 
 Validation locale fraîche : 10 tests ciblés PASS (dont HTTP 403, succès, hash différent, téléchargement tronqué ou interrompu et redirection HTTP refusée), syntaxe Python/Bash PASS et téléchargement réel des sept fichiers officiels avec hash et version épinglés PASS dans un répertoire temporaire. Le premier essai local non privilégié avait échoué sur DNS bloqué par le sandbox (`curl 6`) ; le même essai avec accès réseau autorisé a réussi. Aucun installateur n'a été exécuté par ce test.
 
+Validation distante non privilégiée : le helper corrigé a été retransféré seul dans `~/deopt-bootstrap.stage/` ; ses trois empreintes de staging correspondent au tableau. La fonction `prepare()` du fichier stagé a téléchargé et vérifié les sept fichiers officiels dans un répertoire temporaire du VPS, puis ce répertoire a été supprimé automatiquement. Résultat `VPS_VENDOR_FETCH_AND_HASH=PASS count=7`. Aucun fichier sous `/root`, service ou conteneur n'a été modifié par ce test.
+
 Un seul fichier non secret, `prepare_coolify_vendor.py`, a changé. Dans le terminal SSH de l'opérateur, copier **seulement** ce fichier depuis le staging dans le répertoire root-owned existant, avec arrêt sur toute erreur :
 
 ```bash
