@@ -76,7 +76,7 @@ fi
 /usr/sbin/sshd -t
 for client_addr in 203.0.113.5 2001:db8::5; do
   /usr/sbin/sshd -T -C "user=root,host=localhost,addr=$client_addr" |
-    grep -qx 'permitrootlogin prohibit-password' || { echo 'Root password SSH still permitted' >&2; exit 2; }
+    grep -Eqx 'permitrootlogin (prohibit-password|without-password)' || { echo 'Root password SSH still permitted' >&2; exit 2; }
 done
 systemctl reload ssh
 echo 'SSH_ROOT_PASSWORD_LOGIN=DISABLED; DEOPTOPS_PASSWORD_SETTING_UNCHANGED'

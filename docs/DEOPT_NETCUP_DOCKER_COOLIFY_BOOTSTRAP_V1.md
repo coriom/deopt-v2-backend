@@ -8,24 +8,40 @@ Vérifié le 2026-11-01 UTC, **sans modification du VPS**. Cible unique : `deopt
 
 Fichiers à transférer dans `~/deopt-bootstrap.stage/` (aucun secret) :
 
-Le transfert SFTP/SSH non privilégié a été réalisé le 2026-11-01 ; le dossier distant appartient à `deoptops`, mode `0700`, et les trois SHA-256 distants correspondent au tableau ci-dessous. Aucun fichier système root n'a été modifié par ce transfert.
+Le transfert SFTP/SSH non privilégié a été réalisé le 2026-11-01 ; le dossier distant appartient à `deoptops`, mode `0700`. Le 2026-11-01, le seul script corrigé a été retransféré et les trois SHA-256 distants ont été revérifiés. Aucun fichier système root n'a été modifié par ce transfert.
 
 | Fichier | SHA-256 attendu |
 |---|---|
-| `netcup-docker-coolify-bootstrap.sh` | `4c6b1e4a3d2a0d3bb3c42de4b1ea89d840ed51a5d675dad5cc38b6772ecf2c23` |
+| `netcup-docker-coolify-bootstrap.sh` | `68848fed094e8da65b1214c59bd3c9970aa780ef3f78e58245ba19f3b7c82d2b` |
 | `prepare_coolify_vendor.py` | `48eb61ed1ab3d561e0e9554beb599af7947e238bd362cff7a4e85a1a11ae6af3` |
 | `coolify-loopback.override.yml` | `0df01f752a0959b095738f741bf9f632d7334f0dac914b0ed850ea315cbe9856` |
 
-Les empreintes doivent être recalculées après la dernière révision des scripts et **comparées dans le terminal opérateur** avant puis après la copie root-owned. La copie dans `/root/deopt-bootstrap/` doit appartenir à root, mode `0700` pour le script et `0600` pour ses deux dépendances. Le script refuse toute autre propriété ou mode. La préparation distante user-owned n'accorde aucun privilège ; elle est seulement l'entrée de la copie vérifiée.
+Les empreintes doivent être **comparées automatiquement dans le terminal opérateur** avant puis après la copie root-owned. La copie dans `/root/deopt-bootstrap/` doit appartenir à root, mode `0700` pour le script et `0600` pour ses deux dépendances. Le script refuse toute autre propriété ou mode. La préparation distante user-owned n'accorde aucun privilège ; elle est seulement l'entrée de la copie vérifiée. Le contrôle `sshd -T` accepte exactement `prohibit-password` ou son synonyme OpenSSH `without-password` ; les autres valeurs, une sortie vide et une commande en échec restent refusées. La vérification `sshd -t` reste obligatoire.
 
 Dans **le terminal SSH de l'opérateur** (après contrôle des trois empreintes ci-dessus) :
 
-```sh
+```bash
+set -euo pipefail
+cat <<'SHA' | sha256sum --check --status
+68848fed094e8da65b1214c59bd3c9970aa780ef3f78e58245ba19f3b7c82d2b  /home/deoptops/deopt-bootstrap.stage/netcup-docker-coolify-bootstrap.sh
+48eb61ed1ab3d561e0e9554beb599af7947e238bd362cff7a4e85a1a11ae6af3  /home/deoptops/deopt-bootstrap.stage/prepare_coolify_vendor.py
+0df01f752a0959b095738f741bf9f632d7334f0dac914b0ed850ea315cbe9856  /home/deoptops/deopt-bootstrap.stage/coolify-loopback.override.yml
+SHA
 sudo install -d -o root -g root -m 0700 /root/deopt-bootstrap
 sudo install -o root -g root -m 0700 ~/deopt-bootstrap.stage/netcup-docker-coolify-bootstrap.sh /root/deopt-bootstrap/
 sudo install -o root -g root -m 0600 ~/deopt-bootstrap.stage/prepare_coolify_vendor.py /root/deopt-bootstrap/
 sudo install -o root -g root -m 0600 ~/deopt-bootstrap.stage/coolify-loopback.override.yml /root/deopt-bootstrap/
-sudo sha256sum /root/deopt-bootstrap/netcup-docker-coolify-bootstrap.sh /root/deopt-bootstrap/prepare_coolify_vendor.py /root/deopt-bootstrap/coolify-loopback.override.yml
+cat <<'SHA' | sudo sha256sum --check --status
+68848fed094e8da65b1214c59bd3c9970aa780ef3f78e58245ba19f3b7c82d2b  /root/deopt-bootstrap/netcup-docker-coolify-bootstrap.sh
+48eb61ed1ab3d561e0e9554beb599af7947e238bd362cff7a4e85a1a11ae6af3  /root/deopt-bootstrap/prepare_coolify_vendor.py
+0df01f752a0959b095738f741bf9f632d7334f0dac914b0ed850ea315cbe9856  /root/deopt-bootstrap/coolify-loopback.override.yml
+SHA
+echo 'COPIE_ROOT_OWNED=VERIFIED'
+```
+
+L'exécution est une **commande séparée**, seulement après la vérification :
+
+```sh
 sudo /root/deopt-bootstrap/netcup-docker-coolify-bootstrap.sh --execute
 ```
 

@@ -2,6 +2,7 @@
 
 import json
 from pathlib import Path
+import re
 import shutil
 import subprocess
 from tempfile import TemporaryDirectory
@@ -73,6 +74,36 @@ class NetcupCoolifyTests(unittest.TestCase):
         result = subprocess.run(["bash", str(script)], capture_output=True, text=True, check=False)
         self.assertEqual(result.returncode, 2)
         self.assertIn("Run the reviewed root-owned copy", result.stderr)
+
+    def test_root_ssh_password_check_accepts_only_key_only_values(self):
+        script = (ROOT / "deploy/vps/netcup-docker-coolify-bootstrap.sh").read_text()
+        self.assertIn("set -euo pipefail", script)
+        self.assertIn("/usr/sbin/sshd -t", script)
+        match = re.search(
+            r"/usr/sbin/sshd -T -C \"user=root,host=localhost,addr=\$client_addr\" \|\s*"
+            r"(grep -Eqx '[^']+') \|\|",
+            script,
+        )
+        self.assertIsNotNone(match, "effective sshd check missing")
+        command = match.group(1)
+        for value, expected in (
+            ("permitrootlogin prohibit-password\n", 0),
+            ("permitrootlogin without-password\n", 0),
+            ("permitrootlogin yes\n", 1),
+            ("", 1),
+        ):
+            with self.subTest(value=value):
+                result = subprocess.run(
+                    ["bash", "-o", "pipefail", "-c", f"printf '%s' \"$1\" | {command}", "test", value],
+                    capture_output=True, text=True, check=False,
+                )
+                self.assertEqual(result.returncode, expected)
+        failed_sshd = subprocess.run(
+            ["bash", "-o", "pipefail", "-c",
+             f"{{ printf 'permitrootlogin prohibit-password\\n'; exit 7; }} | {command}"],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertNotEqual(failed_sshd.returncode, 0)
 
 
 if __name__ == "__main__":
