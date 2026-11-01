@@ -1,6 +1,7 @@
 """Offline safety checks for the operator-run Netcup/Coolify preparation."""
 
 import json
+import hashlib
 from pathlib import Path
 import re
 import shutil
@@ -10,7 +11,12 @@ import unittest
 
 import yaml
 
-from .prepare_coolify_vendor import install_port_guard, patch_cdn
+from .prepare_coolify_vendor import (
+    download_curl,
+    install_port_guard,
+    patch_cdn,
+    verify_reviewed_content,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -67,6 +73,62 @@ class NetcupCoolifyTests(unittest.TestCase):
             install_port_guard(b"unreviewed installer")
         patched = install_port_guard('step_start "Pulling images" "coolify · postgres · redis · helper"'.encode())
         self.assertIn(b"Coolify private-port pre-start gate failed", patched)
+
+    def test_curl_recovers_reviewed_content_after_urllib_403(self):
+        content = b"reviewed Coolify fixture"
+        expected = hashlib.sha256(content).hexdigest()
+
+        def successful_curl(command, **kwargs):
+            self.assertIn("--fail", command)
+            self.assertIn("--proto-redir", command)
+            self.assertIn("=https", command)
+            self.assertEqual(command[command.index("--retry") + 1], "2")
+            Path(command[command.index("--output") + 1]).write_bytes(content)
+            return subprocess.CompletedProcess(command, 0, "https://cdn.coollabs.io/coolify/install.sh", "")
+
+        with TemporaryDirectory() as directory:
+            fetched = download_curl("install.sh", Path(directory), runner=successful_curl)
+            verify_reviewed_content("install.sh", fetched, expected)
+            self.assertEqual(fetched, content)
+            self.assertEqual(list(Path(directory).iterdir()), [])
+
+    def test_curl_http_403_fails_without_accepting_body(self):
+        def denied_curl(command, **kwargs):
+            Path(command[command.index("--output") + 1]).write_bytes(b"403 response")
+            return subprocess.CompletedProcess(command, 22, "https://cdn.coollabs.io/coolify/install.sh", "HTTP 403")
+
+        with TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(RuntimeError, "curl 22") as error:
+                download_curl("install.sh", Path(directory), runner=denied_curl)
+            self.assertNotIn("403 response", str(error.exception))
+            self.assertEqual(list(Path(directory).iterdir()), [])
+
+    def test_curl_incomplete_transfer_fails_and_removes_partial_file(self):
+        def interrupted_curl(command, **kwargs):
+            Path(command[command.index("--output") + 1]).write_bytes(b"partial")
+            return subprocess.CompletedProcess(command, 18, "https://cdn.coollabs.io/coolify/install.sh", "")
+
+        with TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(RuntimeError, "curl 18"):
+                download_curl("install.sh", Path(directory), runner=interrupted_curl)
+            self.assertEqual(list(Path(directory).iterdir()), [])
+
+    def test_curl_rejects_non_https_redirect(self):
+        def redirected_curl(command, **kwargs):
+            Path(command[command.index("--output") + 1]).write_bytes(b"content")
+            return subprocess.CompletedProcess(command, 0, "http://example.invalid/install.sh", "")
+
+        with TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "outside HTTPS"):
+                download_curl("install.sh", Path(directory), runner=redirected_curl)
+
+    def test_reviewed_content_rejects_wrong_hash_and_incomplete_download(self):
+        complete = b"reviewed Coolify fixture"
+        expected = hashlib.sha256(complete).hexdigest()
+        for content in (b"changed Coolify fixture", complete[:-1], b""):
+            with self.subTest(content=content):
+                with self.assertRaisesRegex(ValueError, "reviewed Coolify input changed"):
+                    verify_reviewed_content("install.sh", content, expected)
 
     def test_privileged_script_refuses_implicit_execution(self):
         script = ROOT / "deploy/vps/netcup-docker-coolify-bootstrap.sh"

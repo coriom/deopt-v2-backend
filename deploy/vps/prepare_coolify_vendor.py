@@ -8,8 +8,8 @@ import hashlib
 import json
 from pathlib import Path
 import subprocess
+from tempfile import TemporaryDirectory
 from urllib.parse import urlsplit
-from urllib.request import urlopen
 
 CDN = "https://cdn.coollabs.io/coolify"
 VENDOR = Path("/root/deopt-bootstrap/vendor")
@@ -22,6 +22,33 @@ HASHES = {
     "upgrade-postgres.sh": "aa65c277fc13ab5b27c349fbfef12defc59c084b244e4b258329e1f6c570ae8d",
     "versions.json": "3b4e05bb558b7fcca41fae174d750650b83277129dc0d5cbd11418934c292891",
 }
+
+
+def download_curl(name: str, directory: Path, runner=subprocess.run) -> bytes:
+    """Fetch one pinned public input over TLS without exposing its body to logs."""
+    with TemporaryDirectory(prefix=".coolify-fetch-", dir=directory) as temporary:
+        output = Path(temporary) / "download"
+        result = runner(
+            [
+                "curl", "--fail", "--silent", "--show-error", "--location",
+                "--proto", "=https", "--proto-redir", "=https", "--tlsv1.2",
+                "--connect-timeout", "5", "--max-time", "30",
+                "--retry", "2", "--retry-all-errors", "--retry-delay", "1",
+                "--retry-max-time", "60", "--max-filesize", "1000000",
+                "--output", str(output), "--write-out", "%{url_effective}",
+                f"{CDN}/{name}",
+            ], capture_output=True, text=True, check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"Coolify HTTPS download failed: {name} (curl {result.returncode})")
+        if urlsplit(result.stdout.strip()).scheme != "https":
+            raise ValueError(f"Coolify source redirected outside HTTPS: {name}")
+        return output.read_bytes()
+
+
+def verify_reviewed_content(name: str, content: bytes, expected: str) -> None:
+    if len(content) > 1_000_000 or hashlib.sha256(content).hexdigest() != expected:
+        raise ValueError(f"reviewed Coolify input changed: {name}")
 
 
 def patch_cdn(source: bytes, directory: Path) -> bytes:
@@ -60,12 +87,8 @@ def prepare(directory: Path = VENDOR, source_dir: Path | None = None) -> dict:
         if source_dir:
             content = (source_dir / name).read_bytes()
         else:
-            with urlopen(f"{CDN}/{name}", timeout=30) as response:
-                if urlsplit(response.geturl()).scheme != "https":
-                    raise ValueError("Coolify source redirected outside HTTPS")
-                content = response.read(1_000_001)
-        if len(content) > 1_000_000 or hashlib.sha256(content).hexdigest() != expected:
-            raise ValueError(f"reviewed Coolify input changed: {name}")
+            content = download_curl(name, directory)
+        verify_reviewed_content(name, content, expected)
         reviewed[name] = content
     versions = json.loads(reviewed["versions.json"])
     if versions["coolify"]["v4"]["version"] != "4.5.3" or versions["coolify"]["helper"]["version"] != "1.0.19":

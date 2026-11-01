@@ -1,5 +1,7 @@
 # Netcup Debian 13: Docker et Coolify, point de reprise opérateur
 
+**Mise à jour du 2026-11-01 12:54 UTC :** Docker 29.9.2, Compose 5.6.1 et SSH sont actifs sur le VPS. `/data` est absent, seuls les ports SSH écoutent ; l'inventaire Docker des conteneurs exige root et reste non vérifié par `deoptops`. La préparation Coolify s'est arrêtée avant son installation : `urllib` a reçu HTTP 403 sur `upgrade-postgres.sh`, tandis que `curl` a reçu HTTP 200 sans redirection pour ce fichier et son SHA-256 correspond au hash approuvé. La procédure de reprise et ses nouvelles empreintes figurent à la fin de ce document ; la copie intégrale ci-dessous décrit le bootstrap initial et n'est plus nécessaire.
+
 Vérifié le 2026-11-01 UTC, **sans modification du VPS**. Cible unique : `deoptops@94.16.113.122`, hostname `v2202611448349549977`, Debian 13 amd64. L'agent SSH keychain existant a fourni la clé `SHA256:4+ZAflWevkavw030+70CA8xDzkSSNqK7gfoAhEIN6KA`. La clé d'hôte ED25519 connue par WSL est `SHA256:cLC+iqPLwsu2CMkzZnFfaIefkljcr9mct2VR0M1mGhQ` ; **sa comparaison indépendante depuis la console Netcup reste à faire**. Deux connexions strictes, indépendantes et sans agent forwarding ont réussi. `sudo -n` échoue ; **seul l'opérateur peut lancer le bootstrap avec sudo interactif**. Ne jamais communiquer son mot de passe ni la phrase secrète de la clé.
 
 État mesuré : 4 vCPU ; 7,8 Gio de RAM (7,4 Gio disponibles lors du relevé) ; `/` sur `/dev/vda4`, 157 Gio, 149 Gio libres ; SSH actif sur `0.0.0.0:22` et `[::]:22`. Docker, Compose et Coolify absents au contrôle. Les conteneurs étaient inaccessibles parce que Docker est absent, pas prouvés « arrêtés ». Les lignes SSH visibles indiquaient `PermitRootLogin yes` et `PasswordAuthentication yes`; le bootstrap réduit l'accès root à la clé sans supprimer l'accès initial de `deoptops`. Aucun pare-feu utilisateur n'était visible ; les règles effectives privilégiées et l'exposition externe après installation restent à vérifier.
@@ -13,7 +15,7 @@ Le transfert SFTP/SSH non privilégié a été réalisé le 2026-11-01 ; le doss
 | Fichier | SHA-256 attendu |
 |---|---|
 | `netcup-docker-coolify-bootstrap.sh` | `68848fed094e8da65b1214c59bd3c9970aa780ef3f78e58245ba19f3b7c82d2b` |
-| `prepare_coolify_vendor.py` | `48eb61ed1ab3d561e0e9554beb599af7947e238bd362cff7a4e85a1a11ae6af3` |
+| `prepare_coolify_vendor.py` | `160e174c8b4c337b94819377ea6a2cb9b0099705b646bb8b5e0d4c5d3ebe0b95` |
 | `coolify-loopback.override.yml` | `0df01f752a0959b095738f741bf9f632d7334f0dac914b0ed850ea315cbe9856` |
 
 Les empreintes doivent être **comparées automatiquement dans le terminal opérateur** avant puis après la copie root-owned. La copie dans `/root/deopt-bootstrap/` doit appartenir à root, mode `0700` pour le script et `0600` pour ses deux dépendances. Le script refuse toute autre propriété ou mode. La préparation distante user-owned n'accorde aucun privilège ; elle est seulement l'entrée de la copie vérifiée. Le contrôle `sshd -T` accepte exactement `prohibit-password` ou son synonyme OpenSSH `without-password` ; les autres valeurs, une sortie vide et une commande en échec restent refusées. La vérification `sshd -t` reste obligatoire.
@@ -24,7 +26,7 @@ Dans **le terminal SSH de l'opérateur** (après contrôle des trois empreintes 
 set -euo pipefail
 cat <<'SHA' | sha256sum --check --status
 68848fed094e8da65b1214c59bd3c9970aa780ef3f78e58245ba19f3b7c82d2b  /home/deoptops/deopt-bootstrap.stage/netcup-docker-coolify-bootstrap.sh
-48eb61ed1ab3d561e0e9554beb599af7947e238bd362cff7a4e85a1a11ae6af3  /home/deoptops/deopt-bootstrap.stage/prepare_coolify_vendor.py
+160e174c8b4c337b94819377ea6a2cb9b0099705b646bb8b5e0d4c5d3ebe0b95  /home/deoptops/deopt-bootstrap.stage/prepare_coolify_vendor.py
 0df01f752a0959b095738f741bf9f632d7334f0dac914b0ed850ea315cbe9856  /home/deoptops/deopt-bootstrap.stage/coolify-loopback.override.yml
 SHA
 sudo install -d -o root -g root -m 0700 /root/deopt-bootstrap
@@ -33,7 +35,7 @@ sudo install -o root -g root -m 0600 ~/deopt-bootstrap.stage/prepare_coolify_ven
 sudo install -o root -g root -m 0600 ~/deopt-bootstrap.stage/coolify-loopback.override.yml /root/deopt-bootstrap/
 cat <<'SHA' | sudo sha256sum --check --status
 68848fed094e8da65b1214c59bd3c9970aa780ef3f78e58245ba19f3b7c82d2b  /root/deopt-bootstrap/netcup-docker-coolify-bootstrap.sh
-48eb61ed1ab3d561e0e9554beb599af7947e238bd362cff7a4e85a1a11ae6af3  /root/deopt-bootstrap/prepare_coolify_vendor.py
+160e174c8b4c337b94819377ea6a2cb9b0099705b646bb8b5e0d4c5d3ebe0b95  /root/deopt-bootstrap/prepare_coolify_vendor.py
 0df01f752a0959b095738f741bf9f632d7334f0dac914b0ed850ea315cbe9856  /root/deopt-bootstrap/coolify-loopback.override.yml
 SHA
 echo 'COPIE_ROOT_OWNED=VERIFIED'
@@ -78,4 +80,32 @@ Coolify `Settings > Backup` doit sauvegarder **l'instance Coolify**, distincteme
 
 Après l'intervention opérateur, refaire deux connexions SSH indépendantes, `/usr/sbin/sshd -t`, paramètres effectifs root, `docker version`, `docker compose version`, `docker inspect` des bindings, `ss -lnt` IPv4/IPv6, inspection de `DOCKER-USER` et du pare-feu fournisseur, état Coolify et ressources au repos. Tester que l'interface d'inscription **n'est pas accessible directement** depuis l'adresse publique, tout en restant accessible par tunnel. Vérifier qu'aucun conteneur DeOpt, worker ou base DeOpt ne tourne. Ne pas interpréter l'absence de règles UFW comme une preuve de filtrage ; le binding Docker doit être vérifié directement.
 
-Sources officielles revues : [Docker Debian](https://docs.docker.com/engine/install/debian/), [Docker post-install](https://docs.docker.com/engine/install/linux-postinstall/), [Coolify installation](https://coolify.io/docs/start-with-self-hosted), [Coolify SSH](https://coolify.io/docs/core/infrastructure/servers/openssh), [Coolify firewall](https://coolify.io/docs/core/infrastructure/servers/firewall), [Coolify instance backup](https://coolify.io/docs/core/backup-and-recovery/instance-backup). Le script n'a pas été exécuté sur le VPS dans cette étape : `DOCKER`, `COOLIFY_RUNTIME`, `ADMIN_ACCOUNT` et `OFFSITE_RECOVERY` restent **PENDING**.
+Sources officielles revues : [Docker Debian](https://docs.docker.com/engine/install/debian/), [Docker post-install](https://docs.docker.com/engine/install/linux-postinstall/), [Coolify installation](https://coolify.io/docs/start-with-self-hosted), [Coolify SSH](https://coolify.io/docs/core/infrastructure/servers/openssh), [Coolify firewall](https://coolify.io/docs/core/infrastructure/servers/firewall), [Coolify instance backup](https://coolify.io/docs/core/backup-and-recovery/instance-backup). Lors du rapport initial, le script n'avait pas encore été exécuté ; l'état actuel de Docker et Coolify figure dans la mise à jour ci-dessus.
+
+## Reprise ciblée après le HTTP 403
+
+Le script de préparation utilise maintenant `curl` avec HTTPS et TLS obligatoires, redirections limitées à HTTPS, délai et tentatives bornés, limite de taille et vérification des sept SHA-256 inchangés. `--fail` refuse les réponses HTTP en erreur ; un téléchargement incomplet ou un hash différent arrête le bootstrap. Le fichier bloqué a été vérifié directement depuis le VPS avec `curl` : SHA-256 `aa65c277fc13ab5b27c349fbfef12defc59c084b244e4b258329e1f6c570ae8d`. Aucun miroir GitHub n'est nécessaire. Les paquets Docker déjà installés sont réutilisés par le script ; pas de purge ni de réinstallation.
+
+Validation locale fraîche : 10 tests ciblés PASS (dont HTTP 403, succès, hash différent, téléchargement tronqué ou interrompu et redirection HTTP refusée), syntaxe Python/Bash PASS et téléchargement réel des sept fichiers officiels avec hash et version épinglés PASS dans un répertoire temporaire. Le premier essai local non privilégié avait échoué sur DNS bloqué par le sandbox (`curl 6`) ; le même essai avec accès réseau autorisé a réussi. Aucun installateur n'a été exécuté par ce test.
+
+Un seul fichier non secret, `prepare_coolify_vendor.py`, a changé. Dans le terminal SSH de l'opérateur, copier **seulement** ce fichier depuis le staging dans le répertoire root-owned existant, avec arrêt sur toute erreur :
+
+```bash
+set -euo pipefail
+cat <<'SHA' | sha256sum --check --status
+68848fed094e8da65b1214c59bd3c9970aa780ef3f78e58245ba19f3b7c82d2b  /home/deoptops/deopt-bootstrap.stage/netcup-docker-coolify-bootstrap.sh
+160e174c8b4c337b94819377ea6a2cb9b0099705b646bb8b5e0d4c5d3ebe0b95  /home/deoptops/deopt-bootstrap.stage/prepare_coolify_vendor.py
+0df01f752a0959b095738f741bf9f632d7334f0dac914b0ed850ea315cbe9856  /home/deoptops/deopt-bootstrap.stage/coolify-loopback.override.yml
+SHA
+sudo install -o root -g root -m 0600 \
+  /home/deoptops/deopt-bootstrap.stage/prepare_coolify_vendor.py \
+  /root/deopt-bootstrap/prepare_coolify_vendor.py
+cat <<'SHA' | sudo sha256sum --check --status
+68848fed094e8da65b1214c59bd3c9970aa780ef3f78e58245ba19f3b7c82d2b  /root/deopt-bootstrap/netcup-docker-coolify-bootstrap.sh
+160e174c8b4c337b94819377ea6a2cb9b0099705b646bb8b5e0d4c5d3ebe0b95  /root/deopt-bootstrap/prepare_coolify_vendor.py
+0df01f752a0959b095738f741bf9f632d7334f0dac914b0ed850ea315cbe9856  /root/deopt-bootstrap/coolify-loopback.override.yml
+SHA
+echo 'COPIE_ROOT_OWNED=VERIFIED'
+```
+
+Puis lancer séparément `sudo /root/deopt-bootstrap/netcup-docker-coolify-bootstrap.sh --execute`. Le script demande de nouveau `HOSTKEY_VERIFIED` après comparaison indépendante depuis la console Netcup, puis `VERIFIED` après une nouvelle connexion SSH indépendante. Il revérifie Docker, les empreintes Coolify et les ports privés avant le premier démarrage. Un éventuel état Coolify partiel inattendu reste un arrêt obligatoire ; ne pas supprimer `/data` pour contourner ce contrôle.
