@@ -1,0 +1,20 @@
+{
+  "milestone": "DEOPT_GHCR_PRIVATE_IMAGE_RELEASE_V1",
+  "observed_utc": "2026-11-01",
+  "repository": "coriom/deopt-v2-backend",
+  "repository_visibility": "PUBLIC_GITHUB_CONNECTOR",
+  "repository_admin_permission": true,
+  "package_preexistence": "UNKNOWN_PRIVATE_OR_ABSENT",
+  "package_visibility": "NOT_VERIFIED",
+  "publication": "BLOCKED_BEFORE_WORKFLOW_DISPATCH",
+  "registry_digest": null,
+  "workflow": ".github/workflows/publish-private-ghcr.yml",
+  "workflow_trigger": "MANUAL_ONLY",
+  "workflow_permissions": ["contents:read", "packages:write"],
+  "privacy_gate": "EXISTING_PRIVATE_PACKAGE_OR_PRIVATE_REPOSITORY_REQUIRED",
+  "coolify_pull": "DOCUMENTED_NOT_CONFIGURED",
+  "deployment": "NOT_PERFORMED",
+  "frontend_modified": false,
+  "public_blockchain_transactions": 0,
+  "trading_enabled": false
+}

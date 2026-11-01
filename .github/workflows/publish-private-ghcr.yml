@@ -1,0 +1,71 @@
+name: Publish private DeOpt backend image
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: private-ghcr-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.repository == 'coriom/deopt-v2-backend' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out exact source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Prove private GHCR publication is safe
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash deploy/vps/ghcr-private-preflight.sh pre
+
+      - name: Run image release checks
+        run: |
+          set -euo pipefail
+          python3 -m unittest deploy.vps.test_coolify_private_compose deploy.vps.test_release_profile -q
+          bash -n deploy/vps/build-private-image-local.sh deploy/vps/ghcr-private-preflight.sh
+          grep -Fxq '.env*' .dockerignore
+          test -z "$(git ls-files src resources migrations deploy/vps | grep -E '(^|/)(\.env[^/]*|[^/]+\.(pem|key|p12|dmp))$' || true)"
+
+      - name: Log in to GHCR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+
+      - name: Build and publish one commit tag
+        env:
+          IMAGE: ghcr.io/coriom/deopt-v2-backend
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          docker buildx build --platform linux/amd64 --push --provenance=mode=min \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --tag "$IMAGE:sha-$GITHUB_SHA" \
+            --metadata-file "$RUNNER_TEMP/deopt-ghcr-metadata.json" .
+          digest=$(jq -r '."containerimage.digest" // empty' "$RUNNER_TEMP/deopt-ghcr-metadata.json")
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          printf '%s\n' "$digest" >"$RUNNER_TEMP/deopt-ghcr-digest"
+
+      - name: Verify package is private and pull by digest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE: ghcr.io/coriom/deopt-v2-backend
+        run: |
+          set -euo pipefail
+          bash deploy/vps/ghcr-private-preflight.sh post
+          digest=$(cat "$RUNNER_TEMP/deopt-ghcr-digest")
+          docker pull "$IMAGE@$digest"
+          test "$(docker image inspect "$IMAGE@$digest" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$GITHUB_SHA"
+          test "$(docker image inspect "$IMAGE@$digest" --format '{{index .Config.Labels "org.opencontainers.image.source"}}')" = "https://github.com/$GITHUB_REPOSITORY"
+          printf 'SOURCE_COMMIT=%s\nREGISTRY_DIGEST=%s\n' "$GITHUB_SHA" "$digest" >>"$GITHUB_STEP_SUMMARY"
