@@ -1,0 +1,17 @@
+{
+  "report": "DEOPT_R2_ANONYMOUS_CHECK_FIX_V1",
+  "prior_failure": "S3_ENDPOINT_HTTP_400_InvalidArgument",
+  "prior_upload_download": "OPERATOR_REPORTED_SUCCESS_BEFORE_ANONYMOUS_CHECK",
+  "source_of_public_access_truth": "Cloudflare R2 bucket Settings: Public Development URL and Custom Domains",
+  "anonymous_s3_http_400": "INCONCLUSIVE",
+  "anonymous_s3_http_2xx": "HARD_STOP",
+  "private_configuration": "REQUIRES_OPERATOR_DASHBOARD_ATTESTATION",
+  "rclone_credentials": "PRESERVED_ROOT_ONLY",
+  "gpg_public_key": "PRESERVED_ON_VPS",
+  "gpg_private_key": "PRESERVED_OFF_VPS",
+  "postgres_backup": "PENDING_FIRST_DEPLOY",
+  "postgres_restore": "PENDING_FIRST_DEPLOY",
+  "backend_deployed": false,
+  "tests": "targeted S3 HTTP classification and existing release profile tests; Bash syntax",
+  "reference": "https://developers.cloudflare.com/r2/buckets/public-buckets/"
+}

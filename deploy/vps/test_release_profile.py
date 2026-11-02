@@ -87,6 +87,22 @@ class ReadOnlyProfile(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("Run as root", result.stderr)
 
+    def test_r2_s3_http_cannot_prove_private_bucket_settings(self):
+        script = str(ROOT / "deploy/vps/operator-setup-deopt-r2-vps.sh")
+        for code, expected in (("400", "INCONCLUSIVE_HTTP_400"),
+                               ("403", "INCONCLUSIVE_HTTP_403"),
+                               ("404", "INCONCLUSIVE_HTTP_404"),
+                               ("000", "INCONCLUSIVE_TRANSPORT")):
+            with self.subTest(code=code):
+                result = subprocess.run(["bash", script, "--classify-anonymous-s3-http", code],
+                                        capture_output=True, text=True, check=False)
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(result.stdout.strip(), expected)
+        exposed = subprocess.run(["bash", script, "--classify-anonymous-s3-http", "200"],
+                                 capture_output=True, text=True, check=False)
+        self.assertNotEqual(exposed.returncode, 0)
+        self.assertEqual(exposed.stdout.strip(), "PUBLIC_OBJECT_ACCESS_HTTP_200")
+
     def test_recovery_key_script_requires_explicit_operator_mode(self):
         result = subprocess.run(
             ["bash", str(ROOT / "deploy/vps/operator-deopt-backup-key-wsl.sh")],

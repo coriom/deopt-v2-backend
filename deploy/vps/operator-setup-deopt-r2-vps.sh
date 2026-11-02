@@ -8,6 +8,20 @@ bucket='deopt-private-backups'
 stage='/home/deoptops/deopt-bootstrap.stage'
 config='/root/.config/deopt/rclone.conf'
 key_home='/root/.local/share/deopt-backup-gpg'
+classify_anonymous_s3_http() {
+  case "$1" in
+    2[0-9][0-9]) printf 'PUBLIC_OBJECT_ACCESS_HTTP_%s\n' "$1"; return 1 ;;
+    400) printf 'INCONCLUSIVE_HTTP_400\n' ;;
+    000) printf 'INCONCLUSIVE_TRANSPORT\n' ;;
+    [0-9][0-9][0-9]) printf 'INCONCLUSIVE_HTTP_%s\n' "$1" ;;
+    *) printf 'INCONCLUSIVE_TRANSPORT\n' ;;
+  esac
+}
+if [[ "${1:-}" == '--classify-anonymous-s3-http' ]]; then
+  [[ $# == 2 ]] || exit 2
+  classify_anonymous_s3_http "$2"
+  exit $?
+fi
 [[ ${EUID} == 0 && $# == 1 && "$1" =~ ^[0-9A-Fa-f]{40}$ ]] || {
   echo 'Run as root with the reviewed 40-character GPG fingerprint' >&2; exit 2;
 }
@@ -70,14 +84,20 @@ if RCLONE_CONFIG_DEOPT_R2_ACCESS_KEY_ID='INVALID_TEST_KEY' \
    rclone --config "$config" cat "deopt_r2:$bucket/$object" >/dev/null 2>&1; then
   echo 'Invalid credentials unexpectedly succeeded' >&2; exit 1
 fi
-anonymous_code="$(curl --silent --show-error --location --max-time 12 --output /dev/null --write-out '%{http_code}' "$endpoint/$bucket/$object" 2>/dev/null)" || {
-  echo 'Anonymous access check inconclusive' >&2; exit 1;
+anonymous_code="$(curl --silent --show-error --location --max-time 12 --output /dev/null --write-out '%{http_code}' "$endpoint/$bucket/$object" 2>/dev/null)" || anonymous_code='TRANSPORT_ERROR'
+anonymous_status="$(classify_anonymous_s3_http "$anonymous_code")" || {
+  echo 'Unauthenticated S3 request accessed the probe object; stop and investigate public access' >&2; exit 1;
 }
-[[ "$anonymous_code" == 403 || "$anonymous_code" == 404 ]] || {
-  echo 'Anonymous object access not proven denied' >&2; exit 1;
+# S3 endpoint responses do not establish r2.dev or Custom Domain exposure.
+[[ -r /dev/tty && -w /dev/tty ]] || { echo 'Cloudflare dashboard attestation requires an interactive terminal' >&2; exit 2; }
+printf 'Confirm in Cloudflare R2 > deopt-private-backups > Settings: Public Development URL is disabled AND no Custom Domain has Access to Bucket allowed.\nType PRIVATE deopt-private-backups to attest these two settings: ' >/dev/tty
+IFS= read -r public_access_attestation </dev/tty
+[[ "$public_access_attestation" == 'PRIVATE deopt-private-backups' ]] || {
+  echo 'Cloudflare public-access configuration not attested' >&2; exit 1;
 }
+unset public_access_attestation
 probe_stage="$(mktemp -d "$stage/probe.XXXXXXXX")"
 install -m 0600 "$work/download.gpg" "$probe_stage/probe.gpg"
 chown -R deoptops:deoptops "$probe_stage"
-printf 'R2_ENDPOINT=CONFIGURED\nRCLONE_AUTH=PASS\nGPG_PUBLIC_KEY_ON_VPS=PASS\nSYNTHETIC_ENCRYPTION=PASS\nR2_UPLOAD=PASS\nR2_DOWNLOAD=PASS\nSHA256_INTEGRITY=PASS\nBAD_CREDENTIALS=REJECTED\nANONYMOUS_OBJECT=DENIED_%s\nPROBE_STAGE=%s\nPLAINTEXT_SHA256=%s\nCIPHERTEXT_SHA256=%s\n' \
-  "$anonymous_code" "$(basename "$probe_stage")" "$plain_sha" "$cipher_sha"
+printf 'R2_ENDPOINT=CONFIGURED\nRCLONE_AUTH=PASS\nGPG_PUBLIC_KEY_ON_VPS=PASS\nSYNTHETIC_ENCRYPTION=PASS\nR2_UPLOAD=PASS\nR2_DOWNLOAD=PASS\nSHA256_INTEGRITY=PASS\nBAD_CREDENTIALS=REJECTED\nS3_ANONYMOUS_CHECK=%s\nCLOUDFLARE_PUBLIC_ACCESS=OPERATOR_ATTESTED_NOT_API_VERIFIED\nPROBE_STAGE=%s\nPLAINTEXT_SHA256=%s\nCIPHERTEXT_SHA256=%s\n' \
+  "$anonymous_status" "$(basename "$probe_stage")" "$plain_sha" "$cipher_sha"
