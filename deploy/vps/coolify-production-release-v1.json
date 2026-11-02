@@ -1,0 +1,18 @@
+{
+  "release": "DEOPT_COOLIFY_PRIVATE_PRODUCTION_V1",
+  "backend_image": "ghcr.io/coriom/deopt-v2-backend@sha256:b7ed384e9cae879579cf255fac79cce087de7f7c6922e65940c1147c78382436",
+  "backend_source_commit": "e2f139fc33286fea06d94989b31ab9d33aab8b98",
+  "postgres_image": "postgres:16@sha256:5db6dac2ef5dcff512f4f00a009c3c332b9f2f28f24277175bf3e4a3d02ef83a",
+  "postgres_version_from_registry": "16.15",
+  "cors_origin": "https://deoptv2-frontend.vercel.app",
+  "postgres_password_file": "/srv/deopt/production/secrets/postgres_password",
+  "compose_source": "compose.coolify-readonly.yml",
+  "coolify_project": "DeOpt",
+  "coolify_environment": "production",
+  "coolify_resource_type": "Git Docker Compose Application",
+  "compose_mode": "Raw",
+  "deployment_mode": "Manual only",
+  "public_domain": null,
+  "deployment_authorization": "SESSION_SCOPED_AND_CONDITIONAL; manifest grants no permission",
+  "deployment_eligible_only_after_real_render_validation": true
+}

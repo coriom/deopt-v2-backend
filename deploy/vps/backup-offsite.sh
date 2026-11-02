@@ -59,4 +59,5 @@ rclone copyto "$tmpdir/$object" "$DEOPT_BACKUP_REMOTE/$object"
 local_hash="$(sha256sum "$tmpdir/$object" | cut -d ' ' -f 1)"
 remote_hash="$(rclone cat "$DEOPT_BACKUP_REMOTE/$object" | sha256sum | cut -d ' ' -f 1)"
 [[ "$local_hash" == "$remote_hash" ]] || { echo 'OFFSERVER_CIPHERTEXT_HASH_MISMATCH' >&2; exit 1; }
-echo 'ENCRYPTED_OFFSERVER_BACKUP=UPLOADED_AND_RETRIEVED; RESTORE_NOT_YET_VERIFIED'
+printf 'ENCRYPTED_OFFSERVER_BACKUP=UPLOADED_AND_RETRIEVED\nBACKUP_OBJECT=%s\nCIPHERTEXT_SHA256=%s\nRESTORE_NOT_YET_VERIFIED=YES\n' \
+  "$DEOPT_BACKUP_REMOTE/$object" "$local_hash"

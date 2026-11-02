@@ -173,6 +173,8 @@ class ReadOnlyProfile(unittest.TestCase):
             self.assertEqual((root / "remote-ciphertext").read_bytes(), b"fixture-pgdump")
             self.assertRegex((root / "remote-path").read_text(),
                              r"^remote:deopt/\d{8}T\d{6}Z-[0-9a-f]{32}\.dump\.gpg$")
+            self.assertIn("BACKUP_OBJECT=" + (root / "remote-path").read_text(), result.stdout)
+            self.assertIn("CIPHERTEXT_SHA256=", result.stdout)
 
 
 if __name__ == "__main__":

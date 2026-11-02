@@ -76,6 +76,31 @@ class CoolifyPrivateComposeTests(unittest.TestCase):
         with self.assertRaisesRegex(PrivateComposeError, "POSTGRES_RELEASE_SECRET_PATH"):
             check(candidate, release)
 
+    def test_production_manifest_is_private_and_separate_from_staging(self):
+        staging = json.loads((ROOT / "deploy/vps/coolify-staging-release-v1.json").read_text())
+        production = json.loads((ROOT / "deploy/vps/coolify-production-release-v1.json").read_text())
+        self.assertNotEqual(production["postgres_password_file"], staging["postgres_password_file"])
+        self.assertEqual(production["backend_image"], staging["backend_image"])
+        self.assertEqual(production["postgres_image"], staging["postgres_image"])
+        self.assertEqual(production["coolify_environment"], "production")
+        env = dict(os.environ)
+        env.update(DEOPT_BACKEND_IMAGE=production["backend_image"],
+                   DEOPT_POSTGRES_IMAGE=production["postgres_image"],
+                   DEOPT_CORS_ORIGIN=production["cors_origin"],
+                   DEOPT_POSTGRES_PASSWORD_FILE=production["postgres_password_file"])
+        result = subprocess.run(
+            ["docker", "compose", "-f", str(ROOT / "compose.coolify-readonly.yml"),
+             "config", "--format", "json"],
+            env=env, capture_output=True, text=True, check=True)
+        check(json.loads(result.stdout), production)
+
+    def test_production_secret_setup_requires_reviewed_root_host(self):
+        script = ROOT / "deploy/vps/operator-create-production-secret.sh"
+        subprocess.run(["bash", "-n", str(script)], check=True)
+        result = subprocess.run(["bash", str(script)], capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("Root on reviewed Netcup host required", result.stderr)
+
     def test_rejects_published_port_and_proxy_route(self):
         self.reject(lambda x: x["services"]["backend"].update(ports=[{"published": 8080, "target": 8080}]),
                     "BACKEND_PUBLISHED_PORT")

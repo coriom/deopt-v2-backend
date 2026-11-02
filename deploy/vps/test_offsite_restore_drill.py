@@ -56,6 +56,21 @@ class RestoreDrillTests(unittest.TestCase):
         self.assertIn("not empty", result.stderr)
         self.assertFalse(self.target.exists())
 
+    def test_local_ciphertext_restore_and_permissions(self):
+        cipher = Path(self.tmp.name) / "download.dump.gpg"
+        cipher.write_bytes(b"encrypted-local-fixture")
+        cipher.chmod(0o600)
+        self.env["DEOPT_BACKUP_LOCAL_CIPHERTEXT"] = str(cipher)
+        result = self.run_script()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.target.read_bytes(), b"encrypted-local-fixture")
+        self.target.unlink()
+        cipher.chmod(0o644)
+        result = self.run_script()
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("mode-0600", result.stderr)
+        self.assertFalse(self.target.exists())
+
 
 if __name__ == "__main__":
     unittest.main()
