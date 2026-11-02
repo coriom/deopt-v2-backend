@@ -1,0 +1,28 @@
+{
+  "report": "DEOPT_R2_ENCRYPTED_BACKUP_SETUP_V1",
+  "source_commit_at_start": "0c983d01ae7b3b78251c07c9c6980222050e8d83",
+  "bucket": "deopt-private-backups",
+  "endpoint": "https://77dc4e907cd36ee29964c8aff47f7c38.r2.cloudflarestorage.com",
+  "bucket_public_access": "OPERATOR_REPORTED_DISABLED",
+  "rclone_on_vps": "MISSING_AT_PREPARATION; Debian 13 candidate 1.60.1+dfsg-4",
+  "vps_gpg": "2.4.7_INSTALLED",
+  "wsl_gpg": "2.4.4_INSTALLED",
+  "operator_only_secret_setup": "PREPARED_NOT_EXECUTED",
+  "root_only_rclone_config": "/root/.config/deopt/rclone.conf",
+  "public_key_gnupg_home": "/root/.local/share/deopt-backup-gpg",
+  "synthetic_r2_upload": "PENDING_OPERATOR_CREDENTIAL_ENTRY",
+  "synthetic_r2_download": "PENDING_OPERATOR_CREDENTIAL_ENTRY",
+  "off_host_decryption": "PENDING_OPERATOR_PRIVATE_KEY",
+  "postgres_backup": "PENDING_FIRST_DEPLOY",
+  "postgres_restore": "PENDING_FIRST_DEPLOY",
+  "retention": "PROPOSED_14_DAYS_NOT_ENABLED; reference backups excluded",
+  "schedule": "NOT_ENABLED",
+  "backend_deployed": false,
+  "public_blockchain_transactions": 0,
+  "tests": "bash syntax; focused release-profile unittest; git diff --check",
+  "limitations": [
+    "Operator credentials and passphrases must never be handled by Codex",
+    "No R2 upload, downloaded ciphertext or off-host decryption is claimed before operator-run probe",
+    "The synthetic probe cannot establish a PostgreSQL restore"
+  ]
+}

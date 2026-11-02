@@ -51,11 +51,12 @@ on_exit() {
 }
 trap on_exit EXIT
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+object="$stamp-$(openssl rand -hex 16).dump.gpg"
 "${dump_command[@]}" | gpg --batch --yes --trust-model always --encrypt \
-  --recipient "$DEOPT_BACKUP_RECIPIENT" --output "$tmpdir/$stamp.dump.gpg"
-test -s "$tmpdir/$stamp.dump.gpg"
-rclone copyto "$tmpdir/$stamp.dump.gpg" "$DEOPT_BACKUP_REMOTE/$stamp.dump.gpg"
-local_hash="$(sha256sum "$tmpdir/$stamp.dump.gpg" | cut -d ' ' -f 1)"
-remote_hash="$(rclone cat "$DEOPT_BACKUP_REMOTE/$stamp.dump.gpg" | sha256sum | cut -d ' ' -f 1)"
+  --recipient "$DEOPT_BACKUP_RECIPIENT" --output "$tmpdir/$object"
+test -s "$tmpdir/$object"
+rclone copyto "$tmpdir/$object" "$DEOPT_BACKUP_REMOTE/$object"
+local_hash="$(sha256sum "$tmpdir/$object" | cut -d ' ' -f 1)"
+remote_hash="$(rclone cat "$DEOPT_BACKUP_REMOTE/$object" | sha256sum | cut -d ' ' -f 1)"
 [[ "$local_hash" == "$remote_hash" ]] || { echo 'OFFSERVER_CIPHERTEXT_HASH_MISMATCH' >&2; exit 1; }
 echo 'ENCRYPTED_OFFSERVER_BACKUP=UPLOADED_AND_RETRIEVED; RESTORE_NOT_YET_VERIFIED'

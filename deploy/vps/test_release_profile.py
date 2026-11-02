@@ -80,6 +80,20 @@ class ReadOnlyProfile(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("DEOPT_BACKUP_REMOTE", result.stderr)
 
+    def test_r2_operator_setup_refuses_unprivileged_execution(self):
+        result = subprocess.run(
+            ["bash", str(ROOT / "deploy/vps/operator-setup-deopt-r2-vps.sh"), "0" * 40],
+            capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("Run as root", result.stderr)
+
+    def test_recovery_key_script_requires_explicit_operator_mode(self):
+        result = subprocess.run(
+            ["bash", str(ROOT / "deploy/vps/operator-deopt-backup-key-wsl.sh")],
+            capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("usage:", result.stderr)
+
     def test_coolify_backup_rejects_unreviewed_project_and_image(self):
         script = ROOT / "deploy/vps/backup-offsite.sh"
         with tempfile.TemporaryDirectory() as tmp:
@@ -122,8 +136,8 @@ class ReadOnlyProfile(unittest.TestCase):
                        "done\n"
                        "cat > \"$out\"\n",
                 "rclone": "case \"$1\" in\n"
-                          "copyto) cp \"$2\" \"$DEOPT_TEST_BACKUP_OBJECT\";;\n"
-                          "cat) cat \"$DEOPT_TEST_BACKUP_OBJECT\";;\n"
+                          "copyto) printf '%s' \"$3\" > \"$DEOPT_TEST_BACKUP_PATH\"; cp \"$2\" \"$DEOPT_TEST_BACKUP_OBJECT\";;\n"
+                          "cat) test \"$2\" = \"$(cat \"$DEOPT_TEST_BACKUP_PATH\")\" || exit 98; cat \"$DEOPT_TEST_BACKUP_OBJECT\";;\n"
                           "*) exit 99;;\n"
                           "esac\n",
             }.items():
@@ -134,12 +148,15 @@ class ReadOnlyProfile(unittest.TestCase):
             env.update(PATH=f"{tmp}:{env['PATH']}", DEOPT_BACKUP_RECIPIENT="0" * 40,
                        DEOPT_BACKUP_REMOTE="remote:deopt", DEOPT_COMPOSE_PROJECT="deopt_staging",
                        DEOPT_BACKUP_POSTGRES_IMAGE="postgres:16@sha256:5db6dac2ef5dcff512f4f00a009c3c332b9f2f28f24277175bf3e4a3d02ef83a",
-                       DEOPT_TEST_BACKUP_OBJECT=str(root / "remote-ciphertext"))
+                       DEOPT_TEST_BACKUP_OBJECT=str(root / "remote-ciphertext"),
+                       DEOPT_TEST_BACKUP_PATH=str(root / "remote-path"))
             result = subprocess.run(["bash", str(script)], env=env,
                                     capture_output=True, text=True, check=False)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("UPLOADED_AND_RETRIEVED", result.stdout)
             self.assertEqual((root / "remote-ciphertext").read_bytes(), b"fixture-pgdump")
+            self.assertRegex((root / "remote-path").read_text(),
+                             r"^remote:deopt/\d{8}T\d{6}Z-[0-9a-f]{32}\.dump\.gpg$")
 
 
 if __name__ == "__main__":
