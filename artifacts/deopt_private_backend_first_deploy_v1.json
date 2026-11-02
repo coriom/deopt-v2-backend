@@ -1,0 +1,80 @@
+{
+  "report": "DEOPT_PRIVATE_BACKEND_FIRST_DEPLOY_V1",
+  "chain_id": 84532,
+  "source_commit": "65115765e4e9e439c1663530fa69865d9eb21cda",
+  "backend_image_source_commit": "e2f139fc33286fea06d94989b31ab9d33aab8b98",
+  "coolify_resource": "dxco90jwpdxyennmquv2elyj",
+  "coolify_project": "DeOpt/production",
+  "predeploy": {
+    "raw_compose": "PASS_FOR_SELECTED_SOURCE",
+    "commit_pinned": "65115765e4e9e439c1663530fa69865d9eb21cda",
+    "validator": "PRIVATE_COMPOSE=PASS",
+    "targeted_validator_tests": "14 PASS",
+    "postgres_secret_uid_1001_read": "PASS",
+    "postgres_secret_value_printed": false
+  },
+  "deployment": {
+    "first_coolify_deployment_id": "fxsu1upif95c8zyhzrhu1upu",
+    "controlled_redeploy_id": "0l6mkyjcc01jexlhii39mow2",
+    "status": "PASS_PRIVATE_RUNTIME",
+    "runtime_verifier": "PRIVATE_PRODUCTION_RUNTIME=PASS",
+    "postgres_volume": "dxco90jwpdxyennmquv2elyj_postgres_data",
+    "migrations": 71,
+    "same_volume_after_redeploy": true,
+    "backend_and_postgres_image_digests": "PASS",
+    "network_isolation": "PASS",
+    "published_deopt_ports": 0,
+    "secret_mount": "PASS",
+    "backend_nonroot_readonly": "PASS",
+    "economic_flags": "DISABLED"
+  },
+  "http_status": {
+    "health": 200,
+    "ready": 200,
+    "market_unavailable": 503,
+    "wallet_history_blocked": 403,
+    "write_rejected": 405
+  },
+  "resource_sample": {
+    "backend_cpu_percent": 0.01,
+    "backend_memory_mib": 9.199,
+    "postgres_cpu_percent": 0.08,
+    "postgres_memory_mib": 21.9,
+    "limitation": "Point-in-time idle sample, not a sustained capacity benchmark"
+  },
+  "backup": {
+    "real_r2_upload": "PASS_UPLOADED_AND_RETRIEVED",
+    "object": "deopt_r2:deopt-private-backups/postgres/20261102T110240Z-502e9a2d5027b8c6dda858b444d3818b.dump.gpg",
+    "ciphertext_sha256": "32ee356c97844bc0b1f017de5a82a56f34049128472e9a0c3331058d4deb3085",
+    "offhost_ciphertext_integrity": "PASS_48512_BYTES_SHA256_MATCH",
+    "r2_retry_observation": "Initial 501 NotImplemented from rclone copy, second of three bounded attempts succeeded; downloaded ciphertext hash matched",
+    "isolated_postgres_restore": "PASS",
+    "restore_method": "Interactive WSL GPG decryption streamed into a network-isolated disposable PostgreSQL 16 container with pg_restore --single-transaction --exit-on-error",
+    "restored_public_tables": 93,
+    "restored_migration_rows": 71,
+    "restored_migration_sha384_matches_source": "71/71",
+    "restored_nonmigration_rows": 0,
+    "failed_restore_target_table_count": 0,
+    "local_restore_target": "Disposable PostgreSQL 16, network none, no published ports"
+  },
+  "public_api": "DISABLED",
+  "trading": "DISABLED",
+  "public_blockchain_transactions_by_codex": "NONE",
+  "vercel_changed": false,
+  "proxy_changed": false,
+  "private_backend_runtime_operational": true,
+  "full_private_release_acceptance": "PASS_PRIVATE_READ_ONLY_SCOPE",
+  "daily_backup_scheduler": "NOT_ENABLED_PENDING_OPERATOR_ALERT_DESTINATION_AND_TIMER_REVIEW",
+  "targeted_tests": [
+    "14 Coolify Compose validator tests PASS",
+    "Bash syntax for backup and restore scripts PASS",
+    "Runtime verifier Python compilation PASS",
+    "Backup operator script rejects non-root host PASS",
+    "Restore script rejects wrong ciphertext hash PASS",
+    "Restore script rejects absent local GPG private key before pg_restore PASS",
+    "Disposable restore database remained empty after failed decryption PASS",
+    "Real encrypted R2 dump restored in isolated PostgreSQL 16 PASS",
+    "71/71 SQLx migration SHA-384 checksums matched source PASS",
+    "93 restored public tables and zero nonmigration rows verified PASS"
+  ]
+}

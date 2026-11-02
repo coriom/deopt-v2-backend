@@ -1,0 +1,57 @@
+{
+  "report": "DEOPT_COOLIFY_PLAYWRIGHT_AUTOMATION_V1",
+  "observed_at_utc": "2026-11-02T10:16:46Z",
+  "coolify_version": "4.5.3",
+  "access": "Private SSH tunnel; isolated Playwright Chromium; operator completed login and 2FA personally",
+  "brave_mcp": "UNAVAILABLE_TIMEOUT; personal Brave profile untouched",
+  "production_resource": {
+    "project": "DeOpt",
+    "environment": "production",
+    "resource_uuid": "dxco90jwpdxyennmquv2elyj",
+    "type": "Git Docker Compose Application",
+    "repository": "coriom/deopt-v2-backend",
+    "branch": "main",
+    "build_pack": "Compose",
+    "compose_path": "/compose.coolify-readonly.yml",
+    "compose_mode": "Raw (deploy file as-is)",
+    "auto_deploy": "Manual deployments only",
+    "public_domains": 0,
+    "status": "Exited",
+    "deployment_performed": false
+  },
+  "environment_variables_saved": [
+    "DEOPT_BACKEND_IMAGE",
+    "DEOPT_POSTGRES_IMAGE",
+    "DEOPT_CORS_ORIGIN",
+    "DEOPT_POSTGRES_PASSWORD_FILE"
+  ],
+  "variable_source": "deploy/vps/coolify-production-release-v1.json; names recorded without values",
+  "loaded_compose_source": {
+    "private_local_copy": "/tmp/deopt-coolify-production-loaded-source.yml",
+    "mode": "0600",
+    "sha256": "f525ee01ef82a7f1e29c974d5c937b84a9f2bd8d04619a7cee322b24863425fa",
+    "repository_file_sha256": "524bd14b0cb6d23672eabb7c793c2c649f2c760651370d33592c1a6622745f82",
+    "difference": "Only the repository file's final newline is absent in Coolify's editor model"
+  },
+  "generated_compose_export": {
+    "status": "NOT_VERIFIED",
+    "reason": "The General page's Show deployable compose control is hidden by x-show=false in Raw mode; no generated preview was exported before deployment"
+  },
+  "local_compose_validation": {
+    "status": "PASS_FOR_LOADED_SOURCE_ONLY",
+    "method": "docker compose -f /tmp/deopt-coolify-production-loaded-source.yml config --format json with four reviewed nonsecret manifest variables, then check_coolify_private_compose.py --release-manifest",
+    "normalized_copy": "/tmp/deopt-coolify-production-normalized.json",
+    "normalized_sha256": "05f50d423a019b962e32333b4a54dc69335711f8fe583ca4707466cef67e94bf",
+    "result": "PRIVATE_COMPOSE=PASS; DEPLOYMENT_NOT_AUTHORIZED"
+  },
+  "actual_coolify_generated_compose_validation": "NOT_VERIFIED",
+  "security_boundaries": {
+    "secrets_read": false,
+    "personal_browser_profile_modified": false,
+    "deploy_clicked": false,
+    "deopt_containers_started": false,
+    "proxy_modified": false,
+    "vercel_modified": false
+  },
+  "next_gate": "Obtain a supported Coolify predeploy generated-Compose preview for this Raw application, or retain the actual-render gate as unverified before any separate deployment authorization"
+}
