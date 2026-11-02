@@ -56,7 +56,9 @@ def check(rendered: dict, release: dict | None = None) -> None:
     require(set(services) == {"postgres", "backend"}, "SERVICES")
     require(isinstance(rendered.get("networks"), dict), "NETWORKS")
     networks = rendered["networks"]
+    require(set(networks) == {"db", "web"}, "NETWORK_SET")
     for name, service in services.items():
+        require(not service.get("env_file"), f"{name.upper()}_UNREVIEWED_ENV_FILE")
         require(not service.get("ports"), f"{name.upper()}_PUBLISHED_PORT")
         require(not service.get("build"), f"{name.upper()}_BUILD")
         require(not service.get("privileged"), f"{name.upper()}_PRIVILEGED")
@@ -80,10 +82,10 @@ def check(rendered: dict, release: dict | None = None) -> None:
     require(bool(re.fullmatch(r"postgres:16(?:[.-][^@]+)?@sha256:[0-9a-f]{64}", postgres["image"])),
             "POSTGRES_MAJOR_VERSION")
     pg_networks = network_names(postgres)
-    require(len(pg_networks) == 1, "POSTGRES_NETWORK_COUNT")
-    db_network = next(iter(pg_networks))
+    require(pg_networks == {"db"}, "POSTGRES_NETWORK_COUNT")
+    db_network = "db"
     require(bool(networks[db_network].get("internal")), "POSTGRES_NETWORK_NOT_INTERNAL")
-    require(db_network in network_names(backend), "BACKEND_DB_NETWORK")
+    require(network_names(backend) == {"db", "web"}, "BACKEND_NETWORK_SET")
     volumes = rendered.get("volumes", {})
     require(isinstance(volumes, dict), "VOLUME_DEFINITIONS")
     require(any(mount.get("type") == "volume" and mount.get("target") == "/var/lib/postgresql/data"

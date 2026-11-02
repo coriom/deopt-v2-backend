@@ -87,6 +87,14 @@ class CoolifyPrivateComposeTests(unittest.TestCase):
         self.reject(lambda x: x["networks"]["db"].update(internal=False), "POSTGRES_NETWORK_NOT_INTERNAL")
         self.reject(lambda x: x["services"]["postgres"].update(ports=[{"published": 5432, "target": 5432}]),
                     "POSTGRES_PUBLISHED_PORT")
+        self.reject(lambda x: x["services"]["backend"].update(networks={"db": None}),
+                    "BACKEND_NETWORK_SET")
+        self.reject(lambda x: x["networks"].update(extra={"internal": True}),
+                    "NETWORK_SET")
+
+    def test_rejects_unreviewed_env_file(self):
+        self.reject(lambda x: x["services"]["backend"].update(env_file=["/data/coolify/generated/.env"]),
+                    "BACKEND_UNREVIEWED_ENV_FILE")
 
     def test_rejects_missing_persistence_or_secret_mount(self):
         self.reject(lambda x: x["services"]["postgres"].update(volumes=[]), "POSTGRES_PERSISTENCE")
