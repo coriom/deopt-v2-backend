@@ -65,6 +65,16 @@
   "private_backend_runtime_operational": true,
   "full_private_release_acceptance": "PASS_PRIVATE_READ_ONLY_SCOPE",
   "daily_backup_scheduler": "NOT_ENABLED_PENDING_OPERATOR_ALERT_DESTINATION_AND_TIMER_REVIEW",
+  "daily_backup_preparation": {
+    "runner": "deploy/vps/run-daily-production-backup.sh",
+    "service": "deploy/vps/systemd/deopt-production-backup.service",
+    "timer": "deploy/vps/systemd/deopt-production-backup.timer",
+    "calendar": "02:00 UTC daily with 15-minute randomized delay",
+    "nonoverlap_lock": true,
+    "automatic_retention": false,
+    "installed_on_vps": false,
+    "operator_alert_destination": "NOT_SELECTED"
+  },
   "targeted_tests": [
     "14 Coolify Compose validator tests PASS",
     "Bash syntax for backup and restore scripts PASS",
@@ -75,6 +85,8 @@
     "Disposable restore database remained empty after failed decryption PASS",
     "Real encrypted R2 dump restored in isolated PostgreSQL 16 PASS",
     "71/71 SQLx migration SHA-384 checksums matched source PASS",
-    "93 restored public tables and zero nonmigration rows verified PASS"
+    "93 restored public tables and zero nonmigration rows verified PASS",
+    "Daily runner Bash syntax and nonroot refusal PASS",
+    "Systemd calendar and unit/timer syntax with staged executable PASS"
   ]
 }
