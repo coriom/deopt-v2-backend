@@ -1,0 +1,10 @@
+[Unit]
+Description=Retry queued DeOpt Discord backup alerts every 15 minutes
+
+[Timer]
+OnCalendar=*-*-* *:00/15:00 UTC
+Persistent=true
+Unit=deopt-backup-alert-retry.service
+
+[Install]
+WantedBy=timers.target

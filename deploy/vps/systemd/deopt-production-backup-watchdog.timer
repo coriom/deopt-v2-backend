@@ -1,0 +1,10 @@
+[Unit]
+Description=Hourly check for a missing DeOpt offsite backup
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+Unit=deopt-production-backup-watchdog.service
+
+[Install]
+WantedBy=timers.target

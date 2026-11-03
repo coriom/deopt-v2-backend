@@ -1,0 +1,14 @@
+[Unit]
+Description=Discord alert for failed DeOpt backup unit %i
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+LoadCredential=discord_webhook:/etc/deopt/backup-discord-webhook
+ExecStart=/usr/local/sbin/deopt-backup-discord-alert %i
+TimeoutStartSec=60s
+StandardOutput=journal
+StandardError=journal

@@ -1,0 +1,23 @@
+{
+  "report": "DEOPT_PRODUCTION_AUTOMATED_BACKUP_V1",
+  "source_head_before_change": "480abf976c4a91dad12213afa7a3fb2a6ddd93d8",
+  "target_host": "v2202611448349549977",
+  "coolify_project": "dxco90jwpdxyennmquv2elyj",
+  "backup_schedule": "02:00 UTC daily plus at most 15 minutes random delay; persistent catch-up",
+  "backup_nonoverlap": "exclusive flock",
+  "missing_backup_detection": "hourly; anomaly after more than 36 hours without verified R2 success",
+  "discord_notification": {
+    "status": "PENDING_OPERATOR_SECRET_AND_SYNTHETIC_RECEIPT",
+    "fields": ["service", "utc", "state", "execution_id"],
+    "webhook_transport": "systemd LoadCredential from root-only file; HTTPS wait=true and message ID required",
+    "delivery": "three bounded immediate attempts plus persistent root-only queue and 15-minute retry timer",
+    "secret_value_recorded": false
+  },
+  "bundle_manifest_sha256": "7f9b11ce834c38318e66de02e6f6259769eff54d155cb156ff7f726396d6495c",
+  "installer_sha256": "54147fcd2fdb87f45d4858810f9211370abd25b5b280ea926a8792a56b853938",
+  "installation": "NOT_PERFORMED_YET",
+  "timer_activation": "NOT_VERIFIED_YET",
+  "r2_retention_deletion": "DISABLED",
+  "external_vps_outage_monitor": "NOT_CONFIGURED_SEPARATE_REQUIREMENT",
+  "production_database_mutated_by_preparation": false
+}

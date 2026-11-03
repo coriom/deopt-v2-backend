@@ -1,0 +1,14 @@
+[Unit]
+Description=Retry queued DeOpt Discord backup alerts
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+LoadCredential=discord_webhook:/etc/deopt/backup-discord-webhook
+ExecStart=/usr/local/sbin/deopt-backup-discord-alert --retry-pending
+TimeoutStartSec=3min
+StandardOutput=journal
+StandardError=journal

@@ -1,7 +1,9 @@
 [Unit]
 Description=Encrypted offsite backup of private DeOpt PostgreSQL
 Requires=docker.service
-After=docker.service
+Wants=network-online.target
+After=docker.service network-online.target
+OnFailure=deopt-backup-alert@%n.service
 
 [Service]
 Type=oneshot

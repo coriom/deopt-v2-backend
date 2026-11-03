@@ -34,4 +34,20 @@ export DEOPT_BACKUP_RECIPIENT=${fingerprints[0]}
 export DEOPT_BACKUP_REMOTE=deopt_r2:deopt-private-backups/postgres
 export DEOPT_COMPOSE_PROJECT=dxco90jwpdxyennmquv2elyj
 export DEOPT_BACKUP_POSTGRES_IMAGE='postgres:16@sha256:5db6dac2ef5dcff512f4f00a009c3c332b9f2f28f24277175bf3e4a3d02ef83a'
+state_dir=/var/lib/deopt-backup
+[[ ! -e "$state_dir" || ( -d "$state_dir" && ! -L "$state_dir" ) ]] || {
+  echo 'BACKUP_STATE_DIRECTORY_CONFLICT' >&2; exit 2;
+}
+install -d -o root -g root -m 0700 "$state_dir"
+[[ "$(stat -c %U:%G:%a "$state_dir")" == root:root:700 ]] || {
+  echo 'BACKUP_STATE_DIRECTORY_UNSAFE' >&2; exit 2;
+}
+run_id=${INVOCATION_ID:-$(tr -d '-' </proc/sys/kernel/random/uuid)}
+[[ "$run_id" =~ ^[0-9a-f]{32}$ ]] || { echo 'BACKUP_RUN_ID_INVALID' >&2; exit 2; }
 bash "$backup_script"
+state_file="$(mktemp "$state_dir/.last-success.XXXXXXXX")"
+printf '%s %s\n' "$(date -u +%s)" "$run_id" > "$state_file"
+chmod 0600 "$state_file"
+mv -T -- "$state_file" "$state_dir/last-success"
+rm -f -- "$state_dir/last-watchdog-alert-key" || true
+printf 'BACKUP_SUCCESS_STATE=RECORDED\nBACKUP_RUN_ID=%s\n' "$run_id"

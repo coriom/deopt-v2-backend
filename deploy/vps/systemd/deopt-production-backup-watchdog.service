@@ -1,0 +1,12 @@
+[Unit]
+Description=Detect missing DeOpt offsite backups after 36 hours
+OnFailure=deopt-backup-alert@%n.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/local/sbin/deopt-backup-freshness
+TimeoutStartSec=30s
+StandardOutput=journal
+StandardError=journal
