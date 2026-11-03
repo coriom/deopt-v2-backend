@@ -42,6 +42,20 @@ class CoolifyPrivateComposeTests(unittest.TestCase):
 
     def test_exact_source_profile_passes_without_authorizing_deployment(self):
         check(self.fixture)
+        self.assertEqual(self.fixture["services"]["backend"]["environment"]["WALLET_READ_AUTH_ENABLED"], "false")
+
+    def test_wallet_auth_is_opt_in_and_bound_to_reviewed_frontend(self):
+        candidate = copy.deepcopy(self.fixture)
+        env = candidate["services"]["backend"]["environment"]
+        env["WALLET_READ_AUTH_ENABLED"] = "true"
+        check(candidate)
+        env["WALLET_READ_AUTH_ORIGIN"] = "https://other.example"
+        with self.assertRaisesRegex(PrivateComposeError, "WALLET_AUTH_ORIGIN"):
+            check(candidate)
+        env["WALLET_READ_AUTH_ORIGIN"] = "https://deoptv2-frontend.vercel.app"
+        env["TRADING_ENABLED"] = "true"
+        with self.assertRaisesRegex(PrivateComposeError, "BACKEND_UNEXPECTED_ENABLED_FLAG"):
+            check(candidate)
 
     def test_exact_release_manifest_accepts_only_reviewed_images_and_secret_path(self):
         release = json.loads((ROOT / "deploy/vps/coolify-staging-release-v1.json").read_text())

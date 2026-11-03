@@ -94,12 +94,14 @@ class FirstPublishTests(unittest.TestCase):
         self.assertIn("DOCKER_CONFIG=\"$session_dir/docker\"", script)
         self.assertIn("ANONYMOUS_PULL_INCONCLUSIVE", script)
 
-    def test_full_interactive_path_uses_temporary_credentials(self):
+    def exercise_interactive_path(self, update=False):
         commit = "a" * 40
         digest = "sha256:" + "b" * 64
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             state = root / "package-state"
+            if update:
+                state.write_text("present")
             config_path = root / "config-path"
             (root / "git").write_text(
                 "#!/bin/sh\n"
@@ -149,7 +151,7 @@ class FirstPublishTests(unittest.TestCase):
                 "  pathlib.Path(os.environ['MOCK_PACKAGE_STATE']).write_text('present')\n"
                 f"  print('digest: {digest} size: 42')\n"
                 "elif a[:2] == ['manifest', 'inspect']:\n"
-                "  print('unauthorized', file=sys.stderr)\n"
+                "  print('manifest unknown' if ':sha-' in a[-1] else 'unauthorized', file=sys.stderr)\n"
                 "  sys.exit(1)\n"
                 "elif a[0] in ('buildx', 'run', 'pull', 'logout'): pass\n"
                 "else: sys.exit(9)\n"
@@ -171,7 +173,7 @@ class FirstPublishTests(unittest.TestCase):
                 fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
 
             process = subprocess.Popen(
-                ["bash", str(SCRIPT), "--publish-private"],
+                ["bash", str(SCRIPT), "--publish-private-update" if update else "--publish-private"],
                 stdin=slave, stdout=slave, stderr=slave, env=env,
                 preexec_fn=attach_tty,
             )
@@ -192,8 +194,8 @@ class FirstPublishTests(unittest.TestCase):
             try:
                 wait_for("GitHub PAT classic temporaire")
                 os.write(master, b"test-only-secret\n")
-                wait_for("Saisir PUBLISH_PRIVATE")
-                os.write(master, b"PUBLISH_PRIVATE\n")
+                wait_for("Saisir PUBLISH_PRIVATE_UPDATE" if update else "Saisir PUBLISH_PRIVATE")
+                os.write(master, b"PUBLISH_PRIVATE_UPDATE\n" if update else b"PUBLISH_PRIVATE\n")
                 self.assertEqual(process.wait(timeout=10), 0, output.decode(errors="replace"))
                 while True:
                     ready, _, _ = select.select([master], [], [], 0.1)
@@ -211,6 +213,12 @@ class FirstPublishTests(unittest.TestCase):
                     process.kill()
                     process.wait()
                 os.close(master)
+
+    def test_full_interactive_path_uses_temporary_credentials(self):
+        self.exercise_interactive_path()
+
+    def test_existing_private_package_update_keeps_temporary_credentials(self):
+        self.exercise_interactive_path(update=True)
 
 
 if __name__ == "__main__":

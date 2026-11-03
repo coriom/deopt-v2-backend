@@ -52,8 +52,16 @@ cleanup() {
   unset pat
 }
 main() {
-  [[ $# == 1 && "$1" == --publish-private ]] ||
-    die 'usage: ghcr-private-first-publish.sh --publish-private'
+  [[ $# == 1 && ( "$1" == --publish-private || "$1" == --publish-private-update ) ]] ||
+    die 'usage: ghcr-private-first-publish.sh --publish-private|--publish-private-update'
+  local publish_mode=$1 expected_state confirmation
+  if [[ "$publish_mode" == --publish-private-update ]]; then
+    expected_state=EXISTS_PRIVATE
+    confirmation=PUBLISH_PRIVATE_UPDATE
+  else
+    expected_state=ABSENT
+    confirmation=PUBLISH_PRIVATE
+  fi
   [[ -t 0 && -r /dev/tty ]] || die 'INTERACTIVE_TTY_REQUIRED'
   for command_name in git gh docker; do
     command -v "$command_name" >/dev/null || die "MISSING_TOOL_$command_name"
@@ -96,8 +104,10 @@ main() {
 
   state=$(classify_package)
   case "$state" in
-    ABSENT) printf 'PACKAGE_EXISTS=NO_AUTHENTICATED_INVENTORY\n' ;;
-    EXISTS_PRIVATE) die 'PACKAGE_EXISTS_PRIVATE_NO_FIRST_PUBLISH_NEEDED' ;;
+    ABSENT) [[ "$expected_state" == ABSENT ]] || die 'PACKAGE_MISSING_FOR_UPDATE'
+      printf 'PACKAGE_EXISTS=NO_AUTHENTICATED_INVENTORY\n' ;;
+    EXISTS_PRIVATE) [[ "$expected_state" == EXISTS_PRIVATE ]] || die 'PACKAGE_EXISTS_PRIVATE_NO_FIRST_PUBLISH_NEEDED'
+      printf 'PACKAGE_EXISTS=YES_AUTHENTICATED_PRIVATE\n' ;;
     EXISTS_PUBLIC) die 'PACKAGE_EXISTS_PUBLIC_STOP_USE_NEW_APPROVED_NAME' ;;
     ACCESS_DENIED) die 'PACKAGE_INVENTORY_ACCESS_DENIED' ;;
     *) die 'PACKAGE_VISIBILITY_UNKNOWN' ;;
@@ -120,14 +130,21 @@ main() {
   printf 'LOCAL_IMAGE_VERIFIED=%s\n' "$commit"
 
   state=$(classify_package)
-  [[ "$state" == ABSENT ]] || die 'PACKAGE_STATE_CHANGED_BEFORE_PUSH'
-  printf 'Publier une seule image privée %s ? Saisir PUBLISH_PRIVATE : ' "$tag" >/dev/tty
+  [[ "$state" == "$expected_state" ]] || die 'PACKAGE_STATE_CHANGED_BEFORE_PUSH'
+  printf 'Publier une seule image privée %s ? Saisir %s : ' "$tag" "$confirmation" >/dev/tty
   IFS= read -r decision </dev/tty || die 'OPERATOR_CONFIRMATION_FAILED'
-  [[ "$decision" == PUBLISH_PRIVATE ]] || die 'OPERATOR_DID_NOT_CONFIRM'
+  [[ "$decision" == "$confirmation" ]] || die 'OPERATOR_DID_NOT_CONFIRM'
   printf '%s' "$pat" | docker login ghcr.io -u coriom --password-stdin \
     >"$session_dir/login.log" 2>&1 || die 'GHCR_LOGIN_FAILED'
   state=$(classify_package)
-  [[ "$state" == ABSENT ]] || die 'PACKAGE_STATE_CHANGED_BEFORE_PUSH'
+  [[ "$state" == "$expected_state" ]] || die 'PACKAGE_STATE_CHANGED_BEFORE_PUSH'
+  if [[ "$expected_state" == EXISTS_PRIVATE ]]; then
+    if docker manifest inspect "$tag" >"$session_dir/tag-check.log" 2>&1; then
+      die 'COMMIT_TAG_ALREADY_EXISTS'
+    fi
+    grep -Eiq 'manifest unknown|no such manifest|not found' "$session_dir/tag-check.log" ||
+      die 'COMMIT_TAG_STATE_INCONCLUSIVE'
+  fi
   docker push "$tag" >"$session_dir/push.log" 2>&1 || die 'GHCR_PUSH_FAILED'
   digest=$(sed -n 's/.*digest: \(sha256:[0-9a-f]\{64\}\).*/\1/p' "$session_dir/push.log" | tail -1)
   [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || die 'REGISTRY_DIGEST_UNAVAILABLE'

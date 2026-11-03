@@ -56,6 +56,8 @@ services:
       METRICS_ENABLED: 'false'
       MM_GATEWAY_ENABLED: 'false'
       CORS_ALLOWED_ORIGINS: ${DEOPT_CORS_ORIGIN:?set reviewed HTTPS frontend origin}
+      WALLET_READ_AUTH_ENABLED: ${DEOPT_WALLET_READ_AUTH_ENABLED:-false}
+      WALLET_READ_AUTH_ORIGIN: https://deoptv2-frontend.vercel.app
     secrets:
     - postgres_password
     networks:
