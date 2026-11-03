@@ -120,11 +120,11 @@ def check(rendered: dict, release: dict | None = None) -> None:
     require(not any(key.upper().endswith("_CHAIN_ID") and str(value) != "84532"
                     for key, value in env.items()), "BACKEND_EXTRA_CHAIN")
     require("DATABASE_URL" not in env, "BACKEND_INLINE_DATABASE_SECRET")
-    require(str(env.get("WALLET_READ_AUTH_ENABLED", "false")).lower() in {"true", "false"},
+    require(env.get("WALLET_READ_AUTH_ENABLED", "false") in {"true", "false"},
             "WALLET_AUTH_FLAG")
     require(env.get("WALLET_READ_AUTH_ORIGIN") in (None, "https://deoptv2-frontend.vercel.app"),
             "WALLET_AUTH_ORIGIN")
-    if str(env.get("WALLET_READ_AUTH_ENABLED", "false")).lower() == "true":
+    if env.get("WALLET_READ_AUTH_ENABLED", "false") == "true":
         require(env.get("WALLET_READ_AUTH_ORIGIN") == "https://deoptv2-frontend.vercel.app",
                 "WALLET_AUTH_ORIGIN")
     require(not any(key.upper().endswith("_ENABLED") and str(value).lower() == "true"

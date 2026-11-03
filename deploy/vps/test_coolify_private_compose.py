@@ -56,6 +56,10 @@ class CoolifyPrivateComposeTests(unittest.TestCase):
         env["TRADING_ENABLED"] = "true"
         with self.assertRaisesRegex(PrivateComposeError, "BACKEND_UNEXPECTED_ENABLED_FLAG"):
             check(candidate)
+        del env["TRADING_ENABLED"]
+        env["WALLET_READ_AUTH_ENABLED"] = "TRUE"
+        with self.assertRaisesRegex(PrivateComposeError, "WALLET_AUTH_FLAG"):
+            check(candidate)
 
     def test_exact_release_manifest_accepts_only_reviewed_images_and_secret_path(self):
         release = json.loads((ROOT / "deploy/vps/coolify-staging-release-v1.json").read_text())
