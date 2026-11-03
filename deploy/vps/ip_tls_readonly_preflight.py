@@ -22,6 +22,14 @@ def proxy_evidence(inspected: dict) -> dict[str, str]:
     mounts = inspected.get("Mounts") or []
     networks = inspected.get("NetworkSettings", {}).get("Networks") or {}
     flags = [part for part in cmd if isinstance(part, str) and part.startswith("--")]
+    def setting(name: str) -> str:
+        prefix = f"--certificatesresolvers.letsencrypt.acme.{name}="
+        return next((f[len(prefix):] for f in flags if f.lower().startswith(prefix)), "UNSET")
+
+    ca = setting("caserver")
+    ca_kind = ("DEFAULT" if ca == "UNSET" else
+               "LE_STAGING" if ca == "https://acme-staging-v02.api.letsencrypt.org/directory" else
+               "OTHER")
     return {
         "PROXY_IMAGE": inspected.get("Config", {}).get("Image", "UNKNOWN"),
         "PROXY_RUNNING": str(inspected.get("State", {}).get("Running") is True),
@@ -36,6 +44,13 @@ def proxy_evidence(inspected: dict) -> dict[str, str]:
                                      if f.startswith("--entrypoints.") and ".address=" in f)),
         "ACME_RESOLVERS": ",".join(sorted({f.split(".")[1] for f in flags
                                             if f.startswith("--certificatesresolvers.")})),
+        "ACME_HTTP_ENTRYPOINT": setting("httpchallenge.entrypoint"),
+        "ACME_TLS_CHALLENGE": setting("tlschallenge"),
+        "ACME_PROFILE": setting("profile"),
+        "ACME_CERTIFICATES_DURATION": setting("certificatesduration"),
+        "ACME_DISABLE_COMMON_NAME": setting("disablecommonname"),
+        "ACME_CA_SERVER_KIND": ca_kind,
+        "ACME_STORAGE_CONFIGURED": str(setting("storage") != "UNSET"),
     }
 
 

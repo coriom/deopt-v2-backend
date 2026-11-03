@@ -10,6 +10,10 @@ class ProxyEvidenceTests(unittest.TestCase):
         "Config": {"Image": "traefik:v3.7", "Env": ["SECRET=never-print"],
                    "Cmd": ["--entrypoints.http.address=:80", "--entrypoints.https.address=:443",
                            "--providers.file.directory=/traefik/dynamic", "--providers.file.watch=true",
+                           "--certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=http",
+                           "--certificatesresolvers.letsencrypt.acme.profile=shortlived",
+                           "--certificatesresolvers.letsencrypt.acme.caserver=https://acme-staging-v02.api.letsencrypt.org/directory",
+                           "--certificatesresolvers.letsencrypt.acme.storage=/traefik/acme.json",
                            "--certificatesresolvers.letsencrypt.acme.email=private@example.invalid"]},
         "State": {"Running": True},
         "Mounts": [{"Source": "/data/coolify/proxy", "Destination": "/traefik"},
@@ -22,6 +26,10 @@ class ProxyEvidenceTests(unittest.TestCase):
         self.assertEqual(evidence["FILE_DIRECTORY"], "/traefik/dynamic")
         self.assertEqual(evidence["FILE_WATCH"], "True")
         self.assertEqual(evidence["ACME_RESOLVERS"], "letsencrypt")
+        self.assertEqual(evidence["ACME_HTTP_ENTRYPOINT"], "http")
+        self.assertEqual(evidence["ACME_PROFILE"], "shortlived")
+        self.assertEqual(evidence["ACME_CA_SERVER_KIND"], "LE_STAGING")
+        self.assertEqual(evidence["ACME_STORAGE_CONFIGURED"], "True")
         self.assertEqual(evidence["ENTRYPOINTS"], "http.address,https.address")
         self.assertNotIn("SECRET", str(evidence))
         self.assertNotIn("private@example.invalid", str(evidence))
