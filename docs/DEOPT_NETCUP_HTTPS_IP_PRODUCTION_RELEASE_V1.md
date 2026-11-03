@@ -29,14 +29,46 @@ Date: 2026-11-03 UTC. This is a staged release record, not evidence that the pub
 
 ## Remaining prerequisites
 
-The current Traefik ACME flags and safe static proxy edit path need root-only filtered evidence. No staging or production IP certificate has been issued. No external IP TLS, migration 0072, new GHCR digest, hosted wallet session or Vercel integration has passed. The automatic R2 timer run is not due yet. Public trading, indexer writes and broadcaster remain disabled.
+The root-only filtered preflight confirmed the existing `letsencrypt` resolver uses HTTP-01 on `http`, the default production CA and persisted ACME storage. Its `profile`, `certificatesDuration` and `disableCommonName` settings are unset. Preserve that resolver for existing applications. No staging or production IP certificate has been issued. No external IP TLS, migration 0072, new GHCR digest, hosted wallet session or Vercel integration has passed. The automatic R2 timer run is not due yet. Public trading, indexer writes and broadcaster remain disabled.
 
 The filtered ACME preflight was extended and staged at `/home/deoptops/deopt-release.stage/ip_tls_readonly_preflight.py`, SHA-256 `c3e86d621601085e8e735148f0113d9716ca24317eb33616af73e0f9d1dcfc99`. It prints only ACME challenge/profile/duration/CA-kind/storage flags. Root execution of this updated copy awaits the operator; no proxy change is authorized by the script.
 
 ## Candidate Traefik IP ACME sequence (not applied)
 
-The running proxy is Traefik 3.7.17. After confirming its static flags, preserve the current `letsencrypt` resolver and add two independent resolvers in the Coolify-managed proxy configuration: `deopt-ip-staging` with Let's Encrypt staging CA, and `deopt-ip-production` with the default production CA. Each needs its own persisted ACME storage file, HTTP-01 on the existing `http` entrypoint, `profile=shortlived`, `disableCommonName=true` and `certificatesDuration=160`. Adding both at once requires one controlled proxy restart and complete 80/443/other-app/tunnel postflight. Restore the exact prior proxy configuration if the postflight fails.
+The running proxy is Traefik 3.7.17. Preserve the current `letsencrypt` resolver and add two independent resolvers in the Coolify-managed proxy configuration: `deoptipstaging` with Let's Encrypt staging CA, and `deoptipproduction` with the default production CA. Each needs its own persisted ACME storage file, HTTP-01 on the existing `http` entrypoint, `profile=shortlived`, `disableCommonName=true` and `certificatesDuration=160`. Adding both at once requires one controlled proxy restart and complete 80/443/other-app/tunnel postflight. Restore the exact prior proxy configuration if the postflight fails.
+
+The exact additional Traefik command flags to review in **Coolify > Servers > localhost > Proxy > Configuration** are:
+
+```text
+--certificatesresolvers.deoptipstaging.acme.httpchallenge.entrypoint=http
+--certificatesresolvers.deoptipstaging.acme.caserver=https://acme-staging-v02.api.letsencrypt.org/directory
+--certificatesresolvers.deoptipstaging.acme.storage=/traefik/acme-ip-staging.json
+--certificatesresolvers.deoptipstaging.acme.profile=shortlived
+--certificatesresolvers.deoptipstaging.acme.disablecommonname=true
+--certificatesresolvers.deoptipstaging.acme.certificatesduration=160
+--certificatesresolvers.deoptipproduction.acme.httpchallenge.entrypoint=http
+--certificatesresolvers.deoptipproduction.acme.storage=/traefik/acme-ip-production.json
+--certificatesresolvers.deoptipproduction.acme.profile=shortlived
+--certificatesresolvers.deoptipproduction.acme.disablecommonname=true
+--certificatesresolvers.deoptipproduction.acme.certificatesduration=160
+```
+
+These are candidates, not applied or proven by staging. The two storage files need owner access for Traefik and mode 0600; never print their contents. Retain the existing resolver, all 80/443 bindings and existing routes. Coolify's [dynamic configuration guidance](https://coolify.io/docs/core/networking/proxy/traefik/dynamic-config) says static proxy changes must be saved in its UI and require a proxy restart; disk-only edits can be overwritten. The currently saved Compose SHA-256 `c9e17d1716197d8124b7ae0f686335f6ddb9574fcc324280768020b504986833` already omits the 8080 binding, so a reviewed restart can apply that removal at the same time. Check that the saved UI still matches this exact Compose before changing it.
 
 Only then add a watched dynamic TLS store file with `defaultGeneratedCert` for `94.16.113.122`, pointing first to the staging resolver. Confirm HTTP-01 succeeded and the no-SNI certificate has an IP SAN. Change the dynamic resolver to production only after staging passes; confirm a publicly trusted no-SNI certificate and automated-renewal settings. The default store is global, so verify existing DNS-SNI applications before and after both dynamic changes. Configure a separate expiry alert before depending on a 160-hour certificate. An actual renewal remains unverified until observed; a staging issue proves only initial issuance.
+
+Staging dynamic file candidate:
+
+```yaml
+tls:
+  stores:
+    default:
+      defaultGeneratedCert:
+        resolver: deoptipstaging
+        domain:
+          main: "94.16.113.122"
+```
+
+After staging passes, change only `resolver` to `deoptipproduction`. Do not put these files on the host until the static resolvers are saved and verified; preserve the prior dynamic configuration for rollback.
 
 Never route DeOpt's backend through this change alone. Add its restricted API router only after the trusted certificate, application release and database migration are independently ready.
