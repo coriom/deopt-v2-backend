@@ -1,0 +1,7 @@
+tls:
+  stores:
+    default:
+      defaultGeneratedCert:
+        resolver: deoptipproduction
+        domain:
+          main: "94.16.113.122"

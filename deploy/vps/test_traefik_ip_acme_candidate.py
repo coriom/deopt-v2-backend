@@ -1,4 +1,4 @@
-"""Guard the reviewed, unapplied Traefik IP ACME candidate against drift."""
+"""Guard the reviewed Traefik IP ACME configuration against drift."""
 
 from pathlib import Path
 import unittest
@@ -35,6 +35,13 @@ class IpAcmeCandidateTests(unittest.TestCase):
         self.assertIn('main: "94.16.113.122"', content)
         self.assertNotIn("deoptipproduction", content)
         self.assertNotIn("http:", content)
+
+    def test_production_default_differs_only_by_resolver(self):
+        staging = (ROOT / "traefik-ip-staging-dynamic-v1.yaml").read_text()
+        production = (ROOT / "traefik-ip-production-dynamic-v1.yaml").read_text()
+        self.assertEqual(production, staging.replace("deoptipstaging", "deoptipproduction"))
+        self.assertEqual(production.count("deoptipproduction"), 1)
+        self.assertNotIn("http:", production)
 
 
 if __name__ == "__main__":

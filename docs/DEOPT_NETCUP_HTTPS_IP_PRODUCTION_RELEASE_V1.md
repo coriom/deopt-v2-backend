@@ -1,8 +1,22 @@
 # DeOpt Netcup HTTPS IP production release V1 — gated evidence
 
-Date: 2026-11-03 UTC. This is a staged release record, not evidence that the public API or wallet authentication is live.
+Date: 2026-11-03 UTC. The IP certificate is live; the DeOpt public API and wallet authentication are not.
 
-## Current production boundary
+## Latest checkpoint — 2026-11-03 UTC
+
+After explicit operator approval for one controlled shared proxy restart, the exact saved Coolify proxy candidate SHA-256 `5b3aa11b9ced228e569a7927789b0b88bca16e09d053e495ca1a8dcfc60c5f7d` was restarted once. Root read-only preflight confirmed Traefik 3.7.17 running with the original `letsencrypt` resolver plus `deoptipstaging` and `deoptipproduction`. The original configuration SHA-256 was `c9e17d1716197d8124b7ae0f686335f6ddb9574fcc324280768020b504986833`. The 11 added flags are in `deploy/vps/traefik-ip-acme-flags-v1.txt`; the existing 80/443 bindings remained and 8080 ceased listening on both IPv4 and IPv6. The Coolify private tunnel on 127.0.0.1:8000 returned HTTP 200. No DeOpt router or domain was added.
+
+Coolify's watched dynamic configuration first obtained a Let's Encrypt **staging** certificate for `94.16.113.122`: issuer `(STAGING) Ersatz Emmer YR2`, IP SAN `94.16.113.122`, validity 2026-11-03 14:18:44 to 2026-11-10 06:18:43 UTC. It was then replaced with one production default TLS store. The temporary staging file was deleted. The sole current file is `deopt_ip_production_tls.yaml`, read back in Coolify with `resolver: deoptipproduction` and `main: 94.16.113.122` (Coolify-normalized content SHA-256 `a5cabf5c52e3c1265d4ab5b098a3e50e981cfaad5550c562a3ffd84df81bd8b1`). The source candidate is `deploy/vps/traefik-ip-production-dynamic-v1.yaml`; its different SHA reflects whitespace and quoting only.
+
+The **production** certificate was independently observed by `openssl s_client -noservername`: Let's Encrypt issuer `YR1`, critical IP SAN `94.16.113.122`, validity 2026-11-03 14:20:05 to 2026-11-10 06:20:04 UTC. `openssl s_client -verify_ip 94.16.113.122 -verify_return_error` returned `Verification: OK` and code 0. `curl https://94.16.113.122/` with normal TLS verification returned TLS verify result 0 and HTTP 503, the expected response with **no DeOpt route**. This proves trusted IP TLS and absence of a backend route; it does not prove certificate renewal. The 160-hour ACME renewal configuration is active, but a real renewal and expiry alert remain unverified.
+
+**Isolation finding:** the root preflight after restart reported proxy networks `coolify`, `dxco90jwpdxyennmquv2elyj_db`, `dxco90jwpdxyennmquv2elyj_web`. Coolify's [networking documentation](https://coolify.io/docs/core/networking-in-coolify) says its proxy joins resource networks. PostgreSQL still has no published port, but the proxy sharing the internal `db` network violates the stricter intended network boundary. Do not claim proxy/DB separation or add a public backend route until a persistent fix has been reviewed and tested. A one-time `docker network disconnect` would not be durable across resource deploy or proxy restart. Keep the existing private backend running and preserve its database volume.
+
+The old image source `e2f139fc` remains deployed; migration 0072, wallet-auth sessions, the frontend gateway, GHCR update, Vercel settings and public API are not deployed. The first automatic R2 timer run is not due until 2026-11-04 02:07 UTC. No code or image has been pushed in this milestone. The sections below retain the pre-change evidence and candidate review for audit history; their pre-change statements are superseded by this checkpoint.
+
+Fresh local Chromium acceptance: `NEXT_PUBLIC_DEOPT_WALLET_READ_AUTH=true npm run dev -- -p 3100`, then `E2E_BASE_URL=http://127.0.0.1:3100 npx playwright test tests/e2e/perps-wallet-read-auth.spec.ts --project=chromium --workers=1` passed **2/2**. The first run without the required opt-in flag failed 2/2 because the fee UI correctly remained unavailable; the flag-enabled rerun passed. Both runs used synthetic local wallet fixtures and establish no hosted Vercel authentication. `python3 -m unittest deploy.vps.test_traefik_ip_acme_candidate` passed **3/3** after adding the production dynamic-file drift check. No real wallet signed a message.
+
+## Pre-change production boundary (historical)
 
 - Coolify resource `dxco90jwpdxyennmquv2elyj` was last verified running the private read-only image from source `e2f139fc`. PostgreSQL 16 is private; the new wallet-auth migration `0072_wallet_read_auth.sql` has not been reported applied in production.
 - The backend wallet-auth source at `aa84d42404ba381725c6bab4839ca0969bf21d5f` and frontend same-origin gateway at `a7b165a97d168726f5bbb9e2297425c6be2b90e9` are local, unpushed release candidates. The gateway feature flag defaults off.
