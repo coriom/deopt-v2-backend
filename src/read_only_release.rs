@@ -2,7 +2,7 @@
 //! boundary; it does not change the normal local development configuration.
 
 use crate::error::{BackendError, Result};
-use axum::extract::Request;
+use axum::extract::{Request, State};
 use axum::http::{Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::Response;
@@ -52,7 +52,10 @@ fn validate_pairs(pairs: impl IntoIterator<Item = (String, String)>) -> Result<(
             )));
         }
         if upper.ends_with("_ENABLED")
-            && !matches!(upper.as_str(), "PERSISTENCE_ENABLED" | "PERPS_READ_ENABLED")
+            && !matches!(
+                upper.as_str(),
+                "PERSISTENCE_ENABLED" | "PERPS_READ_ENABLED" | "WALLET_READ_AUTH_ENABLED"
+            )
             && value.eq_ignore_ascii_case("true")
         {
             return Err(BackendError::Config(format!(
@@ -63,17 +66,31 @@ fn validate_pairs(pairs: impl IntoIterator<Item = (String, String)>) -> Result<(
     Ok(())
 }
 
-pub async fn reject_http_writes(request: Request, next: Next) -> Response {
+pub async fn reject_http_writes(
+    State(state): State<crate::api::AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let path = request.uri().path();
+    let auth_write = state.wallet_read_auth.enabled
+        && *request.method() == Method::POST
+        && matches!(
+            path,
+            "/auth/wallet/challenge" | "/auth/wallet/verify" | "/auth/wallet/logout"
+        );
     if !matches!(
         *request.method(),
         Method::GET | Method::HEAD | Method::OPTIONS
-    ) {
+    ) && !auth_write
+    {
         return (StatusCode::METHOD_NOT_ALLOWED, "read-only release").into_response();
     }
     // Wallet history is not authenticated by the legacy route. CORS is no
     // access control, so expose only the bounded market/status surface here.
-    let path = request.uri().path();
-    if !matches!(path, "/health" | "/ready" | "/perps/markets")
+    let auth_read = state.wallet_read_auth.enabled
+        && (path == "/auth/wallet/session"
+            || (path.starts_with("/accounts/") && path.ends_with("/perps/canonical-fees")));
+    if !auth_write && !auth_read && !matches!(path, "/health" | "/ready" | "/perps/markets")
         && !path.starts_with("/perps/markets/")
     {
         return (StatusCode::FORBIDDEN, "read-only release route unavailable").into_response();
@@ -122,7 +139,10 @@ mod tests {
                 "/accounts/:wallet/perps/canonical-fees",
                 get(|| async { "private" }),
             )
-            .layer(axum::middleware::from_fn(reject_http_writes));
+            .layer(axum::middleware::from_fn_with_state(
+                crate::api::AppState::new(crate::engine::EngineState::with_default_markets()),
+                reject_http_writes,
+            ));
         let get_response = app
             .clone()
             .oneshot(

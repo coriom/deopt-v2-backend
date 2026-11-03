@@ -13,6 +13,7 @@
 //! schema and replay-protection guarantees.
 
 pub mod write_authorization;
+pub mod wallet_read;
 
 pub use write_authorization::{
     canonical_payload_bytes, write_auth_domain, write_auth_eip712_digest, AuthorizationEnvelope,

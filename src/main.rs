@@ -117,6 +117,11 @@ async fn main() -> deopt_v2_backend::Result<()> {
         config.fees.clone(),
         config.chain_id,
     );
+    state.wallet_read_auth = deopt_v2_backend::auth::wallet_read::WalletReadAuthConfig::from_env(
+        read_only_release,
+        repository.is_some(),
+        config.chain_id,
+    )?;
     state.option_confirmation_config = config.option_confirmation.clone();
     state.option_event_indexer_config = config.option_event_indexer.clone();
     state.option_reconciliation_config = config.option_reconciliation.clone();
@@ -650,7 +655,8 @@ async fn main() -> deopt_v2_backend::Result<()> {
     // Build the router AFTER hybrid_v2 wiring so mounted operator
     // admin routes see the projection-store handle attached above.
     let app = if read_only_release {
-        router(state.clone()).layer(axum::middleware::from_fn(
+        router(state.clone()).layer(axum::middleware::from_fn_with_state(
+            state.clone(),
             deopt_v2_backend::read_only_release::reject_http_writes,
         ))
     } else {

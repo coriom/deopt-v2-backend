@@ -302,6 +302,10 @@ pub fn router(state: AppState) -> Router {
     let gate_state = state.clone();
     let hybrid_v2_state = state.hybrid_v2_read.clone();
     Router::new()
+        .route("/auth/wallet/challenge", post(crate::auth::wallet_read::challenge))
+        .route("/auth/wallet/verify", post(crate::auth::wallet_read::verify))
+        .route("/auth/wallet/session", get(crate::auth::wallet_read::session))
+        .route("/auth/wallet/logout", post(crate::auth::wallet_read::logout))
         .route("/health", get(health))
         .route("/ready", get(ready))
         .route("/metrics", get(metrics))
@@ -2715,6 +2719,7 @@ struct CanonicalFeeCursor {
 async fn perps_canonical_fees(
     State(state): State<AppState>,
     Path(address): Path<String>,
+    headers: HeaderMap,
     Query(query): Query<CanonicalFeeHistoryQuery>,
 ) -> Result<Json<CanonicalPerpFeeHistoryResponse>, ApiError> {
     let limit = query.limit.unwrap_or(25);
@@ -2736,6 +2741,20 @@ async fn perps_canonical_fees(
         status: StatusCode::BAD_REQUEST,
         message: "invalid wallet address".into(),
     })?;
+    if state.wallet_read_auth.enabled {
+        let authenticated = crate::auth::wallet_read::session_wallet(&state, &headers)
+            .await
+            .map_err(|(status, message)| ApiError {
+                status,
+                message: message.into(),
+            })?;
+        if authenticated != wallet {
+            return Err(ApiError {
+                status: StatusCode::FORBIDDEN,
+                message: "wallet access denied".into(),
+            });
+        }
+    }
     let repository = state.repository.as_ref().ok_or_else(|| ApiError {
         status: StatusCode::SERVICE_UNAVAILABLE,
         message: "canonical fee history requires persistent storage".into(),
