@@ -1,0 +1,15 @@
+[Unit]
+Description=Encrypted offsite backup of private DeOpt PostgreSQL
+Requires=docker.service
+Wants=network-online.target
+After=docker.service network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+ExecStart=/usr/local/sbin/deopt-production-backup
+TimeoutStartSec=30min
+StandardOutput=journal
+StandardError=journal
