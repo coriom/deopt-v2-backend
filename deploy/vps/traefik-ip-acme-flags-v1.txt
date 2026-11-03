@@ -1,0 +1,11 @@
+--certificatesresolvers.deoptipstaging.acme.httpchallenge.entrypoint=http
+--certificatesresolvers.deoptipstaging.acme.caserver=https://acme-staging-v02.api.letsencrypt.org/directory
+--certificatesresolvers.deoptipstaging.acme.storage=/traefik/acme-ip-staging.json
+--certificatesresolvers.deoptipstaging.acme.profile=shortlived
+--certificatesresolvers.deoptipstaging.acme.disablecommonname=true
+--certificatesresolvers.deoptipstaging.acme.certificatesduration=160
+--certificatesresolvers.deoptipproduction.acme.httpchallenge.entrypoint=http
+--certificatesresolvers.deoptipproduction.acme.storage=/traefik/acme-ip-production.json
+--certificatesresolvers.deoptipproduction.acme.profile=shortlived
+--certificatesresolvers.deoptipproduction.acme.disablecommonname=true
+--certificatesresolvers.deoptipproduction.acme.certificatesduration=160

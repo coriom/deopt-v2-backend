@@ -39,6 +39,8 @@ The running proxy is Traefik 3.7.17. Preserve the current `letsencrypt` resolver
 
 The exact additional Traefik command flags to review in **Coolify > Servers > localhost > Proxy > Configuration** are:
 
+The same candidate is saved in `deploy/vps/traefik-ip-acme-flags-v1.txt`; the staging TLS store is in `deploy/vps/traefik-ip-staging-dynamic-v1.yaml`. Both are review-only and have 2 focused guard tests plus a YAML parse check.
+
 ```text
 --certificatesresolvers.deoptipstaging.acme.httpchallenge.entrypoint=http
 --certificatesresolvers.deoptipstaging.acme.caserver=https://acme-staging-v02.api.letsencrypt.org/directory
