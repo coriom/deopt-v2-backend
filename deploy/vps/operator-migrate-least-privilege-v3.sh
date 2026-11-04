@@ -34,7 +34,7 @@ admin_psql() {
   ' sh "$@"
 }
 [[ "$(admin_psql -A -t -c 'SELECT count(*) FROM _sqlx_migrations')" == 71 ]] || exit 2
-docker run --rm --pull never --network none --user 1001:999 --read-only \
+docker run --rm --pull never --network none --user 1001:1001 --group-add 999 --read-only \
   --pids-limit 64 --memory 256m --cap-drop ALL --security-opt no-new-privileges \
   -v "$volume:/var/run/postgresql:ro" \
   -v "$secret:/run/secrets/migrator_password:ro" \
