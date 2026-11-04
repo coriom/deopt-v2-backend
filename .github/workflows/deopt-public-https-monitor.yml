@@ -1,0 +1,33 @@
+name: DeOpt public HTTPS monitor
+
+on:
+  workflow_dispatch:
+    inputs:
+      simulate_failure:
+        description: Test GitHub Actions failure notification without touching production
+        type: boolean
+        default: false
+  schedule:
+    - cron: '17 * * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deopt-public-https-monitor
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check certificate, Netcup and Vercel
+        shell: bash
+        run: |
+          if [[ '${{ inputs.simulate_failure }}' == 'true' ]]; then
+            python3 deploy/vps/monitor_public_https_v6.py --simulate-alert
+          else
+            python3 deploy/vps/monitor_public_https_v6.py
+          fi
