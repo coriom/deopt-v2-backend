@@ -1,0 +1,4 @@
+f6a111eabd4e1fb48efe55bed4fbf3e120e040e3e385ba53b8c63e4084896692  deploy/vps/postgres-socket-pg_hba.conf
+8c7ebf6479820c8a9ddf5dd2cab64113aa26d6908f4d6ec7172529f7c498c98b  deploy/vps/backup-offsite-socket.sh
+23da06476b239ec69f11fe03c084f08122538b8927d41b7704dd58be7a317e53  deploy/vps/run-daily-production-backup-socket.sh
+a58ebbdd0358576b2f1d9fedfe7c5580d8d35157fb1e2e70423879a8ed6aa406  deploy/vps/inspect-release-prereqs-v2.py

@@ -9,6 +9,12 @@ services:
     - listen_addresses=
     - -c
     - unix_socket_directories=/var/run/postgresql
+    - -c
+    - unix_socket_group=postgres
+    - -c
+    - unix_socket_permissions=0770
+    - -c
+    - hba_file=/etc/postgresql/deopt_pg_hba.conf
     environment:
       POSTGRES_USER: deopt_readonly
       POSTGRES_DB: deopt_readonly
@@ -18,6 +24,7 @@ services:
     volumes:
     - postgres_data:/var/lib/postgresql/data
     - postgres_socket:/var/run/postgresql
+    - ./deploy/vps/postgres-socket-pg_hba.conf:/etc/postgresql/deopt_pg_hba.conf:ro
     healthcheck:
       test:
       - CMD-SHELL

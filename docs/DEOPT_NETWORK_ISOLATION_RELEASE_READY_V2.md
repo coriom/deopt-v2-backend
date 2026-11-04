@@ -1,0 +1,28 @@
+# DEOPT_NETWORK_ISOLATION_RELEASE_READY_V2
+
+Date: 2026-11-04. This is preparation only. The active Coolify resource remains on the old image and its proxy can reach PostgreSQL over TCP.
+
+## Local acceptance
+
+- The candidate `compose.coolify-socket-readonly.yml` runs PostgreSQL with `network_mode: none`, a separate socket volume and a retained `postgres_data` volume key. Its static HBA permits local `scram-sha-256` only; both IP families are rejected. The socket is group `postgres`, mode `0770`; backend UID 1001 has supplemental group 999. PostgreSQL has no published port. The proxy shares only the backend `web` network in the isolated Docker test.
+- Real local PostgreSQL 16 containers started with this Compose. Effective HBA readback was `local|scram-sha-256`, `host|reject`, `host|reject`; socket settings were `0770|postgres`; a wrong password was refused. Backend `/ready` returned 200, migrations reached `72|72`, and Compose recreation preserved both health and migrations. The private GHCR digest remains to be published. Local Docker behavior does not prove Coolify's rendered production topology.
+- The new `backup-offsite-socket.sh` obtains the existing mounted password inside the PostgreSQL container without printing it. A real `pg_dump --format=custom` from the isolated SCRAM container passed `pg_restore --list`. Ciphertext transfer and R2 restoration were validated in an earlier milestone; the new backup wrapper has not been installed on the VPS.
+- The deployed old backend image, source `e2f139fc`, **cannot** start on the isolated 72-migration database: it exits 1 with `migration 72 was previously applied but is missing in the resolved migrations`. Rollback after 0072 must use a 72-compatible image with wallet authentication disabled, keeping the additive schema. Returning to the old image requires a separately proven compatibility build or isolated restore. Neither production downgrade nor volume deletion is permitted.
+
+## Cutover prerequisites and sequence
+
+1. Verify the current Coolify project ID, `postgres_data` volume name, PostgreSQL authentication method/role, current backup timer success and an actual encrypted R2 object. Check its size and timestamp. Verify GHCR package remains private and the new manifest digest matches the source commit.
+2. Before changing any container, take and verify a fresh encrypted PostgreSQL backup. Preserve the old image digest and exact Coolify Raw Compose for rollback. Copy the reviewed socket HBA and updated backup scripts root-owned; compare them with `deploy/vps/socket-release-bundle.sha256`. Update the daily systemd backup command and its pinned hash **as one controlled change**; verify `systemd-analyze verify` before activation. Keep the old backup scripts available for immediate pre-cutover rollback.
+3. In the existing Coolify resource only, render the candidate Compose with its new backend registry digest. Check same Compose project ID, same `postgres_data` volume, a new separate socket volume, only backend on `web`, PostgreSQL on `none`, exact HBA bind, no published ports, no public route, no new signer or economic flag. Reject any Coolify transform that adds PostgreSQL to a network.
+4. After separate operator authorization, recreate only the DeOpt PostgreSQL/backend containers. Expect a short private API interruption; other Coolify projects and the shared proxy remain untouched. Check live networks, socket mode, SCRAM, backend/database connection, `/health`, `/ready`, migration 0072, wallet auth default off, timer and a subsequent encrypted backup. A shared-proxy restart needs separate authorization. Coolify network persistence after a real app redeploy remains unproven until this postflight.
+5. Only after private backend acceptance, enable wallet auth and add the reviewed narrow HTTPS route. Then set Vercel's server-only backend origin, test hosted login, nonce replay, logout, cross-wallet rejection, no-store responses, and My Fees before enabling the frontend feature gate. ERC-1271 smart-contract wallets remain unsupported.
+
+Failure response: leave the public API route absent or disable the Vercel wallet feature gate. Preserve PGDATA and migration history. If the new binary fails after 0072, use a 72-compatible binary with auth off; **do not** switch blindly to the currently deployed 71-migration image. If socket/HBA fails before migration, restore the old private Compose/image through Coolify without touching the volume, then investigate. Do not run `down -v`.
+
+## Remaining gates
+
+- GitHub remotes were found to be public. Operator subsequently approved pushes to those exact existing remotes, with no visibility change, after a secret scan.
+- Local `gh` authentication is invalid, and Docker has no GHCR credentials. A PAT must be entered interactively by the operator into the existing `ghcr-private-first-publish.sh --publish-private-update` script after Git push; it checks private package visibility and outputs the registry digest. Codex must not receive the token.
+- The production PostgreSQL role/HBA and R2 object still require the staged, root-owned read-only check. The first automatic backup service reports `Result=success`, `ExecMainStatus=0` on 2026-11-04, but this alone does not prove a current R2 object.
+- IP TLS is currently valid. ACME renewal configuration was previously checked; no real renewal has yet been observed. Expiry is 2026-11-10 06:20 UTC.
+- The public backend, migration 0072, Coolify cutover and proxy restart remain unauthorized in this milestone. Trading, broadcaster, Safe, C02 and MKT1 remain disabled.

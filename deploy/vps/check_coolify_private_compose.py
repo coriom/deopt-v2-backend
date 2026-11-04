@@ -87,8 +87,16 @@ def check(rendered: dict, release: dict | None = None, *, socket_mode: bool = Fa
                 "POSTGRES_NETWORK_MODE")
         require(network_names(backend) == {"web"}, "BACKEND_NETWORK_SET")
         require(postgres.get("command") == ["postgres", "-c", "listen_addresses=", "-c",
-                                            "unix_socket_directories=/var/run/postgresql"],
+                                            "unix_socket_directories=/var/run/postgresql", "-c",
+                                            "unix_socket_group=postgres", "-c",
+                                            "unix_socket_permissions=0770", "-c",
+                                            "hba_file=/etc/postgresql/deopt_pg_hba.conf"],
                 "POSTGRES_SOCKET_ONLY_COMMAND")
+        require(any(isinstance(mount, dict) and mount.get("type") == "bind"
+                    and str(mount.get("source", "")).endswith("/deploy/vps/postgres-socket-pg_hba.conf")
+                    and mount.get("target") == "/etc/postgresql/deopt_pg_hba.conf"
+                    and mount.get("read_only") is True
+                    for mount in postgres.get("volumes", [])), "POSTGRES_HBA_MOUNT")
         require("999" in [str(g) for g in backend.get("group_add", [])],
                 "BACKEND_SOCKET_GROUP")
     else:
