@@ -28,13 +28,15 @@ Corrections locales V2 : les cinq routes `/accounts/:wallet/{positions,portfolio
 
 Le contrôle final fait échouer les cinq lectures privées avec 503 si l'auth wallet n'est pas activée, au lieu d'accepter une simple adresse dans l'URL. L'API marque les positions déduites des fills `partial` même si une marque oracle est disponible ; l'interface affiche explicitement que ces positions ne sont pas réconciliées avec `MarginEngine` et ne transforme plus une réponse partielle vide en « aucune position ouverte ». Les données restent hors chaîne et ne constituent pas une position canonique. Le mode actuel d'auth wallet exige par configuration le profil hébergé en lecture seule, alors que ce profil refuse les routes Options : ce couplage doit être résolu et testé avant publication des lectures Options.
 
+Une vérification croisée avec l'ABI réellement déployée a révélé un défaut logiciel distinct : le lecteur Rust déclarait `getPriceSafe` comme un retour `uint256`, alors que le routeur renvoie `(uint256 price, uint256 updatedAt, bool ok)`. Le lecteur décode maintenant les trois champs et refuse `ok=false`, un prix nul, un timestamp nul et une réponse incomplète. Cela corrige le prix indicatif de l'API ; cela ne modifie ni le routeur, ni la tolérance de 100 bps, ni la disponibilité réelle des feeds.
+
 ## Verdicts
 
 | Porte | Verdict et preuve |
 | --- | --- |
 | `ORACLE_ROOT_CAUSE` | **PASS** pour la cause immédiate : divergences 166/124 bps entre sources fraîches au bloc V1. Origine économique de ces différences **UNKNOWN**. |
 | `ORACLE_FEED_VALIDITY` | **PASS on-chain** pour IDs, cotations, normalisation, âge, round Chainlink et réponse Pyth aux blocs cités. Heartbeat fournisseur et comparaison Hermes directe **BLOCKED** (HTTP 403). |
-| `ORACLE_RESOLUTION` | **PASS ponctuel** aux deux blocs V2 ; aucune intervention on-chain requise pour obtenir `getPriceSafe=true` à ces blocs. Disponibilité continue **BLOCKED** sans surveillance fraîche. |
+| `ORACLE_RESOLUTION` | **PASS ponctuel** aux deux blocs V2 et décodage Rust corrigé localement ; aucune intervention on-chain requise pour obtenir `getPriceSafe=true` à ces blocs. Disponibilité continue **BLOCKED** sans surveillance fraîche. |
 | `GET_PRICE_SAFE` | **PASS** : `(0,0,false)` V1 et prix normal V2 ; test du seuil exact 100 bps et de l'échec sur timestamps invalides. |
 | `FULL_E2E_INTEGRATION` | **BLOCKED** : aucun test unique navigateur → Rust → PG → Anvil → indexation → navigateur. |
 | `EIP712_ORDER_EXECUTION` | **PASS contrat local** (Call signé, `RiskModule` réel et oracle synthétique, replay rejeté dans le test V1) ; **BLOCKED intégré** avec Rust/browser/Anvil. |
@@ -51,6 +53,7 @@ Le contrôle final fait échouer les cinq lectures privées avec 503 si l'auth w
 - `forge test --match-path test/scenario/options/OptionSettlementFlow.t.sol` : 9 PASS.
 - `cargo test --lib api::trading::tests::wallet_account` : 3 PASS après correction fail-closed.
 - `cargo test --lib api::trading::tests::account_positions_impl` : PASS, avec avertissement canonique.
+- `cargo test --lib api::trading_views::tests::oracle_price` : 4 PASS, y compris retour false et réponse tronquée ; `cargo test --lib api::trading::tests::` : 104 PASS.
 - `cargo test --test wallet_read_auth_pg` sur PostgreSQL 16 jetable : 1 PASS, 401/403 pour cinq routes ; conteneur retiré.
 - `cargo test --lib read_only_release::tests::rejects_every_http_mutation_method` : PASS, refus Options conservé.
 - `npm run typecheck`, ESLint des fichiers frontend modifiés : PASS. Next local : 403 admin, 401 wallet anonyme, 503 catalogue sans upstream, `no-store, private` partout.

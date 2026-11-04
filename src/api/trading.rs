@@ -4407,7 +4407,11 @@ mod tests {
         let mut s = seeded_state_with_addresses();
         s.trading_views = tv_config_full();
         let mock = ProgrammableMockProvider::new();
-        let encoded_price = SolValue::abi_encode(&U256::from(3_500_000_000_000u128));
+        let encoded_price = SolValue::abi_encode(&(
+            U256::from(3_500_000_000_000u128),
+            U256::from(123u64),
+            true,
+        ));
         mock.returns([0x63, 0x85, 0x1e, 0xa3], encoded_price);
         let env = series_details_impl(&s, "S-1", Some(&mock))
             .await
@@ -4479,7 +4483,11 @@ mod tests {
         let mock = ProgrammableMockProvider::new();
         mock.returns(
             [0x63, 0x85, 0x1e, 0xa3],
-            SolValue::abi_encode(&U256::from(123_456_789_000u128)),
+            SolValue::abi_encode(&(
+                U256::from(123_456_789_000u128),
+                U256::from(123u64),
+                true,
+            )),
         );
         let env = quote_preview_impl(
             &s,
@@ -4718,7 +4726,11 @@ mod tests {
         let mock = ProgrammableMockProvider::new();
         mock.returns(
             [0x63, 0x85, 0x1e, 0xa3],
-            SolValue::abi_encode(&U256::from(999_999_999u128)),
+            SolValue::abi_encode(&(
+                U256::from(999_999_999u128),
+                U256::from(123u64),
+                true,
+            )),
         );
         let env = close_preview_impl(
             &s,

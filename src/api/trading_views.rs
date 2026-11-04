@@ -99,12 +99,9 @@ sol! {
 
     function hasActiveFeed(address baseAsset, address quoteAsset) external view returns (bool);
 
-    // OracleRouter — read-only, fail-fast price probe. Reverts if the
-    // feed is stale or missing; selector 0x63851ea3 verified against
-    // the frozen ABI. Returns a single uint256 mark price scaled by
-    // the underlying feed's decimals (typically 1e8 for chain-link
-    // style feeds).
-    function getPriceSafe(address baseAsset, address quoteAsset) external view returns (uint256);
+    // OracleRouter — read-only, fail-closed price probe. Invalid feeds
+    // return (0, 0, false). Selector 0x63851ea3 is unchanged.
+    function getPriceSafe(address baseAsset, address quoteAsset) external view returns (uint256, uint256, bool);
 }
 
 // ---------------------------------------------------------------------
@@ -325,10 +322,8 @@ pub async fn try_get_oracle_feed<P: EthCallProvider>(
     Ok(Some(success.output))
 }
 
-/// OracleRouter.getPriceSafe — single-uint256 mark price for a
-/// (base, quote) pair. Reverts on-chain when the feed is stale or
-/// missing; the helper surfaces that as `Err(String)` so the handler
-/// can emit a structured warning rather than panic.
+/// OracleRouter.getPriceSafe returns (price, updatedAt, ok). A false
+/// `ok` is never a usable mark, even if the encoded price is nonzero.
 pub async fn try_get_oracle_price_safe<P: EthCallProvider>(
     cfg: &TradingViewsConfig,
     from: &AccountId,
@@ -356,6 +351,12 @@ pub async fn try_get_oracle_price_safe<P: EthCallProvider>(
         .map_err(|e| format!("eth_call failed: {e}"))?;
     let decoded = getPriceSafeCall::abi_decode_returns(&success.output, true)
         .map_err(|e| format!("decode failed: {e}"))?;
+    if !decoded._2 {
+        return Ok(None);
+    }
+    if decoded._0 == U256::ZERO || decoded._1 == U256::ZERO {
+        return Err("oracle returned an invalid positive-status price".to_string());
+    }
     Ok(Some(decoded._0))
 }
 
@@ -998,7 +999,7 @@ pub mod tests {
             ..Default::default()
         };
         let price = U256::from(3_500_000_000_000u128);
-        let encoded = alloy_sol_types::SolValue::abi_encode(&price);
+        let encoded = alloy_sol_types::SolValue::abi_encode(&(price, U256::from(123u64), true));
         let mock = ProgrammableMockProvider::new();
         mock.returns([0x63, 0x85, 0x1e, 0xa3], encoded);
         let out = try_get_oracle_price_safe(
@@ -1012,6 +1013,52 @@ pub mod tests {
         .expect("ok")
         .expect("Some");
         assert_eq!(out, price);
+    }
+
+    #[tokio::test]
+    async fn oracle_price_rejects_false_status_and_malformed_success() {
+        let cfg = TradingViewsConfig {
+            oracle_router_address: Some(anvil_address()),
+            ..Default::default()
+        };
+        for (price, updated_at, ok) in [
+            (U256::from(123u64), U256::from(42u64), false),
+            (U256::ZERO, U256::from(42u64), true),
+            (U256::from(123u64), U256::ZERO, true),
+        ] {
+            let mock = ProgrammableMockProvider::new();
+            mock.returns(
+                [0x63, 0x85, 0x1e, 0xa3],
+                alloy_sol_types::SolValue::abi_encode(&(price, updated_at, ok)),
+            );
+            let result = try_get_oracle_price_safe(
+                &cfg,
+                &anvil_address(),
+                Address::from([0xaa; 20]),
+                Address::from([0xbb; 20]),
+                &mock,
+            )
+            .await;
+            if ok {
+                assert!(result.is_err());
+            } else {
+                assert!(matches!(result, Ok(None)));
+            }
+        }
+        let mock = ProgrammableMockProvider::new();
+        mock.returns(
+            [0x63, 0x85, 0x1e, 0xa3],
+            alloy_sol_types::SolValue::abi_encode(&U256::from(123u64)),
+        );
+        assert!(try_get_oracle_price_safe(
+            &cfg,
+            &anvil_address(),
+            Address::from([0xaa; 20]),
+            Address::from([0xbb; 20]),
+            &mock,
+        )
+        .await
+        .is_err());
     }
 
     #[tokio::test]
