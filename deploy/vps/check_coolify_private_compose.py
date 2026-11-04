@@ -51,7 +51,9 @@ def secret_names(service: dict) -> set[str]:
             for item in service.get("secrets", [])}
 
 
-def check(rendered: dict, release: dict | None = None, *, socket_mode: bool = False) -> None:
+def check(rendered: dict, release: dict | None = None, *, socket_mode: bool = False,
+          least_privilege_mode: bool = False) -> None:
+    socket_mode = socket_mode or least_privilege_mode
     services = rendered.get("services", {})
     require(set(services) == {"postgres", "backend"}, "SERVICES")
     require(isinstance(rendered.get("networks"), dict), "NETWORKS")
@@ -126,8 +128,21 @@ def check(rendered: dict, release: dict | None = None, *, socket_mode: bool = Fa
             "POSTGRES_PASSWORD_SOURCE")
     secret = rendered.get("secrets", {}).get("postgres_password", {})
     require(isinstance(secret, dict) and str(secret.get("file", "")).startswith("/") and
-            "postgres_password" in secret_names(postgres) and
-            "postgres_password" in secret_names(backend), "POSTGRES_SECRET_MOUNT")
+            "postgres_password" in secret_names(postgres), "POSTGRES_SECRET_MOUNT")
+    if least_privilege_mode:
+        runtime_secret = rendered.get("secrets", {}).get("runtime_password", {})
+        require(socket_mode and isinstance(runtime_secret, dict)
+                and str(runtime_secret.get("file", "")).startswith("/")
+                and runtime_secret.get("file") != secret.get("file")
+                and secret_names(backend) == {"runtime_password"}
+                and "runtime_password" not in secret_names(postgres), "RUNTIME_SECRET_ISOLATION")
+        backup_secret = rendered.get("secrets", {}).get("backup_password", {})
+        require(isinstance(backup_secret, dict) and str(backup_secret.get("file", "")).startswith("/")
+                and backup_secret.get("file") not in {secret.get("file"), runtime_secret.get("file")}
+                and "backup_password" in secret_names(postgres)
+                and "backup_password" not in secret_names(backend), "BACKUP_SECRET_ISOLATION")
+    else:
+        require("postgres_password" in secret_names(backend), "POSTGRES_SECRET_MOUNT")
     require(postgres.get("restart") == "unless-stopped", "POSTGRES_RESTART")
 
     env = environment(backend)
@@ -148,6 +163,8 @@ def check(rendered: dict, release: dict | None = None, *, socket_mode: bool = Fa
     require("DATABASE_URL" not in env, "BACKEND_INLINE_DATABASE_SECRET")
     require(env.get("DEOPT_POSTGRES_SOCKET_ONLY", "false") == ("true" if socket_mode else "false"),
             "BACKEND_DATABASE_TRANSPORT")
+    require(env.get("DEOPT_DB_ROLE", "legacy") == ("runtime" if least_privilege_mode else "legacy"),
+            "BACKEND_DATABASE_ROLE")
     require(env.get("WALLET_READ_AUTH_ENABLED", "false") in {"true", "false"},
             "WALLET_AUTH_FLAG")
     require(env.get("WALLET_READ_AUTH_ORIGIN") in (None, "https://deoptv2-frontend.vercel.app"),
@@ -172,11 +189,21 @@ def check(rendered: dict, release: dict | None = None, *, socket_mode: bool = Fa
         require(postgres["image"] == release["postgres_image"], "POSTGRES_RELEASE_DIGEST")
         require(env.get("CORS_ALLOWED_ORIGINS") == release["cors_origin"], "BACKEND_CORS_ORIGIN")
         require(secret["file"] == release["postgres_password_file"], "POSTGRES_RELEASE_SECRET_PATH")
+        if least_privilege_mode:
+            require(runtime_secret["file"] == release.get("runtime_password_file"),
+                    "RUNTIME_RELEASE_SECRET_PATH")
+            require(backup_secret["file"] == release.get("backup_password_file"),
+                    "BACKUP_RELEASE_SECRET_PATH")
 
 
 def main() -> int:
     args = sys.argv[1:]
     socket_mode = False
+    least_privilege_mode = False
+    if "--least-privilege-mode" in args:
+        args.remove("--least-privilege-mode")
+        least_privilege_mode = True
+        socket_mode = True
     if "--socket-mode" in args:
         args.remove("--socket-mode")
         socket_mode = True
@@ -193,7 +220,7 @@ def main() -> int:
     try:
         rendered = json.loads(Path(rendered_path).read_text())
         release = json.loads(Path(release_path).read_text()) if release_path else None
-        check(rendered, release, socket_mode=socket_mode)
+        check(rendered, release, socket_mode=socket_mode, least_privilege_mode=least_privilege_mode)
     except (OSError, ValueError, KeyError, TypeError) as error:
         code = str(error) if isinstance(error, PrivateComposeError) else "INVALID_RENDERED_COMPOSE"
         print(f"PRIVATE_COMPOSE=FAIL {code}", file=sys.stderr)

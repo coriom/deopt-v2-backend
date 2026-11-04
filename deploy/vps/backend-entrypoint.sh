@@ -3,7 +3,18 @@
 set -eu
 test "${DEOPT_READ_ONLY_RELEASE:-}" = true || exit 2
 test "${CHAIN_ID:-}" = 84532 || exit 2
-password_file=/run/secrets/postgres_password
+case "${DEOPT_DB_ROLE:-legacy}" in
+    runtime)
+        test "${DEOPT_POSTGRES_SOCKET_ONLY:-false}" = true || exit 2
+        database_user=deopt_runtime
+        password_file=/run/secrets/runtime_password
+        ;;
+    legacy)
+        database_user=deopt_readonly
+        password_file=/run/secrets/postgres_password
+        ;;
+    *) echo "Invalid database role mode" >&2; exit 2 ;;
+esac
 test -r "$password_file" || exit 2
 password=$(cat "$password_file")
 case "$password" in
@@ -19,10 +30,10 @@ case "${DEOPT_POSTGRES_SOCKET_ONLY:-false}" in
             echo "PostgreSQL socket unavailable" >&2
             exit 2
         }
-        export DATABASE_URL="postgres://deopt_readonly:${password}@%2Fvar%2Frun%2Fpostgresql/deopt_readonly"
+        export DATABASE_URL="postgres://${database_user}:${password}@%2Fvar%2Frun%2Fpostgresql/deopt_readonly"
         ;;
     false)
-        export DATABASE_URL="postgres://deopt_readonly:${password}@postgres:5432/deopt_readonly"
+        export DATABASE_URL="postgres://${database_user}:${password}@postgres:5432/deopt_readonly"
         ;;
     *)
         echo "Invalid PostgreSQL transport mode" >&2

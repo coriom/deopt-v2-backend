@@ -36,7 +36,20 @@ async fn pg_wallet_session_replay_isolation_and_revocation() {
         return;
     };
     let repo = PgRepository::connect(&url).await.unwrap();
-    pool::run_migrations(repo.pool()).await.unwrap();
+    if std::env::var("DEOPT_AUTH_TEST_SKIP_MIGRATIONS")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
+        assert_eq!(
+            std::env::var("DEOPT_AUTH_TEST_DISPOSABLE").ok().as_deref(),
+            Some("1"),
+            "existing-schema auth test requires explicit disposable DB confirmation"
+        );
+        pool::verify_read_only_schema(repo.pool()).await.unwrap();
+    } else {
+        pool::run_migrations(repo.pool()).await.unwrap();
+    }
     let mut state = AppState::with_signature_mode_domain_and_repository(
         EngineState::with_default_markets(),
         SignatureVerificationMode::Strict,

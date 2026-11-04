@@ -31,6 +31,24 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> deopt_v2_backend::Result<()> {
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    if !arguments.is_empty() && arguments != ["--migrate-only"] {
+        return Err(BackendError::Config("unsupported backend command".into()));
+    }
+    if arguments == ["--migrate-only"] {
+        if std::env::var("CHAIN_ID").ok().as_deref() != Some("84532")
+            || std::env::var("DEOPT_READ_ONLY_RELEASE").ok().as_deref() != Some("true")
+        {
+            return Err(BackendError::Config(
+                "migrate-only requires Base Sepolia read-only release".into(),
+            ));
+        }
+        let url = std::env::var("DATABASE_URL")
+            .map_err(|_| BackendError::Config("migrate-only requires DATABASE_URL".into()))?;
+        let repository = PgRepository::connect(&url).await?;
+        repository.run_migrations().await?;
+        return Ok(());
+    }
     let config = AppConfig::from_env()?;
     // AppConfig loads .env first; validate the effective environment, not
     // only the parent process variables.
@@ -84,7 +102,11 @@ async fn main() -> deopt_v2_backend::Result<()> {
             )
         })?;
         let repository = PgRepository::connect(database_url).await?;
-        repository.run_migrations().await?;
+        if read_only_release {
+            deopt_v2_backend::db::pool::verify_read_only_schema(repository.pool()).await?;
+        } else {
+            repository.run_migrations().await?;
+        }
         Some(repository)
     } else {
         // SUBACCOUNTS-PERSISTENCE-SESSION-RELOAD-V1 — surface the

@@ -22,3 +22,20 @@ pub async fn run_migrations(pool: &PgPool) -> Result<()> {
         .await
         .map_err(|error| BackendError::Persistence(error.to_string()))
 }
+
+/// The hosted read-only API must never perform DDL with its runtime identity.
+pub async fn verify_read_only_schema(pool: &PgPool) -> Result<()> {
+    let (applied, highest, failed): (i64, i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*)::BIGINT, COALESCE(MAX(version),0)::BIGINT, \
+         COUNT(*) FILTER (WHERE NOT success)::BIGINT FROM _sqlx_migrations",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|error| BackendError::Persistence(error.to_string()))?;
+    if (applied, highest, failed) != (72, 72, 0) {
+        return Err(BackendError::Persistence(
+            "read-only release requires exactly 72 successful migrations".into(),
+        ));
+    }
+    Ok(())
+}

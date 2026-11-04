@@ -18,7 +18,8 @@
 #     deopt-v2-backend
 #
 # The container listens on $PORT (defaults to 8080) and runs DB
-# migrations automatically on startup when PERSISTENCE_ENABLED=true.
+# migrations on ordinary startup only outside the hosted read-only release.
+# Use the separately controlled --migrate-only command for that release.
 #
 # Health endpoints (for PaaS health checks):
 #   GET /health   always 200 when the HTTP server is up

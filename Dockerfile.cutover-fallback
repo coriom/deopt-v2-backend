@@ -1,0 +1,8 @@
+# Supply the reviewed schema-72 release digest; default fails the RUN guard.
+ARG BASE_IMAGE=debian:bookworm-slim
+FROM ${BASE_IMAGE}
+USER root
+RUN test -x /usr/local/bin/deopt-readonly-entrypoint \
+ && mv /usr/local/bin/deopt-readonly-entrypoint /usr/local/bin/deopt-runtime-entrypoint
+COPY --chmod=0555 deploy/vps/locked-fallback-entrypoint.sh /usr/local/bin/deopt-readonly-entrypoint
+USER deopt
