@@ -601,6 +601,13 @@ pub async fn list_products(
     State(state): State<AppState>,
     Query(query): Query<ListProductsQuery>,
 ) -> Result<Json<Envelope<ProductsListData>>, TradingApiError> {
+    if !state.options_config.enabled {
+        return Err(TradingApiError::new(
+            TradingErrorCode::SourceUnavailable,
+            "options market data is unavailable in this release",
+            MetaBlock::new(&state, "internal"),
+        ));
+    }
     let series = list_option_series_service(&state, OptionSeriesFilter::default())
         .await
         .map_err(|_| {
@@ -3639,6 +3646,17 @@ mod tests {
         assert_eq!(env.0.status, "ok");
         assert!(env.0.data.products.is_empty());
         assert!(env.0.warnings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_products_disabled_is_unavailable_not_an_empty_market() {
+        let mut s = test_state();
+        s.options_config.enabled = false;
+        let err = list_products(State(s), Query(ListProductsQuery::default()))
+            .await
+            .expect_err("disabled options must not look like an empty market");
+        assert_eq!(err.code, TradingErrorCode::SourceUnavailable);
+        assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
