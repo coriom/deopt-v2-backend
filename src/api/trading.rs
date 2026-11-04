@@ -26,7 +26,7 @@ use crate::options::{
 use crate::signing::eip712::parse_evm_address;
 use crate::types::{now_ms, AccountId};
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
@@ -78,6 +78,8 @@ impl IntoResponse for TradingApiError {
 pub enum TradingErrorCode {
     InvalidAddress,
     InvalidRequest,
+    Unauthorized,
+    Forbidden,
     ProductNotFound,
     SeriesNotFound,
     OrderbookUnavailable,
@@ -100,6 +102,8 @@ impl TradingErrorCode {
         match self {
             Self::InvalidAddress => "INVALID_ADDRESS",
             Self::InvalidRequest => "INVALID_REQUEST",
+            Self::Unauthorized => "UNAUTHORIZED",
+            Self::Forbidden => "FORBIDDEN",
             Self::ProductNotFound => "PRODUCT_NOT_FOUND",
             Self::SeriesNotFound => "SERIES_NOT_FOUND",
             Self::OrderbookUnavailable => "ORDERBOOK_UNAVAILABLE",
@@ -121,6 +125,8 @@ impl TradingErrorCode {
     fn http_status(self) -> StatusCode {
         match self {
             Self::InvalidAddress | Self::InvalidRequest => StatusCode::BAD_REQUEST,
+            Self::Unauthorized => StatusCode::UNAUTHORIZED,
+            Self::Forbidden => StatusCode::FORBIDDEN,
             Self::ProductNotFound | Self::SeriesNotFound => StatusCode::NOT_FOUND,
             Self::QuoteStale => StatusCode::CONFLICT,
             Self::QuoteUnsupported
@@ -184,6 +190,46 @@ fn parse_address_or_400(state: &AppState, raw: &str) -> Result<AccountId, Tradin
         )
     })?;
     Ok(acct)
+}
+
+/// The wallet address in a route is a lookup key, not proof of ownership.
+/// Keep the existing local fixture profile usable when wallet auth is disabled;
+/// when enabled, every account read requires a live session for that wallet.
+async fn authorize_account_read(
+    state: &AppState,
+    address: &str,
+    headers: &HeaderMap,
+) -> Result<(), TradingApiError> {
+    let account = parse_address_or_400(state, address)?;
+    if !state.wallet_read_auth.enabled {
+        return Ok(());
+    }
+    let session = crate::auth::wallet_read::session_wallet(state, headers)
+        .await
+        .map_err(|(status, _)| {
+            let code = if status == StatusCode::SERVICE_UNAVAILABLE {
+                TradingErrorCode::SourceUnavailable
+            } else {
+                TradingErrorCode::Unauthorized
+            };
+            TradingApiError::new(
+                code,
+                "wallet authentication required",
+                MetaBlock::new(state, "auth"),
+            )
+        })?;
+    if !session_matches_account(&session, &account.0) {
+        return Err(TradingApiError::new(
+            TradingErrorCode::Forbidden,
+            "wallet access denied",
+            MetaBlock::new(state, "auth"),
+        ));
+    }
+    Ok(())
+}
+
+fn session_matches_account(session: &str, account: &str) -> bool {
+    session.eq_ignore_ascii_case(account)
 }
 
 /// Product id = keccak256(underlying || settlement_asset || is_call || expiry-le-u64).
@@ -1243,6 +1289,15 @@ where
     }))
 }
 
+pub async fn account_positions_authorized(
+    State(state): State<AppState>,
+    Path(address): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<Envelope<PositionsData>>, TradingApiError> {
+    authorize_account_read(&state, &address, &headers).await?;
+    account_positions(State(state), Path(address)).await
+}
+
 pub async fn account_positions(
     State(state): State<AppState>,
     Path(address): Path<String>,
@@ -1416,6 +1471,15 @@ where
     }))
 }
 
+pub async fn account_portfolio_authorized(
+    State(state): State<AppState>,
+    Path(address): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<Envelope<PortfolioData>>, TradingApiError> {
+    authorize_account_read(&state, &address, &headers).await?;
+    account_portfolio(State(state), Path(address)).await
+}
+
 pub async fn account_portfolio(
     State(state): State<AppState>,
     Path(address): Path<String>,
@@ -1560,6 +1624,15 @@ where
         warnings,
         meta: MetaBlock::new(state, if status == "ok" { "rpc" } else { "db" }),
     }))
+}
+
+pub async fn account_balances_authorized(
+    State(state): State<AppState>,
+    Path(address): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<Envelope<BalancesData>>, TradingApiError> {
+    authorize_account_read(&state, &address, &headers).await?;
+    account_balances(State(state), Path(address)).await
 }
 
 pub async fn account_balances(
@@ -1899,6 +1972,15 @@ fn sanitise_rpc_err(s: &str) -> String {
     out
 }
 
+pub async fn account_history_authorized(
+    State(state): State<AppState>,
+    Path(address): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<Envelope<HistoryData>>, TradingApiError> {
+    authorize_account_read(&state, &address, &headers).await?;
+    account_history(State(state), Path(address)).await
+}
+
 pub async fn account_history(
     State(state): State<AppState>,
     Path(address): Path<String>,
@@ -2085,6 +2167,16 @@ fn empty_history_envelope(
         warnings: Vec::new(),
         meta: MetaBlock::new(state, "db"),
     })
+}
+
+pub async fn account_history_v2_authorized(
+    State(state): State<AppState>,
+    Path(address): Path<String>,
+    headers: HeaderMap,
+    Query(query): Query<HistoryV2Query>,
+) -> Result<Json<Envelope<HistoryV2Data>>, TradingApiError> {
+    authorize_account_read(&state, &address, &headers).await?;
+    account_history_v2(State(state), Path(address), Query(query)).await
 }
 
 pub async fn account_history_v2(
@@ -3047,6 +3139,27 @@ mod tests {
         let s = test_state();
         let err = parse_address_or_400(&s, "0xabcd").unwrap_err();
         assert_eq!(err.code, TradingErrorCode::InvalidAddress);
+    }
+
+    #[tokio::test]
+    async fn wallet_account_route_rejects_anonymous_session_when_auth_enabled() {
+        let mut state = test_state();
+        state.chain_id = 84532;
+        state.wallet_read_auth.enabled = true;
+        let address = "0x00000000000000000000000000000000000000a1".to_string();
+        let err = account_positions_authorized(State(state), Path(address), HeaderMap::new())
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(err.code, TradingErrorCode::Unauthorized);
+    }
+
+    #[test]
+    fn wallet_account_scope_rejects_other_wallet() {
+        let owner = "0x00000000000000000000000000000000000000a1";
+        let other = "0x00000000000000000000000000000000000000b2";
+        assert!(session_matches_account(owner, &owner.to_ascii_uppercase()));
+        assert!(!session_matches_account(owner, other));
     }
 
     #[test]

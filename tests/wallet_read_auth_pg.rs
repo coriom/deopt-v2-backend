@@ -175,6 +175,43 @@ async fn pg_wallet_session_replay_isolation_and_revocation() {
         .await
         .unwrap();
     assert_eq!(other.status(), StatusCode::FORBIDDEN);
+    // Exercise the future Options route without the production read-only
+    // middleware, which currently blocks all Options routes before the
+    // handler. This proves the handler itself checks wallet ownership.
+    let options_app = router(state.clone());
+    for suffix in [
+        "positions",
+        "portfolio",
+        "balances",
+        "history",
+        "history/v2",
+    ] {
+        let alice_path = format!("/accounts/{alice_wallet}/{suffix}");
+        let bob_path = format!("/accounts/{bob_wallet}/{suffix}");
+        let anonymous = options_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(alice_path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED, "{suffix}");
+        let other = options_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(bob_path)
+                    .header(AUTHORIZATION, format!("Bearer {}", verified.token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(other.status(), StatusCode::FORBIDDEN, "{suffix}");
+    }
     let write = app
         .clone()
         .oneshot(

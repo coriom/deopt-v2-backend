@@ -90,7 +90,9 @@ pub async fn reject_http_writes(
     let auth_read = state.wallet_read_auth.enabled
         && (path == "/auth/wallet/session"
             || (path.starts_with("/accounts/") && path.ends_with("/perps/canonical-fees")));
-    if !auth_write && !auth_read && !matches!(path, "/health" | "/ready" | "/perps/markets")
+    if !auth_write
+        && !auth_read
+        && !matches!(path, "/health" | "/ready" | "/perps/markets")
         && !path.starts_with("/perps/markets/")
     {
         return (StatusCode::FORBIDDEN, "read-only release route unavailable").into_response();
@@ -139,6 +141,8 @@ mod tests {
                 "/accounts/:wallet/perps/canonical-fees",
                 get(|| async { "private" }),
             )
+            .route("/options/products", get(|| async { "options" }))
+            .route("/accounts/:wallet/positions", get(|| async { "positions" }))
             .layer(axum::middleware::from_fn_with_state(
                 crate::api::AppState::new(crate::engine::EngineState::with_default_markets()),
                 reject_http_writes,
@@ -165,6 +169,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(history.status(), StatusCode::FORBIDDEN);
+        for path in ["/options/products", "/accounts/0x123/positions"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
+        }
         for method in [Method::POST, Method::PUT, Method::PATCH, Method::DELETE] {
             let response = app
                 .clone()

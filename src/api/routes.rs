@@ -782,23 +782,23 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/accounts/:address/positions",
-            get(crate::api::trading::account_positions),
+            get(crate::api::trading::account_positions_authorized),
         )
         .route(
             "/accounts/:address/portfolio",
-            get(crate::api::trading::account_portfolio),
+            get(crate::api::trading::account_portfolio_authorized),
         )
         .route(
             "/accounts/:address/balances",
-            get(crate::api::trading::account_balances),
+            get(crate::api::trading::account_balances_authorized),
         )
         .route(
             "/accounts/:address/history",
-            get(crate::api::trading::account_history),
+            get(crate::api::trading::account_history_authorized),
         )
         .route(
             "/accounts/:address/history/v2",
-            get(crate::api::trading::account_history_v2),
+            get(crate::api::trading::account_history_v2_authorized),
         )
         .route("/leaderboard", get(crate::api::trading::leaderboard))
         // BACKEND-PUBLIC-WS-API-V1 — public WebSocket fanout for
