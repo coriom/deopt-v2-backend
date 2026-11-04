@@ -7,6 +7,10 @@ on:
         description: Test GitHub Actions failure notification without touching production
         type: boolean
         default: false
+      simulate_expiring_certificate:
+        description: Test 48-hour certificate alert against synthetic metadata
+        type: boolean
+        default: false
   schedule:
     - cron: '17 * * * *'
 
@@ -26,7 +30,9 @@ jobs:
       - name: Check certificate, Netcup and Vercel
         shell: bash
         run: |
-          if [[ '${{ inputs.simulate_failure }}' == 'true' ]]; then
+          if [[ '${{ inputs.simulate_expiring_certificate }}' == 'true' ]]; then
+            python3 deploy/vps/monitor_public_https_v6.py --simulate-expiring-certificate
+          elif [[ '${{ inputs.simulate_failure }}' == 'true' ]]; then
             python3 deploy/vps/monitor_public_https_v6.py --simulate-alert
           else
             python3 deploy/vps/monitor_public_https_v6.py

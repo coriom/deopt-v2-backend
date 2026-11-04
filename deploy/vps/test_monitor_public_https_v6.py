@@ -28,6 +28,10 @@ class MonitorPolicyTests(unittest.TestCase):
         with patch("sys.argv", ["monitor", "--simulate-alert"]), patch.object(monitor, "check_certificate"), patch.object(monitor, "check_health"):
             self.assertEqual(monitor.main(), 1)
 
+    def test_synthetic_expiring_certificate_exits_nonzero(self):
+        with patch("sys.argv", ["monitor", "--simulate-expiring-certificate"]), patch.object(monitor, "check_certificate"), patch.object(monitor, "check_health"):
+            self.assertEqual(monitor.main(), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

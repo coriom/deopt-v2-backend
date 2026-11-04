@@ -66,11 +66,18 @@ def check_health(host, path, label):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--simulate-alert", action="store_true", help="Fail only for notification delivery drill")
+    parser.add_argument("--simulate-expiring-certificate", action="store_true", help="Exercise the 48-hour expiry policy without changing the live certificate")
     args = parser.parse_args()
     try:
         check_certificate(time.time())
         check_health(IP, "/health", "NETCUP_HEALTH")
         check_health(VERCEL, "/api/deopt/public/health", "VERCEL_GATEWAY")
+        if args.simulate_expiring_certificate:
+            synthetic_cert = {
+                "subjectAltName": (("IP Address", IP),),
+                "notAfter": time.strftime("%b %d %H:%M:%S %Y GMT", time.gmtime(time.time() + 3600)),
+            }
+            certificate_status(synthetic_cert, time.time())
         if args.simulate_alert:
             raise ValueError("SYNTHETIC_ALERT_TEST")
     except (OSError, ssl.SSLError, ValueError, http.client.HTTPException) as exc:
