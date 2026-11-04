@@ -1,0 +1,38 @@
+# Coolify file provider. Public read-only Base Sepolia API on the reviewed IP.
+# Rollback: remove this one file; the default 503 router remains in place.
+http:
+  routers:
+    deopt-v5-read:
+      entryPoints: [https]
+      rule: >-
+        Host(`94.16.113.122`) && Method(`GET`) &&
+        (Path(`/health`) || Path(`/ready`) || Path(`/perps/markets`) ||
+        PathRegexp(`^/perps/markets/[0-9]+(?:/price)?$`) ||
+        Path(`/auth/wallet/session`) ||
+        PathRegexp(`^/accounts/0x[0-9A-Fa-f]{40}/perps/canonical-fees$`))
+      priority: 1000
+      service: deopt-v5-backend
+      middlewares: [deopt-v5-no-store]
+      tls: {}
+    deopt-v5-auth-write:
+      entryPoints: [https]
+      rule: >-
+        Host(`94.16.113.122`) && Method(`POST`) &&
+        (Path(`/auth/wallet/challenge`) || Path(`/auth/wallet/verify`) ||
+        Path(`/auth/wallet/logout`))
+      priority: 1000
+      service: deopt-v5-backend
+      middlewares: [deopt-v5-no-store]
+      tls: {}
+  middlewares:
+    deopt-v5-no-store:
+      headers:
+        customResponseHeaders:
+          Cache-Control: "private, no-store, max-age=0"
+          X-Content-Type-Options: nosniff
+  services:
+    deopt-v5-backend:
+      loadBalancer:
+        passHostHeader: false
+        servers:
+          - url: http://dxco90jwpdxyennmquv2elyj-backend-1:8080
