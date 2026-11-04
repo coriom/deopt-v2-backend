@@ -12,6 +12,22 @@ case "$password" in
         exit 2
         ;;
 esac
-export DATABASE_URL="postgres://deopt_readonly:${password}@postgres:5432/deopt_readonly"
+case "${DEOPT_POSTGRES_SOCKET_ONLY:-false}" in
+    true)
+        socket_dir=/var/run/postgresql
+        test -S "$socket_dir/.s.PGSQL.5432" || {
+            echo "PostgreSQL socket unavailable" >&2
+            exit 2
+        }
+        export DATABASE_URL="postgres://deopt_readonly:${password}@%2Fvar%2Frun%2Fpostgresql/deopt_readonly"
+        ;;
+    false)
+        export DATABASE_URL="postgres://deopt_readonly:${password}@postgres:5432/deopt_readonly"
+        ;;
+    *)
+        echo "Invalid PostgreSQL transport mode" >&2
+        exit 2
+        ;;
+esac
 unset password
 exec /usr/local/bin/deopt-v2-backend

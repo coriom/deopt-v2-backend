@@ -186,5 +186,51 @@ class CoolifyPrivateComposeTests(unittest.TestCase):
         self.assertIn("FROM debian:bookworm-slim@sha256:", dockerfile)
 
 
+class CoolifySocketComposeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        if not shutil.which("docker"):
+            raise unittest.SkipTest("Docker Compose CLI unavailable")
+        env = dict(os.environ)
+        env.update({
+            "DEOPT_SOCKET_BACKEND_IMAGE": "ghcr.io/coriom/deopt-v2-backend@sha256:" + "a" * 64,
+            "DEOPT_POSTGRES_IMAGE": "postgres:16@sha256:" + "b" * 64,
+            "DEOPT_CORS_ORIGIN": "https://deoptv2-frontend.vercel.app",
+            "DEOPT_POSTGRES_PASSWORD_FILE": "/tmp/nonsecret-placeholder",
+        })
+        result = subprocess.run(
+            ["docker", "compose", "-f", str(ROOT / "compose.coolify-socket-readonly.yml"),
+             "config", "--format", "json"], env=env, capture_output=True, text=True, check=True)
+        cls.rendered = json.loads(result.stdout)
+
+    def test_socket_profile_is_private(self):
+        check(copy.deepcopy(self.rendered), socket_mode=True)
+
+    def test_rejects_tcp_or_proxy_database_network(self):
+        for change, code in (
+            (lambda x: x["services"]["postgres"].update(network_mode="bridge"), "POSTGRES_NETWORK_MODE"),
+            (lambda x: x["services"]["postgres"].update(command=["postgres", "-c", "listen_addresses=*"]),
+             "POSTGRES_SOCKET_ONLY_COMMAND"),
+            (lambda x: x["services"]["backend"].update(networks={"web": None, "db": None}),
+             "BACKEND_UNKNOWN_NETWORK"),
+        ):
+            candidate = copy.deepcopy(self.rendered)
+            change(candidate)
+            with self.assertRaisesRegex(PrivateComposeError, code):
+                check(candidate, socket_mode=True)
+
+    def test_rejects_missing_socket_authorization(self):
+        for change, code in (
+            (lambda x: x["services"]["backend"].update(group_add=[]), "BACKEND_SOCKET_GROUP"),
+            (lambda x: x["services"]["backend"].update(volumes=[]), "POSTGRES_SOCKET_VOLUME"),
+            (lambda x: x["services"]["backend"]["environment"].update(DEOPT_POSTGRES_SOCKET_ONLY="false"),
+             "BACKEND_DATABASE_TRANSPORT"),
+        ):
+            candidate = copy.deepcopy(self.rendered)
+            change(candidate)
+            with self.assertRaisesRegex(PrivateComposeError, code):
+                check(candidate, socket_mode=True)
+
+
 if __name__ == "__main__":
     unittest.main()

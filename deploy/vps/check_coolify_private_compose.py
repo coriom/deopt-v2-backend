@@ -51,12 +51,12 @@ def secret_names(service: dict) -> set[str]:
             for item in service.get("secrets", [])}
 
 
-def check(rendered: dict, release: dict | None = None) -> None:
+def check(rendered: dict, release: dict | None = None, *, socket_mode: bool = False) -> None:
     services = rendered.get("services", {})
     require(set(services) == {"postgres", "backend"}, "SERVICES")
     require(isinstance(rendered.get("networks"), dict), "NETWORKS")
     networks = rendered["networks"]
-    require(set(networks) == {"db", "web"}, "NETWORK_SET")
+    require(set(networks) == ({"web"} if socket_mode else {"db", "web"}), "NETWORK_SET")
     for name, service in services.items():
         require(not service.get("env_file"), f"{name.upper()}_UNREVIEWED_ENV_FILE")
         require(not service.get("ports"), f"{name.upper()}_PUBLISHED_PORT")
@@ -82,16 +82,34 @@ def check(rendered: dict, release: dict | None = None) -> None:
     require(bool(re.fullmatch(r"postgres:16(?:[.-][^@]+)?@sha256:[0-9a-f]{64}", postgres["image"])),
             "POSTGRES_MAJOR_VERSION")
     pg_networks = network_names(postgres)
-    require(pg_networks == {"db"}, "POSTGRES_NETWORK_COUNT")
-    db_network = "db"
-    require(bool(networks[db_network].get("internal")), "POSTGRES_NETWORK_NOT_INTERNAL")
-    require(network_names(backend) == {"db", "web"}, "BACKEND_NETWORK_SET")
+    if socket_mode:
+        require(postgres.get("network_mode") == "none" and not pg_networks,
+                "POSTGRES_NETWORK_MODE")
+        require(network_names(backend) == {"web"}, "BACKEND_NETWORK_SET")
+        require(postgres.get("command") == ["postgres", "-c", "listen_addresses=", "-c",
+                                            "unix_socket_directories=/var/run/postgresql"],
+                "POSTGRES_SOCKET_ONLY_COMMAND")
+        require("999" in [str(g) for g in backend.get("group_add", [])],
+                "BACKEND_SOCKET_GROUP")
+    else:
+        require(pg_networks == {"db"}, "POSTGRES_NETWORK_COUNT")
+        require(bool(networks["db"].get("internal")), "POSTGRES_NETWORK_NOT_INTERNAL")
+        require(network_names(backend) == {"db", "web"}, "BACKEND_NETWORK_SET")
     volumes = rendered.get("volumes", {})
     require(isinstance(volumes, dict), "VOLUME_DEFINITIONS")
     require(any(mount.get("type") == "volume" and mount.get("target") == "/var/lib/postgresql/data"
                 and mount.get("source") in volumes
                 for mount in postgres.get("volumes", []) if isinstance(mount, dict)),
             "POSTGRES_PERSISTENCE")
+    if socket_mode:
+        pg_socket = {mount.get("source") for mount in postgres.get("volumes", [])
+                     if isinstance(mount, dict) and mount.get("type") == "volume"
+                     and mount.get("target") == "/var/run/postgresql"}
+        backend_socket = {mount.get("source") for mount in backend.get("volumes", [])
+                          if isinstance(mount, dict) and mount.get("type") == "volume"
+                          and mount.get("target") == "/var/run/postgresql" and mount.get("read_only") is True}
+        require(len(pg_socket) == 1 and pg_socket == backend_socket and pg_socket <= set(volumes),
+                "POSTGRES_SOCKET_VOLUME")
     pg_env = environment(postgres)
     require(pg_env.get("POSTGRES_USER") == "deopt_readonly" and pg_env.get("POSTGRES_DB") == "deopt_readonly",
             "POSTGRES_IDENTITY")
@@ -120,6 +138,8 @@ def check(rendered: dict, release: dict | None = None) -> None:
     require(not any(key.upper().endswith("_CHAIN_ID") and str(value) != "84532"
                     for key, value in env.items()), "BACKEND_EXTRA_CHAIN")
     require("DATABASE_URL" not in env, "BACKEND_INLINE_DATABASE_SECRET")
+    require(env.get("DEOPT_POSTGRES_SOCKET_ONLY", "false") == ("true" if socket_mode else "false"),
+            "BACKEND_DATABASE_TRANSPORT")
     require(env.get("WALLET_READ_AUTH_ENABLED", "false") in {"true", "false"},
             "WALLET_AUTH_FLAG")
     require(env.get("WALLET_READ_AUTH_ORIGIN") in (None, "https://deoptv2-frontend.vercel.app"),
@@ -147,20 +167,25 @@ def check(rendered: dict, release: dict | None = None) -> None:
 
 
 def main() -> int:
-    if len(sys.argv) == 2:
+    args = sys.argv[1:]
+    socket_mode = False
+    if "--socket-mode" in args:
+        args.remove("--socket-mode")
+        socket_mode = True
+    if len(args) == 1:
         release_path = None
-        rendered_path = sys.argv[1]
-    elif len(sys.argv) == 4 and sys.argv[1] == "--release-manifest":
-        release_path = sys.argv[2]
-        rendered_path = sys.argv[3]
+        rendered_path = args[0]
+    elif len(args) == 3 and args[0] == "--release-manifest":
+        release_path = args[1]
+        rendered_path = args[2]
     else:
-        print("usage: check_coolify_private_compose.py [--release-manifest manifest.json] rendered-compose.json",
+        print("usage: check_coolify_private_compose.py [--socket-mode] [--release-manifest manifest.json] rendered-compose.json",
               file=sys.stderr)
         return 2
     try:
         rendered = json.loads(Path(rendered_path).read_text())
         release = json.loads(Path(release_path).read_text()) if release_path else None
-        check(rendered, release)
+        check(rendered, release, socket_mode=socket_mode)
     except (OSError, ValueError, KeyError, TypeError) as error:
         code = str(error) if isinstance(error, PrivateComposeError) else "INVALID_RENDERED_COMPOSE"
         print(f"PRIVATE_COMPOSE=FAIL {code}", file=sys.stderr)

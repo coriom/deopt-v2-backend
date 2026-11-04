@@ -1,0 +1,114 @@
+# Candidate for a separately approved Coolify release. PostgreSQL has no Docker network.
+services:
+  postgres:
+    image: ${DEOPT_POSTGRES_IMAGE:?pin postgres 16 image digest}
+    network_mode: none
+    command:
+    - postgres
+    - -c
+    - listen_addresses=
+    - -c
+    - unix_socket_directories=/var/run/postgresql
+    environment:
+      POSTGRES_USER: deopt_readonly
+      POSTGRES_DB: deopt_readonly
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets:
+    - postgres_password
+    volumes:
+    - postgres_data:/var/lib/postgresql/data
+    - postgres_socket:/var/run/postgresql
+    healthcheck:
+      test:
+      - CMD-SHELL
+      - pg_isready -h /var/run/postgresql -U deopt_readonly -d deopt_readonly
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    mem_limit: 1536m
+    cpus: 1.5
+    pids_limit: 128
+    restart: unless-stopped
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '5'
+  backend:
+    image: ${DEOPT_SOCKET_BACKEND_IMAGE:?pin new socket-capable backend image digest}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    entrypoint:
+    - /usr/local/bin/deopt-readonly-entrypoint
+    environment:
+      HOST: 0.0.0.0
+      PORT: '8080'
+      CHAIN_ID: '84532'
+      NETWORK_NAME: base-sepolia
+      DEOPT_READ_ONLY_RELEASE: 'true'
+      PERSISTENCE_ENABLED: 'true'
+      DEOPT_POSTGRES_SOCKET_ONLY: 'true'
+      PERPS_READ_ENABLED: 'false'
+      EXECUTION_ENABLED: 'false'
+      EXECUTOR_DRY_RUN: 'true'
+      EXECUTOR_REAL_BROADCAST_ENABLED: 'false'
+      HV2_BROADCAST_ENABLED: 'false'
+      PERPS_PUBLIC_TRADING_ENABLED: 'false'
+      PERPS_CLOSED_TEST_ENABLED: 'false'
+      OPTIONS_ENABLED: 'false'
+      INDEXER_ENABLED: 'false'
+      PUBLIC_WS_ENABLED: 'false'
+      METRICS_ENABLED: 'false'
+      MM_GATEWAY_ENABLED: 'false'
+      CORS_ALLOWED_ORIGINS: ${DEOPT_CORS_ORIGIN:?set reviewed HTTPS frontend origin}
+      WALLET_READ_AUTH_ENABLED: ${DEOPT_WALLET_READ_AUTH_ENABLED:-false}
+      WALLET_READ_AUTH_ORIGIN: https://deoptv2-frontend.vercel.app
+    secrets:
+    - postgres_password
+    volumes:
+    - postgres_socket:/var/run/postgresql:ro
+    networks:
+    - web
+    user: 1001:1001
+    group_add:
+    - '999'
+    read_only: true
+    tmpfs:
+    - /tmp
+    security_opt:
+    - no-new-privileges:true
+    cap_drop:
+    - ALL
+    mem_limit: 2048m
+    cpus: 2.0
+    pids_limit: 128
+    init: true
+    healthcheck:
+      test:
+      - CMD
+      - curl
+      - --fail
+      - --silent
+      - --show-error
+      - http://127.0.0.1:8080/ready
+      interval: 10s
+      timeout: 3s
+      start_period: 30s
+      retries: 5
+    restart: unless-stopped
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '5'
+networks:
+  web: {}
+secrets:
+  postgres_password:
+    file: ${DEOPT_POSTGRES_PASSWORD_FILE:?set absolute path to host-only password file}
+volumes:
+  postgres_data: {}
+  postgres_socket: {}
