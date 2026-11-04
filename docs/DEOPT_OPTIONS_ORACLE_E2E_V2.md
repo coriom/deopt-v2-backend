@@ -26,6 +26,8 @@ La pile historique `OptionMatchingEngine` exige deux signatures EIP-712 et `only
 
 Corrections locales V2 : les cinq routes `/accounts/:wallet/{positions,portfolio,balances,history,history/v2}` comparent l'URL à la session wallet côté Rust quand l'auth wallet est activée. Un test sur PostgreSQL 16 jetable vérifie 401 anonyme et 403 inter-wallet pour chacune. La passerelle Next `/api/deopt/options` n'autorise que les lectures catalogue et ces cinq routes ; les lectures privées transmettent le cookie de session au Rust via `Authorization` serveur, avec `Cache-Control: no-store, private`. Le test HTTP local a obtenu 403 pour `/admin/status`, 401 pour les lectures wallet anonymes, 503 pour le catalogue en l'absence d'upstream. Le profil `DEOPT_READ_ONLY_RELEASE` hébergé refuse toujours toute route Options et tout flag `OPTIONS_ENABLED=true`; aucun changement de production n'est effectué.
 
+Le contrôle final fait échouer les cinq lectures privées avec 503 si l'auth wallet n'est pas activée, au lieu d'accepter une simple adresse dans l'URL. L'API marque les positions déduites des fills `partial` même si une marque oracle est disponible ; l'interface affiche explicitement que ces positions ne sont pas réconciliées avec `MarginEngine` et ne transforme plus une réponse partielle vide en « aucune position ouverte ». Les données restent hors chaîne et ne constituent pas une position canonique. Le mode actuel d'auth wallet exige par configuration le profil hébergé en lecture seule, alors que ce profil refuse les routes Options : ce couplage doit être résolu et testé avant publication des lectures Options.
+
 ## Verdicts
 
 | Porte | Verdict et preuve |
@@ -37,7 +39,7 @@ Corrections locales V2 : les cinq routes `/accounts/:wallet/{positions,portfolio
 | `FULL_E2E_INTEGRATION` | **BLOCKED** : aucun test unique navigateur → Rust → PG → Anvil → indexation → navigateur. |
 | `EIP712_ORDER_EXECUTION` | **PASS contrat local** (Call signé, `RiskModule` réel et oracle synthétique, replay rejeté dans le test V1) ; **BLOCKED intégré** avec Rust/browser/Anvil. |
 | `POSTGRES_INDEXATION` | **BLOCKED intégré** : indexeur existant, aucun receipt Anvil réellement indexé dans ce jalon. |
-| `FRONTEND_POSITION_DISPLAY` | **BLOCKED canonique** : positions actuelles dérivées des fills backend ; fixture EIP-712 navigateur non authentique. |
+| `FRONTEND_POSITION_DISPLAY` | **BLOCKED canonique** : positions actuelles dérivées des fills backend, maintenant marquées partielles ; fixture EIP-712 navigateur non authentique. |
 | `EXPIRATION_SETTLEMENT` | **PASS contrat local** (9/9 scénarios, dont un avec `RiskModule` réel) ; **BLOCKED intégré** pour affichage et réconciliation. |
 | `WALLET_DATA_ISOLATION` | **PASS local** pour les cinq routes avec auth active et PostgreSQL jetable ; la configuration hébergée garde Options indisponible. |
 | `BASE_SEPOLIA_READINESS` | **BLOCKED** : exécuteur effectif non établi, aucun Put enregistré, indexation/positions canoniques et pipeline hébergé indisponibles. |
@@ -47,10 +49,12 @@ Corrections locales V2 : les cinq routes `/accounts/:wallet/{positions,portfolio
 - `python3 -m unittest discover -s scripts -p test_options_oracle_preflight_v2.py` : 6 PASS.
 - `python3 scripts/options_oracle_preflight_v2.py --block 54414188`, `--block 54421424`, sans `--block` : lectures RPC PASS ; aucun envoi.
 - `forge test --match-path test/scenario/options/OptionSettlementFlow.t.sol` : 9 PASS.
-- `cargo test --lib api::trading::tests::wallet_account` : 2 PASS.
+- `cargo test --lib api::trading::tests::wallet_account` : 3 PASS après correction fail-closed.
+- `cargo test --lib api::trading::tests::account_positions_impl` : PASS, avec avertissement canonique.
 - `cargo test --test wallet_read_auth_pg` sur PostgreSQL 16 jetable : 1 PASS, 401/403 pour cinq routes ; conteneur retiré.
 - `cargo test --lib read_only_release::tests::rejects_every_http_mutation_method` : PASS, refus Options conservé.
 - `npm run typecheck`, ESLint des fichiers frontend modifiés : PASS. Next local : 403 admin, 401 wallet anonyme, 503 catalogue sans upstream, `no-store, private` partout.
+- `forge build` global lancé puis interrompu après plusieurs minutes sans résultat au-delà de « Compiling 115 files with Solc 0.8.30 » ; verdict global **INCONCLUSIVE**. Le test Foundry ciblé de 9 scénarios a passé avant cet essai.
 - Les warnings Clippy/formatage historiques hors fichiers touchés ne sont pas présentés comme corrigés.
 
 Pour le premier trade **Call** testnet : (1) revalider feed `getPriceSafe` et fraîcheur au bloc canonique ; (2) déterminer l'exécuteur réellement autorisé par `OptionMatchingEngine.isExecutor`, les rôles de règlement, soldes mUSDC et paramètres de risque ; (3) relier un vrai trade signé sur Anvil au Rust et à PG, puis projeter les positions depuis l'état canonique et les afficher dans Playwright sans signatures factices ; (4) tester reorg, redémarrage et double règlement dans cette chaîne ; (5) obtenir les autorisations distinctes pour tout changement on-chain requis, transaction testnet bornée, déploiement backend/frontend et ouverture utilisateur. Le Call actif n'exige pas une nouvelle série ; un Put exige une création/configuration de série approuvée. La pile legacy ne fournit pas d'exercice anticipé : le règlement suit expiration et prix finalisé.

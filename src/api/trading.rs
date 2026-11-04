@@ -193,8 +193,8 @@ fn parse_address_or_400(state: &AppState, raw: &str) -> Result<AccountId, Tradin
 }
 
 /// The wallet address in a route is a lookup key, not proof of ownership.
-/// Keep the existing local fixture profile usable when wallet auth is disabled;
-/// when enabled, every account read requires a live session for that wallet.
+/// Public account routes fail closed when wallet auth is disabled. Local
+/// fixtures can exercise the underlying handlers directly.
 async fn authorize_account_read(
     state: &AppState,
     address: &str,
@@ -202,7 +202,11 @@ async fn authorize_account_read(
 ) -> Result<(), TradingApiError> {
     let account = parse_address_or_400(state, address)?;
     if !state.wallet_read_auth.enabled {
-        return Ok(());
+        return Err(TradingApiError::new(
+            TradingErrorCode::SourceUnavailable,
+            "wallet authentication unavailable",
+            MetaBlock::new(state, "auth"),
+        ));
     }
     let session = crate::auth::wallet_read::session_wallet(state, headers)
         .await
@@ -1454,11 +1458,12 @@ where
         ));
     }
 
-    let status: &'static str = if any_mark_resolved && !positions.is_empty() {
-        "ok"
-    } else {
-        "partial"
-    };
+    // A fill ledger is not the canonical MarginEngine position. Even with a
+    // fresh oracle mark, do not present these inferred quantities as complete.
+    warnings.push(warning_source_unavailable(
+        "Positions are inferred from backend fills; MarginEngine positions have not been reconciled.",
+    ));
+    let status: &'static str = "partial";
 
     Ok(Json(Envelope {
         status,
@@ -1467,7 +1472,7 @@ where
             positions,
         },
         warnings,
-        meta: MetaBlock::new(state, if status == "ok" { "rpc" } else { "db" }),
+        meta: MetaBlock::new(state, "db"),
     }))
 }
 
@@ -3154,6 +3159,17 @@ mod tests {
         assert_eq!(err.code, TradingErrorCode::Unauthorized);
     }
 
+    #[tokio::test]
+    async fn wallet_account_route_fails_closed_when_auth_disabled() {
+        let state = test_state();
+        let address = "0x00000000000000000000000000000000000000a1".to_string();
+        let err = account_positions_authorized(State(state), Path(address), HeaderMap::new())
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(err.code, TradingErrorCode::SourceUnavailable);
+    }
+
     #[test]
     fn wallet_account_scope_rejects_other_wallet() {
         let owner = "0x00000000000000000000000000000000000000a1";
@@ -4499,6 +4515,11 @@ mod tests {
             .warnings
             .iter()
             .any(|w| w.code == "CONFIG_MISSING" || w.code == "RPC_UNAVAILABLE"));
+        assert!(env
+            .0
+            .warnings
+            .iter()
+            .any(|w| w.message.contains("MarginEngine positions have not been reconciled")));
     }
 
     // ----- account_portfolio_impl -----
