@@ -31,6 +31,8 @@ The same run rejected: trade replay, expired EIP-712 intent after refreshing the
 
 `OptionMatchingEngine` now requires the MarginEngine-configured oracle to return a positive price within its nonzero freshness limit before either signed trade or RFQ execution. The prior oracle-down margin fallback allowed a fresh trade during an oracle outage. The new guard is a local contract change and requires separate on-chain review and deployment before Base Sepolia can gain that protection. The existing Base Sepolia contracts were untouched. The compiled OptionMatchingEngine deployed bytecode is 10680 bytes, below the EIP-170 limit of 24576.
 
+The guard also rejects risk-reducing close trades while the oracle is unavailable or its maximum delay is configured as zero. This availability tradeoff requires explicit protocol review before deployment. The local test proves refusal for new exposure, but does not prove safe emergency close behavior.
+
 User-created Rust execution intents now expire no later than one hour or the series expiry. The local frontend uses a loopback-only economic API URL in development; production builds keep the trading UI and Rust economic execution disabled. The V5 test's local signer is an Anvil fixture; neither it nor the adapter is exposed as a production route. No production PostgreSQL migration is introduced by this change.
 
 ## Verdicts
