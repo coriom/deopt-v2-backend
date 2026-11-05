@@ -1,25 +1,32 @@
 # DEOPT_OPTIONS_REAL_E2E_V4
 
-This milestone is local only. No Base Sepolia transaction, production deployment, or GitHub push was performed.
+Local integration proof only. No public Base Sepolia transaction, production deployment, or GitHub push occurred.
 
-## Executed local chain and database path
+## Reproduction
 
-Run `bash scripts/run-options-anvil-indexer-v4.sh` from the backend repository. It requires local `anvil`, `forge`, `cast`, Docker, PostgreSQL client, and Rust. The runner binds Anvil and a disposable PostgreSQL 16 to `127.0.0.1`, checks both ports are free, broadcasts the Foundry script only to that Anvil, runs the Rust integration test, then stops the resources it created. It never targets the hosted backend or database. Oracle prices and token balances in `OptionsLocalAnvilE2E.s.sol` are deterministic local test fixtures.
+From the backend repository:
 
-The passing run used Anvil chain 31337. `executeTrade` produced a successful receipt and seven logs; the Rust indexer persisted 11 events across the deployment and trade blocks. It read `MarginEngine.getPositionQuantity` as buyer +1 and seller -1, and the receipt-backed API returned matching buyer/seller contract counts from PostgreSQL. The test then advanced Anvil time, set a local settlement price, submitted real `settleAccount` transactions for both wallets, indexed two `AccountSettled` logs, and read both positions as zero. A snapshot revert and replacement blocks removed the orphaned trade from PostgreSQL. The following hashes are ephemeral local proof, not public transactions:
+```bash
+OPTIONS_V4_CHAIN_ID=84532 OPTIONS_V4_BROWSER=1 \
+  bash scripts/run-options-anvil-indexer-v4.sh
+```
 
-- Trade: `0x5cb2a1537a5ad1083f95a7a7dc9964e316f31c253ce10aaa3167ef64b4eeb35e`
-- Block hash: `0x2f9550170d150ea484cce8709735aa7eb8f1cc5b5ac8cea0e55219f82a476a09`
-- Settlement price: `0x8d59c5877aae1d4c0e4d45bf35c8159c04f25cb147b842771dd9e98ab908a839`
-- Seller settlement: `0x7e1e0ae60614afec40bb1bd26006085bfe7696ddef623f1a4cb23c0549b86f55`
-- Buyer settlement: `0x4b97378a6a206b6529430aa03fee2e55d99a5b00a54438e79ba970a56cd09de6`
+The command checks for Anvil, Foundry, Docker, PostgreSQL client, Rust, Node, and free loopback ports. It starts a disposable Anvil chain (chain ID 84532) and PostgreSQL 16, deploys the real local Options contracts with a deterministic synthetic oracle, runs the Rust API/indexer and Next.js, then invokes Playwright Chromium. The script verifies `anvil_nodeInfo` before any Foundry broadcast. Only the local test resources it created are stopped. The test wallets and local database password are public fixture data. The Rust trade adapter lives exclusively in `tests/options_v4_live_anvil_pg.rs`; no production route or economic flag is changed.
 
-The indexer now persists a canonical block hash with its cursor. On a cursor hash mismatch, it deletes affected chain events and resets the cursor in one PostgreSQL transaction before replay. Wallet projection reads use only indexed receipts with block hashes, compare open contract counts to MarginEngine, and fail closed on mismatch or a changed cursor hash. The test snapshot predates contract deployment, so the post-reorg API correctly refuses the read with HTTP 503 when MarginEngine disappears. Economic fields remain unverified and absent. The existing wallet session guard still protects the route.
+Two isolated browser wallets sign in through the actual Next.js gateway and Rust wallet challenge. They sign the same OptionMatchingEngine EIP-712 trade with real cryptographic signatures. The test submits those signatures to the loopback Rust adapter. Rust verifies both signers, ABI-encodes `executeTrade`, submits it to local Anvil, receives the successful receipt, and indexes its logs into PostgreSQL. The authenticated portfolio renders the buyer as long one contract and seller as short one contract. A cross-wallet request returns HTTP 403; a malformed buyer signature returns 401; repeating the successful adapter request returns 409. The authenticated seller view persists across browser reload.
 
-The final one-command run passed one ignored-by-default Rust integration test (`1 passed, 0 failed`) and left neither its PostgreSQL container nor its localhost listeners running. The Foundry broadcast artifact reported `receipt.status=0x1` with seven trade logs. The frontend type check and targeted ESLint check passed. The browser wallet fixture signed EIP-712 cryptographically, but that test did not submit an order to the Rust API.
+The Rust test compares the indexed receipt projection to `MarginEngine.getPositionQuantity` for both wallets. It advances local Anvil time, sets a local settlement price, submits two real `settleAccount` transactions, indexes both `AccountSettled` events, and confirms zero positions in the API and browser. It reverts to a snapshot taken after contract deployment and mines a replacement chain. The indexer removes the orphaned trade and settlement events, replays canonical earlier events, and has an idempotent second tick. The browser no longer displays the orphaned position. The frontend shows “No open positions” only when the empty list has `source: onchain_reconciled`; unavailable data still fails closed.
+
+Last passing browser run (ephemeral local hashes, not public transactions):
+
+- `REAL_ANVIL_TX=0xe8440a762d8f6cb2752499f57a9109af9e753fbc3366b5c7d79a01b267a55b05`
+- `REAL_BLOCK_HASH=0xeaa3703495b92ae191c90ed5b78e1d3b6fbf56339c817d6af0d9d66d6186bf18`
+- `RUST_PG_INDEXED_EVENTS=11`
+- `CANONICAL_API_POSITION=buyer:long:1,seller:short:1`
+- `CANONICAL_POSITION_AFTER_SETTLEMENT=buyer:0,seller:0`
+- `PLAYWRIGHT_LIVE_POSITION=PASS`, `PLAYWRIGHT_SETTLED_POSITION=PASS`, `PLAYWRIGHT_REORG_POSITION_REMOVED=PASS`
+- `REAL_REORG_ORPHAN_REMOVAL=PASS`; Rust integration test: `1 passed, 0 failed`.
 
 ## Acceptance boundary
 
-The local EIP-712 test and browser wallet signature fixture passed independently. A complete Next.js browser flow that submits the order through Rust, receives the actual receipt, and renders the reconciled position has **not** been demonstrated by these proofs. In particular, the broadcast in this runner is initiated by the Foundry script. Do not label `FULL_E2E`, `PLAYWRIGHT_E2E`, or Base Sepolia trading readiness PASS from this milestone.
-
-The next implementation gate is a test-only, loopback-bound Rust execution adapter that accepts signed orders from the real local Next.js interface, sends them to the local Anvil matching engine, then lets the indexer and authenticated position endpoint update the browser. The adapter must be impossible to enable in production. The economics and replay checks need to run in that same integrated fixture before the user flow can be accepted.
+This proves the local browser-signature → Rust submission → real Anvil receipt → Rust indexer → PostgreSQL → authenticated browser position path, plus local settlement and reorg recovery. The test drives its trade through the loopback test adapter rather than the production Options order form, which remains gated off. Premium, fees, collateral attribution, mark, and final balances are not fully reconciled by the current receipt projection; the API honestly reports `partial` and leaves those fields absent. The synthetic oracle does not prove Base Sepolia oracle readiness. Expired orders, insufficient collateral, invalid oracle, and double settlement require the existing contract-level tests or further integration coverage; this run does not claim those cases. It does not authorize hosted trading.
