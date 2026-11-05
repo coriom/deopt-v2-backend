@@ -501,6 +501,29 @@ pub struct Position {
     pub is_exercisable: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quantity_contracts: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub premium_proof: Option<PremiumProof>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PremiumProof {
+    pub amount_native: String,
+    pub settlement_asset: String,
+    pub direction: &'static str,
+    pub tx_hash: String,
+    pub block_hash: String,
+    pub status: &'static str,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SettlementProof {
+    pub option_id: String,
+    pub collected_native: String,
+    pub paid_native: String,
+    pub settlement_asset: String,
+    pub tx_hash: String,
+    pub block_hash: String,
+    pub status: &'static str,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -509,6 +532,8 @@ pub struct PositionsData {
     pub positions: Vec<Position>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<&'static str>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub settlements: Vec<SettlementProof>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1111,7 +1136,7 @@ pub async fn create_execution_intent(
                 | crate::options::OptionExecutionIntentStatus::CalldataReady
         ),
         next_step: "request_signing_payload",
-        expires_at_ms: None,
+        expires_at_ms: i64::try_from(intent.deadline.saturating_mul(1000)).ok(),
     }))
 }
 
@@ -1153,6 +1178,18 @@ fn warning_partial_preview() -> Warning {
             "assumed_taker_ppm": PARTIAL_PREVIEW_TAKER_PPM,
         }),
     }
+}
+
+fn preview_premium_native(state: &AppState, size_1e8: u128, price_1e8: u128) -> Result<u128, TradingApiError> {
+    let decimals = state.options_config.execution_default_settlement_decimals;
+    let native_scale = 10u128.checked_pow(decimals).ok_or_else(|| TradingApiError::new(
+        TradingErrorCode::InvalidRequest, "unsupported settlement decimals", MetaBlock::new(state, "validation"),
+    ))?;
+    size_1e8.checked_mul(price_1e8).and_then(|n| n.checked_mul(native_scale))
+        .map(|n| n / 10_000_000_000_000_000u128)
+        .ok_or_else(|| TradingApiError::new(
+            TradingErrorCode::InvalidRequest, "quote amount overflow", MetaBlock::new(state, "validation"),
+        ))
 }
 
 fn warning_source_unavailable(reason: &str) -> Warning {
@@ -1226,7 +1263,7 @@ where
         })?,
         None => series.strike_1e8,
     };
-    let premium = size.saturating_mul(price_1e8);
+    let premium = preview_premium_native(state, size, price_1e8)?;
     let fee_amount = premium.saturating_mul(PARTIAL_PREVIEW_TAKER_PPM as u128) / 1_000_000u128;
     let quote_expires_at_ms = now_ms() + 20_000; // 20s freshness window.
 
@@ -1386,6 +1423,7 @@ where
             mm_contribution: None,
             is_exercisable: None,
             quantity_contracts: None,
+            premium_proof: None,
         });
     }
     positions.sort_by(|a, b| a.series_id.cmp(&b.series_id));
@@ -1579,6 +1617,7 @@ where
             address: address.to_string(),
             positions,
             source: None,
+            settlements: Vec::new(),
         },
         warnings,
         meta: MetaBlock::new(state, "db"),
@@ -1623,23 +1662,93 @@ async fn indexed_account_positions<P: crate::execution::rpc::EthCallProvider>(
     if observed != projected {
         return Err(unavailable("Options position reconciliation pending"));
     }
-    let positions = projected.into_iter().map(|(id, quantity)| Position {
-        series_id: id.to_string(),
-        size: quantity.unsigned_abs().to_string(),
-        side: if quantity > 0 { "long" } else { "short" },
-        avg_entry_price_1e8: None,
-        mark_price_1e8: None,
-        unrealised_pnl: None,
-        im_contribution: None,
-        mm_contribution: None,
-        is_exercisable: None,
-        quantity_contracts: Some(quantity.unsigned_abs().to_string()),
-    }).collect();
+    let series = repo.list_option_series().await.map_err(|_| unavailable("Options series metadata unavailable"))?;
+    let mut positions = Vec::new();
+    for (id, quantity) in projected {
+        let id_string = id.to_string();
+        let mut premium_proof = None;
+        let trades: Vec<_> = events.iter().filter(|event|
+            matches!(event.event_name.as_str(), "OptionTradeExecuted" | "OptionRfqTradeExecuted")
+                && event.option_id.as_deref() == Some(id_string.as_str())).collect();
+        // Multi-fill cost basis needs a separate weighted projection. Never
+        // substitute signed order amounts for observed vault transfers.
+        if trades.len() == 1 && events.len() <= 100 {
+            let trade = trades[0];
+            let asset = series.iter().find(|s| s.onchain_series_id.as_deref() == Some(id_string.as_str()))
+                .map(|s| s.settlement_asset.as_str());
+            let expected = trade.quantity_contracts.as_deref().and_then(|s| s.parse::<u128>().ok())
+                .zip(trade.premium_per_contract_native.as_deref().and_then(|s| s.parse::<u128>().ok()))
+                .and_then(|(quantity, price)| quantity.checked_mul(price));
+            if let (Some(asset), Some(expected), Some(block_hash), Some(buyer), Some(seller)) =
+                (asset, expected, trade.block_hash.as_ref(), trade.buyer.as_ref(), trade.seller.as_ref()) {
+                let tx_events = repo.list_option_execution_events_by_tx_hash(&trade.tx_hash).await
+                    .map_err(|_| unavailable("Options premium events unavailable"))?;
+                let transfers: Vec<_> = tx_events.iter().filter(|event|
+                    event.event_name == "InternalTransfer" && event.block_hash.as_ref() == Some(block_hash)
+                        && event.decoded.as_ref().is_some_and(|d|
+                            d["token"].as_str().is_some_and(|x| x.eq_ignore_ascii_case(asset))
+                                && d["from"].as_str().is_some_and(|x| x.eq_ignore_ascii_case(buyer))
+                                && d["to"].as_str().is_some_and(|x| x.eq_ignore_ascii_case(seller))
+                                && d["amount"].as_str().and_then(|x| x.parse::<u128>().ok()) == Some(expected)
+                        )).collect();
+                if transfers.len() == 1 {
+                    premium_proof = Some(PremiumProof {
+                        amount_native: expected.to_string(), settlement_asset: asset.to_string(),
+                        direction: if buyer.eq_ignore_ascii_case(&account.0) { "paid" } else { "received" },
+                        tx_hash: trade.tx_hash.clone(), block_hash: block_hash.clone(), status: "vault_transfer_verified",
+                    });
+                }
+            }
+        }
+        positions.push(Position {
+            series_id: id_string, size: quantity.unsigned_abs().to_string(),
+            side: if quantity > 0 { "long" } else { "short" },
+            avg_entry_price_1e8: None, mark_price_1e8: None, unrealised_pnl: None,
+            im_contribution: None, mm_contribution: None, is_exercisable: None,
+            quantity_contracts: Some(quantity.unsigned_abs().to_string()), premium_proof,
+        });
+    }
+    let mut settlements = Vec::new();
+    if events.len() <= 100 {
+        for event in events.iter().filter(|e| e.event_name == "AccountSettled").take(20) {
+            let Some(asset) = series.iter().find(|s| s.onchain_series_id.as_deref() == event.option_id.as_deref())
+                .map(|s| s.settlement_asset.as_str()) else { continue };
+            let Some(decoded) = event.decoded.as_ref() else { continue };
+            let Some(block_hash) = event.block_hash.as_ref() else { continue };
+            let Some(collected) = decoded["collectedFromTrader"].as_str().and_then(|x| x.parse::<u128>().ok()) else { continue };
+            let Some(paid) = decoded["paidToTrader"].as_str().and_then(|x| x.parse::<u128>().ok()) else { continue };
+            let tx_events = repo.list_option_execution_events_by_tx_hash(&event.tx_hash).await
+                .map_err(|_| unavailable("Options settlement events unavailable"))?;
+            let mut incoming = 0u128;
+            let mut outgoing = 0u128;
+            let mut valid = true;
+            for transfer in tx_events.iter().filter(|e| e.event_name == "InternalTransfer") {
+                if transfer.block_hash.as_ref() != Some(block_hash) { valid = false; break; }
+                let Some(d) = transfer.decoded.as_ref() else { valid = false; break };
+                if !d["token"].as_str().is_some_and(|x| x.eq_ignore_ascii_case(asset)) { continue; }
+                let Some(amount) = d["amount"].as_str().and_then(|x| x.parse::<u128>().ok()) else { valid = false; break };
+                if d["to"].as_str().is_some_and(|x| x.eq_ignore_ascii_case(&account.0)) {
+                    incoming = incoming.checked_add(amount).ok_or_else(|| unavailable("settlement overflow"))?;
+                }
+                if d["from"].as_str().is_some_and(|x| x.eq_ignore_ascii_case(&account.0)) {
+                    outgoing = outgoing.checked_add(amount).ok_or_else(|| unavailable("settlement overflow"))?;
+                }
+            }
+            if valid && incoming == paid && outgoing == collected {
+                settlements.push(SettlementProof {
+                    option_id: event.option_id.clone().unwrap_or_default(),
+                    collected_native: collected.to_string(), paid_native: paid.to_string(),
+                    settlement_asset: asset.to_string(), tx_hash: event.tx_hash.clone(),
+                    block_hash: block_hash.clone(), status: "vault_transfer_verified",
+                });
+            }
+        }
+    }
     Ok(Json(Envelope {
         status: "partial",
-        data: PositionsData { address: account.0.clone(), positions, source: Some("onchain_reconciled") },
+        data: PositionsData { address: account.0.clone(), positions, source: Some("onchain_reconciled"), settlements },
         warnings: vec![warning_source_unavailable(
-            "Contract counts match MarginEngine; premium, fees, collateral and mark remain unverified.",
+            "Contract counts match MarginEngine. Premium and settlement are shown only with matching vault transfers; fees, collateral and mark remain unverified.",
         )],
         meta: MetaBlock::new(state, "chain+db"),
     }))
@@ -3079,7 +3188,7 @@ where
         })?,
         None => series.strike_1e8,
     };
-    let premium = size.saturating_mul(price_1e8);
+    let premium = preview_premium_native(state, size, price_1e8)?;
     let fee_amount = premium.saturating_mul(PARTIAL_PREVIEW_TAKER_PPM as u128) / 1_000_000u128;
     let quote_expires_at_ms = now_ms() + 20_000;
 
@@ -4057,6 +4166,25 @@ mod tests {
         assert_eq!(env.0.data.buyer_fee.ppm_signed, PARTIAL_PREVIEW_TAKER_PPM);
         // PARTIAL_PREVIEW warning present.
         assert!(env.0.warnings.iter().any(|w| w.code == "PARTIAL_PREVIEW"));
+    }
+
+    #[tokio::test]
+    async fn quote_preview_uses_settlement_native_units() {
+        let s = seeded_state(true);
+        let env = quote_preview(
+            State(s),
+            Query(QuotePreviewQuery {
+                series_id: "S-1".to_string(),
+                side: "buy".to_string(),
+                size: "100000000".to_string(),
+                price_1e8: Some("10000000000".to_string()),
+                account: None,
+            }),
+        )
+        .await
+        .expect("indicative quote");
+        assert_eq!(env.0.data.premium, "100000000");
+        assert_eq!(env.0.status, "partial");
     }
 
     #[tokio::test]

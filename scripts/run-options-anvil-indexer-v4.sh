@@ -15,14 +15,14 @@ anvil_pid=
 frontend_pid=
 pg_started=0
 cleanup() {
-  if [[ -n "$frontend_pid" ]]; then kill "$frontend_pid" 2>/dev/null || true; wait "$frontend_pid" 2>/dev/null || true; fi
+  if [[ -n "$frontend_pid" ]]; then kill -- "-$frontend_pid" 2>/dev/null || true; wait "$frontend_pid" 2>/dev/null || true; fi
   if [[ -n "$anvil_pid" ]]; then kill "$anvil_pid" 2>/dev/null || true; wait "$anvil_pid" 2>/dev/null || true; fi
   if (( pg_started )); then docker stop "$container" >/dev/null 2>&1 || true; fi
 }
 trap cleanup EXIT
 for tool in anvil cast forge docker cargo python3 psql; do command -v "$tool" >/dev/null || { echo "missing: $tool" >&2; exit 1; }; done
 if [[ "${OPTIONS_V4_BROWSER:-0}" == 1 ]]; then
-  for tool in node npm curl; do command -v "$tool" >/dev/null || { echo "missing: $tool" >&2; exit 1; }; done
+  for tool in node npm curl setsid; do command -v "$tool" >/dev/null || { echo "missing: $tool" >&2; exit 1; }; done
   [[ "$chain_id" == 84532 ]] || { echo 'browser auth bench requires local Anvil chain 84532' >&2; exit 1; }
   export OPTIONS_V4_FRONTEND_PORT=${OPTIONS_V4_FRONTEND_PORT:-13000}
   export OPTIONS_V4_API_PORT=${OPTIONS_V4_API_PORT:-18555}
@@ -34,6 +34,7 @@ ports = list(map(int,sys.argv[1:]))
 if len(ports) != len(set(ports)): raise SystemExit('test ports must differ')
 for port in ports[:4 if __import__('os').environ.get('OPTIONS_V4_BROWSER') == '1' else 2]:
     with socket.socket() as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind(('127.0.0.1',port))
 PY
 if [[ -n "$(docker ps -aq --filter "name=^/${container}$")" ]]; then echo 'test container name in use' >&2; exit 1; fi
@@ -76,7 +77,8 @@ export OPTIONS_V4_RPC_URL="http://127.0.0.1:$anvil_port"
 export OPTIONS_V4_PG_URL="postgres://postgres:deopt-local-test-only@127.0.0.1:$pg_port/deopt_options_v4"
 export OPTIONS_V4_BROADCAST="$sol/broadcast/OptionsLocalAnvilE2E.s.sol/$chain_id/run-latest.json"
 if [[ "${OPTIONS_V4_BROWSER:-0}" == 1 ]]; then
-  (cd "$front" && DEOPT_BACKEND_HTTPS_ORIGIN="http://127.0.0.1:$OPTIONS_V4_API_PORT" \
+  (cd "$front" && exec setsid env DEOPT_BACKEND_HTTPS_ORIGIN="http://127.0.0.1:$OPTIONS_V4_API_PORT" \
+    NEXT_PUBLIC_TRADING_API_BASE_URL="http://127.0.0.1:$OPTIONS_V4_API_PORT" \
     NEXT_PUBLIC_DEOPT_WALLET_READ_AUTH=true NEXT_PUBLIC_CHAIN_ENV=sepolia \
     npm run dev -- --hostname 127.0.0.1 --port "$OPTIONS_V4_FRONTEND_PORT") \
     >/tmp/deopt-options-v4-next-$$.log 2>&1 &
@@ -87,5 +89,8 @@ if [[ "${OPTIONS_V4_BROWSER:-0}" == 1 ]]; then
     sleep 1
   done
   curl -fsS "http://127.0.0.1:$OPTIONS_V4_FRONTEND_PORT/portfolio" >/dev/null
+  if [[ "${OPTIONS_V5_PRODUCT:-0}" == 1 ]]; then
+    curl -fsS "http://127.0.0.1:$OPTIONS_V4_FRONTEND_PORT/options" >/dev/null
+  fi
 fi
 (cd "$repo" && CARGO_BUILD_JOBS=2 cargo test --test options_v4_live_anvil_pg -- --ignored --nocapture)

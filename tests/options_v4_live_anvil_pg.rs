@@ -15,8 +15,10 @@ use deopt_v2_backend::execution::{EthCallProvider, EthCallRequest, HttpJsonRpcPr
 use deopt_v2_backend::options::{
     encode_option_execute_trade_calldata, index_option_events_with_provider,
     list_option_execution_events, option_trade_digest_bytes, OptionEventIndexerConfig,
-    OptionTradePayload, OptionTradeSignatureBundle, OptionsConfig,
+    OptionTradePayload, OptionTradeSignatureBundle, OptionsConfig, OptionSeries,
+    OptionSeriesSource, OptionSeriesStatus, OptionExecutionSignatureMode,
 };
+use deopt_v2_backend::execution::config::PrivateKeySecret;
 use deopt_v2_backend::signing::{recover_eip712_signer, Eip712Domain};
 use deopt_v2_backend::types::AccountId;
 use serde_json::Value;
@@ -187,6 +189,25 @@ async fn browser_trade_adapter(
             "buyerNonce":"0","sellerNonce":"0","deadline":payload.deadline.to_string()
         }
     });
+    if std::env::var("OPTIONS_V5_PRODUCT").as_deref() == Ok("1") {
+        state.repository.as_ref().expect("disposable PG").insert_option_series(&OptionSeries {
+            option_series_id: "local-call-v5".into(),
+            underlying: payload.underlying.0.clone(),
+            base_asset: payload.underlying.0.clone(),
+            quote_asset: payload.settlement_asset.0.clone(),
+            settlement_asset: payload.settlement_asset.0.clone(),
+            expiry,
+            strike_1e8: strike as u128,
+            is_call: true,
+            contract_size_1e8: contract_size,
+            status: OptionSeriesStatus::Active,
+            source: OptionSeriesSource::Onchain,
+            onchain_product_id: None,
+            onchain_series_id: Some(id.to_string()),
+            created_at_ms: (timestamp as i64) * 1000,
+            updated_at_ms: (timestamp as i64) * 1000,
+        }).await.expect("seed real deployed series metadata");
+    }
     LocalTradeAdapter {
         state: state.clone(),
         rpc: rpc.into(),
@@ -249,9 +270,22 @@ async fn real_receipt_is_indexed_in_postgres() {
     }
     let repo = repo.expect("connect disposable PG after host readiness");
     repo.run_migrations().await.expect("migrations");
+    let v5 = std::env::var("OPTIONS_V5_PRODUCT").as_deref() == Ok("1");
+    let mut options_config = OptionsConfig::enabled_in_memory_for_tests();
+    if v5 {
+        options_config.execution_enabled = true;
+        options_config.matching_engine_address = AccountId::new(matching);
+        options_config.execution_eip712_domain.verifying_contract = AccountId::new(matching);
+        options_config.execution_signature_mode = OptionExecutionSignatureMode::Strict;
+        options_config.execution_simulation_enabled = true;
+        options_config.execution_simulation_rpc_url = Some(rpc.clone());
+        options_config.execution_simulation_gas_limit = 1_000_000;
+        options_config.execution_broadcast_enabled = true;
+        options_config.execution_broadcast_gas_limit = 1_000_000;
+    }
     let mut state = AppState::with_options_config_and_repository(
         EngineState::with_default_markets(),
-        OptionsConfig::enabled_in_memory_for_tests(),
+        options_config,
         repo.clone(),
     );
     let local_chain = std::env::var("OPTIONS_V4_CHAIN_ID")
@@ -261,6 +295,21 @@ async fn real_receipt_is_indexed_in_postgres() {
     assert!(local_chain == 31337 || local_chain == 84532);
     state.chain_id = local_chain;
     state.execution_config.rpc_url = Some(rpc.clone());
+    if v5 {
+        state.execution_config.execution_enabled = true;
+        state.execution_config.real_broadcast_enabled = true;
+        state.execution_config.dry_run = false;
+        state.execution_config.executor_chain_id = local_chain;
+        state.execution_config.executor_allow_local_signer = true;
+        state.execution_config.max_fee_per_gas_wei = Some("10000000000".into());
+        state.execution_config.max_priority_fee_per_gas_wei = Some("1000000000".into());
+        state.execution_config.executor_private_key = Some(PrivateKeySecret::new(
+            "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80".into(),
+        ));
+        state.execution_config.executor_from_address = AccountId::new(
+            "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+        );
+    }
     state.trading_views.margin_engine_address = Some(AccountId::new(margin));
     state.option_event_indexer_config = OptionEventIndexerConfig {
         enabled: true,
@@ -279,12 +328,16 @@ async fn real_receipt_is_indexed_in_postgres() {
         protocol_fee_vault_address: None,
     };
     let provider = HttpJsonRpcProvider::new(rpc.clone());
-    let (tx_hash, receipt, browser_indexed, browser_calldata) = if browser {
+    let (tx_hash, receipt, browser_indexed, browser_calldata, pre_balances) = if browser {
         assert_eq!(
             local_chain, 84532,
             "browser bench must use local chain 84532"
         );
         let adapter = browser_trade_adapter(&broadcast, &state, &rpc, matching).await;
+        let pre_provider = HttpJsonRpcProvider::new(rpc.clone());
+        let buyer_before = vault_balance(&pre_provider, vault, &adapter.payload.buyer.0, &adapter.payload.settlement_asset.0).await;
+        let seller_before = vault_balance(&pre_provider, vault, &adapter.payload.seller.0, &adapter.payload.settlement_asset.0).await;
+        let asset = adapter.payload.settlement_asset.0.clone();
         let option_id = adapter.payload.option_id.to_string();
         run_browser(&state, adapter.clone(), &option_id, "trade").await;
         let hash = adapter
@@ -307,7 +360,7 @@ async fn real_receipt_is_indexed_in_postgres() {
             serde_json::json!([hash]),
         )
         .await;
-        (hash, receipt, indexed, Some(calldata))
+        (hash, receipt, indexed, Some(calldata), Some((buyer_before, seller_before, asset)))
     } else {
         let trade = transactions
             .iter()
@@ -319,6 +372,7 @@ async fn real_receipt_is_indexed_in_postgres() {
             transactions[trade]["hash"].as_str().unwrap().to_owned(),
             receipts[trade].clone(),
             0,
+            None,
             None,
         )
     };
@@ -341,6 +395,28 @@ async fn real_receipt_is_indexed_in_postgres() {
         .iter()
         .find(|e| e.tx_hash.eq_ignore_ascii_case(&tx_hash) && e.event_name == "OptionTradeExecuted")
         .expect("matching event in PG");
+    if let Some((buyer_before, seller_before, asset)) = pre_balances.as_ref() {
+        let premium = indexed.quantity_contracts.as_deref().unwrap().parse::<u128>().unwrap()
+            * indexed.premium_per_contract_native.as_deref().unwrap().parse::<u128>().unwrap();
+        let transfer: Vec<_> = events.iter().filter(|e| e.tx_hash.eq_ignore_ascii_case(&tx_hash)
+            && e.event_name == "InternalTransfer"
+            && e.decoded.as_ref().and_then(|d| d["from"].as_str()).is_some_and(|v| v.eq_ignore_ascii_case(indexed.buyer.as_deref().unwrap()))
+            && e.decoded.as_ref().and_then(|d| d["to"].as_str()).is_some_and(|v| v.eq_ignore_ascii_case(indexed.seller.as_deref().unwrap()))
+            && e.decoded.as_ref().and_then(|d| d["token"].as_str()).is_some_and(|v| v.eq_ignore_ascii_case(asset))
+        ).collect();
+        assert_eq!(transfer.len(), 1, "exactly one vault premium transfer");
+        assert_eq!(transfer[0].decoded.as_ref().unwrap()["amount"], premium.to_string());
+        assert_eq!(transfer[0].block_hash, indexed.block_hash);
+        let buyer_after = vault_balance(&provider, vault, indexed.buyer.as_deref().unwrap(), asset).await;
+        let seller_after = vault_balance(&provider, vault, indexed.seller.as_deref().unwrap(), asset).await;
+        assert_eq!(*buyer_before - buyer_after, premium);
+        assert_eq!(seller_after - *seller_before, premium);
+        assert_eq!(buyer_after + seller_after, *buyer_before + *seller_before);
+        assert!(!events.iter().any(|e| e.tx_hash.eq_ignore_ascii_case(&tx_hash)
+            && matches!(e.event_name.as_str(), "TradingFeeCharged" | "FeeChargedV2" | "FeeRebatedV2")));
+        println!("PREMIUM_VAULT_CONSERVATION=PASS_NATIVE_{premium}");
+        println!("LOCAL_FIXTURE_FEES=ZERO_NO_FEE_MANAGER");
+    }
     assert_eq!(indexed.block_hash.as_deref(), Some(block_hash.as_str()));
     assert!(indexed.option_id.is_some());
     assert!(indexed.buyer.is_some());
@@ -444,6 +520,12 @@ async fn real_receipt_is_indexed_in_postgres() {
         &alloy_primitives::U256::from(2500u64 * 100_000_000).to_be_bytes::<32>(),
     );
     let price_tx = send_local(&client, &rpc, registry, &set_price).await;
+    let settlement_before = if let Some((_, _, asset)) = pre_balances.as_ref() {
+        Some((
+            vault_balance(&provider, vault, &buyer_wallet, asset).await,
+            vault_balance(&provider, vault, &seller_wallet, asset).await,
+        ))
+    } else { None };
     let mut settle = selector("settleAccount(uint256,address)");
     settle.extend_from_slice(&option_id.to_be_bytes::<32>());
     let seller = alloy_primitives::Address::from_str(indexed.seller.as_deref().unwrap()).unwrap();
@@ -484,6 +566,32 @@ async fn real_receipt_is_indexed_in_postgres() {
             .count(),
         2
     );
+    if let (Some((_, _, asset)), Some((buyer_before_settle, seller_before_settle))) =
+        (pre_balances.as_ref(), settlement_before) {
+        for (wallet, tx, balance_before) in [
+            (&buyer_wallet, &buyer_tx, buyer_before_settle),
+            (&seller_wallet, &seller_tx, seller_before_settle),
+        ] {
+            let settled: Vec<_> = settled_events.iter().filter(|e| e.event_name == "AccountSettled"
+                && e.tx_hash == *tx && e.account.as_deref().is_some_and(|a| a.eq_ignore_ascii_case(wallet))).collect();
+            assert_eq!(settled.len(), 1);
+            let d = settled[0].decoded.as_ref().unwrap();
+            let collected = d["collectedFromTrader"].as_str().unwrap().parse::<u128>().unwrap();
+            let paid = d["paidToTrader"].as_str().unwrap().parse::<u128>().unwrap();
+            let transfers: Vec<_> = settled_events.iter().filter(|e| e.tx_hash == *tx && e.event_name == "InternalTransfer"
+                && e.decoded.as_ref().and_then(|v| v["token"].as_str()).is_some_and(|v| v.eq_ignore_ascii_case(asset))).collect();
+            let incoming: u128 = transfers.iter().filter(|e| e.decoded.as_ref().unwrap()["to"].as_str().unwrap().eq_ignore_ascii_case(wallet))
+                .map(|e| e.decoded.as_ref().unwrap()["amount"].as_str().unwrap().parse::<u128>().unwrap()).sum();
+            let outgoing: u128 = transfers.iter().filter(|e| e.decoded.as_ref().unwrap()["from"].as_str().unwrap().eq_ignore_ascii_case(wallet))
+                .map(|e| e.decoded.as_ref().unwrap()["amount"].as_str().unwrap().parse::<u128>().unwrap()).sum();
+            assert_eq!(incoming, paid);
+            assert_eq!(outgoing, collected);
+            let balance_after = vault_balance(&provider, vault, wallet, asset).await;
+            assert_eq!(balance_after.checked_add(outgoing), balance_before.checked_add(incoming));
+        }
+        println!("SETTLEMENT_VAULT_TRANSFERS=PASS");
+        println!("SETTLEMENT_WALLET_BALANCES=PASS");
+    }
     let settled_view = serde_json::to_value(
         deopt_v2_backend::api::trading::account_positions(
             State(state.clone()),
@@ -570,7 +678,7 @@ async fn real_receipt_is_indexed_in_postgres() {
             assert_eq!(body["data"]["source"], "onchain_reconciled");
             assert_eq!(body["data"]["positions"].as_array().unwrap().len(), 0);
             let adapter = browser_trade_adapter(&broadcast, &state, &rpc, matching).await;
-            run_browser(&state, adapter, &option_id.to_string(), "reorg").await;
+            run_browser(&state, adapter.clone(), &option_id.to_string(), "reorg").await;
             println!("PLAYWRIGHT_REORG_POSITION_REMOVED=PASS");
             let calldata = browser_calldata.as_deref().expect("browser trade calldata");
             rpc_request(
@@ -583,8 +691,72 @@ async fn real_receipt_is_indexed_in_postgres() {
             }, "latest"]),
             )
             .await;
+            if std::env::var("OPTIONS_V5_PRODUCT").as_deref() == Ok("1") {
+                let oracle = transactions.iter().find(|tx| tx["contractName"] == "ScenarioOptionOracle"
+                    && tx["transactionType"] == "CREATE")
+                    .and_then(|tx| tx["contractAddress"].as_str()).expect("local oracle deployment");
+                let mut set_oracle = selector("setPrice(address,address,uint256,uint256,bool)");
+                for address in [&adapter.payload.underlying.0, &adapter.payload.settlement_asset.0] {
+                    let parsed = alloy_primitives::Address::from_str(address).unwrap();
+                    set_oracle.extend_from_slice(&[0u8; 12]);
+                    set_oracle.extend_from_slice(parsed.as_slice());
+                }
+                set_oracle.extend_from_slice(&U256::from(2000u64 * 100_000_000).to_be_bytes::<32>());
+                let latest = rpc_request(&client, &rpc, "eth_getBlockByNumber", serde_json::json!(["latest",false])).await;
+                let timestamp = u64::from_str_radix(latest["timestamp"].as_str().unwrap().trim_start_matches("0x"),16).unwrap();
+                set_oracle.extend_from_slice(&U256::from(timestamp).to_be_bytes::<32>());
+                let mut invalid = set_oracle.clone();
+                invalid.extend_from_slice(&[0u8; 32]);
+                send_local(&client, &rpc, oracle, &invalid).await;
+                expect_local_revert(&client, &rpc, matching, calldata).await;
+                println!("INVALID_ORACLE_CONTRACT_REJECTION=PASS");
+                let mut stale = selector("setPrice(address,address,uint256,uint256,bool)");
+                for address in [&adapter.payload.underlying.0, &adapter.payload.settlement_asset.0] {
+                    let parsed = alloy_primitives::Address::from_str(address).unwrap();
+                    stale.extend_from_slice(&[0u8; 12]);
+                    stale.extend_from_slice(parsed.as_slice());
+                }
+                stale.extend_from_slice(&U256::from(2000u64 * 100_000_000).to_be_bytes::<32>());
+                stale.extend_from_slice(&U256::from(1).to_be_bytes::<32>());
+                stale.extend_from_slice(&U256::from(1).to_be_bytes::<32>());
+                send_local(&client, &rpc, oracle, &stale).await;
+                expect_local_revert(&client, &rpc, matching, calldata).await;
+                println!("STALE_ORACLE_CONTRACT_REJECTION=PASS");
+                set_oracle.extend_from_slice(&U256::from(1).to_be_bytes::<32>());
+                send_local(&client, &rpc, oracle, &set_oracle).await;
+
+                let collateral_snapshot = rpc_request(&client, &rpc, "evm_snapshot", serde_json::json!([])).await;
+                let seller = adapter.payload.seller.0.clone();
+                rpc_request(&client, &rpc, "anvil_impersonateAccount", serde_json::json!([seller])).await;
+                let mut withdraw = selector("withdraw(address,uint256)");
+                let token = alloy_primitives::Address::from_str(&adapter.payload.settlement_asset.0).unwrap();
+                withdraw.extend_from_slice(&[0u8;12]);
+                withdraw.extend_from_slice(token.as_slice());
+                withdraw.extend_from_slice(&U256::from(10_000u64 * 1_000_000).to_be_bytes::<32>());
+                send_local_as(&client, &rpc, vault, &withdraw, &seller).await;
+                expect_local_revert(&client, &rpc, matching, calldata).await;
+                println!("INSUFFICIENT_COLLATERAL_CONTRACT_REJECTION=PASS");
+                assert_eq!(rpc_request(&client, &rpc, "evm_revert", serde_json::json!([collateral_snapshot])).await, true);
+            }
             rpc_request(&client, &rpc, "evm_increaseTime", serde_json::json!([7200])).await;
             rpc_request(&client, &rpc, "evm_mine", serde_json::json!([])).await;
+            if std::env::var("OPTIONS_V5_PRODUCT").as_deref() == Ok("1") {
+                let oracle = transactions.iter().find(|tx| tx["contractName"] == "ScenarioOptionOracle"
+                    && tx["transactionType"] == "CREATE")
+                    .and_then(|tx| tx["contractAddress"].as_str()).expect("local oracle deployment");
+                let latest = rpc_request(&client, &rpc, "eth_getBlockByNumber", serde_json::json!(["latest",false])).await;
+                let timestamp = u64::from_str_radix(latest["timestamp"].as_str().unwrap().trim_start_matches("0x"),16).unwrap();
+                let mut refresh = selector("setPrice(address,address,uint256,uint256,bool)");
+                for address in [&adapter.payload.underlying.0, &adapter.payload.settlement_asset.0] {
+                    let parsed = alloy_primitives::Address::from_str(address).unwrap();
+                    refresh.extend_from_slice(&[0u8; 12]);
+                    refresh.extend_from_slice(parsed.as_slice());
+                }
+                refresh.extend_from_slice(&U256::from(2000u64 * 100_000_000).to_be_bytes::<32>());
+                refresh.extend_from_slice(&U256::from(timestamp).to_be_bytes::<32>());
+                refresh.extend_from_slice(&U256::from(1).to_be_bytes::<32>());
+                send_local(&client, &rpc, oracle, &refresh).await;
+            }
             expect_local_revert(&client, &rpc, matching, calldata).await;
             println!("EXPIRED_OPTION_TRADE=REJECTED");
         } else {
@@ -604,19 +776,61 @@ async fn run_browser(state: &AppState, adapter: LocalTradeAdapter, option_id: &s
     let mut browser_state = state.clone();
     browser_state.wallet_read_auth.enabled = true;
     browser_state.wallet_read_auth.origin = format!("http://127.0.0.1:{frontend_port}");
+    let v5_product = std::env::var("OPTIONS_V5_PRODUCT").as_deref() == Ok("1") && phase == "trade";
     let local_routes = axum::Router::new()
         .route("/local/options-v4/trade", get(local_trade))
         .route("/local/options-v4/execute", post(local_execute))
-        .layer(Extension(adapter));
-    let app = deopt_v2_backend::api::router(browser_state)
-        .merge(local_routes)
-        .layer(CorsLayer::permissive()); // disposable loopback test server only
+        .layer(Extension(adapter.clone()));
+    let app = if v5_product {
+        deopt_v2_backend::api::router(browser_state)
+    } else {
+        deopt_v2_backend::api::router(browser_state).merge(local_routes)
+    }
+    .layer(CorsLayer::permissive()); // disposable loopback test server only
     let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{api_port}"))
         .await
         .expect("local-only Rust API listener");
     let server = tokio::spawn(async move {
         axum::serve(listener, app).await.expect("local Rust API");
     });
+    let watcher = if v5_product {
+        let local_state = state.clone();
+        let local_adapter = adapter.clone();
+        let api = format!("http://127.0.0.1:{api_port}");
+        Some(tokio::spawn(async move {
+            let repo = local_state.repository.as_ref().expect("disposable PG");
+            let client = reqwest::Client::new();
+            for _ in 0..120 {
+                let ready = repo.list_option_execution_intents().await.expect("intent list")
+                    .into_iter().find(|intent| intent.calldata.is_some());
+                if let Some(intent) = ready {
+                    let intent_id = intent.intent_id.to_string();
+                    let simulation = client.post(format!("{api}/options/execution-intents/{intent_id}/simulate"))
+                        .send().await.expect("real simulation handler");
+                    assert!(simulation.status().is_success(), "real simulation failed: {}", simulation.text().await.unwrap());
+                    let broadcast = client.post(format!("{api}/options/execution-intents/{intent_id}/broadcast"))
+                        .send().await.expect("real broadcast handler");
+                    assert!(broadcast.status().is_success(), "real broadcast failed: {}", broadcast.text().await.unwrap());
+                    let body: Value = broadcast.json().await.expect("broadcast JSON");
+                    let hash = body["tx_hash"].as_str().expect("tx hash").to_owned();
+                    for _ in 0..20 {
+                        let receipt = rpc_request(&client, &local_adapter.rpc, "eth_getTransactionReceipt", serde_json::json!([hash])).await;
+                        if receipt.is_object() && receipt["status"] == "0x1" { break; }
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    }
+                    let provider = HttpJsonRpcProvider::new(local_adapter.rpc.clone());
+                    let tick = index_option_events_with_provider(&local_state, &provider).await.expect("index broadcast receipt");
+                    assert!(tick.events_indexed > 0, "broadcast receipt must index");
+                    *local_adapter.tx_hash.lock().unwrap() = Some(hash);
+                    *local_adapter.indexed_count.lock().unwrap() = tick.events_indexed;
+                    *local_adapter.calldata.lock().unwrap() = Some(hex::decode(intent.calldata.expect("calldata").trim_start_matches("0x")).unwrap());
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+            panic!("product form did not produce a fully signed intent");
+        }))
+    } else { None };
     let frontend = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
@@ -625,13 +839,14 @@ async fn run_browser(state: &AppState, adapter: LocalTradeAdapter, option_id: &s
     let seller = "0xb040e0fAac56886b0f29Af446544AED0A154ED29".to_owned();
     let option_id = option_id.to_owned();
     let phase = phase.to_owned();
+    let spec = if v5_product { "tests/e2e/options-v5-product.spec.ts" } else { "tests/e2e/options-v4-live-position.spec.ts" };
     let output = tokio::task::spawn_blocking(move || {
         std::process::Command::new("npx")
             .current_dir(frontend)
             .args([
                 "playwright",
                 "test",
-                "tests/e2e/options-v4-live-position.spec.ts",
+                spec,
                 "--project=chromium",
             ])
             .env("E2E_BASE_URL", format!("http://127.0.0.1:{frontend_port}"))
@@ -640,11 +855,20 @@ async fn run_browser(state: &AppState, adapter: LocalTradeAdapter, option_id: &s
             .env("OPTIONS_V4_SELLER", seller)
             .env("OPTIONS_V4_OPTION_ID", option_id)
             .env("OPTIONS_V4_PHASE", phase)
+            .env("OPTIONS_V5_PRODUCT", if v5_product || std::env::var("OPTIONS_V5_PRODUCT").as_deref() == Ok("1") { "1" } else { "0" })
             .output()
     })
     .await
     .expect("Playwright join")
     .expect("Playwright process");
+    if !output.status.success() {
+        if let Some(watcher) = watcher { watcher.abort(); }
+        server.abort();
+        panic!("Playwright failed:\n{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    }
+    if let Some(watcher) = watcher {
+        watcher.await.expect("real Rust route broadcaster");
+    }
     server.abort();
     assert!(
         output.status.success(),
@@ -657,6 +881,21 @@ async fn run_browser(state: &AppState, adapter: LocalTradeAdapter, option_id: &s
 
 fn selector(signature: &str) -> Vec<u8> {
     alloy_primitives::keccak256(signature.as_bytes())[..4].to_vec()
+}
+
+async fn vault_balance(provider: &HttpJsonRpcProvider, vault: &str, wallet: &str, asset: &str) -> u128 {
+    let mut data = selector("balances(address,address)");
+    for address in [wallet, asset] {
+        let parsed = alloy_primitives::Address::from_str(address).expect("fixture address");
+        data.extend_from_slice(&[0u8; 12]);
+        data.extend_from_slice(parsed.as_slice());
+    }
+    let output = provider.eth_call(EthCallRequest {
+        from: AccountId::new(wallet), to: AccountId::new(vault), data,
+        value: 0, gas_limit: None,
+    }).await.expect("canonical vault balance").output;
+    assert_eq!(output.len(), 32);
+    u128::try_from(U256::from_be_slice(&output)).expect("fixture balance fits u128")
 }
 
 async fn rpc_request(client: &reqwest::Client, url: &str, method: &str, params: Value) -> Value {
@@ -679,6 +918,13 @@ async fn rpc_request(client: &reqwest::Client, url: &str, method: &str, params: 
 }
 
 async fn expect_local_revert(client: &reqwest::Client, url: &str, to: &str, data: &[u8]) {
+    assert!(
+        local_call_reverted(client, url, to, data).await,
+        "expected a real local contract revert"
+    );
+}
+
+async fn local_call_reverted(client: &reqwest::Client, url: &str, to: &str, data: &[u8]) -> bool {
     let response: Value = client
         .post(url)
         .json(&serde_json::json!({
@@ -692,26 +938,26 @@ async fn expect_local_revert(client: &reqwest::Client, url: &str, to: &str, data
         .json()
         .await
         .expect("local revert JSON");
-    assert!(
-        response.get("error").is_some() && response.get("result").is_none(),
-        "expected a real local contract revert"
-    );
+    response.get("error").is_some() && response.get("result").is_none()
 }
 
 async fn send_local(client: &reqwest::Client, url: &str, to: &str, data: &[u8]) -> String {
+    send_local_as(client, url, to, data, "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266").await
+}
+
+async fn send_local_as(client: &reqwest::Client, url: &str, to: &str, data: &[u8], from: &str) -> String {
     let calldata = format!(
         "0x{}",
         data.iter()
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>()
     );
-    let owner = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"; // public Anvil account
     let hash = rpc_request(
         client,
         url,
         "eth_sendTransaction",
         serde_json::json!([{
-            "from":owner, "to":to, "data":calldata
+            "from":from, "to":to, "data":calldata
         }]),
     )
     .await

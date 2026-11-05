@@ -3896,7 +3896,7 @@ pub async fn create_user_initiated_execution_intent_from_quote(
     let (buyer_nonce, seller_nonce) =
         option_execution_nonces(state, nonce_provider.as_ref(), &buyer, &seller).await?;
     let source_id = Uuid::new_v4().to_string();
-    let intent = build_option_execution_intent(
+    let mut intent = build_option_execution_intent(
         state,
         series,
         OptionExecutionSourceType::OptionOrderbookFill,
@@ -3917,6 +3917,15 @@ pub async fn create_user_initiated_execution_intent_from_quote(
         // wiring for this path is F-order 3.
         None,
     )?;
+    // A user-created intent must not remain executable indefinitely. Bound
+    // the EIP-712 deadline by both the series expiry and a one-hour session.
+    let now_sec = u64::try_from(now_ms() / 1000).map_err(|_| {
+        BackendError::InvalidOptionExecutionIntentState("invalid server time".to_string())
+    })?;
+    intent.deadline = series.expiry.min(now_sec.saturating_add(3600));
+    if intent.deadline <= now_sec {
+        return Err(BackendError::InvalidOptionSeriesState("option series has expired".to_string()));
+    }
     insert_option_execution_intent(state, intent).await
 }
 
