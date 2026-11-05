@@ -503,6 +503,8 @@ pub struct Position {
     pub quantity_contracts: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub premium_proof: Option<PremiumProof>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fee_proof: Option<FeeProof>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -510,6 +512,17 @@ pub struct PremiumProof {
     pub amount_native: String,
     pub settlement_asset: String,
     pub direction: &'static str,
+    pub tx_hash: String,
+    pub block_hash: String,
+    pub status: &'static str,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct FeeProof {
+    pub amount_native: String,
+    pub settlement_asset: String,
+    pub recipient: String,
+    pub fee_ppm: i64,
     pub tx_hash: String,
     pub block_hash: String,
     pub status: &'static str,
@@ -1424,6 +1437,7 @@ where
             is_exercisable: None,
             quantity_contracts: None,
             premium_proof: None,
+            fee_proof: None,
         });
     }
     positions.sort_by(|a, b| a.series_id.cmp(&b.series_id));
@@ -1667,6 +1681,7 @@ async fn indexed_account_positions<P: crate::execution::rpc::EthCallProvider>(
     for (id, quantity) in projected {
         let id_string = id.to_string();
         let mut premium_proof = None;
+        let mut fee_proof = None;
         let trades: Vec<_> = events.iter().filter(|event|
             matches!(event.event_name.as_str(), "OptionTradeExecuted" | "OptionRfqTradeExecuted")
                 && event.option_id.as_deref() == Some(id_string.as_str())).collect();
@@ -1698,6 +1713,44 @@ async fn indexed_account_positions<P: crate::execution::rpc::EthCallProvider>(
                         tx_hash: trade.tx_hash.clone(), block_hash: block_hash.clone(), status: "vault_transfer_verified",
                     });
                 }
+                let one_trade_in_tx = tx_events.iter().filter(|event|
+                    matches!(event.event_name.as_str(), "OptionTradeExecuted" | "OptionRfqTradeExecuted")).count() == 1;
+                let fees: Vec<_> = tx_events.iter().filter(|event|
+                    event.event_name == "FeeChargedV2" && event.block_hash.as_ref() == Some(block_hash)
+                        && state.option_event_indexer_config.fees_manager_v2_address.as_ref()
+                            .is_some_and(|address| event.contract_address.eq_ignore_ascii_case(&address.0))
+                        && event.decoded.as_ref().is_some_and(|d|
+                            d["productKind"].as_str() == Some("option")
+                                && d["trader"].as_str().is_some_and(|x| x.eq_ignore_ascii_case(&account.0))
+                                && d["consumer"].as_str().is_some_and(|x| x.eq_ignore_ascii_case(&state.trading_views.margin_engine_address.as_ref().map(|a| a.0.as_str()).unwrap_or("")))
+                                && d["settlementAsset"].as_str().is_some_and(|x| x.eq_ignore_ascii_case(asset))
+                        )).collect();
+                if one_trade_in_tx && fees.len() == 1 {
+                    let fee = fees[0];
+                    if let Some(d) = fee.decoded.as_ref() {
+                        if let (Some(amount), Some(recipient), Some(ppm), Some(basis)) = (
+                            d["feeAmount"].as_str().and_then(|x| x.parse::<u128>().ok()),
+                            d["recipient"].as_str(), d["feePpm"].as_i64(),
+                            d["basisAmount"].as_str().and_then(|x| x.parse::<u128>().ok()),
+                        ) {
+                            let fee_transfers = tx_events.iter().filter(|event|
+                                event.event_name == "InternalTransfer" && event.block_hash.as_ref() == Some(block_hash)
+                                    && event.decoded.as_ref().is_some_and(|v|
+                                        v["from"].as_str().is_some_and(|x| x.eq_ignore_ascii_case(&account.0))
+                                            && v["to"].as_str().is_some_and(|x| x.eq_ignore_ascii_case(recipient))
+                                            && v["token"].as_str().is_some_and(|x| x.eq_ignore_ascii_case(asset))
+                                            && v["amount"].as_str().and_then(|x| x.parse::<u128>().ok()) == Some(amount))).count();
+                            if amount > 0 && basis == expected && fee_transfers == 1 {
+                                fee_proof = Some(FeeProof {
+                                    amount_native: amount.to_string(), settlement_asset: asset.to_string(),
+                                    recipient: recipient.to_string(), fee_ppm: ppm,
+                                    tx_hash: trade.tx_hash.clone(), block_hash: block_hash.clone(),
+                                    status: "vault_transfer_verified",
+                                });
+                            }
+                        }
+                    }
+                }
             }
         }
         positions.push(Position {
@@ -1705,7 +1758,7 @@ async fn indexed_account_positions<P: crate::execution::rpc::EthCallProvider>(
             side: if quantity > 0 { "long" } else { "short" },
             avg_entry_price_1e8: None, mark_price_1e8: None, unrealised_pnl: None,
             im_contribution: None, mm_contribution: None, is_exercisable: None,
-            quantity_contracts: Some(quantity.unsigned_abs().to_string()), premium_proof,
+            quantity_contracts: Some(quantity.unsigned_abs().to_string()), premium_proof, fee_proof,
         });
     }
     let mut settlements = Vec::new();
@@ -1748,7 +1801,7 @@ async fn indexed_account_positions<P: crate::execution::rpc::EthCallProvider>(
         status: "partial",
         data: PositionsData { address: account.0.clone(), positions, source: Some("onchain_reconciled"), settlements },
         warnings: vec![warning_source_unavailable(
-            "Contract counts match MarginEngine. Premium and settlement are shown only with matching vault transfers; fees, collateral and mark remain unverified.",
+            "Contract counts match MarginEngine. Premium, fees and settlement are shown only with matching vault transfers; per-position collateral and mark remain unverified.",
         )],
         meta: MetaBlock::new(state, "chain+db"),
     }))

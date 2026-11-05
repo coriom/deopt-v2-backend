@@ -252,6 +252,11 @@ async fn real_receipt_is_indexed_in_postgres() {
         .find(|tx| tx["contractName"] == "CollateralVault" && tx["transactionType"] == "CREATE")
         .and_then(|tx| tx["contractAddress"].as_str())
         .expect("vault deployment");
+    let fees_manager = transactions
+        .iter()
+        .find(|tx| tx["contractName"] == "FeesManagerV2" && tx["transactionType"] == "CREATE")
+        .and_then(|tx| tx["contractAddress"].as_str())
+        .expect("local fee manager deployment");
     let registry = transactions
         .iter()
         .find(|tx| {
@@ -279,9 +284,9 @@ async fn real_receipt_is_indexed_in_postgres() {
         options_config.execution_signature_mode = OptionExecutionSignatureMode::Strict;
         options_config.execution_simulation_enabled = true;
         options_config.execution_simulation_rpc_url = Some(rpc.clone());
-        options_config.execution_simulation_gas_limit = 1_000_000;
+        options_config.execution_simulation_gas_limit = 1_500_000;
         options_config.execution_broadcast_enabled = true;
-        options_config.execution_broadcast_gas_limit = 1_000_000;
+        options_config.execution_broadcast_gas_limit = 1_500_000;
     }
     let mut state = AppState::with_options_config_and_repository(
         EngineState::with_default_markets(),
@@ -323,7 +328,7 @@ async fn real_receipt_is_indexed_in_postgres() {
         margin_engine_address: AccountId::new(margin),
         collateral_vault_address: AccountId::new(vault),
         fees_manager_address: None,
-        fees_manager_v2_address: None,
+        fees_manager_v2_address: Some(AccountId::new(fees_manager)),
         old_margin_engine_address: None,
         protocol_fee_vault_address: None,
     };
@@ -337,6 +342,7 @@ async fn real_receipt_is_indexed_in_postgres() {
         let pre_provider = HttpJsonRpcProvider::new(rpc.clone());
         let buyer_before = vault_balance(&pre_provider, vault, &adapter.payload.buyer.0, &adapter.payload.settlement_asset.0).await;
         let seller_before = vault_balance(&pre_provider, vault, &adapter.payload.seller.0, &adapter.payload.settlement_asset.0).await;
+        let recipient_before = vault_balance(&pre_provider, vault, "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266", &adapter.payload.settlement_asset.0).await;
         let asset = adapter.payload.settlement_asset.0.clone();
         let option_id = adapter.payload.option_id.to_string();
         run_browser(&state, adapter.clone(), &option_id, "trade").await;
@@ -360,7 +366,7 @@ async fn real_receipt_is_indexed_in_postgres() {
             serde_json::json!([hash]),
         )
         .await;
-        (hash, receipt, indexed, Some(calldata), Some((buyer_before, seller_before, asset)))
+        (hash, receipt, indexed, Some(calldata), Some((buyer_before, seller_before, recipient_before, asset)))
     } else {
         let trade = transactions
             .iter()
@@ -395,7 +401,7 @@ async fn real_receipt_is_indexed_in_postgres() {
         .iter()
         .find(|e| e.tx_hash.eq_ignore_ascii_case(&tx_hash) && e.event_name == "OptionTradeExecuted")
         .expect("matching event in PG");
-    if let Some((buyer_before, seller_before, asset)) = pre_balances.as_ref() {
+    if let Some((buyer_before, seller_before, recipient_before, asset)) = pre_balances.as_ref() {
         let premium = indexed.quantity_contracts.as_deref().unwrap().parse::<u128>().unwrap()
             * indexed.premium_per_contract_native.as_deref().unwrap().parse::<u128>().unwrap();
         let transfer: Vec<_> = events.iter().filter(|e| e.tx_hash.eq_ignore_ascii_case(&tx_hash)
@@ -409,13 +415,52 @@ async fn real_receipt_is_indexed_in_postgres() {
         assert_eq!(transfer[0].block_hash, indexed.block_hash);
         let buyer_after = vault_balance(&provider, vault, indexed.buyer.as_deref().unwrap(), asset).await;
         let seller_after = vault_balance(&provider, vault, indexed.seller.as_deref().unwrap(), asset).await;
-        assert_eq!(*buyer_before - buyer_after, premium);
-        assert_eq!(seller_after - *seller_before, premium);
-        assert_eq!(buyer_after + seller_after, *buyer_before + *seller_before);
-        assert!(!events.iter().any(|e| e.tx_hash.eq_ignore_ascii_case(&tx_hash)
-            && matches!(e.event_name.as_str(), "TradingFeeCharged" | "FeeChargedV2" | "FeeRebatedV2")));
+        let recipient = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266";
+        let recipient_after = vault_balance(&provider, vault, recipient, asset).await;
+        let fee_events: Vec<_> = events.iter().filter(|e| e.tx_hash.eq_ignore_ascii_case(&tx_hash)
+            && e.event_name == "FeeChargedV2" && e.block_hash == indexed.block_hash).collect();
+        assert_eq!(fee_events.len(), 2, "both sides must pay a real OPTION fee");
+        let mut buyer_fee = 0u128;
+        let mut seller_fee = 0u128;
+        for fee in fee_events {
+            let d = fee.decoded.as_ref().unwrap();
+            assert_eq!(d["productKind"], "option");
+            assert!(d["consumer"].as_str().unwrap().eq_ignore_ascii_case(margin));
+            assert!(d["settlementAsset"].as_str().unwrap().eq_ignore_ascii_case(asset));
+            assert!(d["recipient"].as_str().unwrap().eq_ignore_ascii_case(recipient));
+            assert_eq!(d["basisAmount"], premium.to_string());
+            let trader = d["trader"].as_str().unwrap();
+            let amount = d["feeAmount"].as_str().unwrap().parse::<u128>().unwrap();
+            let ppm = d["feePpm"].as_i64().unwrap() as u128;
+            assert_eq!(amount, premium * ppm / 1_000_000);
+            let transfers: Vec<_> = events.iter().filter(|e| e.tx_hash.eq_ignore_ascii_case(&tx_hash)
+                && e.event_name == "InternalTransfer" && e.block_hash == indexed.block_hash
+                && e.decoded.as_ref().is_some_and(|v| v["from"].as_str().is_some_and(|x| x.eq_ignore_ascii_case(trader))
+                    && v["to"].as_str().is_some_and(|x| x.eq_ignore_ascii_case(recipient))
+                    && v["token"].as_str().is_some_and(|x| x.eq_ignore_ascii_case(asset))
+                    && v["amount"].as_str().and_then(|x| x.parse::<u128>().ok()) == Some(amount))).collect();
+            assert_eq!(transfers.len(), 1, "fee must be backed by a vault transfer");
+            if trader.eq_ignore_ascii_case(indexed.buyer.as_deref().unwrap()) { buyer_fee = amount; }
+            else if trader.eq_ignore_ascii_case(indexed.seller.as_deref().unwrap()) { seller_fee = amount; }
+            else { panic!("unexpected fee trader"); }
+        }
+        assert_eq!(buyer_fee, 25_000);
+        assert_eq!(seller_fee, 5_000);
+        assert_eq!(*buyer_before - buyer_after, premium + buyer_fee);
+        assert_eq!(seller_after - *seller_before, premium - seller_fee);
+        assert_eq!(recipient_after - *recipient_before, buyer_fee + seller_fee);
+        assert_eq!(buyer_after + seller_after + recipient_after, *buyer_before + *seller_before + *recipient_before);
+        let mut excess_withdraw = selector("withdraw(address,uint256)");
+        let token = alloy_primitives::Address::from_str(asset).unwrap();
+        excess_withdraw.extend_from_slice(&[0u8; 12]);
+        excess_withdraw.extend_from_slice(token.as_slice());
+        excess_withdraw.extend_from_slice(&U256::from(10_000u64 * 1_000_000).to_be_bytes::<32>());
+        assert!(local_call_reverted_as(&reqwest::Client::new(), &rpc, vault,
+            &excess_withdraw, indexed.seller.as_deref().unwrap()).await,
+            "direct vault withdrawal must obey real account risk");
         println!("PREMIUM_VAULT_CONSERVATION=PASS_NATIVE_{premium}");
-        println!("LOCAL_FIXTURE_FEES=ZERO_NO_FEE_MANAGER");
+        println!("OPTION_FEES_VAULT_CONSERVATION=PASS_BUYER_{buyer_fee}_SELLER_{seller_fee}");
+        println!("EXCESS_DIRECT_VAULT_WITHDRAWAL=REJECTED_REAL_RISK_MODULE");
     }
     assert_eq!(indexed.block_hash.as_deref(), Some(block_hash.as_str()));
     assert!(indexed.option_id.is_some());
@@ -520,7 +565,7 @@ async fn real_receipt_is_indexed_in_postgres() {
         &alloy_primitives::U256::from(2500u64 * 100_000_000).to_be_bytes::<32>(),
     );
     let price_tx = send_local(&client, &rpc, registry, &set_price).await;
-    let settlement_before = if let Some((_, _, asset)) = pre_balances.as_ref() {
+    let settlement_before = if let Some((_, _, _, asset)) = pre_balances.as_ref() {
         Some((
             vault_balance(&provider, vault, &buyer_wallet, asset).await,
             vault_balance(&provider, vault, &seller_wallet, asset).await,
@@ -566,7 +611,7 @@ async fn real_receipt_is_indexed_in_postgres() {
             .count(),
         2
     );
-    if let (Some((_, _, asset)), Some((buyer_before_settle, seller_before_settle))) =
+    if let (Some((_, _, _, asset)), Some((buyer_before_settle, seller_before_settle))) =
         (pre_balances.as_ref(), settlement_before) {
         for (wallet, tx, balance_before) in [
             (&buyer_wallet, &buyer_tx, buyer_before_settle),
@@ -591,6 +636,37 @@ async fn real_receipt_is_indexed_in_postgres() {
         }
         println!("SETTLEMENT_VAULT_TRANSFERS=PASS");
         println!("SETTLEMENT_WALLET_BALANCES=PASS");
+    }
+    if let Some((buyer_before, seller_before, recipient_before, asset)) = pre_balances.as_ref() {
+        let buyer_after = vault_balance(&provider, vault, &buyer_wallet, asset).await;
+        let seller_after = vault_balance(&provider, vault, &seller_wallet, asset).await;
+        let recipient_after = vault_balance(&provider, vault, "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266", asset).await;
+        let buyer_settled = settled_events.iter().find(|e| e.event_name == "AccountSettled"
+            && e.tx_hash == buyer_tx && e.account.as_deref().is_some_and(|a| a.eq_ignore_ascii_case(&buyer_wallet))).unwrap();
+        let seller_settled = settled_events.iter().find(|e| e.event_name == "AccountSettled"
+            && e.tx_hash == seller_tx && e.account.as_deref().is_some_and(|a| a.eq_ignore_ascii_case(&seller_wallet))).unwrap();
+        let buyer_paid = buyer_settled.decoded.as_ref().unwrap()["paidToTrader"].as_str().unwrap().parse::<u128>().unwrap();
+        let seller_collected = seller_settled.decoded.as_ref().unwrap()["collectedFromTrader"].as_str().unwrap().parse::<u128>().unwrap();
+        assert_eq!(buyer_settled.decoded.as_ref().unwrap()["badDebt"], "0");
+        assert_eq!(seller_settled.decoded.as_ref().unwrap()["badDebt"], "0");
+        let premium = indexed.quantity_contracts.as_deref().unwrap().parse::<u128>().unwrap()
+            * indexed.premium_per_contract_native.as_deref().unwrap().parse::<u128>().unwrap();
+        let fees: Vec<_> = events.iter().filter(|e| e.tx_hash.eq_ignore_ascii_case(&tx_hash)
+            && e.event_name == "FeeChargedV2").collect();
+        let fee_for = |wallet: &str| -> u128 { fees.iter()
+            .find(|e| e.account.as_deref().is_some_and(|a| a.eq_ignore_ascii_case(wallet)))
+            .unwrap().decoded.as_ref().unwrap()["feeAmount"].as_str().unwrap().parse().unwrap() };
+        let buyer_fee = fee_for(&buyer_wallet);
+        let seller_fee = fee_for(&seller_wallet);
+        assert_eq!(buyer_after + premium + buyer_fee, *buyer_before + buyer_paid);
+        assert_eq!(seller_after + seller_collected + seller_fee, *seller_before + premium);
+        assert_eq!(recipient_after, *recipient_before + buyer_fee + seller_fee);
+        assert_eq!(buyer_after + seller_after + recipient_after,
+            *buyer_before + *seller_before + *recipient_before);
+        let buyer_realized = buyer_paid as i128 - premium as i128 - buyer_fee as i128;
+        let seller_realized = premium as i128 - seller_collected as i128 - seller_fee as i128;
+        println!("REALIZED_CASHFLOW_NATIVE=buyer:{buyer_realized},seller:{seller_realized}");
+        println!("FULL_VAULT_CONSERVATION=PASS");
     }
     let settled_view = serde_json::to_value(
         deopt_v2_backend::api::trading::account_positions(
@@ -925,11 +1001,15 @@ async fn expect_local_revert(client: &reqwest::Client, url: &str, to: &str, data
 }
 
 async fn local_call_reverted(client: &reqwest::Client, url: &str, to: &str, data: &[u8]) -> bool {
+    local_call_reverted_as(client, url, to, data, "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266").await
+}
+
+async fn local_call_reverted_as(client: &reqwest::Client, url: &str, to: &str, data: &[u8], from: &str) -> bool {
     let response: Value = client
         .post(url)
         .json(&serde_json::json!({
             "jsonrpc":"2.0", "id":1, "method":"eth_call",
-            "params":[{"from":"0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+            "params":[{"from":from,
                        "to":to, "data":format!("0x{}", hex::encode(data))}, "latest"]
         }))
         .send()
