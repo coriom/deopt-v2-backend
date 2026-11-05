@@ -102,6 +102,11 @@ sol! {
     // OracleRouter — read-only, fail-closed price probe. Invalid feeds
     // return (0, 0, false). Selector 0x63851ea3 is unchanged.
     function getPriceSafe(address baseAsset, address quoteAsset) external view returns (uint256, uint256, bool);
+
+    // Canonical legacy Options position surface.
+    function getTraderSeriesLength(address trader) external view returns (uint256);
+    function getTraderSeriesSlice(address trader, uint256 start, uint256 end) external view returns (uint256[] memory);
+    function getPositionQuantity(address trader, uint256 optionId) external view returns (int128);
 }
 
 // ---------------------------------------------------------------------
@@ -129,6 +134,82 @@ fn account_to_address(a: &AccountId) -> Option<Address> {
 
 pub fn address_to_account(a: Address) -> AccountId {
     AccountId::new(format!("{a:#x}"))
+}
+
+pub async fn try_get_canonical_option_positions<P: EthCallProvider>(
+    cfg: &TradingViewsConfig,
+    from: &AccountId,
+    trader: Address,
+    provider: &P,
+) -> Result<Option<Vec<(U256, i128)>>, String> {
+    let Some(engine) = cfg.margin_engine_address.as_ref() else {
+        return Ok(None);
+    };
+    let length_result = provider
+        .eth_call(EthCallRequest {
+            from: from.clone(),
+            to: engine.clone(),
+            data: getTraderSeriesLengthCall { trader }.abi_encode(),
+            value: 0,
+            gas_limit: None,
+        })
+        .await
+        .map_err(|e| format!("getTraderSeriesLength failed: {e}"))?;
+    let length = getTraderSeriesLengthCall::abi_decode_returns(&length_result.output, true)
+        .map_err(|e| format!("getTraderSeriesLength decode failed: {e}"))?
+        ._0;
+    if length > U256::from(128u64) {
+        return Err("canonical position enumeration exceeds 128 series".into());
+    }
+    let series_result = provider
+        .eth_call(EthCallRequest {
+            from: from.clone(),
+            to: engine.clone(),
+            data: getTraderSeriesSliceCall {
+                trader,
+                start: U256::ZERO,
+                end: length,
+            }
+            .abi_encode(),
+            value: 0,
+            gas_limit: None,
+        })
+        .await
+        .map_err(|e| format!("getTraderSeriesSlice failed: {e}"))?;
+    let ids = getTraderSeriesSliceCall::abi_decode_returns(&series_result.output, true)
+        .map_err(|e| format!("getTraderSeriesSlice decode failed: {e}"))?
+        ._0;
+    if ids.len() != usize::try_from(length).map_err(|_| "series length overflow")? {
+        return Err("canonical position enumeration changed during read".into());
+    }
+    let mut positions = Vec::with_capacity(ids.len());
+    for id in ids {
+        let result = provider
+            .eth_call(EthCallRequest {
+                from: from.clone(),
+                to: engine.clone(),
+                data: getPositionQuantityCall { trader, optionId: id }.abi_encode(),
+                value: 0,
+                gas_limit: None,
+            })
+            .await
+            .map_err(|e| format!("getPositionQuantity failed: {e}"))?;
+        if result.output.len() != 32 {
+            return Err("getPositionQuantity returned a malformed ABI word".into());
+        }
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(&result.output[16..]);
+        let quantity = i128::from_be_bytes(bytes);
+        let extension = if quantity < 0 { 0xff } else { 0 };
+        if quantity == 0
+            || quantity == i128::MIN
+            || result.output[..16].iter().any(|byte| *byte != extension)
+        {
+            return Err("getPositionQuantity violated the open-series invariant".into());
+        }
+        positions.push((id, quantity));
+    }
+    Ok(Some(positions))
 }
 
 /// Iterate the configured collateral token list.
@@ -589,6 +670,69 @@ pub mod tests {
 
     fn account_2() -> AccountId {
         AccountId::new("0xabcdef0123456789abcdef0123456789abcdef01")
+    }
+
+    #[tokio::test]
+    async fn canonical_option_position_reads_real_abi_and_rejects_bad_quantity() {
+        use alloy_sol_types::SolValue;
+        let cfg = TradingViewsConfig {
+            margin_engine_address: Some(anvil_address()),
+            ..Default::default()
+        };
+        let trader = Address::from([0x11; 20]);
+        let mock = ProgrammableMockProvider::new();
+        mock.returns(
+            getTraderSeriesSliceCall::SELECTOR,
+            SolValue::abi_encode(&vec![U256::from(7u64)]),
+        );
+        mock.returns(
+            getTraderSeriesLengthCall::SELECTOR,
+            SolValue::abi_encode(&U256::from(1u64)),
+        );
+        mock.returns(
+            getPositionQuantityCall::SELECTOR,
+            SolValue::abi_encode(&U256::from(2u64)),
+        );
+        assert_eq!(
+            try_get_canonical_option_positions(&cfg, &anvil_address(), trader, &mock)
+                .await
+                .unwrap(),
+            Some(vec![(U256::from(7u64), 2)])
+        );
+
+        let short = ProgrammableMockProvider::new();
+        short.returns(
+            getTraderSeriesLengthCall::SELECTOR,
+            SolValue::abi_encode(&U256::from(1u64)),
+        );
+        short.returns(
+            getTraderSeriesSliceCall::SELECTOR,
+            SolValue::abi_encode(&vec![U256::from(7u64)]),
+        );
+        short.returns(getPositionQuantityCall::SELECTOR, vec![0xff; 32]);
+        assert_eq!(
+            try_get_canonical_option_positions(&cfg, &anvil_address(), trader, &short)
+                .await
+                .unwrap(),
+            Some(vec![(U256::from(7u64), -1)])
+        );
+
+        let malformed = ProgrammableMockProvider::new();
+        malformed.returns(
+            getTraderSeriesSliceCall::SELECTOR,
+            SolValue::abi_encode(&vec![U256::from(7u64)]),
+        );
+        malformed.returns(
+            getTraderSeriesLengthCall::SELECTOR,
+            SolValue::abi_encode(&U256::from(1u64)),
+        );
+        let mut invalid_word = vec![0u8; 32];
+        invalid_word[0] = 1;
+        invalid_word[31] = 1;
+        malformed.returns(getPositionQuantityCall::SELECTOR, invalid_word);
+        assert!(try_get_canonical_option_positions(&cfg, &anvil_address(), trader, &malformed)
+            .await
+            .is_err());
     }
 
     // ----- try_get_collateral_tokens -----

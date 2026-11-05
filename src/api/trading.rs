@@ -1382,6 +1382,106 @@ where
     }
     positions.sort_by(|a, b| a.series_id.cmp(&b.series_id));
 
+    // A configured MarginEngine is authoritative. Never return fill-derived
+    // positions if its open-series set or quantities disagree with the ledger.
+    if state.trading_views.margin_engine_address.is_some() {
+        let rpc = provider.ok_or_else(|| {
+            TradingApiError::new(
+                TradingErrorCode::SourceUnavailable,
+                "canonical position RPC unavailable",
+                MetaBlock::new(state, "rpc"),
+            )
+        })?;
+        let trader = address_from_account_str(&acct.0).ok_or_else(|| {
+            TradingApiError::new(
+                TradingErrorCode::InvalidAddress,
+                "invalid trader address",
+                MetaBlock::new(state, "validation"),
+            )
+        })?;
+        let canonical = crate::api::trading_views::try_get_canonical_option_positions(
+            &state.trading_views,
+            &state.execution_config.executor_from_address,
+            trader,
+            rpc,
+        )
+        .await
+        .map_err(|_| {
+            TradingApiError::new(
+                TradingErrorCode::SourceUnavailable,
+                "canonical position read failed",
+                MetaBlock::new(state, "rpc"),
+            )
+        })?
+        .ok_or_else(|| {
+            TradingApiError::new(
+                TradingErrorCode::SourceUnavailable,
+                "canonical position engine unavailable",
+                MetaBlock::new(state, "rpc"),
+            )
+        })?;
+        let mut observed = std::collections::BTreeMap::new();
+        for (id, qty) in canonical {
+            if observed.insert(id, qty).is_some() {
+                return Err(TradingApiError::new(
+                    TradingErrorCode::SourceUnavailable,
+                    "duplicate canonical series",
+                    MetaBlock::new(state, "rpc"),
+                ));
+            }
+        }
+        let mut expected = std::collections::BTreeMap::new();
+        for pos in &positions {
+            let series = get_option_series_service(state, &pos.series_id).await.map_err(|_| {
+                TradingApiError::new(
+                    TradingErrorCode::SourceUnavailable,
+                    "position series metadata unavailable",
+                    MetaBlock::new(state, "db"),
+                )
+            })?;
+            let raw_id = series
+                .onchain_series_id
+                .as_deref()
+                .or(series.onchain_product_id.as_deref());
+            let id = raw_id.and_then(|value| {
+                let (digits, radix) = value
+                    .strip_prefix("0x")
+                    .map(|s| (s, 16))
+                    .unwrap_or((value, 10));
+                alloy_primitives::U256::from_str_radix(digits, radix).ok()
+            });
+            let size = pos.size.parse::<u128>().ok();
+            let contract_size = series.contract_size_1e8;
+            let quantity = size.and_then(|size| {
+                (contract_size != 0 && size % contract_size == 0)
+                    .then(|| size / contract_size)
+                    .and_then(|contracts| i128::try_from(contracts).ok())
+            });
+            let (Some(id), Some(quantity)) = (id, quantity) else {
+                return Err(TradingApiError::new(
+                    TradingErrorCode::SourceUnavailable,
+                    "position cannot be mapped to canonical series",
+                    MetaBlock::new(state, "db"),
+                ));
+            };
+            let signed = if pos.side == "long" { quantity } else { -quantity };
+            if expected.insert(id, signed).is_some() {
+                return Err(TradingApiError::new(
+                    TradingErrorCode::SourceUnavailable,
+                    "duplicate position series mapping",
+                    MetaBlock::new(state, "db"),
+                ));
+            }
+        }
+        if observed != expected {
+            return Err(TradingApiError::new(
+                TradingErrorCode::SourceUnavailable,
+                "position reconciliation pending",
+                MetaBlock::new(state, "rpc"),
+            ));
+        }
+    }
+
     // M-P2e — per-position oracle mark when oracle is configured. We
     // call OracleRouter.getPriceSafe(underlying, settlement) for each
     // distinct (underlying, settlement) pair. The on-chain function
@@ -4528,6 +4628,92 @@ mod tests {
             .warnings
             .iter()
             .any(|w| w.message.contains("MarginEngine positions have not been reconciled")));
+    }
+
+    #[tokio::test]
+    async fn account_positions_refuses_unmapped_canonical_open_series() {
+        use alloy_primitives::U256;
+        use alloy_sol_types::SolValue;
+        let mut state = seeded_state_with_addresses();
+        state.trading_views.margin_engine_address = Some(AccountId::new(
+            "0x5555555555555555555555555555555555555555",
+        ));
+        let rpc = ProgrammableMockProvider::new();
+        rpc.returns(
+            [0xd0, 0x5a, 0x23, 0x04],
+            SolValue::abi_encode(&vec![U256::from(7u64)]),
+        );
+        rpc.returns(
+            [0x2a, 0xbe, 0x5d, 0xfe],
+            SolValue::abi_encode(&U256::from(1u64)),
+        );
+        rpc.returns(
+            [0xff, 0xdf, 0xae, 0xad],
+            SolValue::abi_encode(&U256::from(1u64)),
+        );
+        let error = account_positions_impl(
+            &state,
+            "0x1234567890abcdef1234567890abcdef12345678",
+            Some(&rpc),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, TradingErrorCode::SourceUnavailable);
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn account_positions_accepts_matching_canonical_quantity_as_partial() {
+        use alloy_primitives::U256;
+        use alloy_sol_types::SolValue;
+        use crate::types::{OrderId, Side};
+        let mut state = seeded_state_with_addresses();
+        state.trading_views.margin_engine_address = Some(AccountId::new(
+            "0x5555555555555555555555555555555555555555",
+        ));
+        let buyer = AccountId::new("0x1234567890abcdef1234567890abcdef12345678");
+        let seller = AccountId::new("0xabcdef0123456789abcdef0123456789abcdef01");
+        let order = || OrderId(Uuid::new_v4());
+        state.options_store.lock().unwrap().insert_fill_for_test(OptionFill {
+            fill_id: Uuid::new_v4(),
+            option_series_id: "S-1".into(),
+            buy_order_id: order(),
+            sell_order_id: order(),
+            buyer,
+            seller,
+            buyer_subaccount_id: 1,
+            seller_subaccount_id: 1,
+            maker_order_id: order(),
+            taker_order_id: order(),
+            taker_side: Side::Buy,
+            price_1e8: 100_000_000,
+            size_1e8: 100_000_000,
+            canonical_execution_id: None,
+            created_at_ms: now_ms(),
+        });
+        let rpc = ProgrammableMockProvider::new();
+        rpc.returns(
+            [0xd0, 0x5a, 0x23, 0x04],
+            SolValue::abi_encode(&vec![U256::from(7u64)]),
+        );
+        rpc.returns(
+            [0x2a, 0xbe, 0x5d, 0xfe],
+            SolValue::abi_encode(&U256::from(1u64)),
+        );
+        rpc.returns(
+            [0xff, 0xdf, 0xae, 0xad],
+            SolValue::abi_encode(&U256::from(1u64)),
+        );
+        let envelope = account_positions_impl(
+            &state,
+            "0x1234567890abcdef1234567890abcdef12345678",
+            Some(&rpc),
+        )
+        .await
+        .expect("matching canonical quantity");
+        assert_eq!(envelope.0.status, "partial");
+        assert_eq!(envelope.0.data.positions.len(), 1);
+        assert_eq!(envelope.0.data.positions[0].size, "100000000");
     }
 
     // ----- account_portfolio_impl -----
