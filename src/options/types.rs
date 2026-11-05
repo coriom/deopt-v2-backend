@@ -571,6 +571,8 @@ impl OptionExecutionEvent {
 pub struct OptionEventIndexerState {
     pub id: String,
     pub last_indexed_block: u64,
+    #[serde(default)]
+    pub last_indexed_block_hash: Option<String>,
     pub updated_at_ms: TimestampMs,
     pub last_error: Option<String>,
 }

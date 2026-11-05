@@ -5054,7 +5054,7 @@ impl PgRepository {
             return Ok(None);
         }
         let row = sqlx::query(
-            "SELECT id, last_indexed_block, updated_at_ms, last_error
+            "SELECT id, last_indexed_block, last_indexed_block_hash, updated_at_ms, last_error
              FROM option_event_indexer_state
              WHERE id = $1",
         )
@@ -5072,6 +5072,19 @@ impl PgRepository {
         last_indexed_block: u64,
         updated_at_ms: TimestampMs,
     ) -> Result<u64> {
+        self.persist_option_execution_events_and_canonical_cursor(
+            state_id, events, last_indexed_block, None, updated_at_ms,
+        ).await
+    }
+
+    pub async fn persist_option_execution_events_and_canonical_cursor(
+        &self,
+        state_id: &str,
+        events: &[OptionExecutionEvent],
+        last_indexed_block: u64,
+        block_hash: Option<&str>,
+        updated_at_ms: TimestampMs,
+    ) -> Result<u64> {
         let mut tx = self.begin().await?;
         let mut inserted = 0u64;
         for event in events {
@@ -5081,6 +5094,7 @@ impl PgRepository {
             &mut tx,
             state_id,
             last_indexed_block,
+            block_hash,
             updated_at_ms,
             None,
         )
@@ -5089,6 +5103,22 @@ impl PgRepository {
             .await
             .map_err(|error| BackendError::Persistence(error.to_string()))?;
         Ok(inserted)
+    }
+
+    /// A changed canonical cursor invalidates all indexed Options events since
+    /// the configured origin. Replaying from there avoids retaining orphan logs.
+    pub async fn rewind_option_execution_events(
+        &self, state_id: &str, chain_id: u64, from_block: u64,
+    ) -> Result<()> {
+        let mut tx = self.begin().await?;
+        sqlx::query("DELETE FROM option_execution_events WHERE chain_id = $1 AND block_number > $2")
+            .bind(u64_to_i64("chain_id", chain_id)?)
+            .bind(u64_to_i64("from_block", from_block)?)
+            .execute(&mut *tx).await.map_err(|e| BackendError::Persistence(e.to_string()))?;
+        upsert_option_event_indexer_state(&mut tx, state_id, from_block, None, crate::types::now_ms(),
+            Some("canonical block changed; replay required")).await?;
+        tx.commit().await.map_err(|e| BackendError::Persistence(e.to_string()))?;
+        Ok(())
     }
 
     pub async fn summarize_option_execution_events(&self) -> Result<Vec<(String, u64)>> {
@@ -5190,6 +5220,37 @@ impl PgRepository {
         rows.into_iter()
             .map(option_execution_event_from_row)
             .collect()
+    }
+
+    /// Canonical Options projection input. A bounded, chain-scoped query keeps
+    /// wallet reads independent of unrelated accounts and fails closed on lag.
+    pub async fn list_option_position_events_for_wallet(
+        &self, chain_id: u64, wallet: &str,
+    ) -> Result<Vec<OptionExecutionEvent>> {
+        let rows = sqlx::query(
+            "SELECT id, chain_id, contract_address, tx_hash, log_index, block_number, block_hash,
+                    event_name, event_signature, intent_id, onchain_intent_id,
+                    option_execution_transaction_id, buyer, seller, account, option_id,
+                    quantity_contracts, premium_per_contract_native, raw_topics, raw_data,
+                    decoded, created_at_ms, updated_at_ms
+             FROM option_execution_events
+             WHERE chain_id = $1 AND (
+                (event_name IN ('OptionTradeExecuted', 'OptionRfqTradeExecuted')
+                    AND (lower(buyer) = lower($2) OR lower(seller) = lower($2)))
+                OR (event_name = 'AccountSettled' AND lower(account) = lower($2))
+             )
+             ORDER BY block_number ASC, log_index ASC, id ASC
+             LIMIT 10001",
+        )
+        .bind(u64_to_i64("chain_id", chain_id)?)
+        .bind(wallet)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        if rows.len() > 10_000 {
+            return Err(BackendError::Persistence("Options wallet projection event cap exceeded".into()));
+        }
+        rows.into_iter().map(option_execution_event_from_row).collect()
     }
 
     pub async fn list_confirmed_unreconciled_option_execution_transactions(
@@ -6878,20 +6939,23 @@ async fn upsert_option_event_indexer_state(
     tx: &mut Transaction<'_, Postgres>,
     id: &str,
     last_indexed_block: u64,
+    last_indexed_block_hash: Option<&str>,
     updated_at_ms: i64,
     last_error: Option<&str>,
 ) -> Result<()> {
     sqlx::query(
         "INSERT INTO option_event_indexer_state (
-            id, last_indexed_block, updated_at_ms, last_error
-        ) VALUES ($1, $2, $3, $4)
+            id, last_indexed_block, last_indexed_block_hash, updated_at_ms, last_error
+        ) VALUES ($1, $2, $3, $4, $5)
         ON CONFLICT (id) DO UPDATE
         SET last_indexed_block = EXCLUDED.last_indexed_block,
+            last_indexed_block_hash = EXCLUDED.last_indexed_block_hash,
             updated_at_ms = EXCLUDED.updated_at_ms,
             last_error = EXCLUDED.last_error",
     )
     .bind(id)
     .bind(u64_to_i64("last_indexed_block", last_indexed_block)?)
+    .bind(last_indexed_block_hash)
     .bind(timestamp_to_i64(updated_at_ms))
     .bind(last_error)
     .execute(&mut **tx)
@@ -8567,6 +8631,7 @@ fn option_event_indexer_state_from_row(row: PgRow) -> Result<OptionEventIndexerS
     Ok(OptionEventIndexerState {
         id: row_get(&row, "id")?,
         last_indexed_block: i64_to_u64_persistence("last_indexed_block", last_indexed_block)?,
+        last_indexed_block_hash: row_get(&row, "last_indexed_block_hash")?,
         updated_at_ms: row_get(&row, "updated_at_ms")?,
         last_error: row_get(&row, "last_error")?,
     })

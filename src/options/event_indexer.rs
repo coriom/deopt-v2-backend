@@ -24,6 +24,8 @@ pub const OPTION_RFQ_TRADE_EXECUTED_SIGNATURE: &str =
     "OptionRfqTradeExecuted(bytes32,address,address,uint256,uint128,uint128,bool,uint256,uint256)";
 pub const MARGIN_TRADE_EXECUTED_SIGNATURE: &str =
     "TradeExecuted(address,address,uint256,uint128,uint128)";
+pub const ACCOUNT_SETTLED_SIGNATURE: &str =
+    "AccountSettled(address,uint256,int256,uint256,uint256,uint256)";
 pub const TRADING_FEE_CHARGED_SIGNATURE: &str =
     "TradingFeeCharged(address,address,address,uint256,bool,uint256,uint256,uint256,uint256,uint256,bool)";
 pub const INTERNAL_TRANSFER_SIGNATURE: &str = "InternalTransfer(address,address,address,uint256)";
@@ -262,6 +264,10 @@ pub fn margin_trade_executed_topic0() -> String {
     hex_0x(&keccak256(MARGIN_TRADE_EXECUTED_SIGNATURE.as_bytes()))
 }
 
+pub fn account_settled_topic0() -> String {
+    hex_0x(&keccak256(ACCOUNT_SETTLED_SIGNATURE.as_bytes()))
+}
+
 pub fn trading_fee_charged_topic0() -> String {
     hex_0x(&keccak256(TRADING_FEE_CHARGED_SIGNATURE.as_bytes()))
 }
@@ -348,6 +354,7 @@ pub fn tier_claimed_v2_topic0() -> String {
 
 pub fn default_option_event_counts() -> BTreeMap<String, u64> {
     BTreeMap::from([
+        ("AccountSettled".to_string(), 0),
         ("CollateralDeposited".to_string(), 0),
         ("CollateralWithdrawn".to_string(), 0),
         ("DefaultFeesSet".to_string(), 0),
@@ -383,6 +390,7 @@ fn event_topics_for_emitter_role(role: &str) -> Vec<String> {
         ],
         "margin_engine" => vec![
             margin_trade_executed_topic0(),
+            account_settled_topic0(),
             trading_fee_charged_topic0(),
             margin_collateral_deposited_topic0(),
             margin_collateral_withdrawn_topic0(),
@@ -443,7 +451,21 @@ where
 
     let current_block_number = provider.block_number().await?;
     let safe_head = current_block_number.saturating_sub(config.confirmation_blocks);
-    let cursor = get_option_event_indexer_state(state).await?;
+    let mut cursor = get_option_event_indexer_state(state).await?;
+    if let Some(previous) = cursor.as_ref() {
+        if let Some(expected) = previous.last_indexed_block_hash.as_deref() {
+            let actual = provider.block_hash(previous.last_indexed_block).await?;
+            if actual.as_deref() != Some(expected) {
+                let repository = state.repository.as_ref().ok_or_else(|| {
+                    BackendError::Indexer("canonical Options reorg requires persistent store".into())
+                })?;
+                repository.rewind_option_execution_events(
+                    OPTION_EVENT_INDEXER_STATE_ID, state.chain_id, config.from_block,
+                ).await?;
+                cursor = None;
+            }
+        }
+    }
     let last_indexed_block = cursor
         .as_ref()
         .map(|state| state.last_indexed_block)
@@ -474,6 +496,7 @@ where
         .saturating_add(config.batch_blocks)
         .saturating_sub(1);
     let to_block = safe_head.min(range_end);
+    let block_hash_before = provider.block_hash(to_block).await?;
     let mut logs = Vec::new();
     for emitter in config.emitter_contracts() {
         for topic0 in event_topics_for_emitter_role(&emitter.role) {
@@ -506,8 +529,13 @@ where
         events.push(event);
     }
     let events_decoded = events.len();
-    let events_indexed =
-        persist_option_execution_events_and_cursor(state, &events, to_block).await?;
+    let block_hash_after = provider.block_hash(to_block).await?;
+    if block_hash_before != block_hash_after {
+        return Err(BackendError::Indexer("Options chain changed while indexing".into()));
+    }
+    let events_indexed = persist_option_execution_events_and_cursor(
+        state, &events, to_block, block_hash_after.as_deref(),
+    ).await?;
 
     let result = OptionEventIndexerTickResult {
         enabled: true,
@@ -615,14 +643,16 @@ async fn persist_option_execution_events_and_cursor(
     state: &AppState,
     events: &[OptionExecutionEvent],
     last_indexed_block: u64,
+    block_hash: Option<&str>,
 ) -> Result<u64> {
     let now = now_ms();
     if let Some(repository) = state.repository.clone() {
         return repository
-            .persist_option_execution_events_and_cursor(
+            .persist_option_execution_events_and_canonical_cursor(
                 OPTION_EVENT_INDEXER_STATE_ID,
                 events,
                 last_indexed_block,
+                block_hash,
                 now,
             )
             .await;
@@ -660,6 +690,9 @@ pub fn decode_option_execution_event(
     }
     if topic0.eq_ignore_ascii_case(&margin_trade_executed_topic0()) {
         return decode_margin_trade_executed_log(log, chain_id).map(Some);
+    }
+    if topic0.eq_ignore_ascii_case(&account_settled_topic0()) {
+        return decode_account_settled_log(log, chain_id).map(Some);
     }
     if topic0.eq_ignore_ascii_case(&trading_fee_charged_topic0()) {
         return decode_trading_fee_charged_log(log, chain_id).map(Some);
@@ -746,6 +779,30 @@ pub fn decode_option_execution_event(
         return decode_tier_claimed_v2_log(log, chain_id).map(Some);
     }
     Ok(None)
+}
+
+fn decode_account_settled_log(log: &EthLog, chain_id: u64) -> Result<OptionExecutionEvent> {
+    if log.topics.len() != 3 {
+        return Err(BackendError::Indexer("AccountSettled requires three topics".into()));
+    }
+    let data = decode_hex_bytes(&log.data)?;
+    if data.len() != 4 * 32 {
+        return Err(BackendError::Indexer("AccountSettled requires four ABI words".into()));
+    }
+    let trader = decode_topic_address(&log.topics[1])?;
+    let option_id = decode_topic_u256(&log.topics[2])?.to_string();
+    let decoded = serde_json::json!({
+        "trader": trader,
+        "optionId": option_id,
+        // Signed two's-complement PnL is kept raw until a canonical
+        // settlement-asset unit decoder is available.
+        "pnlWord": hex_0x(&data[..32]),
+        "collectedFromTrader": decode_data_u256(&data, 1)?.to_string(),
+        "paidToTrader": decode_data_u256(&data, 2)?.to_string(),
+        "badDebt": decode_data_u256(&data, 3)?.to_string(),
+    });
+    option_event_from_decoded_fields(log, chain_id, "AccountSettled", ACCOUNT_SETTLED_SIGNATURE,
+        None, None, Some(trader), Some(option_id), None, None, decoded)
 }
 
 fn decode_option_trade_executed_log(log: &EthLog, chain_id: u64) -> Result<OptionExecutionEvent> {

@@ -53,6 +53,10 @@ pub trait TransactionReceiptProvider: Clone + Send + Sync {
 pub trait EthLogsProvider: Clone + Send + Sync {
     fn block_number(&self) -> RpcFuture<'_, u64>;
     fn get_logs(&self, filter: EthGetLogsFilter) -> RpcFuture<'_, Vec<crate::indexer::EthLog>>;
+    /// Providers without canonical block lookup may leave this unavailable.
+    fn block_hash(&self, _block_number: u64) -> RpcFuture<'_, Option<String>> {
+        Box::pin(async { Ok(None) })
+    }
 }
 
 /// Minimal `eth_getBalance` surface for the broadcast policy data provider.
@@ -345,6 +349,28 @@ impl EthBalanceProvider for HttpJsonRpcProvider {
 impl EthLogsProvider for HttpJsonRpcProvider {
     fn block_number(&self) -> RpcFuture<'_, u64> {
         TransactionReceiptProvider::block_number(self)
+    }
+
+    fn block_hash(&self, block_number: u64) -> RpcFuture<'_, Option<String>> {
+        Box::pin(async move {
+            let response: JsonRpcResponse<serde_json::Value> = self.client
+                .post(&self.rpc_url)
+                .json(&JsonRpcRequest {
+                    jsonrpc: "2.0", id: 1, method: "eth_getBlockByNumber",
+                    params: (format!("0x{block_number:x}"), false),
+                })
+                .send().await.map_err(|e| BackendError::Indexer(e.to_string()))?
+                .json().await.map_err(|e| BackendError::Indexer(e.to_string()))?;
+            if let Some(error) = response.error { return Err(BackendError::Indexer(error.message)); }
+            let Some(block) = response.result else { return Ok(None); };
+            let Some(hash) = block.get("hash").and_then(serde_json::Value::as_str) else {
+                return Err(BackendError::Indexer("canonical block hash absent".into()));
+            };
+            if hash.len() != 66 || !hash.starts_with("0x") || !hash[2..].bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(BackendError::Indexer("invalid canonical block hash".into()));
+            }
+            Ok(Some(hash.to_ascii_lowercase()))
+        })
     }
 
     fn get_logs(&self, filter: EthGetLogsFilter) -> RpcFuture<'_, Vec<crate::indexer::EthLog>> {

@@ -499,12 +499,16 @@ pub struct Position {
     pub im_contribution: Option<String>,
     pub mm_contribution: Option<String>,
     pub is_exercisable: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quantity_contracts: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub struct PositionsData {
     pub address: String,
     pub positions: Vec<Position>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<&'static str>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1319,6 +1323,9 @@ where
     P: crate::execution::rpc::EthCallProvider,
 {
     let acct = parse_address_or_400(state, address)?;
+    if state.option_event_indexer_config.enabled && state.trading_views.margin_engine_address.is_some() {
+        return indexed_account_positions(state, &acct, provider).await;
+    }
     // Aggregate net position per series from the OptionFill store.
     let fills = list_option_fills_service(
         state,
@@ -1378,6 +1385,7 @@ where
             im_contribution: None,
             mm_contribution: None,
             is_exercisable: None,
+            quantity_contracts: None,
         });
     }
     positions.sort_by(|a, b| a.series_id.cmp(&b.series_id));
@@ -1570,9 +1578,70 @@ where
         data: PositionsData {
             address: address.to_string(),
             positions,
+            source: None,
         },
         warnings,
         meta: MetaBlock::new(state, "db"),
+    }))
+}
+
+/// Return only receipt-derived contract counts that agree exactly with the
+/// live MarginEngine. The surrounding route still requires a wallet session.
+async fn indexed_account_positions<P: crate::execution::rpc::EthCallProvider>(
+    state: &AppState, account: &AccountId, provider: Option<&P>,
+) -> Result<Json<Envelope<PositionsData>>, TradingApiError> {
+    use crate::execution::rpc::{EthLogsProvider, HttpJsonRpcProvider};
+    let unavailable = |reason| TradingApiError::new(
+        TradingErrorCode::SourceUnavailable, reason, MetaBlock::new(state, "indexer"),
+    );
+    let repo = state.repository.as_ref().ok_or_else(|| unavailable("Options projection requires PostgreSQL"))?;
+    let rpc = provider.ok_or_else(|| unavailable("canonical position RPC unavailable"))?;
+    let cursor = repo.get_option_event_indexer_state(crate::options::OPTION_EVENT_INDEXER_STATE_ID)
+        .await.map_err(|_| unavailable("Options cursor unavailable"))?
+        .ok_or_else(|| unavailable("Options indexer has not scanned the chain"))?;
+    let expected_hash = cursor.last_indexed_block_hash.as_deref()
+        .ok_or_else(|| unavailable("Options cursor has no canonical block hash"))?;
+    let rpc_url = state.option_event_indexer_config.rpc_url.as_deref()
+        .ok_or_else(|| unavailable("Options indexer RPC unavailable"))?;
+    let indexer_rpc = HttpJsonRpcProvider::new(rpc_url.to_string());
+    let actual_hash = indexer_rpc.block_hash(cursor.last_indexed_block).await
+        .map_err(|_| unavailable("Options canonical block check failed"))?;
+    if actual_hash.as_deref() != Some(expected_hash) {
+        return Err(unavailable("Options indexer is behind a chain reorganization"));
+    }
+    let events = repo.list_option_position_events_for_wallet(state.chain_id, &account.0).await
+        .map_err(|_| unavailable("Options position events unavailable"))?;
+    let projected = crate::options::position_projection::open_contracts(&events, &account.0)
+        .map_err(unavailable)?;
+    let wallet = address_from_account_str(&account.0)
+        .ok_or_else(|| unavailable("invalid wallet address"))?;
+    let canonical = crate::api::trading_views::try_get_canonical_option_positions(
+        &state.trading_views, &state.execution_config.executor_from_address, wallet, rpc,
+    ).await.map_err(|_| unavailable("canonical position read failed"))?
+        .ok_or_else(|| unavailable("MarginEngine unavailable"))?;
+    let observed: std::collections::BTreeMap<_, _> = canonical.into_iter().collect();
+    if observed != projected {
+        return Err(unavailable("Options position reconciliation pending"));
+    }
+    let positions = projected.into_iter().map(|(id, quantity)| Position {
+        series_id: id.to_string(),
+        size: quantity.unsigned_abs().to_string(),
+        side: if quantity > 0 { "long" } else { "short" },
+        avg_entry_price_1e8: None,
+        mark_price_1e8: None,
+        unrealised_pnl: None,
+        im_contribution: None,
+        mm_contribution: None,
+        is_exercisable: None,
+        quantity_contracts: Some(quantity.unsigned_abs().to_string()),
+    }).collect();
+    Ok(Json(Envelope {
+        status: "partial",
+        data: PositionsData { address: account.0.clone(), positions, source: Some("onchain_reconciled") },
+        warnings: vec![warning_source_unavailable(
+            "Contract counts match MarginEngine; premium, fees, collateral and mark remain unverified.",
+        )],
+        meta: MetaBlock::new(state, "chain+db"),
     }))
 }
 

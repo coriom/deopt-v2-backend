@@ -10,6 +10,7 @@ pub mod execution;
 pub mod lifecycle;
 pub mod multi_leg;
 pub mod multi_leg_service;
+pub mod position_projection;
 pub mod reconciliation_worker;
 pub mod reservation_formulas;
 pub mod reservation_repository;

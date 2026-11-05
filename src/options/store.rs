@@ -1020,6 +1020,7 @@ impl OptionSeriesStore {
             OptionEventIndexerState {
                 id: state_id.to_string(),
                 last_indexed_block,
+                last_indexed_block_hash: None,
                 updated_at_ms,
                 last_error: None,
             },
