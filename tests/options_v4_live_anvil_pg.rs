@@ -34,6 +34,7 @@ struct LocalTradeAdapter {
     typed_data: Value,
     tx_hash: Arc<Mutex<Option<String>>>,
     indexed_count: Arc<Mutex<u64>>,
+    calldata: Arc<Mutex<Option<Vec<u8>>>>,
 }
 
 #[derive(serde::Deserialize)]
@@ -68,6 +69,7 @@ async fn local_execute(
         .map_err(|_| StatusCode::BAD_REQUEST)?;
     let calldata = encode_option_execute_trade_calldata(&adapter.payload, &bundle)
         .map_err(|_| StatusCode::BAD_REQUEST)?;
+    *adapter.calldata.lock().unwrap() = Some(calldata.clone());
     let client = reqwest::Client::new();
     let hash = send_local(&client, &adapter.rpc, &adapter.matching, &calldata).await;
     let provider = HttpJsonRpcProvider::new(adapter.rpc.clone());
@@ -194,6 +196,7 @@ async fn browser_trade_adapter(
         typed_data,
         tx_hash: Arc::new(Mutex::new(None)),
         indexed_count: Arc::new(Mutex::new(0)),
+        calldata: Arc::new(Mutex::new(None)),
     }
 }
 
@@ -276,7 +279,7 @@ async fn real_receipt_is_indexed_in_postgres() {
         protocol_fee_vault_address: None,
     };
     let provider = HttpJsonRpcProvider::new(rpc.clone());
-    let (tx_hash, receipt, browser_indexed) = if browser {
+    let (tx_hash, receipt, browser_indexed, browser_calldata) = if browser {
         assert_eq!(
             local_chain, 84532,
             "browser bench must use local chain 84532"
@@ -291,6 +294,12 @@ async fn real_receipt_is_indexed_in_postgres() {
             .clone()
             .expect("browser submitted trade");
         let indexed = *adapter.indexed_count.lock().unwrap();
+        let calldata = adapter
+            .calldata
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("browser trade calldata");
         let receipt = rpc_request(
             &reqwest::Client::new(),
             &rpc,
@@ -298,7 +307,7 @@ async fn real_receipt_is_indexed_in_postgres() {
             serde_json::json!([hash]),
         )
         .await;
-        (hash, receipt, indexed)
+        (hash, receipt, indexed, Some(calldata))
     } else {
         let trade = transactions
             .iter()
@@ -310,6 +319,7 @@ async fn real_receipt_is_indexed_in_postgres() {
             transactions[trade]["hash"].as_str().unwrap().to_owned(),
             receipts[trade].clone(),
             0,
+            None,
         )
     };
     assert_eq!(receipt["status"], "0x1", "actual trade receipt");
@@ -403,6 +413,11 @@ async fn real_receipt_is_indexed_in_postgres() {
         .await
         .expect("idempotent tick");
     assert_eq!(second.events_indexed, 0);
+    let client = reqwest::Client::new();
+    if let Some(calldata) = browser_calldata.as_deref() {
+        expect_local_revert(&client, &rpc, matching, calldata).await;
+        println!("ONCHAIN_TRADE_REPLAY=REJECTED");
+    }
     println!("REAL_ANVIL_TX={tx_hash}");
     println!("REAL_BLOCK_HASH={block_hash}");
     println!(
@@ -440,6 +455,8 @@ async fn real_receipt_is_indexed_in_postgres() {
     settle.extend_from_slice(&[0u8; 12]);
     settle.extend_from_slice(buyer.as_slice());
     let buyer_tx = send_local(&client, &rpc, margin, &settle).await;
+    expect_local_revert(&client, &rpc, margin, &settle).await;
+    println!("DOUBLE_SETTLEMENT=REJECTED");
     let buyer_closed = provider
         .eth_call(check_quantity(indexed.buyer.as_deref().unwrap()))
         .await
@@ -555,6 +572,21 @@ async fn real_receipt_is_indexed_in_postgres() {
             let adapter = browser_trade_adapter(&broadcast, &state, &rpc, matching).await;
             run_browser(&state, adapter, &option_id.to_string(), "reorg").await;
             println!("PLAYWRIGHT_REORG_POSITION_REMOVED=PASS");
+            let calldata = browser_calldata.as_deref().expect("browser trade calldata");
+            rpc_request(
+                &client,
+                &rpc,
+                "eth_call",
+                serde_json::json!([{
+                "from":"0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+                "to":matching, "data":format!("0x{}",hex::encode(calldata))
+            }, "latest"]),
+            )
+            .await;
+            rpc_request(&client, &rpc, "evm_increaseTime", serde_json::json!([7200])).await;
+            rpc_request(&client, &rpc, "evm_mine", serde_json::json!([])).await;
+            expect_local_revert(&client, &rpc, matching, calldata).await;
+            println!("EXPIRED_OPTION_TRADE=REJECTED");
         } else {
             let orphan = after_reorg.expect_err("a reverted deployment must fail closed");
             assert_eq!(
@@ -644,6 +676,26 @@ async fn rpc_request(client: &reqwest::Client, url: &str, method: &str, params: 
         "local Anvil RPC {method} failed: {answer}"
     );
     answer["result"].clone()
+}
+
+async fn expect_local_revert(client: &reqwest::Client, url: &str, to: &str, data: &[u8]) {
+    let response: Value = client
+        .post(url)
+        .json(&serde_json::json!({
+            "jsonrpc":"2.0", "id":1, "method":"eth_call",
+            "params":[{"from":"0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+                       "to":to, "data":format!("0x{}", hex::encode(data))}, "latest"]
+        }))
+        .send()
+        .await
+        .expect("local revert request")
+        .json()
+        .await
+        .expect("local revert JSON");
+    assert!(
+        response.get("error").is_some() && response.get("result").is_none(),
+        "expected a real local contract revert"
+    );
 }
 
 async fn send_local(client: &reqwest::Client, url: &str, to: &str, data: &[u8]) -> String {
