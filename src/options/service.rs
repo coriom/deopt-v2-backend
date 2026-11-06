@@ -4480,6 +4480,12 @@ fn validate_executable_option_series(
     state: &AppState,
     series: &OptionSeries,
 ) -> Result<ExecutableOptionSeriesMetadata> {
+    if state.option_event_indexer_config.secondary_margin_engine_address.is_some()
+        && (series.onchain_chain_id.is_none() || series.onchain_registry_address.is_none()) {
+        return Err(BackendError::InvalidOptionExecutionIntentState(
+            "dual Options execution requires verified series Registry provenance".into(),
+        ));
+    }
     if let Some(registry) = series.onchain_registry_address.as_deref() {
         if series.onchain_chain_id != Some(state.chain_id)
             || !registry.eq_ignore_ascii_case(&state.options_config.execution_registry_address.0)

@@ -1219,14 +1219,14 @@ async fn admin_option_events(
         .and_then(|guard| guard.clone());
     let cursor_state = if let Some(repository) = state.repository.clone() {
         repository
-            .get_option_event_indexer_state(OPTION_EVENT_INDEXER_STATE_ID)
+            .get_option_event_indexer_state(&state.option_event_indexer_config.cursor_id())
             .await?
     } else {
         state
             .options_store
             .lock()
             .map_err(|_| ApiError::internal())?
-            .get_option_event_indexer_state(OPTION_EVENT_INDEXER_STATE_ID)
+            .get_option_event_indexer_state(&state.option_event_indexer_config.cursor_id())
     };
     let last_indexed_block = cursor_state
         .as_ref()
@@ -4747,6 +4747,9 @@ async fn submit_option_order(
     State(state): State<AppState>,
     Json(request): Json<SubmitOptionOrderRequest>,
 ) -> Result<Json<SubmitOptionOrderResponse>, ApiError> {
+    if state.option_event_indexer_config.secondary_margin_engine_address.is_some() {
+        return Err(ApiError::forbidden("dual Options order execution is not Registry-scoped"));
+    }
     let resolved_subaccount_id = resolve_options_v2_subaccount(
         &state,
         &request.authorization,
@@ -5611,6 +5614,9 @@ async fn create_option_rfq(
     State(state): State<AppState>,
     Json(request): Json<CreateOptionRfqRequest>,
 ) -> Result<Json<OptionRfqResponse>, ApiError> {
+    if state.option_event_indexer_config.secondary_margin_engine_address.is_some() {
+        return Err(ApiError::forbidden("dual Options RFQ execution is not Registry-scoped"));
+    }
     // SUBACCOUNTS-RFQ-INTEGRATION-V1 — resolve the taker subaccount
     // (v1 defaults to 1; v2 requires an owned id) before picking
     // canonical bytes so the challenge digest matches the wire form.
@@ -7044,6 +7050,9 @@ async fn create_option_twap_order(
     State(state): State<AppState>,
     Json(request): Json<CreateOptionTwapRequest>,
 ) -> Result<Json<OptionTwapOrderResponse>, ApiError> {
+    if state.option_event_indexer_config.secondary_margin_engine_address.is_some() {
+        return Err(ApiError::forbidden("dual Options TWAP execution is not Registry-scoped"));
+    }
     // SUBACCOUNTS-OPTIONS-CONDITIONAL-TWAP-WS-V1 — TWAP create flips
     // from foundation gate 503 to real routing.
     let resolved_subaccount_id = resolve_options_v2_subaccount(
@@ -7183,6 +7192,9 @@ async fn accept_option_rfq_quote(
     Path((option_rfq_id, quote_id)): Path<(String, String)>,
     Json(body): Json<AuthorizationOnlyBody>,
 ) -> Result<Json<AcceptOptionRfqQuoteResponse>, ApiError> {
+    if state.option_event_indexer_config.secondary_margin_engine_address.is_some() {
+        return Err(ApiError::forbidden("dual Options RFQ acceptance is not Registry-scoped"));
+    }
     let parsed_rfq_id = parse_option_rfq_id(&option_rfq_id)?;
     let parsed_quote_id = parse_option_rfq_quote_id(&quote_id)?;
     // Resolve taker from the RFQ and require their signature.
@@ -11452,6 +11464,8 @@ mod tests {
             rpc_url: Some("https://rpc.example/redacted-key".to_string()),
             matching_engine_address: AccountId::new("0x00000000000000000000000000000000000000ee"),
             margin_engine_address: AccountId::new("0x00000000000000000000000000000000000000aa"),
+            secondary_matching_engine_address: None,
+            secondary_margin_engine_address: None,
             collateral_vault_address: AccountId::new("0x00000000000000000000000000000000000000bb"),
             fees_manager_address: Some(AccountId::new(
                 "0x00000000000000000000000000000000000000cc",
@@ -11546,6 +11560,8 @@ mod tests {
             rpc_url: None,
             matching_engine_address: AccountId::new("0x00000000000000000000000000000000000000ee"),
             margin_engine_address: AccountId::new("0x00000000000000000000000000000000000000aa"),
+            secondary_matching_engine_address: None,
+            secondary_margin_engine_address: None,
             collateral_vault_address: AccountId::new("0x00000000000000000000000000000000000000bb"),
             fees_manager_address: None,
             fees_manager_v2_address: None,
@@ -11581,6 +11597,8 @@ mod tests {
             rpc_url: Some(rpc_url),
             matching_engine_address: AccountId::new("0x00000000000000000000000000000000000000ee"),
             margin_engine_address: AccountId::new("0x00000000000000000000000000000000000000aa"),
+            secondary_matching_engine_address: None,
+            secondary_margin_engine_address: None,
             collateral_vault_address: AccountId::new("0x00000000000000000000000000000000000000bb"),
             fees_manager_address: None,
             fees_manager_v2_address: None,

@@ -693,6 +693,12 @@ impl AppConfig {
             rpc_url: execution.rpc_url.clone(),
             matching_engine_address: option_event_indexer_matching_engine_address,
             margin_engine_address: option_event_indexer_margin_engine_address,
+            secondary_matching_engine_address: parse_optional_address_env(
+                &mut lookup, "OPTION_EVENT_INDEXER_SECONDARY_MATCHING_ENGINE_ADDRESS",
+            )?,
+            secondary_margin_engine_address: parse_optional_address_env(
+                &mut lookup, "OPTION_EVENT_INDEXER_SECONDARY_MARGIN_ENGINE_ADDRESS",
+            )?,
             collateral_vault_address: option_event_indexer_collateral_vault_address,
             fees_manager_address: option_event_indexer_fees_manager_address,
             fees_manager_v2_address: option_event_indexer_fees_manager_v2_address,

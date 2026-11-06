@@ -305,6 +305,8 @@ pub struct SeriesDetailData {
 pub struct SeriesSummary {
     pub series_id: String,
     pub product_id: String,
+    pub onchain_chain_id: Option<u64>,
+    pub onchain_registry_address: Option<String>,
     pub underlying: String,
     pub settlement_asset: String,
     pub is_call: bool,
@@ -943,6 +945,8 @@ where
         series: SeriesSummary {
             series_id: series.option_series_id.to_string(),
             product_id: pid,
+            onchain_chain_id: series.onchain_chain_id,
+            onchain_registry_address: series.onchain_registry_address.clone(),
             underlying: series.underlying.clone(),
             settlement_asset: series.settlement_asset.clone(),
             is_call: series.is_call,
@@ -1373,7 +1377,17 @@ where
     P: crate::execution::rpc::EthCallProvider,
 {
     let acct = parse_address_or_400(state, address)?;
-    if state.option_event_indexer_config.enabled && state.trading_views.margin_engine_address.is_some() {
+    if state.option_event_indexer_config.secondary_margin_engine_address.is_some()
+        && !state.option_event_indexer_config.enabled {
+        return Err(TradingApiError::new(
+            TradingErrorCode::SourceUnavailable,
+            "dual Options stack requires the canonical event indexer",
+            MetaBlock::new(state, "indexer"),
+        ));
+    }
+    if state.option_event_indexer_config.enabled
+        && (state.trading_views.margin_engine_address.is_some()
+            || state.option_event_indexer_config.secondary_margin_engine_address.is_some()) {
         return indexed_account_positions(state, &acct, provider).await;
     }
     // Aggregate net position per series from the OptionFill store.
@@ -1659,6 +1673,9 @@ where
 async fn indexed_account_positions<P: crate::execution::rpc::EthCallProvider>(
     state: &AppState, account: &AccountId, provider: Option<&P>,
 ) -> Result<Json<Envelope<PositionsData>>, TradingApiError> {
+    if state.option_event_indexer_config.secondary_margin_engine_address.is_some() {
+        return dual_indexed_account_positions(state, account, provider).await;
+    }
     use crate::execution::rpc::{EthLogsProvider, HttpJsonRpcProvider};
     let unavailable = |reason| TradingApiError::new(
         TradingErrorCode::SourceUnavailable, reason, MetaBlock::new(state, "indexer"),
@@ -1847,6 +1864,117 @@ async fn indexed_account_positions<P: crate::execution::rpc::EthCallProvider>(
     }))
 }
 
+fn raw_option_id(value: &str) -> Option<alloy_primitives::U256> {
+    let (digits, radix) = value.strip_prefix("0x").map(|v| (v, 16)).unwrap_or((value, 10));
+    alloy_primitives::U256::from_str_radix(digits, radix).ok()
+}
+
+/// Only exact (chain, Registry, raw optionId) metadata can name a
+/// canonical position. Legacy rows stay in PostgreSQL but cannot be used as
+/// evidence for either Registry until their provenance is verified.
+fn resolve_dual_series<'a>(
+    series: &'a [OptionSeries], chain_id: u64, registry: &str,
+    option_id: alloy_primitives::U256,
+) -> Option<&'a OptionSeries> {
+    let mut matches = series.iter().filter(|item|
+        item.onchain_chain_id == Some(chain_id)
+            && item.onchain_registry_address.as_deref().is_some_and(|r| r.eq_ignore_ascii_case(registry))
+            && item.onchain_series_id.as_deref().and_then(raw_option_id) == Some(option_id)
+            && crate::options::onchain_option_series_key(chain_id, registry, &option_id.to_string())
+                .is_ok_and(|key| key == item.option_series_id)
+    );
+    let unique = matches.next()?;
+    matches.next().is_none().then_some(unique)
+}
+
+async fn dual_indexed_account_positions<P: crate::execution::rpc::EthCallProvider>(
+    state: &AppState, account: &AccountId, provider: Option<&P>,
+) -> Result<Json<Envelope<PositionsData>>, TradingApiError> {
+    use crate::execution::rpc::{EthLogsProvider, HttpJsonRpcProvider};
+    let unavailable = |reason| TradingApiError::new(
+        TradingErrorCode::SourceUnavailable, reason, MetaBlock::new(state, "indexer"),
+    );
+    let config = &state.option_event_indexer_config;
+    config.validate_startup(state.repository.is_some())
+        .map_err(|_| unavailable("dual Options emitter configuration invalid"))?;
+    let repo = state.repository.as_ref().ok_or_else(|| unavailable("Options projection requires PostgreSQL"))?;
+    let rpc = provider.ok_or_else(|| unavailable("canonical position RPC unavailable"))?;
+    let cursor = repo.get_option_event_indexer_state(&config.cursor_id()).await
+        .map_err(|_| unavailable("dual Options cursor unavailable"))?
+        .ok_or_else(|| unavailable("dual Options history has not been indexed"))?;
+    let expected_hash = cursor.last_indexed_block_hash.as_deref()
+        .ok_or_else(|| unavailable("dual Options cursor has no canonical block hash"))?;
+    let rpc_url = config.rpc_url.as_deref().ok_or_else(|| unavailable("Options indexer RPC unavailable"))?;
+    let indexer_rpc = HttpJsonRpcProvider::new(rpc_url.to_string());
+    let actual_hash = indexer_rpc.block_hash(cursor.last_indexed_block).await
+        .map_err(|_| unavailable("Options canonical block check failed"))?;
+    if actual_hash.as_deref() != Some(expected_hash) {
+        return Err(unavailable("Options indexer is behind a chain reorganization"));
+    }
+    let wallet = address_from_account_str(&account.0).ok_or_else(|| unavailable("invalid wallet address"))?;
+    let events = repo.list_option_position_events_for_wallet(state.chain_id, &account.0).await
+        .map_err(|_| unavailable("Options position events unavailable"))?;
+    let mut scoped = [Vec::new(), Vec::new()];
+    for event in events {
+        let index = config.position_stack_index(&event)
+            .ok_or_else(|| unavailable("position receipt has unknown Options emitter"))?;
+        scoped[index].push(event);
+    }
+    let series = repo.list_option_series().await.map_err(|_| unavailable("Options series metadata unavailable"))?;
+    let engines = [
+        &config.margin_engine_address,
+        config.secondary_margin_engine_address.as_ref()
+            .ok_or_else(|| unavailable("second MarginEngine unavailable"))?,
+    ];
+    let mut positions = Vec::new();
+    for (index, engine) in engines.iter().enumerate() {
+        let mut views = state.trading_views.clone();
+        views.margin_engine_address = Some((*engine).clone());
+        let registry = crate::api::trading_views::try_get_margin_option_registry(
+            &views, &state.execution_config.executor_from_address, rpc,
+        ).await.map_err(|_| unavailable("MarginEngine registry provenance unavailable"))?
+            .ok_or_else(|| unavailable("MarginEngine registry provenance unavailable"))?;
+        let registry = format!("{registry:#x}");
+        let projected = crate::options::position_projection::open_contracts(&scoped[index], &account.0)
+            .map_err(unavailable)?;
+        let canonical = crate::api::trading_views::try_get_canonical_option_positions(
+            &views, &state.execution_config.executor_from_address, wallet, rpc,
+        ).await.map_err(|_| unavailable("canonical position read failed"))?
+            .ok_or_else(|| unavailable("MarginEngine unavailable"))?;
+        let mut observed = std::collections::BTreeMap::new();
+        for (id, quantity) in canonical {
+            if observed.insert(id, quantity).is_some() {
+                return Err(unavailable("duplicate canonical Options series"));
+            }
+        }
+        if observed != projected {
+            return Err(unavailable("Options position reconciliation pending"));
+        }
+        for (id, quantity) in projected {
+            let item = resolve_dual_series(&series, state.chain_id, &registry, id)
+                .ok_or_else(|| unavailable("position lacks exact Registry provenance"))?;
+            positions.push(Position {
+                series_id: item.option_series_id.clone(),
+                size: quantity.unsigned_abs().to_string(),
+                side: if quantity > 0 { "long" } else { "short" },
+                avg_entry_price_1e8: None, mark_price_1e8: None, unrealised_pnl: None,
+                im_contribution: None, mm_contribution: None, is_exercisable: None,
+                quantity_contracts: Some(quantity.unsigned_abs().to_string()),
+                premium_proof: None, fee_proof: None,
+            });
+        }
+    }
+    positions.sort_by(|a, b| a.series_id.cmp(&b.series_id));
+    Ok(Json(Envelope {
+        status: "partial",
+        data: PositionsData { address: account.0.clone(), positions, source: Some("onchain_reconciled"), settlements: Vec::new() },
+        warnings: vec![warning_source_unavailable(
+            "Both MarginEngine contract counts are reconciled by Registry. Economic proofs and per-position collateral are unavailable in dual-Registry mode.",
+        )],
+        meta: MetaBlock::new(state, "chain+db"),
+    }))
+}
+
 pub async fn account_portfolio_authorized(
     State(state): State<AppState>,
     Path(address): Path<String>,
@@ -1872,6 +2000,13 @@ pub(crate) async fn account_portfolio_impl<P>(
 where
     P: crate::execution::rpc::EthCallProvider,
 {
+    if state.option_event_indexer_config.secondary_margin_engine_address.is_some() {
+        return Err(TradingApiError::new(
+            TradingErrorCode::SourceUnavailable,
+            "portfolio aggregation across both MarginEngines is unavailable",
+            MetaBlock::new(state, "indexer"),
+        ));
+    }
     let acct = parse_address_or_400(state, address)?;
     let fills = list_option_fills_service(
         state,
@@ -2361,6 +2496,13 @@ pub async fn account_history(
     State(state): State<AppState>,
     Path(address): Path<String>,
 ) -> Result<Json<Envelope<HistoryData>>, TradingApiError> {
+    if state.option_event_indexer_config.secondary_margin_engine_address.is_some() {
+        return Err(TradingApiError::new(
+            TradingErrorCode::SourceUnavailable,
+            "dual Options history is not reconciled across both Registries",
+            MetaBlock::new(&state, "indexer"),
+        ));
+    }
     let acct = parse_address_or_400(&state, &address)?;
     let fills = list_option_fills_service(
         &state,
@@ -2560,6 +2702,13 @@ pub async fn account_history_v2(
     Path(address): Path<String>,
     Query(q): Query<HistoryV2Query>,
 ) -> Result<Json<Envelope<HistoryV2Data>>, TradingApiError> {
+    if state.option_event_indexer_config.secondary_margin_engine_address.is_some() {
+        return Err(TradingApiError::new(
+            TradingErrorCode::SourceUnavailable,
+            "dual Options history is not reconciled across both Registries",
+            MetaBlock::new(&state, "indexer"),
+        ));
+    }
     let acct = parse_address_or_400(&state, &address)?;
 
     let tab_str = q.tab.as_deref().unwrap_or("trades");
@@ -3064,6 +3213,13 @@ pub(crate) async fn exercise_preview_impl<P>(
 where
     P: crate::execution::rpc::EthCallProvider,
 {
+    if state.option_event_indexer_config.secondary_margin_engine_address.is_some() {
+        return Err(TradingApiError::new(
+            TradingErrorCode::SourceUnavailable,
+            "exercise preview is not scoped to both MarginEngines",
+            MetaBlock::new(state, "indexer"),
+        ));
+    }
     let acct = parse_address_or_400(state, &req.account)?;
     let series = get_option_series_service(state, &req.series_id)
         .await
@@ -3376,6 +3532,38 @@ pub async fn trading_health(State(state): State<AppState>) -> Json<Envelope<Trad
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn same_raw_option_id_resolves_only_with_exact_registry_and_chain() {
+        use crate::options::{OptionSeriesSource, OptionSeriesStatus};
+        let first_registry = "0x1111111111111111111111111111111111111111";
+        let second_registry = "0x2222222222222222222222222222222222222222";
+        let make = |registry: &str| OptionSeries {
+            option_series_id: crate::options::onchain_option_series_key(84532, registry, "7").unwrap(),
+            underlying: first_registry.into(), base_asset: first_registry.into(),
+            quote_asset: second_registry.into(), settlement_asset: second_registry.into(),
+            expiry: 1_800_000_000, strike_1e8: 200_000_000_000,
+            is_call: true, contract_size_1e8: 100_000_000,
+            status: OptionSeriesStatus::Active, source: OptionSeriesSource::Manual,
+            onchain_product_id: None, onchain_series_id: Some("0x07".into()),
+            onchain_chain_id: Some(84532), onchain_registry_address: Some(registry.into()),
+            created_at_ms: 1, updated_at_ms: 1,
+        };
+        let first = make(first_registry);
+        let second = make(second_registry);
+        let mut legacy = make(first_registry);
+        legacy.onchain_chain_id = None;
+        legacy.onchain_registry_address = None;
+        let rows = vec![legacy, first.clone(), second.clone()];
+        let id = alloy_primitives::U256::from(7u64);
+        assert_eq!(resolve_dual_series(&rows, 84532, first_registry, id).unwrap().option_series_id,
+                   first.option_series_id);
+        assert_eq!(resolve_dual_series(&rows, 84532, second_registry, id).unwrap().option_series_id,
+                   second.option_series_id);
+        assert_ne!(first.option_series_id, second.option_series_id);
+        assert!(resolve_dual_series(&rows, 1, first_registry, id).is_none());
+        assert!(resolve_dual_series(&rows, 84532, "0x3333333333333333333333333333333333333333", id).is_none());
+    }
 
     #[test]
     fn product_id_is_deterministic_for_same_fields() {

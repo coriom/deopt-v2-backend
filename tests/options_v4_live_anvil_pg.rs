@@ -342,6 +342,8 @@ async fn real_receipt_is_indexed_in_postgres() {
         rpc_url: Some(rpc.clone()),
         matching_engine_address: AccountId::new(matching),
         margin_engine_address: AccountId::new(margin),
+        secondary_matching_engine_address: None,
+        secondary_margin_engine_address: None,
         collateral_vault_address: AccountId::new(vault),
         fees_manager_address: None,
         fees_manager_v2_address: Some(AccountId::new(fees_manager)),

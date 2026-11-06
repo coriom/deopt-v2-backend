@@ -70,6 +70,10 @@ pub struct OptionEventIndexerConfig {
     pub rpc_url: Option<String>,
     pub matching_engine_address: AccountId,
     pub margin_engine_address: AccountId,
+    /// Optional second historical Options stack. Both addresses are required
+    /// together; each emitter remains distinguishable in persisted receipts.
+    pub secondary_matching_engine_address: Option<AccountId>,
+    pub secondary_margin_engine_address: Option<AccountId>,
     pub collateral_vault_address: AccountId,
     pub fees_manager_address: Option<AccountId>,
     /// Optional V2 fees manager (FeesManagerV2) address. When set, the
@@ -104,6 +108,26 @@ pub struct OptionEventEmitterContract {
 }
 
 impl OptionEventIndexerConfig {
+    pub fn cursor_id(&self) -> String {
+        if self.secondary_margin_engine_address.is_none() {
+            return OPTION_EVENT_INDEXER_STATE_ID.to_string();
+        }
+        // A new emitter topology must rescan from its configured start block.
+        let topology = format!(
+            "{}|{}|{}|{}|{}|{}|{}|{}",
+            self.from_block,
+            self.matching_engine_address.0.to_ascii_lowercase(),
+            self.margin_engine_address.0.to_ascii_lowercase(),
+            self.secondary_matching_engine_address.as_ref().map(|a| a.0.to_ascii_lowercase()).unwrap_or_default(),
+            self.secondary_margin_engine_address.as_ref().map(|a| a.0.to_ascii_lowercase()).unwrap_or_default(),
+            self.collateral_vault_address.0.to_ascii_lowercase(),
+            self.fees_manager_address.as_ref().map(|a| a.0.to_ascii_lowercase()).unwrap_or_default(),
+            self.fees_manager_v2_address.as_ref().map(|a| a.0.to_ascii_lowercase()).unwrap_or_default(),
+        );
+        let hash = keccak256(topology.as_bytes());
+        format!("{OPTION_EVENT_INDEXER_STATE_ID}_dual_{}", &hex_0x(&hash[..8])[2..])
+    }
+
     pub fn disabled() -> Self {
         Self {
             enabled: false,
@@ -115,6 +139,8 @@ impl OptionEventIndexerConfig {
             rpc_url: None,
             matching_engine_address: AccountId::new(""),
             margin_engine_address: AccountId::new(""),
+            secondary_matching_engine_address: None,
+            secondary_margin_engine_address: None,
             collateral_vault_address: AccountId::new(""),
             fees_manager_address: None,
             fees_manager_v2_address: None,
@@ -131,6 +157,12 @@ impl OptionEventIndexerConfig {
             &self.matching_engine_address,
         );
         push_emitter_contract(&mut contracts, "margin_engine", &self.margin_engine_address);
+        if let Some(address) = &self.secondary_matching_engine_address {
+            push_emitter_contract(&mut contracts, "matching_engine_secondary", address);
+        }
+        if let Some(address) = &self.secondary_margin_engine_address {
+            push_emitter_contract(&mut contracts, "margin_engine_secondary", address);
+        }
         push_emitter_contract(
             &mut contracts,
             "collateral_vault",
@@ -143,6 +175,26 @@ impl OptionEventIndexerConfig {
             push_emitter_contract(&mut contracts, "fees_manager_v2", address);
         }
         contracts
+    }
+
+    /// Resolve a position receipt to its exact engine stack. Historical rows
+    /// keep their emitter address, so no destructive provenance backfill is
+    /// needed. Unknown emitters fail closed at the API boundary.
+    pub fn position_stack_index(&self, event: &OptionExecutionEvent) -> Option<usize> {
+        let address = &event.contract_address;
+        match event.event_name.as_str() {
+            "OptionTradeExecuted" | "OptionRfqTradeExecuted" => {
+                if address.eq_ignore_ascii_case(&self.matching_engine_address.0) { Some(0) }
+                else if self.secondary_matching_engine_address.as_ref().is_some_and(|a| address.eq_ignore_ascii_case(&a.0)) { Some(1) }
+                else { None }
+            }
+            "AccountSettled" => {
+                if address.eq_ignore_ascii_case(&self.margin_engine_address.0) { Some(0) }
+                else if self.secondary_margin_engine_address.as_ref().is_some_and(|a| address.eq_ignore_ascii_case(&a.0)) { Some(1) }
+                else { None }
+            }
+            _ => None,
+        }
     }
 
     pub fn validate_startup(&self, persistence_enabled: bool) -> Result<()> {
@@ -177,6 +229,20 @@ impl OptionEventIndexerConfig {
             "OPTION_EVENT_INDEXER_MARGIN_ENGINE_ADDRESS",
             &self.margin_engine_address,
         )?;
+        match (&self.secondary_matching_engine_address, &self.secondary_margin_engine_address) {
+            (None, None) => {}
+            (Some(matching), Some(margin)) => {
+                validate_optional_emitter_address("OPTION_EVENT_INDEXER_SECONDARY_MATCHING_ENGINE_ADDRESS", matching)?;
+                validate_optional_emitter_address("OPTION_EVENT_INDEXER_SECONDARY_MARGIN_ENGINE_ADDRESS", margin)?;
+                let addresses = [&self.matching_engine_address, &self.margin_engine_address, matching, margin];
+                for (index, address) in addresses.iter().enumerate() {
+                    if addresses[..index].iter().any(|other| other.0.eq_ignore_ascii_case(&address.0)) {
+                        return Err(BackendError::Config("Options stack emitters must have distinct addresses".into()));
+                    }
+                }
+            }
+            _ => return Err(BackendError::Config("secondary Options matching and margin engines must be configured together".into())),
+        }
         validate_required_emitter_address(
             "OPTION_EVENT_INDEXER_COLLATERAL_VAULT_ADDRESS",
             &self.collateral_vault_address,
@@ -384,11 +450,11 @@ pub fn default_option_event_counts() -> BTreeMap<String, u64> {
 
 fn event_topics_for_emitter_role(role: &str) -> Vec<String> {
     match role {
-        "matching_engine" => vec![
+        "matching_engine" | "matching_engine_secondary" => vec![
             option_trade_executed_topic0(),
             option_rfq_trade_executed_topic0(),
         ],
-        "margin_engine" => vec![
+        "margin_engine" | "margin_engine_secondary" => vec![
             margin_trade_executed_topic0(),
             account_settled_topic0(),
             trading_fee_charged_topic0(),
@@ -460,7 +526,7 @@ where
                     BackendError::Indexer("canonical Options reorg requires persistent store".into())
                 })?;
                 repository.rewind_option_execution_events(
-                    OPTION_EVENT_INDEXER_STATE_ID, state.chain_id, config.from_block,
+                    &config.cursor_id(), state.chain_id, config.from_block,
                 ).await?;
                 cursor = None;
             }
@@ -612,14 +678,14 @@ pub async fn get_option_event_indexer_state(
 ) -> Result<Option<OptionEventIndexerState>> {
     if let Some(repository) = state.repository.clone() {
         return repository
-            .get_option_event_indexer_state(OPTION_EVENT_INDEXER_STATE_ID)
+            .get_option_event_indexer_state(&state.option_event_indexer_config.cursor_id())
             .await;
     }
     Ok(state
         .options_store
         .lock()
         .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?
-        .get_option_event_indexer_state(OPTION_EVENT_INDEXER_STATE_ID))
+        .get_option_event_indexer_state(&state.option_event_indexer_config.cursor_id()))
 }
 
 async fn find_option_execution_event_link(
@@ -649,7 +715,7 @@ async fn persist_option_execution_events_and_cursor(
     if let Some(repository) = state.repository.clone() {
         return repository
             .persist_option_execution_events_and_canonical_cursor(
-                OPTION_EVENT_INDEXER_STATE_ID,
+                &state.option_event_indexer_config.cursor_id(),
                 events,
                 last_indexed_block,
                 block_hash,
@@ -662,7 +728,7 @@ async fn persist_option_execution_events_and_cursor(
         .lock()
         .map_err(|_| BackendError::Config("options store lock poisoned".to_string()))?
         .persist_option_execution_events_and_cursor(
-            OPTION_EVENT_INDEXER_STATE_ID,
+            &state.option_event_indexer_config.cursor_id(),
             events,
             last_indexed_block,
             now,
@@ -2020,6 +2086,29 @@ mod tests {
     };
     use std::sync::{Arc, Mutex};
 
+    #[tokio::test]
+    async fn same_raw_option_id_is_indexed_from_both_matching_emitters() {
+        let mut state = state_with_event_indexer(true, 0, 20, 0);
+        let secondary_matching = "0x00000000000000000000000000000000000000ef";
+        state.option_event_indexer_config.secondary_matching_engine_address =
+            Some(AccountId::new(secondary_matching));
+        state.option_event_indexer_config.secondary_margin_engine_address =
+            Some(AccountId::new("0x00000000000000000000000000000000000000ab"));
+        let mut secondary = option_trade_log(10, 3);
+        secondary.address = secondary_matching.to_string();
+        let provider = MockEventLogProvider::new(20, vec![option_trade_log(10, 2), secondary]);
+        let result = index_option_events_with_provider(&state, &provider).await.unwrap();
+        assert_eq!(result.events_indexed, 2);
+        let events = state.options_store.lock().unwrap().list_option_execution_events(10);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].option_id, events[1].option_id);
+        assert_ne!(state.option_event_indexer_config.position_stack_index(&events[0]),
+                   state.option_event_indexer_config.position_stack_index(&events[1]));
+        assert!(state.option_event_indexer_config.cursor_id().contains("_dual_"));
+        assert!(state.options_store.lock().unwrap()
+            .get_option_event_indexer_state(&state.option_event_indexer_config.cursor_id()).is_some());
+    }
+
     #[derive(Clone)]
     struct MockEventLogProvider {
         head: u64,
@@ -2714,6 +2803,8 @@ mod tests {
             rpc_url: None,
             matching_engine_address: AccountId::new("0x00000000000000000000000000000000000000ee"),
             margin_engine_address: AccountId::new("0x00000000000000000000000000000000000000aa"),
+            secondary_matching_engine_address: None,
+            secondary_margin_engine_address: None,
             collateral_vault_address: AccountId::new("0x00000000000000000000000000000000000000bb"),
             fees_manager_address: Some(AccountId::new(
                 "0x00000000000000000000000000000000000000cc",
@@ -2973,6 +3064,8 @@ mod tests {
             rpc_url: Some("http://127.0.0.1:8545".to_string()),
             matching_engine_address: AccountId::new("0x00000000000000000000000000000000000000ee"),
             margin_engine_address: AccountId::new("0x00000000000000000000000000000000000000aa"),
+            secondary_matching_engine_address: None,
+            secondary_margin_engine_address: None,
             collateral_vault_address: AccountId::new("0x00000000000000000000000000000000000000bb"),
             fees_manager_address: None,
             fees_manager_v2_address: None,
