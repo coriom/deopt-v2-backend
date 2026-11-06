@@ -242,6 +242,8 @@ async fn real_receipt_is_indexed_in_postgres() {
     let receipts = broadcast["receipts"].as_array().expect("receipts");
     let browser = std::env::var("OPTIONS_V4_BROWSER").as_deref() == Ok("1");
     let verified_settlement = std::env::var("OPTIONS_V13_VERIFIED_SETTLEMENT").as_deref() == Ok("1");
+    let dual_registry = std::env::var("OPTIONS_V16_DUAL_REGISTRY").as_deref() == Ok("1");
+    assert!(!dual_registry || (browser && verified_settlement), "V16 requires browser and verified settlement");
     let matching = transactions
         .iter()
         .find(|tx| {
@@ -271,6 +273,17 @@ async fn real_receipt_is_indexed_in_postgres() {
         })
         .and_then(|tx| tx["contractAddress"].as_str())
         .expect("registry deployment");
+    let legacy_deployment = |name: &str| -> Option<&str> {
+        dual_registry.then(|| transactions.iter().rev()
+            .find(|tx| tx["contractName"] == name && tx["transactionType"] == "CREATE")
+            .and_then(|tx| tx["contractAddress"].as_str())
+            .expect("V16 legacy stack deployment"))
+    };
+    let legacy_registry = legacy_deployment("OptionProductRegistry");
+    let legacy_matching = legacy_deployment("OptionMatchingEngine");
+    let legacy_margin = legacy_deployment("MarginEngine");
+    let legacy_vault = legacy_deployment("CollateralVault");
+    let legacy_fees_manager = legacy_deployment("FeesManagerV2");
     let deployment = |name: &str| {
         transactions.iter()
             .find(|tx| tx["contractName"] == name && tx["transactionType"] == "CREATE")
@@ -345,24 +358,95 @@ async fn real_receipt_is_indexed_in_postgres() {
         secondary_matching_engine_address: None,
         secondary_margin_engine_address: None,
         collateral_vault_address: AccountId::new(vault),
+        secondary_collateral_vault_address: None,
         fees_manager_address: None,
         fees_manager_v2_address: Some(AccountId::new(fees_manager)),
+        secondary_fees_manager_v2_address: None,
         old_margin_engine_address: None,
         protocol_fee_vault_address: None,
     };
+    if dual_registry {
+        assert_ne!(legacy_registry.unwrap().to_ascii_lowercase(), registry.to_ascii_lowercase());
+        assert_ne!(legacy_vault.unwrap().to_ascii_lowercase(), vault.to_ascii_lowercase());
+        state.option_event_indexer_config.secondary_matching_engine_address =
+            Some(AccountId::new(legacy_matching.unwrap()));
+        state.option_event_indexer_config.secondary_margin_engine_address =
+            Some(AccountId::new(legacy_margin.unwrap()));
+        state.option_event_indexer_config.secondary_collateral_vault_address =
+            Some(AccountId::new(legacy_vault.unwrap()));
+        state.option_event_indexer_config.secondary_fees_manager_v2_address =
+            Some(AccountId::new(legacy_fees_manager.unwrap()));
+        state.option_event_indexer_config.validate_startup(true).expect("V16 emitter isolation");
+    }
     let provider = HttpJsonRpcProvider::new(rpc.clone());
+    let mut legacy_balances_before = None;
     let (tx_hash, receipt, browser_indexed, browser_calldata, pre_balances) = if browser {
         assert_eq!(
             local_chain, 84532,
             "browser bench must use local chain 84532"
         );
         let adapter = browser_trade_adapter(&broadcast, &state, &rpc, matching, registry).await;
+        if let Some(old_registry) = legacy_registry {
+            let old_log = created_series_log(&broadcast, old_registry);
+            let old_id = U256::from_str_radix(&old_log["topics"][1].as_str().unwrap()[2..], 16).unwrap();
+            assert_eq!(old_id, adapter.payload.option_id, "same raw optionId in both Registries");
+            let mut old_series = repo.list_option_series().await.expect("new series seeded")
+                .into_iter().find(|item| item.onchain_registry_address.as_deref()
+                    .is_some_and(|address| address.eq_ignore_ascii_case(registry)))
+                .expect("new series metadata");
+            old_series.option_series_id = deopt_v2_backend::options::onchain_option_series_key(
+                local_chain, old_registry, &old_id.to_string()).unwrap();
+            old_series.onchain_registry_address = Some(old_registry.to_ascii_lowercase());
+            repo.insert_option_series(&old_series).await.expect("legacy series metadata");
+            let old_trade = transactions.iter().find(|tx|
+                tx["contractName"] == "OptionMatchingEngine"
+                    && tx["transactionType"] == "CALL"
+                    && tx["contractAddress"].as_str().is_some_and(|address|
+                        address.eq_ignore_ascii_case(legacy_matching.unwrap()))
+                    && tx["function"].as_str().is_some_and(|name| name.starts_with("executeTrade(")))
+                .expect("real legacy EIP712 trade transaction");
+            let old_calldata = hex::decode(old_trade["transaction"]["input"].as_str().unwrap().trim_start_matches("0x")).unwrap();
+            assert!(local_call_reverted(&reqwest::Client::new(), &rpc, matching, &old_calldata).await,
+                "legacy signatures must fail against dedicated MatchingEngine domain");
+            println!("V16_SAME_RAW_OPTION_ID_TWO_REGISTRIES=PASS");
+            println!("V16_CROSS_REGISTRY_EIP712_REPLAY=REJECTED");
+        }
         let pre_provider = HttpJsonRpcProvider::new(rpc.clone());
         let buyer_before = vault_balance(&pre_provider, vault, &adapter.payload.buyer.0, &adapter.payload.settlement_asset.0).await;
         let seller_before = vault_balance(&pre_provider, vault, &adapter.payload.seller.0, &adapter.payload.settlement_asset.0).await;
         let recipient_before = vault_balance(&pre_provider, vault, "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266", &adapter.payload.settlement_asset.0).await;
         let asset = adapter.payload.settlement_asset.0.clone();
+        if let Some(old_vault) = legacy_vault {
+            legacy_balances_before = Some((
+                vault_balance(&pre_provider, old_vault, &adapter.payload.buyer.0, &asset).await,
+                vault_balance(&pre_provider, old_vault, &adapter.payload.seller.0, &asset).await,
+            ));
+        }
         let option_id = adapter.payload.option_id.to_string();
+        if dual_registry {
+            let client = reqwest::Client::new();
+            let asset_address = alloy_primitives::Address::from_str(&asset).unwrap();
+            let mut deposit_cap = selector("tokenDepositCap(address)");
+            deposit_cap.extend_from_slice(&[0u8; 12]);
+            deposit_cap.extend_from_slice(asset_address.as_slice());
+            let cap = rpc_request(&client, &rpc, "eth_call", serde_json::json!([
+                {"to": vault, "data": format!("0x{}", hex::encode(deposit_cap))}, "latest"
+            ])).await;
+            assert_eq!(U256::from_str_radix(&cap.as_str().unwrap()[2..], 16).unwrap(), U256::from(2_000_000_000u64));
+            let mut oi_cap = selector("seriesShortOpenInterestCap(uint256)");
+            oi_cap.extend_from_slice(&adapter.payload.option_id.to_be_bytes::<32>());
+            let cap = rpc_request(&client, &rpc, "eth_call", serde_json::json!([
+                {"to": margin, "data": format!("0x{}", hex::encode(oi_cap))}, "latest"
+            ])).await;
+            assert_eq!(U256::from_str_radix(&cap.as_str().unwrap()[2..], 16).unwrap(), U256::from(1));
+            let mut extra_deposit = selector("deposit(address,uint256)");
+            extra_deposit.extend_from_slice(&[0u8; 12]);
+            extra_deposit.extend_from_slice(asset_address.as_slice());
+            extra_deposit.extend_from_slice(&U256::from(1_000_000u64).to_be_bytes::<32>());
+            assert!(local_call_reverted_as(&client, &rpc, vault, &extra_deposit, &adapter.payload.buyer.0).await,
+                "dedicated Vault must reject deposits above aggregate cap");
+            println!("V16_ONCHAIN_DEPOSIT_AND_SHORT_OI_CAPS=PASS");
+        }
         run_browser(&state, adapter.clone(), &option_id, "trade").await;
         let hash = adapter
             .tx_hash
@@ -415,6 +499,14 @@ async fn real_receipt_is_indexed_in_postgres() {
     let events = list_option_execution_events(&state, 1000)
         .await
         .expect("persisted events");
+    if let (Some(old_vault), Some((buyer_before, seller_before)), Some((_, _, _, asset))) =
+        (legacy_vault, legacy_balances_before, pre_balances.as_ref()) {
+        assert_eq!(vault_balance(&provider, old_vault, "0x0376AAc07Ad725E01357B1725B5ceC61aE10473c", asset).await, buyer_before);
+        assert_eq!(vault_balance(&provider, old_vault, "0xb040e0fAac56886b0f29Af446544AED0A154ED29", asset).await, seller_before);
+        assert!(events.iter().filter(|event| event.tx_hash.eq_ignore_ascii_case(&tx_hash))
+            .all(|event| !event.contract_address.eq_ignore_ascii_case(old_vault)));
+        println!("V16_LEGACY_VAULT_UNCHANGED_BY_DEDICATED_TRADE=PASS");
+    }
     let indexed = events
         .iter()
         .find(|e| e.tx_hash.eq_ignore_ascii_case(&tx_hash) && e.event_name == "OptionTradeExecuted")
@@ -729,8 +821,12 @@ async fn real_receipt_is_indexed_in_postgres() {
     .unwrap();
     assert_eq!(
         settled_view["data"]["positions"].as_array().unwrap().len(),
-        0
+        usize::from(dual_registry)
     );
+    if dual_registry {
+        assert_eq!(settled_view["data"]["settlements"].as_array().unwrap().len(), 1);
+        println!("V16_LEGACY_POSITION_SURVIVES_DEDICATED_SETTLEMENT=PASS");
+    }
     println!("SETTLEMENT_PRICE_TX={price_tx}");
     println!("SELLER_SETTLEMENT_TX={seller_tx}");
     println!("BUYER_SETTLEMENT_TX={buyer_tx}");
@@ -801,7 +897,7 @@ async fn real_receipt_is_indexed_in_postgres() {
                 serde_json::to_value(after_reorg.expect("deployed contracts survive reorg").0)
                     .unwrap();
             assert_eq!(body["data"]["source"], "onchain_reconciled");
-            assert_eq!(body["data"]["positions"].as_array().unwrap().len(), 0);
+            assert_eq!(body["data"]["positions"].as_array().unwrap().len(), usize::from(dual_registry));
             let adapter = browser_trade_adapter(&broadcast, &state, &rpc, matching, registry).await;
             run_browser(&state, adapter.clone(), &option_id.to_string(), "reorg").await;
             println!("PLAYWRIGHT_REORG_POSITION_REMOVED=PASS");
@@ -887,7 +983,8 @@ async fn real_receipt_is_indexed_in_postgres() {
                 let token = alloy_primitives::Address::from_str(&adapter.payload.settlement_asset.0).unwrap();
                 withdraw.extend_from_slice(&[0u8;12]);
                 withdraw.extend_from_slice(token.as_slice());
-                withdraw.extend_from_slice(&U256::from(10_000u64 * 1_000_000).to_be_bytes::<32>());
+                let seller_deposit = if dual_registry { 1_000u64 } else { 10_000u64 };
+                withdraw.extend_from_slice(&U256::from(seller_deposit * 1_000_000).to_be_bytes::<32>());
                 send_local_as(&client, &rpc, vault, &withdraw, &seller).await;
                 expect_local_revert(&client, &rpc, matching, calldata).await;
                 println!("INSUFFICIENT_COLLATERAL_CONTRACT_REJECTION=PASS");
@@ -1024,6 +1121,14 @@ async fn run_browser(state: &AppState, adapter: LocalTradeAdapter, option_id: &s
     let buyer = "0x0376AAc07Ad725E01357B1725B5ceC61aE10473c".to_owned();
     let seller = "0xb040e0fAac56886b0f29Af446544AED0A154ED29".to_owned();
     let option_id = option_id.to_owned();
+    let dedicated_registry = adapter.state.options_config.execution_registry_address.0.clone();
+    let legacy_registry = if std::env::var("OPTIONS_V16_DUAL_REGISTRY").as_deref() == Ok("1") {
+        adapter.state.repository.as_ref().expect("disposable PG").list_option_series().await
+            .expect("dual series metadata").into_iter()
+            .find_map(|series| series.onchain_registry_address
+                .filter(|address| !address.eq_ignore_ascii_case(&dedicated_registry)))
+            .unwrap_or_default()
+    } else { String::new() };
     let phase = phase.to_owned();
     let spec = if v5_product { "tests/e2e/options-v5-product.spec.ts" } else { "tests/e2e/options-v4-live-position.spec.ts" };
     let output = tokio::task::spawn_blocking(move || {
@@ -1040,6 +1145,8 @@ async fn run_browser(state: &AppState, adapter: LocalTradeAdapter, option_id: &s
             .env("OPTIONS_V4_BUYER", buyer)
             .env("OPTIONS_V4_SELLER", seller)
             .env("OPTIONS_V4_OPTION_ID", option_id)
+            .env("OPTIONS_V16_DEDICATED_REGISTRY", dedicated_registry)
+            .env("OPTIONS_V16_LEGACY_REGISTRY", legacy_registry)
             .env("OPTIONS_V4_PHASE", phase)
             .env("OPTIONS_V5_PRODUCT", if v5_product || std::env::var("OPTIONS_V5_PRODUCT").as_deref() == Ok("1") { "1" } else { "0" })
             .output()
@@ -1185,16 +1292,24 @@ async fn send_local_as(client: &reqwest::Client, url: &str, to: &str, data: &[u8
     .as_str()
     .expect("local transaction hash")
     .to_string();
-    let receipt = rpc_request(
-        client,
-        url,
-        "eth_getTransactionReceipt",
-        serde_json::json!([&hash]),
-    )
-    .await;
+    let mut receipt = serde_json::Value::Null;
+    for _ in 0..40 {
+        receipt = rpc_request(
+            client,
+            url,
+            "eth_getTransactionReceipt",
+            serde_json::json!([&hash]),
+        )
+        .await;
+        if receipt.is_object() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
     assert_eq!(
         receipt["status"], "0x1",
-        "local settlement transaction failed"
+        "local transaction failed target={to} selector=0x{} hash={hash}",
+        hex::encode(&data[..data.len().min(4)]),
     );
     hash
 }

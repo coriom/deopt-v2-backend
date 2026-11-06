@@ -11467,10 +11467,12 @@ mod tests {
             secondary_matching_engine_address: None,
             secondary_margin_engine_address: None,
             collateral_vault_address: AccountId::new("0x00000000000000000000000000000000000000bb"),
+            secondary_collateral_vault_address: None,
             fees_manager_address: Some(AccountId::new(
                 "0x00000000000000000000000000000000000000cc",
             )),
             fees_manager_v2_address: None,
+            secondary_fees_manager_v2_address: None,
             old_margin_engine_address: None,
             protocol_fee_vault_address: None,
         };
@@ -11563,8 +11565,10 @@ mod tests {
             secondary_matching_engine_address: None,
             secondary_margin_engine_address: None,
             collateral_vault_address: AccountId::new("0x00000000000000000000000000000000000000bb"),
+            secondary_collateral_vault_address: None,
             fees_manager_address: None,
             fees_manager_v2_address: None,
+            secondary_fees_manager_v2_address: None,
             old_margin_engine_address: None,
             protocol_fee_vault_address: None,
         };
@@ -11600,8 +11604,10 @@ mod tests {
             secondary_matching_engine_address: None,
             secondary_margin_engine_address: None,
             collateral_vault_address: AccountId::new("0x00000000000000000000000000000000000000bb"),
+            secondary_collateral_vault_address: None,
             fees_manager_address: None,
             fees_manager_v2_address: None,
+            secondary_fees_manager_v2_address: None,
             old_margin_engine_address: None,
             protocol_fee_vault_address: None,
         };

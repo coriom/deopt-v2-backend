@@ -75,12 +75,14 @@ pub struct OptionEventIndexerConfig {
     pub secondary_matching_engine_address: Option<AccountId>,
     pub secondary_margin_engine_address: Option<AccountId>,
     pub collateral_vault_address: AccountId,
+    pub secondary_collateral_vault_address: Option<AccountId>,
     pub fees_manager_address: Option<AccountId>,
     /// Optional V2 fees manager (FeesManagerV2) address. When set, the
     /// indexer subscribes to the V2 signed-ppm fee events on this contract
     /// alongside any V1 events on `fees_manager_address`. V1 behavior is
     /// fully unchanged when this is `None`.
     pub fees_manager_v2_address: Option<AccountId>,
+    pub secondary_fees_manager_v2_address: Option<AccountId>,
     /// V2G-F observability metadata: optional address of the legacy /
     /// stranded MarginEngine. Used solely by the
     /// `deopt_option_fee_charged_v2_total{consumer="old"}` metric and
@@ -114,15 +116,17 @@ impl OptionEventIndexerConfig {
         }
         // A new emitter topology must rescan from its configured start block.
         let topology = format!(
-            "{}|{}|{}|{}|{}|{}|{}|{}",
+            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
             self.from_block,
             self.matching_engine_address.0.to_ascii_lowercase(),
             self.margin_engine_address.0.to_ascii_lowercase(),
             self.secondary_matching_engine_address.as_ref().map(|a| a.0.to_ascii_lowercase()).unwrap_or_default(),
             self.secondary_margin_engine_address.as_ref().map(|a| a.0.to_ascii_lowercase()).unwrap_or_default(),
             self.collateral_vault_address.0.to_ascii_lowercase(),
+            self.secondary_collateral_vault_address.as_ref().map(|a| a.0.to_ascii_lowercase()).unwrap_or_default(),
             self.fees_manager_address.as_ref().map(|a| a.0.to_ascii_lowercase()).unwrap_or_default(),
             self.fees_manager_v2_address.as_ref().map(|a| a.0.to_ascii_lowercase()).unwrap_or_default(),
+            self.secondary_fees_manager_v2_address.as_ref().map(|a| a.0.to_ascii_lowercase()).unwrap_or_default(),
         );
         let hash = keccak256(topology.as_bytes());
         format!("{OPTION_EVENT_INDEXER_STATE_ID}_dual_{}", &hex_0x(&hash[..8])[2..])
@@ -142,8 +146,10 @@ impl OptionEventIndexerConfig {
             secondary_matching_engine_address: None,
             secondary_margin_engine_address: None,
             collateral_vault_address: AccountId::new(""),
+            secondary_collateral_vault_address: None,
             fees_manager_address: None,
             fees_manager_v2_address: None,
+            secondary_fees_manager_v2_address: None,
             old_margin_engine_address: None,
             protocol_fee_vault_address: None,
         }
@@ -168,11 +174,17 @@ impl OptionEventIndexerConfig {
             "collateral_vault",
             &self.collateral_vault_address,
         );
+        if let Some(address) = &self.secondary_collateral_vault_address {
+            push_emitter_contract(&mut contracts, "collateral_vault_secondary", address);
+        }
         if let Some(address) = self.fees_manager_address.as_ref() {
             push_emitter_contract(&mut contracts, "fees_manager", address);
         }
         if let Some(address) = self.fees_manager_v2_address.as_ref() {
             push_emitter_contract(&mut contracts, "fees_manager_v2", address);
+        }
+        if let Some(address) = self.secondary_fees_manager_v2_address.as_ref() {
+            push_emitter_contract(&mut contracts, "fees_manager_v2_secondary", address);
         }
         contracts
     }
@@ -230,7 +242,12 @@ impl OptionEventIndexerConfig {
             &self.margin_engine_address,
         )?;
         match (&self.secondary_matching_engine_address, &self.secondary_margin_engine_address) {
-            (None, None) => {}
+            (None, None) => {
+                if self.secondary_collateral_vault_address.is_some()
+                    || self.secondary_fees_manager_v2_address.is_some() {
+                    return Err(BackendError::Config("secondary Options Vault or fees requires both secondary engines".into()));
+                }
+            }
             (Some(matching), Some(margin)) => {
                 validate_optional_emitter_address("OPTION_EVENT_INDEXER_SECONDARY_MATCHING_ENGINE_ADDRESS", matching)?;
                 validate_optional_emitter_address("OPTION_EVENT_INDEXER_SECONDARY_MARGIN_ENGINE_ADDRESS", margin)?;
@@ -239,6 +256,12 @@ impl OptionEventIndexerConfig {
                     if addresses[..index].iter().any(|other| other.0.eq_ignore_ascii_case(&address.0)) {
                         return Err(BackendError::Config("Options stack emitters must have distinct addresses".into()));
                     }
+                }
+                let vault = self.secondary_collateral_vault_address.as_ref().ok_or_else(||
+                    BackendError::Config("dual Options stack requires its own collateral Vault".into()))?;
+                validate_optional_emitter_address("OPTION_EVENT_INDEXER_SECONDARY_COLLATERAL_VAULT_ADDRESS", vault)?;
+                if vault.0.eq_ignore_ascii_case(&self.collateral_vault_address.0) {
+                    return Err(BackendError::Config("dual Options Vaults must be distinct".into()));
                 }
             }
             _ => return Err(BackendError::Config("secondary Options matching and margin engines must be configured together".into())),
@@ -258,6 +281,12 @@ impl OptionEventIndexerConfig {
                 "OPTION_EVENT_INDEXER_FEES_MANAGER_V2_ADDRESS",
                 address,
             )?;
+        }
+        if let Some(address) = self.secondary_fees_manager_v2_address.as_ref() {
+            validate_optional_emitter_address("OPTION_EVENT_INDEXER_SECONDARY_FEES_MANAGER_V2_ADDRESS", address)?;
+            if self.fees_manager_v2_address.as_ref().is_some_and(|primary| primary.0.eq_ignore_ascii_case(&address.0)) {
+                return Err(BackendError::Config("dual Options fee managers must be distinct".into()));
+            }
         }
         Ok(())
     }
@@ -461,7 +490,7 @@ fn event_topics_for_emitter_role(role: &str) -> Vec<String> {
             margin_collateral_deposited_topic0(),
             margin_collateral_withdrawn_topic0(),
         ],
-        "collateral_vault" => vec![
+        "collateral_vault" | "collateral_vault_secondary" => vec![
             internal_transfer_topic0(),
             collateral_vault_deposited_topic0(),
             collateral_vault_withdrawn_topic0(),
@@ -474,7 +503,7 @@ fn event_topics_for_emitter_role(role: &str) -> Vec<String> {
             tier_claimed_topic0(),
             override_set_topic0(),
         ],
-        "fees_manager_v2" => vec![
+        "fees_manager_v2" | "fees_manager_v2_secondary" => vec![
             fee_charged_v2_topic0(),
             fee_rebated_v2_topic0(),
             rebate_budget_funded_topic0(),
@@ -2806,10 +2835,12 @@ mod tests {
             secondary_matching_engine_address: None,
             secondary_margin_engine_address: None,
             collateral_vault_address: AccountId::new("0x00000000000000000000000000000000000000bb"),
+            secondary_collateral_vault_address: None,
             fees_manager_address: Some(AccountId::new(
                 "0x00000000000000000000000000000000000000cc",
             )),
             fees_manager_v2_address: None,
+            secondary_fees_manager_v2_address: None,
             old_margin_engine_address: None,
             protocol_fee_vault_address: None,
         };
@@ -3067,8 +3098,10 @@ mod tests {
             secondary_matching_engine_address: None,
             secondary_margin_engine_address: None,
             collateral_vault_address: AccountId::new("0x00000000000000000000000000000000000000bb"),
+            secondary_collateral_vault_address: None,
             fees_manager_address: None,
             fees_manager_v2_address: None,
+            secondary_fees_manager_v2_address: None,
             old_margin_engine_address: None,
             protocol_fee_vault_address: None,
         };

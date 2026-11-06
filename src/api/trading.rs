@@ -533,6 +533,8 @@ pub struct FeeProof {
 #[derive(Clone, Debug, Serialize)]
 pub struct SettlementProof {
     pub option_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub series_id: Option<String>,
     pub collected_native: String,
     pub paid_native: String,
     pub settlement_asset: String,
@@ -1847,6 +1849,7 @@ async fn indexed_account_positions<P: crate::execution::rpc::EthCallProvider>(
             if valid && incoming == paid && outgoing == collected {
                 settlements.push(SettlementProof {
                     option_id: event.option_id.clone().unwrap_or_default(),
+                    series_id: None,
                     collected_native: collected.to_string(), paid_native: paid.to_string(),
                     settlement_asset: asset.to_string(), tx_hash: event.tx_hash.clone(),
                     block_hash: block_hash.clone(), status: "vault_transfer_verified",
@@ -1927,6 +1930,7 @@ async fn dual_indexed_account_positions<P: crate::execution::rpc::EthCallProvide
             .ok_or_else(|| unavailable("second MarginEngine unavailable"))?,
     ];
     let mut positions = Vec::new();
+    let mut settlements = Vec::new();
     for (index, engine) in engines.iter().enumerate() {
         let mut views = state.trading_views.clone();
         views.margin_engine_address = Some((*engine).clone());
@@ -1953,6 +1957,80 @@ async fn dual_indexed_account_positions<P: crate::execution::rpc::EthCallProvide
         for (id, quantity) in projected {
             let item = resolve_dual_series(&series, state.chain_id, &registry, id)
                 .ok_or_else(|| unavailable("position lacks exact Registry provenance"))?;
+            let vault = (if index == 0 { Some(&config.collateral_vault_address) }
+                else { config.secondary_collateral_vault_address.as_ref() })
+                .ok_or_else(|| unavailable("Options Vault provenance unavailable"))?;
+            let fee_manager = if index == 0 { config.fees_manager_v2_address.as_ref() }
+                else { config.secondary_fees_manager_v2_address.as_ref() };
+            let mut premium_proof = None;
+            let mut fee_proof = None;
+            let trades: Vec<_> = scoped[index].iter().filter(|event|
+                matches!(event.event_name.as_str(), "OptionTradeExecuted" | "OptionRfqTradeExecuted")
+                    && event.option_id.as_deref().and_then(raw_option_id) == Some(id)).collect();
+            // The existing position proof schema carries one transaction.
+            // Multiple fills require a different evidence shape and remain partial.
+            if trades.len() == 1 {
+                let trade = trades[0];
+                let expected = trade.quantity_contracts.as_deref().and_then(|v| v.parse::<u128>().ok())
+                    .zip(trade.premium_per_contract_native.as_deref().and_then(|v| v.parse::<u128>().ok()))
+                    .and_then(|(quantity, price)| quantity.checked_mul(price));
+                if let (Some(expected), Some(block_hash), Some(buyer), Some(seller)) =
+                    (expected, trade.block_hash.as_ref(), trade.buyer.as_ref(), trade.seller.as_ref()) {
+                    let tx_events = repo.list_option_execution_events_by_tx_hash(&trade.tx_hash).await
+                        .map_err(|_| unavailable("Options economic receipt unavailable"))?;
+                    let asset = &item.settlement_asset;
+                    let vault_transfer = |event: &&crate::options::OptionExecutionEvent,
+                                          from: &str, to: &str, amount: u128| {
+                        event.event_name == "InternalTransfer"
+                            && event.contract_address.eq_ignore_ascii_case(&vault.0)
+                            && event.block_hash.as_ref() == Some(block_hash)
+                            && event.decoded.as_ref().is_some_and(|d|
+                                d["token"].as_str().is_some_and(|v| v.eq_ignore_ascii_case(asset))
+                                    && d["from"].as_str().is_some_and(|v| v.eq_ignore_ascii_case(from))
+                                    && d["to"].as_str().is_some_and(|v| v.eq_ignore_ascii_case(to))
+                                    && d["amount"].as_str().and_then(|v| v.parse::<u128>().ok()) == Some(amount))
+                    };
+                    if tx_events.iter().filter(|event| vault_transfer(event, buyer, seller, expected)).count() == 1 {
+                        premium_proof = Some(PremiumProof {
+                            amount_native: expected.to_string(), settlement_asset: asset.clone(),
+                            direction: if buyer.eq_ignore_ascii_case(&account.0) { "paid" } else { "received" },
+                            tx_hash: trade.tx_hash.clone(), block_hash: block_hash.clone(),
+                            status: "vault_transfer_verified",
+                        });
+                    }
+                    if let Some(fee_manager) = fee_manager {
+                        let fees: Vec<_> = tx_events.iter().filter(|event|
+                            event.event_name == "FeeChargedV2"
+                                && event.contract_address.eq_ignore_ascii_case(&fee_manager.0)
+                                && event.block_hash.as_ref() == Some(block_hash)
+                                && event.decoded.as_ref().is_some_and(|d|
+                                    d["productKind"].as_str() == Some("option")
+                                        && d["trader"].as_str().is_some_and(|v| v.eq_ignore_ascii_case(&account.0))
+                                        && d["consumer"].as_str().is_some_and(|v| v.eq_ignore_ascii_case(&engine.0))
+                                        && d["settlementAsset"].as_str().is_some_and(|v| v.eq_ignore_ascii_case(asset)))).collect();
+                        if fees.len() == 1 {
+                            if let Some(d) = fees[0].decoded.as_ref() {
+                                if let (Some(amount), Some(recipient), Some(ppm), Some(basis)) = (
+                                    d["feeAmount"].as_str().and_then(|v| v.parse::<u128>().ok()),
+                                    d["recipient"].as_str(), d["feePpm"].as_i64(),
+                                    d["basisAmount"].as_str().and_then(|v| v.parse::<u128>().ok()),
+                                ) {
+                                    if amount > 0 && basis == expected
+                                        && tx_events.iter().filter(|event|
+                                            vault_transfer(event, &account.0, recipient, amount)).count() == 1 {
+                                        fee_proof = Some(FeeProof {
+                                            amount_native: amount.to_string(), settlement_asset: asset.clone(),
+                                            recipient: recipient.to_string(), fee_ppm: ppm,
+                                            tx_hash: trade.tx_hash.clone(), block_hash: block_hash.clone(),
+                                            status: "vault_transfer_verified",
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             positions.push(Position {
                 series_id: item.option_series_id.clone(),
                 size: quantity.unsigned_abs().to_string(),
@@ -1960,16 +2038,54 @@ async fn dual_indexed_account_positions<P: crate::execution::rpc::EthCallProvide
                 avg_entry_price_1e8: None, mark_price_1e8: None, unrealised_pnl: None,
                 im_contribution: None, mm_contribution: None, is_exercisable: None,
                 quantity_contracts: Some(quantity.unsigned_abs().to_string()),
-                premium_proof: None, fee_proof: None,
+                premium_proof, fee_proof,
             });
+        }
+        for event in scoped[index].iter().filter(|event| event.event_name == "AccountSettled").take(20) {
+            let Some(id) = event.option_id.as_deref().and_then(raw_option_id) else { continue };
+            let Some(item) = resolve_dual_series(&series, state.chain_id, &registry, id) else { continue };
+            let Some(decoded) = event.decoded.as_ref() else { continue };
+            let Some(block_hash) = event.block_hash.as_ref() else { continue };
+            let Some(collected) = decoded["collectedFromTrader"].as_str().and_then(|v| v.parse::<u128>().ok()) else { continue };
+            let Some(paid) = decoded["paidToTrader"].as_str().and_then(|v| v.parse::<u128>().ok()) else { continue };
+            let vault = (if index == 0 { Some(&config.collateral_vault_address) }
+                else { config.secondary_collateral_vault_address.as_ref() })
+                .ok_or_else(|| unavailable("Options Vault provenance unavailable"))?;
+            let tx_events = repo.list_option_execution_events_by_tx_hash(&event.tx_hash).await
+                .map_err(|_| unavailable("Options settlement receipt unavailable"))?;
+            let mut incoming = 0u128;
+            let mut outgoing = 0u128;
+            let mut valid = true;
+            for transfer in tx_events.iter().filter(|entry|
+                entry.event_name == "InternalTransfer"
+                    && entry.contract_address.eq_ignore_ascii_case(&vault.0)) {
+                if transfer.block_hash.as_ref() != Some(block_hash) { valid = false; break; }
+                let Some(d) = transfer.decoded.as_ref() else { valid = false; break };
+                if !d["token"].as_str().is_some_and(|v| v.eq_ignore_ascii_case(&item.settlement_asset)) { continue; }
+                let Some(amount) = d["amount"].as_str().and_then(|v| v.parse::<u128>().ok()) else { valid = false; break };
+                if d["to"].as_str().is_some_and(|v| v.eq_ignore_ascii_case(&account.0)) {
+                    incoming = incoming.checked_add(amount).ok_or_else(|| unavailable("settlement overflow"))?;
+                }
+                if d["from"].as_str().is_some_and(|v| v.eq_ignore_ascii_case(&account.0)) {
+                    outgoing = outgoing.checked_add(amount).ok_or_else(|| unavailable("settlement overflow"))?;
+                }
+            }
+            if valid && incoming == paid && outgoing == collected {
+                settlements.push(SettlementProof {
+                    option_id: id.to_string(), series_id: Some(item.option_series_id.clone()),
+                    collected_native: collected.to_string(), paid_native: paid.to_string(),
+                    settlement_asset: item.settlement_asset.clone(), tx_hash: event.tx_hash.clone(),
+                    block_hash: block_hash.clone(), status: "vault_transfer_verified",
+                });
+            }
         }
     }
     positions.sort_by(|a, b| a.series_id.cmp(&b.series_id));
     Ok(Json(Envelope {
         status: "partial",
-        data: PositionsData { address: account.0.clone(), positions, source: Some("onchain_reconciled"), settlements: Vec::new() },
+        data: PositionsData { address: account.0.clone(), positions, source: Some("onchain_reconciled"), settlements },
         warnings: vec![warning_source_unavailable(
-            "Both MarginEngine contract counts are reconciled by Registry. Economic proofs and per-position collateral are unavailable in dual-Registry mode.",
+            "Both MarginEngine contract counts are reconciled by Registry. Single-fill premiums and fees require exact Vault and fee-manager receipts; multi-fill accounting and per-position collateral remain unavailable.",
         )],
         meta: MetaBlock::new(state, "chain+db"),
     }))

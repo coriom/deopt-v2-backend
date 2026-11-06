@@ -17,8 +17,11 @@ CREATE TABLE option_series (
   option_series_id TEXT PRIMARY KEY,
   onchain_series_id TEXT
 );
+CREATE TABLE option_event_indexer_state (cursor_id TEXT PRIMARY KEY);
 INSERT INTO option_series VALUES ('historical-opaque-key', '7');
 SQL
+docker exec -i "$name" psql -v ON_ERROR_STOP=1 -U postgres \
+  < "$repo/migrations/0073_option_indexer_canonical_hash.sql" >/dev/null
 docker exec -i "$name" psql -v ON_ERROR_STOP=1 -U postgres \
   < "$repo/migrations/0074_option_registry_identity.sql" >/dev/null
 result=$(docker exec -i "$name" psql -v ON_ERROR_STOP=1 -At -U postgres <<'SQL'
@@ -29,9 +32,18 @@ VALUES
 SELECT COUNT(*) FROM option_series WHERE onchain_series_id='7';
 SELECT COUNT(*) FROM option_series WHERE option_series_id='historical-opaque-key'
   AND onchain_chain_id IS NULL;
+DO $$
+BEGIN
+  BEGIN
+    INSERT INTO option_series(option_series_id,onchain_series_id,onchain_chain_id,onchain_registry_address)
+    VALUES ('noncanonical-duplicate','07',84532,'0x1111111111111111111111111111111111111111');
+    RAISE EXCEPTION 'noncanonical ID accepted';
+  EXCEPTION WHEN check_violation THEN NULL;
+  END;
+END $$;
 SQL
 )
-[[ "$result" == $'INSERT 0 2\n3\n1' ]] || { echo 'V15_MIGRATION=FAIL'; exit 1; }
+[[ "$result" == $'INSERT 0 2\n3\n1\nDO' ]] || { echo 'V15_MIGRATION=FAIL'; exit 1; }
 echo 'V15_MIGRATION=PASS'
 echo 'SAME_RAW_ID_TWO_REGISTRIES=PASS'
 echo 'HISTORICAL_ROW_PRESERVED=PASS'

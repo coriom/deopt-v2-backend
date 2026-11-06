@@ -8,7 +8,7 @@ ALTER TABLE option_series
     ADD CONSTRAINT option_series_registry_identity_pair CHECK (
         (onchain_chain_id IS NULL AND onchain_registry_address IS NULL)
         OR (onchain_chain_id > 0 AND onchain_registry_address ~ '^0x[0-9a-f]{40}$'
-            AND onchain_series_id IS NOT NULL)
+            AND onchain_series_id ~ '^(0|[1-9][0-9]*)$')
     );
 
 CREATE UNIQUE INDEX option_series_registry_option_id_unique

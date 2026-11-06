@@ -700,8 +700,14 @@ impl AppConfig {
                 &mut lookup, "OPTION_EVENT_INDEXER_SECONDARY_MARGIN_ENGINE_ADDRESS",
             )?,
             collateral_vault_address: option_event_indexer_collateral_vault_address,
+            secondary_collateral_vault_address: parse_optional_address_env(
+                &mut lookup, "OPTION_EVENT_INDEXER_SECONDARY_COLLATERAL_VAULT_ADDRESS",
+            )?,
             fees_manager_address: option_event_indexer_fees_manager_address,
             fees_manager_v2_address: option_event_indexer_fees_manager_v2_address,
+            secondary_fees_manager_v2_address: parse_optional_address_env(
+                &mut lookup, "OPTION_EVENT_INDEXER_SECONDARY_FEES_MANAGER_V2_ADDRESS",
+            )?,
             old_margin_engine_address: option_event_indexer_old_margin_engine_address,
             protocol_fee_vault_address: option_event_indexer_protocol_fee_vault_address,
         };
