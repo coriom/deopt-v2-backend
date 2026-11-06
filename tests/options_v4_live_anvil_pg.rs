@@ -92,25 +92,27 @@ fn series_word(data: &[u8], index: usize) -> U256 {
     U256::from_be_slice(&data[index * 32..(index + 1) * 32])
 }
 
+fn created_series_log<'a>(broadcast: &'a Value, registry: &str) -> &'a Value {
+    let topic = format!("0x{}", hex::encode(alloy_primitives::keccak256(
+        b"SeriesCreated(uint256,address,address,uint64,uint64,uint128,bool,bool)"
+    )));
+    broadcast["receipts"].as_array().expect("receipts").iter()
+        .flat_map(|receipt| receipt["logs"].as_array().into_iter().flatten())
+        .find(|log| {
+            log["address"].as_str().is_some_and(|address| address.eq_ignore_ascii_case(registry))
+                && log["topics"][0].as_str().is_some_and(|value| value.eq_ignore_ascii_case(&topic))
+        })
+        .expect("real SeriesCreated log from dedicated Registry")
+}
+
 async fn browser_trade_adapter(
     broadcast: &Value,
     state: &AppState,
     rpc: &str,
     matching: &str,
+    registry: &str,
 ) -> LocalTradeAdapter {
-    let txs = broadcast["transactions"].as_array().unwrap();
-    let receipts = broadcast["receipts"].as_array().unwrap();
-    let create = txs
-        .iter()
-        .position(|tx| {
-            tx["contractName"] == "OptionProductRegistry"
-                && tx["function"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .starts_with("createSeries")
-        })
-        .expect("actual local series creation");
-    let log = &receipts[create]["logs"][0];
+    let log = created_series_log(broadcast, registry);
     let topics = log["topics"].as_array().expect("SeriesCreated topics");
     assert_eq!(topics.len(), 4);
     let id = U256::from_str_radix(&topics[1].as_str().unwrap()[2..], 16).unwrap();
@@ -235,6 +237,7 @@ async fn real_receipt_is_indexed_in_postgres() {
     let transactions = broadcast["transactions"].as_array().expect("transactions");
     let receipts = broadcast["receipts"].as_array().expect("receipts");
     let browser = std::env::var("OPTIONS_V4_BROWSER").as_deref() == Ok("1");
+    let verified_settlement = std::env::var("OPTIONS_V13_VERIFIED_SETTLEMENT").as_deref() == Ok("1");
     let matching = transactions
         .iter()
         .find(|tx| {
@@ -264,6 +267,14 @@ async fn real_receipt_is_indexed_in_postgres() {
         })
         .and_then(|tx| tx["contractAddress"].as_str())
         .expect("registry deployment");
+    let deployment = |name: &str| {
+        transactions.iter()
+            .find(|tx| tx["contractName"] == name && tx["transactionType"] == "CREATE")
+            .and_then(|tx| tx["contractAddress"].as_str())
+            .expect("V13 contract deployment")
+    };
+    let verifier = verified_settlement.then(|| deployment("VerifiedOptionSettlementOwner"));
+    let historical_feed = verified_settlement.then(|| deployment("LocalHistoricalChainlinkFeed"));
 
     let mut repo = None;
     for _ in 0..12 {
@@ -338,7 +349,7 @@ async fn real_receipt_is_indexed_in_postgres() {
             local_chain, 84532,
             "browser bench must use local chain 84532"
         );
-        let adapter = browser_trade_adapter(&broadcast, &state, &rpc, matching).await;
+        let adapter = browser_trade_adapter(&broadcast, &state, &rpc, matching, registry).await;
         let pre_provider = HttpJsonRpcProvider::new(rpc.clone());
         let buyer_before = vault_balance(&pre_provider, vault, &adapter.payload.buyer.0, &adapter.payload.settlement_asset.0).await;
         let seller_before = vault_balance(&pre_provider, vault, &adapter.payload.seller.0, &adapter.payload.settlement_asset.0).await;
@@ -564,7 +575,38 @@ async fn real_receipt_is_indexed_in_postgres() {
     set_price.extend_from_slice(
         &alloy_primitives::U256::from(2500u64 * 100_000_000).to_be_bytes::<32>(),
     );
-    let price_tx = send_local(&client, &rpc, registry, &set_price).await;
+    let price_tx = if verified_settlement {
+        let feed = historical_feed.expect("local historical feed");
+        let verifier = verifier.expect("verified settlement owner");
+        let series_log = created_series_log(&broadcast, registry);
+        let series_data = hex::decode(series_log["data"].as_str().unwrap().trim_start_matches("0x")).unwrap();
+        let expiry = u64::try_from(series_word(&series_data, 0)).unwrap();
+        assert!(expiry > 10);
+        expect_local_revert(&client, &rpc, registry, &set_price).await;
+        for (round_id, timestamp) in [(101u64, expiry - 10), (102u64, expiry + 10)] {
+            let mut round = selector("setRound(uint80,int256,uint256)");
+            round.extend_from_slice(&U256::from(round_id).to_be_bytes::<32>());
+            round.extend_from_slice(&U256::from(2500u64 * 100_000_000).to_be_bytes::<32>());
+            round.extend_from_slice(&U256::from(timestamp).to_be_bytes::<32>());
+            send_local(&client, &rpc, feed, &round).await;
+        }
+        let mut propose = selector("propose(uint256,uint80,uint80)");
+        propose.extend_from_slice(&option_id.to_be_bytes::<32>());
+        propose.extend_from_slice(&U256::from(101).to_be_bytes::<32>());
+        propose.extend_from_slice(&U256::from(102).to_be_bytes::<32>());
+        send_local(&client, &rpc, verifier, &propose).await;
+        rpc_request(&client, &rpc, "evm_increaseTime", serde_json::json!([172800])).await;
+        rpc_request(&client, &rpc, "evm_mine", serde_json::json!([])).await;
+        let mut single_id = selector("resolve(uint256)");
+        single_id.extend_from_slice(&option_id.to_be_bytes::<32>());
+        send_local(&client, &rpc, verifier, &single_id).await;
+        single_id[..4].copy_from_slice(&selector("finalize(uint256)"));
+        let finalized = send_local(&client, &rpc, verifier, &single_id).await;
+        println!("VERIFIED_LOCAL_SETTLEMENT=CHAINLINK_PROOF_DIRECT_PRICE_REJECTED");
+        finalized
+    } else {
+        send_local(&client, &rpc, registry, &set_price).await
+    };
     let settlement_before = if let Some((_, _, _, asset)) = pre_balances.as_ref() {
         Some((
             vault_balance(&provider, vault, &buyer_wallet, asset).await,
@@ -687,7 +729,7 @@ async fn real_receipt_is_indexed_in_postgres() {
     println!("BUYER_SETTLEMENT_TX={buyer_tx}");
     println!("CANONICAL_POSITION_AFTER_SETTLEMENT=buyer:0,seller:0");
     if browser {
-        let adapter = browser_trade_adapter(&broadcast, &state, &rpc, matching).await;
+        let adapter = browser_trade_adapter(&broadcast, &state, &rpc, matching, registry).await;
         run_browser(&state, adapter, &option_id.to_string(), "settled").await;
         println!("PLAYWRIGHT_SETTLED_POSITION=PASS");
     }
@@ -753,7 +795,7 @@ async fn real_receipt_is_indexed_in_postgres() {
                     .unwrap();
             assert_eq!(body["data"]["source"], "onchain_reconciled");
             assert_eq!(body["data"]["positions"].as_array().unwrap().len(), 0);
-            let adapter = browser_trade_adapter(&broadcast, &state, &rpc, matching).await;
+            let adapter = browser_trade_adapter(&broadcast, &state, &rpc, matching, registry).await;
             run_browser(&state, adapter.clone(), &option_id.to_string(), "reorg").await;
             println!("PLAYWRIGHT_REORG_POSITION_REMOVED=PASS");
             let calldata = browser_calldata.as_deref().expect("browser trade calldata");
