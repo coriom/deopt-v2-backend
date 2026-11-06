@@ -312,6 +312,8 @@ pub async fn create_option_series(
         source: OptionSeriesSource::Manual,
         onchain_product_id: input.onchain_product_id,
         onchain_series_id: input.onchain_series_id,
+        onchain_chain_id: None,
+        onchain_registry_address: None,
         created_at_ms: now,
         updated_at_ms: now,
     };
@@ -4478,6 +4480,15 @@ fn validate_executable_option_series(
     state: &AppState,
     series: &OptionSeries,
 ) -> Result<ExecutableOptionSeriesMetadata> {
+    if let Some(registry) = series.onchain_registry_address.as_deref() {
+        if series.onchain_chain_id != Some(state.chain_id)
+            || !registry.eq_ignore_ascii_case(&state.options_config.execution_registry_address.0)
+        {
+            return Err(BackendError::InvalidOptionExecutionIntentState(
+                "series Registry differs from configured execution Registry".to_string(),
+            ));
+        }
+    }
     let onchain_option_id = series
         .onchain_series_id
         .as_deref()
@@ -4491,7 +4502,6 @@ fn validate_executable_option_series(
     validate_nonzero_execution_address(&series.underlying, "underlying")?;
     validate_nonzero_execution_address(&series.settlement_asset, "settlement_asset")?;
     validate_series_option_id_matches_metadata(series, &onchain_option_id)?;
-    let _ = state;
     Ok(ExecutableOptionSeriesMetadata {
         onchain_option_id,
         underlying: AccountId::new(series.underlying.clone()),
@@ -8047,6 +8057,8 @@ mod tests {
                 source: OptionSeriesSource::Manual,
                 onchain_product_id: None,
                 onchain_series_id: Some(onchain_option_id),
+                onchain_chain_id: None,
+                onchain_registry_address: None,
                 created_at_ms: 1,
                 updated_at_ms: 1,
             });

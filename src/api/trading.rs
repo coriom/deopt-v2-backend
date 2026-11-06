@@ -1491,6 +1491,15 @@ where
             }
         }
         let mut expected = std::collections::BTreeMap::new();
+        let engine_registry = crate::api::trading_views::try_get_margin_option_registry(
+            &state.trading_views, &state.execution_config.executor_from_address, rpc,
+        ).await.map_err(|_| TradingApiError::new(
+            TradingErrorCode::SourceUnavailable, "MarginEngine registry provenance unavailable",
+            MetaBlock::new(state, "rpc"),
+        ))?.ok_or_else(|| TradingApiError::new(
+            TradingErrorCode::SourceUnavailable, "MarginEngine registry provenance unavailable",
+            MetaBlock::new(state, "rpc"),
+        ))?;
         for pos in &positions {
             let series = get_option_series_service(state, &pos.series_id).await.map_err(|_| {
                 TradingApiError::new(
@@ -1499,6 +1508,13 @@ where
                     MetaBlock::new(state, "db"),
                 )
             })?;
+            if series.onchain_registry_address.as_deref().is_some_and(|registry|
+                !registry.eq_ignore_ascii_case(&format!("{engine_registry:#x}"))) {
+                return Err(TradingApiError::new(
+                    TradingErrorCode::SourceUnavailable, "position Registry differs from MarginEngine",
+                    MetaBlock::new(state, "rpc"),
+                ));
+            }
             let raw_id = series
                 .onchain_series_id
                 .as_deref()
@@ -1677,9 +1693,33 @@ async fn indexed_account_positions<P: crate::execution::rpc::EthCallProvider>(
         return Err(unavailable("Options position reconciliation pending"));
     }
     let series = repo.list_option_series().await.map_err(|_| unavailable("Options series metadata unavailable"))?;
+    let engine_registry = crate::api::trading_views::try_get_margin_option_registry(
+        &state.trading_views, &state.execution_config.executor_from_address, rpc,
+    ).await.map_err(|_| unavailable("MarginEngine registry provenance unavailable"))?
+        .ok_or_else(|| unavailable("MarginEngine registry provenance unavailable"))?;
+    // The configured indexer and MarginEngine describe one stack. A second
+    // Registry may legitimately reuse the raw optionId; never attribute its
+    // receipts or balances to the first stack until both are indexed with
+    // explicit Registry provenance.
+    let mut owners = std::collections::BTreeMap::<&str, Option<&str>>::new();
+    for item in &series {
+        if let Some(raw_id) = item.onchain_series_id.as_deref() {
+            let registry = item.onchain_registry_address.as_deref();
+            if let Some(previous) = owners.insert(raw_id, registry) {
+                if previous != registry {
+                    return Err(unavailable("Options series ID is ambiguous across registries"));
+                }
+            }
+        }
+    }
     let mut positions = Vec::new();
     for (id, quantity) in projected {
         let id_string = id.to_string();
+        let matching_series: Vec<_> = series.iter().filter(|s| s.onchain_series_id.as_deref() == Some(id_string.as_str())).collect();
+        if matching_series.len() != 1 || !matching_series[0].onchain_registry_address.as_deref()
+            .is_some_and(|registry| registry.eq_ignore_ascii_case(&format!("{engine_registry:#x}"))) {
+            return Err(unavailable("Options position lacks matching Registry provenance"));
+        }
         let mut premium_proof = None;
         let mut fee_proof = None;
         let trades: Vec<_> = events.iter().filter(|event|
@@ -3420,6 +3460,8 @@ mod tests {
             source: OptionSeriesSource::Onchain,
             onchain_product_id: None,
             onchain_series_id: None,
+            onchain_chain_id: None,
+            onchain_registry_address: None,
             created_at_ms: 0,
             updated_at_ms: 0,
         };
@@ -4635,6 +4677,8 @@ mod tests {
             source: OptionSeriesSource::Manual,
             onchain_product_id: None,
             onchain_series_id: None,
+            onchain_chain_id: None,
+            onchain_registry_address: None,
             created_at_ms: now_ms_v,
             updated_at_ms: now_ms_v,
         };
@@ -4666,6 +4710,8 @@ mod tests {
             source: OptionSeriesSource::Manual,
             onchain_product_id: None,
             onchain_series_id: Some(format!("0x{:064x}", 7u64)),
+            onchain_chain_id: None,
+            onchain_registry_address: None,
             created_at_ms: now_ms_v,
             updated_at_ms: now_ms_v,
         };
@@ -5320,6 +5366,8 @@ mod tests {
             source: OptionSeriesSource::Manual,
             onchain_product_id: None,
             onchain_series_id: Some(option_id.to_string()),
+            onchain_chain_id: None,
+            onchain_registry_address: None,
             created_at_ms: now_ms_v,
             updated_at_ms: now_ms_v,
         };

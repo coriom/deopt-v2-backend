@@ -41,6 +41,8 @@ pub struct OptionsConfig {
     pub execution_enabled: bool,
     pub execution_require_persistence: bool,
     pub matching_engine_address: AccountId,
+    /// Registry bound to the execution engine for composite on-chain series.
+    pub execution_registry_address: AccountId,
     pub execution_signature_mode: OptionExecutionSignatureMode,
     pub execution_eip712_domain: Eip712Domain,
     pub execution_default_settlement_decimals: u32,
@@ -97,6 +99,7 @@ impl OptionsConfig {
             execution_enabled: false,
             execution_require_persistence: true,
             matching_engine_address: AccountId::new(""),
+            execution_registry_address: AccountId::new(""),
             execution_signature_mode: OptionExecutionSignatureMode::Disabled,
             execution_eip712_domain: Eip712Domain {
                 name: "DeOptV2-OptionMatchingEngine".to_string(),
@@ -806,6 +809,10 @@ pub struct OptionSeries {
     pub source: OptionSeriesSource,
     pub onchain_product_id: Option<String>,
     pub onchain_series_id: Option<String>,
+    #[serde(default)]
+    pub onchain_chain_id: Option<u64>,
+    #[serde(default)]
+    pub onchain_registry_address: Option<String>,
     pub created_at_ms: TimestampMs,
     pub updated_at_ms: TimestampMs,
 }

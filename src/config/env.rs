@@ -490,6 +490,9 @@ impl AppConfig {
                 "true",
             )?,
             matching_engine_address: option_matching_engine_address.clone(),
+            execution_registry_address: AccountId::new(get_env(
+                &mut lookup, "OPTION_EXECUTION_REGISTRY_ADDRESS", "",
+            )),
             execution_signature_mode: parse_env(
                 &mut lookup,
                 "OPTION_EXECUTION_SIGNATURE_MODE",

@@ -3327,12 +3327,30 @@ impl PgRepository {
     }
 
     pub async fn insert_option_series(&self, series: &OptionSeries) -> Result<()> {
+        match (series.onchain_chain_id, series.onchain_registry_address.as_deref()) {
+            (Some(chain), Some(registry)) => {
+                let raw_id = series.onchain_series_id.as_deref().ok_or_else(|| {
+                    BackendError::InvalidOptionSeriesId("missing onchain option id".into())
+                })?;
+                let expected = crate::options::onchain_option_series_key(chain, registry, raw_id)?;
+                if series.option_series_id != expected
+                    || registry != registry.to_ascii_lowercase()
+                {
+                    return Err(BackendError::InvalidOptionSeriesId(
+                        "onchain series identity must include chain, registry and option id".into(),
+                    ));
+                }
+            }
+            (None, None) => {}
+            _ => return Err(BackendError::InvalidOptionSeriesId("incomplete registry identity".into())),
+        }
         sqlx::query(
             "INSERT INTO option_series (
                 option_series_id, underlying, base_asset, quote_asset, settlement_asset,
                 expiry, strike_1e8, is_call, contract_size_1e8, status, source,
-                onchain_product_id, onchain_series_id, created_at_ms, updated_at_ms
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+                onchain_product_id, onchain_series_id, onchain_chain_id,
+                onchain_registry_address, created_at_ms, updated_at_ms
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
             ON CONFLICT (option_series_id) DO NOTHING",
         )
         .bind(&series.option_series_id)
@@ -3348,6 +3366,8 @@ impl PgRepository {
         .bind(series.source.as_str())
         .bind(&series.onchain_product_id)
         .bind(&series.onchain_series_id)
+        .bind(series.onchain_chain_id.map(|chain| u64_to_i64("onchain_chain_id", chain)).transpose()?)
+        .bind(&series.onchain_registry_address)
         .bind(timestamp_to_i64(series.created_at_ms))
         .bind(timestamp_to_i64(series.updated_at_ms))
         .execute(&self.pool)
@@ -3360,7 +3380,8 @@ impl PgRepository {
         let rows = sqlx::query(
             "SELECT option_series_id, underlying, base_asset, quote_asset, settlement_asset,
                     expiry, strike_1e8, is_call, contract_size_1e8, status, source,
-                    onchain_product_id, onchain_series_id, created_at_ms, updated_at_ms
+                    onchain_product_id, onchain_series_id, onchain_chain_id,
+                    onchain_registry_address, created_at_ms, updated_at_ms
              FROM option_series
              ORDER BY expiry ASC, strike_1e8 ASC, option_series_id ASC",
         )
@@ -3374,7 +3395,8 @@ impl PgRepository {
         let row = sqlx::query(
             "SELECT option_series_id, underlying, base_asset, quote_asset, settlement_asset,
                     expiry, strike_1e8, is_call, contract_size_1e8, status, source,
-                    onchain_product_id, onchain_series_id, created_at_ms, updated_at_ms
+                    onchain_product_id, onchain_series_id, onchain_chain_id,
+                    onchain_registry_address, created_at_ms, updated_at_ms
              FROM option_series
              WHERE option_series_id = $1",
         )
@@ -3396,7 +3418,8 @@ impl PgRepository {
              WHERE option_series_id = $1
              RETURNING option_series_id, underlying, base_asset, quote_asset, settlement_asset,
                        expiry, strike_1e8, is_call, contract_size_1e8, status, source,
-                       onchain_product_id, onchain_series_id, created_at_ms, updated_at_ms",
+                       onchain_product_id, onchain_series_id, onchain_chain_id,
+                       onchain_registry_address, created_at_ms, updated_at_ms",
         )
         .bind(option_series_id)
         .bind(timestamp_to_i64(updated_at_ms))
@@ -8107,6 +8130,9 @@ fn option_series_from_row(row: PgRow) -> Result<OptionSeries> {
         source: OptionSeriesSource::parse(&source)?,
         onchain_product_id: row_get(&row, "onchain_product_id")?,
         onchain_series_id: row_get(&row, "onchain_series_id")?,
+        onchain_chain_id: row_get::<Option<i64>>(&row, "onchain_chain_id")?
+            .map(|chain| i64_to_u64_persistence("onchain_chain_id", chain)).transpose()?,
+        onchain_registry_address: row_get(&row, "onchain_registry_address")?,
         created_at_ms: row_get(&row, "created_at_ms")?,
         updated_at_ms: row_get(&row, "updated_at_ms")?,
     })

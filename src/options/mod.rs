@@ -85,7 +85,7 @@ pub use rfq_operator_packet::{
     build_option_rfq_operator_packet, OptionRfqOperatorBroadcastError, OptionRfqOperatorPacket,
     OptionRfqOperatorPacketInputs, OPTION_RFQ_OPERATOR_BROADCAST_CONFIRM_ENV,
 };
-pub use series_id::{option_series_id, OptionSeriesIdInput};
+pub use series_id::{onchain_option_series_key, option_series_id, OptionSeriesIdInput};
 pub use signing::{
     option_rfq_id_to_b256, option_rfq_id_to_hex_bytes32, option_rfq_quote_digest,
     option_series_id_to_b256, option_series_id_to_hex_bytes32, OptionRfqQuoteSigningPayload,

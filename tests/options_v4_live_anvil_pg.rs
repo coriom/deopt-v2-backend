@@ -193,7 +193,9 @@ async fn browser_trade_adapter(
     });
     if std::env::var("OPTIONS_V5_PRODUCT").as_deref() == Ok("1") {
         state.repository.as_ref().expect("disposable PG").insert_option_series(&OptionSeries {
-            option_series_id: "local-call-v5".into(),
+            option_series_id: deopt_v2_backend::options::onchain_option_series_key(
+                state.chain_id, registry, &id.to_string(),
+            ).expect("deployed registry series identity"),
             underlying: payload.underlying.0.clone(),
             base_asset: payload.underlying.0.clone(),
             quote_asset: payload.settlement_asset.0.clone(),
@@ -206,6 +208,8 @@ async fn browser_trade_adapter(
             source: OptionSeriesSource::Onchain,
             onchain_product_id: None,
             onchain_series_id: Some(id.to_string()),
+            onchain_chain_id: Some(state.chain_id),
+            onchain_registry_address: Some(registry.to_ascii_lowercase()),
             created_at_ms: (timestamp as i64) * 1000,
             updated_at_ms: (timestamp as i64) * 1000,
         }).await.expect("seed real deployed series metadata");
@@ -291,6 +295,7 @@ async fn real_receipt_is_indexed_in_postgres() {
     if v5 {
         options_config.execution_enabled = true;
         options_config.matching_engine_address = AccountId::new(matching);
+        options_config.execution_registry_address = AccountId::new(registry);
         options_config.execution_eip712_domain.verifying_contract = AccountId::new(matching);
         options_config.execution_signature_mode = OptionExecutionSignatureMode::Strict;
         options_config.execution_simulation_enabled = true;
@@ -975,17 +980,20 @@ async fn run_browser(state: &AppState, adapter: LocalTradeAdapter, option_id: &s
         Some(tokio::spawn(async move {
             let repo = local_state.repository.as_ref().expect("disposable PG");
             let client = reqwest::Client::new();
-            for _ in 0..120 {
+            for _ in 0..300 {
                 let ready = repo.list_option_execution_intents().await.expect("intent list")
                     .into_iter().find(|intent| intent.calldata.is_some());
                 if let Some(intent) = ready {
+                    eprintln!("V15_WATCHER=INTENT_READY");
                     let intent_id = intent.intent_id.to_string();
                     let simulation = client.post(format!("{api}/options/execution-intents/{intent_id}/simulate"))
                         .send().await.expect("real simulation handler");
                     assert!(simulation.status().is_success(), "real simulation failed: {}", simulation.text().await.unwrap());
+                    eprintln!("V15_WATCHER=SIMULATION_OK");
                     let broadcast = client.post(format!("{api}/options/execution-intents/{intent_id}/broadcast"))
                         .send().await.expect("real broadcast handler");
                     assert!(broadcast.status().is_success(), "real broadcast failed: {}", broadcast.text().await.unwrap());
+                    eprintln!("V15_WATCHER=BROADCAST_OK");
                     let body: Value = broadcast.json().await.expect("broadcast JSON");
                     let hash = body["tx_hash"].as_str().expect("tx hash").to_owned();
                     for _ in 0..20 {
@@ -995,6 +1003,7 @@ async fn run_browser(state: &AppState, adapter: LocalTradeAdapter, option_id: &s
                     }
                     let provider = HttpJsonRpcProvider::new(local_adapter.rpc.clone());
                     let tick = index_option_events_with_provider(&local_state, &provider).await.expect("index broadcast receipt");
+                    eprintln!("V15_WATCHER=INDEXED_{}", tick.events_indexed);
                     assert!(tick.events_indexed > 0, "broadcast receipt must index");
                     *local_adapter.tx_hash.lock().unwrap() = Some(hash);
                     *local_adapter.indexed_count.lock().unwrap() = tick.events_indexed;

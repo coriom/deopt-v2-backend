@@ -107,6 +107,7 @@ sol! {
     function getTraderSeriesLength(address trader) external view returns (uint256);
     function getTraderSeriesSlice(address trader, uint256 start, uint256 end) external view returns (uint256[] memory);
     function getPositionQuantity(address trader, uint256 optionId) external view returns (int128);
+    function optionRegistry() external view returns (address);
 }
 
 // ---------------------------------------------------------------------
@@ -134,6 +135,26 @@ fn account_to_address(a: &AccountId) -> Option<Address> {
 
 pub fn address_to_account(a: Address) -> AccountId {
     AccountId::new(format!("{a:#x}"))
+}
+
+/// Registry actually bound to the configured MarginEngine. A caller must
+/// compare this with the series provenance before reconciling raw optionIds.
+pub async fn try_get_margin_option_registry<P: EthCallProvider>(
+    cfg: &TradingViewsConfig,
+    from: &AccountId,
+    provider: &P,
+) -> Result<Option<Address>, String> {
+    let Some(engine) = cfg.margin_engine_address.as_ref() else {
+        return Ok(None);
+    };
+    let result = provider.eth_call(EthCallRequest {
+        from: from.clone(), to: engine.clone(), data: optionRegistryCall {}.abi_encode(),
+        value: 0, gas_limit: None,
+    }).await.map_err(|_| "optionRegistry read failed".to_string())?;
+    let registry = optionRegistryCall::abi_decode_returns(&result.output, true)
+        .map_err(|_| "optionRegistry decode failed".to_string())?._0;
+    if registry == Address::ZERO { return Err("optionRegistry is zero".into()); }
+    Ok(Some(registry))
 }
 
 pub async fn try_get_canonical_option_positions<P: EthCallProvider>(

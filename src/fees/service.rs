@@ -1069,6 +1069,8 @@ mod tests {
             source: OptionSeriesSource::Manual,
             onchain_product_id: None,
             onchain_series_id: None,
+            onchain_chain_id: None,
+            onchain_registry_address: None,
             created_at_ms: 1,
             updated_at_ms: 1,
         }
