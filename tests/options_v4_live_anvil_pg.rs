@@ -810,38 +810,68 @@ async fn real_receipt_is_indexed_in_postgres() {
             )
             .await;
             if std::env::var("OPTIONS_V5_PRODUCT").as_deref() == Ok("1") {
-                let oracle = transactions.iter().find(|tx| tx["contractName"] == "ScenarioOptionOracle"
-                    && tx["transactionType"] == "CREATE")
-                    .and_then(|tx| tx["contractAddress"].as_str()).expect("local oracle deployment");
-                let mut set_oracle = selector("setPrice(address,address,uint256,uint256,bool)");
-                for address in [&adapter.payload.underlying.0, &adapter.payload.settlement_asset.0] {
-                    let parsed = alloy_primitives::Address::from_str(address).unwrap();
-                    set_oracle.extend_from_slice(&[0u8; 12]);
-                    set_oracle.extend_from_slice(parsed.as_slice());
-                }
-                set_oracle.extend_from_slice(&U256::from(2000u64 * 100_000_000).to_be_bytes::<32>());
-                let latest = rpc_request(&client, &rpc, "eth_getBlockByNumber", serde_json::json!(["latest",false])).await;
-                let timestamp = u64::from_str_radix(latest["timestamp"].as_str().unwrap().trim_start_matches("0x"),16).unwrap();
-                set_oracle.extend_from_slice(&U256::from(timestamp).to_be_bytes::<32>());
-                let mut invalid = set_oracle.clone();
-                invalid.extend_from_slice(&[0u8; 32]);
-                send_local(&client, &rpc, oracle, &invalid).await;
+                let v14_router = std::env::var("OPTIONS_V14_ROUTER").as_deref() == Ok("1");
+                let oracle_targets: Vec<String> = transactions
+                    .iter()
+                    .filter(|tx| {
+                        tx["transactionType"] == "CREATE"
+                            && tx["contractName"]
+                                == if v14_router {
+                                    "V14LocalPriceSource"
+                                } else {
+                                    "ScenarioOptionOracle"
+                                }
+                    })
+                    .filter_map(|tx| tx["contractAddress"].as_str().map(str::to_owned))
+                    .collect();
+                assert_eq!(
+                    oracle_targets.len(),
+                    if v14_router { 2 } else { 1 },
+                    "local oracle sources"
+                );
+                let latest = rpc_request(
+                    &client,
+                    &rpc,
+                    "eth_getBlockByNumber",
+                    serde_json::json!(["latest", false]),
+                )
+                .await;
+                let timestamp = u64::from_str_radix(
+                    latest["timestamp"]
+                        .as_str()
+                        .unwrap()
+                        .trim_start_matches("0x"),
+                    16,
+                )
+                .unwrap();
+                let invalid = oracle_update_calldata(
+                    v14_router,
+                    &adapter.payload.underlying.0,
+                    &adapter.payload.settlement_asset.0,
+                    timestamp,
+                    false,
+                );
+                apply_oracle_update(&client, &rpc, &oracle_targets, &invalid).await;
                 expect_local_revert(&client, &rpc, matching, calldata).await;
                 println!("INVALID_ORACLE_CONTRACT_REJECTION=PASS");
-                let mut stale = selector("setPrice(address,address,uint256,uint256,bool)");
-                for address in [&adapter.payload.underlying.0, &adapter.payload.settlement_asset.0] {
-                    let parsed = alloy_primitives::Address::from_str(address).unwrap();
-                    stale.extend_from_slice(&[0u8; 12]);
-                    stale.extend_from_slice(parsed.as_slice());
-                }
-                stale.extend_from_slice(&U256::from(2000u64 * 100_000_000).to_be_bytes::<32>());
-                stale.extend_from_slice(&U256::from(1).to_be_bytes::<32>());
-                stale.extend_from_slice(&U256::from(1).to_be_bytes::<32>());
-                send_local(&client, &rpc, oracle, &stale).await;
+                let stale = oracle_update_calldata(
+                    v14_router,
+                    &adapter.payload.underlying.0,
+                    &adapter.payload.settlement_asset.0,
+                    1,
+                    true,
+                );
+                apply_oracle_update(&client, &rpc, &oracle_targets, &stale).await;
                 expect_local_revert(&client, &rpc, matching, calldata).await;
                 println!("STALE_ORACLE_CONTRACT_REJECTION=PASS");
-                set_oracle.extend_from_slice(&U256::from(1).to_be_bytes::<32>());
-                send_local(&client, &rpc, oracle, &set_oracle).await;
+                let restored = oracle_update_calldata(
+                    v14_router,
+                    &adapter.payload.underlying.0,
+                    &adapter.payload.settlement_asset.0,
+                    timestamp,
+                    true,
+                );
+                apply_oracle_update(&client, &rpc, &oracle_targets, &restored).await;
 
                 let collateral_snapshot = rpc_request(&client, &rpc, "evm_snapshot", serde_json::json!([])).await;
                 let seller = adapter.payload.seller.0.clone();
@@ -859,21 +889,48 @@ async fn real_receipt_is_indexed_in_postgres() {
             rpc_request(&client, &rpc, "evm_increaseTime", serde_json::json!([7200])).await;
             rpc_request(&client, &rpc, "evm_mine", serde_json::json!([])).await;
             if std::env::var("OPTIONS_V5_PRODUCT").as_deref() == Ok("1") {
-                let oracle = transactions.iter().find(|tx| tx["contractName"] == "ScenarioOptionOracle"
-                    && tx["transactionType"] == "CREATE")
-                    .and_then(|tx| tx["contractAddress"].as_str()).expect("local oracle deployment");
-                let latest = rpc_request(&client, &rpc, "eth_getBlockByNumber", serde_json::json!(["latest",false])).await;
-                let timestamp = u64::from_str_radix(latest["timestamp"].as_str().unwrap().trim_start_matches("0x"),16).unwrap();
-                let mut refresh = selector("setPrice(address,address,uint256,uint256,bool)");
-                for address in [&adapter.payload.underlying.0, &adapter.payload.settlement_asset.0] {
-                    let parsed = alloy_primitives::Address::from_str(address).unwrap();
-                    refresh.extend_from_slice(&[0u8; 12]);
-                    refresh.extend_from_slice(parsed.as_slice());
-                }
-                refresh.extend_from_slice(&U256::from(2000u64 * 100_000_000).to_be_bytes::<32>());
-                refresh.extend_from_slice(&U256::from(timestamp).to_be_bytes::<32>());
-                refresh.extend_from_slice(&U256::from(1).to_be_bytes::<32>());
-                send_local(&client, &rpc, oracle, &refresh).await;
+                let v14_router = std::env::var("OPTIONS_V14_ROUTER").as_deref() == Ok("1");
+                let oracle_targets: Vec<String> = transactions
+                    .iter()
+                    .filter(|tx| {
+                        tx["transactionType"] == "CREATE"
+                            && tx["contractName"]
+                                == if v14_router {
+                                    "V14LocalPriceSource"
+                                } else {
+                                    "ScenarioOptionOracle"
+                                }
+                    })
+                    .filter_map(|tx| tx["contractAddress"].as_str().map(str::to_owned))
+                    .collect();
+                assert_eq!(
+                    oracle_targets.len(),
+                    if v14_router { 2 } else { 1 },
+                    "local oracle sources"
+                );
+                let latest = rpc_request(
+                    &client,
+                    &rpc,
+                    "eth_getBlockByNumber",
+                    serde_json::json!(["latest", false]),
+                )
+                .await;
+                let timestamp = u64::from_str_radix(
+                    latest["timestamp"]
+                        .as_str()
+                        .unwrap()
+                        .trim_start_matches("0x"),
+                    16,
+                )
+                .unwrap();
+                let refresh = oracle_update_calldata(
+                    v14_router,
+                    &adapter.payload.underlying.0,
+                    &adapter.payload.settlement_asset.0,
+                    timestamp,
+                    true,
+                );
+                apply_oracle_update(&client, &rpc, &oracle_targets, &refresh).await;
             }
             expect_local_revert(&client, &rpc, matching, calldata).await;
             println!("EXPIRED_OPTION_TRADE=REJECTED");
@@ -999,6 +1056,37 @@ async fn run_browser(state: &AppState, adapter: LocalTradeAdapter, option_id: &s
 
 fn selector(signature: &str) -> Vec<u8> {
     alloy_primitives::keccak256(signature.as_bytes())[..4].to_vec()
+}
+
+fn oracle_update_calldata(
+    v14_router: bool,
+    underlying: &str,
+    settlement_asset: &str,
+    timestamp: u64,
+    valid: bool,
+) -> Vec<u8> {
+    let mut data = if v14_router {
+        selector("set(uint256,uint256,bool)")
+    } else {
+        selector("setPrice(address,address,uint256,uint256,bool)")
+    };
+    if !v14_router {
+        for address in [underlying, settlement_asset] {
+            let parsed = alloy_primitives::Address::from_str(address).expect("fixture address");
+            data.extend_from_slice(&[0u8; 12]);
+            data.extend_from_slice(parsed.as_slice());
+        }
+    }
+    data.extend_from_slice(&U256::from(2_000u64 * 100_000_000).to_be_bytes::<32>());
+    data.extend_from_slice(&U256::from(timestamp).to_be_bytes::<32>());
+    data.extend_from_slice(&U256::from(u8::from(valid)).to_be_bytes::<32>());
+    data
+}
+
+async fn apply_oracle_update(client: &reqwest::Client, rpc: &str, targets: &[String], data: &[u8]) {
+    for target in targets {
+        send_local(client, rpc, target, data).await;
+    }
 }
 
 async fn vault_balance(provider: &HttpJsonRpcProvider, vault: &str, wallet: &str, asset: &str) -> u128 {
