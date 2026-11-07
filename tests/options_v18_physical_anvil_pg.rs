@@ -79,22 +79,26 @@ async fn physical_trade_exercise_and_lapse_are_persisted() {
         .list_option_execution_events_by_tx_hash(&trade_hash)
         .await
         .unwrap();
-    let fill = trade
+    let fills: Vec<_> = trade
         .iter()
-        .find(|event| event.event_name == "CoveredFill")
-        .expect("covered fill in PG");
+        .filter(|event| event.event_name == "CoveredFill")
+        .collect();
+    assert_eq!(fills.len(), 2, "both physical fills share one receipt");
+    assert_ne!(fills[0].log_index, fills[1].log_index);
+    let fill = fills[0];
     assert_eq!(fill.chain_id, 84532);
     assert!(fill.block_hash.is_some());
-    assert_eq!(fill.decoded.as_ref().unwrap()["quantity"], "2");
-    assert_eq!(fill.decoded.as_ref().unwrap()["premium"], "200000000");
+    assert_eq!(fill.decoded.as_ref().unwrap()["quantity"], "1");
+    assert_eq!(fill.decoded.as_ref().unwrap()["premium"], "100000000");
     assert_eq!(
         fill.decoded.as_ref().unwrap()["lockedUnderlying"],
-        "2000000000000000000"
+        "1000000000000000000"
     );
-    assert!(trade
+    assert_eq!(trade
         .iter()
-        .any(|event| event.event_name == "OptionTradeExecuted"
-            && event.contract_address.eq_ignore_ascii_case(&matching)));
+        .filter(|event| event.event_name == "OptionTradeExecuted"
+            && event.contract_address.eq_ignore_ascii_case(&matching))
+        .count(), 2);
 
     let exercised = repo
         .list_option_execution_events_by_tx_hash(&exercise_hash)
@@ -135,6 +139,7 @@ async fn physical_trade_exercise_and_lapse_are_persisted() {
         .await
         .expect("idempotent rescan");
     assert_eq!(again.events_indexed, 0);
+    println!("V18_TWO_PHYSICAL_FILLS_ONE_RECEIPT_POSTGRES=PASS trade={trade_hash}");
     println!("V18_PHYSICAL_RECEIPTS_INDEXED_POSTGRES=PASS trade={trade_hash} exercise={exercise_hash} lapse={release_hash}");
 
     let snapshot = std::env::var("OPTIONS_V18_REORG_SNAPSHOT").expect("post-trade snapshot");

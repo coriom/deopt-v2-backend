@@ -51,7 +51,7 @@ j=json.load(open(sys.argv[1])); tx=j['transactions']; receipts=j['receipts']
 def creations(name): return [t['contractAddress'] for t in tx if t.get('contractName')==name and t.get('transactionType')=='CREATE']
 engine,=creations('CoveredCallMarginEngine'); matcher,=creations('OptionMatchingEngine')
 weth,usdc=creations('CoveredLocalTokenV18')
-trade=next(t for t in tx if t.get('contractName')=='OptionMatchingEngine' and t.get('transactionType')=='CALL' and t.get('function','').startswith('executeTrade('))
+trade=next(t for t in tx if t.get('contractName')=='CoveredLocalTradeBatchV18' and t.get('transactionType')=='CALL' and t.get('function','').startswith('executeTwo('))
 receipt=next(r for r in receipts if r['transactionHash'].lower()==trade['hash'].lower())
 assert receipt['status']=='0x1' and receipt['blockHash'].startswith('0x')
 print(engine);print(matcher);print(weth);print(usdc);print(trade['hash']);print(receipt['blockHash'])
