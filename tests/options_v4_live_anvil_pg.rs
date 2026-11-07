@@ -633,12 +633,18 @@ async fn real_receipt_is_indexed_in_postgres() {
     )
     .unwrap();
     assert_eq!(buyer_view["data"]["source"], "onchain_reconciled");
-    assert_eq!(
-        buyer_view["data"]["positions"][0]["quantity_contracts"],
-        "1"
-    );
-    assert_eq!(buyer_view["data"]["positions"][0]["side"], "long");
-    assert_eq!(seller_view["data"]["positions"][0]["side"], "short");
+    let dedicated_series_id = deopt_v2_backend::options::onchain_option_series_key(
+        local_chain, registry, &option_id.to_string()).unwrap();
+    fn position_for<'a>(view: &'a Value, series_id: &str) -> &'a Value {
+        view["data"]["positions"].as_array().unwrap().iter()
+            .find(|position| position["series_id"].as_str() == Some(series_id))
+            .expect("dedicated position")
+    }
+    let buyer_dedicated = position_for(&buyer_view, &dedicated_series_id);
+    let seller_dedicated = position_for(&seller_view, &dedicated_series_id);
+    assert_eq!(buyer_dedicated["quantity_contracts"], "1");
+    assert_eq!(buyer_dedicated["side"], "long");
+    assert_eq!(seller_dedicated["side"], "short");
     println!("CANONICAL_API_POSITION=buyer:long:1,seller:short:1");
     let second = index_option_events_with_provider(&state, &provider)
         .await
