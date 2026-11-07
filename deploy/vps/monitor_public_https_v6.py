@@ -17,6 +17,10 @@ TIMEOUT = 8
 
 
 def certificate_status(cert, now):
+    issuer_values = [value for attribute in cert.get("issuer", ()) for name, value in attribute]
+    issuer_organizations = [value for attribute in cert.get("issuer", ()) for name, value in attribute if name == "organizationName"]
+    if "Let's Encrypt" not in issuer_organizations or any("STAGING" in value.upper() for value in issuer_values):
+        raise ValueError("CERT_ISSUER_UNEXPECTED")
     ip_sans = [value for kind, value in cert.get("subjectAltName", ()) if kind == "IP Address"]
     if IP not in ip_sans:
         raise ValueError("IP_SAN_MISSING")
@@ -74,6 +78,7 @@ def main():
         check_health(VERCEL, "/api/deopt/public/health", "VERCEL_GATEWAY")
         if args.simulate_expiring_certificate:
             synthetic_cert = {
+                "issuer": ((("organizationName", "Let's Encrypt"),),),
                 "subjectAltName": (("IP Address", IP),),
                 "notAfter": time.strftime("%b %d %H:%M:%S %Y GMT", time.gmtime(time.time() + 3600)),
             }
