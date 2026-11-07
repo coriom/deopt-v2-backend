@@ -45,7 +45,7 @@ pub struct TradingApiError {
 }
 
 impl TradingApiError {
-    fn new(code: TradingErrorCode, message: impl Into<String>, meta: MetaBlock) -> Self {
+    pub(crate) fn new(code: TradingErrorCode, message: impl Into<String>, meta: MetaBlock) -> Self {
         Self {
             status: code.http_status(),
             code,
@@ -155,7 +155,7 @@ pub struct MetaBlock {
 }
 
 impl MetaBlock {
-    fn new(state: &AppState, source: &'static str) -> Self {
+    pub(crate) fn new(state: &AppState, source: &'static str) -> Self {
         Self {
             source,
             chain_id: state.chain_id,
@@ -195,7 +195,7 @@ fn parse_address_or_400(state: &AppState, raw: &str) -> Result<AccountId, Tradin
 /// The wallet address in a route is a lookup key, not proof of ownership.
 /// Public account routes fail closed when wallet auth is disabled. Local
 /// fixtures can exercise the underlying handlers directly.
-async fn authorize_account_read(
+pub(crate) async fn authorize_account_read(
     state: &AppState,
     address: &str,
     headers: &HeaderMap,

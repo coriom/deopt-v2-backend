@@ -785,6 +785,10 @@ pub fn router(state: AppState) -> Router {
             get(crate::api::trading::account_positions_authorized),
         )
         .route(
+            "/accounts/:address/physical-positions",
+            get(crate::api::physical_options::physical_positions_authorized),
+        )
+        .route(
             "/accounts/:address/portfolio",
             get(crate::api::trading::account_portfolio_authorized),
         )

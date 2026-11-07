@@ -58,6 +58,9 @@ pub struct TradingViewsConfig {
     /// itself lives at `margin_engine_lens_address`; this is the
     /// engine the lens is reading from.
     pub margin_engine_address: Option<AccountId>,
+    /// Covered-call engine for authenticated physical lot reads. Unset by
+    /// default; this does not enable trade broadcast or public execution.
+    pub physical_engine_address: Option<AccountId>,
 }
 
 impl TradingViewsConfig {

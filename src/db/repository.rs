@@ -5276,6 +5276,36 @@ impl PgRepository {
         rows.into_iter().map(option_execution_event_from_row).collect()
     }
 
+    /// Physical lots are fungible per buyer/writer pair in the contract.
+    /// Scope this read to the exact engine before projecting wallet data.
+    pub async fn list_physical_option_events_for_wallet(
+        &self, chain_id: u64, wallet: &str, engine: &str,
+    ) -> Result<Vec<OptionExecutionEvent>> {
+        let rows = sqlx::query(
+            "SELECT id, chain_id, contract_address, tx_hash, log_index, block_number, block_hash,
+                    event_name, event_signature, intent_id, onchain_intent_id,
+                    option_execution_transaction_id, buyer, seller, account, option_id,
+                    quantity_contracts, premium_per_contract_native, raw_topics, raw_data,
+                    decoded, created_at_ms, updated_at_ms
+             FROM option_execution_events
+             WHERE chain_id = $1 AND lower(contract_address) = lower($2)
+               AND (lower(buyer) = lower($3) OR lower(seller) = lower($3))
+               AND event_name IN ('CoveredFill', 'PhysicalExercise', 'LongWaived', 'LongExpired')
+             ORDER BY block_number ASC, log_index ASC, id ASC
+             LIMIT 10001",
+        )
+        .bind(u64_to_i64("chain_id", chain_id)?)
+        .bind(engine)
+        .bind(wallet)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| BackendError::Persistence(error.to_string()))?;
+        if rows.len() > 10_000 {
+            return Err(BackendError::Persistence("physical wallet event cap exceeded".into()));
+        }
+        rows.into_iter().map(option_execution_event_from_row).collect()
+    }
+
     pub async fn list_confirmed_unreconciled_option_execution_transactions(
         &self,
         limit: u32,
