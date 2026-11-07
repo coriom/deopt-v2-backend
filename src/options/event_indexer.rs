@@ -26,6 +26,14 @@ pub const MARGIN_TRADE_EXECUTED_SIGNATURE: &str =
     "TradeExecuted(address,address,uint256,uint128,uint128)";
 pub const ACCOUNT_SETTLED_SIGNATURE: &str =
     "AccountSettled(address,uint256,int256,uint256,uint256,uint256)";
+pub const COVERED_FILL_SIGNATURE: &str =
+    "CoveredFill(uint256,address,address,uint256,uint256,uint256)";
+pub const PHYSICAL_EXERCISE_SIGNATURE: &str =
+    "PhysicalExercise(uint256,address,address,uint256,uint256,uint256)";
+pub const LONG_WAIVED_SIGNATURE: &str =
+    "LongWaived(uint256,address,address,uint256,uint256)";
+pub const LONG_EXPIRED_SIGNATURE: &str =
+    "LongExpired(uint256,address,address,uint256,uint256)";
 pub const TRADING_FEE_CHARGED_SIGNATURE: &str =
     "TradingFeeCharged(address,address,address,uint256,bool,uint256,uint256,uint256,uint256,uint256,bool)";
 pub const INTERNAL_TRANSFER_SIGNATURE: &str = "InternalTransfer(address,address,address,uint256)";
@@ -200,7 +208,7 @@ impl OptionEventIndexerConfig {
                 else if self.secondary_matching_engine_address.as_ref().is_some_and(|a| address.eq_ignore_ascii_case(&a.0)) { Some(1) }
                 else { None }
             }
-            "AccountSettled" => {
+            "AccountSettled" | "CoveredFill" | "PhysicalExercise" | "LongWaived" | "LongExpired" => {
                 if address.eq_ignore_ascii_case(&self.margin_engine_address.0) { Some(0) }
                 else if self.secondary_margin_engine_address.as_ref().is_some_and(|a| address.eq_ignore_ascii_case(&a.0)) { Some(1) }
                 else { None }
@@ -363,6 +371,10 @@ pub fn account_settled_topic0() -> String {
     hex_0x(&keccak256(ACCOUNT_SETTLED_SIGNATURE.as_bytes()))
 }
 
+fn physical_topic0(signature: &str) -> String {
+    hex_0x(&keccak256(signature.as_bytes()))
+}
+
 pub fn trading_fee_charged_topic0() -> String {
     hex_0x(&keccak256(TRADING_FEE_CHARGED_SIGNATURE.as_bytes()))
 }
@@ -450,6 +462,10 @@ pub fn tier_claimed_v2_topic0() -> String {
 pub fn default_option_event_counts() -> BTreeMap<String, u64> {
     BTreeMap::from([
         ("AccountSettled".to_string(), 0),
+        ("CoveredFill".to_string(), 0),
+        ("PhysicalExercise".to_string(), 0),
+        ("LongWaived".to_string(), 0),
+        ("LongExpired".to_string(), 0),
         ("CollateralDeposited".to_string(), 0),
         ("CollateralWithdrawn".to_string(), 0),
         ("DefaultFeesSet".to_string(), 0),
@@ -486,6 +502,10 @@ fn event_topics_for_emitter_role(role: &str) -> Vec<String> {
         "margin_engine" | "margin_engine_secondary" => vec![
             margin_trade_executed_topic0(),
             account_settled_topic0(),
+            physical_topic0(COVERED_FILL_SIGNATURE),
+            physical_topic0(PHYSICAL_EXERCISE_SIGNATURE),
+            physical_topic0(LONG_WAIVED_SIGNATURE),
+            physical_topic0(LONG_EXPIRED_SIGNATURE),
             trading_fee_charged_topic0(),
             margin_collateral_deposited_topic0(),
             margin_collateral_withdrawn_topic0(),
@@ -789,6 +809,17 @@ pub fn decode_option_execution_event(
     if topic0.eq_ignore_ascii_case(&account_settled_topic0()) {
         return decode_account_settled_log(log, chain_id).map(Some);
     }
+    for (name, signature, has_two_amounts) in [
+        ("CoveredFill", COVERED_FILL_SIGNATURE, true),
+        ("PhysicalExercise", PHYSICAL_EXERCISE_SIGNATURE, true),
+        ("LongWaived", LONG_WAIVED_SIGNATURE, false),
+        ("LongExpired", LONG_EXPIRED_SIGNATURE, false),
+    ] {
+        if topic0.eq_ignore_ascii_case(&physical_topic0(signature)) {
+            return decode_physical_lifecycle_log(log, chain_id, name, signature, has_two_amounts)
+                .map(Some);
+        }
+    }
     if topic0.eq_ignore_ascii_case(&trading_fee_charged_topic0()) {
         return decode_trading_fee_charged_log(log, chain_id).map(Some);
     }
@@ -898,6 +929,50 @@ fn decode_account_settled_log(log: &EthLog, chain_id: u64) -> Result<OptionExecu
     });
     option_event_from_decoded_fields(log, chain_id, "AccountSettled", ACCOUNT_SETTLED_SIGNATURE,
         None, None, Some(trader), Some(option_id), None, None, decoded)
+}
+
+fn decode_physical_lifecycle_log(
+    log: &EthLog,
+    chain_id: u64,
+    name: &str,
+    signature: &str,
+    has_two_amounts: bool,
+) -> Result<OptionExecutionEvent> {
+    if log.topics.len() != 4 {
+        return Err(BackendError::Indexer(format!("{name} requires four topics")));
+    }
+    let data = decode_hex_bytes(&log.data)?;
+    let expected_words = if has_two_amounts { 3 } else { 2 };
+    if data.len() != expected_words * 32 {
+        return Err(BackendError::Indexer(format!("{name} requires {expected_words} ABI words")));
+    }
+    let option_id = decode_topic_u256(&log.topics[1])?.to_string();
+    let buyer = decode_topic_address(&log.topics[2])?;
+    let seller = decode_topic_address(&log.topics[3])?;
+    let quantity = decode_data_u256(&data, 0)?.to_string();
+    let first_amount = decode_data_u256(&data, 1)?.to_string();
+    let decoded = if has_two_amounts {
+        let second_amount = decode_data_u256(&data, 2)?.to_string();
+        match name {
+            "CoveredFill" => serde_json::json!({
+                "optionId": option_id, "buyer": buyer, "seller": seller,
+                "quantity": quantity, "premium": first_amount, "lockedUnderlying": second_amount
+            }),
+            _ => serde_json::json!({
+                "optionId": option_id, "buyer": buyer, "seller": seller,
+                "quantity": quantity, "strikePaid": first_amount, "underlyingDelivered": second_amount
+            }),
+        }
+    } else {
+        serde_json::json!({
+            "optionId": option_id, "buyer": buyer, "seller": seller,
+            "quantity": quantity, "underlyingReturned": first_amount
+        })
+    };
+    option_event_from_decoded_fields(
+        log, chain_id, name, signature, Some(buyer), Some(seller), None,
+        Some(option_id), Some(quantity), None, decoded,
+    )
 }
 
 fn decode_option_trade_executed_log(log: &EthLog, chain_id: u64) -> Result<OptionExecutionEvent> {
@@ -2114,6 +2189,34 @@ mod tests {
         OptionExecutionSourceType, OptionExecutionTransaction, OptionsConfig,
     };
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn physical_lifecycle_logs_keep_amounts_and_provenance_distinct() {
+        let mut fill = option_trade_log(10, 2);
+        fill.address = "0x00000000000000000000000000000000000000ab".into();
+        fill.topics = vec![
+            physical_topic0(COVERED_FILL_SIGNATURE),
+            format!("0x{}", word_no_prefix(7)),
+            topic_address("0000000000000000000000000000000000000001"),
+            topic_address("0000000000000000000000000000000000000002"),
+        ];
+        fill.data = format!("0x{}{}{}", word_no_prefix(2), word_no_prefix(200_000_000), word_no_prefix(2_000_000_000));
+        let event = decode_option_execution_event(&fill, 84532).unwrap().unwrap();
+        assert_eq!(event.event_name, "CoveredFill");
+        assert_eq!(event.option_id.as_deref(), Some("7"));
+        assert_eq!(event.quantity_contracts.as_deref(), Some("2"));
+        assert_eq!(event.decoded.as_ref().unwrap()["premium"], "200000000");
+        assert_eq!(event.decoded.as_ref().unwrap()["lockedUnderlying"], "2000000000");
+        assert_eq!(event.log_index, 2);
+
+        fill.topics[0] = physical_topic0(LONG_EXPIRED_SIGNATURE);
+        fill.data = format!("0x{}{}", word_no_prefix(2), word_no_prefix(2_000_000_000));
+        let expired = decode_option_execution_event(&fill, 84532).unwrap().unwrap();
+        assert_eq!(expired.event_name, "LongExpired");
+        assert_eq!(expired.decoded.as_ref().unwrap()["underlyingReturned"], "2000000000");
+        fill.data.push_str(&word_no_prefix(1));
+        assert!(decode_option_execution_event(&fill, 84532).is_err());
+    }
 
     #[tokio::test]
     async fn same_raw_option_id_is_indexed_from_both_matching_emitters() {

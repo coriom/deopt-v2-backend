@@ -499,6 +499,21 @@ async fn real_receipt_is_indexed_in_postgres() {
     let events = list_option_execution_events(&state, 1000)
         .await
         .expect("persisted events");
+    if dual_registry {
+        let batch_tx = transactions.iter().find(|tx| tx["contractName"] == "LocalOptionTradeBatch"
+            && tx["transactionType"] == "CALL")
+            .expect("two legacy fills must execute in one Anvil transaction");
+        let batch_hash = batch_tx["hash"].as_str().expect("batch transaction hash");
+        let batch_fills: Vec<_> = events.iter().filter(|event|
+            event.tx_hash.eq_ignore_ascii_case(batch_hash)
+                && event.event_name == "OptionTradeExecuted"
+                && event.contract_address.eq_ignore_ascii_case(legacy_matching.unwrap())
+        ).collect();
+        assert_eq!(batch_fills.len(), 2, "two real matching logs in one receipt");
+        assert_ne!(batch_fills[0].log_index, batch_fills[1].log_index);
+        assert_eq!(batch_fills[0].block_hash, batch_fills[1].block_hash);
+        println!("V18_TWO_FILLS_ONE_RECEIPT_POSTGRES=PASS tx={batch_hash}");
+    }
     if let (Some(old_vault), Some((buyer_before, seller_before)), Some((_, _, _, asset))) =
         (legacy_vault, legacy_balances_before, pre_balances.as_ref()) {
         assert_eq!(vault_balance(&provider, old_vault, "0x0376AAc07Ad725E01357B1725B5ceC61aE10473c", asset).await, buyer_before);

@@ -1981,16 +1981,27 @@ async fn dual_indexed_account_positions<P: crate::execution::rpc::EthCallProvide
                     (expected, trade.block_hash.as_ref(), trade.buyer.as_ref(), trade.seller.as_ref()) {
                     let tx_events = repo.list_option_execution_events_by_tx_hash(&trade.tx_hash).await
                         .map_err(|_| unavailable("Options economic receipt unavailable"))?;
-                    // A receipt can contain several fills. Without a log-index
-                    // correlation, reusing its transfer for each fill would
-                    // double-count economics. Keep that case unverified.
-                    let single_fill_receipt = tx_events.iter().filter(|event|
+                    // Matching emits its trade event after the margin/vault/fee
+                    // calls. Partition a batched receipt by successive trade
+                    // log indices, so a transfer can prove at most one fill.
+                    let mut trade_logs: Vec<_> = tx_events.iter().filter(|event|
                         matches!(event.event_name.as_str(), "OptionTradeExecuted" | "OptionRfqTradeExecuted")
-                    ).count() == 1;
-                    let unique_indexed_tx = trades.iter().filter(|candidate|
-                        candidate.tx_hash.eq_ignore_ascii_case(&trade.tx_hash)
-                    ).count() == 1;
-                    if !single_fill_receipt || !unique_indexed_tx { continue; }
+                            && event.block_hash.as_ref() == Some(block_hash)
+                    ).collect();
+                    trade_logs.sort_by_key(|event| event.log_index);
+                    let matching_positions: Vec<_> = trade_logs.iter().enumerate().filter_map(|(position, event)|
+                        (event.log_index == trade.log_index
+                            && event.contract_address.eq_ignore_ascii_case(&trade.contract_address))
+                        .then_some(position)
+                    ).collect();
+                    if matching_positions.len() != 1 { continue; }
+                    let position = matching_positions[0];
+                    let previous_trade_log = position.checked_sub(1).map(|previous| trade_logs[previous].log_index);
+                    let tx_events: Vec<_> = tx_events.into_iter().filter(|event|
+                        event.block_hash.as_ref() == Some(block_hash)
+                            && event.log_index <= trade.log_index
+                            && previous_trade_log.is_none_or(|previous| event.log_index > previous)
+                    ).collect();
                     let asset = &item.settlement_asset;
                     let vault_transfer = |event: &&crate::options::OptionExecutionEvent,
                                           from: &str, to: &str, amount: u128| {
