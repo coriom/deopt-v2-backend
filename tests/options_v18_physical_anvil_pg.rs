@@ -85,6 +85,74 @@ async fn physical_trade_exercise_and_lapse_are_persisted() {
         .collect();
     assert_eq!(fills.len(), 2, "both physical fills share one receipt");
     assert_ne!(fills[0].log_index, fills[1].log_index);
+    let fees: Vec<_> = trade
+        .iter()
+        .filter(|event| event.event_name == "PhysicalFeePaid")
+        .collect();
+    assert_eq!(fees.len(), 2, "one fee record per fill in the same receipt");
+    for fee in &fees {
+        assert!(fills.iter().any(|fill| fill.log_index == fee.log_index + 1
+            && fill.option_id == fee.option_id
+            && fill.buyer == fee.buyer
+            && fill.seller == fee.seller));
+    }
+    let nonzero_fees = std::env::var("OPTIONS_V20_NONZERO_FEES").as_deref() == Ok("1");
+    let buyer_fee = if nonzero_fees { "5000" } else { "0" };
+    let seller_fee = if nonzero_fees { "25000" } else { "0" };
+    for fee in &fees {
+        assert_eq!(fee.decoded.as_ref().unwrap()["buyerFee"], buyer_fee);
+        assert_eq!(fee.decoded.as_ref().unwrap()["sellerFee"], seller_fee);
+    }
+    let quote = tx
+        .iter()
+        .filter(|row| {
+            row["contractName"] == "CoveredLocalTokenV18" && row["transactionType"] == "CREATE"
+        })
+        .nth(1)
+        .and_then(|row| row["contractAddress"].as_str())
+        .unwrap();
+    let recipient = fees[0].decoded.as_ref().unwrap()["recipient"]
+        .as_str()
+        .unwrap();
+    let transfer_topic = format!(
+        "0x{}",
+        hex::encode(keccak256(b"Transfer(address,address,uint256)"))
+    );
+    let receipt = broadcast["receipts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| {
+            row["transactionHash"]
+                .as_str()
+                .is_some_and(|hash| hash.eq_ignore_ascii_case(&trade_hash))
+        })
+        .expect("real batch receipt");
+    let transferred_to_recipient: U256 = receipt["logs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|log| {
+            log["address"]
+                .as_str()
+                .is_some_and(|address| address.eq_ignore_ascii_case(quote))
+                && log["topics"][0]
+                    .as_str()
+                    .is_some_and(|topic| topic.eq_ignore_ascii_case(&transfer_topic))
+                && log["topics"][2]
+                    .as_str()
+                    .is_some_and(|topic| topic.ends_with(&recipient[2..].to_ascii_lowercase()))
+        })
+        .map(|log| {
+            U256::from_str_radix(log["data"].as_str().unwrap().trim_start_matches("0x"), 16)
+                .unwrap()
+        })
+        .fold(U256::ZERO, |sum, amount| sum + amount);
+    assert_eq!(
+        transferred_to_recipient,
+        U256::from(if nonzero_fees { 60_000u64 } else { 0 })
+    );
+    println!("V20_MULTIFILL_FEE_TRANSFERS=PASS tx={trade_hash} amount={transferred_to_recipient}");
     let fill = fills[0];
     assert_eq!(fill.chain_id, 84532);
     assert!(fill.block_hash.is_some());
@@ -94,11 +162,14 @@ async fn physical_trade_exercise_and_lapse_are_persisted() {
         fill.decoded.as_ref().unwrap()["lockedUnderlying"],
         "1000000000000000000"
     );
-    assert_eq!(trade
-        .iter()
-        .filter(|event| event.event_name == "OptionTradeExecuted"
-            && event.contract_address.eq_ignore_ascii_case(&matching))
-        .count(), 2);
+    assert_eq!(
+        trade
+            .iter()
+            .filter(|event| event.event_name == "OptionTradeExecuted"
+                && event.contract_address.eq_ignore_ascii_case(&matching))
+            .count(),
+        2
+    );
 
     let exercised = repo
         .list_option_execution_events_by_tx_hash(&exercise_hash)

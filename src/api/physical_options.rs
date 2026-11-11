@@ -42,6 +42,8 @@ pub struct PhysicalPosition {
     underlying_delivered_native: String,
     underlying_returned_native: String,
     fee_native: Option<String>,
+    buyer_fee_native: Option<String>,
+    seller_fee_native: Option<String>,
     proof: Vec<PhysicalEventProof>,
 }
 
@@ -75,6 +77,9 @@ struct Totals {
     locked: u128,
     delivered: u128,
     returned: u128,
+    buyer_fee: u128,
+    seller_fee: u128,
+    fee_contracts: u128,
     proof: Vec<PhysicalEventProof>,
 }
 
@@ -150,6 +155,27 @@ fn project_event(
         .checked_mul(underlying_per_contract)
         .ok_or("underlying overflow")?;
     match event.event_name.as_str() {
+        "PhysicalFeePaid" => {
+            let buyer_fee = amount(event, "buyerFee")?;
+            let seller_fee = amount(event, "sellerFee")?;
+            let recipient = event
+                .decoded
+                .as_ref()
+                .and_then(|decoded| decoded["recipient"].as_str())
+                .ok_or("missing fee recipient")?;
+            if buyer_fee
+                .checked_add(seller_fee)
+                .ok_or("fee amount overflow")?
+                > 0
+                && (recipient.eq_ignore_ascii_case(event.buyer.as_deref().unwrap_or(""))
+                    || recipient.eq_ignore_ascii_case(event.seller.as_deref().unwrap_or("")))
+            {
+                return Err("fee recipient overlaps trader".into());
+            }
+            add(&mut totals.buyer_fee, buyer_fee)?;
+            add(&mut totals.seller_fee, seller_fee)?;
+            add(&mut totals.fee_contracts, qty)?;
+        }
         "CoveredFill" => {
             if amount(event, "lockedUnderlying")? != underlying {
                 return Err("fill cover mismatch".into());
@@ -356,6 +382,25 @@ pub async fn physical_positions_authorized(
         .list_physical_option_events_for_wallet(state.chain_id, &address, &engine.0)
         .await
         .map_err(|_| unavailable("physical events unavailable"))?;
+    for (index, event) in events.iter().enumerate() {
+        if event.event_name != "PhysicalFeePaid" {
+            continue;
+        }
+        let next = events
+            .get(index + 1)
+            .ok_or_else(|| unavailable("unpaired physical fee"))?;
+        if next.event_name != "CoveredFill"
+            || next.tx_hash != event.tx_hash
+            || next.block_hash != event.block_hash
+            || next.log_index != event.log_index + 1
+            || next.option_id != event.option_id
+            || next.buyer != event.buyer
+            || next.seller != event.seller
+            || next.quantity_contracts != event.quantity_contracts
+        {
+            return Err(unavailable("physical fee/fill provenance mismatch"));
+        }
+    }
     let mut pairs: BTreeMap<(String, String), Totals> = BTreeMap::new();
     for event in &events {
         if event.option_id.as_deref() != Some(&option_id.to_string()) {
@@ -399,6 +444,11 @@ pub async fn physical_positions_authorized(
         if onchain != U256::from(totals.open) {
             return Err(unavailable("physical lot reconciliation pending"));
         }
+        let wallet_fee = if address.eq_ignore_ascii_case(&buyer) {
+            totals.buyer_fee
+        } else {
+            totals.seller_fee
+        };
         positions.push(PhysicalPosition {
             buyer,
             seller,
@@ -412,7 +462,11 @@ pub async fn physical_positions_authorized(
             underlying_locked_native: totals.locked.to_string(),
             underlying_delivered_native: totals.delivered.to_string(),
             underlying_returned_native: totals.returned.to_string(),
-            fee_native: None,
+            fee_native: (totals.fee_contracts == totals.filled).then(|| wallet_fee.to_string()),
+            buyer_fee_native: (totals.fee_contracts == totals.filled)
+                .then(|| totals.buyer_fee.to_string()),
+            seller_fee_native: (totals.fee_contracts == totals.filled)
+                .then(|| totals.seller_fee.to_string()),
             proof: totals.proof,
         });
     }
@@ -426,7 +480,7 @@ pub async fn physical_positions_authorized(
             exercise_deadline: deadline, chain_timestamp: clock, positions,
         },
         warnings: vec![Warning { code: "SOURCE_UNAVAILABLE".into(),
-            message: "Physical quantities match the contract. Fills between one buyer and seller are fungible; per-fill lots and fees are not provable by this engine.".into(),
+            message: "Physical quantities match the contract. Fills between one buyer and seller are fungible; per-fill lots remain non-canonical.".into(),
             details: serde_json::json!({}) }],
         meta: MetaBlock::new(&state, "chain+db"),
     }))

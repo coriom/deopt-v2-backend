@@ -119,6 +119,7 @@ if [[ "$browser" == 1 ]]; then
     NEXT_PUBLIC_TRADING_API_BASE_URL="http://127.0.0.1:$api_port" \
     NEXT_PUBLIC_DEOPT_WALLET_READ_AUTH=true NEXT_PUBLIC_CHAIN_ENV=sepolia \
     NEXT_PUBLIC_OPTIONS_PHYSICAL_MODE=1 NEXT_PUBLIC_OPTIONS_PHYSICAL_REGISTRY="$registry" \
+    NEXT_PUBLIC_OPTIONS_PHYSICAL_ENGINE="$engine" \
     npm run dev -- --hostname 127.0.0.1 --port "$frontend_port") \
     >"/tmp/deopt-options-v19-next-$$.log" 2>&1 &
   frontend_pid=$!
@@ -142,14 +143,20 @@ buyer_key=0x$(printf '%064x' $((0xB0B)))
 seller_key=0x$(printf '%064x' $((0xCA11)))
 exercise_hash=$(cast send "$engine" 'exercise(address,uint256)' "$seller" 1 --private-key "$buyer_key" --rpc-url "$url" --json | python3 -c 'import json,sys; r=json.load(sys.stdin); assert r["status"]=="0x1"; print(r["transactionHash"])')
 test "$(onchain_uint "$weth" 'balanceOf(address)(uint256)' "$buyer")" = 1000000000000000000
-test "$(onchain_uint "$usdc" 'balanceOf(address)(uint256)' "$seller")" = 2450000000
+seller_expected=2450000000
+buyer_expected=2550000000
+if [[ "${OPTIONS_V20_NONZERO_FEES:-0}" == 1 ]]; then
+  seller_expected=2449950000
+  buyer_expected=2549990000
+fi
+test "$(onchain_uint "$usdc" 'balanceOf(address)(uint256)' "$seller")" = "$seller_expected"
 deadline=$((expiry + 48 * 3600))
 cast rpc evm_setNextBlockTimestamp "$deadline" --rpc-url "$url" > /dev/null
 release_hash=$(cast send "$engine" 'releaseExpired(address,address,uint256)' "$buyer" "$seller" 1 --private-key "$seller_key" --rpc-url "$url" --json | python3 -c 'import json,sys; r=json.load(sys.stdin); assert r["status"]=="0x1"; print(r["transactionHash"])')
 test "$(onchain_uint "$engine" 'totalLockedUnderlying()(uint256)')" = 0
 test "$(onchain_uint "$weth" 'balanceOf(address)(uint256)' "$seller")" = 1000000000000000000
 test "$(onchain_uint "$weth" 'balanceOf(address)(uint256)' "$engine")" = 0
-test "$(onchain_uint "$usdc" 'balanceOf(address)(uint256)' "$buyer")" = 2550000000
+test "$(onchain_uint "$usdc" 'balanceOf(address)(uint256)' "$buyer")" = "$buyer_expected"
 export OPTIONS_V18_TRADE_HASH="$trade_hash"
 export OPTIONS_V18_EXERCISE_HASH="$exercise_hash"
 export OPTIONS_V18_RELEASE_HASH="$release_hash"

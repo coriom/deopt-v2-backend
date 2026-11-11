@@ -28,12 +28,12 @@ pub const ACCOUNT_SETTLED_SIGNATURE: &str =
     "AccountSettled(address,uint256,int256,uint256,uint256,uint256)";
 pub const COVERED_FILL_SIGNATURE: &str =
     "CoveredFill(uint256,address,address,uint256,uint256,uint256)";
+pub const PHYSICAL_FEE_PAID_SIGNATURE: &str =
+    "PhysicalFeePaid(uint256,address,address,uint256,uint256,uint256,address)";
 pub const PHYSICAL_EXERCISE_SIGNATURE: &str =
     "PhysicalExercise(uint256,address,address,uint256,uint256,uint256)";
-pub const LONG_WAIVED_SIGNATURE: &str =
-    "LongWaived(uint256,address,address,uint256,uint256)";
-pub const LONG_EXPIRED_SIGNATURE: &str =
-    "LongExpired(uint256,address,address,uint256,uint256)";
+pub const LONG_WAIVED_SIGNATURE: &str = "LongWaived(uint256,address,address,uint256,uint256)";
+pub const LONG_EXPIRED_SIGNATURE: &str = "LongExpired(uint256,address,address,uint256,uint256)";
 pub const TRADING_FEE_CHARGED_SIGNATURE: &str =
     "TradingFeeCharged(address,address,address,uint256,bool,uint256,uint256,uint256,uint256,uint256,bool)";
 pub const INTERNAL_TRANSFER_SIGNATURE: &str = "InternalTransfer(address,address,address,uint256)";
@@ -128,16 +128,37 @@ impl OptionEventIndexerConfig {
             self.from_block,
             self.matching_engine_address.0.to_ascii_lowercase(),
             self.margin_engine_address.0.to_ascii_lowercase(),
-            self.secondary_matching_engine_address.as_ref().map(|a| a.0.to_ascii_lowercase()).unwrap_or_default(),
-            self.secondary_margin_engine_address.as_ref().map(|a| a.0.to_ascii_lowercase()).unwrap_or_default(),
+            self.secondary_matching_engine_address
+                .as_ref()
+                .map(|a| a.0.to_ascii_lowercase())
+                .unwrap_or_default(),
+            self.secondary_margin_engine_address
+                .as_ref()
+                .map(|a| a.0.to_ascii_lowercase())
+                .unwrap_or_default(),
             self.collateral_vault_address.0.to_ascii_lowercase(),
-            self.secondary_collateral_vault_address.as_ref().map(|a| a.0.to_ascii_lowercase()).unwrap_or_default(),
-            self.fees_manager_address.as_ref().map(|a| a.0.to_ascii_lowercase()).unwrap_or_default(),
-            self.fees_manager_v2_address.as_ref().map(|a| a.0.to_ascii_lowercase()).unwrap_or_default(),
-            self.secondary_fees_manager_v2_address.as_ref().map(|a| a.0.to_ascii_lowercase()).unwrap_or_default(),
+            self.secondary_collateral_vault_address
+                .as_ref()
+                .map(|a| a.0.to_ascii_lowercase())
+                .unwrap_or_default(),
+            self.fees_manager_address
+                .as_ref()
+                .map(|a| a.0.to_ascii_lowercase())
+                .unwrap_or_default(),
+            self.fees_manager_v2_address
+                .as_ref()
+                .map(|a| a.0.to_ascii_lowercase())
+                .unwrap_or_default(),
+            self.secondary_fees_manager_v2_address
+                .as_ref()
+                .map(|a| a.0.to_ascii_lowercase())
+                .unwrap_or_default(),
         );
         let hash = keccak256(topology.as_bytes());
-        format!("{OPTION_EVENT_INDEXER_STATE_ID}_dual_{}", &hex_0x(&hash[..8])[2..])
+        format!(
+            "{OPTION_EVENT_INDEXER_STATE_ID}_dual_{}",
+            &hex_0x(&hash[..8])[2..]
+        )
     }
 
     pub fn disabled() -> Self {
@@ -204,14 +225,31 @@ impl OptionEventIndexerConfig {
         let address = &event.contract_address;
         match event.event_name.as_str() {
             "OptionTradeExecuted" | "OptionRfqTradeExecuted" => {
-                if address.eq_ignore_ascii_case(&self.matching_engine_address.0) { Some(0) }
-                else if self.secondary_matching_engine_address.as_ref().is_some_and(|a| address.eq_ignore_ascii_case(&a.0)) { Some(1) }
-                else { None }
+                if address.eq_ignore_ascii_case(&self.matching_engine_address.0) {
+                    Some(0)
+                } else if self
+                    .secondary_matching_engine_address
+                    .as_ref()
+                    .is_some_and(|a| address.eq_ignore_ascii_case(&a.0))
+                {
+                    Some(1)
+                } else {
+                    None
+                }
             }
-            "AccountSettled" | "CoveredFill" | "PhysicalExercise" | "LongWaived" | "LongExpired" => {
-                if address.eq_ignore_ascii_case(&self.margin_engine_address.0) { Some(0) }
-                else if self.secondary_margin_engine_address.as_ref().is_some_and(|a| address.eq_ignore_ascii_case(&a.0)) { Some(1) }
-                else { None }
+            "AccountSettled" | "CoveredFill" | "PhysicalFeePaid" | "PhysicalExercise"
+            | "LongWaived" | "LongExpired" => {
+                if address.eq_ignore_ascii_case(&self.margin_engine_address.0) {
+                    Some(0)
+                } else if self
+                    .secondary_margin_engine_address
+                    .as_ref()
+                    .is_some_and(|a| address.eq_ignore_ascii_case(&a.0))
+                {
+                    Some(1)
+                } else {
+                    None
+                }
             }
             _ => None,
         }
@@ -249,30 +287,71 @@ impl OptionEventIndexerConfig {
             "OPTION_EVENT_INDEXER_MARGIN_ENGINE_ADDRESS",
             &self.margin_engine_address,
         )?;
-        match (&self.secondary_matching_engine_address, &self.secondary_margin_engine_address) {
+        match (
+            &self.secondary_matching_engine_address,
+            &self.secondary_margin_engine_address,
+        ) {
             (None, None) => {
                 if self.secondary_collateral_vault_address.is_some()
-                    || self.secondary_fees_manager_v2_address.is_some() {
-                    return Err(BackendError::Config("secondary Options Vault or fees requires both secondary engines".into()));
+                    || self.secondary_fees_manager_v2_address.is_some()
+                {
+                    return Err(BackendError::Config(
+                        "secondary Options Vault or fees requires both secondary engines".into(),
+                    ));
                 }
             }
             (Some(matching), Some(margin)) => {
-                validate_optional_emitter_address("OPTION_EVENT_INDEXER_SECONDARY_MATCHING_ENGINE_ADDRESS", matching)?;
-                validate_optional_emitter_address("OPTION_EVENT_INDEXER_SECONDARY_MARGIN_ENGINE_ADDRESS", margin)?;
-                let addresses = [&self.matching_engine_address, &self.margin_engine_address, matching, margin];
+                validate_optional_emitter_address(
+                    "OPTION_EVENT_INDEXER_SECONDARY_MATCHING_ENGINE_ADDRESS",
+                    matching,
+                )?;
+                validate_optional_emitter_address(
+                    "OPTION_EVENT_INDEXER_SECONDARY_MARGIN_ENGINE_ADDRESS",
+                    margin,
+                )?;
+                let addresses = [
+                    &self.matching_engine_address,
+                    &self.margin_engine_address,
+                    matching,
+                    margin,
+                ];
                 for (index, address) in addresses.iter().enumerate() {
-                    if addresses[..index].iter().any(|other| other.0.eq_ignore_ascii_case(&address.0)) {
-                        return Err(BackendError::Config("Options stack emitters must have distinct addresses".into()));
+                    if addresses[..index]
+                        .iter()
+                        .any(|other| other.0.eq_ignore_ascii_case(&address.0))
+                    {
+                        return Err(BackendError::Config(
+                            "Options stack emitters must have distinct addresses".into(),
+                        ));
                     }
                 }
-                let vault = self.secondary_collateral_vault_address.as_ref().ok_or_else(||
-                    BackendError::Config("dual Options stack requires its own collateral Vault".into()))?;
-                validate_optional_emitter_address("OPTION_EVENT_INDEXER_SECONDARY_COLLATERAL_VAULT_ADDRESS", vault)?;
-                if vault.0.eq_ignore_ascii_case(&self.collateral_vault_address.0) {
-                    return Err(BackendError::Config("dual Options Vaults must be distinct".into()));
+                let vault = self
+                    .secondary_collateral_vault_address
+                    .as_ref()
+                    .ok_or_else(|| {
+                        BackendError::Config(
+                            "dual Options stack requires its own collateral Vault".into(),
+                        )
+                    })?;
+                validate_optional_emitter_address(
+                    "OPTION_EVENT_INDEXER_SECONDARY_COLLATERAL_VAULT_ADDRESS",
+                    vault,
+                )?;
+                if vault
+                    .0
+                    .eq_ignore_ascii_case(&self.collateral_vault_address.0)
+                {
+                    return Err(BackendError::Config(
+                        "dual Options Vaults must be distinct".into(),
+                    ));
                 }
             }
-            _ => return Err(BackendError::Config("secondary Options matching and margin engines must be configured together".into())),
+            _ => {
+                return Err(BackendError::Config(
+                    "secondary Options matching and margin engines must be configured together"
+                        .into(),
+                ))
+            }
         }
         validate_required_emitter_address(
             "OPTION_EVENT_INDEXER_COLLATERAL_VAULT_ADDRESS",
@@ -291,9 +370,18 @@ impl OptionEventIndexerConfig {
             )?;
         }
         if let Some(address) = self.secondary_fees_manager_v2_address.as_ref() {
-            validate_optional_emitter_address("OPTION_EVENT_INDEXER_SECONDARY_FEES_MANAGER_V2_ADDRESS", address)?;
-            if self.fees_manager_v2_address.as_ref().is_some_and(|primary| primary.0.eq_ignore_ascii_case(&address.0)) {
-                return Err(BackendError::Config("dual Options fee managers must be distinct".into()));
+            validate_optional_emitter_address(
+                "OPTION_EVENT_INDEXER_SECONDARY_FEES_MANAGER_V2_ADDRESS",
+                address,
+            )?;
+            if self
+                .fees_manager_v2_address
+                .as_ref()
+                .is_some_and(|primary| primary.0.eq_ignore_ascii_case(&address.0))
+            {
+                return Err(BackendError::Config(
+                    "dual Options fee managers must be distinct".into(),
+                ));
             }
         }
         Ok(())
@@ -463,6 +551,7 @@ pub fn default_option_event_counts() -> BTreeMap<String, u64> {
     BTreeMap::from([
         ("AccountSettled".to_string(), 0),
         ("CoveredFill".to_string(), 0),
+        ("PhysicalFeePaid".to_string(), 0),
         ("PhysicalExercise".to_string(), 0),
         ("LongWaived".to_string(), 0),
         ("LongExpired".to_string(), 0),
@@ -503,6 +592,7 @@ fn event_topics_for_emitter_role(role: &str) -> Vec<String> {
             margin_trade_executed_topic0(),
             account_settled_topic0(),
             physical_topic0(COVERED_FILL_SIGNATURE),
+            physical_topic0(PHYSICAL_FEE_PAID_SIGNATURE),
             physical_topic0(PHYSICAL_EXERCISE_SIGNATURE),
             physical_topic0(LONG_WAIVED_SIGNATURE),
             physical_topic0(LONG_EXPIRED_SIGNATURE),
@@ -572,11 +662,17 @@ where
             let actual = provider.block_hash(previous.last_indexed_block).await?;
             if actual.as_deref() != Some(expected) {
                 let repository = state.repository.as_ref().ok_or_else(|| {
-                    BackendError::Indexer("canonical Options reorg requires persistent store".into())
+                    BackendError::Indexer(
+                        "canonical Options reorg requires persistent store".into(),
+                    )
                 })?;
-                repository.rewind_option_execution_events(
-                    &config.cursor_id(), state.chain_id, config.from_block,
-                ).await?;
+                repository
+                    .rewind_option_execution_events(
+                        &config.cursor_id(),
+                        state.chain_id,
+                        config.from_block,
+                    )
+                    .await?;
                 cursor = None;
             }
         }
@@ -646,11 +742,17 @@ where
     let events_decoded = events.len();
     let block_hash_after = provider.block_hash(to_block).await?;
     if block_hash_before != block_hash_after {
-        return Err(BackendError::Indexer("Options chain changed while indexing".into()));
+        return Err(BackendError::Indexer(
+            "Options chain changed while indexing".into(),
+        ));
     }
     let events_indexed = persist_option_execution_events_and_cursor(
-        state, &events, to_block, block_hash_after.as_deref(),
-    ).await?;
+        state,
+        &events,
+        to_block,
+        block_hash_after.as_deref(),
+    )
+    .await?;
 
     let result = OptionEventIndexerTickResult {
         enabled: true,
@@ -809,6 +911,9 @@ pub fn decode_option_execution_event(
     if topic0.eq_ignore_ascii_case(&account_settled_topic0()) {
         return decode_account_settled_log(log, chain_id).map(Some);
     }
+    if topic0.eq_ignore_ascii_case(&physical_topic0(PHYSICAL_FEE_PAID_SIGNATURE)) {
+        return decode_physical_fee_log(log, chain_id).map(Some);
+    }
     for (name, signature, has_two_amounts) in [
         ("CoveredFill", COVERED_FILL_SIGNATURE, true),
         ("PhysicalExercise", PHYSICAL_EXERCISE_SIGNATURE, true),
@@ -909,11 +1014,15 @@ pub fn decode_option_execution_event(
 
 fn decode_account_settled_log(log: &EthLog, chain_id: u64) -> Result<OptionExecutionEvent> {
     if log.topics.len() != 3 {
-        return Err(BackendError::Indexer("AccountSettled requires three topics".into()));
+        return Err(BackendError::Indexer(
+            "AccountSettled requires three topics".into(),
+        ));
     }
     let data = decode_hex_bytes(&log.data)?;
     if data.len() != 4 * 32 {
-        return Err(BackendError::Indexer("AccountSettled requires four ABI words".into()));
+        return Err(BackendError::Indexer(
+            "AccountSettled requires four ABI words".into(),
+        ));
     }
     let trader = decode_topic_address(&log.topics[1])?;
     let option_id = decode_topic_u256(&log.topics[2])?.to_string();
@@ -927,8 +1036,19 @@ fn decode_account_settled_log(log: &EthLog, chain_id: u64) -> Result<OptionExecu
         "paidToTrader": decode_data_u256(&data, 2)?.to_string(),
         "badDebt": decode_data_u256(&data, 3)?.to_string(),
     });
-    option_event_from_decoded_fields(log, chain_id, "AccountSettled", ACCOUNT_SETTLED_SIGNATURE,
-        None, None, Some(trader), Some(option_id), None, None, decoded)
+    option_event_from_decoded_fields(
+        log,
+        chain_id,
+        "AccountSettled",
+        ACCOUNT_SETTLED_SIGNATURE,
+        None,
+        None,
+        Some(trader),
+        Some(option_id),
+        None,
+        None,
+        decoded,
+    )
 }
 
 fn decode_physical_lifecycle_log(
@@ -939,12 +1059,16 @@ fn decode_physical_lifecycle_log(
     has_two_amounts: bool,
 ) -> Result<OptionExecutionEvent> {
     if log.topics.len() != 4 {
-        return Err(BackendError::Indexer(format!("{name} requires four topics")));
+        return Err(BackendError::Indexer(format!(
+            "{name} requires four topics"
+        )));
     }
     let data = decode_hex_bytes(&log.data)?;
     let expected_words = if has_two_amounts { 3 } else { 2 };
     if data.len() != expected_words * 32 {
-        return Err(BackendError::Indexer(format!("{name} requires {expected_words} ABI words")));
+        return Err(BackendError::Indexer(format!(
+            "{name} requires {expected_words} ABI words"
+        )));
     }
     let option_id = decode_topic_u256(&log.topics[1])?.to_string();
     let buyer = decode_topic_address(&log.topics[2])?;
@@ -970,8 +1094,56 @@ fn decode_physical_lifecycle_log(
         })
     };
     option_event_from_decoded_fields(
-        log, chain_id, name, signature, Some(buyer), Some(seller), None,
-        Some(option_id), Some(quantity), None, decoded,
+        log,
+        chain_id,
+        name,
+        signature,
+        Some(buyer),
+        Some(seller),
+        None,
+        Some(option_id),
+        Some(quantity),
+        None,
+        decoded,
+    )
+}
+
+fn decode_physical_fee_log(log: &EthLog, chain_id: u64) -> Result<OptionExecutionEvent> {
+    if log.topics.len() != 4 {
+        return Err(BackendError::Indexer(
+            "PhysicalFeePaid requires four topics".into(),
+        ));
+    }
+    let data = decode_hex_bytes(&log.data)?;
+    if data.len() != 4 * 32 {
+        return Err(BackendError::Indexer(
+            "PhysicalFeePaid requires four ABI words".into(),
+        ));
+    }
+    let option_id = decode_topic_u256(&log.topics[1])?.to_string();
+    let buyer = decode_topic_address(&log.topics[2])?;
+    let seller = decode_topic_address(&log.topics[3])?;
+    let quantity = decode_data_u256(&data, 0)?.to_string();
+    let buyer_fee = decode_data_u256(&data, 1)?.to_string();
+    let seller_fee = decode_data_u256(&data, 2)?.to_string();
+    let recipient = format!("0x{}", hex_lower(&data[3 * 32 + 12..4 * 32]));
+    let decoded = serde_json::json!({
+        "optionId": option_id, "buyer": buyer, "seller": seller,
+        "quantity": quantity, "buyerFee": buyer_fee, "sellerFee": seller_fee,
+        "recipient": recipient
+    });
+    option_event_from_decoded_fields(
+        log,
+        chain_id,
+        "PhysicalFeePaid",
+        PHYSICAL_FEE_PAID_SIGNATURE,
+        Some(buyer),
+        Some(seller),
+        None,
+        Some(option_id),
+        Some(quantity),
+        None,
+        decoded,
     )
 }
 
@@ -2200,20 +2372,35 @@ mod tests {
             topic_address("0000000000000000000000000000000000000001"),
             topic_address("0000000000000000000000000000000000000002"),
         ];
-        fill.data = format!("0x{}{}{}", word_no_prefix(2), word_no_prefix(200_000_000), word_no_prefix(2_000_000_000));
-        let event = decode_option_execution_event(&fill, 84532).unwrap().unwrap();
+        fill.data = format!(
+            "0x{}{}{}",
+            word_no_prefix(2),
+            word_no_prefix(200_000_000),
+            word_no_prefix(2_000_000_000)
+        );
+        let event = decode_option_execution_event(&fill, 84532)
+            .unwrap()
+            .unwrap();
         assert_eq!(event.event_name, "CoveredFill");
         assert_eq!(event.option_id.as_deref(), Some("7"));
         assert_eq!(event.quantity_contracts.as_deref(), Some("2"));
         assert_eq!(event.decoded.as_ref().unwrap()["premium"], "200000000");
-        assert_eq!(event.decoded.as_ref().unwrap()["lockedUnderlying"], "2000000000");
+        assert_eq!(
+            event.decoded.as_ref().unwrap()["lockedUnderlying"],
+            "2000000000"
+        );
         assert_eq!(event.log_index, 2);
 
         fill.topics[0] = physical_topic0(LONG_EXPIRED_SIGNATURE);
         fill.data = format!("0x{}{}", word_no_prefix(2), word_no_prefix(2_000_000_000));
-        let expired = decode_option_execution_event(&fill, 84532).unwrap().unwrap();
+        let expired = decode_option_execution_event(&fill, 84532)
+            .unwrap()
+            .unwrap();
         assert_eq!(expired.event_name, "LongExpired");
-        assert_eq!(expired.decoded.as_ref().unwrap()["underlyingReturned"], "2000000000");
+        assert_eq!(
+            expired.decoded.as_ref().unwrap()["underlyingReturned"],
+            "2000000000"
+        );
         fill.data.push_str(&word_no_prefix(1));
         assert!(decode_option_execution_event(&fill, 84532).is_err());
     }
@@ -2222,23 +2409,45 @@ mod tests {
     async fn same_raw_option_id_is_indexed_from_both_matching_emitters() {
         let mut state = state_with_event_indexer(true, 0, 20, 0);
         let secondary_matching = "0x00000000000000000000000000000000000000ef";
-        state.option_event_indexer_config.secondary_matching_engine_address =
-            Some(AccountId::new(secondary_matching));
-        state.option_event_indexer_config.secondary_margin_engine_address =
+        state
+            .option_event_indexer_config
+            .secondary_matching_engine_address = Some(AccountId::new(secondary_matching));
+        state
+            .option_event_indexer_config
+            .secondary_margin_engine_address =
             Some(AccountId::new("0x00000000000000000000000000000000000000ab"));
         let mut secondary = option_trade_log(10, 3);
         secondary.address = secondary_matching.to_string();
         let provider = MockEventLogProvider::new(20, vec![option_trade_log(10, 2), secondary]);
-        let result = index_option_events_with_provider(&state, &provider).await.unwrap();
+        let result = index_option_events_with_provider(&state, &provider)
+            .await
+            .unwrap();
         assert_eq!(result.events_indexed, 2);
-        let events = state.options_store.lock().unwrap().list_option_execution_events(10);
+        let events = state
+            .options_store
+            .lock()
+            .unwrap()
+            .list_option_execution_events(10);
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].option_id, events[1].option_id);
-        assert_ne!(state.option_event_indexer_config.position_stack_index(&events[0]),
-                   state.option_event_indexer_config.position_stack_index(&events[1]));
-        assert!(state.option_event_indexer_config.cursor_id().contains("_dual_"));
-        assert!(state.options_store.lock().unwrap()
-            .get_option_event_indexer_state(&state.option_event_indexer_config.cursor_id()).is_some());
+        assert_ne!(
+            state
+                .option_event_indexer_config
+                .position_stack_index(&events[0]),
+            state
+                .option_event_indexer_config
+                .position_stack_index(&events[1])
+        );
+        assert!(state
+            .option_event_indexer_config
+            .cursor_id()
+            .contains("_dual_"));
+        assert!(state
+            .options_store
+            .lock()
+            .unwrap()
+            .get_option_event_indexer_state(&state.option_event_indexer_config.cursor_id())
+            .is_some());
     }
 
     #[derive(Clone)]

@@ -243,10 +243,15 @@ async fn physical_product_browser_exercises_and_releases() {
     let watcher = tokio::spawn(async move {
         let client = reqwest::Client::new();
         for _ in 0..240 {
-            if let Some(intent) = watcher_repo
-                .list_option_execution_intents()
-                .await
-                .unwrap()
+            let intents = match watcher_repo.list_option_execution_intents().await {
+                Ok(intents) => intents,
+                Err(error) if error.to_string().contains("pool timed out") => {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    continue;
+                }
+                Err(error) => panic!("physical intent watcher failed: {error}"),
+            };
+            if let Some(intent) = intents
                 .into_iter()
                 .find(|intent| intent.calldata.is_some())
             {
@@ -300,6 +305,7 @@ async fn physical_product_browser_exercises_and_releases() {
         .parent()
         .unwrap()
         .join("deopt-v2-frontend");
+    let pre_trade_snapshot = rpc(&rpc_url, "evm_snapshot", serde_json::json!([])).await;
     let output = tokio::task::spawn_blocking(move || {
         std::process::Command::new("npx")
             .current_dir(front)
@@ -358,6 +364,9 @@ async fn physical_product_browser_exercises_and_releases() {
         .await
         .unwrap();
     assert!(events.iter().any(|event| event.event_name == "CoveredFill"));
+    assert!(events
+        .iter()
+        .any(|event| event.event_name == "PhysicalFeePaid"));
     let legacy_vault_after = token_balance(
         &std::env::var("OPTIONS_V18_RPC_URL").unwrap(),
         &legacy_series.settlement_asset,
@@ -366,6 +375,33 @@ async fn physical_product_browser_exercises_and_releases() {
     .await;
     assert_eq!(legacy_vault_before, legacy_vault_after);
     println!("V19_LEGACY_VAULT_UNCHANGED=PASS");
+    assert_eq!(
+        rpc(
+            &std::env::var("OPTIONS_V18_RPC_URL").unwrap(),
+            "evm_revert",
+            serde_json::json!([pre_trade_snapshot])
+        )
+        .await,
+        serde_json::json!(true)
+    );
+    rpc(
+        &std::env::var("OPTIONS_V18_RPC_URL").unwrap(),
+        "anvil_mine",
+        serde_json::json!(["0x40"]),
+    )
+    .await;
+    let provider = HttpJsonRpcProvider::new(std::env::var("OPTIONS_V18_RPC_URL").unwrap());
+    index_option_events_with_provider(&state, &provider)
+        .await
+        .expect("reindex canonical blocks after fee receipt reorg");
+    assert!(
+        repo.list_option_execution_events_by_tx_hash(&trade_hash)
+            .await
+            .unwrap()
+            .is_empty(),
+        "orphaned fee/fill receipt remains indexed"
+    );
+    println!("V20_PHYSICAL_FEE_REORG=PASS");
     println!("V19_PLAYWRIGHT_PRODUCT=PASS");
     println!("{}", String::from_utf8_lossy(&output.stdout));
 }
