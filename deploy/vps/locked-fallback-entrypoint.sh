@@ -1,5 +1,5 @@
 #!/bin/sh
-# Schema-74 emergency read-only API posture. Wallet reads remain authenticated.
+# Schema-75 emergency read-only API posture. Wallet reads remain authenticated.
 set -eu
 export DEOPT_READ_ONLY_RELEASE=true
 export EXECUTION_ENABLED=false
