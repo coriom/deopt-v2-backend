@@ -83,6 +83,7 @@ pub struct PhysicalStackData {
     max_open_contracts: String,
     matching_engine_bound: bool,
     economic_state: &'static str,
+    series: Vec<crate::options::physical_series_indexer::PhysicalSeriesProjection>,
 }
 
 #[derive(Default)]
@@ -347,19 +348,13 @@ pub async fn physical_stack_read(
     let max_open_contracts = read_word!(engine, "maxOpenContracts()");
     let matching_engine_bound = read_word!(engine, "matchingEngine()") != U256::ZERO;
     let series_bound = read_word!(engine, "seriesBound()") != U256::ZERO;
-    let physical_series: Vec<_> = repo
-        .list_option_series()
-        .await
-        .map_err(|_| unavailable("Options series projection unavailable"))?
-        .into_iter()
-        .filter(|series| {
-            series.onchain_chain_id == Some(state.chain_id)
-                && series
-                    .onchain_registry_address
-                    .as_deref()
-                    .is_some_and(|address| address.eq_ignore_ascii_case(&registry.0))
-        })
-        .collect();
+    let physical_series = crate::options::physical_series_indexer::list_physical_series(
+        repo.pool(),
+        state.chain_id,
+        &registry.0,
+    )
+    .await
+    .map_err(|_| unavailable("physical series projection unavailable"))?;
     let indexed_series = physical_series.len();
     let series_consistent = if total_series == U256::ZERO {
         indexed_series == 0
@@ -415,18 +410,31 @@ pub async fn physical_stack_read(
                         Address::from_str(&db_series.settlement_asset).ok() == Some(value)
                     })
                 && U256::from_be_slice(&series.output[64..96]) == U256::from(db_series.expiry)
-                && U256::from_be_slice(&series.output[96..128]) == U256::from(db_series.strike_1e8)
-                && U256::from_be_slice(&series.output[128..160])
-                    == U256::from(db_series.contract_size_1e8)
+                && U256::from_str(&db_series.strike_1e8).ok()
+                    == Some(U256::from_be_slice(&series.output[96..128]))
+                && U256::from_str(&db_series.contract_size_1e8).ok()
+                    == Some(U256::from_be_slice(&series.output[128..160]))
                 && U256::from_be_slice(&series.output[160..192])
                     == U256::from(db_series.is_call as u8)
                 && U256::from_be_slice(&series.output[192..224]) == U256::from(1)
                 && U256::from_be_slice(&series.output[7 * 32..8 * 32]) == U256::from(1)
                 && U256::from_be_slice(&series.output[8 * 32..9 * 32]) == U256::ZERO
                 && indexed_series == 1
-                && db_series.onchain_series_id.as_deref() == Some(option_id_text.as_str())
-                && canonical_id.as_deref() == Some(db_series.option_series_id.as_str())
-                && db_series.status == crate::options::OptionSeriesStatus::Disabled
+                && db_series.option_id == option_id_text
+                && canonical_id.as_deref() == Some(db_series.series_id.as_str())
+                && !db_series.is_active
+                && db_series.last_block_number
+                    <= rpc
+                        .block_number()
+                        .await
+                        .map_err(|_| unavailable("chain head unavailable"))?
+                        .saturating_sub(state.option_event_indexer_config.confirmation_blocks)
+                && rpc
+                    .block_hash(db_series.last_block_number)
+                    .await
+                    .map_err(|_| unavailable("series canonical block unavailable"))?
+                    .as_deref()
+                    == Some(db_series.last_block_hash.as_str())
         }
     } else {
         false
@@ -454,6 +462,7 @@ pub async fn physical_stack_read(
             max_open_contracts: max_open_contracts.to_string(),
             matching_engine_bound,
             economic_state: if inactive { "inactive" } else { "unverified" },
+            series: physical_series,
         },
         warnings: if inactive {
             Vec::new()

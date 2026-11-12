@@ -6,6 +6,8 @@ repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 sol=$(cd -- "$repo/../deopt-v2-sol" && pwd)
 front=$(cd -- "$repo/../deopt-v2-frontend" && pwd)
 browser=${OPTIONS_V19_PRODUCT:-0}
+inactive_series=${OPTIONS_V28_INACTIVE_SERIES:-0}
+if [[ "$inactive_series" == 1 ]]; then browser=1; fi
 port=${OPTIONS_V18_ANVIL_PORT:-18546}
 pg_port=${OPTIONS_V18_PG_PORT:-15433}
 frontend_port=${OPTIONS_V19_FRONTEND_PORT:-13001}
@@ -86,6 +88,55 @@ if [[ "$browser" == 1 ]]; then
     script/OptionsLocalAnvilE2E.s.sol:OptionsLocalAnvilE2E --rpc-url "$url" --broadcast --slow > "$log" 2>&1) \
     || { tail -n 25 "$log" >&2; exit 1; }
   export OPTIONS_V19_LEGACY_BROADCAST="$sol/broadcast/OptionsLocalAnvilE2E.s.sol/84532/run-latest.json"
+fi
+if [[ "$inactive_series" == 1 ]]; then
+  (cd "$sol" && OPTIONS_V28_DEPLOY_ONLY=true forge script \
+    script/OptionsInactiveLocalAnvilV28.s.sol:OptionsInactiveLocalAnvilV28 \
+    --rpc-url "$url" --broadcast --slow > "$log" 2>&1) \
+    || { tail -n 35 "$log" >&2; exit 1; }
+  artifact="$sol/broadcast/OptionsInactiveLocalAnvilV28.s.sol/84532/run-latest.json"
+  readarray -t deployed_v28 < <(python3 - "$artifact" <<'PY'
+import json,sys
+tx=json.load(open(sys.argv[1]))['transactions']
+def made(name): return [x['contractAddress'] for x in tx if x.get('contractName')==name and x.get('transactionType')=='CREATE']
+legacy,physical=made('OptionProductRegistry')
+engine,=made('CoveredCallMarginEngine')
+matcher,=made('OptionMatchingEngine')
+owner,=made('LocalInactiveSeriesOwnerV28')
+weth,usdc=made('CoveredLocalTokenV18')
+print(legacy);print(physical);print(engine);print(matcher);print(owner);print(weth);print(usdc)
+PY
+  )
+  export OPTIONS_V28_LEGACY_REGISTRY=${deployed_v28[0]}
+  export OPTIONS_V28_PHYSICAL_REGISTRY=${deployed_v28[1]}
+  export OPTIONS_V28_ENGINE=${deployed_v28[2]}
+  export OPTIONS_V28_MATCHER=${deployed_v28[3]}
+  export OPTIONS_V28_OWNER=${deployed_v28[4]}
+  export OPTIONS_V28_WETH=${deployed_v28[5]}
+  export OPTIONS_V28_USDC=${deployed_v28[6]}
+  export OPTIONS_V28_EXPIRY=$(sed -n 's/^.*V28_EXPIRY[[:space:]]*//p' "$log" | tail -n 1 | tr -d '[:space:]')
+  export OPTIONS_V28_OPTION_ID=$(sed -n 's/^.*V28_LEGACY_ID[[:space:]]*//p' "$log" | tail -n 1 | tr -d '[:space:]')
+  export OPTIONS_V18_RPC_URL="$url" OPTIONS_V18_PG_URL="postgres://postgres:deopt-local-test-only@127.0.0.1:$pg_port/deopt_options_v18"
+  export OPTIONS_V19_FRONTEND_PORT="$frontend_port" OPTIONS_V19_API_PORT="$api_port"
+  (cd "$front" && exec setsid env DEOPT_BACKEND_HTTPS_ORIGIN="http://127.0.0.1:$api_port" \
+    NEXT_PUBLIC_TRADING_API_BASE_URL="http://127.0.0.1:$api_port" \
+    NEXT_PUBLIC_CHAIN_ENV=sepolia NEXT_PUBLIC_OPTIONS_PHYSICAL_READS_ENABLED=1 \
+    NEXT_PUBLIC_OPTIONS_LEGACY_REGISTRY="$OPTIONS_V28_LEGACY_REGISTRY" \
+    NEXT_PUBLIC_OPTIONS_PHYSICAL_REGISTRY="$OPTIONS_V28_PHYSICAL_REGISTRY" \
+    NEXT_PUBLIC_OPTIONS_PHYSICAL_ENGINE="$OPTIONS_V28_ENGINE" \
+    NEXT_PUBLIC_OPTIONS_PHYSICAL_UNDERLYING="$OPTIONS_V28_WETH" \
+    NEXT_PUBLIC_OPTIONS_PHYSICAL_QUOTE="$OPTIONS_V28_USDC" \
+    npm run dev -- --hostname 127.0.0.1 --port "$frontend_port") \
+    >"/tmp/deopt-options-v28-next-$$.log" 2>&1 &
+  frontend_pid=$!
+  for _ in {1..90}; do
+    if curl -fsS "http://127.0.0.1:$frontend_port/options" >/dev/null 2>&1; then break; fi
+    kill -0 "$frontend_pid" 2>/dev/null || { echo 'Next.js exited' >&2; exit 1; }
+    sleep 1
+  done
+  (cd "$repo" && CARGO_BUILD_JOBS=1 cargo test --test options_v28_inactive_series -- --ignored --nocapture)
+  echo 'V28_INACTIVE_SERIES_E2E=PASS'
+  exit 0
 fi
 (cd "$sol" && OPTIONS_V19_DEPLOY_ONLY="$( [[ "$browser" == 1 ]] && echo true || echo false )" forge script script/OptionsCoveredLocalAnvilV18.s.sol:OptionsCoveredLocalAnvilV18 --rpc-url "$url" --broadcast --slow > "$log" 2>&1) || { tail -n 25 "$log" >&2; exit 1; }
 artifact="$sol/broadcast/OptionsCoveredLocalAnvilV18.s.sol/84532/run-latest.json"

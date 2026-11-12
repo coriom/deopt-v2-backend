@@ -654,6 +654,10 @@ where
         });
     }
 
+    // Registry metadata has a separate confirmed cursor and projection. The
+    // read-only physical stack is never inferred from fills or manual rows.
+    super::physical_series_indexer::index_physical_series_with_provider(state, provider).await?;
+
     let current_block_number = provider.block_number().await?;
     let safe_head = current_block_number.saturating_sub(config.confirmation_blocks);
     let mut cursor = get_option_event_indexer_state(state).await?;
