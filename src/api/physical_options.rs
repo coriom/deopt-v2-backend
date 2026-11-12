@@ -66,7 +66,7 @@ pub struct PhysicalPositionsData {
     positions: Vec<PhysicalPosition>,
 }
 
-/// Public read-only view of the isolated stack before its first series exists.
+/// Public read-only view of the isolated stack, including one inactive series.
 /// A database row alone is never treated as evidence that trading is live.
 #[derive(Serialize)]
 pub struct PhysicalStackData {
@@ -347,7 +347,7 @@ pub async fn physical_stack_read(
     let max_open_contracts = read_word!(engine, "maxOpenContracts()");
     let matching_engine_bound = read_word!(engine, "matchingEngine()") != U256::ZERO;
     let series_bound = read_word!(engine, "seriesBound()") != U256::ZERO;
-    let indexed_series = repo
+    let physical_series: Vec<_> = repo
         .list_option_series()
         .await
         .map_err(|_| unavailable("Options series projection unavailable"))?
@@ -359,13 +359,82 @@ pub async fn physical_stack_read(
                     .as_deref()
                     .is_some_and(|address| address.eq_ignore_ascii_case(&registry.0))
         })
-        .count();
-    if total_series == U256::ZERO && indexed_series != 0 {
-        return Err(unavailable("indexed physical series absent on-chain"));
-    }
-    let inactive = total_series == U256::ZERO
-        && indexed_series == 0
+        .collect();
+    let indexed_series = physical_series.len();
+    let series_consistent = if total_series == U256::ZERO {
+        indexed_series == 0
+    } else if total_series == U256::from(1) {
+        // One-series closed beta only. Check Registry storage directly before
+        // treating a PostgreSQL row as canonical or declaring the stack inert.
+        let ids = rpc
+            .eth_call(EthCallRequest {
+                from: from.clone(),
+                to: registry.clone(),
+                data: selector("getAllOptionIds()"),
+                value: 0,
+                gas_limit: None,
+            })
+            .await
+            .map_err(|_| unavailable("physical series IDs unavailable"))?;
+        if ids.output.len() != 96
+            || U256::from_be_slice(&ids.output[..32]) != U256::from(32)
+            || U256::from_be_slice(&ids.output[32..64]) != U256::from(1)
+        {
+            false
+        } else {
+            let option_id = U256::from_be_slice(&ids.output[64..96]);
+            let mut data = selector("getSeries(uint256)");
+            data.extend_from_slice(&option_id.to_be_bytes::<32>());
+            let series = rpc
+                .eth_call(EthCallRequest {
+                    from: from.clone(),
+                    to: registry.clone(),
+                    data,
+                    value: 0,
+                    gas_limit: None,
+                })
+                .await
+                .map_err(|_| unavailable("physical series state unavailable"))?;
+            let option_id_text = option_id.to_string();
+            let db_series = &physical_series[0];
+            let canonical_id = crate::options::onchain_option_series_key(
+                state.chain_id,
+                &registry.0,
+                &option_id_text,
+            )
+            .ok();
+            series.output.len() == 9 * 32
+                && word_address(U256::from_be_slice(&series.output[..32]))
+                    .ok()
+                    .is_some_and(|value| {
+                        Address::from_str(&db_series.underlying).ok() == Some(value)
+                    })
+                && word_address(U256::from_be_slice(&series.output[32..64]))
+                    .ok()
+                    .is_some_and(|value| {
+                        Address::from_str(&db_series.settlement_asset).ok() == Some(value)
+                    })
+                && U256::from_be_slice(&series.output[64..96]) == U256::from(db_series.expiry)
+                && U256::from_be_slice(&series.output[96..128]) == U256::from(db_series.strike_1e8)
+                && U256::from_be_slice(&series.output[128..160])
+                    == U256::from(db_series.contract_size_1e8)
+                && U256::from_be_slice(&series.output[160..192])
+                    == U256::from(db_series.is_call as u8)
+                && U256::from_be_slice(&series.output[192..224]) == U256::from(1)
+                && U256::from_be_slice(&series.output[7 * 32..8 * 32]) == U256::from(1)
+                && U256::from_be_slice(&series.output[8 * 32..9 * 32]) == U256::ZERO
+                && indexed_series == 1
+                && db_series.onchain_series_id.as_deref() == Some(option_id_text.as_str())
+                && canonical_id.as_deref() == Some(db_series.option_series_id.as_str())
+                && db_series.status == crate::options::OptionSeriesStatus::Disabled
+        }
+    } else {
+        false
+    };
+    let inactive = series_consistent
+        && (total_series == U256::ZERO || registry_paused)
         && engine_paused
+        && (total_series == U256::ZERO || matcher_paused)
         && max_open_contracts == U256::ZERO
         && !matching_engine_bound
         && !series_bound;
@@ -391,7 +460,7 @@ pub async fn physical_stack_read(
         } else {
             vec![Warning {
                 code: "PHYSICAL_STACK_STATE_UNVERIFIED".into(),
-                message: "Physical stack is no longer in its initial inactive state".into(),
+                message: "Physical stack or series projection is not verified inactive".into(),
                 details: serde_json::json!({}),
             }]
         },
