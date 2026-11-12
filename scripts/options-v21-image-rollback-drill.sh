@@ -124,6 +124,10 @@ start_api() {
     -e DATABASE_URL='postgres://deopt_readonly:deopt-local-test-only@postgres:5432/deopt_readonly' \
     -e WALLET_READ_AUTH_ENABLED=true -e WALLET_READ_AUTH_ORIGIN=https://deoptv2-frontend.vercel.app \
     -e OPTIONS_ENABLED=false -e EXECUTION_ENABLED=false -e INDEXER_ENABLED=false \
+    -e EXECUTOR_REAL_BROADCAST_ENABLED=false -e HV2_BROADCAST_ENABLED=false \
+    -e PERPS_PUBLIC_TRADING_ENABLED=false -e PERPS_CLOSED_TEST_ENABLED=false \
+    -e OPTION_EXECUTION_ENABLED=false -e OPTION_EXECUTION_BROADCAST_ENABLED=false \
+    -e OPTION_EVENT_INDEXER_ENABLED=false \
     "$image" >/dev/null
   for _ in {1..50}; do
     curl --fail --silent "http://127.0.0.1:$port/ready" >/dev/null && return 0
