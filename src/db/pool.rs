@@ -32,9 +32,9 @@ pub async fn verify_read_only_schema(pool: &PgPool) -> Result<()> {
     .fetch_one(pool)
     .await
     .map_err(|error| BackendError::Persistence(error.to_string()))?;
-    if (applied, highest, failed) != (74, 74, 0) {
+    if (applied, highest, failed) != (75, 75, 0) {
         return Err(BackendError::Persistence(
-            "Options V20 read-only release requires exactly 74 successful migrations".into(),
+            "Options V29 read-only release requires exactly 75 successful migrations".into(),
         ));
     }
     Ok(())

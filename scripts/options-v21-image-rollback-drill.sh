@@ -3,28 +3,52 @@
 set -euo pipefail
 set +x
 umask 077
-[[ $# == 2 ]] || { echo 'usage: ciphertext expected-sha256' >&2; exit 2; }
-ciphertext=$1 expected=$2
-[[ "$ciphertext" == /* && -f "$ciphertext" && ! -L "$ciphertext" &&
-   "$(stat -c %a "$ciphertext")" == 600 && "$expected" =~ ^[0-9a-f]{64}$ &&
-   "$(sha256sum "$ciphertext" | cut -d' ' -f1)" == "$expected" ]] || exit 2
-[[ "${GNUPGHOME:-}" == /home/corio/.local/share/deopt-backup-gpg ]] || exit 2
+[[ $# == 2 ]] || { echo 'usage: ciphertext expected-sha256 | --restored-volume local-volume' >&2; exit 2; }
+restored_volume=''
+if [[ "$1" == --restored-volume ]]; then
+  [[ "$2" =~ ^[a-zA-Z0-9_-]+$ ]] || exit 2
+  restored_volume=$2
+  docker volume inspect "$restored_volume" >/dev/null
+  [[ -z "$(docker ps -q --filter "volume=$restored_volume")" ]] || { echo 'SOURCE_VOLUME_IN_USE' >&2; exit 2; }
+else
+  ciphertext=$1 expected=$2
+  [[ "$ciphertext" == /* && -f "$ciphertext" && ! -L "$ciphertext" &&
+     "$(stat -c %a "$ciphertext")" == 600 && "$expected" =~ ^[0-9a-f]{64}$ &&
+     "$(sha256sum "$ciphertext" | cut -d' ' -f1)" == "$expected" ]] || exit 2
+  [[ "${GNUPGHOME:-}" == /home/corio/.local/share/deopt-backup-gpg ]] || exit 2
+fi
 [[ "$(hostname -s)" != v2202611448349549977 ]] || exit 2
-for tool in docker gpg python3 curl cast openssl; do command -v "$tool" >/dev/null || exit 2; done
-gpg --batch --quiet --decrypt --output /dev/null "$ciphertext" 2>/dev/null || {
-  echo 'LOCAL_GPG_UNLOCK_REQUIRED' >&2; exit 2;
-}
+candidate_image=${OPTIONS_SCHEMA_CANDIDATE_IMAGE:-deopt-v21-candidate:local}
+rollback_image=${OPTIONS_SCHEMA_ROLLBACK_IMAGE:-deopt-v21-rollback:local}
+rollback_entry=${OPTIONS_SCHEMA_ROLLBACK_ENTRY-/usr/local/bin/deopt-readonly-entrypoint}
+expected_migrations=${OPTIONS_SCHEMA_EXPECTED_MIGRATIONS:-74}
+[[ "$expected_migrations" =~ ^(74|75)$ ]] || exit 2
+for tool in docker python3 curl cast openssl; do command -v "$tool" >/dev/null || exit 2; done
+if [[ -z "$restored_volume" ]]; then
+  command -v gpg >/dev/null || exit 2
+  gpg --batch --quiet --decrypt --output /dev/null "$ciphertext" 2>/dev/null || {
+    echo 'LOCAL_GPG_UNLOCK_REQUIRED' >&2; exit 2;
+  }
+fi
 tag="deopt-v21-drill-$$"
 network="$tag-net"
 pg="$tag-pg"
 api="$tag-api"
 work=$(mktemp -d /tmp/deopt-v21-drill.XXXXXX)
+clone_volume=''
 cleanup() {
   docker rm -f "$api" "$pg" >/dev/null 2>&1 || true
   docker network rm "$network" >/dev/null 2>&1 || true
+  [[ -z "$clone_volume" ]] || docker volume rm "$clone_volume" >/dev/null 2>&1 || true
   rm -rf -- "$work"
 }
 trap cleanup EXIT
+if [[ -n "$restored_volume" ]]; then
+  clone_volume="$tag-data"
+  docker volume create "$clone_volume" >/dev/null
+  docker run --rm -v "$restored_volume:/src:ro" -v "$clone_volume:/dst" busybox:musl \
+    sh -c 'test "$(cat /src/PG_VERSION)" = 16 && cp -a /src/. /dst/' >/dev/null
+fi
 port=$(python3 - <<'PY'
 import socket
 with socket.socket() as sock:
@@ -33,7 +57,9 @@ with socket.socket() as sock:
 PY
 )
 docker network create "$network" >/dev/null
-docker run --rm -d --name "$pg" --network "$network" --network-alias postgres \
+pg_volume_flags=()
+[[ -z "$clone_volume" ]] || pg_volume_flags=(-v "$clone_volume:/var/lib/postgresql/data")
+docker run --rm -d --name "$pg" --network "$network" --network-alias postgres "${pg_volume_flags[@]}" \
   --memory 768m --cpus 1 -e POSTGRES_PASSWORD=deopt-local-test-only \
   -e POSTGRES_DB=deopt_readonly postgres:16 -c fsync=off -c synchronous_commit=off >/dev/null
 for _ in {1..60}; do
@@ -41,17 +67,22 @@ for _ in {1..60}; do
   sleep 1
 done
 docker exec "$pg" pg_isready -U postgres -d deopt_readonly >/dev/null
-gpg --batch --quiet --decrypt --output - "$ciphertext" |
-  docker exec -i "$pg" pg_restore --single-transaction --exit-on-error --no-owner --no-acl \
-    -U postgres -d deopt_readonly >/dev/null
-sql() { docker exec "$pg" psql -X -q -A -t -v ON_ERROR_STOP=1 -U postgres -d deopt_readonly -c "$1"; }
+if [[ -z "$restored_volume" ]]; then
+  gpg --batch --quiet --decrypt --output - "$ciphertext" |
+    docker exec -i -u postgres "$pg" pg_restore --single-transaction --exit-on-error --no-owner --no-acl \
+      -U postgres -d deopt_readonly >/dev/null
+fi
+sql() { docker exec -u postgres "$pg" psql -X -q -A -t -v ON_ERROR_STOP=1 -U postgres -d deopt_readonly -c "$1"; }
 baseline=$(sql 'SELECT COUNT(*) FROM _sqlx_migrations')
 [[ "$baseline" == 72 ]] || { echo "BASELINE_MIGRATIONS=$baseline" >&2; exit 2; }
+if [[ -n "$restored_volume" ]]; then
+  sql "ALTER ROLE postgres PASSWORD 'deopt-local-test-only'" >/dev/null
+fi
 fingerprint() {
   python3 - "$pg" <<'PY'
 import hashlib, subprocess, sys
 container=sys.argv[1]
-base=['docker','exec',container,'psql','-X','-q','-A','-t','-v','ON_ERROR_STOP=1','-U','postgres','-d','deopt_readonly','-c']
+base=['docker','exec','-u','postgres',container,'psql','-X','-q','-A','-t','-v','ON_ERROR_STOP=1','-U','postgres','-d','deopt_readonly','-c']
 def query(s): return subprocess.run(base+[s],check=True,capture_output=True,text=True).stdout.strip()
 tables=query("SELECT table_name FROM information_schema.tables WHERE table_schema='public' AND table_type='BASE TABLE' AND table_name NOT IN ('_sqlx_migrations','wallet_read_challenges','wallet_read_sessions','wallet_read_rate') ORDER BY table_name").splitlines()
 parts=[]
@@ -76,8 +107,8 @@ auth_before=$(auth_snapshot)
 db_url='postgres://postgres:deopt-local-test-only@postgres:5432/deopt_readonly'
 docker run --rm --network "$network" --memory 512m --cpus 1 \
   -e DATABASE_URL="$db_url" -e CHAIN_ID=84532 -e DEOPT_READ_ONLY_RELEASE=true \
-  deopt-v21-candidate:local --migrate-only >/dev/null
-[[ "$(sql 'SELECT COUNT(*) FROM _sqlx_migrations')" == 74 ]] || exit 2
+  "$candidate_image" --migrate-only >/dev/null
+[[ "$(sql 'SELECT COUNT(*) FROM _sqlx_migrations')" == "$expected_migrations" ]] || exit 2
 [[ "$(fingerprint)" == "$before" ]] || { echo 'HISTORICAL_DATA_CHANGED' >&2; exit 2; }
 sql "CREATE ROLE deopt_readonly LOGIN PASSWORD 'deopt-local-test-only'" >/dev/null
 sql 'GRANT CONNECT ON DATABASE deopt_readonly TO deopt_readonly; GRANT USAGE ON SCHEMA public TO deopt_readonly; GRANT SELECT, INSERT, UPDATE ON ALL TABLES IN SCHEMA public TO deopt_readonly; GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO deopt_readonly' >/dev/null
@@ -108,7 +139,7 @@ probe() {
   [[ "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" "http://127.0.0.1:$port/auth/wallet/session")" == 200 ]] || return 1
   [[ "$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$port/options/orders")" == 405 ]] || return 1
 }
-start_api deopt-v21-candidate:local ''
+start_api "$candidate_image" ''
 key="0x$(openssl rand -hex 32)"
 wallet=$(cast wallet address --private-key "$key")
 challenge=$(curl --fail --silent -H 'content-type: application/json' -d "{\"address\":\"$wallet\"}" "http://127.0.0.1:$port/auth/wallet/challenge")
@@ -122,18 +153,18 @@ token=$(printf '%s' "$verify" | python3 -c 'import json,sys;print(json.load(sys.
 unset challenge verify
 probe
 stop_api
-start_api deopt-v21-rollback:local /usr/local/bin/deopt-readonly-entrypoint
+start_api "$rollback_image" "$rollback_entry"
 probe
 stop_api
-start_api deopt-v21-candidate:local ''
+start_api "$candidate_image" ''
 probe
 stop_api
 unset token
-[[ "$(sql 'SELECT COUNT(*) FROM _sqlx_migrations')" == 74 ]] || exit 2
+[[ "$(sql 'SELECT COUNT(*) FROM _sqlx_migrations')" == "$expected_migrations" ]] || exit 2
 [[ "$(fingerprint)" == "$before" ]] || { echo 'HISTORICAL_DATA_CHANGED' >&2; exit 2; }
 [[ "$(auth_snapshot)" == "$auth_before" ]] || { echo 'HISTORICAL_AUTH_DATA_CHANGED' >&2; exit 2; }
 echo "REAL_BACKUP_BASELINE_MIGRATIONS=$baseline"
-echo 'SCHEMA_74_CANDIDATE_ROLLBACK_CANDIDATE=PASS'
+echo "SCHEMA_${expected_migrations}_CANDIDATE_ROLLBACK_CANDIDATE=PASS"
 echo 'WALLET_AUTH_PERSISTENCE=PASS'
 echo 'ECONOMIC_HTTP_WRITE_GUARD=PASS'
 echo "HISTORICAL_FINGERPRINT_PRESERVED=$before"

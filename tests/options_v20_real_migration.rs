@@ -3,6 +3,8 @@ use deopt_v2_backend::db::{pool, PgRepository};
 use deopt_v2_backend::options::{
     onchain_option_series_key, OptionSeries, OptionSeriesSource, OptionSeriesStatus,
 };
+use sqlx::migrate::Migrator;
+use std::{borrow::Cow, path::Path};
 
 #[tokio::test]
 #[ignore = "requires a verified, decrypted real backup in a disposable local PostgreSQL 16"]
@@ -25,19 +27,38 @@ async fn real_backup_migrates_to_dual_registry_schema() {
         .fetch_one(repo.pool())
         .await
         .expect("historical series");
-    repo.run_migrations()
+    let all = Migrator::new(Path::new("./migrations"))
         .await
-        .expect("migrate disposable database");
+        .expect("load repository migrations");
+    for target in 73..=75 {
+        let mut step = Migrator::new(Path::new("./migrations"))
+            .await
+            .expect("load migration step");
+        step.migrations = Cow::Owned(
+            all.migrations
+                .iter()
+                .filter(|m| m.version <= target)
+                .cloned()
+                .collect(),
+        );
+        step.run(repo.pool()).await.expect("apply migration step");
+        let max: (i64,) = sqlx::query_as("SELECT MAX(version)::bigint FROM _sqlx_migrations")
+            .fetch_one(repo.pool())
+            .await
+            .expect("migration version");
+        assert_eq!(max.0, target);
+    }
+    repo.run_migrations().await.expect("idempotent migrations");
     let after: (i64, i64) =
         sqlx::query_as("SELECT COUNT(*)::bigint, MAX(version)::bigint FROM _sqlx_migrations")
             .fetch_one(repo.pool())
             .await
             .expect("migrated versions");
-    assert_eq!(after.1, 74);
-    assert_eq!(after.0, 74);
+    assert_eq!(after.1, 75);
+    assert_eq!(after.0, 75);
     pool::verify_read_only_schema(repo.pool())
         .await
-        .expect("V20 read-only schema gate");
+        .expect("V29 read-only schema gate");
     let preserved: (i64,) = sqlx::query_as("SELECT COUNT(*)::bigint FROM option_series WHERE onchain_chain_id IS NULL AND onchain_registry_address IS NULL")
         .fetch_one(repo.pool()).await.expect("historical series preserved");
     assert_eq!(preserved.0, historical_count.0);
@@ -75,7 +96,7 @@ async fn real_backup_migrates_to_dual_registry_schema() {
     sqlx::query("DELETE FROM option_series WHERE onchain_chain_id=84532 AND onchain_series_id='1' AND onchain_registry_address IN ($1,$2)")
         .bind(first).bind(second).execute(repo.pool()).await.expect("remove disposable collision fixtures");
     println!(
-        "REAL_0074_MIGRATIONS={}; HISTORICAL_SERIES={}; COLLIDING_OPTION_IDS=2",
+        "REAL_0075_MIGRATIONS={}; HISTORICAL_SERIES={}; COLLIDING_OPTION_IDS=2",
         after.0, historical_count.0
     );
 }
