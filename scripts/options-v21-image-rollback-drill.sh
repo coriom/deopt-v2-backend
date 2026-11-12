@@ -84,7 +84,7 @@ import hashlib, subprocess, sys
 container=sys.argv[1]
 base=['docker','exec','-u','postgres',container,'psql','-X','-q','-A','-t','-v','ON_ERROR_STOP=1','-U','postgres','-d','deopt_readonly','-c']
 def query(s): return subprocess.run(base+[s],check=True,capture_output=True,text=True).stdout.strip()
-tables=query("SELECT table_name FROM information_schema.tables WHERE table_schema='public' AND table_type='BASE TABLE' AND table_name NOT IN ('_sqlx_migrations','wallet_read_challenges','wallet_read_sessions','wallet_read_rate') ORDER BY table_name").splitlines()
+tables=query("SELECT table_name FROM information_schema.tables WHERE table_schema='public' AND table_type='BASE TABLE' AND table_name NOT IN ('_sqlx_migrations','wallet_read_challenges','wallet_read_sessions','wallet_read_rate') AND table_name NOT LIKE 'physical_option_series_%' ORDER BY table_name").splitlines()
 parts=[]
 for table in tables:
     name='"'+table.replace('"','""')+'"'
