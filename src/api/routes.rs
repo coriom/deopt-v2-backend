@@ -769,6 +769,10 @@ pub fn router(state: AppState) -> Router {
             get(crate::api::trading::series_details),
         )
         .route(
+            "/options/physical-stack",
+            get(crate::api::physical_options::physical_stack_read),
+        )
+        .route(
             "/options/quotes/preview",
             get(crate::api::trading::quote_preview),
         )

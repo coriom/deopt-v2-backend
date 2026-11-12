@@ -828,6 +828,14 @@ impl AppConfig {
                 &mut lookup,
                 "OPTION_PHYSICAL_ENGINE_ADDRESS",
             )?,
+            physical_registry_address: parse_optional_address_env(
+                &mut lookup,
+                "OPTION_PHYSICAL_REGISTRY_ADDRESS",
+            )?,
+            physical_matching_engine_address: parse_optional_address_env(
+                &mut lookup,
+                "OPTION_PHYSICAL_MATCHING_ENGINE_ADDRESS",
+            )?,
         };
         // PERPS-MINIMAL-MARKET-AND-PRICE-V1 — read-only Perps market
         // registry + oracle price config. Off by default. Reuses

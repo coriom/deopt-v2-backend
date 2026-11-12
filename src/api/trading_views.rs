@@ -61,6 +61,10 @@ pub struct TradingViewsConfig {
     /// Covered-call engine for authenticated physical lot reads. Unset by
     /// default; this does not enable trade broadcast or public execution.
     pub physical_engine_address: Option<AccountId>,
+    /// Read-only addresses of the isolated covered-call stack. Never used
+    /// as execution targets by the economic write path.
+    pub physical_registry_address: Option<AccountId>,
+    pub physical_matching_engine_address: Option<AccountId>,
 }
 
 impl TradingViewsConfig {

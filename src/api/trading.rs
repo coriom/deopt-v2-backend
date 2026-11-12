@@ -5089,6 +5089,7 @@ mod tests {
             margin_engine_address: Some(AccountId::new(
                 "0x5555555555555555555555555555555555555555",
             )),
+            ..TradingViewsConfig::default()
         }
     }
 

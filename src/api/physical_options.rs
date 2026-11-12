@@ -6,6 +6,7 @@ use super::trading::{
 };
 use crate::execution::rpc::{
     EthCallProvider, EthCallRequest, EthLogsProvider, HttpJsonRpcProvider,
+    TransactionBroadcastProvider,
 };
 use crate::options::OptionExecutionEvent;
 use crate::types::AccountId;
@@ -63,6 +64,25 @@ pub struct PhysicalPositionsData {
     exercise_deadline: u64,
     chain_timestamp: u64,
     positions: Vec<PhysicalPosition>,
+}
+
+/// Public read-only view of the isolated stack before its first series exists.
+/// A database row alone is never treated as evidence that trading is live.
+#[derive(Serialize)]
+pub struct PhysicalStackData {
+    chain_id: u64,
+    registry: String,
+    engine: String,
+    matcher: String,
+    governance_owner: String,
+    series_count_onchain: String,
+    series_count_indexed: usize,
+    registry_paused: bool,
+    engine_paused: bool,
+    matcher_paused: bool,
+    max_open_contracts: String,
+    matching_engine_bound: bool,
+    economic_state: &'static str,
 }
 
 #[derive(Default)]
@@ -241,6 +261,144 @@ async fn chain_timestamp(rpc_url: &str) -> Result<u64, String> {
         .map_err(|_| "invalid chain timestamp".into())
 }
 
+pub async fn physical_stack_read(
+    State(state): State<AppState>,
+) -> Result<Json<Envelope<PhysicalStackData>>, TradingApiError> {
+    let unavailable = |reason: &str| {
+        TradingApiError::new(
+            TradingErrorCode::SourceUnavailable,
+            reason.to_owned(),
+            MetaBlock::new(&state, "physical_stack"),
+        )
+    };
+    if state.chain_id != 84532 {
+        return Err(unavailable(
+            "physical stack requires Base Sepolia chain identity",
+        ));
+    }
+    let cfg = &state.trading_views;
+    let registry = cfg
+        .physical_registry_address
+        .as_ref()
+        .ok_or_else(|| unavailable("physical Registry not configured"))?;
+    let engine = cfg
+        .physical_engine_address
+        .as_ref()
+        .ok_or_else(|| unavailable("physical engine not configured"))?;
+    let matcher = cfg
+        .physical_matching_engine_address
+        .as_ref()
+        .ok_or_else(|| unavailable("physical matcher not configured"))?;
+    let rpc_url = state
+        .execution_config
+        .rpc_url
+        .as_deref()
+        .ok_or_else(|| unavailable("RPC unavailable"))?;
+    let repo = state
+        .repository
+        .as_ref()
+        .ok_or_else(|| unavailable("PostgreSQL unavailable"))?;
+    let rpc = HttpJsonRpcProvider::new(rpc_url);
+    if rpc
+        .chain_id()
+        .await
+        .map_err(|_| unavailable("RPC chain unavailable"))?
+        != state.chain_id
+    {
+        return Err(unavailable("RPC chain mismatch"));
+    }
+    let from = &state.execution_config.executor_from_address;
+    macro_rules! read_word {
+        ($address:expr, $signature:literal) => {
+            call_word(&rpc, from, $address, $signature, &[])
+                .await
+                .map_err(|_| unavailable("physical contract read failed"))?
+        };
+    }
+    let registry_owner = word_address(read_word!(registry, "owner()"))
+        .map_err(|_| unavailable("Registry owner invalid"))?;
+    let engine_owner = word_address(read_word!(engine, "owner()"))
+        .map_err(|_| unavailable("engine owner invalid"))?;
+    let matcher_owner = word_address(read_word!(matcher, "owner()"))
+        .map_err(|_| unavailable("matcher owner invalid"))?;
+    if registry_owner != engine_owner || engine_owner != matcher_owner {
+        return Err(unavailable("physical governance owners differ"));
+    }
+    let engine_registry = word_address(read_word!(engine, "registry()"))
+        .map_err(|_| unavailable("engine Registry pointer invalid"))?;
+    let matcher_registry = word_address(read_word!(matcher, "optionRegistry()"))
+        .map_err(|_| unavailable("matcher Registry pointer invalid"))?;
+    let matcher_engine = word_address(read_word!(matcher, "marginEngine()"))
+        .map_err(|_| unavailable("matcher engine pointer invalid"))?;
+    if !engine_registry
+        .to_string()
+        .eq_ignore_ascii_case(&registry.0)
+        || !matcher_registry
+            .to_string()
+            .eq_ignore_ascii_case(&registry.0)
+        || !matcher_engine.to_string().eq_ignore_ascii_case(&engine.0)
+    {
+        return Err(unavailable("physical contract pointers differ"));
+    }
+    let total_series = read_word!(registry, "totalSeries()");
+    let registry_paused = read_word!(registry, "paused()") != U256::ZERO;
+    let engine_paused = read_word!(engine, "paused()") != U256::ZERO;
+    let matcher_paused = read_word!(matcher, "paused()") != U256::ZERO;
+    let max_open_contracts = read_word!(engine, "maxOpenContracts()");
+    let matching_engine_bound = read_word!(engine, "matchingEngine()") != U256::ZERO;
+    let series_bound = read_word!(engine, "seriesBound()") != U256::ZERO;
+    let indexed_series = repo
+        .list_option_series()
+        .await
+        .map_err(|_| unavailable("Options series projection unavailable"))?
+        .into_iter()
+        .filter(|series| {
+            series.onchain_chain_id == Some(state.chain_id)
+                && series
+                    .onchain_registry_address
+                    .as_deref()
+                    .is_some_and(|address| address.eq_ignore_ascii_case(&registry.0))
+        })
+        .count();
+    if total_series == U256::ZERO && indexed_series != 0 {
+        return Err(unavailable("indexed physical series absent on-chain"));
+    }
+    let inactive = total_series == U256::ZERO
+        && indexed_series == 0
+        && engine_paused
+        && max_open_contracts == U256::ZERO
+        && !matching_engine_bound
+        && !series_bound;
+    Ok(Json(Envelope {
+        status: if inactive { "ok" } else { "partial" },
+        data: PhysicalStackData {
+            chain_id: state.chain_id,
+            registry: registry.0.to_ascii_lowercase(),
+            engine: engine.0.to_ascii_lowercase(),
+            matcher: matcher.0.to_ascii_lowercase(),
+            governance_owner: format!("{registry_owner:#x}"),
+            series_count_onchain: total_series.to_string(),
+            series_count_indexed: indexed_series,
+            registry_paused,
+            engine_paused,
+            matcher_paused,
+            max_open_contracts: max_open_contracts.to_string(),
+            matching_engine_bound,
+            economic_state: if inactive { "inactive" } else { "unverified" },
+        },
+        warnings: if inactive {
+            Vec::new()
+        } else {
+            vec![Warning {
+                code: "PHYSICAL_STACK_STATE_UNVERIFIED".into(),
+                message: "Physical stack is no longer in its initial inactive state".into(),
+                details: serde_json::json!({}),
+            }]
+        },
+        meta: MetaBlock::new(&state, "rpc+db"),
+    }))
+}
+
 pub async fn physical_positions_authorized(
     State(state): State<AppState>,
     Path(address): Path<String>,
@@ -260,14 +418,13 @@ pub async fn physical_positions_authorized(
         .as_ref()
         .ok_or_else(|| unavailable("physical Options are not configured"))?;
     let config = &state.option_event_indexer_config;
-    if !config.enabled
-        || !engine
-            .0
-            .eq_ignore_ascii_case(&config.margin_engine_address.0)
-            && !config
-                .secondary_margin_engine_address
-                .as_ref()
-                .is_some_and(|a| a.0.eq_ignore_ascii_case(&engine.0))
+    if !engine
+        .0
+        .eq_ignore_ascii_case(&config.margin_engine_address.0)
+        && !config
+            .secondary_margin_engine_address
+            .as_ref()
+            .is_some_and(|a| a.0.eq_ignore_ascii_case(&engine.0))
     {
         return Err(unavailable("physical engine is not indexed"));
     }
@@ -285,6 +442,17 @@ pub async fn physical_positions_authorized(
         .await
         .map_err(|_| unavailable("physical indexer cursor unavailable"))?
         .ok_or_else(|| unavailable("physical indexer has not scanned"))?;
+    // The API may be read-only while a separate worker maintains the cursor.
+    // Refuse old projections even when their former block remains canonical.
+    let latest = rpc
+        .block_number()
+        .await
+        .map_err(|_| unavailable("chain head unavailable"))?;
+    if latest.saturating_sub(cursor.last_indexed_block)
+        > config.confirmation_blocks.saturating_add(5)
+    {
+        return Err(unavailable("physical indexer cursor is stale"));
+    }
     let expected = cursor
         .last_indexed_block_hash
         .as_deref()

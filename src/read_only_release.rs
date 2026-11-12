@@ -89,10 +89,15 @@ pub async fn reject_http_writes(
     // access control, so expose only the bounded market/status surface here.
     let auth_read = state.wallet_read_auth.enabled
         && (path == "/auth/wallet/session"
-            || (path.starts_with("/accounts/") && path.ends_with("/perps/canonical-fees")));
+            || (path.starts_with("/accounts/")
+                && (path.ends_with("/perps/canonical-fees")
+                    || path.ends_with("/physical-positions"))));
     if !auth_write
         && !auth_read
-        && !matches!(path, "/health" | "/ready" | "/perps/markets")
+        && !matches!(
+            path,
+            "/health" | "/ready" | "/perps/markets" | "/options/physical-stack"
+        )
         && !path.starts_with("/perps/markets/")
     {
         return (StatusCode::FORBIDDEN, "read-only release route unavailable").into_response();
@@ -142,6 +147,10 @@ mod tests {
                 get(|| async { "private" }),
             )
             .route("/options/products", get(|| async { "options" }))
+            .route(
+                "/options/physical-stack",
+                get(|| async { "inactive" }).post(|| async { "bad" }),
+            )
             .route("/accounts/:wallet/positions", get(|| async { "positions" }))
             .layer(axum::middleware::from_fn_with_state(
                 crate::api::AppState::new(crate::engine::EngineState::with_default_markets()),
@@ -169,6 +178,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(history.status(), StatusCode::FORBIDDEN);
+        let physical = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/options/physical-stack")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(physical.status(), StatusCode::OK);
+        let physical_write = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/options/physical-stack")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(physical_write.status(), StatusCode::METHOD_NOT_ALLOWED);
         for path in ["/options/products", "/accounts/0x123/positions"] {
             let response = app
                 .clone()
