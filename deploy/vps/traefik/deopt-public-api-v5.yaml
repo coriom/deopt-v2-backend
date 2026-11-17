@@ -6,7 +6,8 @@ http:
       entryPoints: [https]
       rule: >-
         Host(`94.16.113.122`) && Method(`GET`) &&
-        (Path(`/health`) || Path(`/ready`) || Path(`/perps/markets`) ||
+        (Path(`/health`) || Path(`/ready`) || Path(`/options/physical-stack`) ||
+        Path(`/perps/markets`) ||
         PathRegexp(`^/perps/markets/[0-9]+(?:/price)?$`) ||
         Path(`/auth/wallet/session`) ||
         PathRegexp(`^/accounts/0x[0-9A-Fa-f]{40}/perps/canonical-fees$`))
