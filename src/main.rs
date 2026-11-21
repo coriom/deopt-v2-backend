@@ -139,6 +139,7 @@ async fn main() -> deopt_v2_backend::Result<()> {
         config.fees.clone(),
         config.chain_id,
     );
+    state.read_only_release = read_only_release;
     state.wallet_read_auth = deopt_v2_backend::auth::wallet_read::WalletReadAuthConfig::from_env(
         read_only_release,
         repository.is_some(),

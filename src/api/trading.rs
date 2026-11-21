@@ -15,6 +15,8 @@
 //! rationale.
 
 use crate::api::http::AppState;
+use crate::api::legacy_options_catalog::{self, LegacySeries, LEGACY_REGISTRY};
+use crate::execution::rpc::TransactionBroadcastProvider;
 use crate::options::service::{
     create_user_initiated_execution_intent_from_quote,
     get_option_series as get_option_series_service, list_option_fills as list_option_fills_service,
@@ -307,6 +309,8 @@ pub struct SeriesSummary {
     pub product_id: String,
     pub onchain_chain_id: Option<u64>,
     pub onchain_registry_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub onchain_option_id: Option<String>,
     pub underlying: String,
     pub settlement_asset: String,
     pub is_call: bool,
@@ -314,6 +318,8 @@ pub struct SeriesSummary {
     pub expiry_ms: u64,
     pub contract_size_1e8: String,
     pub is_active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_european: Option<bool>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -685,6 +691,256 @@ fn aggregate_products(series_list: &[OptionSeries]) -> Vec<ProductResponse> {
     out
 }
 
+fn valid_catalogue_id(id: &str) -> bool {
+    id.len() == 66 && id.starts_with("0x") && id.as_bytes()[2..].iter().all(u8::is_ascii_hexdigit)
+}
+
+fn legacy_product_id(series: &LegacySeries) -> String {
+    let product = compute_product_id(
+        &series.underlying,
+        &series.settlement_asset,
+        series.is_call,
+        series.expiry,
+    );
+    // Product IDs are opaque to the frontend. Scope them to this Registry so
+    // a future physical series with identical terms cannot share an ID.
+    let scoped = format!("84532|{}|{product}", LEGACY_REGISTRY.to_ascii_lowercase());
+    format!("0x{}", hex::encode(Keccak256::digest(scoped.as_bytes())))
+}
+
+fn legacy_products(series: &[LegacySeries]) -> Vec<ProductResponse> {
+    let mut products = Vec::<ProductResponse>::new();
+    for item in series {
+        let id = legacy_product_id(item);
+        if let Some(existing) = products.iter_mut().find(|p| p.product_id == id) {
+            existing.series_count += 1;
+            existing.is_active_any |= item.is_active;
+        } else {
+            products.push(ProductResponse {
+                product_id: id,
+                underlying: item.underlying.clone(),
+                settlement_asset: item.settlement_asset.clone(),
+                is_call: item.is_call,
+                expiry_ms: item.expiry.saturating_mul(1000),
+                series_count: 1,
+                is_active_any: item.is_active,
+            });
+        }
+    }
+    products.sort_by(|a, b| {
+        a.expiry_ms
+            .cmp(&b.expiry_ms)
+            .then(a.underlying.cmp(&b.underlying))
+    });
+    products
+}
+
+async fn legacy_catalogue(state: &AppState) -> Result<Vec<LegacySeries>, TradingApiError> {
+    let provider = rpc_provider_from_state(state).ok_or_else(|| {
+        TradingApiError::new(
+            TradingErrorCode::SourceUnavailable,
+            "historical Registry RPC unavailable",
+            MetaBlock::new(state, "rpc"),
+        )
+    })?;
+    let chain_id = provider.chain_id().await.map_err(|_| {
+        TradingApiError::new(
+            TradingErrorCode::SourceUnavailable,
+            "historical Registry RPC unavailable",
+            MetaBlock::new(state, "rpc"),
+        )
+    })?;
+    legacy_options_catalog::read_series(
+        &provider,
+        &state.execution_config.executor_from_address,
+        chain_id,
+    )
+    .await
+    .map_err(|reason| {
+        TradingApiError::new(
+            TradingErrorCode::SourceUnavailable,
+            reason,
+            MetaBlock::new(state, "rpc"),
+        )
+    })
+}
+
+fn legacy_series_detail(item: &LegacySeries) -> SeriesDetailData {
+    SeriesDetailData {
+        series: SeriesSummary {
+            series_id: item.series_id.clone(),
+            product_id: legacy_product_id(item),
+            onchain_chain_id: Some(84532),
+            onchain_registry_address: Some(LEGACY_REGISTRY.to_string()),
+            onchain_option_id: Some(item.option_id.to_string()),
+            underlying: item.underlying.clone(),
+            settlement_asset: item.settlement_asset.clone(),
+            is_call: item.is_call,
+            strike_1e8: item.strike_1e8.to_string(),
+            expiry_ms: item.expiry.saturating_mul(1000),
+            contract_size_1e8: item.contract_size_1e8.to_string(),
+            is_active: item.is_active,
+            is_european: Some(item.is_european),
+        },
+        orderbook_top: None,
+        last_fill: None,
+        oracle_mark_1e8: None,
+    }
+}
+
+#[cfg(test)]
+mod legacy_catalogue_http_tests {
+    use super::*;
+    use alloy_primitives::U256;
+    use axum::{
+        body::{to_bytes, Body},
+        http::Request,
+        routing::get,
+        Router,
+    };
+    use tower::ServiceExt;
+
+    fn word(value: U256) -> String {
+        format!("{value:064x}")
+    }
+
+    fn series_result(underlying: u64, active: bool) -> String {
+        let words = [
+            underlying,
+            0x5678,
+            1_893_456_000,
+            300_000_000_000,
+            100_000_000,
+            1,
+            1,
+            1,
+            u64::from(active),
+        ];
+        format!(
+            "0x{}",
+            words
+                .into_iter()
+                .map(|n| word(U256::from(n)))
+                .collect::<String>()
+        )
+    }
+
+    fn sig(signature: &str) -> String {
+        Keccak256::digest(signature.as_bytes())[..4]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn three_http_routes_use_rpc_and_never_invent_market_data() {
+        let rpc = Router::new().route(
+            "/",
+            axum::routing::post(|Json(body): Json<serde_json::Value>| async move {
+                let method = body["method"].as_str().unwrap_or("");
+                let data = body["params"][0]["data"].as_str().unwrap_or("");
+                let result = match method {
+                    "eth_chainId" => "0x14a34".to_string(),
+                    "eth_blockNumber" => "0x123".to_string(),
+                    "eth_call" if data.starts_with(&format!("0x{}", sig("totalSeries()"))) => {
+                        format!("0x{}", word(U256::from(2)))
+                    }
+                    "eth_call" if data.starts_with(&format!("0x{}", sig("seriesAt(uint256)"))) => {
+                        let index = U256::from_str_radix(&data[10..], 16).unwrap();
+                        format!("0x{}", word(index + U256::from(11)))
+                    }
+                    "eth_call" if data.starts_with(&format!("0x{}", sig("getSeries(uint256)"))) => {
+                        let id = U256::from_str_radix(&data[10..], 16).unwrap();
+                        series_result(
+                            if id == U256::from(11) { 0x1234 } else { 0x9999 },
+                            id == U256::from(11),
+                        )
+                    }
+                    _ => "0x".to_string(),
+                };
+                Json(serde_json::json!({"jsonrpc":"2.0","id":1,"result":result}))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, rpc).await.unwrap();
+        });
+        let mut state = AppState::new(crate::engine::EngineState::with_default_markets());
+        state.read_only_release = true;
+        state.chain_id = 84532;
+        state.execution_config.rpc_url = Some(format!("http://{addr}"));
+        let app = Router::new()
+            .route("/options/products", get(list_products))
+            .route("/options/products/:product_id", get(get_product))
+            .route("/options/series/:series_id/details", get(series_details))
+            .with_state(state.clone())
+            .layer(axum::middleware::from_fn_with_state(
+                state,
+                crate::read_only_release::reject_http_writes,
+            ));
+        async fn fetch(app: &Router, path: &str) -> (StatusCode, serde_json::Value) {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = to_bytes(response.into_body(), 128_000).await.unwrap();
+            (status, serde_json::from_slice(&body).unwrap())
+        }
+        let (status, catalogue) = fetch(&app, "/options/products").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(catalogue["data"]["products"].as_array().unwrap().len(), 2);
+        let products = catalogue["data"]["products"].as_array().unwrap();
+        for product in products {
+            let id = product["product_id"].as_str().unwrap();
+            let (status, detail) = fetch(&app, &format!("/options/products/{id}")).await;
+            assert_eq!(status, StatusCode::OK);
+            let series_id = detail["data"]["series_ids"][0].as_str().unwrap();
+            let (status, series) =
+                fetch(&app, &format!("/options/series/{series_id}/details")).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(
+                series["data"]["series"]["onchain_registry_address"],
+                LEGACY_REGISTRY
+            );
+            assert_eq!(series["data"]["series"]["onchain_chain_id"], 84532);
+            assert!(series["data"]["last_fill"].is_null());
+            assert!(series["data"]["orderbook_top"].is_null());
+            assert!(series["data"]["oracle_mark_1e8"].is_null());
+        }
+        let (_, first) = fetch(
+            &app,
+            &format!(
+                "/options/series/{}/details",
+                legacy_options_catalog::read_series(
+                    &crate::execution::rpc::HttpJsonRpcProvider::new(format!("http://{addr}")),
+                    &AccountId::new("0x0000000000000000000000000000000000000001"),
+                    84532
+                )
+                .await
+                .unwrap()[0]
+                    .series_id
+            ),
+        )
+        .await;
+        assert_eq!(first["data"]["series"]["is_active"], true);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/options/products")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        task.abort();
+    }
+}
+
 // ---------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------
@@ -701,6 +957,23 @@ pub async fn list_products(
     State(state): State<AppState>,
     Query(query): Query<ListProductsQuery>,
 ) -> Result<Json<Envelope<ProductsListData>>, TradingApiError> {
+    if state.read_only_release {
+        let series = legacy_catalogue(&state).await?;
+        let mut products = legacy_products(&series);
+        if let Some(underlying) = query.underlying.as_deref() {
+            products.retain(|p| p.underlying.eq_ignore_ascii_case(underlying));
+        }
+        if let Some(is_call) = query.is_call {
+            products.retain(|p| p.is_call == is_call);
+        }
+        // Closed read-only catalogue includes inactive historical series.
+        return Ok(Json(Envelope {
+            status: "ok",
+            data: ProductsListData { products },
+            warnings: Vec::new(),
+            meta: MetaBlock::new(&state, "rpc"),
+        }));
+    }
     if !state.options_config.enabled {
         return Err(TradingApiError::new(
             TradingErrorCode::SourceUnavailable,
@@ -740,6 +1013,40 @@ pub async fn get_product(
     State(state): State<AppState>,
     Path(product_id): Path<String>,
 ) -> Result<Json<Envelope<ProductDetailData>>, TradingApiError> {
+    if state.read_only_release {
+        if !valid_catalogue_id(&product_id) {
+            return Err(TradingApiError::new(
+                TradingErrorCode::InvalidRequest,
+                "invalid product id",
+                MetaBlock::new(&state, "validation"),
+            ));
+        }
+        let series = legacy_catalogue(&state).await?;
+        let product = legacy_products(&series)
+            .into_iter()
+            .find(|p| p.product_id.eq_ignore_ascii_case(&product_id))
+            .ok_or_else(|| {
+                TradingApiError::new(
+                    TradingErrorCode::ProductNotFound,
+                    "Product id unknown",
+                    MetaBlock::new(&state, "rpc"),
+                )
+            })?;
+        let series_ids = series
+            .iter()
+            .filter(|item| legacy_product_id(item) == product.product_id)
+            .map(|item| item.series_id.clone())
+            .collect();
+        return Ok(Json(Envelope {
+            status: "ok",
+            data: ProductDetailData {
+                product,
+                series_ids,
+            },
+            warnings: Vec::new(),
+            meta: MetaBlock::new(&state, "rpc"),
+        }));
+    }
     let series = list_option_series_service(&state, OptionSeriesFilter::default())
         .await
         .map_err(|_| {
@@ -843,6 +1150,27 @@ pub async fn series_details(
     State(state): State<AppState>,
     Path(series_id): Path<String>,
 ) -> Result<Json<Envelope<SeriesDetailData>>, TradingApiError> {
+    if state.read_only_release {
+        if !valid_catalogue_id(&series_id) {
+            return Err(TradingApiError::new(
+                TradingErrorCode::InvalidRequest,
+                "invalid series id",
+                MetaBlock::new(&state, "validation"),
+            ));
+        }
+        let series = legacy_catalogue(&state).await?;
+        let item = series
+            .iter()
+            .find(|item| item.series_id.eq_ignore_ascii_case(&series_id))
+            .ok_or_else(|| {
+                TradingApiError::new(
+                    TradingErrorCode::SeriesNotFound,
+                    "Series id unknown",
+                    MetaBlock::new(&state, "rpc"),
+                )
+            })?;
+        return Ok(Json(Envelope { status: "partial", data: legacy_series_detail(item), warnings: vec![warning_source_unavailable("No canonical price, orderbook or fill is available for this historical Registry series; trading is disabled.")], meta: MetaBlock::new(&state, "rpc") }));
+    }
     let provider = rpc_provider_from_state(&state);
     series_details_impl(&state, &series_id, provider.as_ref()).await
 }
@@ -953,6 +1281,7 @@ where
             product_id: pid,
             onchain_chain_id: series.onchain_chain_id,
             onchain_registry_address: series.onchain_registry_address.clone(),
+            onchain_option_id: None,
             underlying: series.underlying.clone(),
             settlement_asset: series.settlement_asset.clone(),
             is_call: series.is_call,
@@ -960,6 +1289,7 @@ where
             expiry_ms: series.expiry.saturating_mul(1000),
             contract_size_1e8: series.contract_size_1e8.to_string(),
             is_active: matches!(series.status, crate::options::OptionSeriesStatus::Active),
+            is_european: None,
         },
         orderbook_top: None,
         last_fill,

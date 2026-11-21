@@ -96,13 +96,31 @@ pub async fn reject_http_writes(
         && !auth_read
         && !matches!(
             path,
-            "/health" | "/ready" | "/perps/markets" | "/options/physical-stack"
+            "/health"
+                | "/ready"
+                | "/perps/markets"
+                | "/options/physical-stack"
+                | "/options/products"
         )
         && !path.starts_with("/perps/markets/")
+        && !is_legacy_catalogue_detail(path)
     {
         return (StatusCode::FORBIDDEN, "read-only release route unavailable").into_response();
     }
     next.run(request).await
+}
+
+fn is_hex_id(id: &str) -> bool {
+    id.len() == 66 && id.starts_with("0x") && id.as_bytes()[2..].iter().all(u8::is_ascii_hexdigit)
+}
+
+fn is_legacy_catalogue_detail(path: &str) -> bool {
+    if let Some(id) = path.strip_prefix("/options/products/") {
+        return is_hex_id(id);
+    }
+    path.strip_prefix("/options/series/")
+        .and_then(|rest| rest.strip_suffix("/details"))
+        .is_some_and(is_hex_id)
 }
 
 use axum::response::IntoResponse;
@@ -201,7 +219,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(physical_write.status(), StatusCode::METHOD_NOT_ALLOWED);
-        for path in ["/options/products", "/accounts/0x123/positions"] {
+        for path in [
+            "/accounts/0x123/positions",
+            "/options/orders",
+            "/options/products/invalid",
+            "/options/series/invalid/details",
+        ] {
             let response = app
                 .clone()
                 .oneshot(
@@ -213,6 +236,23 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
+        }
+        for path in [
+            "/options/products",
+            &format!("/options/products/0x{}", "a".repeat(64)),
+            &format!("/options/series/0x{}/details", "b".repeat(64)),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_ne!(response.status(), StatusCode::FORBIDDEN, "{path}");
         }
         for method in [Method::POST, Method::PUT, Method::PATCH, Method::DELETE] {
             let response = app

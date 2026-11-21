@@ -28,6 +28,7 @@ use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct AppState {
+    pub read_only_release: bool,
     pub wallet_read_auth: crate::auth::wallet_read::WalletReadAuthConfig,
     pub engine: Arc<Mutex<EngineState>>,
     pub nonces: Arc<Mutex<NonceStore>>,
@@ -498,6 +499,7 @@ impl AppState {
             None => Arc::new(crate::perps::InMemoryNonceLedger::new()),
         };
         Self {
+            read_only_release: false,
             wallet_read_auth: crate::auth::wallet_read::WalletReadAuthConfig::default(),
             engine: Arc::new(Mutex::new(engine)),
             nonces: Arc::new(Mutex::new(NonceStore::new())),

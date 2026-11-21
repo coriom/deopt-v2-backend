@@ -5,6 +5,7 @@ pub mod hybrid_v2_admin;
 pub mod hybrid_v2_execution_admin;
 pub mod hybrid_v2_read;
 pub mod local_test_fixtures;
+pub mod legacy_options_catalog;
 pub mod perps_cosign;
 pub mod physical_options;
 pub mod public_ws;

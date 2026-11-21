@@ -7,6 +7,9 @@ http:
       rule: >-
         Host(`94.16.113.122`) && Method(`GET`) &&
         (Path(`/health`) || Path(`/ready`) || Path(`/options/physical-stack`) ||
+        Path(`/options/products`) ||
+        PathRegexp(`^/options/products/0x[0-9A-Fa-f]{64}$`) ||
+        PathRegexp(`^/options/series/0x[0-9A-Fa-f]{64}/details$`) ||
         Path(`/perps/markets`) ||
         PathRegexp(`^/perps/markets/[0-9]+(?:/price)?$`) ||
         Path(`/auth/wallet/session`) ||

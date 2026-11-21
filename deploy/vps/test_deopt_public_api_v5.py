@@ -17,8 +17,10 @@ class DeoptPublicApiV5Tests(unittest.TestCase):
         self.assertIn("Host(`94.16.113.122`) && Method(`GET`)", read_rule)
         self.assertEqual(
             re.findall(r"Path\(`/options/[^`]+`\)", read_rule),
-            ["Path(`/options/physical-stack`)"]
+            ["Path(`/options/physical-stack`)", "Path(`/options/products`)"]
         )
+        self.assertIn("PathRegexp(`^/options/products/0x[0-9A-Fa-f]{64}$`)", read_rule)
+        self.assertIn("PathRegexp(`^/options/series/0x[0-9A-Fa-f]{64}/details$`)", read_rule)
         self.assertIn("priority: 1000", read_rule)
         self.assertIn("service: deopt-v5-backend", read_rule)
         self.assertNotIn("PathPrefix(", read_rule)
